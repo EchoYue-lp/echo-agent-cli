@@ -98,6 +98,8 @@ pub enum ChatDriverEvent {
         before_tokens: usize,
         after_tokens: usize,
     },
+    /// Typed result of an app-core Extension management command.
+    ExtensionReceipt(Box<crate::extension_commands::ExtensionCommandReceipt>),
     CommandCellStarted {
         cell: Box<crate::tasks::task_runtime::BackgroundCellState>,
     },
@@ -2230,6 +2232,7 @@ mod tests {
                 | ChatDriverEvent::ApprovalRequest { .. }
                 | ChatDriverEvent::InputRequest { .. }
                 | ChatDriverEvent::SelectionRequest { .. }
+                | ChatDriverEvent::ExtensionReceipt(_)
                 | ChatDriverEvent::CommandCellStarted { .. }
                 | ChatDriverEvent::CommandCellSettled { .. }
                 | ChatDriverEvent::AwaiterResultReady { .. }

@@ -19,7 +19,6 @@ use std::{
 };
 
 #[cfg(feature = "channels")]
-#[cfg(feature = "channels")]
 use echo_agent_app_core::foreground_turn::{
     ForegroundTurnControl, ForegroundTurnError, ForegroundTurnSurface,
 };
@@ -2128,8 +2127,91 @@ fn format_channel_completion_gate(
 fn is_agent_management_command(message: &str) -> bool {
     matches!(
         message.split_whitespace().next(),
-        Some("/trace" | "/analysis" | "/papers" | "/skills")
+        Some("/trace" | "/analysis" | "/papers")
     )
+}
+
+#[cfg(feature = "channels")]
+#[allow(clippy::large_enum_variant)]
+enum ChannelExtensionInput {
+    Request(echo_agent_app_core::extension_commands::ExtensionCommandRequest),
+    ParseFailure {
+        kind: echo_agent_app_core::extension_commands::ExtensionKind,
+        identity: echo_agent_app_core::extension_commands::ExtensionCommandIdentity,
+        error: String,
+    },
+}
+
+#[cfg(feature = "channels")]
+fn channel_extension_scope_from_product_data(
+    workspace_id: &str,
+    workspace_generation: String,
+    sender_id: &str,
+    sender_incarnation: &str,
+) -> Result<echo_agent_app_core::extension_commands::ExtensionRequestScope, String> {
+    echo_agent_app_core::extension_commands::ExtensionRequestScope::new(
+        workspace_id,
+        workspace_generation,
+        Some(sender_id.to_string()),
+        Some(sender_incarnation.to_string()),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "channels")]
+async fn channel_extension_scope_for_runtime(
+    state: &echo_agent_app_core::state::AppState,
+    runtime: &echo_agent_app_core::state::ScopedChatRuntime,
+    sender_id: &str,
+    sender_incarnation: &str,
+) -> Result<echo_agent_app_core::extension_commands::ExtensionRequestScope, String> {
+    let product_data = state
+        .product_data_for_runtime(runtime)
+        .await
+        .map_err(|error| error.to_string())?;
+    channel_extension_scope_from_product_data(
+        product_data.workspace_id(),
+        product_data.generation(),
+        sender_id,
+        sender_incarnation,
+    )
+}
+
+#[cfg(feature = "channels")]
+fn parse_channel_extension_input(
+    message: &str,
+    request_id: &str,
+    operation_id: &str,
+) -> Result<Option<ChannelExtensionInput>, String> {
+    let identity = echo_agent_app_core::extension_commands::ExtensionCommandIdentity {
+        request_id: request_id.to_string(),
+        operation_id: operation_id.to_string(),
+    };
+    match echo_agent_app_core::extension_commands::parse_extension_command(
+        message,
+        identity.clone(),
+    ) {
+        Ok(Some(request)) => Ok(Some(ChannelExtensionInput::Request(request))),
+        Ok(None) => Ok(None),
+        Err(error) => match error.extension {
+            Some(kind) => Ok(Some(ChannelExtensionInput::ParseFailure {
+                kind,
+                identity,
+                error: error.message,
+            })),
+            None => Err(error.message),
+        },
+    }
+}
+
+#[cfg(feature = "channels")]
+struct ChannelManagementJournalSink;
+
+#[cfg(feature = "channels")]
+impl echo_agent_app_core::chat_driver::ChatSink for ChannelManagementJournalSink {
+    fn on_event(&self, _event: echo_agent_app_core::chat_driver::ChatDriverEvent) -> bool {
+        true
+    }
 }
 
 #[cfg(feature = "channels")]
@@ -2221,6 +2303,180 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 "Channel session identity changed after framework routing.",
             ));
         }
+        let conv = Self::conversation_id(&msg.channel_id, msg.conversation_id(), &msg.sender_id);
+        let incarnation_id = self.session_instance.incarnation_id();
+        let agent_conv = Self::agent_conversation_id(&conv, &incarnation_id);
+        let active_surface_id =
+            Self::active_surface_identity(&msg.channel_id, msg.conversation_id(), &msg.sender_id);
+        let cache_id = Self::cache_user_id(&conv, &incarnation_id);
+        let extension_operation_id =
+            format!("channel-extension:{}:{}", msg.channel_id, msg.message_id);
+        let extension_input = match parse_channel_extension_input(
+            &msg.text,
+            &msg.message_id,
+            &extension_operation_id,
+        ) {
+            Ok(input) => input,
+            Err(error) => return Ok(immediate_channel_response(&msg, error)),
+        };
+        if let Some(extension_input) = extension_input {
+            let retirement_runtime = match self.app_state.current_control_runtime().await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Workspace runtime is unavailable: {error}"),
+                    ));
+                }
+            };
+            if let Err(error) = self
+                .settle_pending_retirement_for_runtime(
+                    &retirement_runtime,
+                    &conv,
+                    &agent_conv,
+                    &active_surface_id,
+                )
+                .await
+            {
+                return Ok(immediate_channel_response(&msg, error));
+            }
+            let turn_id = format!("channel-extension-turn:{}", msg.message_id);
+            let (runtime, lease) = match self
+                .app_state
+                .begin_scoped_chat_turn_owned(
+                    ForegroundTurnSurface::Channel,
+                    &conv,
+                    turn_id.clone(),
+                )
+                .await
+            {
+                Ok(lease) => lease,
+                Err(echo_agent_app_core::state::ScopedChatTurnError::Conversation(
+                    echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                        ForegroundTurnError::Busy { active_turn_id, .. },
+                    ),
+                )) => {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Turn {active_turn_id} is still running; command was not applied."),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Unable to admit the Extension command: {error}"),
+                    ));
+                }
+            };
+            if let Err(message) =
+                self.publish_active_turn(&active_surface_id, &conv, &agent_conv, &runtime, &turn_id)
+            {
+                lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+                return Ok(immediate_channel_response(&msg, message));
+            }
+            let _active_owner = ChannelActiveTurnOwner::new(
+                Arc::clone(&self.active_turns),
+                active_surface_id.clone(),
+                turn_id.clone(),
+            );
+            self.record_runtime_owner(&runtime, &conv, &agent_conv);
+            let scope = runtime.execution_scope().workspace_id().to_string();
+            let receipt = match extension_input {
+                ChannelExtensionInput::Request(mut request) if msg.attachments.is_empty() => {
+                    match channel_extension_scope_for_runtime(
+                        self.app_state.as_ref(),
+                        &runtime,
+                        &msg.sender_id,
+                        &incarnation_id,
+                    )
+                    .await
+                    {
+                        Ok(request_scope) => {
+                            request.scope = Some(request_scope);
+                            echo_agent_app_core::extension_commands::ExtensionCommandDispatcher::new(
+                                self.app_state.clone(),
+                            )
+                            .dispatch(request, Some(runtime.clone()), conv.clone())
+                            .await
+                        }
+                        Err(error) => {
+                            echo_agent_app_core::extension_commands::ExtensionCommandReceipt::failed(
+                                request.kind(),
+                                request.identity(),
+                                scope.clone(),
+                                error.to_string(),
+                            )
+                        }
+                    }
+                }
+                ChannelExtensionInput::Request(request) => {
+                    echo_agent_app_core::extension_commands::ExtensionCommandReceipt::failed(
+                        request.kind(),
+                        request.identity(),
+                        scope.clone(),
+                        "Channel Extension management commands do not accept attachments",
+                    )
+                }
+                ChannelExtensionInput::ParseFailure {
+                    kind,
+                    identity,
+                    error,
+                } => echo_agent_app_core::extension_commands::ExtensionCommandReceipt::failed(
+                    kind,
+                    identity,
+                    scope.clone(),
+                    error,
+                ),
+            };
+            let message = receipt.display_message();
+            let outcome = crate::cli::modes::extension_receipt_terminal(&receipt);
+            let sink = echo_agent_app_core::chat_event_log::bind_surface_chat_sink(
+                echo_agent_app_core::chat_event_log::ChatSurface::Channel,
+                Arc::new(ChannelManagementJournalSink),
+                self.app_state.storage.chat_events.clone(),
+                self.app_state.storage.tool_executions.clone(),
+                scope,
+                Some(conv.clone()),
+                turn_id,
+            );
+            if !sink.on_event(
+                echo_agent_app_core::chat_driver::ChatDriverEvent::ExtensionReceipt(Box::new(
+                    receipt,
+                )),
+            ) {
+                let failure = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(
+                        "channel_journal",
+                        "Channel journal rejected the Extension receipt",
+                    ),
+                );
+                lease.settle(failure);
+                return Ok(immediate_channel_response(
+                    &msg,
+                    "Channel journal rejected the Extension receipt.",
+                ));
+            }
+            let terminal_delivered = sink.on_event(
+                echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
+                    status: outcome.status().to_string(),
+                },
+            );
+            if !terminal_delivered {
+                let failure = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(
+                        "channel_journal",
+                        "Channel journal rejected the Extension terminal",
+                    ),
+                );
+                lease.settle(failure);
+                return Ok(immediate_channel_response(
+                    &msg,
+                    "Channel journal rejected the Extension terminal.",
+                ));
+            }
+            lease.settle(outcome);
+            return Ok(immediate_channel_response(&msg, message));
+        }
         let developer_command = match parse_developer_command(&msg.text) {
             Ok(command) => command,
             Err(error) => return Ok(immediate_channel_response(&msg, error)),
@@ -2230,10 +2486,13 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             // this channel starts observing its output.
             let terminal_events = self.app_state.terminal.subscribe();
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let browser_conversation =
+                Self::conversation_id(&msg.channel_id, msg.conversation_id(), &msg.sender_id);
             let registry = echo_agent_app_core::developer_commands::DeveloperCommandRegistry::new(
                 self.app_state.terminal.clone(),
-                self.app_state.plugin_runtime.clone(),
-            );
+                Some(self.app_state.clone()),
+            )
+            .with_browser_conversation_id(browser_conversation);
             return match registry.execute(&command, &arg_refs).await {
                 Ok(output) => match output.attached_terminal {
                     Some(terminal_id) => Ok(channel_terminal_stream(
@@ -2250,12 +2509,6 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 )),
             };
         }
-        let conv = Self::conversation_id(&msg.channel_id, msg.conversation_id(), &msg.sender_id);
-        let incarnation_id = self.session_instance.incarnation_id();
-        let agent_conv = Self::agent_conversation_id(&conv, &incarnation_id);
-        let active_surface_id =
-            Self::active_surface_identity(&msg.channel_id, msg.conversation_id(), &msg.sender_id);
-        let cache_id = Self::cache_user_id(&conv, &incarnation_id);
         if let Some(message) = self.agent_router_command_response(&msg.text, &conv).await {
             return Ok(immediate_channel_response(&msg, message));
         }
@@ -2596,25 +2849,26 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             let agent = pool_execution.agent();
             configure_channel_agent(&agent, &cache_id, Arc::clone(&self.hitl)).await;
             let product_data = self.app_state.product_data_for_runtime(&runtime).await.ok();
-            let message = if let Some(message) = channel_trace_response(&agent, &msg.text).await {
-                message
+            let response = if let Some(message) = channel_trace_response(&agent, &msg.text).await {
+                ChannelManagementResponse::completed(message)
             } else if let Some(message) =
                 channel_analysis_response(product_data.as_ref(), &msg.text).await
             {
-                message
+                ChannelManagementResponse::completed(message)
             } else if let Some(message) =
                 channel_papers_response(product_data.as_ref(), &msg.text).await
             {
-                message
-            } else if let Some(message) = channel_skills_response(&agent, &msg.text).await {
-                message
+                ChannelManagementResponse::completed(message)
             } else {
-                "Unsupported channel management command.".to_string()
+                ChannelManagementResponse::failed(
+                    "management_command",
+                    "Unsupported channel management command.",
+                )
             };
             drop(pool_execution);
             generation_receipts.release_lifo();
-            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
-            return Ok(immediate_channel_response(&msg, message));
+            lease.settle(response.terminal);
+            return Ok(immediate_channel_response(&msg, response.message));
         }
 
         if channel_resume_rejects_attachments(resume_task_run.is_some(), msg.attachments.len()) {
@@ -3189,16 +3443,29 @@ async fn channel_papers_response(
 }
 
 #[cfg(feature = "channels")]
-async fn channel_skills_response(
-    agent: &echo_agent_app_core::agent_handle::AgentHandle,
-    message: &str,
-) -> Option<String> {
-    let mut parts = message.split_whitespace();
-    if parts.next()? != "/skills" {
-        return None;
+struct ChannelManagementResponse {
+    message: String,
+    terminal: echo_agent_app_core::chat_driver::TurnOutcome,
+}
+
+#[cfg(feature = "channels")]
+impl ChannelManagementResponse {
+    fn completed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            terminal: echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+        }
     }
-    let args = parts.collect::<Vec<_>>();
-    crate::cli::cmd_impls::skills::execute_skill_update_command(agent, &args).await
+
+    fn failed(code: &'static str, message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            terminal: echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message(code, message.clone()),
+            ),
+            message,
+        }
+    }
 }
 
 #[cfg(feature = "channels")]
@@ -3774,6 +4041,10 @@ async fn aggregate_by_sentence_with_repository<'a>(
                     ChatDriverEvent::AwaiterResultDeliveryStarted { .. }
                     | ChatDriverEvent::AwaiterResultAcknowledged { .. },
                 ) => {}
+                ChannelRenderEvent::Driver(ChatDriverEvent::ExtensionReceipt(receipt)) => {
+                    flush_all!();
+                    yield ChannelOutboundDraft::ordinary(receipt.display_message());
+                }
                 ChannelRenderEvent::Driver(ChatDriverEvent::ApprovalRequest {
                     request_id,
                     tool_name,
@@ -4853,9 +5124,90 @@ mod tests {
     #[test]
     fn management_commands_are_classified_exactly() {
         assert!(super::is_agent_management_command("/trace run-1"));
-        assert!(super::is_agent_management_command(" /skills list "));
+        for command in ["/analysis", "/papers"] {
+            assert!(super::is_agent_management_command(command));
+        }
+        assert!(!super::is_agent_management_command(" /skills list "));
+        assert!(!super::is_agent_management_command("/browser status"));
         assert!(!super::is_agent_management_command("/stop"));
         assert!(!super::is_agent_management_command("/traceable"));
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn typed_extension_parser_claims_all_families_before_the_model() -> Result<(), String> {
+        for command in [
+            "/skills list",
+            "/plugins list",
+            "/mcp list",
+            "/hooks list",
+            "/lsp status",
+            "/browser status",
+        ] {
+            let parsed = super::parse_channel_extension_input(command, "request-1", "operation-1")?
+                .ok_or_else(|| format!("{command} was not claimed by the Extension parser"))?;
+            if !matches!(parsed, super::ChannelExtensionInput::Request(_)) {
+                return Err(format!("{command} did not produce a typed request"));
+            }
+        }
+        let invalid =
+            super::parse_channel_extension_input("/browser unknown", "request-2", "operation-2")?
+                .ok_or_else(|| "invalid Browser command was sent to the model".to_string())?;
+        assert!(matches!(
+            invalid,
+            super::ChannelExtensionInput::ParseFailure {
+                kind: echo_agent_app_core::extension_commands::ExtensionKind::Browser,
+                ..
+            }
+        ));
+        assert!(
+            super::parse_channel_extension_input("ordinary prompt", "request-3", "operation-3")?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn non_global_extension_scope_uses_product_data_generation() -> Result<(), String> {
+        let temporary = std::env::temp_dir().join(format!(
+            "eko-channel-extension-scope-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace_root = temporary.join("workspace");
+        std::fs::create_dir_all(&workspace_root).map_err(|error| error.to_string())?;
+        let registry = echo_agent_app_core::workspace::registry::WorkspaceRegistry::with_base_dir(
+            temporary.join("registry"),
+        )
+        .map_err(|error| error.to_string())?;
+        let workspace = registry
+            .create_at(
+                "channel-extension-scope",
+                echo_agent_app_core::workspace::WorkspaceKind::General,
+                workspace_root,
+            )
+            .map_err(|error| error.to_string())?;
+        let product_data_generation = workspace.opaque_product_data_generation();
+        let host_generation = workspace
+            .created_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+
+        let scope = super::channel_extension_scope_from_product_data(
+            workspace.id.as_str(),
+            product_data_generation.clone(),
+            "sender-a",
+            "incarnation-a",
+        )?;
+
+        assert_ne!(workspace.id.as_str(), "global");
+        assert_eq!(scope.workspace_id, workspace.id.as_str());
+        assert_eq!(scope.workspace_generation, product_data_generation);
+        assert_ne!(scope.workspace_generation, host_generation);
+        let decoded: (String, String, u64) =
+            serde_json::from_str(&scope.workspace_generation).map_err(|error| error.to_string())?;
+        assert_eq!(decoded.0, workspace.id.as_str());
+        let _cleanup = std::fs::remove_dir_all(&temporary);
+        Ok(())
     }
 
     #[cfg(feature = "channels")]

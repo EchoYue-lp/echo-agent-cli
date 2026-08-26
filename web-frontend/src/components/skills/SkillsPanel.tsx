@@ -1,7 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { skillsApi } from '../../api/endpoints';
-import type { TauriSkillInfo, SkillUpdateStatus } from '../../types/api';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { extensionRequestScope, skillsApi } from '../../api/endpoints';
+import type { TauriSkillInfo } from '../../types/api';
 import { CATEGORY_LABELS } from '../../types/api';
+import type {
+  ExtensionCommandReceipt,
+  ExtensionRequestScope,
+  SkillCommandReceipt,
+  SkillSyncReceipt,
+  SkillUpdateProjection,
+} from '../../generated';
 import {
   BookOpen,
   ChevronDown,
@@ -14,8 +21,10 @@ import {
   AlertTriangle,
   Download,
   RefreshCw,
+  Trash2,
 } from 'lucide-react';
 import { useToastStore } from '../../stores/toastStore';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { fileSystem, isTauri } from '../../lib/tauri-bridge';
 
 /** Category sort order for consistent display. */
@@ -28,8 +37,30 @@ const CATEGORY_ORDER = [
   'automation',
 ];
 
+function sameScope(left: ExtensionRequestScope, right: ExtensionRequestScope): boolean {
+  return (
+    left.workspace_id === right.workspace_id &&
+    left.workspace_generation === right.workspace_generation &&
+    left.sender_id === right.sender_id &&
+    left.sender_incarnation === right.sender_incarnation
+  );
+}
+
+export function skillCommandReceipt(receipt: ExtensionCommandReceipt): SkillCommandReceipt {
+  if (receipt.extension !== 'skills' || receipt.receipt === null) {
+    throw new Error(receipt.meta.error ?? 'Skill command returned no typed receipt');
+  }
+  if (receipt.meta.status === 'failed') {
+    throw new Error(receipt.meta.error ?? 'Skill command failed');
+  }
+  return receipt.receipt;
+}
+
 export function SkillsPanel() {
+  const workspace = useWorkspaceStore((state) => state.current);
+  const requestScope = useMemo(() => extensionRequestScope(workspace), [workspace]);
   const [skills, setSkills] = useState<TauriSkillInfo[]>([]);
+  const [skillsOmitted, setSkillsOmitted] = useState(0);
   const [dir, setDir] = useState('');
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -37,26 +68,15 @@ export function SkillsPanel() {
   const [busySkill, setBusySkill] = useState<string | null>(null);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [syncingSkills, setSyncingSkills] = useState(false);
-  const [updateStatuses, setUpdateStatuses] = useState<Record<string, SkillUpdateStatus>>({});
+  const [updateStatuses, setUpdateStatuses] = useState<Record<string, SkillUpdateProjection>>({});
+  const [updatesOmitted, setUpdatesOmitted] = useState(0);
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const requestSequence = useRef(0);
   const addToast = useToastStore((s) => s.addToast);
   const loadingAny = loading || uploading || checkingUpdates || syncingSkills;
 
-  const filteredSkills = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return skills;
-    return skills.filter((skill) => {
-      const catLabel = CATEGORY_LABELS[skill.category || ''] || '';
-      return (
-        skill.name.toLowerCase().includes(q) ||
-        skill.description.toLowerCase().includes(q) ||
-        skill.tags?.some((tag) => tag.toLowerCase().includes(q)) ||
-        catLabel.includes(q) ||
-        (skill.category || '').toLowerCase().includes(q)
-      );
-    });
-  }, [skills, query]);
+  const filteredSkills = skills;
 
   /** Group filtered skills by category, maintaining display order. */
   const groupedSkills = useMemo(() => {
@@ -86,26 +106,87 @@ export function SkillsPanel() {
     });
   };
 
-  useEffect(() => {
-    refreshSkills().catch(console.error);
+  const assertActiveScope = useCallback((expected: ExtensionRequestScope) => {
+    const current = extensionRequestScope(useWorkspaceStore.getState().current);
+    if (!sameScope(current, expected)) {
+      throw new Error('Workspace focus changed before the Skill command settled');
+    }
   }, []);
 
-  async function refreshSkills() {
-    const list = await skillsApi.list();
-    setSkills(list);
-    return list;
-  }
+  const refreshSkills = useCallback(
+    async (search = query, token?: { active: boolean }) => {
+      const sequence = ++requestSequence.current;
+      const expectedScope = requestScope;
+      const normalized = search.trim();
+      const receipt = normalized
+        ? await skillsApi.search(expectedScope, normalized)
+        : await skillsApi.list(expectedScope);
+      assertActiveScope(expectedScope);
+      if (token?.active === false || sequence !== requestSequence.current) return [];
+      const command = skillCommandReceipt(receipt);
+      const bounded =
+        command.action === 'listed' || command.action === 'searched' ? command.skills : null;
+      if (bounded === null) {
+        throw new Error(`Unexpected Skill receipt '${command.action}' while listing skills`);
+      }
+      setSkills(bounded.items);
+      setSkillsOmitted(bounded.omitted);
+      return bounded.items;
+    },
+    [assertActiveScope, query, requestScope]
+  );
+
+  useEffect(() => {
+    const sequence = ++requestSequence.current;
+    const token = { active: true };
+    const timeout = window.setTimeout(
+      () => {
+        if (sequence !== requestSequence.current) return;
+        setLoading(true);
+        void refreshSkills(query, token)
+          .catch((error) => addToast('error', `加载技能失败: ${String(error)}`))
+          .finally(() => setLoading(false));
+      },
+      query.trim() ? 180 : 0
+    );
+    return () => {
+      token.active = false;
+      window.clearTimeout(timeout);
+    };
+  }, [addToast, query, refreshSkills, requestScope]);
+
+  const showSettlement = (action: string, receipt: SkillSyncReceipt, settledMessage: string) => {
+    if (receipt.status === 'settled') {
+      addToast('success', settledMessage);
+      return;
+    }
+
+    if (receipt.status === 'committed') {
+      addToast('info', `${action}已写入持久配置，运行时仍在结算`, 8000);
+      return;
+    }
+
+    const repair = receipt.repair_debt ? '，已记录自动修复任务' : '';
+    addToast('warning', `${action}已写入持久配置，但部分运行时目标未完成${repair}`, 8000);
+  };
 
   const loadPath = async (path: string) => {
     if (!path || loading) return;
     setLoading(true);
     try {
-      const result = await skillsApi.load(path);
-      const list = result.skills ?? (await refreshSkills());
-      setSkills(list);
+      const result = await skillsApi.load(requestScope, path);
+      assertActiveScope(requestScope);
+      const command = skillCommandReceipt(result);
+      if (command.action !== 'installed') {
+        throw new Error(`Unexpected Skill receipt '${command.action}' after install`);
+      }
+      await refreshSkills();
       setDir('');
-      const loadedCount = result.count ?? result.loaded?.length ?? list.length;
-      addToast('success', loadedCount > 0 ? `成功加载 ${loadedCount} 个技能` : '未发现新的技能');
+      showSettlement(
+        '技能安装',
+        command.settlement.settlement,
+        `已安装并启用 ${command.settlement.name}`
+      );
     } catch (e: any) {
       const msg = e?.message || String(e);
       addToast('error', `加载技能失败: ${msg}`);
@@ -122,10 +203,18 @@ export function SkillsPanel() {
     if (busySkill) return;
     setBusySkill(name);
     try {
-      const result = await skillsApi.enable(name);
-      setSkills(result.skills ?? (await refreshSkills()));
-      const loadedCount = result.count ?? result.loaded?.length ?? 0;
-      addToast('success', loadedCount > 0 ? `已启用 ${name}` : `${name} 已是可用状态`);
+      const result = await skillsApi.enable(requestScope, name);
+      assertActiveScope(requestScope);
+      const command = skillCommandReceipt(result);
+      if (command.action !== 'enabled') {
+        throw new Error(`Unexpected Skill receipt '${command.action}' after enable`);
+      }
+      await refreshSkills();
+      showSettlement(
+        '技能启用',
+        command.settlement,
+        command.settlement.idempotent ? `${name} 已是启用状态` : `已启用 ${name}`
+      );
     } catch (e: any) {
       addToast('error', `启用技能失败: ${e?.message || String(e)}`);
     } finally {
@@ -137,12 +226,39 @@ export function SkillsPanel() {
     if (busySkill) return;
     setBusySkill(name);
     try {
-      const result = await skillsApi.disable(name);
-      if (result.skills) setSkills(result.skills);
-      else await refreshSkills();
-      addToast(result.requires_restart ? 'info' : 'success', result.message || `已禁用 ${name}`);
+      const result = await skillsApi.disable(requestScope, name);
+      assertActiveScope(requestScope);
+      const command = skillCommandReceipt(result);
+      if (command.action !== 'disabled') {
+        throw new Error(`Unexpected Skill receipt '${command.action}' after disable`);
+      }
+      await refreshSkills();
+      showSettlement(
+        '技能禁用',
+        command.settlement,
+        command.settlement.idempotent ? `${name} 已是禁用状态` : `已禁用 ${name}`
+      );
     } catch (e: any) {
       addToast('error', `禁用技能失败: ${e?.message || String(e)}`);
+    } finally {
+      setBusySkill(null);
+    }
+  };
+
+  const uninstallSkill = async (name: string) => {
+    if (busySkill || !window.confirm(`卸载技能 '${name}'？`)) return;
+    setBusySkill(name);
+    try {
+      const result = await skillsApi.uninstall(requestScope, name);
+      assertActiveScope(requestScope);
+      const command = skillCommandReceipt(result);
+      if (command.action !== 'uninstalled') {
+        throw new Error(`Unexpected Skill receipt '${command.action}' after uninstall`);
+      }
+      await refreshSkills();
+      showSettlement('技能卸载', command.settlement.settlement, `已卸载 ${name}`);
+    } catch (e: any) {
+      addToast('error', `卸载技能失败: ${e?.message || String(e)}`);
     } finally {
       setBusySkill(null);
     }
@@ -152,13 +268,20 @@ export function SkillsPanel() {
     if (loadingAny) return;
     setCheckingUpdates(true);
     try {
-      const statuses = await skillsApi.checkUpdates();
+      const receipt = await skillsApi.checkUpdates(requestScope);
+      assertActiveScope(requestScope);
+      const command = skillCommandReceipt(receipt);
+      if (command.action !== 'updates_checked') {
+        throw new Error(`Unexpected Skill receipt '${command.action}' after update check`);
+      }
+      const statuses = command.updates.items;
       setUpdateStatuses(Object.fromEntries(statuses.map((status) => [status.name, status])));
+      setUpdatesOmitted(command.updates.omitted);
       const available = statuses.filter((status) => status.state === 'update_available').length;
       const localChanges = statuses.filter((status) => status.state === 'local_changes').length;
       addToast(
         available > 0 || localChanges > 0 ? 'info' : 'success',
-        `检查完成：${available} 个更新，${localChanges} 个存在本地修改`
+        `检查完成：${available} 个更新，${localChanges} 个存在本地修改${command.updates.omitted > 0 ? `，${command.updates.omitted} 项未展示` : ''}`
       );
     } catch (e: any) {
       addToast('error', `检查技能更新失败: ${e?.message || String(e)}`);
@@ -172,20 +295,57 @@ export function SkillsPanel() {
     setBusySkill(name);
     setSyncingSkills(true);
     try {
-      const results = await skillsApi.sync(name, force);
-      const result = results[0];
+      const receipt = await skillsApi.sync(requestScope, name, force);
+      assertActiveScope(requestScope);
+      const command = skillCommandReceipt(receipt);
+      if (command.action !== 'synced') {
+        throw new Error(`Unexpected Skill receipt '${command.action}' after sync`);
+      }
+      const result = command.settlement.results.find((candidate) => candidate.name === name);
       await refreshSkills();
-      const statuses = await skillsApi.checkUpdates();
-      setUpdateStatuses(Object.fromEntries(statuses.map((status) => [status.name, status])));
-      addToast(
-        result?.success === false ? 'error' : result?.updated ? 'success' : 'info',
-        result?.message || `${name} 无需更新`
+      const updateReceipt = await skillsApi.checkUpdates(requestScope);
+      assertActiveScope(requestScope);
+      const updateCommand = skillCommandReceipt(updateReceipt);
+      if (updateCommand.action !== 'updates_checked') {
+        throw new Error(`Unexpected Skill receipt '${updateCommand.action}' after update check`);
+      }
+      setUpdateStatuses(
+        Object.fromEntries(updateCommand.updates.items.map((status) => [status.name, status]))
       );
+      setUpdatesOmitted(updateCommand.updates.omitted);
+      if (result?.success === false) {
+        addToast('error', result.message);
+      } else {
+        showSettlement(
+          '技能同步',
+          command.settlement.settlement,
+          result?.message || (result?.updated ? `已更新 ${name}` : `${name} 无需更新`)
+        );
+      }
     } catch (e: any) {
       addToast('error', `同步技能失败: ${e?.message || String(e)}`);
     } finally {
       setBusySkill(null);
       setSyncingSkills(false);
+    }
+  };
+
+  const refreshEnabledSkills = async () => {
+    if (loadingAny) return;
+    setLoading(true);
+    try {
+      const receipt = await skillsApi.refresh(requestScope);
+      assertActiveScope(requestScope);
+      const command = skillCommandReceipt(receipt);
+      if (command.action !== 'refreshed') {
+        throw new Error(`Unexpected Skill receipt '${command.action}' after refresh`);
+      }
+      await refreshSkills();
+      showSettlement('技能刷新', command.settlement, '已刷新当前 workspace 的技能运行时');
+    } catch (e: any) {
+      addToast('error', `刷新技能失败: ${e?.message || String(e)}`);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -261,19 +421,33 @@ export function SkillsPanel() {
     <div className="p-3 space-y-3">
       <div className="flex items-center justify-between gap-2">
         <h3 className="text-sm font-semibold" style={{ color: s.text }}>
-          技能 ({skills.length})
+          技能 ({skills.length}
+          {skillsOmitted > 0 ? ` + ${skillsOmitted}` : ''})
         </h3>
-        <button
-          type="button"
-          onClick={checkUpdates}
-          disabled={loadingAny}
-          className="flex h-7 items-center gap-1 rounded-md border px-2 text-[10px] disabled:opacity-50"
-          style={{ borderColor: s.border, color: s.textSec }}
-          title="检查 Git 安装技能的上游更新"
-        >
-          <RefreshCw size={11} className={checkingUpdates ? 'animate-spin' : ''} />
-          检查更新
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={refreshEnabledSkills}
+            disabled={loadingAny}
+            className="flex h-7 w-7 items-center justify-center rounded-md border disabled:opacity-50"
+            style={{ borderColor: s.border, color: s.textSec }}
+            title="刷新当前 workspace 的技能运行时"
+            aria-label="刷新当前 workspace 的技能运行时"
+          >
+            <RefreshCw size={11} className={loading ? 'animate-spin' : ''} />
+          </button>
+          <button
+            type="button"
+            onClick={checkUpdates}
+            disabled={loadingAny}
+            className="flex h-7 items-center gap-1 rounded-md border px-2 text-[10px] disabled:opacity-50"
+            style={{ borderColor: s.border, color: s.textSec }}
+            title="检查 Git 安装技能的上游更新"
+          >
+            <RefreshCw size={11} className={checkingUpdates ? 'animate-spin' : ''} />
+            检查更新{updatesOmitted > 0 ? ` (+${updatesOmitted})` : ''}
+          </button>
+        </div>
       </div>
 
       <div className="flex gap-2">
@@ -331,7 +505,7 @@ export function SkillsPanel() {
       {filteredSkills.length === 0 && (
         <div className="py-8 text-center text-xs" style={{ color: s.textTer }}>
           <BookOpen size={24} className="mx-auto mb-2" />
-          {skills.length === 0 ? '暂无可用技能' : '没有匹配的技能'}
+          {query.trim() ? '没有匹配的技能' : '暂无可用技能'}
         </div>
       )}
 
@@ -421,6 +595,18 @@ export function SkillsPanel() {
                       )}
                       {sk.loaded ? '禁用' : '启用'}
                     </button>
+                    {!sk.is_builtin && (
+                      <button
+                        onClick={() => void uninstallSkill(sk.name)}
+                        disabled={Boolean(busySkill)}
+                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border transition-opacity disabled:opacity-50"
+                        style={{ borderColor: s.border, color: 'var(--color-error)' }}
+                        title="卸载技能"
+                        aria-label={`卸载技能 ${sk.name}`}
+                      >
+                        <Trash2 size={11} />
+                      </button>
+                    )}
                   </div>
                   {updateStatuses[sk.name] && (
                     <div
@@ -472,9 +658,9 @@ export function SkillsPanel() {
                       ))}
                     </div>
                   )}
-                  {sk.file && (
+                  {sk.path && (
                     <p className="mt-1 text-[10px]" style={{ color: s.textTer }}>
-                      {sk.file}
+                      {sk.path}
                     </p>
                   )}
                 </div>

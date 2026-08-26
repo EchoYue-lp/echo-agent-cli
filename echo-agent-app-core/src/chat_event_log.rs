@@ -1721,6 +1721,7 @@ fn append_durability(event: &ChatDriverEvent) -> FileDurability {
         ChatDriverEvent::Execution(_)
         | ChatDriverEvent::ExecutionPath { .. }
         | ChatDriverEvent::TurnConfiguration { .. }
+        | ChatDriverEvent::ExtensionReceipt(_)
         | ChatDriverEvent::Interrupt { .. }
         | ChatDriverEvent::CommandCellStarted { .. }
         | ChatDriverEvent::CommandCellSettled { .. }
@@ -1972,6 +1973,14 @@ fn validate_driver_event(event: &ChatDriverEvent) -> Result<(), ChatEventLogErro
         {
             Err(ChatEventLogError::InvalidEvent(
                 "Awaiter acknowledgement identity is incomplete".to_string(),
+            ))
+        }
+        ChatDriverEvent::ExtensionReceipt(receipt)
+            if receipt.meta().request_id.trim().is_empty()
+                || receipt.meta().operation_id.trim().is_empty() =>
+        {
+            Err(ChatEventLogError::InvalidEvent(
+                "Extension receipt identity is incomplete".to_string(),
             ))
         }
         _ => Ok(()),

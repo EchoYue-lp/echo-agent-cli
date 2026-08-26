@@ -1454,6 +1454,7 @@ impl TaskExecutionUsage {
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn finalize_framework_subagent_result(
     blocking: TaskRuntimeBlockingAdapter,
     run_id: &str,
@@ -4590,6 +4591,7 @@ async fn subagent_runtime_contract(
 /// primary agent's execution_mutex), so multiple read-only Subagents run in
 /// parallel. The child cancel token propagates parent-run cancellation.
 #[allow(clippy::too_many_arguments)] // handles + cancel + sink thread through; matches framework dispatch style
+#[allow(clippy::result_large_err)]
 async fn run_readonly_subagent(
     primary_agent: &crate::agent_handle::AgentHandle,
     run_id: &str,
@@ -4690,6 +4692,7 @@ fn exec_trace_sink_to_core(trace_sink: Option<ExecSink>) -> Option<echo_agent::t
 /// Disjoint exact owners may run concurrently; the DAG scheduler separates
 /// overlapping and unknown ownership before dispatch.
 #[allow(clippy::too_many_arguments)] // handles + cancel + sink thread through; matches framework dispatch style
+#[allow(clippy::result_large_err)]
 async fn run_writer_subagent(
     primary_agent: &crate::agent_handle::AgentHandle,
     blocking: TaskRuntimeBlockingAdapter,
@@ -4882,6 +4885,7 @@ fn file_access_from_agent_tool(name: &str, args: &serde_json::Value) -> Option<(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
 async fn run_main_agent_task(
     primary_agent: &crate::agent_handle::AgentHandle,
     blocking: TaskRuntimeBlockingAdapter,

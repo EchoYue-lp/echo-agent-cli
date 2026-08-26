@@ -736,86 +736,31 @@ async fn cmd_skill_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcom
             return CommandOutcome::Continue;
         }
     };
-    let echo_agent_dir = control.generation.echo_agent_dir().to_path_buf();
-    let curator = echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir);
-
-    // Check current lifecycle state.
-    let state = match curator.load_state() {
-        Ok(state) => state,
-        Err(error) => {
-            eprintln!("Curator state unavailable: {error}");
-            return CommandOutcome::Continue;
-        }
+    let Some(app_state) = ctx.app_state.as_ref() else {
+        println!("Application extension control is unavailable.");
+        return CommandOutcome::Continue;
     };
-    match state.skills.get(name) {
-        Some(meta) => match meta.lifecycle {
-            echo_agent::evolution::SkillLifecycle::Draft => {
-                let draft_path = echo_agent_dir
-                    .join("skills")
-                    .join("_drafts")
-                    .join(name)
-                    .join("SKILL.md");
-                let active_dir = echo_agent_dir.join("skills").join(name);
-                let active_path = active_dir.join("SKILL.md");
-                let copy_result = std::fs::create_dir_all(&active_dir)
-                    .and_then(|_| std::fs::copy(&draft_path, &active_path));
-                match copy_result {
-                    Ok(_) => match curator.promote_to_active_at(name, Some(&active_path)) {
-                        Ok(true) => {
-                            let load_root = active_dir
-                                .parent()
-                                .map(std::path::Path::to_path_buf)
-                                .unwrap_or(active_dir.clone());
-                            match ctx
-                                .agent
-                                .write_async(|agent| {
-                                    Box::pin(
-                                        async move { agent.load_skills_from_dir(load_root).await },
-                                    )
-                                })
-                                .await
-                            {
-                                Ok(_) => println!(
-                                    "✓ Skill '{}' promoted from Draft to Active and loaded.",
-                                    name
-                                ),
-                                Err(error) => println!(
-                                    "Skill '{}' is active, but runtime load failed: {error}",
-                                    name
-                                ),
-                            }
-                        }
-                        Ok(false) => {
-                            let _ = std::fs::remove_file(&active_path);
-                            println!("Skill '{}' was not in Draft state.", name);
-                        }
-                        Err(e) => {
-                            let _ = std::fs::remove_file(&active_path);
-                            println!("Error promoting skill: {e}");
-                        }
-                    },
-                    Err(error) => println!("Failed to activate draft skill: {error}"),
-                }
-            }
-            echo_agent::evolution::SkillLifecycle::Candidate => {
-                println!("Skill '{}' is a Candidate, not a Draft.", name);
-                println!(
-                    "Run /skill-create {} first to generate a draft SKILL.md.",
-                    name
-                );
-            }
-            echo_agent::evolution::SkillLifecycle::Active => {
-                println!("Skill '{}' is already Active.", name);
-            }
-            other => println!(
-                "Skill '{}' is in {:?} state and cannot be promoted.",
-                name, other
-            ),
-        },
-        None => {
-            println!("Skill '{}' not found in curator state.", name);
-            println!("Run /skill-candidates to see available candidates and drafts.");
+    match app_state
+        .extension_control
+        .publish_curated_skill(app_state, Some(&control.runtime), control.generation, name)
+        .await
+    {
+        Ok(receipt)
+            if receipt.status
+                == echo_agent_app_core::extension_control::SkillSettlementStatus::Settled =>
+        {
+            println!(
+                "✓ Skill '{}' promoted to Active and loaded from {}.",
+                receipt.name,
+                receipt.active_path.display()
+            );
         }
+        Ok(receipt) => println!(
+            "Skill '{}' is durably Active, but runtime publication is degraded: {}",
+            receipt.name,
+            receipt.runtime_error.as_deref().unwrap_or("unknown error")
+        ),
+        Err(error) => println!("Failed to promote skill: {error}"),
     }
 
     CommandOutcome::Continue

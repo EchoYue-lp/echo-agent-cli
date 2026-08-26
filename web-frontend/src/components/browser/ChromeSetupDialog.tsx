@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Chrome, ExternalLink, RefreshCw, X } from 'lucide-react';
 import { apiInvoke, errorMessage, isTauri } from '../../lib/tauri-bridge';
+import type { BrowserBackendResult } from '../../stores/browserStore';
+import type { ExtensionRequestScope } from '../../generated';
 import { Modal } from '../common/Modal';
 
 export interface ChromeSetupStatus {
@@ -12,17 +14,20 @@ export interface ChromeSetupStatus {
 }
 
 export function ChromeSetupDialog({
+  requestScope,
   onClose,
   onConnectionChange,
   onUseChrome,
 }: {
+  requestScope: ExtensionRequestScope;
   onClose: () => void;
   onConnectionChange: (connected: boolean) => void;
-  onUseChrome: () => Promise<string | null>;
+  onUseChrome: () => Promise<BrowserBackendResult>;
 }) {
   const [status, setStatus] = useState<ChromeSetupStatus | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [pending, setPending] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     if (!isTauri()) {
@@ -30,7 +35,10 @@ export function ChromeSetupDialog({
       return;
     }
     try {
-      const next = await apiInvoke<ChromeSetupStatus>('chrome_setup_status');
+      const next = await apiInvoke<ChromeSetupStatus>('chrome_setup_status', {
+        workspaceId: requestScope.workspace_id,
+        workspaceGeneration: requestScope.workspace_generation,
+      });
       setStatus(next);
       setError(next.startupError ?? null);
       onConnectionChange(next.connected);
@@ -38,7 +46,7 @@ export function ChromeSetupDialog({
       setError(errorMessage(refreshError));
       onConnectionChange(false);
     }
-  }, [onConnectionChange]);
+  }, [onConnectionChange, requestScope]);
 
   useEffect(() => {
     void refresh();
@@ -59,11 +67,14 @@ export function ChromeSetupDialog({
   };
 
   const connectChrome = async () => {
-    setBusy('browser_set_backend');
+    setBusy('chrome_backend');
     setError(null);
-    const backendError = await onUseChrome();
-    if (backendError) {
-      setError(backendError);
+    setPending(null);
+    const result = await onUseChrome();
+    if (result.status === 'failed') {
+      setError(result.message);
+    } else if (result.status === 'pending') {
+      setPending(result.message);
     } else {
       onConnectionChange(true);
     }
@@ -153,7 +164,7 @@ export function ChromeSetupDialog({
               disabled={!status?.enabled || busy !== null}
               onClick={() => void connectChrome()}
             >
-              {busy === 'browser_set_backend' ? '正在连接…' : '使用 Chrome'}
+              {busy === 'chrome_backend' ? '正在连接…' : '使用 Chrome'}
             </button>
           </div>
         </section>
@@ -161,6 +172,11 @@ export function ChromeSetupDialog({
         {error && (
           <div className="rounded-md border border-[var(--color-error)]/30 bg-[var(--color-error)]/5 px-3 py-2 text-xs text-[var(--color-error)]">
             {error}
+          </div>
+        )}
+        {pending && (
+          <div className="rounded-md border border-[var(--color-warning)]/30 bg-[var(--color-warning-bg)] px-3 py-2 text-xs text-[var(--color-warning)]">
+            {pending}
           </div>
         )}
       </div>

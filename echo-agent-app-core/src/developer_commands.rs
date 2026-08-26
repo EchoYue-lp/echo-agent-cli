@@ -1,6 +1,5 @@
 //! Shared terminal and LSP commands for every EKO interaction surface.
 
-use crate::plugin_runtime::PluginRuntimeService;
 use crate::terminal::TerminalService;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,11 +18,12 @@ pub struct DeveloperCommandOutput {
 
 pub struct DeveloperCommandRegistry {
     terminal: Arc<TerminalService>,
-    plugin_runtime: Option<Arc<PluginRuntimeService>>,
+    app_state: Option<Arc<crate::state::AppState>>,
+    browser_conversation_id: Option<String>,
 }
 
 impl DeveloperCommandRegistry {
-    pub const COMMANDS: [DeveloperCommandDescriptor; 2] = [
+    pub const COMMANDS: [DeveloperCommandDescriptor; 3] = [
         DeveloperCommandDescriptor {
             name: "terminal",
             summary: "Manage and attach to interactive terminal sessions",
@@ -31,6 +31,10 @@ impl DeveloperCommandRegistry {
         DeveloperCommandDescriptor {
             name: "lsp",
             summary: "Inspect and manage workspace language servers",
+        },
+        DeveloperCommandDescriptor {
+            name: "browser",
+            summary: "Inspect and directly control the workspace browser",
         },
     ];
 
@@ -40,12 +44,18 @@ impl DeveloperCommandRegistry {
 
     pub fn new(
         terminal: Arc<TerminalService>,
-        plugin_runtime: Option<Arc<PluginRuntimeService>>,
+        app_state: Option<Arc<crate::state::AppState>>,
     ) -> Self {
         Self {
             terminal,
-            plugin_runtime,
+            app_state,
+            browser_conversation_id: None,
         }
+    }
+
+    pub fn with_browser_conversation_id(mut self, conversation_id: impl Into<String>) -> Self {
+        self.browser_conversation_id = Some(conversation_id.into());
+        self
     }
 
     pub async fn execute(
@@ -56,6 +66,7 @@ impl DeveloperCommandRegistry {
         match namespace {
             "terminal" | "term" => self.execute_terminal(args).await,
             "lsp" => self.execute_lsp(args).await,
+            "browser" => self.execute_browser(args).await,
             other => Err(format!("unknown developer command '{other}'")),
         }
     }
@@ -131,71 +142,34 @@ impl DeveloperCommandRegistry {
     }
 
     async fn execute_lsp(&self, args: &[&str]) -> Result<DeveloperCommandOutput, String> {
-        let runtime = self
-            .plugin_runtime
+        let state = self
+            .app_state
             .as_ref()
             .ok_or_else(|| "LSP runtime is not initialized".to_string())?;
         let action = args.first().copied().unwrap_or("status");
-        match action {
-            "list" | "ls" => {
-                let languages = runtime.lsp_configured_languages().await;
-                let message = if languages.is_empty() {
-                    "No language servers are configured.".to_string()
-                } else {
-                    languages.join("\n")
-                };
-                Ok(output(message))
-            }
-            "status" => {
-                let statuses = runtime.lsp_status().await;
-                if statuses.is_empty() {
-                    return Ok(output("No language servers are configured.".to_string()));
-                }
-                let lines = statuses
-                    .into_iter()
-                    .map(|status| {
-                        let state = if status.running && status.initialized {
-                            "ready"
-                        } else if status.running {
-                            "starting"
-                        } else {
-                            "stopped"
-                        };
-                        match status.last_error {
-                            Some(error) => format!("{}: {state} ({error})", status.language),
-                            None => format!("{}: {state}", status.language),
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                Ok(output(lines))
-            }
-            "start" => {
-                let language = required_arg(args, 1, "lsp start <language>")?.to_string();
-                runtime
-                    .lsp_start(language.clone())
-                    .await
-                    .map_err(|error| error.to_string())?;
-                Ok(output(format!("Language server '{language}' started.")))
-            }
-            "stop" => {
-                let language = required_arg(args, 1, "lsp stop <language>")?.to_string();
-                runtime
-                    .lsp_stop(language.clone())
-                    .await
-                    .map_err(|error| error.to_string())?;
-                Ok(output(format!("Language server '{language}' stopped.")))
-            }
-            "restart" => {
-                let language = required_arg(args, 1, "lsp restart <language>")?.to_string();
-                runtime
-                    .lsp_restart(language.clone())
-                    .await
-                    .map_err(|error| error.to_string())?;
-                Ok(output(format!("Language server '{language}' restarted.")))
-            }
-            _ => Err("usage: lsp <list|status|start|stop|restart> ...".to_string()),
-        }
+        state
+            .extension_control
+            .lsp_command(state, action, args.get(1).copied())
+            .await
+            .map(output)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn execute_browser(&self, args: &[&str]) -> Result<DeveloperCommandOutput, String> {
+        let state = self
+            .app_state
+            .as_ref()
+            .ok_or_else(|| "Browser runtime is not initialized".to_string())?;
+        let conversation_id = self
+            .browser_conversation_id
+            .as_deref()
+            .unwrap_or("developer-browser-control");
+        state
+            .extension_control
+            .browser_command(state, conversation_id, args)
+            .await
+            .map(output)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -260,6 +234,13 @@ mod tests {
     async fn lsp_registry_fails_closed_without_the_runtime() {
         let registry = DeveloperCommandRegistry::new(TerminalService::new(), None);
         let error = registry.execute("lsp", &["status"]).await;
+        assert!(error.is_err_and(|error| error.contains("not initialized")));
+    }
+
+    #[tokio::test]
+    async fn browser_registry_fails_closed_without_the_runtime() {
+        let registry = DeveloperCommandRegistry::new(TerminalService::new(), None);
+        let error = registry.execute("browser", &["status"]).await;
         assert!(error.is_err_and(|error| error.contains("not initialized")));
     }
 }

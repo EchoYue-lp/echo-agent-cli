@@ -25,7 +25,7 @@ use crate::plugin_components::{
 };
 use crate::scheduler::{CronTask, SchedulerRunner};
 
-const OUTPUT_STYLE_PROJECTION: &str = "eko:plugin-output-style";
+pub(crate) const OUTPUT_STYLE_PROJECTION: &str = "eko:plugin-output-style";
 
 #[derive(Clone)]
 pub struct PluginLspRuntime {
@@ -452,7 +452,11 @@ impl PluginRuntimeService {
             return Err(anyhow::anyhow!("plugin runtime is shut down"));
         }
         let generation = self
-            .capture_agent_generation(state.generation, &state.prepared)
+            .capture_agent_generation(
+                state.generation,
+                &state.prepared,
+                state.active_output_style.as_deref(),
+            )
             .await;
         let mut publication = pool_owner
             .begin_plugin_publication()
@@ -471,65 +475,232 @@ impl PluginRuntimeService {
         &self,
         revision: u64,
         prepared: &PreparedApplicationComponents,
+        active_output_style: Option<&str>,
     ) -> AgentPluginGeneration {
         let descriptors = self
             .agent_handle
             .read(|agent| agent.skill_descriptors())
             .await;
-        AgentPluginGeneration::new(revision, descriptors, prepared.agents.clone())
+        let output_style = active_output_style_instructions_for(active_output_style, prepared);
+        AgentPluginGeneration::new(revision, descriptors, prepared.agents.clone(), output_style)
     }
 
-    /// Republish application-owned skills through the same primary/pool/router
-    /// generation used by plugin mutations.
-    pub async fn refresh_agent_catalog(self: &Arc<Self>) -> anyhow::Result<()> {
-        self.run_owned_mutation(|service| async move {
-            let mut state = service.state.lock().await;
-            if state.shut_down {
-                return Err(anyhow::anyhow!("plugin runtime is shut down"));
-            }
-            let revision = state
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("plugin generation revision exhausted"))?;
-            let primary_execution = service
-                .agent_handle
-                .read(|agent| Arc::clone(agent.execution_mutex()))
-                .await;
-            let _primary_execution_guard = primary_execution.lock_owned().await;
-            let primary_owner = Arc::clone(service.agent_handle.inner());
-            let mut primary = primary_owner.write_owned().await;
-            let pool = service
-                .agent_pool
-                .read()
+    /// Atomically load one EKO-owned skill into the primary and pool catalog.
+    /// The registry edit happens inside the same mutation owner as plugin
+    /// reload/rebind, preventing a plugin generation from overwriting it.
+    pub(crate) async fn enable_application_skill(
+        self: &Arc<Self>,
+        name: String,
+        load_root: PathBuf,
+        source: String,
+    ) -> anyhow::Result<Vec<String>> {
+        self.run_owned_mutation(move |service| async move {
+            service
+                .enable_application_skill_inner(&name, load_root, &source)
                 .await
-                .as_ref()
-                .and_then(Weak::upgrade);
-            let mut pool_publication = if let Some(pool) = pool.as_ref() {
-                Some(
-                    pool.begin_plugin_publication()
+        })
+        .await
+    }
+
+    async fn enable_application_skill_inner(
+        &self,
+        name: &str,
+        load_root: PathBuf,
+        source: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut state = self.state.lock().await;
+        if state.shut_down {
+            anyhow::bail!("plugin runtime is shut down");
+        }
+        let revision = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("plugin generation revision exhausted"))?;
+        let primary_execution = self
+            .agent_handle
+            .read(|agent| Arc::clone(agent.execution_mutex()))
+            .await;
+        let _primary_execution_guard = primary_execution.lock_owned().await;
+        let primary_owner = Arc::clone(self.agent_handle.inner());
+        let mut primary = primary_owner.write_owned().await;
+        let primary_had_skill = primary.skill_descriptors().iter().any(|descriptor| {
+            descriptor.name == name && descriptor.source.as_deref() == Some(source)
+        });
+        let pool = self
+            .agent_pool
+            .read()
+            .await
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if primary_had_skill && pool.is_none() {
+            return Ok(vec![name.to_string()]);
+        }
+        let mut pool_publication = if let Some(pool) = pool.as_ref() {
+            Some(
+                pool.begin_plugin_publication()
+                    .await
+                    .map_err(anyhow::Error::msg)?,
+            )
+        } else {
+            None
+        };
+        let loaded = if primary_had_skill {
+            vec![name.to_string()]
+        } else {
+            load_exact_application_skill(&mut primary, name, load_root, source).await?
+        };
+        if !loaded.iter().any(|loaded_name| loaded_name == name) {
+            anyhow::bail!("Skill '{name}' was not discovered");
+        }
+        crate::runtime::configure_intent_router(&mut primary);
+        let generation = AgentPluginGeneration::new(
+            revision,
+            primary.skill_descriptors(),
+            state.prepared.agents.clone(),
+            active_output_style_instructions(&state),
+        );
+        if let Some(publication) = pool_publication.as_mut()
+            && let Err(error) = publication
+                .prepare_application_skill(generation, name, source)
+                .await
+        {
+            if !primary_had_skill {
+                primary.unregister_skills_by_source(source).await;
+                crate::runtime::configure_intent_router(&mut primary);
+            }
+            return Err(anyhow::Error::msg(error));
+        }
+        if let Some(publication) = pool_publication.as_mut()
+            && let Err(error) = publication.commit().await
+        {
+            if !primary_had_skill {
+                primary.unregister_skills_by_source(source).await;
+                crate::runtime::configure_intent_router(&mut primary);
+            }
+            let rollback = publication.rollback().await.err();
+            return Err(match rollback {
+                Some(rollback) => anyhow::anyhow!(
+                    "Skill pool commit failed: {error}; rollback failed: {rollback}"
+                ),
+                None => anyhow::Error::msg(error),
+            });
+        }
+        state.generation = revision;
+        Ok(loaded)
+    }
+
+    /// Atomically remove one EKO-owned skill from primary and pool catalogs.
+    pub(crate) async fn disable_application_skill(
+        self: &Arc<Self>,
+        name: String,
+        load_root: PathBuf,
+        source: String,
+    ) -> anyhow::Result<Vec<String>> {
+        self.run_owned_mutation(move |service| async move {
+            service
+                .disable_application_skill_inner(&name, load_root, &source)
+                .await
+        })
+        .await
+    }
+
+    async fn disable_application_skill_inner(
+        &self,
+        name: &str,
+        load_root: PathBuf,
+        source: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut state = self.state.lock().await;
+        if state.shut_down {
+            anyhow::bail!("plugin runtime is shut down");
+        }
+        let revision = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("plugin generation revision exhausted"))?;
+        let primary_execution = self
+            .agent_handle
+            .read(|agent| Arc::clone(agent.execution_mutex()))
+            .await;
+        let _primary_execution_guard = primary_execution.lock_owned().await;
+        let primary_owner = Arc::clone(self.agent_handle.inner());
+        let mut primary = primary_owner.write_owned().await;
+        let primary_had_skill = primary.skill_descriptors().iter().any(|descriptor| {
+            descriptor.name == name && descriptor.source.as_deref() == Some(source)
+        });
+        let pool = self
+            .agent_pool
+            .read()
+            .await
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if !primary_had_skill && pool.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut pool_publication = if let Some(pool) = pool.as_ref() {
+            Some(
+                pool.begin_plugin_publication()
+                    .await
+                    .map_err(anyhow::Error::msg)?,
+            )
+        } else {
+            None
+        };
+        let removed = if primary_had_skill {
+            primary.unregister_skills_by_source(source).await
+        } else {
+            Vec::new()
+        };
+        crate::runtime::configure_intent_router(&mut primary);
+        let generation = AgentPluginGeneration::new(
+            revision,
+            primary.skill_descriptors(),
+            state.prepared.agents.clone(),
+            active_output_style_instructions(&state),
+        );
+        if let Some(publication) = pool_publication.as_mut()
+            && let Err(error) = publication
+                .prepare_application_skill(generation, name, source)
+                .await
+        {
+            let restore_error = if primary_had_skill {
+                let restore =
+                    load_exact_application_skill(&mut primary, name, load_root.clone(), source)
                         .await
-                        .map_err(anyhow::Error::msg)?,
-                )
+                        .err();
+                crate::runtime::configure_intent_router(&mut primary);
+                restore
             } else {
                 None
             };
-            crate::runtime::configure_intent_router(&mut primary);
-            let generation = AgentPluginGeneration::new(
-                revision,
-                primary.skill_descriptors(),
-                state.prepared.agents.clone(),
-            );
-            if let Some(publication) = pool_publication.as_mut() {
-                publication
-                    .prepare(generation)
-                    .await
-                    .map_err(anyhow::Error::msg)?;
-                publication.commit().await.map_err(anyhow::Error::msg)?;
+            return Err(match restore_error {
+                Some(restore) => anyhow::anyhow!(
+                    "Skill pool preparation failed: {error}; primary restore failed: {restore}"
+                ),
+                None => anyhow::Error::msg(error),
+            });
+        }
+        if let Some(publication) = pool_publication.as_mut()
+            && let Err(error) = publication.commit().await
+        {
+            let restore = if primary_had_skill {
+                let restore =
+                    load_exact_application_skill(&mut primary, name, load_root, source).await;
+                crate::runtime::configure_intent_router(&mut primary);
+                Some(restore)
+            } else {
+                None
+            };
+            let rollback = publication.rollback().await.err();
+            let mut errors = vec![format!("Skill pool commit failed: {error}")];
+            if let Some(Err(error)) = restore {
+                errors.push(format!("primary restore failed: {error}"));
             }
-            state.generation = revision;
-            Ok(())
-        })
-        .await
+            errors.extend(rollback.map(|error| format!("pool rollback failed: {error}")));
+            return Err(anyhow::anyhow!(errors.join("; ")));
+        }
+        state.generation = revision;
+        Ok(removed)
     }
 
     async fn drain_owned_mutations(&self) -> anyhow::Result<()> {
@@ -554,7 +725,7 @@ impl PluginRuntimeService {
         }
     }
 
-    pub async fn reload(self: &Arc<Self>) -> anyhow::Result<ReloadSummary> {
+    pub(crate) async fn reload(self: &Arc<Self>) -> anyhow::Result<ReloadSummary> {
         self.run_owned_mutation(|service| async move { service.reload_inner().await })
             .await
     }
@@ -598,7 +769,7 @@ impl PluginRuntimeService {
     /// Replace project/local plugins and LSP processes for a committed workspace.
     /// A target failure converges to the target's User-only generation instead
     /// of clearing user-scoped plugins or retaining old workspace plugins.
-    pub async fn rebind_workspace(
+    pub(crate) async fn rebind_workspace(
         self: &Arc<Self>,
         project_root: PathBuf,
     ) -> anyhow::Result<ReloadSummary> {
@@ -798,6 +969,7 @@ impl PluginRuntimeService {
                     revision,
                     primary.skill_descriptors(),
                     state.prepared.agents.clone(),
+                    None,
                 );
                 if let Some(publication) = pool_publication.as_mut() {
                     match publication.prepare(generation).await {
@@ -915,7 +1087,7 @@ impl PluginRuntimeService {
         statuses
     }
 
-    pub async fn lsp_start(self: &Arc<Self>, language: String) -> anyhow::Result<()> {
+    pub(crate) async fn lsp_start(self: &Arc<Self>, language: String) -> anyhow::Result<()> {
         self.run_owned_mutation(move |service| async move {
             let mut manager = service.lsp.manager.write().await;
             if manager.get_client(&language).is_some() {
@@ -931,7 +1103,7 @@ impl PluginRuntimeService {
         .await
     }
 
-    pub async fn lsp_stop(self: &Arc<Self>, language: String) -> anyhow::Result<()> {
+    pub(crate) async fn lsp_stop(self: &Arc<Self>, language: String) -> anyhow::Result<()> {
         self.run_owned_mutation(move |service| async move {
             service
                 .lsp
@@ -945,7 +1117,7 @@ impl PluginRuntimeService {
         .await
     }
 
-    pub async fn lsp_restart(self: &Arc<Self>, language: String) -> anyhow::Result<()> {
+    pub(crate) async fn lsp_restart(self: &Arc<Self>, language: String) -> anyhow::Result<()> {
         self.run_owned_mutation(move |service| async move {
             let mut manager = service.lsp.manager.write().await;
             manager
@@ -1072,7 +1244,7 @@ impl PluginRuntimeService {
         }
     }
 
-    pub async fn enable(self: &Arc<Self>, name: &str) -> anyhow::Result<ReloadSummary> {
+    pub(crate) async fn enable(self: &Arc<Self>, name: &str) -> anyhow::Result<ReloadSummary> {
         let name = name.to_string();
         self.run_owned_mutation(move |service| async move { service.enable_inner(&name).await })
             .await
@@ -1099,7 +1271,7 @@ impl PluginRuntimeService {
         }
     }
 
-    pub async fn disable(self: &Arc<Self>, name: &str) -> anyhow::Result<ReloadSummary> {
+    pub(crate) async fn disable(self: &Arc<Self>, name: &str) -> anyhow::Result<ReloadSummary> {
         let name = name.to_string();
         self.run_owned_mutation(move |service| async move { service.disable_inner(&name).await })
             .await
@@ -1129,7 +1301,7 @@ impl PluginRuntimeService {
         }
     }
 
-    pub async fn install(
+    pub(crate) async fn install(
         self: &Arc<Self>,
         source: &InstallSource,
         scope: PluginScope,
@@ -1162,7 +1334,7 @@ impl PluginRuntimeService {
         }
     }
 
-    pub async fn uninstall(
+    pub(crate) async fn uninstall(
         self: &Arc<Self>,
         name: &str,
         keep_data: bool,
@@ -1252,7 +1424,7 @@ impl PluginRuntimeService {
         self.state.lock().await.registry.get(name).cloned()
     }
 
-    pub async fn configure(
+    pub(crate) async fn configure(
         self: &Arc<Self>,
         name: &str,
         values: HashMap<String, serde_json::Value>,
@@ -1336,7 +1508,7 @@ impl PluginRuntimeService {
         self.state.lock().await.active_theme.clone()
     }
 
-    pub async fn activate_theme(
+    pub(crate) async fn activate_theme(
         self: &Arc<Self>,
         name: Option<&str>,
     ) -> anyhow::Result<Option<PluginThemeDefinition>> {
@@ -1384,7 +1556,10 @@ impl PluginRuntimeService {
         self.state.lock().await.active_output_style.clone()
     }
 
-    pub async fn activate_output_style(self: &Arc<Self>, name: Option<&str>) -> anyhow::Result<()> {
+    pub(crate) async fn activate_output_style(
+        self: &Arc<Self>,
+        name: Option<&str>,
+    ) -> anyhow::Result<()> {
         let name = name.map(str::to_string);
         self.run_owned_mutation(move |service| async move {
             service.activate_output_style_inner(name.as_deref()).await
@@ -1408,22 +1583,95 @@ impl PluginRuntimeService {
             None => None,
         };
         let selected = name.map(str::to_string);
-        persist_preferences(
+        let previous_selected = state.active_output_style.clone();
+        let previous = active_output_style_instructions(&state);
+        let revision = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("plugin generation revision exhausted"))?;
+        let primary_execution = self
+            .agent_handle
+            .read(|agent| Arc::clone(agent.execution_mutex()))
+            .await;
+        let _primary_execution_guard = primary_execution.lock_owned().await;
+        let primary_owner = Arc::clone(self.agent_handle.inner());
+        let primary = primary_owner.write_owned().await;
+        let pool = self
+            .agent_pool
+            .read()
+            .await
+            .as_ref()
+            .and_then(Weak::upgrade);
+        let mut pool_publication = if let Some(pool) = pool.as_ref() {
+            Some(
+                pool.begin_plugin_publication()
+                    .await
+                    .map_err(anyhow::Error::msg)?,
+            )
+        } else {
+            None
+        };
+        primary
+            .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, instructions.clone())
+            .await;
+        let generation = AgentPluginGeneration::new(
+            revision,
+            primary.skill_descriptors(),
+            state.prepared.agents.clone(),
+            instructions,
+        );
+        if let Some(publication) = pool_publication.as_mut()
+            && let Err(error) = publication.prepare(generation).await
+        {
+            primary
+                .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, previous.clone())
+                .await;
+            return Err(anyhow::Error::msg(error));
+        }
+        if let Err(error) = persist_preferences(
             &self.preferences_file,
             &PluginPreferences {
                 active_theme: state.active_theme.clone(),
                 active_output_style: selected.clone(),
             },
-        )?;
-        self.agent_handle
-            .read_async(|agent| {
-                Box::pin(async move {
-                    agent
-                        .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, instructions)
-                        .await;
-                })
-            })
-            .await;
+        ) {
+            primary
+                .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, previous.clone())
+                .await;
+            let rollback = match pool_publication.as_mut() {
+                Some(publication) => publication.rollback().await.err(),
+                None => None,
+            };
+            return Err(match rollback {
+                Some(rollback) => anyhow::anyhow!(
+                    "Output-style persistence failed: {error}; pool rollback failed: {rollback}"
+                ),
+                None => error,
+            });
+        }
+        if let Some(publication) = pool_publication.as_mut()
+            && let Err(error) = publication.commit().await
+        {
+            primary
+                .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, previous)
+                .await;
+            let rollback = publication.rollback().await.err();
+            let preference_rollback = persist_preferences(
+                &self.preferences_file,
+                &PluginPreferences {
+                    active_theme: state.active_theme.clone(),
+                    active_output_style: previous_selected,
+                },
+            )
+            .err();
+            let mut errors = vec![format!("Output-style pool commit failed: {error}")];
+            errors.extend(rollback.map(|error| format!("pool rollback failed: {error}")));
+            errors.extend(
+                preference_rollback.map(|error| format!("preference rollback failed: {error}")),
+            );
+            return Err(anyhow::anyhow!(errors.join("; ")));
+        }
+        state.generation = revision;
         state.active_output_style = selected;
         Ok(())
     }
@@ -1654,6 +1902,10 @@ impl PluginRuntimeService {
             candidate_revision,
             primary.skill_descriptors(),
             applied.prepared.agents.clone(),
+            active_output_style_instructions_for(
+                state.active_output_style.as_deref(),
+                &applied.prepared,
+            ),
         );
         if let Some(publication) = pool_publication.as_mut()
             && let Err(pool_error) = publication.prepare(candidate_generation).await
@@ -1876,6 +2128,7 @@ impl PluginRuntimeService {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::result_large_err)]
     async fn replace_agent_components(
         &self,
         agent: &mut echo_agent::agent::react::ReactAgent,
@@ -2126,7 +2379,7 @@ impl PluginRuntimeService {
         Ok(manager)
     }
 
-    async fn project_root(&self) -> PathBuf {
+    pub(crate) async fn project_root(&self) -> PathBuf {
         self.lsp.binding().await.project_root
     }
 
@@ -2313,6 +2566,49 @@ struct FailedAgentComponents {
     mcp_ownership: PluginMcpOwnership,
     prepared: PreparedApplicationComponents,
     candidate_monitors: Vec<CronTask>,
+}
+
+fn active_output_style_instructions(state: &PluginRuntimeState) -> Option<String> {
+    active_output_style_instructions_for(state.active_output_style.as_deref(), &state.prepared)
+}
+
+fn active_output_style_instructions_for(
+    selected: Option<&str>,
+    prepared: &PreparedApplicationComponents,
+) -> Option<String> {
+    selected.and_then(|name| {
+        prepared
+            .output_styles
+            .iter()
+            .find(|style| style.name == name)
+            .map(|style| style.instructions.clone())
+    })
+}
+
+async fn load_exact_application_skill(
+    agent: &mut echo_agent::agent::react::ReactAgent,
+    requested: &str,
+    load_root: PathBuf,
+    requested_source: &str,
+) -> anyhow::Result<Vec<String>> {
+    let loaded = agent.load_skills_from_dir(load_root).await?;
+    for name in &loaded {
+        let source = if name == requested {
+            requested_source.to_string()
+        } else {
+            format!("eko:discarded-sibling-skill:{name}")
+        };
+        agent
+            .tag_skills_source(std::slice::from_ref(name), &source)
+            .await;
+        if name != requested {
+            agent.unregister_skills_by_source(&source).await;
+        }
+    }
+    Ok(loaded
+        .into_iter()
+        .filter(|name| name == requested)
+        .collect())
 }
 
 fn agent_name(agent: &crate::plugin_components::PreparedPluginAgent) -> String {
@@ -2892,6 +3188,46 @@ done
         Ok(pool)
     }
 
+    fn write_application_skill(root: &Path, name: &str) -> Result<PathBuf, String> {
+        let skill_root = root.join(name);
+        std::fs::create_dir_all(&skill_root).map_err(|error| error.to_string())?;
+        std::fs::write(
+            skill_root.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: Application skill replay fixture\ntriggers:\n  - use {name}\n---\nUse this skill for replay tests.\n"
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(root.to_path_buf())
+    }
+
+    async fn agent_has_application_skill(
+        handle: &AgentHandle,
+        name: &str,
+        source: &str,
+        expected: bool,
+    ) -> Result<(), String> {
+        let matches = handle
+            .read(|agent| {
+                agent
+                    .skill_descriptors()
+                    .into_iter()
+                    .filter(|descriptor| {
+                        descriptor.name == name && descriptor.source.as_deref() == Some(source)
+                    })
+                    .count()
+            })
+            .await;
+        let exact = if expected { matches == 1 } else { matches == 0 };
+        if exact {
+            Ok(())
+        } else {
+            Err(format!(
+                "application skill projection mismatch for '{name}' from '{source}': count={matches}, expected_present={expected}"
+            ))
+        }
+    }
+
     async fn agent_has_plugin_generation(
         handle: &AgentHandle,
         plugin: &str,
@@ -2924,6 +3260,25 @@ done
             ));
         }
         Ok(())
+    }
+
+    async fn agent_has_output_style(handle: &AgentHandle, expected: bool) -> Result<(), String> {
+        let messages = handle
+            .read_async(|agent| Box::pin(async move { agent.get_messages().await }))
+            .await;
+        let present = messages.iter().any(|message| {
+            message
+                .content
+                .as_text_ref()
+                .is_some_and(|content| content.contains("Answer directly"))
+        });
+        if present == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "output style projection expected={expected}, actual={present}"
+            ))
+        }
     }
 
     async fn default_service(root: &Path) -> Result<Arc<PluginRuntimeService>, String> {
@@ -3139,6 +3494,12 @@ done
         runtime.reload().await.map_err(|error| error.to_string())?;
         agent_has_plugin_generation(&runtime.agent_handle, "runtime-fixture", true).await?;
         agent_has_plugin_generation(&existing, "runtime-fixture", true).await?;
+        runtime
+            .activate_output_style(Some("runtime-fixture-concise"))
+            .await
+            .map_err(|error| error.to_string())?;
+        agent_has_output_style(&runtime.agent_handle, true).await?;
+        agent_has_output_style(&existing, true).await?;
 
         let future_lease = pool
             .acquire("future-plugin-consumer")
@@ -3147,6 +3508,7 @@ done
         let future = future_lease.agent();
         drop(future_lease);
         agent_has_plugin_generation(&future, "runtime-fixture", true).await?;
+        agent_has_output_style(&future, true).await?;
         let committed_revision = pool.plugin_generation_revision_for_test().await;
 
         runtime
@@ -3164,6 +3526,99 @@ done
         drop(after_remove_lease);
         agent_has_plugin_generation(&after_remove, "runtime-fixture", false).await?;
         assert!(pool.plugin_generation_revision_for_test().await > committed_revision);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn application_skill_replay_repairs_pool_split_and_future_generation()
+    -> Result<(), String> {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let runtime = service(temporary.path()).await?;
+        let pool = bind_test_pool(&runtime).await?;
+        let existing_lease = pool
+            .acquire("application-skill-existing")
+            .await
+            .map_err(|error| error.to_string())?;
+        let existing = existing_lease.agent();
+        drop(existing_lease);
+        let name = "replay-skill";
+        let source = "eko:user-skill:replay-skill";
+        let skill_root = write_application_skill(temporary.path(), name)?;
+
+        runtime
+            .enable_application_skill(name.to_string(), skill_root.clone(), source.to_string())
+            .await
+            .map_err(|error| error.to_string())?;
+        agent_has_application_skill(&runtime.agent_handle, name, source, true).await?;
+        agent_has_application_skill(&existing, name, source, true).await?;
+
+        let tampered_source = source.to_string();
+        existing
+            .write_async(|agent| {
+                Box::pin(async move {
+                    agent.unregister_skills_by_source(&tampered_source).await;
+                    crate::runtime::configure_intent_router(agent);
+                })
+            })
+            .await;
+        agent_has_application_skill(&runtime.agent_handle, name, source, true).await?;
+        agent_has_application_skill(&existing, name, source, false).await?;
+
+        let before_enable_repair = pool.plugin_generation_revision_for_test().await;
+        runtime
+            .enable_application_skill(name.to_string(), skill_root.clone(), source.to_string())
+            .await
+            .map_err(|error| error.to_string())?;
+        agent_has_application_skill(&existing, name, source, true).await?;
+        assert!(pool.plugin_generation_revision_for_test().await > before_enable_repair);
+        let future_enabled_lease = pool
+            .acquire("application-skill-future-enabled")
+            .await
+            .map_err(|error| error.to_string())?;
+        let future_enabled = future_enabled_lease.agent();
+        drop(future_enabled_lease);
+        agent_has_application_skill(&future_enabled, name, source, true).await?;
+
+        let descriptor = runtime
+            .agent_handle
+            .read(|agent| {
+                agent.skill_descriptors().into_iter().find(|descriptor| {
+                    descriptor.name == name && descriptor.source.as_deref() == Some(source)
+                })
+            })
+            .await
+            .ok_or_else(|| "primary application skill descriptor is missing".to_string())?;
+        runtime
+            .disable_application_skill(name.to_string(), skill_root.clone(), source.to_string())
+            .await
+            .map_err(|error| error.to_string())?;
+        agent_has_application_skill(&runtime.agent_handle, name, source, false).await?;
+        agent_has_application_skill(&existing, name, source, false).await?;
+        agent_has_application_skill(&future_enabled, name, source, false).await?;
+
+        existing
+            .write(|agent| {
+                agent.skill_registry_mut().register_descriptor(descriptor);
+                crate::runtime::configure_intent_router(agent);
+            })
+            .await;
+        agent_has_application_skill(&runtime.agent_handle, name, source, false).await?;
+        agent_has_application_skill(&existing, name, source, true).await?;
+
+        let before_disable_repair = pool.plugin_generation_revision_for_test().await;
+        runtime
+            .disable_application_skill(name.to_string(), skill_root, source.to_string())
+            .await
+            .map_err(|error| error.to_string())?;
+        agent_has_application_skill(&existing, name, source, false).await?;
+        assert!(pool.plugin_generation_revision_for_test().await > before_disable_repair);
+        let future_disabled_lease = pool
+            .acquire("application-skill-future-disabled")
+            .await
+            .map_err(|error| error.to_string())?;
+        let future_disabled = future_disabled_lease.agent();
+        drop(future_disabled_lease);
+        agent_has_application_skill(&future_disabled, name, source, false).await?;
         Ok(())
     }
 

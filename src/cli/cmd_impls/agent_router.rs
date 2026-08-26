@@ -89,7 +89,8 @@ fn parse_group_members(args: &[&str]) -> Result<Vec<AgentGroupMember>, String> {
         return Err("members must be repeated as <role> <workspace> <conversation>".to_string());
     }
     let mut members = Vec::with_capacity(args.len() / 3);
-    for chunk in args.chunks_exact(3) {
+    let (chunks, _) = args.as_chunks::<3>();
+    for chunk in chunks {
         let mut values = chunk.iter().copied();
         let role = values
             .next()

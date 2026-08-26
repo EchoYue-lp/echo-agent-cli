@@ -282,9 +282,16 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
 
     // Spawn config watcher (reloads hooks + webhook endpoints on change).
     let config_path = echo_agent_cli::config_watcher::resolve_config_path(args.config.as_deref());
+    let config_workspace_root = agent_handle
+        .read(|agent| agent.working_dir())
+        .await
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     let config_watcher = std::sync::Arc::new(echo_agent_cli::config_watcher::spawn_config_watcher(
         config_path,
         agent_handle.clone(),
+        config_workspace_root,
+        Some(runtime.plugin_runtime.clone()),
+        runtime.extension_control.clone(),
         Some(webhook_emitter.clone()),
         cancel_token.clone(),
     ));
@@ -327,6 +334,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 review_integration: runtime.review_integration.clone(),
                 mcp_config_runtime: runtime.mcp_config_runtime.clone(),
                 plugin_runtime: runtime.plugin_runtime.clone(),
+                extension_control: runtime.extension_control.clone(),
                 config_watcher: config_watcher.clone(),
                 foreground_turns: foreground_turns.clone(),
                 command_cell_runtime: runtime.command_cell_runtime.clone(),
@@ -445,6 +453,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             review_integration: runtime.review_integration.clone(),
             mcp_config_runtime: runtime.mcp_config_runtime.clone(),
             plugin_runtime: runtime.plugin_runtime.clone(),
+            extension_control: runtime.extension_control.clone(),
             config_watcher: config_watcher.clone(),
             foreground_turns: foreground_turns.clone(),
             command_cell_runtime: runtime.command_cell_runtime.clone(),

@@ -2600,6 +2600,9 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
             | ChatDriverEvent::AwaiterResultAcknowledged { .. } => {
                 AgentEvent::Notice("Awaiter projection unavailable".to_string())
             }
+            ChatDriverEvent::ExtensionReceipt(receipt) => {
+                AgentEvent::Notice(receipt.display_message())
+            }
             ChatDriverEvent::ContextCompressed {
                 before_count,
                 after_count,
@@ -4344,282 +4347,28 @@ async fn handle_slash_command(
                 }
             }
         }
-        Some(SlashCommand::Skills) => {
-            let mut parts = args.split_whitespace();
-            let sub = parts.next().unwrap_or("list");
-            let rest = parts.collect::<Vec<_>>().join(" ");
-            let mut hub = crate::skills_hub::SkillsHub::new();
-            let loaded = agent.read(|value| value.skill_names()).await;
-            hub.set_loaded_skills(loaded);
-            let content = match sub {
-                "list" | "ls" => hub
-                    .list()
-                    .into_iter()
-                    .map(|entry| {
-                        format!(
-                            "[{}] {} - {}",
-                            if entry.loaded { "loaded" } else { "available" },
-                            entry.name,
-                            entry.description
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                "search" | "find" if !rest.is_empty() => hub
-                    .search(&rest)
-                    .into_iter()
-                    .map(|entry| format!("{} - {}", entry.name, entry.description))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                "info" if !rest.is_empty() => hub.get(&rest).map_or_else(
-                    || format!("Skill '{rest}' was not found."),
-                    |entry| {
-                        format!(
-                            "{}\n{}\nPath: {}\nVersion: {}\nAuthor: {}",
-                            entry.name,
-                            entry.description,
-                            entry.path.display(),
-                            entry
-                                .version
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string()),
-                            entry
-                                .author
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string())
-                        )
-                    },
-                ),
-                "refresh" => {
-                    hub.refresh();
-                    let root = hub.root().to_path_buf();
-                    match agent
-                        .write_async(|value| {
-                            Box::pin(async move { value.load_skills_from_dir(root).await })
-                        })
-                        .await
-                    {
-                        Ok(names) => format!("Skills refreshed; {} loaded.", names.len()),
-                        Err(error) => format!("Skill refresh failed: {error}"),
-                    }
-                }
-                "check-updates" | "check" | "sync" => {
-                    let update_args = std::iter::once(sub)
-                        .chain(rest.split_whitespace())
-                        .collect::<Vec<_>>();
-                    crate::cli::cmd_impls::skills::execute_skill_update_command(
-                        agent,
-                        &update_args,
-                    )
-                    .await
-                    .unwrap_or_else(|| "Invalid skill update command".to_string())
-                }
-                "install" if !rest.is_empty() => {
-                    let result = if rest.starts_with("https://") || rest.ends_with(".git") {
-                        crate::skills_hub::install::install_from_git(&rest, None, &mut hub).await
-                    } else {
-                        crate::skills_hub::install::install_from_local(
-                            std::path::Path::new(&rest),
-                            &mut hub,
-                        )
-                    };
-                    match result {
-                        Ok(installed) => {
-                            let root = hub.root().to_path_buf();
-                            let load_result = agent
-                                .write_async(|value| {
-                                    Box::pin(async move { value.load_skills_from_dir(root).await })
-                                })
-                                .await;
-                            match load_result {
-                                Ok(_) => format!(
-                                    "Installed and loaded skill: {} ({})",
-                                    installed.name,
-                                    installed.path.display()
-                                ),
-                                Err(error) => format!(
-                                    "Installed {}, but runtime reload failed: {error}",
-                                    installed.name
-                                ),
-                            }
-                        }
-                        Err(error) => format!("Skill install failed: {error}"),
-                    }
-                }
-                "uninstall" | "remove" | "rm" if !rest.is_empty() => {
-                    match crate::skills_hub::install::uninstall(&rest, &mut hub) {
-                        Ok(()) => {
-                            format!("Uninstalled skill: {rest}. Restart to unload active content.")
-                        }
-                        Err(error) => format!("Skill uninstall failed: {error}"),
-                    }
-                }
-                _ => {
-                    "Usage: /skills [list|search|install|uninstall|info|refresh|check-updates|sync] [args]"
-                        .to_string()
-                }
+        Some(
+            command @ (SlashCommand::Skills
+            | SlashCommand::Mcp
+            | SlashCommand::Hooks
+            | SlashCommand::Plugins),
+        ) => {
+            let root = match command {
+                SlashCommand::Skills => "skills",
+                SlashCommand::Mcp => "mcp",
+                SlashCommand::Hooks => "hooks",
+                SlashCommand::Plugins => "plugins",
+                _ => return,
             };
-            app.messages.push(ChatMessage {
-                role: MessageRole::System,
-                content: if content.is_empty() {
-                    "No matching skills.".to_string()
-                } else {
-                    content
-                },
-            });
-        }
-        Some(SlashCommand::Mcp) => {
-            let mut parts = args.split_whitespace();
-            let sub = parts.next().unwrap_or("list");
-            let target = parts.collect::<Vec<_>>().join(" ");
-            let content = match sub {
-                "list" | "ls" => {
-                    let servers = agent.read(|value| value.list_mcp_servers()).await;
-                    if servers.is_empty() {
-                        "No MCP servers connected.".to_string()
-                    } else {
-                        format!("Connected MCP servers:\n{}", servers.join("\n"))
-                    }
-                }
-                "load" if !target.is_empty() => {
-                    let path = std::path::PathBuf::from(&target);
-                    match app.app_state.as_ref() {
-                        Some(state) => {
-                            match echo_agent_app_core::mcp_config_runtime::load_existing_mcp_config_snapshot(&path) {
-                                Ok(config) => {
-                                    let server_count = config.mcp_servers.len();
-                                    match state
-                                        .replace_mcp_config_owned(config)
-                                        .await
-                                    {
-                                        Ok(_) => format!(
-                                            "Imported {server_count} MCP server(s) into the user config."
-                                        ),
-                                        Err(error) => format!("MCP import failed: {error}"),
-                                    }
-                                }
-                                Err(error) => format!("MCP import failed: {error}"),
-                            }
-                        }
-                        None => "MCP configuration runtime is unavailable.".to_string(),
-                    }
-                }
-                "disconnect" if !target.is_empty() => match app.app_state.as_ref() {
-                    Some(state) => match state.remove_mcp_server_owned(&target).await {
-                        Ok(_) => format!("Removed MCP server from the user config: {target}"),
-                        Err(error) => format!("MCP removal failed: {error}"),
-                    },
-                    None => "MCP configuration runtime is unavailable.".to_string(),
-                },
-                _ => "Usage: /mcp [list|load <config-file>|disconnect <name>]".to_string(),
-            };
-            app.messages.push(ChatMessage {
-                role: MessageRole::System,
-                content,
-            });
-        }
-        Some(SlashCommand::Hooks) => {
-            let mut parts = args.split_whitespace();
-            let sub = parts.next().unwrap_or("list");
-            let target = parts.next().unwrap_or("");
-            let matcher = parts.next().unwrap_or("*");
-            let content = match sub {
-                "list" | "ls" => {
-                    agent
-                        .read_async(|value| {
-                            Box::pin(async move {
-                                let registry = value.hook_registry().read().await;
-                                let sources = registry.list_sources();
-                                if sources.is_empty() {
-                                    "No hooks registered.".to_string()
-                                } else {
-                                    sources
-                                        .into_iter()
-                                        .map(|(name, count)| format!("{name}: {count} rule(s)"))
-                                        .collect::<Vec<_>>()
-                                        .join("\n")
-                                }
-                            })
-                        })
-                        .await
-                }
-                "reload" => {
-                    // P0-1: 从磁盘重读所有 user hook 来源(含 eko.yaml
-                    // 内嵌),合并成单个 definition 后一次性 register。
-                    let loaded = echo_agent_app_core::hook_config_loader::HookConfigLoader::load_merged_from_disk();
-                    if !loaded.errors.is_empty() {
-                        format!(
-                            "Hook reload aborted; existing hooks are unchanged:\n{}",
-                            loaded.errors.join("\n")
-                        )
-                    } else {
-                        let count: usize = loaded.definition.rules.values().map(Vec::len).sum();
-                        let definition = loaded.definition;
-                        agent
-                            .write_async(|value| {
-                                Box::pin(async move {
-                                    let mut registry = value.hook_registry().write().await;
-                                    registry.clear_user_hooks();
-                                    registry.register_user_hooks(definition);
-                                })
-                            })
-                            .await;
-                        format!("Hooks reloaded: {count} rule(s).")
-                    }
-                }
-                "test" if !target.is_empty() => match parse_hook_event(target) {
-                    Some(event) => {
-                        let matcher = matcher.to_string();
-                        let result = agent
-                            .read_async(|value| {
-                                Box::pin(async move {
-                                    let context =
-                                        echo_agent::skills::hooks::HookContext::for_dry_run(
-                                            event, &matcher,
-                                        );
-                                    value.hook_registry().read().await.dry_run(&context)
-                                })
-                            })
-                            .await;
-                        if result.matches.is_empty() {
-                            format!("Dry-run {target}: no matching actions")
-                        } else {
-                            result
-                                .matches
-                                .into_iter()
-                                .map(|item| {
-                                    format!(
-                                        "{} · matcher={} · action={}",
-                                        item.source, item.matcher, item.action
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        }
-                    }
-                    None => format!("Unknown hook event: {target}"),
-                },
-                _ => "Usage: /hooks [list|reload|test <event>]".to_string(),
-            };
-            app.messages.push(ChatMessage {
-                role: MessageRole::System,
-                content,
-            });
-        }
-        Some(SlashCommand::Plugins) => {
-            let app_state = app.app_state.clone();
-            let runtime = match app_state.as_ref() {
-                Some(state) => state.current_plugin_runtime_owned().await.ok(),
-                None => app.plugin_runtime.clone(),
-            };
-            let content = match runtime {
-                Some(runtime) => handle_tui_plugin_command(app, runtime, app_state, args).await,
-                None => "Plugin runtime is not initialized.".to_string(),
-            };
-            app.messages.push(ChatMessage {
-                role: MessageRole::System,
-                content,
-            });
+            let receipt = crate::cli::extension_surface::dispatch_extension_command(
+                app.app_state.as_ref(),
+                app.conversation_id.as_deref(),
+                root,
+                args,
+            )
+            .await;
+            apply_tui_extension_receipt(app, &receipt);
+            push_system_message(app, receipt.display_message());
         }
         Some(SlashCommand::Permission) => {
             if args.is_empty() {
@@ -5294,7 +5043,23 @@ async fn handle_slash_command(
                 content,
             });
         }
-        Some(command @ (SlashCommand::Terminal | SlashCommand::Lsp)) => {
+        Some(command @ (SlashCommand::Lsp | SlashCommand::Browser)) => {
+            let root = match command {
+                SlashCommand::Lsp => "lsp",
+                SlashCommand::Browser => "browser",
+                _ => return,
+            };
+            let receipt = crate::cli::extension_surface::dispatch_extension_command(
+                app.app_state.as_ref(),
+                app.conversation_id.as_deref(),
+                root,
+                args,
+            )
+            .await;
+            push_system_message(app, receipt.display_message());
+            app.rebuild_message_groups();
+        }
+        Some(SlashCommand::Terminal) => {
             let Some(state) = app.app_state.clone() else {
                 push_system_message(
                     app,
@@ -5312,16 +5077,11 @@ async fn handle_slash_command(
                 }
             };
             let parsed_refs = parsed.iter().map(String::as_str).collect::<Vec<_>>();
-            let name = if command == SlashCommand::Terminal {
-                "terminal"
-            } else {
-                "lsp"
-            };
             let registry = echo_agent_app_core::developer_commands::DeveloperCommandRegistry::new(
                 state.terminal.clone(),
-                state.plugin_runtime.clone(),
+                Some(state),
             );
-            match registry.execute(name, &parsed_refs).await {
+            match registry.execute("terminal", &parsed_refs).await {
                 Ok(output) => {
                     push_system_message(app, output.message);
                     if let Some(terminal_id) = output.attached_terminal {
@@ -5329,7 +5089,7 @@ async fn handle_slash_command(
                         app.active_terminal_id = Some(terminal_id);
                     }
                 }
-                Err(error) => push_system_message(app, format!("/{name} failed: {error}")),
+                Err(error) => push_system_message(app, format!("/terminal failed: {error}")),
             }
             app.rebuild_message_groups();
         }
@@ -6129,73 +5889,6 @@ async fn handle_slash_command(
                 }
             }
         }
-        Some(SlashCommand::Browser) => {
-            let Some(runtime) = app.browser_runtime.clone() else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "Browser runtime is unavailable.".to_string(),
-                });
-                app.rebuild_message_groups();
-                return;
-            };
-            let requested = args.trim().to_ascii_lowercase();
-            if requested.is_empty() || requested == "status" {
-                let status = runtime.extension_status().await;
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: format!(
-                        "Playwright Extension: {}\nPackage: {}\nConnection token: {}{}",
-                        if status.connected {
-                            "connected"
-                        } else {
-                            "disconnected"
-                        },
-                        status.package,
-                        if status.token_configured {
-                            "configured"
-                        } else {
-                            "not configured"
-                        },
-                        status
-                            .startup_error
-                            .map(|error| format!("\nError: {error}"))
-                            .unwrap_or_default()
-                    ),
-                });
-            } else if requested == "managed" || requested == "chrome" {
-                let conversation_id = app
-                    .conversation_id
-                    .clone()
-                    .unwrap_or_else(|| "tui-preview".to_string());
-                let params = std::collections::HashMap::from([(
-                    "backend".to_string(),
-                    serde_json::Value::String(requested.clone()),
-                )]);
-                let result = runtime
-                    .execute_main(
-                        app.workspace_execution_scope.workspace_id().to_string(),
-                        app.workspace_execution_scope.root().to_path_buf(),
-                        conversation_id,
-                        echo_agent_app_core::browser::BrowserAction::Backend,
-                        params,
-                        None,
-                    )
-                    .await;
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: match result {
-                        Ok(_) => format!("Browser backend switched to {requested}."),
-                        Err(error) => format!("Browser backend switch failed: {error}"),
-                    },
-                });
-            } else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "Usage: /browser [status|managed|chrome]".to_string(),
-                });
-            }
-            app.rebuild_message_groups();
-        }
         Some(SlashCommand::Worktrees) => {
             let content = handle_tui_worktrees(app, args).await;
             app.messages.push(ChatMessage {
@@ -6923,350 +6616,66 @@ fn append_subagent_summary(content: &mut String, runs: &[SubagentRuntimeView]) {
     }
 }
 
-fn parse_hook_event(name: &str) -> Option<echo_agent::skills::hooks::HookEvent> {
-    echo_agent::skills::hooks::HookEvent::from_name(name)
-}
-
-fn with_plugin_wiring_errors(
-    mut message: String,
-    summary: &echo_agent_app_core::plugin_runtime::ReloadSummary,
-) -> String {
-    if !summary.errors.is_empty() {
-        message.push_str("\nComponent wiring errors:\n");
-        message.push_str(&summary.errors.join("\n"));
-    }
-    message
-}
-
-async fn sync_tui_plugin_theme(
+fn apply_tui_plugin_theme(
     app: &mut TuiApp,
-    runtime: &echo_agent_app_core::plugin_runtime::PluginRuntimeService,
+    theme: Option<&echo_agent_app_core::extension_commands::PluginThemeProjection>,
 ) {
-    let active = runtime.active_theme().await;
-    let theme = match active {
-        Some(active) => runtime
-            .themes()
-            .await
-            .into_iter()
-            .find(|theme| theme.name == active)
-            .map_or_else(
-                || app.default_theme.clone(),
-                |theme| crate::tui::Theme::from_plugin_theme(&theme),
-            ),
-        None => app.default_theme.clone(),
-    };
-    app.theme = theme;
+    app.theme = theme.map_or_else(
+        || app.default_theme.clone(),
+        |theme| {
+            crate::tui::Theme::from_plugin_theme(
+                &echo_agent_app_core::plugin_runtime::PluginThemeDefinition {
+                    name: theme.name.clone(),
+                    display_name: theme.display_name.clone(),
+                    dark: theme.dark,
+                    colors: theme.colors.clone(),
+                    plugin: theme.plugin.clone(),
+                },
+            )
+        },
+    );
     app.rebuild_message_groups();
 }
 
-async fn handle_tui_plugin_command(
+fn apply_tui_extension_receipt(
     app: &mut TuiApp,
-    runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
-    app_state: Option<std::sync::Arc<echo_agent_app_core::state::AppState>>,
-    args: &str,
-) -> String {
-    use echo_agent::plugin::{InstallSource, PluginScope};
+    receipt: &echo_agent_app_core::extension_commands::ExtensionCommandReceipt,
+) {
+    use echo_agent_app_core::extension_commands::{
+        ExtensionCommandReceipt, ExtensionCommandStatus, PluginCommandReceipt,
+    };
 
-    let parts = args.split_whitespace().collect::<Vec<_>>();
-    let sub = parts.first().copied().unwrap_or("list");
-    let rest = parts.get(1..).unwrap_or(&[]);
-    match sub {
-        "list" | "ls" | "" => {
-            let plugins = runtime.list().await;
-            if plugins.is_empty() {
-                return "No plugins installed.".to_string();
-            }
-            plugins
-                .into_iter()
-                .map(|entry| {
-                    format!(
-                        "{} v{} [{}] · {}",
-                        entry.manifest.name,
-                        entry.manifest.version_label(),
-                        if entry.enabled { "enabled" } else { "disabled" },
-                        entry.scope
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        "install" => {
-            let Some(source_text) = rest.first() else {
-                return "Usage: /plugins install <path|git-url> [--scope user|project|local]"
-                    .to_string();
-            };
-            let scope = rest
-                .windows(2)
-                .find(|pair| pair.first() == Some(&"--scope"))
-                .and_then(|pair| pair.get(1))
-                .and_then(|value| PluginScope::from_arg(value))
-                .unwrap_or(PluginScope::User);
-            let source = InstallSource::parse(source_text);
-            let result = match app_state.as_ref() {
-                Some(state) => state.install_plugin_owned(&source, scope).await,
-                None => runtime.install(&source, scope).await,
-            };
-            match result {
-                Ok((plugin_id, summary)) => {
-                    sync_tui_plugin_theme(app, &runtime).await;
-                    let enabled = runtime
-                        .get(&plugin_id)
-                        .await
-                        .is_some_and(|entry| entry.enabled);
-                    with_plugin_wiring_errors(
-                        if !enabled {
-                            format!("Plugin '{plugin_id}' installed and disabled by default.")
-                        } else if summary.errors.is_empty() {
-                            format!("Plugin '{plugin_id}' installed and activated.")
-                        } else {
-                            format!("Plugin '{plugin_id}' installed, but activation is incomplete.")
-                        },
-                        &summary,
-                    )
+    if receipt.status() == ExtensionCommandStatus::Failed {
+        return;
+    }
+    let ExtensionCommandReceipt::Plugins {
+        receipt: Some(plugin_receipt),
+        ..
+    } = receipt
+    else {
+        return;
+    };
+    match plugin_receipt {
+        PluginCommandReceipt::Mutation { projection } => {
+            if let Some(active) = projection.active_theme.as_deref() {
+                if let Some(theme) = projection
+                    .themes
+                    .items
+                    .iter()
+                    .find(|theme| theme.name == active)
+                {
+                    apply_tui_plugin_theme(app, Some(theme));
                 }
-                Err(error) => format!("Plugin install failed: {error}"),
-            }
-        }
-        "uninstall" | "remove" => {
-            let Some(name) = rest.first() else {
-                return "Usage: /plugins uninstall <name> [--keep-data]".to_string();
-            };
-            let keep_data = rest.contains(&"--keep-data");
-            let result = match app_state.as_ref() {
-                Some(state) => state.uninstall_plugin_owned(name, keep_data).await,
-                None => runtime.uninstall(name, keep_data).await,
-            };
-            match result {
-                Ok(summary) => {
-                    sync_tui_plugin_theme(app, &runtime).await;
-                    with_plugin_wiring_errors(
-                        format!("Plugin '{name}' uninstalled and unloaded."),
-                        &summary,
-                    )
-                }
-                Err(error) => format!("Plugin uninstall failed: {error}"),
-            }
-        }
-        "enable" | "disable" => {
-            let Some(name) = rest.first() else {
-                return format!("Usage: /plugins {sub} <name>");
-            };
-            let result = match app_state.as_ref() {
-                Some(state) => state
-                    .set_plugin_enabled_owned(name, sub == "enable")
-                    .await,
-                None if sub == "enable" => runtime.enable(name).await,
-                None => runtime.disable(name).await,
-            };
-            match result {
-                Ok(summary) => {
-                    sync_tui_plugin_theme(app, &runtime).await;
-                    with_plugin_wiring_errors(
-                        format!("Plugin '{name}' {sub}d in the current session."),
-                        &summary,
-                    )
-                }
-                Err(error) => format!("Plugin {sub} failed: {error}"),
-            }
-        }
-        "info" | "details" => {
-            let Some(name) = rest.first() else {
-                return "Usage: /plugins info <name>".to_string();
-            };
-            match runtime.get(name).await {
-                Some(entry) => {
-                    let capabilities =
-                        echo_agent_app_core::plugin_runtime::plugin_capabilities(&entry)
-                        .into_iter()
-                        .map(|capability| capability.display_name().to_string())
-                        .collect::<Vec<_>>();
-                    format!(
-                        "{} v{}\n{}\nScope: {}\nEnabled: {}\nPath: {}\nCapabilities: {}",
-                        entry.manifest.name,
-                        entry.manifest.version_label(),
-                        entry.manifest.description,
-                        entry.scope,
-                        entry.enabled,
-                        entry.root.display(),
-                        if capabilities.is_empty() {
-                            "none".to_string()
-                        } else {
-                            capabilities.join(", ")
-                        }
-                    )
-                }
-                None => format!("Plugin '{name}' not found."),
-            }
-        }
-        "reload" => {
-            let result = match app_state.as_ref() {
-                Some(state) => state.reload_plugins_owned().await,
-                None => runtime.reload().await,
-            };
-            match result {
-                Ok(summary) => {
-                    sync_tui_plugin_theme(app, &runtime).await;
-                    let mut content = format!(
-                        "Reloaded {} plugins ({} enabled).\nSkills: {} · Hooks: {} · MCP: {} · Agents: {} · LSP: {} · Monitors: {} · Themes: {} · Styles: {}",
-                        summary.total,
-                        summary.enabled,
-                        summary.skills_loaded,
-                        summary.hooks_registered,
-                        summary.mcp_connected,
-                        summary.agents_loaded,
-                        summary.lsp_languages_loaded,
-                        summary.monitors_loaded,
-                        summary.themes_loaded,
-                        summary.output_styles_loaded
-                    );
-                    if !summary.errors.is_empty() {
-                        content.push_str("\nErrors:\n");
-                        content.push_str(&summary.errors.join("\n"));
-                    }
-                    content
-                }
-                Err(error) => format!("Plugin reload failed: {error}"),
-            }
-        }
-        "themes" => {
-            let active = runtime.active_theme().await;
-            let themes = runtime.themes().await;
-            if themes.is_empty() {
-                "No plugin themes are loaded.".to_string()
             } else {
-                themes
-                    .into_iter()
-                    .map(|theme| {
-                        format!(
-                            "{}{} [{}] from {}",
-                            if active.as_deref() == Some(theme.name.as_str()) { "* " } else { "  " },
-                            theme.display_name.as_deref().unwrap_or(&theme.name),
-                            if theme.dark { "dark" } else { "light" },
-                            theme.plugin
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                apply_tui_plugin_theme(app, None);
             }
         }
-        "theme" => {
-            let Some(name) = rest.first().copied() else {
-                return "Usage: /plugins theme <name|default>".to_string();
-            };
-            let selected = (!matches!(name, "default" | "off" | "none")).then_some(name);
-            match runtime.activate_theme(selected).await {
-                Ok(_) => {
-                    sync_tui_plugin_theme(app, &runtime).await;
-                    match selected {
-                        Some(name) => format!("Theme '{name}' activated."),
-                        None => "Theme reset to default.".to_string(),
-                    }
-                }
-                Err(error) => format!("Theme activation failed: {error}"),
-            }
+        PluginCommandReceipt::Theme { active, theme } if active.is_none() || theme.is_some() => {
+            apply_tui_plugin_theme(app, theme.as_ref());
         }
-        "config" | "configure" => {
-            let Some(name) = rest.first().copied() else {
-                return "Usage: /plugins config <name> <json-object>".to_string();
-            };
-            let json = rest.get(1..).unwrap_or(&[]).join(" ");
-            let values = match serde_json::from_str::<
-                std::collections::HashMap<String, serde_json::Value>,
-            >(&json) {
-                Ok(values) => values,
-                Err(error) => return format!("Plugin config JSON is invalid: {error}"),
-            };
-            let result = match app_state.as_ref() {
-                Some(state) => state.configure_plugin_owned(name, values).await,
-                None => runtime.configure(name, values).await,
-            };
-            match result {
-                Ok(summary) => {
-                    sync_tui_plugin_theme(app, &runtime).await;
-                    with_plugin_wiring_errors(
-                        format!("Plugin '{name}' configured and reloaded."),
-                        &summary,
-                    )
-                }
-                Err(error) => format!("Plugin configuration failed: {error}"),
-            }
-        }
-        "styles" => {
-            let active = runtime.active_output_style().await;
-            let styles = runtime.output_styles().await;
-            if styles.is_empty() {
-                "No plugin output styles are loaded.".to_string()
-            } else {
-                styles
-                    .into_iter()
-                    .map(|style| {
-                        format!(
-                            "{}{} from {} - {}",
-                            if active.as_deref() == Some(style.name.as_str()) {
-                                "* "
-                            } else {
-                                "  "
-                            },
-                            style.name,
-                            style.plugin,
-                            style.description
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
-        }
-        "style" => {
-            let Some(name) = rest.first().copied() else {
-                return "Usage: /plugins style <name|default>".to_string();
-            };
-            let selected = (!matches!(name, "default" | "off" | "none")).then_some(name);
-            match runtime.activate_output_style(selected).await {
-                Ok(()) => match selected {
-                    Some(name) => format!("Output style '{name}' activated."),
-                    None => "Output style reset to default.".to_string(),
-                },
-                Err(error) => format!("Output style activation failed: {error}"),
-            }
-        }
-        "init" => {
-            let Some(directory) = rest.first().copied() else {
-                return "Usage: /plugins init <directory> [name]".to_string();
-            };
-            let default_name = std::path::Path::new(directory)
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("my-plugin");
-            let name = rest.get(1).copied().unwrap_or(default_name);
-            match echo_agent_app_core::plugin_runtime::PluginRuntimeService::scaffold(
-                directory, name,
-            ) {
-                Ok(result) => format!(
-                    "Plugin '{}' scaffolded at {}.",
-                    result.name,
-                    result.path.display()
-                ),
-                Err(error) => format!("Plugin scaffold failed: {error}"),
-            }
-        }
-        "validate" => {
-            let directory = rest.first().copied().unwrap_or(".");
-            let report =
-                echo_agent_app_core::plugin_runtime::PluginRuntimeService::validate(directory);
-            if report.valid {
-                format!(
-                    "Plugin '{}' is valid.\nComponents: {}",
-                    report.name.as_deref().unwrap_or("<unknown>"),
-                    report.components.join(", ")
-                )
-            } else {
-                format!("Plugin validation failed:\n{}", report.errors.join("\n"))
-            }
-        }
-        _ => "Usage: /plugins [list|install|uninstall|enable|disable|info|reload|config|themes|theme|styles|style|init|validate]".to_string(),
+        _ => {}
     }
 }
-
 fn update_subagent_runs(app: &mut TuiApp, event: &SubagentEvent) {
     match event {
         SubagentEvent::DispatchStarted {

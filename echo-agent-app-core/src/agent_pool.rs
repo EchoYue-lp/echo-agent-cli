@@ -94,6 +94,13 @@ pub(crate) struct AgentPluginGeneration {
     revision: u64,
     skill_descriptors: Vec<echo_agent::skills::external::SkillDescriptor>,
     plugin_agents: Vec<PreparedPluginAgent>,
+    output_style: Option<String>,
+}
+
+#[derive(Clone)]
+struct ApplicationSkillProjectionRepair {
+    name: String,
+    source: String,
 }
 
 impl AgentPluginGeneration {
@@ -101,11 +108,13 @@ impl AgentPluginGeneration {
         revision: u64,
         skill_descriptors: Vec<echo_agent::skills::external::SkillDescriptor>,
         plugin_agents: Vec<PreparedPluginAgent>,
+        output_style: Option<String>,
     ) -> Self {
         Self {
             revision,
             skill_descriptors,
             plugin_agents,
+            output_style,
         }
     }
 }
@@ -704,6 +713,7 @@ pub(crate) struct PreparedAgentPoolPluginPublication<'a> {
     agents: tokio::sync::RwLockWriteGuard<'a, HashMap<String, PooledAgent>>,
     previous: AgentPluginGeneration,
     candidate: Option<AgentPluginGeneration>,
+    application_skill_repair: Option<ApplicationSkillProjectionRepair>,
 }
 
 /// Pool-wide instruction publication under the existing execution admission.
@@ -759,22 +769,66 @@ impl PreparedAgentPoolModelDeactivation<'_> {
 
 impl PreparedAgentPoolPluginPublication<'_> {
     pub(crate) async fn prepare(&mut self, candidate: AgentPluginGeneration) -> Result<(), String> {
+        self.prepare_inner(candidate, None).await
+    }
+
+    pub(crate) async fn prepare_application_skill(
+        &mut self,
+        candidate: AgentPluginGeneration,
+        name: &str,
+        source: &str,
+    ) -> Result<(), String> {
+        self.prepare_inner(
+            candidate,
+            Some(ApplicationSkillProjectionRepair {
+                name: name.to_string(),
+                source: source.to_string(),
+            }),
+        )
+        .await
+    }
+
+    async fn prepare_inner(
+        &mut self,
+        candidate: AgentPluginGeneration,
+        application_skill_repair: Option<ApplicationSkillProjectionRepair>,
+    ) -> Result<(), String> {
         if self.candidate.is_some() {
             return Err("AgentPool plugin publication is already prepared".to_string());
+        }
+        if let Some(repair) = application_skill_repair.as_ref()
+            && candidate.skill_descriptors.iter().any(|descriptor| {
+                descriptor.source.as_deref() == Some(repair.source.as_str())
+                    && descriptor.name != repair.name
+            })
+        {
+            return Err(format!(
+                "application skill source '{}' contains a descriptor other than '{}'",
+                repair.source, repair.name
+            ));
         }
 
         let mut applied = Vec::new();
         let mut pooled_agents = self.agents.iter().collect::<Vec<_>>();
         pooled_agents.sort_by(|left, right| left.0.cmp(right.0));
         for (conversation_id, pooled) in pooled_agents {
-            if let Err(error) =
-                replace_agent_plugin_generation(&pooled.handle, &self.previous, &candidate).await
+            if let Err(error) = replace_agent_plugin_generation(
+                &pooled.handle,
+                &self.previous,
+                &candidate,
+                application_skill_repair.as_ref(),
+            )
+            .await
             {
                 let mut errors = vec![format!("{conversation_id}: {error}")];
                 for (applied_id, applied_handle) in applied.into_iter().rev() {
-                    if let Err(rollback_error) =
-                        replace_agent_plugin_generation(&applied_handle, &candidate, &self.previous)
-                            .await
+                    if let Err(rollback_error) = replace_agent_plugin_generation(
+                        &applied_handle,
+                        &candidate,
+                        &self.previous,
+                        application_skill_repair.as_ref(),
+                    )
+                    .await
                     {
                         errors.push(format!("rollback {applied_id}: {rollback_error}"));
                     }
@@ -788,6 +842,7 @@ impl PreparedAgentPoolPluginPublication<'_> {
         }
 
         self.candidate = Some(candidate);
+        self.application_skill_repair = application_skill_repair;
         Ok(())
     }
 
@@ -813,8 +868,13 @@ impl PreparedAgentPoolPluginPublication<'_> {
         let mut pooled_agents = self.agents.iter().collect::<Vec<_>>();
         pooled_agents.sort_by(|left, right| left.0.cmp(right.0));
         for (conversation_id, pooled) in pooled_agents {
-            if let Err(error) =
-                replace_agent_plugin_generation(&pooled.handle, &candidate, &self.previous).await
+            if let Err(error) = replace_agent_plugin_generation(
+                &pooled.handle,
+                &candidate,
+                &self.previous,
+                self.application_skill_repair.as_ref(),
+            )
+            .await
             {
                 errors.push(format!("{conversation_id}: {error}"));
             }
@@ -987,6 +1047,7 @@ impl AgentPool {
                 0,
                 skill_descriptors,
                 Vec::new(),
+                None,
             )),
             cleanup_cancel: CancellationToken::new(),
             cleanup_handle: Mutex::new(None),
@@ -1103,9 +1164,9 @@ impl AgentPool {
 
         let primary = pool.create_agent("__workspace_primary__").await?;
         let app_config = self.app_config.read().await.clone();
-        crate::infra::load_user_hooks(&primary.handle, &app_config).await;
+        crate::infra::load_user_hooks(&primary.handle, &app_config, Some(root.as_path())).await;
         let lsp_runtime = if mcp_config_snapshot.is_some() {
-            Some(crate::runtime::register_lsp_tools(&primary.handle).await)
+            Some(crate::runtime::register_lsp_tools(&primary.handle, &root).await)
         } else {
             None
         };
@@ -2198,6 +2259,7 @@ impl AgentPool {
             agents,
             previous,
             candidate: None,
+            application_skill_repair: None,
         })
     }
 
@@ -2372,6 +2434,12 @@ impl AgentPool {
         register_plugin_agents(&mut agent, &agent_generation.plugin_agents)
             .await
             .map_err(anyhow::Error::msg)?;
+        agent
+            .replace_system_context_projection(
+                crate::plugin_runtime::OUTPUT_STYLE_PROJECTION,
+                agent_generation.output_style.clone(),
+            )
+            .await;
         crate::runtime::configure_intent_router(&mut agent);
 
         if let Some(snapshot) = self.instruction_projection.read().await.clone() {
@@ -2443,13 +2511,18 @@ async fn replace_agent_plugin_generation(
     handle: &AgentHandle,
     previous: &AgentPluginGeneration,
     candidate: &AgentPluginGeneration,
+    application_skill_repair: Option<&ApplicationSkillProjectionRepair>,
 ) -> Result<(), String> {
     let previous = previous.clone();
     let candidate = candidate.clone();
+    let application_skill_repair = application_skill_repair.cloned();
     handle
         .write_async(|agent| {
             Box::pin(async move {
                 remove_agent_plugin_generation(agent, &previous).await;
+                if let Some(repair) = application_skill_repair.as_ref() {
+                    agent.unregister_skills_by_source(&repair.source).await;
+                }
                 for descriptor in &candidate.skill_descriptors {
                     agent
                         .skill_registry_mut()
@@ -2457,6 +2530,9 @@ async fn replace_agent_plugin_generation(
                 }
                 if let Err(error) = register_plugin_agents(agent, &candidate.plugin_agents).await {
                     remove_agent_plugin_generation(agent, &candidate).await;
+                    if let Some(repair) = application_skill_repair.as_ref() {
+                        agent.unregister_skills_by_source(&repair.source).await;
+                    }
                     for descriptor in &previous.skill_descriptors {
                         agent
                             .skill_registry_mut()
@@ -2473,6 +2549,12 @@ async fn replace_agent_plugin_generation(
                         None => error,
                     });
                 }
+                agent
+                    .replace_system_context_projection(
+                        crate::plugin_runtime::OUTPUT_STYLE_PROJECTION,
+                        candidate.output_style.clone(),
+                    )
+                    .await;
                 crate::runtime::configure_intent_router(agent);
                 Ok(())
             })

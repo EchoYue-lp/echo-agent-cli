@@ -19,7 +19,7 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 安装结果
 #[derive(Debug)]
-pub struct InstallResult {
+pub(crate) struct InstallResult {
     pub name: String,
     pub path: PathBuf,
     pub source: String,
@@ -57,16 +57,20 @@ pub struct SkillUpdateStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SkillSyncResult {
-    pub name: String,
-    pub success: bool,
-    pub updated: bool,
-    pub revision: Option<String>,
-    pub message: String,
+pub(crate) struct SkillSyncResult {
+    pub(crate) name: String,
+    pub(crate) success: bool,
+    pub(crate) updated: bool,
+    pub(crate) revision: Option<String>,
+    pub(crate) message: String,
+    pub(crate) retryable: bool,
 }
 
 /// 从本地目录安装技能。
-pub fn install_from_local(source: &Path, hub: &mut SkillsHub) -> Result<InstallResult, String> {
+pub(crate) fn install_from_local(
+    source: &Path,
+    hub: &mut SkillsHub,
+) -> Result<InstallResult, String> {
     validate_skill_dir(source)?;
     let skill_name = source
         .file_name()
@@ -86,7 +90,7 @@ pub fn install_from_local(source: &Path, hub: &mut SkillsHub) -> Result<InstallR
 }
 
 /// 从 Git 仓库安装技能
-pub async fn install_from_git(
+pub(crate) async fn install_from_git(
     repo_url: &str,
     subdir: Option<&str>,
     hub: &mut SkillsHub,
@@ -123,18 +127,19 @@ pub async fn install_from_git(
 }
 
 /// 卸载技能
-pub fn uninstall(name: &str, hub: &mut SkillsHub) -> Result<(), String> {
-    let entry = hub
-        .get(name)
-        .ok_or_else(|| format!("技能 '{name}' 未找到"))?;
+pub(crate) fn uninstall(name: &str, hub: &mut SkillsHub) -> Result<bool, String> {
+    let Some(entry) = hub.get(name) else {
+        return Ok(false);
+    };
 
     let path = entry.path.clone();
-    if path.exists() {
-        std::fs::remove_dir_all(&path).map_err(|e| format!("删除技能目录失败: {e}"))?;
+    if !path.exists() {
+        return Ok(false);
     }
+    std::fs::remove_dir_all(&path).map_err(|e| format!("删除技能目录失败: {e}"))?;
 
     hub.refresh();
-    Ok(())
+    Ok(true)
 }
 
 pub fn read_source_record(skill_dir: &Path) -> Result<Option<SkillSourceRecord>, String> {
@@ -233,7 +238,7 @@ pub async fn check_updates(
     Ok(statuses)
 }
 
-pub async fn sync_skills(
+pub(crate) async fn sync_skills(
     hub: &mut SkillsHub,
     target: Option<&str>,
     force: bool,
@@ -257,6 +262,7 @@ async fn sync_one(name: &str, path: &Path, force: bool) -> SkillSyncResult {
                 updated: false,
                 revision: None,
                 message: "技能不是从 Git 安装，已跳过".to_string(),
+                retryable: false,
             };
         }
         Err(error) => {
@@ -266,6 +272,7 @@ async fn sync_one(name: &str, path: &Path, force: bool) -> SkillSyncResult {
                 updated: false,
                 revision: None,
                 message: error,
+                retryable: false,
             };
         }
     };
@@ -278,6 +285,7 @@ async fn sync_one(name: &str, path: &Path, force: bool) -> SkillSyncResult {
                 updated: false,
                 revision: Some(record.revision),
                 message: error,
+                retryable: true,
             };
         }
     };
@@ -288,6 +296,7 @@ async fn sync_one(name: &str, path: &Path, force: bool) -> SkillSyncResult {
             updated: false,
             revision: Some(record.revision),
             message: "检测到本地修改，未覆盖；使用 --force 可显式同步".to_string(),
+            retryable: false,
         };
     }
     let remote = match remote_revision(&record.repo_url).await {
@@ -299,6 +308,7 @@ async fn sync_one(name: &str, path: &Path, force: bool) -> SkillSyncResult {
                 updated: false,
                 revision: Some(record.revision),
                 message: error,
+                retryable: true,
             };
         }
     };
@@ -309,6 +319,7 @@ async fn sync_one(name: &str, path: &Path, force: bool) -> SkillSyncResult {
             updated: false,
             revision: Some(record.revision),
             message: "已是最新版本".to_string(),
+            retryable: false,
         };
     }
     let checkout = match clone_repository(&record.repo_url).await {
@@ -320,6 +331,7 @@ async fn sync_one(name: &str, path: &Path, force: bool) -> SkillSyncResult {
                 updated: false,
                 revision: Some(record.revision),
                 message: error,
+                retryable: true,
             };
         }
     };
@@ -332,6 +344,7 @@ async fn sync_one(name: &str, path: &Path, force: bool) -> SkillSyncResult {
                 updated: false,
                 revision: Some(record.revision),
                 message: error,
+                retryable: true,
             };
         }
     };
@@ -344,6 +357,7 @@ async fn sync_one(name: &str, path: &Path, force: bool) -> SkillSyncResult {
                 updated: false,
                 revision: Some(record.revision),
                 message: error,
+                retryable: true,
             };
         }
     };
@@ -360,6 +374,7 @@ async fn sync_one(name: &str, path: &Path, force: bool) -> SkillSyncResult {
             updated: true,
             revision: Some(revision),
             message: "同步完成".to_string(),
+            retryable: false,
         },
         Err(error) => SkillSyncResult {
             name: name.to_string(),
@@ -367,6 +382,7 @@ async fn sync_one(name: &str, path: &Path, force: bool) -> SkillSyncResult {
             updated: false,
             revision: None,
             message: error,
+            retryable: true,
         },
     }
 }
@@ -703,6 +719,41 @@ mod tests {
         std::fs::write(destination.join("SKILL.md"), "# Locally edited\n")
             .map_err(|error| error.to_string())?;
         assert_ne!(hash_skill_dir(&destination)?, record.content_hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn untracked_and_local_change_sync_failures_are_terminal() -> Result<(), String> {
+        let untracked = tempfile::tempdir().map_err(|error| error.to_string())?;
+        std::fs::write(untracked.path().join("SKILL.md"), "# Untracked\n")
+            .map_err(|error| error.to_string())?;
+        let untracked_result = sync_one("untracked", untracked.path(), false).await;
+        assert!(!untracked_result.success);
+        assert!(!untracked_result.retryable);
+
+        let source = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        std::fs::write(source.path().join("SKILL.md"), "# Original\n")
+            .map_err(|error| error.to_string())?;
+        let destination = root.path().join("local-change");
+        let now = Utc::now().to_rfc3339();
+        replace_skill_directory(
+            source.path(),
+            &destination,
+            Some(SkillSourceRecord {
+                repo_url: "https://example.com/local-change.git".to_string(),
+                subdir: None,
+                revision: "abc123".to_string(),
+                content_hash: String::new(),
+                installed_at: now.clone(),
+                synced_at: now,
+            }),
+        )?;
+        std::fs::write(destination.join("SKILL.md"), "# Local edit\n")
+            .map_err(|error| error.to_string())?;
+        let local_change = sync_one("local-change", &destination, false).await;
+        assert!(!local_change.success);
+        assert!(!local_change.retryable);
         Ok(())
     }
 

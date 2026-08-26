@@ -10,6 +10,7 @@ pub mod command;
 pub mod commands;
 pub mod completion;
 pub mod editor;
+pub(crate) mod extension_surface;
 pub mod git_ops;
 pub mod jsonl;
 pub mod keybindings;

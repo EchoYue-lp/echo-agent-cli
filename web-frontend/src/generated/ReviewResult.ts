@@ -3,9 +3,9 @@ import type { ReviewIssue } from './ReviewIssue';
 import type { ReviewOutcome } from './ReviewOutcome';
 
 /**
- * Result of a review gate over a task. When `outcome == NeedsFix`, the
- * runtime (PR 4) creates a new fix task and links it via
- * `created_fix_task_id`.
+ * Result of a review gate over one exact task claim. `NeedsFix` blocks the
+ * current task until an explicit retry or task revision; it does not create a
+ * parallel task graph.
  */
 export type ReviewResult = {
   id: string;

@@ -211,7 +211,7 @@ impl SlashCommand {
             Self::Diff => "Show git or file diff",
             Self::Preview => "Preview a workspace text file",
             Self::Edit => "Edit a workspace file in $VISUAL/$EDITOR",
-            Self::Browser => "Show or switch the browser backend",
+            Self::Browser => "Control browser status, backend, tabs, navigation, and actions",
             Self::Analysis => "Create, inspect, and run file-backed analyses",
             Self::Papers => "Manage research sources, evidence, and systematic reviews",
             Self::Terminal => "Manage and attach to interactive terminal sessions",
@@ -338,7 +338,7 @@ impl SlashCommand {
             Self::Forget => "<fact>",
             Self::Diff => "[file-path]",
             Self::Preview | Self::Edit => "<file-path>",
-            Self::Browser => "[status|managed|chrome]",
+            Self::Browser => "[status|managed|chrome|navigate <url>|back|reload|screenshot]",
             Self::Analysis => {
                 "[list|create <python|r> <title>|show <id>|save <id> <json>|run <id>|wait <id> <owner>|cancel <id>|delete <id>]"
             }

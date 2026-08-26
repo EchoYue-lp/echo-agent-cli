@@ -180,9 +180,16 @@ async fn run_desktop() -> anyhow::Result<()> {
     // ── Config watcher ──
     let config_path = config_watcher::resolve_config_path(args.config.as_deref());
     let config_save_path = config_watcher::resolve_config_save_path(args.config.as_deref());
+    let config_workspace_root = agent_handle
+        .read(|agent| agent.working_dir())
+        .await
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     let config_watcher = Arc::new(config_watcher::spawn_config_watcher(
         config_path,
         agent_handle.clone(),
+        config_workspace_root,
+        Some(runtime.plugin_runtime.clone()),
+        runtime.extension_control.clone(),
         Some(webhook_emitter.clone()),
         cancel_token.clone(),
     ));
@@ -233,6 +240,8 @@ async fn run_desktop() -> anyhow::Result<()> {
         .with_review_integration(runtime.review_integration.clone())
         .with_prompt_assembly(runtime.prompt_assembly.clone())
         .with_plugin_runtime(Some(runtime.plugin_runtime.clone()))
+        .with_extension_control(runtime.extension_control.clone())
+        .with_browser_runtime(Some(runtime.browser_runtime.clone()))
         .with_config_watcher(Some(config_watcher.clone()))
         .with_command_cell_runtime(runtime.command_cell_runtime.clone())
         .with_workspace_delete_hook(runtime.browser_runtime.clone());
@@ -326,6 +335,31 @@ async fn run_desktop() -> anyhow::Result<()> {
     lifecycle.bind_app_state(state.clone());
     if let Some(store) = state.tasks.runtime.as_ref() {
         lifecycle.bind_task_runtime(store.clone());
+    }
+    match state
+        .extension_control
+        .reconcile_enabled_skills_on_load(&state)
+        .await
+    {
+        Ok(receipt)
+            if receipt.status
+                == echo_agent_app_core::extension_control::SkillSettlementStatus::Settled =>
+        {
+            tracing::info!(
+                generation = receipt.settled_generation,
+                "Extension Skill generation settled during GUI startup"
+            );
+        }
+        Ok(receipt) => tracing::warn!(
+            desired_generation = receipt.desired_generation,
+            settled_generation = receipt.settled_generation,
+            status = ?receipt.status,
+            "Extension Skill repair remains pending after GUI startup"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "Extension Skill repair failed during GUI startup"
+        ),
     }
     if let Err(error) = state.recover_agent_deliveries().await {
         tracing::warn!(%error, "failed to resume durable Agent deliveries during GUI startup");

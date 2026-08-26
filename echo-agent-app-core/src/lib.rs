@@ -21,6 +21,8 @@ pub mod diff;
 pub mod error;
 pub mod evolution;
 pub mod export;
+pub mod extension_commands;
+pub mod extension_control;
 pub mod foreground_turn;
 pub mod hitl;
 pub mod hook_config_loader;

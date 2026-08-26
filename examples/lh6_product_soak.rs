@@ -538,6 +538,13 @@ async fn bootstrap(
     let config_watcher = Arc::new(echo_agent_app_core::config_watcher::spawn_config_watcher(
         Some(args.config.clone()),
         runtime.agent_handle.clone(),
+        runtime
+            .agent_handle
+            .read(|agent| agent.working_dir())
+            .await
+            .unwrap_or_else(|| std::path::PathBuf::from(".")),
+        Some(runtime.plugin_runtime.clone()),
+        runtime.extension_control.clone(),
         None,
         root_cancel.clone(),
     ));
@@ -567,6 +574,7 @@ async fn bootstrap(
             review_integration: runtime.review_integration.clone(),
             mcp_config_runtime: runtime.mcp_config_runtime.clone(),
             plugin_runtime: runtime.plugin_runtime.clone(),
+            extension_control: runtime.extension_control.clone(),
             config_watcher: config_watcher.clone(),
             foreground_turns,
             command_cell_runtime: runtime.command_cell_runtime.clone(),

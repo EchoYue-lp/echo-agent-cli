@@ -5,44 +5,12 @@
 //! functionally equivalent). Both read from the live agent's `HookRegistry`
 //! via the primary agent handle, the same accessor the CLI uses.
 
+use crate::tauri::commands::extensions;
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent_app_core::hook_config_loader::HookConfigLoader;
-use serde::{Deserialize, Serialize};
-
-// ── DTOs ────────────────────────────────────────────────────────────────────
-
-/// A single registered hook source (e.g. `user_config`, `skill:foo`,
-/// `plugin:bar`) plus the number of rules it contributes.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HookSourceInfo {
-    pub source: String,
-    pub rule_count: usize,
-}
-
-/// Summary of a reload: where hooks were merged from and the total rule count.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HooksReloadSummary {
-    pub success: bool,
-    pub rule_count: usize,
-    /// Display strings of the files the merged definition was loaded from.
-    pub loaded_from: Vec<String>,
-    pub message: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HookTestResult {
-    pub event: String,
-    pub matcher: String,
-    pub matches: Vec<HookTestMatch>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HookTestMatch {
-    pub source: String,
-    pub matcher: String,
-    pub action: String,
-}
+use echo_agent_app_core::extension_commands::{
+    ExtensionCommand, ExtensionCommandReceipt, ExtensionRequestScope, HookCommand,
+};
 
 // ── IPC Commands ────────────────────────────────────────────────────────────
 
@@ -53,21 +21,16 @@ pub struct HookTestMatch {
 #[tauri::command]
 pub async fn list_hooks(
     state: tauri::State<'_, TauriState>,
-) -> Result<Vec<HookSourceInfo>, IpcError> {
-    let agent_handle = state.app_state.connection.primary_agent();
-    let sources: Vec<(String, usize)> = agent_handle
-        .read_async(|a| {
-            Box::pin(async move {
-                let registry = a.hook_registry().read().await;
-                registry.list_sources()
-            })
-        })
-        .await;
-    let infos = sources
-        .into_iter()
-        .map(|(source, rule_count)| HookSourceInfo { source, rule_count })
-        .collect();
-    Ok(infos)
+    request_scope: ExtensionRequestScope,
+) -> Result<ExtensionCommandReceipt, IpcError> {
+    Ok(extensions::dispatch_scoped(
+        &state,
+        request_scope,
+        "tauri-hook-control",
+        ExtensionCommand::Hooks(HookCommand::List),
+        None,
+    )
+    .await)
 }
 
 #[tauri::command]
@@ -81,34 +44,21 @@ pub fn list_hook_events() -> Vec<&'static str> {
 #[tauri::command]
 pub async fn test_hook(
     state: tauri::State<'_, TauriState>,
+    request_scope: ExtensionRequestScope,
     event: String,
     matcher: Option<String>,
-) -> Result<HookTestResult, IpcError> {
-    let hook_event = echo_agent::skills::hooks::HookEvent::from_name(&event)
-        .ok_or_else(|| IpcError::Validation(format!("Unknown hook event: {event}")))?;
-    let matcher = matcher.unwrap_or_else(|| "*".to_string());
-    let context = echo_agent::skills::hooks::HookContext::for_dry_run(hook_event, &matcher);
-    let dry_run = state
-        .app_state
-        .connection
-        .primary_agent()
-        .read_async(|agent| {
-            Box::pin(async move { agent.hook_registry().read().await.dry_run(&context) })
-        })
-        .await;
-    Ok(HookTestResult {
-        event,
-        matcher,
-        matches: dry_run
-            .matches
-            .into_iter()
-            .map(|item| HookTestMatch {
-                source: item.source,
-                matcher: item.matcher,
-                action: item.action,
-            })
-            .collect(),
-    })
+) -> Result<ExtensionCommandReceipt, IpcError> {
+    Ok(extensions::dispatch_scoped(
+        &state,
+        request_scope,
+        "tauri-hook-control",
+        ExtensionCommand::Hooks(HookCommand::Test {
+            event,
+            matcher: matcher.unwrap_or_else(|| "*".to_string()),
+        }),
+        None,
+    )
+    .await)
 }
 
 /// Reload user-configured hooks from disk and re-register them on the live
@@ -122,53 +72,14 @@ pub async fn test_hook(
 #[tauri::command]
 pub async fn reload_hooks(
     state: tauri::State<'_, TauriState>,
-) -> Result<HooksReloadSummary, IpcError> {
-    // Load the merged definition outside the agent write lock — disk I/O should
-    // never block other agent readers/writers.
-    let load_result = HookConfigLoader::load_merged_from_disk();
-    let rule_count: usize = load_result.definition.rules.values().map(|v| v.len()).sum();
-
-    let hooks_def = load_result.definition;
-    let loaded_from: Vec<String> = load_result
-        .loaded_from
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect();
-    if !load_result.errors.is_empty() {
-        return Ok(HooksReloadSummary {
-            success: false,
-            rule_count,
-            loaded_from,
-            message: format!(
-                "Hook reload aborted; existing hooks are unchanged: {}",
-                load_result.errors.join("; ")
-            ),
-        });
-    }
-
-    // Register into the agent's hook registry. clear_user_hooks +
-    // register_user_hooks both need `&mut`, so this runs under write_async.
-    let agent_handle = state.app_state.connection.primary_agent();
-    agent_handle
-        .write_async(|a| {
-            Box::pin(async move {
-                let mut registry = a.hook_registry().write().await;
-                registry.clear_user_hooks();
-                if !hooks_def.is_empty() {
-                    registry.register_user_hooks(hooks_def);
-                }
-            })
-        })
-        .await;
-
-    Ok(HooksReloadSummary {
-        success: true,
-        rule_count,
-        loaded_from,
-        message: if rule_count == 0 {
-            "No hooks found; cleared previous user hooks".to_string()
-        } else {
-            format!("Reloaded {} hook rules", rule_count)
-        },
-    })
+    request_scope: ExtensionRequestScope,
+) -> Result<ExtensionCommandReceipt, IpcError> {
+    Ok(extensions::dispatch_scoped(
+        &state,
+        request_scope,
+        "tauri-hook-control",
+        ExtensionCommand::Hooks(HookCommand::Reload),
+        None,
+    )
+    .await)
 }

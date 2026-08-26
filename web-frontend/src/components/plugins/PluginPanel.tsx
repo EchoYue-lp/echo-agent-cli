@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   pluginApi,
+  extensionRequestScope,
   type PluginInfo,
   type PluginOutputStyle,
   type PluginThemeDefinition,
@@ -26,9 +27,13 @@ import {
   Save,
 } from 'lucide-react';
 import { applyPluginTheme, useUiStore } from '../../stores/uiStore';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 
 export function PluginPanel() {
+  const workspace = useWorkspaceStore((state) => state.current);
+  const requestScope = useMemo(() => extensionRequestScope(workspace), [workspace]);
   const [plugins, setPlugins] = useState<PluginInfo[]>([]);
+  const [pluginOmitted, setPluginOmitted] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -43,8 +48,10 @@ export function PluginPanel() {
   const [scaffoldName, setScaffoldName] = useState('my-plugin');
   const [developerBusy, setDeveloperBusy] = useState(false);
   const [pluginThemes, setPluginThemes] = useState<PluginThemeDefinition[]>([]);
+  const [themeOmitted, setThemeOmitted] = useState(0);
   const activeTheme = useUiStore((state) => state.activePluginTheme);
   const [outputStyles, setOutputStyles] = useState<PluginOutputStyle[]>([]);
+  const [styleOmitted, setStyleOmitted] = useState(0);
   const [activeOutputStyle, setActiveOutputStyle] = useState<string | null>(null);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
 
@@ -63,14 +70,17 @@ export function PluginPanel() {
     try {
       setLoading(true);
       const [data, themes, styles] = await Promise.all([
-        pluginApi.list(),
-        pluginApi.themes(),
-        pluginApi.outputStyles(),
+        pluginApi.list(requestScope),
+        pluginApi.themes(requestScope),
+        pluginApi.outputStyles(requestScope),
       ]);
-      setPlugins(data);
+      setPlugins(data.plugins);
+      setPluginOmitted(data.omitted);
       setPluginThemes(themes.themes);
+      setThemeOmitted(themes.omitted);
       applyPluginTheme(themes.themes.find((theme) => theme.name === themes.active) || null);
       setOutputStyles(styles.styles);
+      setStyleOmitted(styles.omitted);
       setActiveOutputStyle(styles.active);
       setError(null);
     } catch (e: any) {
@@ -78,7 +88,7 @@ export function PluginPanel() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [requestScope]);
 
   useEffect(() => {
     void loadPlugins();
@@ -87,7 +97,7 @@ export function PluginPanel() {
   const handleThemeChange = async (name: string) => {
     try {
       setRuntimeBusy(true);
-      const result = await pluginApi.activateTheme(name || null);
+      const result = await pluginApi.activateTheme(requestScope, name || null);
       applyPluginTheme(result.theme);
       setMessage({
         type: 'success',
@@ -101,7 +111,7 @@ export function PluginPanel() {
   };
 
   const handleConfigure = async (name: string, values: Record<string, unknown>) => {
-    const result = await pluginApi.configure(name, values);
+    const result = await pluginApi.configure(requestScope, name, values);
     if (!result.success) {
       throw new Error(result.errors?.join('; ') || result.error || 'Configuration failed');
     }
@@ -112,7 +122,7 @@ export function PluginPanel() {
   const handleOutputStyleChange = async (name: string) => {
     try {
       setRuntimeBusy(true);
-      const result = await pluginApi.activateOutputStyle(name || null);
+      const result = await pluginApi.activateOutputStyle(requestScope, name || null);
       setActiveOutputStyle(result.active);
       setMessage({
         type: 'success',
@@ -130,7 +140,7 @@ export function PluginPanel() {
     try {
       setInstalling(true);
       setMessage(null);
-      const result = await pluginApi.install({
+      const result = await pluginApi.install(requestScope, {
         source: installSource.trim(),
         scope: installScope,
       });
@@ -152,7 +162,7 @@ export function PluginPanel() {
   const handleUninstall = async (name: string) => {
     if (!confirm(`Uninstall plugin '${name}'?`)) return;
     try {
-      const result = await pluginApi.uninstall({ name });
+      const result = await pluginApi.uninstall(requestScope, { name });
       if (result.success) {
         setMessage(mutationMessage(result, `Plugin '${name}' uninstalled`));
         await loadPlugins();
@@ -167,8 +177,8 @@ export function PluginPanel() {
   const handleToggle = async (plugin: PluginInfo) => {
     try {
       const result = plugin.enabled
-        ? await pluginApi.disable(plugin.name)
-        : await pluginApi.enable(plugin.name);
+        ? await pluginApi.disable(requestScope, plugin.name)
+        : await pluginApi.enable(requestScope, plugin.name);
       if (result.success) {
         setMessage(mutationMessage(result, `Plugin ${plugin.enabled ? 'disabled' : 'enabled'}`));
         await loadPlugins();
@@ -183,7 +193,7 @@ export function PluginPanel() {
   const handleReload = async () => {
     try {
       setLoading(true);
-      const result = await pluginApi.reload();
+      const result = await pluginApi.reload(requestScope);
       if (result.success) {
         setMessage({ type: 'success', text: result.message || 'Plugins reloaded' });
         await loadPlugins();
@@ -201,7 +211,11 @@ export function PluginPanel() {
     if (!developerPath.trim() || !scaffoldName.trim()) return;
     try {
       setDeveloperBusy(true);
-      const result = await pluginApi.scaffold(developerPath.trim(), scaffoldName.trim());
+      const result = await pluginApi.scaffold(
+        requestScope,
+        developerPath.trim(),
+        scaffoldName.trim()
+      );
       setMessage(
         result.success
           ? { type: 'success', text: result.message || `Plugin scaffolded at ${result.path}` }
@@ -218,7 +232,7 @@ export function PluginPanel() {
     if (!developerPath.trim()) return;
     try {
       setDeveloperBusy(true);
-      const report = await pluginApi.validate(developerPath.trim());
+      const report = await pluginApi.validate(requestScope, developerPath.trim());
       setMessage(
         report.valid
           ? {
@@ -256,6 +270,7 @@ export function PluginPanel() {
           </h2>
           <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
             {plugins.length} installed, {enabledCount} enabled
+            {pluginOmitted > 0 ? `, ${pluginOmitted} omitted` : ''}
           </span>
         </div>
         <div className="flex gap-2">
@@ -407,6 +422,7 @@ export function PluginPanel() {
                     {theme.display_name || theme.name} ({theme.plugin})
                   </option>
                 ))}
+                {themeOmitted > 0 && <option disabled>{themeOmitted} more themes omitted</option>}
               </select>
             )}
           </div>
@@ -436,6 +452,7 @@ export function PluginPanel() {
                   {style.name} ({style.plugin})
                 </option>
               ))}
+              {styleOmitted > 0 && <option disabled>{styleOmitted} more styles omitted</option>}
             </select>
             {activeOutputStyle && (
               <div className="text-xs" style={{ color: 'var(--text-tertiary)' }}>

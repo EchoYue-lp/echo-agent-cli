@@ -492,7 +492,9 @@ pub struct SessionState {
 /// 插件状态：MCP 服务管理
 pub struct PluginState {
     pub mcp_config: Arc<crate::mcp_config_runtime::McpConfigRuntime>,
-    pub mcp_health: RwLock<HashMap<String, McpHealthStatus>>,
+    /// Health is scoped by workspace host generation. A process-global or
+    /// workspace-id-only map can expose an old host after same-id recreation.
+    pub mcp_health: RwLock<HashMap<String, HashMap<String, McpHealthStatus>>>,
 }
 
 /// 持久化存储状态
@@ -822,6 +824,32 @@ pub struct ScopedWorkspaceControl {
     workspace: Option<Workspace>,
 }
 
+/// Exact extension host captured under the workspace publication lock.
+///
+/// Keeping the runtime, plugin service and project root in one receipt prevents
+/// a command accepted for workspace A from resolving a plugin or hook target
+/// again after focus has moved to workspace B.
+pub struct ScopedExtensionControl {
+    runtime: ScopedChatRuntime,
+    plugin_runtime: Arc<crate::plugin_runtime::PluginRuntimeService>,
+    project_root: std::path::PathBuf,
+}
+
+/// One exact primary/pool plugin generation participating in a global
+/// extension policy mutation.
+pub struct ExtensionRuntimeTarget {
+    scope: String,
+    _lifetime: ScopedRuntimeLifetime,
+    primary_agent: AgentHandle,
+    pool: Arc<crate::agent_pool::AgentPool>,
+    plugin_runtime: Arc<crate::plugin_runtime::PluginRuntimeService>,
+}
+
+pub struct ExtensionRuntimeTargets {
+    _transition: tokio::sync::OwnedRwLockReadGuard<()>,
+    targets: Vec<ExtensionRuntimeTarget>,
+}
+
 struct ScopedConversationControl {
     _lifetime: ScopedRuntimeLifetime,
     store: Arc<dyn ConversationStore>,
@@ -915,6 +943,44 @@ pub enum ScopedWorkspaceGenerationError {
     Stale { workspace_id: String },
 }
 
+impl ScopedExtensionControl {
+    pub fn runtime(&self) -> &ScopedChatRuntime {
+        &self.runtime
+    }
+
+    pub fn plugin_runtime(&self) -> Arc<crate::plugin_runtime::PluginRuntimeService> {
+        Arc::clone(&self.plugin_runtime)
+    }
+
+    pub fn project_root(&self) -> &std::path::Path {
+        &self.project_root
+    }
+}
+
+impl ExtensionRuntimeTarget {
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    pub fn primary_agent(&self) -> AgentHandle {
+        self.primary_agent.clone()
+    }
+
+    pub fn pool(&self) -> Arc<crate::agent_pool::AgentPool> {
+        Arc::clone(&self.pool)
+    }
+
+    pub fn plugin_runtime(&self) -> Arc<crate::plugin_runtime::PluginRuntimeService> {
+        Arc::clone(&self.plugin_runtime)
+    }
+}
+
+impl ExtensionRuntimeTargets {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &ExtensionRuntimeTarget> {
+        self.targets.iter()
+    }
+}
+
 #[derive(Clone)]
 enum ScopedRuntimeLifetime {
     Global,
@@ -926,6 +992,10 @@ enum ScopedRuntimeLifetime {
 impl ScopedChatRuntime {
     pub fn execution_scope(&self) -> &crate::workspace::WorkspaceExecutionScope {
         &self.execution_scope
+    }
+
+    pub(crate) fn workspace_host_generation(&self) -> &str {
+        self.workspace_io_identity.host_generation()
     }
 
     pub fn pool(&self) -> Option<Arc<crate::agent_pool::AgentPool>> {
@@ -1287,12 +1357,14 @@ pub struct AppState {
     pub workspace: WorkspaceState,
     /// Skills Hub（本地技能市场）
     pub skills_hub: Arc<RwLock<crate::skills_hub::SkillsHub>>,
+    /// Sole product authority for extension mutations across every surface.
+    pub extension_control: Arc<crate::extension_control::ExtensionControlService>,
     /// Shared memory review integration for GUI/IPC paths that write real memory.
     pub review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
     /// Process-level shared plugin runtime (P0-4). `None` until bootstrap
     /// completes the primary agent; populated via
     /// [`Self::with_plugin_runtime`].
-    pub plugin_runtime: Option<Arc<crate::plugin_runtime::PluginRuntimeService>>,
+    pub(crate) plugin_runtime: Option<Arc<crate::plugin_runtime::PluginRuntimeService>>,
     /// Sole acknowledged hook/config watcher lifecycle handle.
     pub config_watcher: Option<Arc<crate::config_watcher::ConfigWatcherHandle>>,
     /// Application-owned command-cell runtime shared by every Agent surface.
@@ -1300,6 +1372,8 @@ pub struct AppState {
         Option<Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>>,
     /// Interactive terminal authority shared by GUI, TUI, CLI, and channels.
     pub terminal: Arc<crate::terminal::TerminalService>,
+    /// Shared direct Browser authority for GUI, TUI, CLI and channels.
+    pub browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     /// Durable cross-workspace conversation inbox authority.
     pub agent_router: Arc<crate::agent_router::AgentRouter>,
     /// Owned lifetime for asynchronous inbox consumers.
@@ -1493,11 +1567,15 @@ impl AppState {
                 })),
             },
             skills_hub: Arc::new(RwLock::new(crate::skills_hub::SkillsHub::new())),
+            extension_control: Arc::new(
+                crate::extension_control::ExtensionControlService::default(),
+            ),
             review_integration: None,
             plugin_runtime: None,
             config_watcher: None,
             command_cell_runtime: None,
             terminal: crate::terminal::TerminalService::new(),
+            browser_runtime: None,
             agent_router: crate::agent_router::AgentRouter::at_default_root(),
             agent_deliveries: Arc::new(crate::agent_router::AgentDeliverySupervisor::default()),
             workspace_delete_hook: None,
@@ -1874,6 +1952,22 @@ impl AppState {
         plugin_runtime: Option<Arc<crate::plugin_runtime::PluginRuntimeService>>,
     ) -> Self {
         self.plugin_runtime = plugin_runtime;
+        self
+    }
+
+    pub fn with_browser_runtime(
+        mut self,
+        browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
+    ) -> Self {
+        self.browser_runtime = browser_runtime;
+        self
+    }
+
+    pub fn with_extension_control(
+        mut self,
+        extension_control: Arc<crate::extension_control::ExtensionControlService>,
+    ) -> Self {
+        self.extension_control = extension_control;
         self
     }
 
@@ -2583,51 +2677,13 @@ impl AppState {
 
     /// 运行一次 MCP 健康检查，更新 `mcp_health` 状态
     pub async fn run_mcp_health_check(&self) {
-        let server_names: Vec<String> = self
-            .connection
-            .agent
-            .read(|agent| {
-                agent
-                    .list_mcp_servers()
-                    .into_iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .await;
-
-        let now = chrono::Utc::now();
-        let mut new_health: HashMap<String, McpHealthStatus> = HashMap::new();
-
-        for name in &server_names {
-            let healthy = self
-                .connection
-                .agent
-                .read(|agent| {
-                    agent
-                        .mcp_client(name)
-                        .map(|client| !client.tools().is_empty())
-                        .unwrap_or(false)
-                })
-                .await;
-            let error = if healthy {
-                None
-            } else {
-                Some("MCP server unresponsive or returned empty tools".to_string())
-            };
-            new_health.insert(
-                name.clone(),
-                McpHealthStatus {
-                    name: name.clone(),
-                    healthy,
-                    last_check: Some(now),
-                    error,
-                },
-            );
+        if let Err(error) = self
+            .extension_control
+            .refresh_current_mcp_health(self)
+            .await
+        {
+            tracing::warn!(%error, "MCP health check skipped during extension transition");
         }
-
-        // 写入健康状态
-        let mut health_map = self.plugins.mcp_health.write().await;
-        *health_map = new_health;
     }
 
     /// 添加审计日志条目（FIFO 淘汰，防止内存无限增长）
@@ -2789,10 +2845,36 @@ impl AppState {
         })
         .await
         .map_err(|error| anyhow::anyhow!("workspace link task failed: {error}"))??;
-        if let Some(host) = self.workspace.current.read().await.clone()
-            && host.id() == &workspace_id
-        {
+        if let Some(host) = self.workspace.runtimes.loaded_host(&workspace_id).await {
             host.refresh_workspace(workspace.clone()).await?;
+            if let (Some(watcher), Some(execution)) =
+                (self.config_watcher.as_ref(), host.execution_if_loaded())
+            {
+                match watcher
+                    .register_workspace(
+                        crate::config_watcher::ConfigWatcherWorkspaceIdentity::new(
+                            workspace.id.to_string(),
+                            workspace.opaque_product_data_generation(),
+                        ),
+                        workspace.root.clone(),
+                        execution.primary_agent(),
+                        execution.plugin_runtime(),
+                    )
+                    .await
+                {
+                    Ok(receipt) if receipt.errors.is_empty() => {}
+                    Ok(receipt) => tracing::warn!(
+                        workspace = %workspace.id,
+                        errors = %receipt.errors.join("; "),
+                        "Workspace relink committed with degraded config watcher settlement"
+                    ),
+                    Err(error) => tracing::warn!(
+                        workspace = %workspace.id,
+                        %error,
+                        "Workspace relink committed before config watcher registration settled"
+                    ),
+                }
+            }
         }
         Ok(workspace)
     }
@@ -2914,6 +2996,15 @@ impl AppState {
         &self,
         workspace_id: &crate::workspace::WorkspaceId,
     ) -> anyhow::Result<()> {
+        let watcher_identity = if self.config_watcher.is_some() {
+            let workspace = self.workspace.registry.inspect(workspace_id)?;
+            Some(crate::config_watcher::ConfigWatcherWorkspaceIdentity::new(
+                workspace.id.to_string(),
+                workspace.opaque_product_data_generation(),
+            ))
+        } else {
+            None
+        };
         let router_retirement = self
             .agent_router
             .begin_workspace_retirement(workspace_id.clone())?;
@@ -2931,6 +3022,14 @@ impl AppState {
             .is_some_and(|host| host.id() == workspace_id)
         {
             self.exit_workspace_inner_locked().await?;
+        }
+        // The watcher acknowledgement is a drain boundary for earlier file
+        // events. Remove the exact generation before specialist teardown so a
+        // delayed event cannot race host shutdown or same-id recreation.
+        if let (Some(watcher), Some(identity)) = (self.config_watcher.as_ref(), watcher_identity)
+            && let Err(error) = watcher.unregister_workspace(identity).await
+        {
+            tracing::warn!(workspace = %workspace_id, %error, "Failed to unregister deleted workspace from config watcher");
         }
         self.workspace
             .runtimes
@@ -4184,7 +4283,7 @@ impl AppState {
         targets
     }
 
-    pub async fn replace_mcp_config_owned(
+    pub(crate) async fn replace_mcp_config_owned(
         self: &Arc<Self>,
         candidate: echo_agent::mcp::McpConfigFile,
     ) -> Result<u64, crate::mcp_config_runtime::McpConfigRuntimeError> {
@@ -4194,7 +4293,7 @@ impl AppState {
             .await
     }
 
-    pub async fn upsert_mcp_server_owned(
+    pub(crate) async fn upsert_mcp_server_owned(
         self: &Arc<Self>,
         name: String,
         entry: echo_agent::mcp::McpServerEntry,
@@ -4205,7 +4304,7 @@ impl AppState {
             .await
     }
 
-    pub async fn set_mcp_server_enabled_owned(
+    pub(crate) async fn set_mcp_server_enabled_owned(
         self: &Arc<Self>,
         name: &str,
         enabled: bool,
@@ -4216,7 +4315,7 @@ impl AppState {
             .await
     }
 
-    pub async fn remove_mcp_server_owned(
+    pub(crate) async fn remove_mcp_server_owned(
         self: &Arc<Self>,
         name: &str,
     ) -> Result<u64, crate::mcp_config_runtime::McpConfigRuntimeError> {
@@ -4224,32 +4323,6 @@ impl AppState {
             .mcp_config
             .remove_and_reconcile(self.mcp_reconcile_targets().await, name)
             .await
-    }
-
-    /// Resolve plugin reads and mutations against the currently focused host.
-    /// Global mode keeps using the bootstrap runtime.
-    pub async fn current_plugin_runtime_owned(
-        &self,
-    ) -> anyhow::Result<Arc<crate::plugin_runtime::PluginRuntimeService>> {
-        let _transition = self.workspace.transition.read().await;
-        let current = self.workspace.current.read().await.clone();
-        if let Some(host) = current {
-            let seed_pool = self.connection.pool.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Workspace plugin runtime requires the application AgentPool to be initialized"
-                )
-            })?;
-            if let Some(runtime) = host
-                .get_or_open_execution(seed_pool)
-                .await?
-                .plugin_runtime()
-            {
-                return Ok(runtime);
-            }
-        }
-        self.plugin_runtime
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Plugin runtime service is not initialized"))
     }
 
     async fn plugin_runtime_targets(
@@ -4274,70 +4347,13 @@ impl AppState {
         targets
     }
 
-    async fn reload_plugin_followers(
+    pub(crate) async fn reload_plugin_followers(
         &self,
         authority: &Arc<crate::plugin_runtime::PluginRuntimeService>,
         summary: &mut crate::plugin_runtime::ReloadSummary,
     ) {
         reload_plugin_runtime_followers(authority, summary, self.plugin_runtime_targets().await)
             .await;
-    }
-
-    pub async fn reload_plugins_owned(
-        &self,
-    ) -> anyhow::Result<crate::plugin_runtime::ReloadSummary> {
-        let authority = self.current_plugin_runtime_owned().await?;
-        let mut summary = authority.reload().await?;
-        self.reload_plugin_followers(&authority, &mut summary).await;
-        Ok(summary)
-    }
-
-    pub async fn install_plugin_owned(
-        &self,
-        source: &echo_agent::plugin::InstallSource,
-        scope: echo_agent::plugin::PluginScope,
-    ) -> anyhow::Result<(String, crate::plugin_runtime::ReloadSummary)> {
-        let authority = self.current_plugin_runtime_owned().await?;
-        let (plugin_id, mut summary) = authority.install(source, scope).await?;
-        self.reload_plugin_followers(&authority, &mut summary).await;
-        Ok((plugin_id, summary))
-    }
-
-    pub async fn uninstall_plugin_owned(
-        &self,
-        name: &str,
-        keep_data: bool,
-    ) -> anyhow::Result<crate::plugin_runtime::ReloadSummary> {
-        let authority = self.current_plugin_runtime_owned().await?;
-        let mut summary = authority.uninstall(name, keep_data).await?;
-        self.reload_plugin_followers(&authority, &mut summary).await;
-        Ok(summary)
-    }
-
-    pub async fn set_plugin_enabled_owned(
-        &self,
-        name: &str,
-        enabled: bool,
-    ) -> anyhow::Result<crate::plugin_runtime::ReloadSummary> {
-        let authority = self.current_plugin_runtime_owned().await?;
-        let mut summary = if enabled {
-            authority.enable(name).await?
-        } else {
-            authority.disable(name).await?
-        };
-        self.reload_plugin_followers(&authority, &mut summary).await;
-        Ok(summary)
-    }
-
-    pub async fn configure_plugin_owned(
-        &self,
-        name: &str,
-        values: HashMap<String, serde_json::Value>,
-    ) -> anyhow::Result<crate::plugin_runtime::ReloadSummary> {
-        let authority = self.current_plugin_runtime_owned().await?;
-        let mut summary = authority.configure(name, values).await?;
-        self.reload_plugin_followers(&authority, &mut summary).await;
-        Ok(summary)
     }
 
     /// Capture all execution authorities for the currently focused workspace.
@@ -4370,6 +4386,202 @@ impl AppState {
         self.current_chat_runtime_inner()
             .await
             .map_err(|error| ScopedControlError::Runtime(error.to_string()))
+    }
+
+    /// Capture the exact runtime and extension authorities for the focused host.
+    pub async fn current_extension_control(
+        &self,
+    ) -> Result<ScopedExtensionControl, ScopedControlError> {
+        let _lifecycle = self
+            .workspace
+            .transition
+            .try_read()
+            .map_err(|_| ScopedControlError::WorkspaceTransition)?;
+        let current = self.workspace.current.read().await.clone();
+        match current {
+            Some(host) => {
+                let seed_pool = self.connection.pool.as_ref().ok_or_else(|| {
+                    ScopedControlError::Runtime(
+                        "workspace extension control requires an AgentPool".to_string(),
+                    )
+                })?;
+                let control_lease = self
+                    .workspace
+                    .runtimes
+                    .acquire_control_for_host(&host)
+                    .await
+                    .map_err(|error| ScopedControlError::Runtime(error.to_string()))?;
+                let execution = host
+                    .get_or_open_execution(seed_pool)
+                    .await
+                    .map_err(|error| ScopedControlError::Runtime(error.to_string()))?;
+                let workspace = host.workspace().await;
+                let project_root = workspace
+                    .project_root
+                    .clone()
+                    .unwrap_or_else(|| workspace.root.clone());
+                let resources = host.resources();
+                let runtime = ScopedChatRuntime {
+                    _lifetime: ScopedRuntimeLifetime::Workspace {
+                        _lease: control_lease,
+                    },
+                    execution_scope: host.execution_scope(),
+                    workspace_io_identity: host.workspace_io_identity(),
+                    primary_agent: execution.primary_agent(),
+                    pool: Some(execution.pool()),
+                    task_runtime: Some(execution.task_runtime()),
+                    review_integration: Some(execution.review_integration()),
+                    conversation_store: Some(resources.conversation_store()),
+                    runtime_state_store: Some(resources.runtime_state_store()),
+                    deletions: resources.deletion_service(),
+                };
+                let plugin_runtime = execution.plugin_runtime().ok_or_else(|| {
+                    ScopedControlError::Runtime(
+                        "workspace plugin runtime is not initialized".to_string(),
+                    )
+                })?;
+                Ok(ScopedExtensionControl {
+                    runtime,
+                    plugin_runtime,
+                    project_root,
+                })
+            }
+            None => {
+                let runtime = self
+                    .current_chat_runtime_inner()
+                    .await
+                    .map_err(|error| ScopedControlError::Runtime(error.to_string()))?;
+                let plugin_runtime = self.plugin_runtime.clone().ok_or_else(|| {
+                    ScopedControlError::Runtime(
+                        "plugin runtime service is not initialized".to_string(),
+                    )
+                })?;
+                Ok(ScopedExtensionControl {
+                    project_root: runtime.execution_scope().root().to_path_buf(),
+                    runtime,
+                    plugin_runtime,
+                })
+            }
+        }
+    }
+
+    /// Resolve Extension control from a surface-captured runtime generation.
+    ///
+    /// Channel and background surfaces must not re-read mutable workspace
+    /// focus after their turn has already pinned an exact runtime. Pool
+    /// identity distinguishes deletion/recreation ABA even when the workspace
+    /// id is reused.
+    pub async fn extension_control_for_runtime(
+        &self,
+        runtime: &ScopedChatRuntime,
+    ) -> Result<ScopedExtensionControl, ScopedControlError> {
+        let _lifecycle = self
+            .workspace
+            .transition
+            .try_read()
+            .map_err(|_| ScopedControlError::WorkspaceTransition)?;
+        let workspace_id = runtime.execution_scope().workspace_id();
+        let runtime_pool = runtime.pool().ok_or_else(|| {
+            ScopedControlError::Runtime(format!(
+                "extension runtime '{workspace_id}' has no AgentPool"
+            ))
+        })?;
+
+        let plugin_runtime = if workspace_id == "global" {
+            let current_pool = self.connection.pool.as_ref().ok_or_else(|| {
+                ScopedControlError::Runtime("global AgentPool is not initialized".to_string())
+            })?;
+            if !Arc::ptr_eq(current_pool, &runtime_pool) {
+                return Err(ScopedControlError::Runtime(
+                    "global extension runtime generation was replaced".to_string(),
+                ));
+            }
+            self.plugin_runtime.clone().ok_or_else(|| {
+                ScopedControlError::Runtime(
+                    "global plugin runtime service is not initialized".to_string(),
+                )
+            })?
+        } else {
+            let controls = self
+                .workspace
+                .runtimes
+                .loaded_execution_controls()
+                .await
+                .map_err(|error| ScopedControlError::Runtime(error.to_string()))?;
+            let mut matched = None;
+            for (candidate_id, execution, _lease) in controls {
+                if candidate_id.as_str() != workspace_id {
+                    continue;
+                }
+                let candidate_pool = execution.pool();
+                if !Arc::ptr_eq(&candidate_pool, &runtime_pool) {
+                    return Err(ScopedControlError::Runtime(format!(
+                        "workspace '{workspace_id}' extension runtime generation was replaced"
+                    )));
+                }
+                matched = execution.plugin_runtime();
+                break;
+            }
+            matched.ok_or_else(|| {
+                ScopedControlError::Runtime(format!(
+                    "workspace '{workspace_id}' plugin runtime is not registered"
+                ))
+            })?
+        };
+        let project_root = plugin_runtime.project_root().await;
+        Ok(ScopedExtensionControl {
+            runtime: runtime.clone(),
+            plugin_runtime,
+            project_root,
+        })
+    }
+
+    /// Pin the global seed plus every loaded workspace extension generation.
+    /// The global pool is first so future workspace forks inherit a committed
+    /// policy even when no workspace host is currently loaded.
+    pub async fn extension_runtime_targets(
+        &self,
+    ) -> Result<ExtensionRuntimeTargets, ScopedControlError> {
+        let transition = Arc::clone(&self.workspace.transition)
+            .try_read_owned()
+            .map_err(|_| ScopedControlError::WorkspaceTransition)?;
+        let global_runtime = self.plugin_runtime.clone().ok_or_else(|| {
+            ScopedControlError::Runtime("plugin runtime service is not initialized".to_string())
+        })?;
+        let global_pool = self.connection.pool.clone().ok_or_else(|| {
+            ScopedControlError::Runtime("global AgentPool is not initialized".to_string())
+        })?;
+        let mut targets = vec![ExtensionRuntimeTarget {
+            scope: "global".to_string(),
+            _lifetime: ScopedRuntimeLifetime::Global,
+            primary_agent: self.connection.primary_agent(),
+            pool: global_pool,
+            plugin_runtime: global_runtime,
+        }];
+        let controls = self
+            .workspace
+            .runtimes
+            .loaded_execution_controls()
+            .await
+            .map_err(|error| ScopedControlError::Runtime(error.to_string()))?;
+        for (workspace_id, execution, lease) in controls {
+            let plugin_runtime = execution.plugin_runtime().ok_or_else(|| {
+                ScopedControlError::Runtime(format!(
+                    "workspace '{workspace_id}' plugin runtime is not initialized"
+                ))
+            })?;
+            targets.push(ExtensionRuntimeTarget {
+                scope: workspace_id.to_string(),
+                _lifetime: ScopedRuntimeLifetime::Workspace { _lease: lease },
+                primary_agent: execution.primary_agent(),
+                pool: execution.pool(),
+                plugin_runtime,
+            });
+        }
+        Ok(ExtensionRuntimeTargets {
+            _transition: transition,
+            targets,
+        })
     }
 
     /// Run one structured extraction against the pooled Agent resolved by the
@@ -4608,6 +4820,30 @@ impl AppState {
         Ok((entered_rx, release_tx))
     }
 
+    #[cfg(test)]
+    pub(crate) fn park_next_workspace_control_acquire_for_test(
+        &self,
+    ) -> Result<
+        (
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ),
+        String,
+    > {
+        self.workspace.runtimes.park_next_control_acquire()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn evict_workspace_runtime_if_idle_for_test(
+        &self,
+        workspace_id: &crate::workspace::WorkspaceId,
+    ) -> anyhow::Result<bool> {
+        self.workspace
+            .runtimes
+            .shutdown_and_evict_if_idle(workspace_id)
+            .await
+    }
+
     async fn run_owned_workspace_transition(
         self: &Arc<Self>,
         request: WorkspaceTransitionRequest,
@@ -4635,14 +4871,24 @@ impl AppState {
                         WorkspaceSettlementOutcome::Created(workspace, created)
                     }),
                 #[cfg(test)]
-                WorkspaceTransitionRequest::Switch(workspace) => state
-                    .switch_workspace_inner(workspace)
-                    .await
-                    .map(WorkspaceSettlementOutcome::Transition),
-                WorkspaceTransitionRequest::SwitchRegistered(workspace_id) => state
-                    .switch_registered_workspace_inner(workspace_id)
-                    .await
-                    .map(WorkspaceSettlementOutcome::Transition),
+                WorkspaceTransitionRequest::Switch(workspace) => {
+                    let receipt = state.switch_workspace_inner(workspace).await?;
+                    Ok(WorkspaceSettlementOutcome::Transition(
+                        state
+                            .reconcile_extension_skills_after_workspace_load(receipt)
+                            .await,
+                    ))
+                }
+                WorkspaceTransitionRequest::SwitchRegistered(workspace_id) => {
+                    let receipt = state
+                        .switch_registered_workspace_inner(workspace_id)
+                        .await?;
+                    Ok(WorkspaceSettlementOutcome::Transition(
+                        state
+                            .reconcile_extension_skills_after_workspace_load(receipt)
+                            .await,
+                    ))
+                }
                 WorkspaceTransitionRequest::Exit => state
                     .exit_workspace_inner()
                     .await
@@ -4674,6 +4920,72 @@ impl AppState {
         result
     }
 
+    async fn reconcile_extension_skills_after_workspace_load(
+        self: &Arc<Self>,
+        mut receipt: WorkspaceTransitionReceipt,
+    ) -> WorkspaceTransitionReceipt {
+        let repair = self
+            .extension_control
+            .reconcile_enabled_skills_on_load(self)
+            .await;
+        let error = match repair {
+            Ok(skill_receipt)
+                if skill_receipt.status
+                    == crate::extension_control::SkillSettlementStatus::Settled =>
+            {
+                None
+            }
+            Ok(skill_receipt)
+                if skill_receipt.target_receipts.iter().all(|target| {
+                    target.error.as_deref().is_some_and(|error| {
+                        error.contains("plugin runtime service is not initialized")
+                    })
+                }) =>
+            {
+                None
+            }
+            Ok(skill_receipt) => Some(format!(
+                "skill desired generation {} remains {:?} at settled generation {}: {}",
+                skill_receipt.desired_generation,
+                skill_receipt.status,
+                skill_receipt.settled_generation,
+                skill_receipt
+                    .target_receipts
+                    .iter()
+                    .filter_map(|target| target
+                        .error
+                        .as_ref()
+                        .map(|error| format!("{}={error}", target.target)))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )),
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("plugin runtime service is not initialized") =>
+            {
+                // Lightweight state fixtures and the earliest bootstrap phase may not have
+                // attached the specialist runtime yet. Startup performs the same repair after
+                // binding that owner; do not misclassify this ordering gap as a workspace fault.
+                None
+            }
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(error) = error {
+            receipt.status = WorkspaceTransitionStatus::Degraded;
+            receipt
+                .degraded_subsystems
+                .push(WorkspaceSubsystemTransition {
+                    subsystem: "extension_skill_repair".to_string(),
+                    target_root: receipt.target_root.clone(),
+                    stale_roots: Vec::new(),
+                    error,
+                });
+        }
+        *self.workspace.last_transition.write().await = Some(receipt.clone());
+        receipt
+    }
+
     fn begin_workspace_transition_marker(&self) -> anyhow::Result<WorkspaceTransitionMarker> {
         if self
             .workspace
@@ -4693,16 +5005,23 @@ impl AppState {
         })
     }
 
-    /// Await a detached workspace settlement before tearing down plugin,
-    /// scheduler, watcher, MCP, or browser owners.
-    pub async fn shutdown_workspace_transition(&self) -> anyhow::Result<()> {
+    /// Await the detached workspace settlement without tearing down its runtime.
+    ///
+    /// Application shutdown uses this boundary before joining ProductData flows
+    /// so an accepted transition settles while its workspace specialists remain
+    /// available.
+    pub(crate) async fn join_workspace_transition(&self) -> anyhow::Result<()> {
         let mut settlement = self.workspace.settlement.lock().await;
         let result = match settlement.as_mut() {
             Some(handle) => await_workspace_settlement(handle).await.map(|_| ()),
             None => Ok(()),
         };
         settlement.take();
-        drop(settlement);
+        result
+    }
+
+    /// Tear down workspace specialist runtimes after ProductData settlement.
+    pub(crate) async fn shutdown_workspace_runtimes(&self) -> anyhow::Result<()> {
         for activity in self.workspace.runtimes.activity_snapshot().await? {
             tracing::debug!(
                 workspace = %activity.workspace_id,
@@ -4716,8 +5035,16 @@ impl AppState {
                 "workspace runtime activity before shutdown"
             );
         }
-        let runtime_result = self.workspace.runtimes.shutdown().await;
-        match (result, runtime_result) {
+        self.workspace.runtimes.shutdown().await
+    }
+
+    /// Await a detached workspace settlement and then tear down its runtime.
+    /// Callers coordinating ProductData must use the two explicit phase methods
+    /// so accepted extension settlement runs before specialist teardown.
+    pub async fn shutdown_workspace_transition(&self) -> anyhow::Result<()> {
+        let transition_result = self.join_workspace_transition().await;
+        let runtime_result = self.shutdown_workspace_runtimes().await;
+        match (transition_result, runtime_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
             (Err(transition), Err(runtime)) => Err(anyhow::anyhow!(
@@ -4816,7 +5143,15 @@ impl AppState {
         if let (Some(watcher), Some(execution)) = (self.config_watcher.as_ref(), execution.as_ref())
         {
             match watcher
-                .register_workspace(workspace.root.clone(), execution.primary_agent())
+                .register_workspace(
+                    crate::config_watcher::ConfigWatcherWorkspaceIdentity::new(
+                        workspace.id.to_string(),
+                        workspace.opaque_product_data_generation(),
+                    ),
+                    workspace.root.clone(),
+                    execution.primary_agent(),
+                    execution.plugin_runtime(),
+                )
                 .await
             {
                 Ok(registration) if registration.errors.is_empty() => {}
@@ -7519,6 +7854,257 @@ mod workspace_transition_tests {
         }
     }
 
+    async fn extension_control_state(
+        root: &std::path::Path,
+    ) -> Result<
+        (
+            Arc<AppState>,
+            Arc<crate::agent_pool::AgentPool>,
+            Arc<crate::plugin_runtime::PluginRuntimeService>,
+        ),
+        String,
+    > {
+        let global_root = root.join("global");
+        std::fs::create_dir_all(&global_root).map_err(|error| error.to_string())?;
+        let global_root = global_root
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let agent = AgentHandle::new(
+            ReactAgentBuilder::new()
+                .llm_client(Arc::new(MockLlmClient::new()))
+                .system_prompt("extension control runtime identity test")
+                .working_dir(global_root.clone())
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let seed_pool = Arc::new(
+            crate::agent_pool::AgentPool::new_for_test(agent.clone(), None, None, 4, false).await,
+        );
+        seed_pool
+            .update_mcp_config_snapshot(Default::default())
+            .await;
+        let plugin_runtime = crate::plugin_runtime::PluginRuntimeService::new_for_test(
+            agent.clone(),
+            global_root.clone(),
+            root.join("global-plugins.json"),
+            root.join("global-plugin-data"),
+        )
+        .await;
+        let mcp_runtime = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
+            root.join("mcp.json"),
+            Default::default(),
+        ));
+        let skill_root = root.join("skills");
+        std::fs::create_dir_all(&skill_root).map_err(|error| error.to_string())?;
+        let mut state = AppState::from_shared(
+            agent,
+            None,
+            Arc::new(crate::hitl::HitlDispatcher::new()),
+            None,
+            None,
+            Default::default(),
+            mcp_runtime,
+            crate::product_data_io::ProductDataIoService::new(),
+        )
+        .map_err(|error| error.to_string())?
+        .with_plugin_runtime(Some(Arc::clone(&plugin_runtime)));
+        state.skills_hub = Arc::new(tokio::sync::RwLock::new(
+            crate::skills_hub::SkillsHub::with_root(skill_root),
+        ));
+        state.extension_control = Arc::new(
+            crate::extension_control::ExtensionControlService::with_enabled_config_path(
+                root.join("enabled-skills.json"),
+            ),
+        );
+        state.workspace.global_execution_root = global_root;
+        state.workspace.registry = Arc::new(
+            WorkspaceRegistry::with_base_dir(root.join("workspace-registry"))
+                .map_err(|error| error.to_string())?,
+        );
+        state.tasks.runtime = Some(Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        ));
+        state.storage.chat_events = Arc::new(
+            crate::chat_event_log::ChatEventLog::open(
+                root.join("chat-events"),
+                crate::chat_event_log::ChatEventRetention::default(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        state.storage.tool_executions = Arc::new(
+            crate::tool_execution::ToolExecutionRepository::open(root.join("tool-executions"))
+                .map_err(|error| error.to_string())?,
+        );
+        state.set_pool(Arc::clone(&seed_pool));
+        Ok((Arc::new(state), seed_pool, plugin_runtime))
+    }
+
+    #[tokio::test]
+    async fn extension_control_for_runtime_keeps_captured_workspace_after_focus_change()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root_a = temp.path().join("workspace-a");
+        let root_b = temp.path().join("workspace-b");
+        std::fs::create_dir_all(&root_a).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&root_b).map_err(|error| error.to_string())?;
+        let canonical_a = root_a.canonicalize().map_err(|error| error.to_string())?;
+        let canonical_b = root_b.canonicalize().map_err(|error| error.to_string())?;
+        let (state, _, _) = extension_control_state(temp.path()).await?;
+
+        state
+            .switch_workspace(workspace("workspace-a", root_a))
+            .await
+            .map_err(|error| error.to_string())?;
+        let runtime_a = state
+            .current_control_runtime()
+            .await
+            .map_err(|error| error.to_string())?;
+        state
+            .switch_workspace(workspace("workspace-b", root_b))
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let control_a = state
+            .extension_control_for_runtime(&runtime_a)
+            .await
+            .map_err(|error| error.to_string())?;
+        let control_b = state
+            .current_extension_control()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            control_a.runtime().execution_scope().workspace_id(),
+            "workspace-a"
+        );
+        assert_eq!(control_a.project_root(), canonical_a.as_path());
+        assert_eq!(
+            control_b.runtime().execution_scope().workspace_id(),
+            "workspace-b"
+        );
+        assert_eq!(control_b.project_root(), canonical_b.as_path());
+        assert!(!Arc::ptr_eq(
+            &control_a.plugin_runtime(),
+            &control_b.plugin_runtime()
+        ));
+        let enabled = crate::skills_hub::enabled_skills::EnabledSkillsConfig::load(
+            &temp.path().join("enabled-skills.json"),
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(enabled.settled_generation, enabled.desired_generation);
+        assert!(enabled.repair_debt.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_control_for_runtime_rejects_replaced_workspace_generation()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root_a = temp.path().join("workspace-a");
+        let root_b = temp.path().join("workspace-b");
+        std::fs::create_dir_all(&root_a).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&root_b).map_err(|error| error.to_string())?;
+        let (state, _, _) = extension_control_state(temp.path()).await?;
+
+        state
+            .switch_workspace(workspace("workspace-a", root_a.clone()))
+            .await
+            .map_err(|error| error.to_string())?;
+        let runtime_a = state
+            .current_control_runtime()
+            .await
+            .map_err(|error| error.to_string())?;
+        // Preserve the captured identity without its control lease so the test
+        // can model a delayed surface request after the old host is evicted.
+        let stale_runtime = ScopedChatRuntime {
+            _lifetime: ScopedRuntimeLifetime::Global,
+            execution_scope: runtime_a.execution_scope.clone(),
+            workspace_io_identity: runtime_a.workspace_io_identity.clone(),
+            primary_agent: runtime_a.primary_agent.clone(),
+            pool: runtime_a.pool.clone(),
+            task_runtime: runtime_a.task_runtime.clone(),
+            review_integration: runtime_a.review_integration.clone(),
+            conversation_store: runtime_a.conversation_store.clone(),
+            runtime_state_store: runtime_a.runtime_state_store.clone(),
+            deletions: Arc::clone(&runtime_a.deletions),
+        };
+        drop(runtime_a);
+        state
+            .switch_workspace(workspace("workspace-b", root_b))
+            .await
+            .map_err(|error| error.to_string())?;
+        let workspace_a_id = crate::workspace::WorkspaceId::from_name("workspace-a");
+        assert!(
+            state
+                .evict_workspace_runtime_if_idle_for_test(&workspace_a_id)
+                .await
+                .map_err(|error| error.to_string())?
+        );
+        state
+            .switch_workspace(workspace("workspace-a", root_a))
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let error = state
+            .extension_control_for_runtime(&stale_runtime)
+            .await
+            .err()
+            .ok_or_else(|| "replaced workspace generation was accepted".to_string())?;
+        assert!(
+            error
+                .to_string()
+                .contains("workspace 'workspace-a' extension runtime generation was replaced")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_control_for_runtime_matches_global_pool_identity() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let (state, seed_pool, plugin_runtime) = extension_control_state(temp.path()).await?;
+        let global_runtime = state
+            .chat_runtime_for_scope("global")
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let control = state
+            .extension_control_for_runtime(&global_runtime)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(control.runtime().execution_scope().workspace_id(), "global");
+        assert!(Arc::ptr_eq(
+            &control
+                .runtime()
+                .pool()
+                .ok_or_else(|| "global runtime pool missing".to_string())?,
+            &seed_pool
+        ));
+        assert!(Arc::ptr_eq(&control.plugin_runtime(), &plugin_runtime));
+
+        let other_agent = AgentHandle::new(
+            ReactAgentBuilder::new()
+                .llm_client(Arc::new(MockLlmClient::new()))
+                .system_prompt("replacement global runtime")
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let mismatched_runtime = ScopedChatRuntime {
+            pool: Some(Arc::new(
+                crate::agent_pool::AgentPool::new_for_test(other_agent, None, None, 1, false).await,
+            )),
+            ..global_runtime.clone()
+        };
+        assert!(
+            state
+                .extension_control_for_runtime(&mismatched_runtime)
+                .await
+                .is_err_and(|error| error
+                    .to_string()
+                    .contains("global extension runtime generation was replaced"))
+        );
+        Ok(())
+    }
+
     #[test]
     fn workspace_transition_receipt_serializes_generated_typescript_contract()
     -> std::result::Result<(), String> {
@@ -7760,7 +8346,11 @@ mod workspace_transition_tests {
             .switch_workspace(workspace("workspace-b", root_b))
             .await
             .map_err(|error| error.to_string())?;
-        assert_eq!(receipt_b.status, WorkspaceTransitionStatus::Committed);
+        assert_eq!(
+            receipt_b.status,
+            WorkspaceTransitionStatus::Committed,
+            "workspace switch degraded: {receipt_b:?}"
+        );
         assert!(
             state
                 .delete_workspace_owned(&crate::workspace::WorkspaceId::from_name("workspace-a"))

@@ -809,6 +809,9 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
             echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus { status } => {
                 status == "running" || self.output.emit(format!("Turn status: {status}"))
             }
+            echo_agent_app_core::chat_driver::ChatDriverEvent::ExtensionReceipt(receipt) => {
+                self.output.emit(receipt.display_message())
+            }
             echo_agent_app_core::chat_driver::ChatDriverEvent::ExecutionPath {
                 requested_mode,
                 observed_path,
@@ -2938,6 +2941,41 @@ mod tests {
             .lock()
             .map(|messages| messages.len())
             .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn extension_receipt_uses_external_output_projection() -> Result<(), String> {
+        use echo_agent_app_core::chat_driver::{ChatDriverEvent, ChatSink};
+        use echo_agent_app_core::extension_commands::{
+            ExtensionCommandIdentity, ExtensionCommandReceipt, ExtensionKind,
+        };
+
+        let (output, messages) = collecting_output();
+        let sink = ReplChatSink::new(output, crate::output::OutputConfig::default());
+        let receipt = ExtensionCommandReceipt::failed(
+            ExtensionKind::Hooks,
+            ExtensionCommandIdentity {
+                request_id: "request-1".to_string(),
+                operation_id: "operation-1".to_string(),
+            },
+            "global",
+            "fixture failure",
+        );
+        if !ChatSink::on_event(&sink, ChatDriverEvent::ExtensionReceipt(Box::new(receipt))) {
+            return Err("Extension receipt was rejected by external output".to_string());
+        }
+        let rendered = messages
+            .lock()
+            .map_err(|error| error.to_string())?
+            .first()
+            .cloned()
+            .ok_or_else(|| "Extension receipt emitted no external output".to_string())?;
+        if !rendered.starts_with("[FAILED] Extension scope=global")
+            || !rendered.contains("request_id=request-1")
+        {
+            return Err(format!("unexpected Extension receipt output: {rendered}"));
+        }
+        Ok(())
     }
 
     #[test]

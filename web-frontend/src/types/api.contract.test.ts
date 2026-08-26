@@ -1,8 +1,15 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import type {
   BackgroundCellState,
+  ConnectMcpRequest,
+  ExtensionSkillEntry,
   RuntimeEventKind,
   RunContinuationState,
+  SkillArtifactSyncReceipt,
+  SkillInstallSettlementReceipt,
+  SkillRepairTargetDebt,
+  SkillSyncReceipt,
+  SkillUninstallSettlementReceipt,
   StreamingEvent,
   InteractionModeRequest,
   TaskRetryReceipt,
@@ -36,13 +43,125 @@ const serializedMcpServer = {
 const serializedSkill = {
   name: 'research',
   description: 'Research workflow',
-  file: '/skills/research/SKILL.md',
+  path: '/skills/research',
+  category: 'research',
+  is_baseline: false,
+  is_builtin: false,
+  upstream_version: null,
+  source: 'local',
+  license: null,
+  compatibility: null,
+  tags: [],
+  has_sandbox: false,
+  depends_on: [],
+  missing_dependencies: [],
   loaded: true,
-  source: 'builtin',
   version: null,
   author: null,
-  upstream_version: null,
-} satisfies TauriSkillInfo;
+} satisfies ExtensionSkillEntry satisfies TauriSkillInfo;
+
+const settledSkillMutation = {
+  operation_id: 'skill-op-1',
+  committed_file_path: '/data/enabled-skills.json',
+  content_identity: 'sha256:desired-state',
+  desired_generation: '4',
+  settled_generation: '4',
+  durable_committed: true,
+  idempotent: false,
+  status: 'settled',
+  target_receipts: [
+    {
+      target: 'workspace:project-a',
+      workspace_generation: 'workspace-generation-2',
+      specialist_generation: '4',
+      status: 'settled',
+      changed_entries: ['research'],
+      error: null,
+    },
+  ],
+  repair_debt: null,
+} satisfies SkillSyncReceipt;
+
+const runtimeFanoutDebt = {
+  target: 'workspace:project-b',
+  component: 'runtime_fanout',
+  expected_generation: '6',
+  observed_generation: null,
+  reason: 'runtime fanout failed',
+  retryable: true,
+} satisfies SkillRepairTargetDebt;
+
+const committedSkillMutation = {
+  ...settledSkillMutation,
+  operation_id: 'skill-op-2',
+  desired_generation: '5',
+  settled_generation: '4',
+  status: 'committed',
+  target_receipts: [],
+} satisfies SkillSyncReceipt;
+
+const degradedSkillMutation = {
+  ...settledSkillMutation,
+  operation_id: 'skill-op-3',
+  desired_generation: '6',
+  settled_generation: '4',
+  status: 'degraded',
+  target_receipts: [
+    {
+      target: 'workspace:project-b',
+      workspace_generation: 'workspace-generation-3',
+      specialist_generation: '6',
+      status: 'degraded',
+      changed_entries: [],
+      error: 'runtime fanout failed',
+    },
+  ],
+  repair_debt: {
+    generation: '6',
+    content_identity: 'sha256:desired-state',
+    attempts: 1,
+    target_failures: [runtimeFanoutDebt],
+    artifact_removals: [],
+    artifact_syncs: [],
+    artifact_enablements: [],
+  },
+} satisfies SkillSyncReceipt;
+
+const skillReceiptContracts = {
+  install: {
+    name: 'research',
+    path: '/skills/research',
+    source: 'local',
+    revision: null,
+    settlement: settledSkillMutation,
+  } satisfies SkillInstallSettlementReceipt,
+  uninstall: {
+    name: 'research',
+    artifact_removed: false,
+    artifact_error: 'artifact is still in use',
+    settlement: degradedSkillMutation,
+  } satisfies SkillUninstallSettlementReceipt,
+  artifactSync: {
+    results: [
+      {
+        name: 'research',
+        success: true,
+        updated: true,
+        revision: 'revision-2',
+        message: 'updated',
+      },
+    ],
+    settlement: committedSkillMutation,
+  } satisfies SkillArtifactSyncReceipt,
+};
+
+const connectMcpRequest = {
+  name: 'local-tools',
+  transport: 'stdio',
+  command: 'mcp-local-tools',
+  args: ['--stdio'],
+  env: {},
+} satisfies ConnectMcpRequest;
 
 const streamingEvents = [
   { event: 'token', data: 'hello' },
@@ -164,6 +283,26 @@ describe('Rust serialization contracts', () => {
     expect(serializedMcpServer.connected_at).toBeNull();
     expect(serializedMcpServer.error).toBeNull();
     expect(serializedSkill.version).toBeNull();
+  });
+
+  it('keeps skill settlement states distinct across generated receipts', () => {
+    expect(settledSkillMutation.status).toBe('settled');
+    expect(committedSkillMutation.status).toBe('committed');
+    expect(degradedSkillMutation.status).toBe('degraded');
+    expect(degradedSkillMutation.committed_file_path).toBe('/data/enabled-skills.json');
+    expect(degradedSkillMutation.repair_debt?.target_failures).toEqual([runtimeFanoutDebt]);
+    expect(degradedSkillMutation.repair_debt?.target_failures[0]?.expected_generation).toBe('6');
+    expect(degradedSkillMutation.repair_debt?.target_failures[0]?.observed_generation).toBeNull();
+    expect(skillReceiptContracts.install.settlement.durable_committed).toBe(true);
+    expect(skillReceiptContracts.uninstall.artifact_removed).toBe(false);
+    expect(skillReceiptContracts.artifactSync.results[0]?.updated).toBe(true);
+    expect(JSON.parse(JSON.stringify(degradedSkillMutation)).desired_generation).toBe('6');
+  });
+
+  it('uses the flattened HTTP MCP request contract', () => {
+    expect(connectMcpRequest.transport).toBe('stdio');
+    expect(connectMcpRequest.command).toBe('mcp-local-tools');
+    expectTypeOf(connectMcpRequest).toMatchTypeOf<ConnectMcpRequest>();
   });
 
   it('keeps representative streaming and runtime event variants typed', () => {

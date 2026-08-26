@@ -15,7 +15,7 @@ use echo_agent_app_core::chat_event_log::ChatEventEnvelope;
 use echo_agent_app_core::tasks::task_runtime::RuntimeEventKind;
 use echo_agent_app_core::tasks::task_runtime::executor::ExecEventScope;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum FixtureMode {
     ToolThenAnswer,
     TaskThenAnswer,
@@ -37,8 +37,12 @@ impl FixtureServer {
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?.to_string();
         let requests = Arc::new(AtomicUsize::new(0));
+        let tool_requests = Arc::new(AtomicUsize::new(0));
+        let saw_tool_request = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let task_requests = Arc::clone(&requests);
+        let task_tool_requests = Arc::clone(&tool_requests);
+        let task_saw_tool_request = Arc::clone(&saw_tool_request);
         let task_stop = Arc::clone(&stop);
         let task = thread::spawn(move || {
             let mut connections = Vec::new();
@@ -46,12 +50,16 @@ impl FixtureServer {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let connection_requests = Arc::clone(&task_requests);
+                        let connection_tool_requests = Arc::clone(&task_tool_requests);
+                        let connection_saw_tool_request = Arc::clone(&task_saw_tool_request);
                         let connection_stop = Arc::clone(&task_stop);
                         connections.push(thread::spawn(move || {
                             serve_fixture_request(
                                 stream,
                                 mode,
                                 &connection_requests,
+                                &connection_tool_requests,
+                                &connection_saw_tool_request,
                                 &connection_stop,
                             )
                         }));
@@ -142,6 +150,8 @@ fn serve_fixture_request(
     mut stream: TcpStream,
     mode: FixtureMode,
     requests: &AtomicUsize,
+    tool_requests: &AtomicUsize,
+    saw_tool_request: &AtomicBool,
     stop: &AtomicBool,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -231,8 +241,14 @@ fn serve_fixture_request(
         .and_then(serde_json::Value::as_array)
         .is_some_and(|tools| !tools.is_empty());
     if !uses_tools {
+        let warmup =
+            !saw_tool_request.load(Ordering::Acquire) && requests.load(Ordering::Acquire) == 0;
+        if !warmup {
+            requests.fetch_add(1, Ordering::AcqRel);
+        }
         return write_sse(&mut stream, final_answer_sse());
     }
+    saw_tool_request.store(true, Ordering::Release);
     let request_index = match mode {
         #[cfg(unix)]
         FixtureMode::Stall => {
@@ -252,7 +268,10 @@ fn serve_fixture_request(
             }
             return Ok(());
         }
-        _ => requests.fetch_add(1, Ordering::AcqRel),
+        _ => {
+            requests.fetch_add(1, Ordering::AcqRel);
+            tool_requests.fetch_add(1, Ordering::AcqRel)
+        }
     };
 
     match mode {
@@ -444,13 +463,21 @@ logging:
 }
 
 fn spawn_jsonl(root: &IsolatedRoot, endpoint: &str) -> Result<std::process::Child> {
+    spawn_jsonl_prompt(
+        root,
+        endpoint,
+        "exercise the canonical machine event surface",
+    )
+}
+
+fn spawn_jsonl_prompt(
+    root: &IsolatedRoot,
+    endpoint: &str,
+    prompt: &str,
+) -> Result<std::process::Child> {
     let config = fixture_config(root, endpoint)?;
     Command::new(env!("CARGO_BIN_EXE_echo-agent-cli"))
-        .args([
-            "--jsonl",
-            "exercise the canonical machine event surface",
-            "--config",
-        ])
+        .args(["--jsonl", prompt, "--config"])
         .arg(config)
         .arg("--project")
         .arg(root.path())
@@ -472,15 +499,24 @@ fn wait_for_output(mut child: std::process::Child, timeout: Duration) -> Result<
                 .context("failed to collect the JSONL product output");
         }
         if Instant::now() >= deadline {
+            let child_status = child.try_wait()?;
             child
                 .kill()
+                .or_else(|error| {
+                    if child_status.is_some() {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                })
                 .context("failed to stop a timed-out JSONL product entry")?;
             let output = child
                 .wait_with_output()
                 .context("failed to reap a timed-out JSONL product entry")?;
             return Err(anyhow!(
-                "JSONL product entry did not settle within {} seconds; stderr: {}",
+                "JSONL product entry did not settle within {} seconds (child_status={child_status:?}); stdout: {}; stderr: {}",
                 timeout.as_secs(),
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
@@ -490,6 +526,13 @@ fn wait_for_output(mut child: std::process::Child, timeout: Duration) -> Result<
 
 fn run_jsonl(root: &IsolatedRoot, endpoint: &str) -> Result<Output> {
     wait_for_output(spawn_jsonl(root, endpoint)?, Duration::from_secs(30))
+}
+
+fn run_jsonl_prompt(root: &IsolatedRoot, endpoint: &str, prompt: &str) -> Result<Output> {
+    wait_for_output(
+        spawn_jsonl_prompt(root, endpoint, prompt)?,
+        Duration::from_secs(30),
+    )
 }
 
 fn settle_fixture(server: FixtureServer, expected: usize, output: &Output) -> Result<()> {
@@ -592,6 +635,80 @@ fn assert_ordered_single_stream(events: &[ChatEventEnvelope], terminal_status: &
             "JSONL output did not end with the {terminal_status} terminal status"
         ));
     }
+    Ok(())
+}
+
+#[test]
+fn jsonl_extension_management_emits_typed_receipt_without_driving_the_model() -> Result<()> {
+    let root = IsolatedRoot::new("extension")?;
+    let server = FixtureServer::start(FixtureMode::ToolThenAnswer)?;
+    let output = run_jsonl_prompt(&root, &server.endpoint(), "/skills list")?;
+    settle_fixture(server, 0, &output)?;
+    let events = parse_stdout(&output)?;
+    assert_ordered_single_stream(&events, "completed")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "JSONL Extension fixture exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let receipts = events
+        .iter()
+        .filter_map(|envelope| match &envelope.payload {
+            ChatDriverEvent::ExtensionReceipt(receipt) => Some(receipt.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(receipts.len(), 1);
+    assert!(matches!(
+        receipts.first(),
+        Some(echo_agent_app_core::extension_commands::ExtensionCommandReceipt::Skills {
+            meta,
+            receipt: Some(
+                echo_agent_app_core::extension_commands::SkillCommandReceipt::Listed { .. }
+            ),
+        }) if meta.status
+            == echo_agent_app_core::extension_commands::ExtensionCommandStatus::Settled
+            && !meta.request_id.is_empty()
+            && !meta.operation_id.is_empty()
+    ));
+    assert_eq!(
+        count_agent_events(&events, |_| true),
+        0,
+        "Extension management command reached the model event path"
+    );
+    assert_eq!(count_turn_status(&events, "completed"), 1);
+    Ok(())
+}
+
+#[test]
+fn jsonl_extension_committed_receipt_is_pending_not_completed_or_degraded() -> Result<()> {
+    let root = IsolatedRoot::new("extension-committed")?;
+    let server = FixtureServer::start(FixtureMode::ToolThenAnswer)?;
+    let output = run_jsonl_prompt(&root, &server.endpoint(), "/mcp import {\"mcpServers\":{}}")?;
+    settle_fixture(server, 0, &output)?;
+    let events = parse_stdout(&output)?;
+    assert_ordered_single_stream(&events, "failed")?;
+
+    let receipts = events
+        .iter()
+        .filter_map(|envelope| match &envelope.payload {
+            ChatDriverEvent::ExtensionReceipt(receipt) => Some(receipt.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        receipts.as_slice(),
+        [echo_agent_app_core::extension_commands::ExtensionCommandReceipt::Mcp { meta, .. }]
+            if meta.status
+                == echo_agent_app_core::extension_commands::ExtensionCommandStatus::Committed
+                && meta.error.is_none()
+    ));
+    assert_eq!(count_turn_status(&events, "completed"), 0);
+    assert_eq!(count_turn_status(&events, "failed"), 1);
+    assert!(!output.status.success());
     Ok(())
 }
 

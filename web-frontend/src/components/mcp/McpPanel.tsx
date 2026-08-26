@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useState } from 'react';
-import { mcpApi } from '../../api/endpoints';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { extensionRequestScope, mcpApi, mcpConfigDisposition } from '../../api/endpoints';
 import type { TauriMcpServerInfo, McpConfig } from '../../types/api';
 import { Globe, Trash2, ChevronDown, ChevronRight, Save, RefreshCw, Power } from 'lucide-react';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 
 export function McpPanel() {
+  const workspace = useWorkspaceStore((state) => state.current);
+  const requestScope = useMemo(() => extensionRequestScope(workspace), [workspace]);
   const [servers, setServers] = useState<TauriMcpServerInfo[]>([]);
   const [config, setConfig] = useState<McpConfig | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -11,20 +14,23 @@ export function McpPanel() {
   const [parseError, setParseError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState<{
-    type: 'success' | 'error';
+    type: 'success' | 'pending' | 'error';
     text: string;
   } | null>(null);
 
   const loadData = useCallback(async () => {
     try {
-      const [serversData, configData] = await Promise.all([mcpApi.list(), mcpApi.getConfig()]);
+      const [serversData, configData] = await Promise.all([
+        mcpApi.list(requestScope),
+        mcpApi.getConfig(),
+      ]);
       setServers(serversData);
       setConfig(configData);
       setJsonEditor(JSON.stringify(configData, null, 2));
     } catch (e) {
       console.error(e);
     }
-  }, []);
+  }, [requestScope]);
 
   useEffect(() => {
     void loadData();
@@ -47,19 +53,26 @@ export function McpPanel() {
       // background on the Rust side).
       const SAVE_TIMEOUT_MS = 20_000;
       const result = await Promise.race([
-        mcpApi.updateConfig(parsedConfig),
+        mcpApi.updateConfig(requestScope, parsedConfig),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error('保存超时，请重试')), SAVE_TIMEOUT_MS)
         ),
       ]);
 
-      if (result.success) {
-        setSaveMessage({ type: 'success', text: result.message || '配置已保存并应用' });
+      const disposition = mcpConfigDisposition(result);
+      if (disposition.status === 'pending') {
+        setSaveMessage({
+          type: 'pending',
+          text: disposition.message,
+        });
+        await loadData();
+      } else if (disposition.status === 'settled') {
+        setSaveMessage({ type: 'success', text: disposition.message });
         await loadData();
       } else {
         setSaveMessage({
           type: 'error',
-          text: result.message || '保存失败',
+          text: disposition.message,
         });
       }
     } catch (e: any) {
@@ -74,7 +87,7 @@ export function McpPanel() {
 
   const disconnect = async (name: string) => {
     try {
-      await mcpApi.disconnect(name);
+      await mcpApi.disconnect(requestScope, name);
       await loadData();
     } catch (e) {
       console.error(e);
@@ -83,7 +96,7 @@ export function McpPanel() {
 
   const toggle = async (name: string, currentEnabled: boolean) => {
     try {
-      await mcpApi.toggle(name, !currentEnabled);
+      await mcpApi.toggle(requestScope, name, !currentEnabled);
       await loadData();
     } catch (e) {
       console.error(e);
@@ -123,8 +136,17 @@ export function McpPanel() {
           className="rounded-lg px-3 py-2 text-xs"
           style={{
             background:
-              saveMessage.type === 'success' ? 'var(--color-success-bg)' : 'var(--color-error-bg)',
-            color: saveMessage.type === 'success' ? 'var(--color-success)' : 'var(--color-error)',
+              saveMessage.type === 'success'
+                ? 'var(--color-success-bg)'
+                : saveMessage.type === 'pending'
+                  ? 'var(--color-warning-bg)'
+                  : 'var(--color-error-bg)',
+            color:
+              saveMessage.type === 'success'
+                ? 'var(--color-success)'
+                : saveMessage.type === 'pending'
+                  ? 'var(--color-warning)'
+                  : 'var(--color-error)',
           }}
         >
           {saveMessage.text}

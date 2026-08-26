@@ -5,8 +5,6 @@ import { isTauri, apiInvoke } from '../lib/tauri-bridge';
 import type { SessionInfo, ContextStats, ToolInfo } from '../generated';
 import type {
   TauriSkillInfo,
-  SkillSyncResult,
-  SkillUpdateStatus,
   TauriMcpServerInfo,
   McpConfig,
   MemoryEntry,
@@ -69,6 +67,20 @@ import type {
   LlmApiProtocol,
   ModelInputModality,
   ModelProviderListResponse,
+  ConnectMcpRequest,
+  ExtensionCommandReceipt,
+  ExtensionCommandRequest,
+  ExtensionReceiptMeta,
+  ExtensionRequestScope,
+  HookSourceProjection,
+  HookTestMatchProjection,
+  PluginEntryProjection,
+  PluginMutationProjection,
+  PluginOutputStyleProjection,
+  PluginScaffoldProjection,
+  PluginThemeProjection,
+  PluginValidationProjection,
+  SkillCommand,
 } from '../generated';
 
 export type {
@@ -77,18 +89,97 @@ export type {
   WorkspaceTransitionStatus,
 } from '../generated';
 
-type LoadSkillsResponse = {
-  success: boolean;
-  loaded?: string[];
-  count?: number;
-  skills?: TauriSkillInfo[];
-};
-
 export interface AutoMemoryObservation {
   category: 'Project' | 'User' | 'Bug' | 'Decision' | 'FilePath';
   text: string;
   confidence: number;
   source_turn?: number;
+}
+
+export const extensionApi = {
+  execute: (
+    requestScope: ExtensionRequestScope,
+    conversationId: string,
+    request: ExtensionCommandRequest
+  ): Promise<ExtensionCommandReceipt> => {
+    if (!isTauri()) {
+      return Promise.reject(new Error('Structured Extension commands require the desktop runtime'));
+    }
+    return apiInvoke<ExtensionCommandReceipt>('execute_extension_command', {
+      workspaceId: requestScope.workspace_id,
+      workspaceGeneration: requestScope.workspace_generation,
+      conversationId,
+      request: { ...request, scope: request.scope ?? requestScope },
+    }).then((receipt) => assertExtensionReceiptScope(receipt, requestScope, request));
+  },
+};
+
+export function assertExtensionReceiptScope(
+  receipt: ExtensionCommandReceipt,
+  requestScope: ExtensionRequestScope,
+  request?: ExtensionCommandRequest
+): ExtensionCommandReceipt {
+  const sameScope =
+    receipt.meta.authority_scope === requestScope.workspace_id &&
+    receipt.meta.workspace_generation === requestScope.workspace_generation &&
+    receipt.meta.sender_id === requestScope.sender_id &&
+    receipt.meta.sender_incarnation === requestScope.sender_incarnation;
+  const sameIdentity =
+    request === undefined ||
+    (receipt.meta.request_id === request.request_id &&
+      receipt.meta.operation_id === request.operation_id);
+  if (!sameScope || !sameIdentity) {
+    throw new Error('Extension receipt does not match the exact request scope and identity');
+  }
+  return receipt;
+}
+
+function newExtensionIdentity(): string {
+  if (typeof globalThis.crypto?.randomUUID !== 'function') {
+    throw new Error('Secure Extension command identity generation is unavailable');
+  }
+  return globalThis.crypto.randomUUID();
+}
+
+function executeSkillCommand(
+  requestScope: ExtensionRequestScope,
+  command: SkillCommand
+): Promise<ExtensionCommandReceipt> {
+  return extensionApi.execute(requestScope, 'gui-settings-skills', {
+    request_id: newExtensionIdentity(),
+    operation_id: newExtensionIdentity(),
+    scope: requestScope,
+    extension: 'skills',
+    command,
+  });
+}
+
+export type BrowserExtensionDisposition =
+  | { status: 'settled'; message: string }
+  | { status: 'pending'; message: string };
+
+export function browserExtensionDisposition(
+  receipt: ExtensionCommandReceipt
+): BrowserExtensionDisposition {
+  if (receipt.extension !== 'browser') {
+    throw new Error('Unexpected Extension receipt for Browser command');
+  }
+  if (receipt.meta.status === 'failed' || receipt.meta.status === 'degraded') {
+    throw new Error(receipt.meta.error ?? `Browser command ${receipt.meta.status}`);
+  }
+  if (receipt.meta.status === 'committed') {
+    return {
+      status: 'pending',
+      message:
+        receipt.meta.error ??
+        receipt.receipt?.message ??
+        'Browser command committed; runtime settlement is pending',
+    };
+  }
+  if (!receipt.receipt) {
+    throw new Error('Browser command settled without a typed receipt');
+  }
+  return { status: 'settled', message: receipt.receipt.message };
 }
 
 export interface AutoMemoryStatus {
@@ -181,34 +272,22 @@ export const toolsApi = {
 };
 
 export const skillsApi = {
-  list: () =>
-    isTauri() ? apiInvoke<TauriSkillInfo[]>('list_skills') : get<TauriSkillInfo[]>('/skills'),
-  get: (name: string) =>
-    isTauri()
-      ? apiInvoke<TauriSkillInfo>('get_skill', { name })
-      : get<TauriSkillInfo>(`/skills/${name}`),
-  load: (dir: string) =>
-    isTauri()
-      ? apiInvoke<LoadSkillsResponse>('load_skill', { name: dir })
-      : post<LoadSkillsResponse>('/skills/load', { dir }),
-  enable: (name: string) =>
-    isTauri()
-      ? apiInvoke<LoadSkillsResponse>('enable_skill', { name })
-      : post<LoadSkillsResponse>(`/skills/${name}/enable`, {}),
-  disable: (name: string) =>
-    isTauri()
-      ? apiInvoke<{
-          success: boolean;
-          requires_restart?: boolean;
-          message?: string;
-          skills?: TauriSkillInfo[];
-        }>('disable_skill', { name })
-      : post<{
-          success: boolean;
-          requires_restart?: boolean;
-          message?: string;
-          skills?: TauriSkillInfo[];
-        }>(`/skills/${name}/disable`, {}),
+  list: (requestScope: ExtensionRequestScope) =>
+    executeSkillCommand(requestScope, { action: 'list' }),
+  search: (requestScope: ExtensionRequestScope, query: string) =>
+    executeSkillCommand(requestScope, { action: 'search', query }),
+  get: (requestScope: ExtensionRequestScope, name: string) =>
+    executeSkillCommand(requestScope, { action: 'info', name }),
+  load: (requestScope: ExtensionRequestScope, source: string) =>
+    executeSkillCommand(requestScope, { action: 'install', source }),
+  uninstall: (requestScope: ExtensionRequestScope, name: string) =>
+    executeSkillCommand(requestScope, { action: 'uninstall', name }),
+  enable: (requestScope: ExtensionRequestScope, name: string) =>
+    executeSkillCommand(requestScope, { action: 'enable', name }),
+  disable: (requestScope: ExtensionRequestScope, name: string) =>
+    executeSkillCommand(requestScope, { action: 'disable', name }),
+  refresh: (requestScope: ExtensionRequestScope) =>
+    executeSkillCommand(requestScope, { action: 'refresh' }),
   upload: (rootDir: string, files: { path: string; content: string }[]) =>
     isTauri()
       ? Promise.reject(new Error('Tauri 模式请使用“浏览”选择本地技能目录加载'))
@@ -216,39 +295,45 @@ export const skillsApi = {
           root_dir: rootDir,
           files,
         }),
-  checkUpdates: (target = 'all') =>
-    isTauri()
-      ? apiInvoke<SkillUpdateStatus[]>('check_skill_updates', { target })
-      : get<SkillUpdateStatus[]>(`/skills/updates?target=${encodeURIComponent(target)}`),
-  sync: (target = 'all', force = false) =>
-    isTauri()
-      ? apiInvoke<SkillSyncResult[]>('sync_skills', { target, force })
-      : post<SkillSyncResult[]>('/skills/sync', { target, force }),
+  checkUpdates: (requestScope: ExtensionRequestScope, target: string | null = null) =>
+    executeSkillCommand(requestScope, { action: 'check_updates', target }),
+  sync: (requestScope: ExtensionRequestScope, target: string | null = null, force = false) =>
+    executeSkillCommand(requestScope, { action: 'sync', target, force }),
 };
 
 export const mcpApi = {
-  list: () =>
+  list: (requestScope: ExtensionRequestScope) =>
     isTauri()
-      ? apiInvoke<TauriMcpServerInfo[]>('list_mcp_servers')
+      ? apiInvoke<ExtensionCommandReceipt>('list_mcp_servers', { requestScope }).then(
+          mcpServersFromReceipt
+        )
       : get<TauriMcpServerInfo[]>('/mcp'),
-  get: (name: string) =>
+  get: (requestScope: ExtensionRequestScope, name: string) =>
     isTauri()
-      ? apiInvoke<TauriMcpServerInfo>('get_mcp_server', { name })
-      : get<TauriMcpServerInfo>(`/mcp/${name}`),
-  connect: (req: { name: string; transport: { transport: string; [key: string]: unknown } }) =>
-    isTauri()
-      ? apiInvoke<{ success: boolean; name?: string; error?: string }>('connect_mcp_server', {
-          name: req.name,
-          transport: req.transport,
+      ? mcpApi.list(requestScope).then((servers) => {
+          const server = servers.find((candidate) => candidate.name === name);
+          if (!server) throw new Error(`MCP server '${name}' not found`);
+          return server;
         })
-      : post<TauriMcpServerInfo>('/mcp/connect', req),
-  disconnect: (name: string) =>
+      : get<TauriMcpServerInfo>(`/mcp/${name}`),
+  connect: (requestScope: ExtensionRequestScope, req: ConnectMcpRequest) => {
+    const { name, ...transport } = req;
+    return isTauri()
+      ? apiInvoke<ExtensionCommandReceipt>('connect_mcp_server', {
+          requestScope,
+          name,
+          transport,
+        })
+      : post<TauriMcpServerInfo>('/mcp/connect', req);
+  },
+  disconnect: (requestScope: ExtensionRequestScope, name: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean }>('disconnect_mcp_server', { name })
+      ? apiInvoke<ExtensionCommandReceipt>('disconnect_mcp_server', { requestScope, name })
       : post<{ success: boolean }>(`/mcp/${name}/disconnect`),
-  toggle: (name: string, enabled: boolean) =>
+  toggle: (requestScope: ExtensionRequestScope, name: string, enabled: boolean) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; enabled: boolean; message?: string }>('toggle_mcp_server', {
+      ? apiInvoke<ExtensionCommandReceipt>('toggle_mcp_server', {
+          requestScope,
           name,
           enabled,
         })
@@ -257,11 +342,64 @@ export const mcpApi = {
         }),
   getConfig: () =>
     isTauri() ? apiInvoke<McpConfig>('get_mcp_config') : get<McpConfig>('/mcp/config'),
-  updateConfig: (config: McpConfig) =>
+  updateConfig: (requestScope: ExtensionRequestScope, config: McpConfig) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; message?: string }>('update_mcp_config', { config })
+      ? apiInvoke<ExtensionCommandReceipt>('update_mcp_config', { requestScope, config })
       : put<{ success: boolean; message?: string; errors?: string[] }>('/mcp/config', config),
 };
+
+function mcpServersFromReceipt(receipt: ExtensionCommandReceipt): TauriMcpServerInfo[] {
+  if (
+    receipt.extension !== 'mcp' ||
+    receipt.meta.status !== 'settled' ||
+    receipt.receipt?.action !== 'listed'
+  ) {
+    throw new Error(receipt.meta.error ?? 'MCP list did not settle');
+  }
+  return receipt.receipt.servers.items.map((server) => ({
+    name: server.name,
+    status: server.status as TauriMcpServerInfo['status'],
+    transport: server.transport,
+    tool_count: server.tool_count,
+    tools: server.tools.items,
+    connected_at: server.connected_at,
+    error: server.error,
+    enabled: server.enabled,
+  }));
+}
+
+export function mcpConfigDisposition(
+  result: ExtensionCommandReceipt | { success: boolean; message?: string }
+): { status: 'settled' | 'pending' | 'failed'; message: string } {
+  if ('extension' in result) {
+    if (result.extension !== 'mcp') {
+      return { status: 'failed', message: 'Unexpected Extension receipt for MCP command' };
+    }
+    const detail =
+      result.receipt?.action === 'configured'
+        ? `MCP config generation ${result.receipt.generation}`
+        : result.receipt?.action === 'reconciled'
+          ? `MCP server '${result.receipt.name}' generation ${result.receipt.generation}`
+          : 'MCP command';
+    if (result.meta.status === 'committed') {
+      return {
+        status: 'pending',
+        message: `${detail} committed; runtime settlement is pending`,
+      };
+    }
+    if (result.meta.status === 'settled') {
+      return { status: 'settled', message: `${detail} settled` };
+    }
+    return {
+      status: 'failed',
+      message: result.meta.error ?? `${detail} ${result.meta.status}`,
+    };
+  }
+  return {
+    status: result.success ? 'settled' : 'failed',
+    message: result.message || (result.success ? 'MCP config settled' : 'MCP config failed'),
+  };
+}
 
 export const memoryApi = {
   list: (workspaceId: string, namespace?: string) =>
@@ -1666,6 +1804,15 @@ export interface Workspace {
   last_active: string;
 }
 
+export function extensionRequestScope(workspace: Workspace | null): ExtensionRequestScope {
+  return {
+    workspace_id: workspace?.id ?? 'global',
+    workspace_generation: workspace?.product_data_generation ?? 'global',
+    sender_id: null,
+    sender_incarnation: null,
+  };
+}
+
 export interface WorkspaceListResponse {
   workspaces: Workspace[];
   count: number;
@@ -2133,6 +2280,7 @@ export interface PluginInfo {
   dependencies: { name: string; version: string | null }[];
   config: Record<string, PluginConfigEntry>;
   config_values: Record<string, unknown>;
+  projection: PluginEntryProjection;
 }
 
 export interface PluginConfigEntry {
@@ -2153,6 +2301,122 @@ export interface PluginMutationResult {
   error?: string;
   wiring_ok?: boolean;
   errors?: string[];
+  errors_omitted?: number;
+  projection?: PluginMutationProjection;
+  meta?: ExtensionReceiptMeta;
+  receipt?: ExtensionCommandReceipt;
+}
+
+function pluginInfoFromProjection(plugin: PluginEntryProjection): PluginInfo {
+  return {
+    name: plugin.name,
+    display_name: plugin.display_name,
+    version: plugin.version,
+    description: plugin.description,
+    author: plugin.author?.name ?? null,
+    license: plugin.license,
+    scope: plugin.scope,
+    enabled: plugin.enabled,
+    path: plugin.root,
+    capabilities: plugin.capabilities,
+    keywords: plugin.keywords,
+    dependencies: plugin.dependencies,
+    config: plugin.config as Record<string, PluginConfigEntry>,
+    config_values: plugin.config_values,
+    projection: plugin,
+  };
+}
+
+export interface PluginListResult {
+  plugins: PluginInfo[];
+  omitted: number;
+  meta: ExtensionReceiptMeta;
+  receipt: ExtensionCommandReceipt;
+}
+
+function pluginListFromReceipt(receipt: ExtensionCommandReceipt): PluginListResult {
+  if (
+    receipt.extension !== 'plugins' ||
+    receipt.meta.status !== 'settled' ||
+    receipt.receipt?.action !== 'listed'
+  ) {
+    throw new Error(receipt.meta.error ?? 'Plugin list did not settle');
+  }
+  return {
+    plugins: receipt.receipt.plugins.items.map(pluginInfoFromProjection),
+    omitted: receipt.receipt.plugins.omitted,
+    meta: receipt.meta,
+    receipt,
+  };
+}
+
+export interface PluginInfoResult {
+  plugin: PluginInfo;
+  meta: ExtensionReceiptMeta;
+  receipt: ExtensionCommandReceipt;
+}
+
+function pluginInfoReceipt(receipt: ExtensionCommandReceipt): PluginInfoResult {
+  if (
+    receipt.extension !== 'plugins' ||
+    receipt.meta.status !== 'settled' ||
+    receipt.receipt?.action !== 'info' ||
+    receipt.receipt.plugin === null
+  ) {
+    throw new Error(receipt.meta.error ?? 'Plugin was not found');
+  }
+  return {
+    plugin: pluginInfoFromProjection(receipt.receipt.plugin),
+    meta: receipt.meta,
+    receipt,
+  };
+}
+
+function pluginMutationFromReceipt(
+  receipt: ExtensionCommandReceipt,
+  message: string
+): PluginMutationResult & {
+  plugin_id?: string;
+  total?: number;
+  enabled?: number;
+  skills_loaded?: number;
+  hooks_registered?: number;
+  mcp_connected?: number;
+  agents_loaded?: number;
+  lsp_languages_loaded?: number;
+  monitors_loaded?: number;
+  themes_loaded?: number;
+  output_styles_loaded?: number;
+} {
+  if (receipt.extension !== 'plugins') {
+    throw new Error('Unexpected Extension receipt for Plugin command');
+  }
+  const projection =
+    receipt.receipt?.action === 'mutation' ? receipt.receipt.projection : undefined;
+  const errors = projection?.summary.errors.items ?? [];
+  const success = receipt.meta.status === 'settled';
+  return {
+    success,
+    wiring_ok: success,
+    message,
+    error: receipt.meta.error ?? (!success ? errors.join('; ') || receipt.meta.status : undefined),
+    errors,
+    errors_omitted: projection?.summary.errors.omitted,
+    projection,
+    meta: receipt.meta,
+    receipt,
+    plugin_id: projection?.plugin_id ?? undefined,
+    total: projection?.summary.total,
+    enabled: projection?.summary.enabled,
+    skills_loaded: projection?.summary.skills_loaded,
+    hooks_registered: projection?.summary.hooks_registered,
+    mcp_connected: projection?.summary.mcp_connected,
+    agents_loaded: projection?.summary.agents_loaded,
+    lsp_languages_loaded: projection?.summary.lsp_languages_loaded,
+    monitors_loaded: projection?.summary.monitors_loaded,
+    themes_loaded: projection?.summary.themes_loaded,
+    output_styles_loaded: projection?.summary.output_styles_loaded,
+  };
 }
 
 export interface PluginValidationReport {
@@ -2160,6 +2424,55 @@ export interface PluginValidationReport {
   name: string | null;
   components: string[];
   errors: string[];
+  components_omitted: number;
+  errors_omitted: number;
+  projection: PluginValidationProjection;
+  meta: ExtensionReceiptMeta;
+  receipt: ExtensionCommandReceipt;
+}
+
+function pluginScaffoldFromReceipt(receipt: ExtensionCommandReceipt): PluginMutationResult & {
+  path?: string;
+  name?: string;
+  scaffold?: PluginScaffoldProjection;
+} {
+  const scaffold =
+    receipt.extension === 'plugins' && receipt.receipt?.action === 'scaffolded'
+      ? receipt.receipt.scaffold
+      : undefined;
+  const success = receipt.meta.status === 'settled' && scaffold !== undefined;
+  return {
+    success,
+    wiring_ok: success,
+    path: scaffold?.path,
+    name: scaffold?.name,
+    scaffold,
+    meta: receipt.meta,
+    receipt,
+    message: scaffold ? `Plugin '${scaffold.name}' scaffolded` : undefined,
+    error: success ? undefined : (receipt.meta.error ?? 'Plugin scaffold did not settle'),
+  };
+}
+
+function pluginValidationFromReceipt(receipt: ExtensionCommandReceipt): PluginValidationReport {
+  const validation =
+    receipt.extension === 'plugins' && receipt.receipt?.action === 'validated'
+      ? receipt.receipt.validation
+      : undefined;
+  if (receipt.meta.status !== 'settled' || validation === undefined) {
+    throw new Error(receipt.meta.error ?? 'Plugin validation did not settle');
+  }
+  return {
+    valid: validation.valid,
+    name: validation.name,
+    components: validation.components.items,
+    errors: validation.errors.items,
+    components_omitted: validation.components.omitted,
+    errors_omitted: validation.errors.omitted,
+    projection: validation,
+    meta: receipt.meta,
+    receipt,
+  };
 }
 
 export interface PluginThemeDefinition {
@@ -2173,6 +2486,10 @@ export interface PluginThemeDefinition {
 export interface PluginThemesResult {
   themes: PluginThemeDefinition[];
   active: string | null;
+  omitted: number;
+  projections: PluginThemeProjection[];
+  meta: ExtensionReceiptMeta;
+  receipt: ExtensionCommandReceipt;
 }
 
 export interface PluginOutputStyle {
@@ -2185,63 +2502,166 @@ export interface PluginOutputStyle {
 export interface PluginOutputStylesResult {
   styles: PluginOutputStyle[];
   active: string | null;
+  omitted: number;
+  projections: PluginOutputStyleProjection[];
+  meta: ExtensionReceiptMeta;
+  receipt: ExtensionCommandReceipt;
+}
+
+export interface PluginThemeActivationReceipt {
+  status: 'settled';
+  active: string | null;
+  theme: PluginThemeDefinition | null;
+  authority_scope: string;
+  meta: ExtensionReceiptMeta;
+  receipt: ExtensionCommandReceipt;
+}
+
+export interface PluginOutputStyleActivationReceipt {
+  status: 'settled';
+  active: string | null;
+  authority_scope: string;
+  meta: ExtensionReceiptMeta;
+  receipt: ExtensionCommandReceipt;
+}
+
+function pluginThemesFromReceipt(receipt: ExtensionCommandReceipt): PluginThemesResult {
+  if (
+    receipt.extension !== 'plugins' ||
+    receipt.meta.status !== 'settled' ||
+    receipt.receipt?.action !== 'themes'
+  ) {
+    throw new Error(receipt.meta.error ?? 'Plugin themes did not settle');
+  }
+  return {
+    themes: receipt.receipt.themes.items,
+    active: receipt.receipt.active,
+    omitted: receipt.receipt.themes.omitted,
+    projections: receipt.receipt.themes.items,
+    meta: receipt.meta,
+    receipt,
+  };
+}
+
+function pluginThemeActivationFromReceipt(
+  receipt: ExtensionCommandReceipt
+): PluginThemeActivationReceipt {
+  if (
+    receipt.extension !== 'plugins' ||
+    receipt.meta.status !== 'settled' ||
+    receipt.receipt?.action !== 'theme'
+  ) {
+    throw new Error(receipt.meta.error ?? 'Plugin theme activation did not settle');
+  }
+  return {
+    status: 'settled',
+    active: receipt.receipt.active,
+    theme: receipt.receipt.theme,
+    authority_scope: receipt.meta.authority_scope,
+    meta: receipt.meta,
+    receipt,
+  };
+}
+
+function pluginStylesFromReceipt(receipt: ExtensionCommandReceipt): PluginOutputStylesResult {
+  if (
+    receipt.extension !== 'plugins' ||
+    receipt.meta.status !== 'settled' ||
+    receipt.receipt?.action !== 'styles'
+  ) {
+    throw new Error(receipt.meta.error ?? 'Plugin output styles did not settle');
+  }
+  return {
+    styles: receipt.receipt.styles.items,
+    active: receipt.receipt.active,
+    omitted: receipt.receipt.styles.omitted,
+    projections: receipt.receipt.styles.items,
+    meta: receipt.meta,
+    receipt,
+  };
+}
+
+function pluginStyleActivationFromReceipt(
+  receipt: ExtensionCommandReceipt
+): PluginOutputStyleActivationReceipt {
+  if (
+    receipt.extension !== 'plugins' ||
+    receipt.meta.status !== 'settled' ||
+    receipt.receipt?.action !== 'style'
+  ) {
+    throw new Error(receipt.meta.error ?? 'Plugin output style activation did not settle');
+  }
+  return {
+    status: 'settled',
+    active: receipt.receipt.active,
+    authority_scope: receipt.meta.authority_scope,
+    meta: receipt.meta,
+    receipt,
+  };
 }
 
 export const pluginApi = {
-  list: () => (isTauri() ? apiInvoke<PluginInfo[]>('list_plugins') : get<PluginInfo[]>('/plugins')),
-  get: (name: string) =>
+  list: (requestScope: ExtensionRequestScope) =>
     isTauri()
-      ? apiInvoke<{ info: PluginInfo; resolved?: Record<string, any> }>('get_plugin', { name })
-      : get<{ info: PluginInfo; resolved?: Record<string, any> }>(`/plugins/${name}`),
-  install: (req: { source: string; scope?: string }) =>
-    isTauri()
-      ? apiInvoke<PluginMutationResult & { plugin_id?: string; info?: PluginInfo }>(
-          'install_plugin',
-          { source: req.source, scope: req.scope }
+      ? apiInvoke<ExtensionCommandReceipt>('list_plugins', { requestScope }).then(
+          pluginListFromReceipt
         )
+      : get<PluginListResult>('/plugins'),
+  get: (requestScope: ExtensionRequestScope, name: string) =>
+    isTauri()
+      ? apiInvoke<ExtensionCommandReceipt>('get_plugin', { requestScope, name }).then(
+          pluginInfoReceipt
+        )
+      : get<PluginInfoResult>(`/plugins/${name}`),
+  install: (requestScope: ExtensionRequestScope, req: { source: string; scope?: string }) =>
+    isTauri()
+      ? apiInvoke<ExtensionCommandReceipt>('install_plugin', {
+          source: req.source,
+          scope: req.scope,
+          requestScope,
+        }).then((receipt) => pluginMutationFromReceipt(receipt, 'Plugin install settled'))
       : post<PluginMutationResult & { plugin_id?: string; info?: PluginInfo }>(
           '/plugins/install',
           req
         ),
-  uninstall: (req: { name: string; keep_data?: boolean }) =>
+  uninstall: (requestScope: ExtensionRequestScope, req: { name: string; keep_data?: boolean }) =>
     isTauri()
-      ? apiInvoke<PluginMutationResult>('uninstall_plugin', {
+      ? apiInvoke<ExtensionCommandReceipt>('uninstall_plugin', {
           name: req.name,
           keep_data: req.keep_data,
-        })
+          requestScope,
+        }).then((receipt) => pluginMutationFromReceipt(receipt, `Plugin '${req.name}' uninstalled`))
       : post<PluginMutationResult>('/plugins/uninstall', req),
-  enable: (name: string) =>
+  enable: (requestScope: ExtensionRequestScope, name: string) =>
     isTauri()
-      ? apiInvoke<PluginMutationResult>('enable_plugin', { name })
+      ? apiInvoke<ExtensionCommandReceipt>('enable_plugin', { requestScope, name }).then(
+          (receipt) => pluginMutationFromReceipt(receipt, `Plugin '${name}' enabled`)
+        )
       : post<PluginMutationResult>(`/plugins/${name}/enable`),
-  disable: (name: string) =>
+  disable: (requestScope: ExtensionRequestScope, name: string) =>
     isTauri()
-      ? apiInvoke<PluginMutationResult>('disable_plugin', {
+      ? apiInvoke<ExtensionCommandReceipt>('disable_plugin', {
           name,
-        })
+          requestScope,
+        }).then((receipt) => pluginMutationFromReceipt(receipt, `Plugin '${name}' disabled`))
       : post<PluginMutationResult>(`/plugins/${name}/disable`),
-  configure: (name: string, values: Record<string, unknown>) =>
+  configure: (
+    requestScope: ExtensionRequestScope,
+    name: string,
+    values: Record<string, unknown>
+  ) =>
     isTauri()
-      ? apiInvoke<PluginMutationResult>('configure_plugin', { name, values })
+      ? apiInvoke<ExtensionCommandReceipt>('configure_plugin', {
+          requestScope,
+          name,
+          values,
+        }).then((receipt) => pluginMutationFromReceipt(receipt, `Plugin '${name}' configured`))
       : post<PluginMutationResult>(`/plugins/${name}/config`, { values }),
-  reload: () =>
+  reload: (requestScope: ExtensionRequestScope) =>
     isTauri()
-      ? apiInvoke<{
-          success: boolean;
-          total?: number;
-          enabled?: number;
-          skills_loaded?: number;
-          hooks_registered?: number;
-          mcp_connected?: number;
-          agents_loaded?: number;
-          lsp_languages_loaded?: number;
-          monitors_loaded?: number;
-          themes_loaded?: number;
-          output_styles_loaded?: number;
-          errors?: string[];
-          message?: string;
-          error?: string;
-        }>('reload_plugins')
+      ? apiInvoke<ExtensionCommandReceipt>('reload_plugins', { requestScope }).then((receipt) =>
+          pluginMutationFromReceipt(receipt, 'Plugins reloaded')
+        )
       : post<{
           success: boolean;
           total?: number;
@@ -2258,43 +2678,51 @@ export const pluginApi = {
           message?: string;
           error?: string;
         }>('/plugins/reload'),
-  scaffold: (directory: string, name: string) =>
+  scaffold: (requestScope: ExtensionRequestScope, directory: string, name: string) =>
     isTauri()
-      ? apiInvoke<PluginMutationResult & { path?: string; name?: string }>('scaffold_plugin', {
+      ? apiInvoke<ExtensionCommandReceipt>('scaffold_plugin', {
+          requestScope,
           directory,
           name,
-        })
+        }).then(pluginScaffoldFromReceipt)
       : post<PluginMutationResult & { path?: string; name?: string }>('/plugins/scaffold', {
           directory,
           name,
         }),
-  validate: (directory: string) =>
+  validate: (requestScope: ExtensionRequestScope, directory: string) =>
     isTauri()
-      ? apiInvoke<PluginValidationReport>('validate_plugin', { directory })
-      : post<PluginValidationReport>('/plugins/validate', { directory }),
-  themes: () =>
-    isTauri()
-      ? apiInvoke<PluginThemesResult>('list_plugin_themes')
-      : get<PluginThemesResult>('/plugins/themes'),
-  activateTheme: (name: string | null) =>
-    isTauri()
-      ? apiInvoke<{ success: boolean; active: string | null; theme: PluginThemeDefinition | null }>(
-          'activate_plugin_theme',
-          { name }
+      ? apiInvoke<ExtensionCommandReceipt>('validate_plugin', { requestScope, directory }).then(
+          pluginValidationFromReceipt
         )
+      : post<PluginValidationReport>('/plugins/validate', { directory }),
+  themes: (requestScope: ExtensionRequestScope) =>
+    isTauri()
+      ? apiInvoke<ExtensionCommandReceipt>('list_plugin_themes', { requestScope }).then(
+          pluginThemesFromReceipt
+        )
+      : get<PluginThemesResult>('/plugins/themes'),
+  activateTheme: (requestScope: ExtensionRequestScope, name: string | null) =>
+    isTauri()
+      ? apiInvoke<ExtensionCommandReceipt>('activate_plugin_theme', {
+          requestScope,
+          name,
+        }).then(pluginThemeActivationFromReceipt)
       : post<{ success: boolean; active: string | null; theme: PluginThemeDefinition | null }>(
           '/plugins/theme',
           { name }
         ),
-  outputStyles: () =>
+  outputStyles: (requestScope: ExtensionRequestScope) =>
     isTauri()
-      ? apiInvoke<PluginOutputStylesResult>('list_plugin_output_styles')
+      ? apiInvoke<ExtensionCommandReceipt>('list_plugin_output_styles', { requestScope }).then(
+          pluginStylesFromReceipt
+        )
       : get<PluginOutputStylesResult>('/plugins/output-styles'),
-  activateOutputStyle: (name: string | null) =>
+  activateOutputStyle: (requestScope: ExtensionRequestScope, name: string | null) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; active: string | null }>('activate_plugin_output_style', {
+      ? apiInvoke<ExtensionCommandReceipt>('activate_plugin_output_style', {
+          requestScope,
           name,
-        })
+        }).then(pluginStyleActivationFromReceipt)
       : post<{ success: boolean; active: string | null }>('/plugins/output-style', { name }),
 };
 
@@ -2306,6 +2734,14 @@ export const pluginApi = {
 export interface HookSourceInfo {
   source: string;
   rule_count: number;
+  projection: HookSourceProjection;
+}
+
+export interface HookSourceListResult {
+  sources: HookSourceInfo[];
+  omitted: number;
+  meta: ExtensionReceiptMeta;
+  receipt: ExtensionCommandReceipt;
 }
 
 /** Summary returned by a hooks reload: how many rules were merged and where
@@ -2314,27 +2750,109 @@ export interface HooksReloadSummary {
   success: boolean;
   rule_count: number;
   loaded_from: string[];
+  loaded_from_omitted: number;
   message: string;
+  meta: ExtensionReceiptMeta;
+  receipt: ExtensionCommandReceipt;
 }
 
 export interface HookTestResult {
   event: string;
   matcher: string;
   matches: { source: string; matcher: string; action: string }[];
+  match_projections: HookTestMatchProjection[];
+  matches_omitted: number;
+  meta: ExtensionReceiptMeta;
+  receipt: ExtensionCommandReceipt;
+}
+
+function hooksFromReceipt(receipt: ExtensionCommandReceipt): HookSourceListResult {
+  if (
+    receipt.extension !== 'hooks' ||
+    receipt.meta.status !== 'settled' ||
+    receipt.receipt?.action !== 'listed'
+  ) {
+    throw new Error(receipt.meta.error ?? 'Hook list did not settle');
+  }
+  return {
+    sources: receipt.receipt.sources.items.map((source) => ({
+      source: source.source,
+      rule_count: source.rules,
+      projection: source,
+    })),
+    omitted: receipt.receipt.sources.omitted,
+    meta: receipt.meta,
+    receipt,
+  };
+}
+
+function hookReloadFromReceipt(receipt: ExtensionCommandReceipt): HooksReloadSummary {
+  if (receipt.extension !== 'hooks' || receipt.receipt?.action !== 'reloaded') {
+    return {
+      success: false,
+      rule_count: 0,
+      loaded_from: [],
+      loaded_from_omitted: 0,
+      message: receipt.meta.error ?? 'Hook reload did not settle',
+      meta: receipt.meta,
+      receipt,
+    };
+  }
+  const success = receipt.meta.status === 'settled';
+  return {
+    success,
+    rule_count: receipt.receipt.rule_count,
+    loaded_from: receipt.receipt.loaded_from.items,
+    loaded_from_omitted: receipt.receipt.loaded_from.omitted,
+    message:
+      receipt.meta.error ??
+      (receipt.receipt.rule_count === 0
+        ? 'No hooks found; cleared previous user hooks'
+        : `Reloaded ${receipt.receipt.rule_count} hook rules`),
+    meta: receipt.meta,
+    receipt,
+  };
+}
+
+function hookTestFromReceipt(receipt: ExtensionCommandReceipt): HookTestResult {
+  if (
+    receipt.extension !== 'hooks' ||
+    receipt.meta.status !== 'settled' ||
+    receipt.receipt?.action !== 'tested'
+  ) {
+    throw new Error(receipt.meta.error ?? 'Hook test did not settle');
+  }
+  return {
+    event: receipt.receipt.event,
+    matcher: receipt.receipt.matcher,
+    matches: receipt.receipt.matches.items,
+    match_projections: receipt.receipt.matches.items,
+    matches_omitted: receipt.receipt.matches.omitted,
+    meta: receipt.meta,
+    receipt,
+  };
 }
 
 export const hooksApi = {
-  list: () =>
-    isTauri() ? apiInvoke<HookSourceInfo[]>('list_hooks') : get<HookSourceInfo[]>('/hooks'),
-  reload: () =>
+  list: (requestScope: ExtensionRequestScope) =>
     isTauri()
-      ? apiInvoke<HooksReloadSummary>('reload_hooks')
+      ? apiInvoke<ExtensionCommandReceipt>('list_hooks', { requestScope }).then(hooksFromReceipt)
+      : get<HookSourceListResult>('/hooks'),
+  reload: (requestScope: ExtensionRequestScope) =>
+    isTauri()
+      ? apiInvoke<ExtensionCommandReceipt>('reload_hooks', { requestScope }).then(
+          hookReloadFromReceipt
+        )
       : post<HooksReloadSummary>('/hooks/reload'),
   events: () =>
     isTauri() ? apiInvoke<string[]>('list_hook_events') : get<string[]>('/hooks/events'),
-  test: (event: string, matcher?: string) =>
+  test: (requestScope: ExtensionRequestScope, event: string, matcher?: string) =>
     isTauri()
-      ? apiInvoke<HookTestResult>('test_hook', { event, matcher })
+      ? apiInvoke<ExtensionCommandReceipt>('test_hook', {
+          requestScope,
+          event,
+          matcher,
+        }).then(hookTestFromReceipt)
       : post<HookTestResult>('/hooks/test', { event, matcher }),
 };
 
@@ -2454,4 +2972,22 @@ export const worktreeApi = {
     }),
   cleanupUnattended: (workspaceId: string) =>
     apiInvoke<UnattendedWorktreeCleanupResult>('cleanup_unattended_worktrees', { workspaceId }),
+};
+
+export interface LspControlResult {
+  message: string;
+  meta: ExtensionReceiptMeta;
+  receipt: ExtensionCommandReceipt;
+}
+
+export const lspApi = {
+  control: (requestScope: ExtensionRequestScope, action: string, language?: string) =>
+    apiInvoke<ExtensionCommandReceipt>('lsp_control', { requestScope, action, language }).then(
+      (receipt) => {
+        if (receipt.extension !== 'lsp' || receipt.meta.status !== 'settled' || !receipt.receipt) {
+          throw new Error(receipt.meta.error ?? 'LSP command did not settle');
+        }
+        return { message: receipt.receipt.message, meta: receipt.meta, receipt };
+      }
+    ),
 };

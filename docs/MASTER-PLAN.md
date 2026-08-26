@@ -1,6 +1,6 @@
 # EKO 当前项目状态
 
-Last updated: 2026-08-25
+Last updated: 2026-08-26
 
 本文是跨会话恢复工作的简短事实源，只记录当前权威路径、未完成工作和下一步。
 已完成里程碑不在这里保留实施日志；长期有效能力见 [功能总览](./features.md)。
@@ -15,26 +15,31 @@ Last updated: 2026-08-25
 
 ## 当前权威路径
 
-| 语义                                               | 权威实现                                       |
-| -------------------------------------------------- | ---------------------------------------------- |
-| ReAct、tools、DAG、Subagent、store traits、MCP/LSP | `echo-agent`                                   |
-| EKO bootstrap 与共享服务                           | `echo-agent-app-core/src/runtime.rs`           |
-| workspace host 与文件资源                          | `echo-agent-app-core/src/workspace/runtime.rs` |
-| conversation Agent 并发                            | `echo-agent-app-core/src/agent_pool.rs`        |
-| chat driver 与 terminal outcome                    | `echo-agent-app-core/src/chat_driver.rs`       |
-| foreground admission/cancel/settlement             | `echo-agent-app-core/src/foreground_turn.rs`   |
-| revisioned TaskRun graph 与文件投影                | `echo-agent-app-core/src/tasks/task_runtime/`  |
-| 跨 address 消息和 groups                           | `echo-agent-app-core/src/agent_router.rs`      |
-| boot recovery 与 unattended admission              | store-scoped reconciler + product owner split  |
-| GUI IPC                                            | `src/tauri/commands/`                          |
-| GUI address/view projection                        | `web-frontend/src/`                            |
+| 语义                                               | 权威实现                                         |
+| -------------------------------------------------- | ------------------------------------------------ |
+| ReAct、tools、DAG、Subagent、store traits、MCP/LSP | `echo-agent`                                     |
+| EKO bootstrap 与共享服务                           | `echo-agent-app-core/src/runtime.rs`             |
+| workspace host 与文件资源                          | `echo-agent-app-core/src/workspace/runtime.rs`   |
+| conversation Agent 并发                            | `echo-agent-app-core/src/agent_pool.rs`          |
+| chat driver 与 terminal outcome                    | `echo-agent-app-core/src/chat_driver.rs`         |
+| foreground admission/cancel/settlement             | `echo-agent-app-core/src/foreground_turn.rs`     |
+| revisioned TaskRun graph 与文件投影                | `echo-agent-app-core/src/tasks/task_runtime/`    |
+| 跨 address 消息和 groups                           | `echo-agent-app-core/src/agent_router.rs`        |
+| boot recovery 与 unattended admission              | store-scoped reconciler + product owner split    |
+| Extension mutation admission                       | `extension_control.rs` + `extension_commands.rs` |
+| GUI IPC                                            | `src/tauri/commands/`                            |
+| GUI address/view projection                        | `web-frontend/src/`                              |
 
 ## 已完成并已文档化
 
 - 流式对话、会话文件存储、附件与长输入 artifact。
 - revisioned TaskRun DAG、Subagent results/control、worktree、long-horizon core primitives。
 - Tool schema budget、recoverable output、canonical edit、analytics runtime、image input。
-- MCP resources、Browser/Chrome、LSP、Terminal、Plugin、Hook、Skill sync。
+- MCP resources、Browser/Chrome、LSP、Terminal、Plugin、Hook 与 Skill artifact sync 的
+  specialist runtime 已进入生产路径。
+- Extension Control Authority 已完成：v2 durable Skill settlement、boot/workspace repair、
+  scope-keyed MCP health、captured Hook/LSP root、AgentPool generation，以及
+  GUI/TUI/CLI/JSONL/channel 的 Skills/Plugins/MCP/Hooks/LSP/Browser 入口均收敛到 app-core。
 - 数据分析、学术/医学研究、Zotero/Europe PMC、review/export。
 - layered memory、Review Inbox、Curator、rule/Skill promotion。
 - dynamic Provider/model/protocol/thinking profile。
@@ -115,6 +120,10 @@ full workspace/GUI 门禁。
   正式提交集成、full workspace/GUI/TUI/CLI/channel 门禁和 website 镜像同步。
 
 ## 下一步
+
+Extension Control Authority 已完成。当前只进入本轮重构最终集成、完整门禁、双 reviewer 与
+10 分钟并发 soak；不得提前开始 steer/follow-up、Todo/Task/Subagent 或删除
+`InteractionMode`。
 
 TaskRuntime async surface 已统一复用进程共享的 bounded `TaskRuntimeBlockingAdapter`，并以
 ts-rs typed receipts 替代 GUI mutation 的 `serde_json::Value`/numeric interaction mode。

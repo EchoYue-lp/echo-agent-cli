@@ -1,10 +1,12 @@
 import { create } from 'zustand';
-import { pluginApi, type PluginThemeDefinition } from '../api/endpoints';
+import { extensionRequestScope, pluginApi, type PluginThemeDefinition } from '../api/endpoints';
+import { useWorkspaceStore } from './workspaceStore';
 
 export type SettingsTabId =
   | 'overview'
   | 'tools'
   | 'mcp'
+  | 'lsp'
   | 'skills'
   | 'memory'
   | 'config'
@@ -63,7 +65,10 @@ function clearPluginThemeVariables() {
 
 async function deactivatePluginTheme(): Promise<boolean> {
   try {
-    await pluginApi.activateTheme(null);
+    await pluginApi.activateTheme(
+      extensionRequestScope(useWorkspaceStore.getState().current),
+      null
+    );
     return true;
   } catch {
     console.warn('Failed to deactivate the active plugin theme');

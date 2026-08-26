@@ -461,338 +461,6 @@ pub async fn get_auto_memory_observations(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Skills
-// ════════════════════════════════════════════════════════════════════════════
-
-fn skill_descriptor_json(d: &echo_agent::skills::external::SkillDescriptor) -> serde_json::Value {
-    json!({
-        "name": d.name,
-        "description": d.description,
-        "triggers": d.triggers,
-        "file": d.location.display().to_string(),
-        "loaded": true,
-        "source": "runtime",
-    })
-}
-
-fn hub_skill_json(entry: &echo_agent_app_core::skills_hub::SkillHubEntry) -> serde_json::Value {
-    // 下发前端 SkillInfo 所需的全部字段(M4 修复:此前缺 category/is_baseline/
-    // is_builtin/upstream_version/source,且 source 被写死成 "hub" 覆盖真实来源)。
-    // source: 优先用 entry.source(上游来源 superpowers/anthropic/builtin),
-    // 缺失时回退 "hub"(表示由 SkillsHub 发现,与 runtime 相对)。
-    let source = entry.source.clone().unwrap_or_else(|| "hub".to_string());
-    json!({
-        "name": entry.name,
-        "description": entry.description,
-        "file": entry.path.display().to_string(),
-        "loaded": entry.loaded,
-        "source": source,
-        "category": entry.category,
-        "is_baseline": entry.is_baseline,
-        "is_builtin": entry.is_builtin,
-        "upstream_version": entry.upstream_version,
-        "license": entry.license,
-        "version": entry.version,
-        "author": entry.author,
-        "tags": entry.tags,
-        "has_sandbox": entry.has_sandbox,
-        "depends_on": entry.depends_on,
-        // 缺失的系统二进制(scan 时探测 requires-binaries 得出)。
-        // 前端 SkillsPanel 据此显示 ⚠️ AlertTriangle + tooltip。
-        "missing_dependencies": entry.missing_dependencies,
-        // Update state is fetched explicitly by `check_skill_updates`; listing
-        // skills never performs a network request.
-        "has_updates": false,
-    })
-}
-
-/// ~/.eko/enabled-skills.json 路径(B3:enable/disable 同步写此文件,
-/// 消除"SkillsHub 内存 / enabled-skills.json / is_baseline 硬编码"三套状态不同步)。
-fn enabled_skills_json_path() -> Option<std::path::PathBuf> {
-    Some(echo_agent_app_core::data_root::user_data_path(
-        "enabled-skills.json",
-    ))
-}
-
-/// 同步 enabled-skills.json:确保 skill entry 存在(带 category),设置 enabled。
-/// 失败仅记日志不阻断(技能已加载进 agent,持久化失败不应让 UI 操作报错)。
-fn persist_skill_enabled(name: &str, category: &str, enabled: bool) {
-    use echo_agent_app_core::skills_hub::enabled_skills::{EnabledSkillsConfig, SkillEnableEntry};
-    let Some(path) = enabled_skills_json_path() else {
-        tracing::warn!("无法获取 HOME,enabled-skills.json 未更新");
-        return;
-    };
-    let mut config = match EnabledSkillsConfig::load(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "读取 enabled-skills.json 失败,用默认配置");
-            EnabledSkillsConfig::default()
-        }
-    };
-    // 确保 entry 存在(set_enabled 只改已有 entry,新启用的技能需先插入)。
-    // 仅当 entry 不存在时插入,避免覆盖用户已设的 baseline 标记。
-    if !config.skills.contains_key(name) {
-        config.skills.insert(
-            name.to_string(),
-            SkillEnableEntry {
-                category: category.to_string(),
-                enabled,
-                baseline: false, // 新启用默认非 baseline;用户可另行设 baseline
-            },
-        );
-    } else {
-        config.set_enabled(name, enabled);
-    }
-    if let Err(e) = config.save(&path) {
-        tracing::warn!(error = %e, "写入 enabled-skills.json 失败");
-    }
-}
-
-async fn runtime_skill_names(state: &TauriState) -> Vec<String> {
-    let agent = state.app_state.connection.primary_agent();
-    agent
-        .read(|a| {
-            a.skill_descriptors()
-                .iter()
-                .map(|descriptor| descriptor.name.clone())
-                .collect::<Vec<_>>()
-        })
-        .await
-}
-
-async fn refresh_skill_hub_loaded_state(state: &TauriState) {
-    let names = runtime_skill_names(state).await;
-    let mut hub = state.app_state.skills_hub.write().await;
-    hub.refresh();
-    hub.set_loaded_skills(names);
-}
-
-async fn refresh_runtime_skill_catalog(state: &TauriState) -> Result<(), IpcError> {
-    let plugin_runtime = state
-        .app_state
-        .plugin_runtime
-        .as_ref()
-        .ok_or_else(|| IpcError::Internal("Plugin runtime is not configured".to_string()))?;
-    plugin_runtime
-        .refresh_agent_catalog()
-        .await
-        .map_err(|error| IpcError::Internal(error.to_string()))
-}
-
-#[tauri::command]
-pub async fn list_skills(
-    state: tauri::State<'_, TauriState>,
-) -> Result<serde_json::Value, IpcError> {
-    refresh_skill_hub_loaded_state(&state).await;
-    let agent = state.app_state.connection.primary_agent();
-    let descriptors = agent.read(|a| a.skill_descriptors()).await;
-    let mut skills: Vec<serde_json::Value> = {
-        let hub = state.app_state.skills_hub.read().await;
-        hub.list().into_iter().map(hub_skill_json).collect()
-    };
-    for descriptor in descriptors {
-        if !skills.iter().any(|skill| {
-            skill
-                .get("name")
-                .and_then(|name| name.as_str())
-                .is_some_and(|name| name == descriptor.name)
-        }) {
-            skills.push(skill_descriptor_json(&descriptor));
-        }
-    }
-    skills.sort_by(|a, b| {
-        let a_name = a.get("name").and_then(|v| v.as_str()).unwrap_or_default();
-        let b_name = b.get("name").and_then(|v| v.as_str()).unwrap_or_default();
-        a_name.cmp(b_name)
-    });
-    Ok(json!(skills))
-}
-
-#[tauri::command]
-pub async fn get_skill(
-    state: tauri::State<'_, TauriState>,
-    name: String,
-) -> Result<serde_json::Value, IpcError> {
-    let agent = state.app_state.connection.primary_agent();
-    let descriptors = agent.read(|a| a.skill_descriptors()).await;
-    match descriptors.iter().find(|d| d.name == name) {
-        Some(d) => Ok(skill_descriptor_json(d)),
-        None => Err(IpcError::NotFound(format!("Skill '{}' not found", name))),
-    }
-}
-
-#[tauri::command]
-pub async fn check_skill_updates(
-    state: tauri::State<'_, TauriState>,
-    target: Option<String>,
-) -> Result<serde_json::Value, IpcError> {
-    let root = state.app_state.skills_hub.read().await.root().to_path_buf();
-    let hub = echo_agent_app_core::skills_hub::SkillsHub::with_root(root);
-    let statuses = echo_agent_app_core::skills_hub::check_updates(&hub, target.as_deref())
-        .await
-        .map_err(IpcError::Internal)?;
-    serde_json::to_value(statuses).map_err(|error| IpcError::Internal(error.to_string()))
-}
-
-#[tauri::command]
-pub async fn sync_skills(
-    state: tauri::State<'_, TauriState>,
-    target: Option<String>,
-    force: bool,
-) -> Result<serde_json::Value, IpcError> {
-    let root = state.app_state.skills_hub.read().await.root().to_path_buf();
-    let mut hub = echo_agent_app_core::skills_hub::SkillsHub::with_root(root.clone());
-    let results = echo_agent_app_core::skills_hub::sync_skills(&mut hub, target.as_deref(), force)
-        .await
-        .map_err(IpcError::Internal)?;
-    state
-        .app_state
-        .connection
-        .primary_agent()
-        .write_async(|agent| {
-            let root = root.clone();
-            Box::pin(async move { agent.load_skills_from_dir(root).await })
-        })
-        .await
-        .map_err(|error| IpcError::Internal(error.to_string()))?;
-    refresh_skill_hub_loaded_state(&state).await;
-    refresh_runtime_skill_catalog(&state).await?;
-    serde_json::to_value(results).map_err(|error| IpcError::Internal(error.to_string()))
-}
-
-#[tauri::command]
-pub async fn load_skill(
-    state: tauri::State<'_, TauriState>,
-    name: String,
-) -> Result<serde_json::Value, IpcError> {
-    let raw = name.trim();
-    if raw.is_empty() {
-        return Err(IpcError::Validation("技能目录路径不能为空".into()));
-    }
-
-    let path = std::path::PathBuf::from(raw);
-
-    let canonical = path
-        .canonicalize()
-        .map_err(|_| IpcError::NotFound(format!("技能目录不存在: {}", path.display())))?;
-    if !canonical.is_dir() {
-        return Err(IpcError::Validation(format!(
-            "技能路径不是目录: {}",
-            path.display()
-        )));
-    }
-
-    let agent = state.app_state.connection.primary_agent();
-    let loaded = agent
-        .write_async(|agent| {
-            let path = canonical.clone();
-            Box::pin(async move { agent.load_skills_from_dir(path).await })
-        })
-        .await
-        .map_err(|e| IpcError::Internal(e.to_string()))?;
-    let count = loaded.len();
-    refresh_skill_hub_loaded_state(&state).await;
-    refresh_runtime_skill_catalog(&state).await?;
-
-    let skills: Vec<serde_json::Value> = agent
-        .read(|a| {
-            a.skill_descriptors()
-                .iter()
-                .map(skill_descriptor_json)
-                .collect()
-        })
-        .await;
-
-    Ok(json!({
-        "success": true,
-        "loaded": loaded,
-        "count": count,
-        "skills": skills,
-    }))
-}
-
-#[tauri::command]
-pub async fn enable_skill(
-    state: tauri::State<'_, TauriState>,
-    name: String,
-) -> Result<serde_json::Value, IpcError> {
-    let (skill_path, category) = {
-        let mut hub = state.app_state.skills_hub.write().await;
-        hub.refresh();
-        hub.enable_skill(&name).map_err(IpcError::Validation)?;
-        let entry = hub
-            .get(&name)
-            .ok_or_else(|| IpcError::NotFound(format!("Skill '{}' not found", name)))?;
-        (entry.path.clone(), entry.category.clone())
-    };
-
-    let load_root = skill_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or(skill_path);
-    let loaded = state
-        .app_state
-        .connection
-        .primary_agent()
-        .write_async(|agent| {
-            let path = load_root.clone();
-            Box::pin(async move { agent.load_skills_from_dir(path).await })
-        })
-        .await
-        .map_err(|e| IpcError::Internal(e.to_string()))?;
-    let count = loaded.len();
-    // B3:同步写 enabled-skills.json,消除三套状态不同步。
-    persist_skill_enabled(&name, &category, true);
-    refresh_skill_hub_loaded_state(&state).await;
-    refresh_runtime_skill_catalog(&state).await?;
-
-    Ok(json!({
-        "success": true,
-        "loaded": loaded,
-        "count": count,
-        "skills": list_skills(state).await?,
-    }))
-}
-
-#[tauri::command]
-pub async fn disable_skill(
-    state: tauri::State<'_, TauriState>,
-    name: String,
-) -> Result<serde_json::Value, IpcError> {
-    let category = {
-        let mut hub = state.app_state.skills_hub.write().await;
-        hub.refresh();
-        // 先取 category(disable 前entry 还在),再 disable。
-        let category = hub
-            .get(&name)
-            .map(|e| e.category.clone())
-            .unwrap_or_default();
-        hub.disable_skill(&name).map_err(IpcError::Validation)?;
-        category
-    };
-    // B3:同步写 enabled-skills.json(标记 enabled=false)。
-    // 运行中 agent 已发现的技能不能热卸载,但持久化状态必须更新,
-    // 这样下次 bootstrap 不会再加载它,与 UI 显示一致。
-    persist_skill_enabled(&name, &category, false);
-
-    Ok(json!({
-        "success": true,
-        "requires_restart": true,
-        "message": "技能已从启用列表移除(enabled-skills.json 已更新);当前运行中的 agent 已发现的技能不能热卸载,新会话或重启后生效。",
-        "skills": list_skills(state).await?,
-    }))
-}
-
-#[tauri::command]
-pub async fn upload_skill(
-    _state: tauri::State<'_, TauriState>,
-) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::Validation(
-        "Tauri 桌面端不支持浏览器式技能上传；请使用“浏览”选择本地技能目录加载".into(),
-    ))
-}
-
-// ════════════════════════════════════════════════════════════════════════════
 // Workflow
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1753,67 +1421,39 @@ pub async fn activate_skill_draft(
     state: tauri::State<'_, TauriState>,
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let generation = evolution_write_lease(state.inner())?;
-    let agent = state.app_state.connection.primary_agent();
-    let echo_agent_dir = generation.echo_agent_dir().to_path_buf();
-    let draft_dir = echo_agent_dir.join("skills").join("_drafts").join(&name);
-    let target_dir = echo_agent_dir.join("skills").join(&name);
-
-    if !draft_dir.join("SKILL.md").exists() {
-        return Err(IpcError::NotFound(format!(
-            "Draft for '{name}' not found at {}",
-            draft_dir.display()
-        )));
-    }
-
-    // 复制 _drafts/<name>/SKILL.md → skills/<name>/SKILL.md
-    // (草稿目录目前只含 SKILL.md;若将来有附属资源,扩成递归复制即可)
-    std::fs::create_dir_all(&target_dir)
-        .map_err(|e| IpcError::Internal(format!("Failed to create target dir: {e}")))?;
-    std::fs::copy(draft_dir.join("SKILL.md"), target_dir.join("SKILL.md"))
-        .map_err(|e| IpcError::Internal(format!("Failed to copy draft SKILL.md: {e}")))?;
-
-    // curator 状态 Draft→Active。
-    let curator = echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir);
-    let active_skill_path = target_dir.join("SKILL.md");
-    match curator.promote_to_active_at(&name, Some(&active_skill_path)) {
-        Ok(true) => {}
-        Ok(false) => {
-            let _ = std::fs::remove_file(&active_skill_path);
-            return Err(IpcError::Validation(format!(
-                "Skill '{name}' is not in Draft lifecycle state"
-            )));
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(&active_skill_path);
-            return Err(IpcError::Internal(format!(
-                "Failed to promote '{name}' to active: {error}"
-            )));
-        }
-    }
-
-    let load_root = target_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| target_dir.clone());
-    agent
-        .write_async(|runtime| {
-            Box::pin(async move { runtime.load_skills_from_dir(load_root).await })
-        })
+    let runtime = state
+        .app_state
+        .current_control_runtime()
         .await
-        .map_err(|error| IpcError::Internal(format!("Failed to load activated skill: {error}")))?;
-
-    echo_agent_app_core::evolution::fire_evolution_hook(
-        &agent,
-        echo_agent::hooks::HookEvent::SkillLifecycleTransition,
-        &name,
-    )
-    .await;
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let generation = runtime
+        .review_integration()
+        .ok_or_else(|| {
+            IpcError::Internal(format!(
+                "Review integration is not configured for workspace '{}'",
+                runtime.execution_scope().workspace_id()
+            ))
+        })?
+        .lease_generation()
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let receipt = state
+        .app_state
+        .extension_control
+        .publish_curated_skill(&state.app_state, Some(&runtime), generation, &name)
+        .await
+        .map_err(|error| IpcError::Internal(format!("Failed to promote Skill: {error}")))?;
+    let success =
+        receipt.status == echo_agent_app_core::extension_control::SkillSettlementStatus::Settled;
 
     Ok(json!({
-        "success": true,
-        "name": name,
-        "path": target_dir.to_string_lossy(),
+        "success": success,
+        "status": receipt.status,
+        "name": receipt.name,
+        "path": receipt.active_path,
+        "durable_committed": receipt.durable_committed,
+        "idempotent": receipt.idempotent,
+        "loaded_entries": receipt.loaded_entries,
+        "runtime_error": receipt.runtime_error,
     }))
 }
 
@@ -2342,71 +1982,46 @@ pub async fn cleanup_unattended_worktrees(
     }))
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// MCP (missing method)
-// ════════════════════════════════════════════════════════════════════════════
-
-#[tauri::command]
-pub async fn get_mcp_server(
-    state: tauri::State<'_, TauriState>,
-    name: String,
-) -> Result<serde_json::Value, IpcError> {
-    let mcp_config = state.app_state.plugins.mcp_config.snapshot().await;
-    let mcp_health = state.app_state.plugins.mcp_health.read().await;
-
-    let exists = state
-        .app_state
-        .connection
-        .agent
-        .read(|agent| agent.list_mcp_servers().iter().any(|s| s == &name))
-        .await;
-
-    if !exists {
-        return Err(IpcError::NotFound(format!(
-            "MCP server '{}' not found",
-            name
-        )));
-    }
-
-    let health = mcp_health.get(&name);
-    let status = if let Some(h) = health {
-        if h.healthy { "connected" } else { "error" }
-    } else {
-        "disconnected"
-    };
-
-    let transport = mcp_config
-        .mcp_servers
-        .get(&name)
-        .map(|e| {
-            if e.url.is_some() {
-                if e.transport.as_deref() == Some("sse") {
-                    "sse"
-                } else {
-                    "http"
-                }
-            } else if e.command.is_some() {
-                "stdio"
-            } else {
-                "unknown"
-            }
-        })
-        .unwrap_or("unknown");
-
-    Ok(serde_json::json!({
-        "name": name,
-        "status": status,
-        "transport": transport,
-        "tool_count": 0,
-        "tools": [],
-        "connected_at": null,
-        "error": health.and_then(|h| h.error.clone()),
-    }))
-}
-
 #[cfg(test)]
 mod scoped_control_tests {
     use super::*;
+
+    #[test]
+    fn skill_wire_loaded_state_comes_from_extension_projection() {
+        let entry = echo_agent_app_core::extension_control::ExtensionSkillEntry {
+            catalog: echo_agent_app_core::skills_hub::SkillHubEntry {
+                name: "review".to_string(),
+                description: "Review changes".to_string(),
+                path: PathBuf::from("/tmp/skills/review"),
+                category: "development".to_string(),
+                is_baseline: false,
+                is_builtin: true,
+                upstream_version: None,
+                source: None,
+                license: None,
+                compatibility: None,
+                version: None,
+                author: None,
+                tags: Vec::new(),
+                has_sandbox: false,
+                depends_on: Vec::new(),
+                missing_dependencies: Vec::new(),
+            },
+            loaded: true,
+        };
+
+        let wire = serde_json::to_value(&entry).unwrap_or_default();
+
+        assert!(wire.get("file").is_none());
+        assert_eq!(
+            wire.get("path").and_then(serde_json::Value::as_str),
+            Some("/tmp/skills/review")
+        );
+        assert_eq!(
+            wire.get("loaded").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
 
     #[test]
     fn invalid_auto_memory_scope_does_not_commit_global_toggle() {

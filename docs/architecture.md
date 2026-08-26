@@ -52,6 +52,8 @@ Browser 和基础 Agent 资源。GUI 通过 `AppState` 持有这些资源；TUI�
 - `PluginRuntimeService`：Plugin 发现、候选 staging、runtime rewire 和偏好持久化。
 - `McpConfigRuntime`：用户 `mcp.json` 的唯一写入与连接 reconciliation。
 - `BrowserRuntime`：托管 Chromium/Chrome backend 与 browser event projection。
+- `ExtensionControlService`：在当前 workspace generation 上协调 Skills、Hooks、MCP、
+  Plugin、LSP 和 Browser，是所有产品 surface 共享的 EKO mutation admission。
 - `WorkflowService` / `StructuredExtractionService`：EKO catalog、显式 runtime address、
   typed outcome 与 surface command adapter；Graph/`extract_json` 执行仍由 framework 拥有。
 
@@ -223,12 +225,54 @@ EKO 启动时把 framework 用户数据根设置为 `~/.eko`，也可用 `EKO_DA
 - Provider/模型：Provider 保存连接与认证，模型保存协议、输入模态和上下文参数。
 - MCP：用户配置与 Plugin receipt 共享 name ownership，用户配置优先。
 - Plugin：根 `plugin.json` 加固定组件目录，候选完整验证后才替换 live generation。
-- Skill：内置和用户 Skill 都通过 framework loader，SkillsHub 负责产品安装/启停/同步。
+- Skill：内置和用户 Skill 都通过 framework loader；SkillsHub 负责 artifact
+  discovery/install/sync，不拥有第二份 live registry。
 - 分析/研究：计划、脚本、数据、source/evidence/review/report 都保存为可检查 artifact。
 - Memory/evolution：workspace-bound layered memory 和 Review Inbox 是应用策略，写入需要
   可追溯证据。
 
 完整的已实现能力与代码入口见 [功能总览](./features.md)。
+
+### Extension Control Authority
+
+扩展控制按四层分工：
+
+| 层                 | 唯一职责                                                                             |
+| ------------------ | ------------------------------------------------------------------------------------ |
+| framework          | Skill/Hook registry、MCP/LSP 协议与通用 manager                                      |
+| specialist runtime | Plugin scan/wiring、MCP reconcile、Hook/LSP/Browser 实际执行                         |
+| EKO app-core       | workspace generation capture、mutation admission、配置文件、生命周期和 typed receipt |
+| surface            | 参数转换和 receipt 渲染                                                              |
+
+`enabled-skills.json` 是 Skill 启停的唯一 durable desired fact。Skill settlement
+先用同目录 staging、文件同步、原子替换和父目录同步提交 desired generation，
+再向 global seed、已加载 workspace、existing AgentPool 和 future Agent fanout。durable commit
+之后的 target failure 返回 typed degraded receipt 与 repair debt，不进行内存 rollback。
+
+receipt 同时携带 operation/content identity、desired generation、settlement 状态、逐 target
+的 workspace/specialist generation、committed file path 以及结构化 repair debt。每个
+`SkillRepairTargetDebt` 包含 target/component、expected/observed generation、reason 与
+retryable。相同 operation + 相同 content 幂等返回，
+相同 operation + 不同 content 是冲突；旧 generation 不能覆盖新 generation。repair debt 由
+durable desired generation 与 live applied generation 的差异推导；bounded debt snapshot
+可以与 desired state 同存在一个文件中，但不建立第二个 store，并在 restart、workspace load
+和下一次 mutation 前重放。disabled Skill artifact 删除失败也进入同一 bounded debt，不由
+surface 私下重试。
+
+service 接受 operation 后由应用 lifecycle 持有到 settlement；caller drop 不能取消已经接受的
+提交或 fanout。shutdown 先关闭 admission，再等待已接受 operation。完整决策见
+[ADR 0012](./adr/0012-extension-control-authority.md)。
+
+v2 desired/settled generation、`atomic_write`、ProductData-owned `SkillSyncReceipt` 和带
+workspace/specialist generation 的 target receipt 已进入生产路径；Skill content identity 同时
+覆盖 policy 与 enabled `SKILL.md`。GUI/headless bootstrap 在 Agent delivery recovery 前调用
+on-load reconcile，workspace create/switch settlement 也执行相同 repair。
+
+`ExtensionCommandDispatcher` 提供 Skills/Plugins/MCP/Hooks/LSP/Browser 的 surface-neutral
+request/receipt。GUI 使用 typed Tauri IPC；JSONL 把 typed `ExtensionReceipt` 写入 canonical
+journal/event stream且不进入模型；CLI、TUI、channel 通过同一 app-core service 做文本适配和
+terminal settlement。MCP health 按 authority scope 保存，Hook/LSP 使用 captured project root，
+Browser 和 LSP 在五类产品入口功能对等。
 
 ## 不变量
 

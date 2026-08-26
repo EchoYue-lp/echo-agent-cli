@@ -12,7 +12,7 @@ import NewTaskDialog from './components/workspace/NewTaskDialog';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useConversationStore } from './stores/conversationStore';
 import { applyPluginTheme, useUiStore } from './stores/uiStore';
-import { pluginApi } from './api/endpoints';
+import { extensionRequestScope, pluginApi } from './api/endpoints';
 import { useWorkspaceStore } from './stores/workspaceStore';
 import { useTaskRuntimeStore } from './stores/taskRuntimeStore';
 import { RequireAuth } from './components/Auth/RequireAuth';
@@ -28,6 +28,7 @@ function App() {
   const toggleTheme = useUiStore((s) => s.toggleTheme);
   const toggleTerminal = useUiStore((s) => s.toggleTerminal);
   const initWorkspaces = useWorkspaceStore((s) => s.init);
+  const currentWorkspace = useWorkspaceStore((s) => s.current);
   const currentWorkspaceId = useWorkspaceStore((s) => workspaceIdForView(s.current?.id));
 
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -45,13 +46,13 @@ function App() {
 
   useEffect(() => {
     pluginApi
-      .themes()
+      .themes(extensionRequestScope(currentWorkspace))
       .then((result) => {
         const active = result.themes.find((theme) => theme.name === result.active) || null;
         applyPluginTheme(active);
       })
       .catch(() => undefined);
-  }, []);
+  }, [currentWorkspace]);
 
   // Load the active conversation's TaskRuntime run so the main-window
   // ParallelExecutionBlock and the RightRail can render subagent state.

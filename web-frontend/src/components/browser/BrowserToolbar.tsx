@@ -1,5 +1,13 @@
 import { useEffect, useState } from 'react';
-import { ArrowLeft, Camera, CornerDownLeft, Plus, RotateCw, Square } from 'lucide-react';
+import {
+  ArrowLeft,
+  Camera,
+  CornerDownLeft,
+  Plus,
+  RotateCw,
+  SlidersHorizontal,
+  Square,
+} from 'lucide-react';
 
 export function BrowserToolbar({
   url,
@@ -10,6 +18,8 @@ export function BrowserToolbar({
   onStop,
   onRefreshFrame,
   onNewTab,
+  toolsOpen,
+  onToggleTools,
   backend,
   chromeConnected,
   onBackendChange,
@@ -23,6 +33,8 @@ export function BrowserToolbar({
   onStop: () => void;
   onRefreshFrame: () => void;
   onNewTab: () => void;
+  toolsOpen: boolean;
+  onToggleTools: () => void;
   backend: 'managed' | 'chrome';
   chromeConnected: boolean;
   onBackendChange: (backend: 'managed' | 'chrome') => void;
@@ -74,6 +86,15 @@ export function BrowserToolbar({
       </button>
       <button type="button" className={iconClass} onClick={onNewTab} title="新建标签页">
         <Plus size={13} />
+      </button>
+      <button
+        type="button"
+        className={`${iconClass} ${toolsOpen ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : ''}`}
+        onClick={onToggleTools}
+        aria-pressed={toolsOpen}
+        title="浏览器工具"
+      >
+        <SlidersHorizontal size={13} />
       </button>
       <label className="sr-only" htmlFor="browser-backend">
         浏览器模式

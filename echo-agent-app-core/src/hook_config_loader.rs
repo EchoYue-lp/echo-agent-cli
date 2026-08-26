@@ -77,19 +77,20 @@ impl HookConfigSource {
 /// 无状态:所有方法都是关联函数,直接从磁盘/`EkoConfig` 读取并合并。
 /// 提供 `load_merged`(已知 `EkoConfig`)与 `load_merged_from_disk`
 /// (`/hooks reload` 无法访问 `EkoConfig` 时从磁盘重读)两个统一入口。
+/// 默认入口只加载 inline/global 来源；项目级来源必须通过显式 workspace
+/// 入口提供 root，不能从进程 cwd 推断。
 pub struct HookConfigLoader;
 
 impl HookConfigLoader {
-    /// 加载并合并所有 user hook 来源(内嵌 + 全局文件 + 项目文件)。
+    /// 加载并合并非 workspace user hook 来源(内嵌 + 全局文件)。
     ///
     /// 这是 bootstrap 路径应使用的入口:它接收已加载的 `EkoConfig`,
-    /// 取其 `hooks` 字段,再叠加两个 hooks.yaml 文件,合并返回单个
+    /// 取其 `hooks` 字段,再叠加全局 hooks.yaml,合并返回单个
     /// `HooksDefinition`。调用方拿到结果后应**一次性**
     /// `clear_user_hooks()` + `register_user_hooks(merged)`,不要
     /// 再单独 register 内嵌或文件 hooks(那是旧 bug 的根源)。
     pub fn load_merged(app_config: &EkoConfig) -> HooksLoadResult {
-        let project_root = std::env::current_dir().ok();
-        Self::load_merged_for_workspace(app_config, project_root.as_deref())
+        Self::load_merged_for_workspace(app_config, None)
     }
 
     /// Load all user hook sources for an explicit workspace generation.
@@ -130,16 +131,15 @@ impl HookConfigLoader {
     ///
     /// 用于 `/hooks reload`:无法访问 `EkoConfig` 时,用框架的
     /// `load_config(None)` 重新从标准路径读取 `eko.yaml`,
-    /// 再叠加两个 hooks.yaml 文件。语义与 `load_merged` 完全一致,
+    /// 再叠加全局 hooks.yaml。语义与 `load_merged` 完全一致,
     /// 只是内嵌来源从磁盘重读而非从内存取。
     pub fn load_merged_from_disk() -> HooksLoadResult {
         Self::load_merged_from_disk_at(None)
     }
 
-    /// Reload from an explicitly selected app config plus both hooks files.
+    /// Reload from an explicitly selected app config plus the global hooks file.
     pub fn load_merged_from_disk_at(config_path: Option<&Path>) -> HooksLoadResult {
-        let project_root = std::env::current_dir().ok();
-        Self::load_merged_from_disk_for_workspace(config_path, project_root.as_deref())
+        Self::load_merged_from_disk_for_workspace(config_path, None)
     }
 
     /// Reload from disk for an explicit workspace generation.
@@ -278,20 +278,20 @@ mod tests {
     // ── 合并顺序测试 ─────────────────────────────────────────────
 
     #[test]
-    fn test_inline_hooks_loaded_from_app_config() {
-        // 无任何文件时,load_merged 应回收内嵌 hooks。
+    fn test_inline_hooks_loaded_from_app_config() -> Result<(), String> {
+        let workspace = tempfile::tempdir().map_err(|error| error.to_string())?;
         let inline = single_def(HookEvent::SessionStart, "*", "inline-only");
         let cfg = app_config_with_inline(inline);
-        let result = HookConfigLoader::load_merged(&cfg);
-        assert_eq!(
-            result.definition.rules_for(HookEvent::SessionStart).len(),
-            1,
+        let result = HookConfigLoader::load_merged_for_workspace(&cfg, Some(workspace.path()));
+        assert!(
+            result
+                .definition
+                .rules_for(HookEvent::SessionStart)
+                .iter()
+                .any(|rule| rule.matcher == "*"),
             "inline hooks should be present in merged result"
         );
-        assert!(
-            result.loaded_from.is_empty(),
-            "no files loaded, loaded_from should be empty"
-        );
+        Ok(())
     }
 
     #[test]
@@ -315,18 +315,43 @@ mod tests {
     }
 
     #[test]
-    fn test_load_merged_empty_app_config_no_hooks() {
-        // 空 EkoConfig + (测试环境下很可能不存在的)文件 → 空结果。
+    fn test_load_merged_empty_app_config_no_workspace_hooks() -> Result<(), String> {
+        let workspace = tempfile::tempdir().map_err(|error| error.to_string())?;
         let cfg = empty_app_config();
-        let result = HookConfigLoader::load_merged(&cfg);
-        // loaded_from 可能有项目文件(取决于测试运行目录),但 definition
-        // 在无 inline 且无文件时应为空。
-        if result.loaded_from.is_empty() {
-            assert!(
-                result.definition.is_empty(),
-                "empty sources should yield empty definition"
-            );
-        }
+        let result = HookConfigLoader::load_merged_for_workspace(&cfg, Some(workspace.path()));
+        let workspace_hook = workspace.path().join(".eko").join("hooks.yaml");
+        assert!(!result.loaded_from.contains(&workspace_hook));
+        assert!(
+            result
+                .loaded_from
+                .iter()
+                .all(|path| path == &crate::data_root::user_data_path("hooks.yaml"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn default_load_does_not_infer_a_workspace_root() -> Result<(), String> {
+        let workspace = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let hooks_dir = workspace.path().join(".eko");
+        std::fs::create_dir_all(&hooks_dir).map_err(|error| error.to_string())?;
+        let hooks_path = hooks_dir.join("hooks.yaml");
+        std::fs::write(
+            &hooks_path,
+            "SessionStart:\n  - matcher: \"must-stay-explicit\"\n    hooks:\n      - type: prompt\n        prompt: \"workspace hook\"\n",
+        )
+        .map_err(|error| error.to_string())?;
+
+        let result = HookConfigLoader::load_merged(&EkoConfig::default());
+        assert!(!result.loaded_from.contains(&hooks_path));
+        assert!(
+            result
+                .definition
+                .rules_for(HookEvent::SessionStart)
+                .iter()
+                .all(|rule| rule.matcher != "must-stay-explicit")
+        );
+        Ok(())
     }
 
     #[test]

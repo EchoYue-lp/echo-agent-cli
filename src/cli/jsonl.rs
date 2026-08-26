@@ -237,6 +237,54 @@ mod tests {
     }
 
     #[test]
+    fn extension_receipt_keeps_its_typed_journal_tag() -> Result<(), String> {
+        let temp = TestDir::new()?;
+        let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        let shared = SharedOutput::default();
+        let captured = shared.0.clone();
+        let sink = JsonlChatSink::new(Box::new(shared));
+        let receipt = echo_agent_app_core::extension_commands::ExtensionCommandReceipt::failed(
+            echo_agent_app_core::extension_commands::ExtensionKind::Mcp,
+            echo_agent_app_core::extension_commands::ExtensionCommandIdentity {
+                request_id: "request-1".to_string(),
+                operation_id: "operation-1".to_string(),
+            },
+            "global",
+            "fixture failure",
+        );
+        let envelope = log
+            .append(
+                "global",
+                Some("jsonl-conversation"),
+                "jsonl-turn",
+                ChatDriverEvent::ExtensionReceipt(Box::new(receipt)),
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(sink.on_journaled_event(envelope));
+
+        let bytes = lock_output(&captured).clone();
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        assert_eq!(
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("source"))
+                .and_then(serde_json::Value::as_str),
+            Some("extension_receipt")
+        );
+        let decoded: ChatEventEnvelope =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        assert!(matches!(
+            decoded.payload,
+            ChatDriverEvent::ExtensionReceipt(receipt)
+                if receipt.status()
+                    == echo_agent_app_core::extension_commands::ExtensionCommandStatus::Failed
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn hitl_provider_emits_typed_request_and_applies_policy() -> Result<(), String> {
         #[derive(Default)]
         struct RecordingSink(Mutex<Vec<serde_json::Value>>);

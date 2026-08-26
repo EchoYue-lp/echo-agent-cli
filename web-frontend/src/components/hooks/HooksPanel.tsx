@@ -1,5 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
-import { hooksApi, type HookSourceInfo, type HooksReloadSummary } from '../../api/endpoints';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  extensionRequestScope,
+  hooksApi,
+  type HookSourceInfo,
+  type HooksReloadSummary,
+} from '../../api/endpoints';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 import {
   Webhook,
   RefreshCw,
@@ -27,7 +33,10 @@ const KIND_LABEL: Record<ReturnType<typeof sourceKind>, string> = {
 };
 
 export function HooksPanel() {
+  const workspace = useWorkspaceStore((state) => state.current);
+  const requestScope = useMemo(() => extensionRequestScope(workspace), [workspace]);
   const [sources, setSources] = useState<HookSourceInfo[]>([]);
+  const [sourcesOmitted, setSourcesOmitted] = useState(0);
   const [loading, setLoading] = useState(true);
   const [testing, setTesting] = useState(false);
   const [events, setEvents] = useState<string[]>([]);
@@ -39,15 +48,16 @@ export function HooksPanel() {
   const loadHooks = useCallback(async () => {
     try {
       setLoading(true);
-      const data = await hooksApi.list();
-      setSources(data);
+      const data = await hooksApi.list(requestScope);
+      setSources(data.sources);
+      setSourcesOmitted(data.omitted);
       setError(null);
     } catch (e: any) {
       setError(e.message || 'Failed to load hooks');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [requestScope]);
 
   useEffect(() => {
     void loadHooks();
@@ -66,13 +76,17 @@ export function HooksPanel() {
     try {
       setLoading(true);
       setMessage(null);
-      const summary: HooksReloadSummary = await hooksApi.reload();
+      const summary: HooksReloadSummary = await hooksApi.reload(requestScope);
       if (summary.success) {
         const detail =
           summary.loaded_from.length > 0 ? ` from ${summary.loaded_from.join(', ')}` : '';
+        const omitted =
+          summary.loaded_from_omitted > 0
+            ? ` (${summary.loaded_from_omitted} sources omitted)`
+            : '';
         setMessage({
           type: 'success',
-          text: summary.message || `Reloaded ${summary.rule_count} hook rules${detail}`,
+          text: summary.message || `Reloaded ${summary.rule_count} hook rules${detail}${omitted}`,
         });
         await loadHooks();
       } else {
@@ -89,15 +103,16 @@ export function HooksPanel() {
     try {
       setTesting(true);
       setMessage(null);
-      const result = await hooksApi.test(selectedEvent, matcher);
+      const result = await hooksApi.test(requestScope, selectedEvent, matcher);
       const details = result.matches
         .map((item) => `${item.source}: ${item.action} (${item.matcher || '*'})`)
         .join('; ');
+      const omitted = result.matches_omitted > 0 ? `; ${result.matches_omitted} omitted` : '';
       setMessage({
         type: result.matches.length > 0 ? 'success' : 'error',
         text:
           result.matches.length > 0
-            ? `${result.event} dry-run matched ${result.matches.length}: ${details}`
+            ? `${result.event} dry-run matched ${result.matches.length}: ${details}${omitted}`
             : `${result.event} dry-run matched no actions`,
       });
     } catch (e: any) {
@@ -128,6 +143,7 @@ export function HooksPanel() {
           </h2>
           <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
             {sources.length} sources, {totalRules} rules
+            {sourcesOmitted > 0 ? `, ${sourcesOmitted} omitted` : ''}
           </span>
         </div>
         <div className="flex items-center gap-2">

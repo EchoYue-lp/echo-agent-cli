@@ -19,11 +19,12 @@ Skill 的分类来自 `SKILL.md` metadata，不由目录深度决定。loader �
 
 ## enabled-skills.json
 
-管理技能的启用状态和 baseline 标记，位于 `~/.eko/enabled-skills.json`：
+管理技能的启用状态、baseline 与 durable settlement，位于
+`~/.eko/enabled-skills.json`。当前 version 2 形状如下：
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "skills": {
     "brainstorming": {
       "category": "methodology",
@@ -31,16 +32,115 @@ Skill 的分类来自 `SKILL.md` metadata，不由目录深度决定。loader �
       "baseline": true
     },
     "docx": { "category": "document", "enabled": false, "baseline": false }
-  }
+  },
+  "desired_generation": "12",
+  "settled_generation": "12",
+  "content_identity": "sha256_...",
+  "operation_identities": [
+    {
+      "operation_id": "7f74...",
+      "command_identity": "sha256_...",
+      "artifact_name": "paper-reader",
+      "content_identity": "sha256_...",
+      "generation": "12"
+    }
+  ],
+  "repair_debt": null
 }
 ```
 
 - `enabled`: 技能是否加载进 agent
 - `baseline`: 仅对 methodology 技能有效。`true` = 正文注入 system prompt
+- `desired_generation`: 已原子提交的期望策略 generation
+- `settled_generation`: 已完成 runtime fanout 的 generation
+- `content_identity`: Skill policy 与所有 enabled `SKILL.md` 内容的 canonical hash
+- `operation_identities`: bounded recent idempotency records；`command_identity` 只哈希该命令的
+  参数，不会因其它 Skill 或 artifact 内容变化而误报冲突；install/uninstall 同时记录
+  `artifact_name`，使旧 operation retry 能在触碰文件前返回
+- `repair_debt`: committed generation 尚未收敛时的 bounded target failures、attempts 与
+  artifact removal/sync/enablement actions
+- upstream sync 仅把网络、Git 和可恢复 I/O 失败写入自动 repair debt；untracked Skill、
+  无法解析的 source record，以及未使用 `--force` 的本地修改只在当次 typed receipt 中报告
 - 首次启动自动生成默认配置（核心 4 个方法论 baseline-on）
 
 内置和用户 Skill 使用同一个 framework loader；SkillsHub 只负责 EKO 的安装、启停、
 上游记录和 surface 投影，不复制 Skill parser 或 activation runtime。
+
+`enabled` 是进程级全局策略，文件是唯一 durable desired fact。GUI、TUI、CLI/JSONL 和
+channel 都进入 `ExtensionControlService`，使用 durable-first commit 与同一 settlement。
+JSONL 输出 journaled typed `ExtensionReceipt`，不把 Skill slash command 交给模型。
+
+enable/disable/repair 返回 `SkillSyncReceipt`；install、uninstall 和 upstream sync 分别用
+`SkillInstallSettlementReceipt`、`SkillUninstallSettlementReceipt` 与
+`SkillArtifactSyncReceipt` 保留相同 settlement，不能把 artifact 成功与 runtime degraded
+压成一个成功字符串。
+
+## Durable-first settlement 合同
+
+Extension authority 直接升级现有文件，不建立第二个 Skill store。schema 在 Skill map
+之外保存：
+
+- monotonic desired generation；
+- canonical content identity/hash；
+- bounded recent operation identities，用于 duplicate/conflict 判定。
+
+enable、disable、install 后 publication 以及 content-changing sync 使用同一个顺序：
+
+```text
+validate request + capture exact workspace generation
+  -> canonicalize desired content
+  -> detect duplicate/conflicting operation identity
+  -> stage JSON beside enabled-skills.json
+  -> sync staged file
+  -> atomic replace
+  -> sync parent directory
+  -> publish committed desired generation
+  -> fan out through specialist owners
+  -> return Settled or Degraded
+```
+
+validation 或 durable write 失败是 pre-commit error。文件已经提交后，global seed、workspace 或
+AgentPool fanout 失败必须返回 committed-but-degraded，不能用内存 rollback 把 durable commit
+包装成“未发生”。
+
+typed Skill receipt 保留：
+
+- operation identity、content identity/hash 和 desired generation；
+- durable commit marker、settled generation 与 `Committed`/`Settled`/`Degraded`
+  settlement；
+- committed `enabled-skills.json` file path；
+- 每个 target 的 authority scope、workspace generation、specialist generation、
+  settled/degraded status、changed entries 与 error；
+- repair debt generation/content identity、attempts 与 artifact
+  removals/syncs/enablements；
+- 每个 `SkillRepairTargetDebt` 的 target、component、expected/observed generation、reason
+  与 retryable。
+
+structured surface 的外层 `ExtensionCommandReceipt` 再携带 request/operation identity 与
+captured authority scope。
+
+调用者被取消只丢失等待 future；`ExtensionControlService` 通过 ProductData owned flow
+继续持有 accepted operation，直到 terminal settlement。application shutdown 先关闭新的
+admission，再 join 已接受工作。
+
+## 幂等与 repair
+
+- 相同 operation identity + 相同 command identity 返回原 receipt 或根据 durable fact 重建
+  receipt，即使无关 Skill 已经改变全局 content identity；
+- 相同 operation identity + 不同 command identity 返回 typed conflict；
+- 相同 content 不推进 generation，但会重试尚未收敛的 target；
+- 旧 desired/workspace/specialist generation 不能覆盖更新 generation；
+- workspace A -> B -> A 时，host generation 防止旧 A 的迟到结果污染新 A；
+- global seed 和每个 workspace 保留最新 generation，existing/future pooled Agent 都从它创建。
+
+repair debt 只表示 durable desired generation 与 observed live generation 的差异。bounded debt
+snapshot 与 desired state 同存在 `enabled-skills.json`，但不是第二 authority。下一次 mutation
+会先通过同一 coordinator reconcile；GUI/headless startup 在恢复 Agent delivery 前调用 shared
+on-load reconcile，workspace create/switch settlement 也执行 repair。disabled artifact 删除失败、
+upstream sync 部分失败、install artifact 已提交但 enable policy 尚未提交，分别进入同一 debt 的
+`artifact_removals`、`artifact_syncs`、`artifact_enablements` 并由相同 reconcile 重试。单个
+target 失败会保留其他 target 的真实 settlement，不把部分发布包装成成功。每次 runtime
+fanout 前还会比较 durable generation/content CAS，旧 generation 不得发布到新 target。
 
 ## 上游同步
 
@@ -67,8 +167,10 @@ Skill 的分类来自 `SKILL.md` metadata，不由目录深度决定。loader �
 ```
 
 同步会先克隆到同文件系统的 staging 目录,验证 `SKILL.md`,计算内容哈希,再原子
-替换当前技能。检测到本地修改时默认不覆盖;只有显式 `--force` 才会替换。同步
-完成后 CLI、TUI、GUI 和 channel 都会刷新当前 Agent 的技能目录。
+替换当前技能。检测到本地修改时默认不覆盖;只有显式 `--force` 才会替换。同步完成后，
+GUI、TUI、CLI/JSONL 和 channel 都通过 Extension authority 刷新 runtime target。refresh
+重新计算 enabled `SKILL.md` content identity；内容变化即使没有改变 enablement，也会推进
+desired generation 并返回同一个 `SkillSyncReceipt` settlement。
 
 ## 本地应用约束
 

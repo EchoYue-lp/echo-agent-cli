@@ -1,4 +1,10 @@
 import { create } from 'zustand';
+import {
+  browserExtensionDisposition,
+  extensionApi,
+  type BrowserExtensionDisposition,
+} from '../api/endpoints';
+import type { BrowserCommand, ExtensionRequestScope } from '../generated';
 import { apiInvoke, errorMessage, isTauri } from '../lib/tauri-bridge';
 import { viewAddress, viewAddressKey } from '../lib/viewAddress';
 
@@ -74,32 +80,48 @@ interface BrowserViewState {
   diagnostics: Array<{ category: string; summary: string; capturedAt: string }>;
 }
 
+export type BrowserBackendResult =
+  | { status: 'settled'; message: null }
+  | { status: 'pending' | 'failed'; message: string };
+
 interface BrowserStore {
   views: Record<string, BrowserViewState>;
   commandErrors: Record<string, string>;
+  commandPending: Record<string, string>;
+  commandReceipts: Record<string, string>;
   chromeConnected: boolean;
   ingest: (event: BrowserEvent) => void;
-  navigate: (workspaceId: string, conversationId: string, url: string) => Promise<void>;
-  back: (workspaceId: string, conversationId: string) => Promise<void>;
-  reload: (workspaceId: string, conversationId: string) => Promise<void>;
-  refreshFrame: (workspaceId: string, conversationId: string) => Promise<void>;
-  clickAt: (workspaceId: string, conversationId: string, x: number, y: number) => Promise<void>;
+  execute: (
+    scope: ExtensionRequestScope,
+    conversationId: string,
+    command: BrowserCommand
+  ) => Promise<BrowserCommandResult>;
+  navigate: (scope: ExtensionRequestScope, conversationId: string, url: string) => Promise<void>;
+  back: (scope: ExtensionRequestScope, conversationId: string) => Promise<void>;
+  reload: (scope: ExtensionRequestScope, conversationId: string) => Promise<void>;
+  refreshFrame: (scope: ExtensionRequestScope, conversationId: string) => Promise<void>;
+  clickAt: (
+    scope: ExtensionRequestScope,
+    conversationId: string,
+    x: number,
+    y: number
+  ) => Promise<void>;
   scroll: (
-    workspaceId: string,
+    scope: ExtensionRequestScope,
     conversationId: string,
     deltaX: number,
     deltaY: number
   ) => Promise<void>;
-  stop: () => Promise<void>;
-  selectTab: (workspaceId: string, conversationId: string, index: number) => Promise<void>;
-  newTab: (workspaceId: string, conversationId: string) => Promise<void>;
-  closeTab: (workspaceId: string, conversationId: string, index: number) => Promise<void>;
+  stop: (scope: ExtensionRequestScope, conversationId: string) => Promise<void>;
+  selectTab: (scope: ExtensionRequestScope, conversationId: string, index: number) => Promise<void>;
+  newTab: (scope: ExtensionRequestScope, conversationId: string) => Promise<void>;
+  closeTab: (scope: ExtensionRequestScope, conversationId: string, index: number) => Promise<void>;
   setBackend: (
-    workspaceId: string,
+    scope: ExtensionRequestScope,
     conversationId: string,
     backend: 'managed' | 'chrome'
-  ) => Promise<string | null>;
-  refreshChromeStatus: () => Promise<void>;
+  ) => Promise<BrowserBackendResult>;
+  refreshChromeStatus: (scope: ExtensionRequestScope) => Promise<void>;
   clearWorkspace: (workspaceId: string) => void;
 }
 
@@ -114,14 +136,72 @@ function updateSession(
   return { ...views, [addressKey]: updater(view) };
 }
 
-async function invokeBrowser(command: string, args?: Record<string, unknown>) {
-  if (!isTauri()) return;
-  await apiInvoke<void>(command, args);
+export type BrowserCommandResult =
+  | BrowserExtensionDisposition
+  | { status: 'failed'; message: string };
+
+let browserCommandSequence = 0;
+
+function browserCommandId(prefix: string) {
+  const randomId = globalThis.crypto?.randomUUID?.();
+  if (randomId) return `${prefix}:${randomId}`;
+  browserCommandSequence += 1;
+  return `${prefix}:${Date.now()}:${browserCommandSequence}`;
+}
+
+async function invokeBrowser(
+  scope: ExtensionRequestScope,
+  conversationId: string,
+  command: BrowserCommand
+) {
+  const workspaceId = scope.workspace_id;
+  const addressKey = viewAddressKey(viewAddress(workspaceId, conversationId));
+  useBrowserStore.setState((state) => ({
+    commandErrors: { ...state.commandErrors, [addressKey]: '' },
+    commandPending: { ...state.commandPending, [addressKey]: '' },
+    commandReceipts: { ...state.commandReceipts, [addressKey]: '' },
+  }));
+  const actionId = browserCommandId(command.action);
+  const receipt = await extensionApi.execute(scope, conversationId, {
+    request_id: browserCommandId('browser-request'),
+    operation_id: `browser-operation:${actionId}`,
+    scope,
+    extension: 'browser',
+    command,
+  });
+  const disposition = browserExtensionDisposition(receipt);
+  useBrowserStore.setState((state) => ({
+    commandPending: {
+      ...state.commandPending,
+      [addressKey]: disposition.status === 'pending' ? disposition.message : '',
+    },
+    commandReceipts: {
+      ...state.commandReceipts,
+      [addressKey]: disposition.status === 'settled' ? disposition.message : '',
+    },
+  }));
+  return disposition;
+}
+
+async function executeBrowser(
+  set: (partial: Partial<BrowserStore> | ((state: BrowserStore) => Partial<BrowserStore>)) => void,
+  scope: ExtensionRequestScope,
+  conversationId: string,
+  command: BrowserCommand
+): Promise<BrowserCommandResult> {
+  try {
+    return await invokeBrowser(scope, conversationId, command);
+  } catch (error) {
+    setViewError(set, scope.workspace_id, conversationId, error);
+    return { status: 'failed', message: errorMessage(error) };
+  }
 }
 
 export const useBrowserStore = create<BrowserStore>((set) => ({
   views: {},
   commandErrors: {},
+  commandPending: {},
+  commandReceipts: {},
   chromeConnected: false,
   ingest: (event) =>
     set((state) => {
@@ -243,107 +323,81 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
       });
       return { views };
     }),
-  navigate: async (workspaceId, conversationId, url) => {
+  execute: (scope, conversationId, command) => executeBrowser(set, scope, conversationId, command),
+  navigate: async (scope, conversationId, url) => {
+    await executeBrowser(set, scope, conversationId, { action: 'navigate', url });
+  },
+  back: async (scope, conversationId) => {
+    await executeBrowser(set, scope, conversationId, { action: 'back' });
+  },
+  reload: async (scope, conversationId) => {
+    await executeBrowser(set, scope, conversationId, { action: 'reload' });
+  },
+  refreshFrame: async (scope, conversationId) => {
+    await executeBrowser(set, scope, conversationId, { action: 'screenshot' });
+  },
+  clickAt: async (scope, conversationId, x, y) => {
+    await executeBrowser(set, scope, conversationId, { action: 'click', x, y });
+  },
+  scroll: async (scope, conversationId, deltaX, deltaY) => {
+    await executeBrowser(set, scope, conversationId, {
+      action: 'scroll',
+      delta_x: deltaX,
+      delta_y: deltaY,
+    });
+  },
+  stop: async (scope, conversationId) => {
+    await executeBrowser(set, scope, conversationId, { action: 'stop' });
+  },
+  selectTab: async (scope, conversationId, index) => {
+    await executeBrowser(set, scope, conversationId, {
+      action: 'tabs',
+      tab_action: 'select',
+      index,
+      url: null,
+    });
+  },
+  newTab: async (scope, conversationId) => {
+    await executeBrowser(set, scope, conversationId, {
+      action: 'tabs',
+      tab_action: 'new',
+      index: null,
+      url: 'about:blank',
+    });
+  },
+  closeTab: async (scope, conversationId, index) => {
+    await executeBrowser(set, scope, conversationId, {
+      action: 'tabs',
+      tab_action: 'close',
+      index,
+      url: null,
+    });
+  },
+  setBackend: async (scope, conversationId, backend) => {
+    const workspaceId = scope.workspace_id;
     const addressKey = viewAddressKey(viewAddress(workspaceId, conversationId));
+    const disposition = await executeBrowser(set, scope, conversationId, {
+      action: backend,
+    });
     set((state) => ({
-      commandErrors: { ...state.commandErrors, [addressKey]: '' },
+      commandErrors: {
+        ...state.commandErrors,
+        [addressKey]: disposition.status === 'failed' ? disposition.message : '',
+      },
+      chromeConnected:
+        disposition.status === 'settled' && backend === 'chrome' ? true : state.chromeConnected,
     }));
-    try {
-      await invokeBrowser('browser_navigate', { workspaceId, conversationId, url });
-    } catch (error) {
-      set((state) => ({
-        views: updateSession(state.views, state.views[addressKey]?.session.id ?? '', (view) => ({
-          ...view,
-          error: errorMessage(error),
-        })),
-      }));
-    }
+    return disposition.status === 'settled'
+      ? { status: 'settled', message: null }
+      : { status: disposition.status, message: disposition.message };
   },
-  back: async (workspaceId, conversationId) => {
-    try {
-      await invokeBrowser('browser_back', { workspaceId, conversationId });
-    } catch (error) {
-      setViewError(set, workspaceId, conversationId, error);
-    }
-  },
-  reload: async (workspaceId, conversationId) => {
-    try {
-      await invokeBrowser('browser_reload', { workspaceId, conversationId });
-    } catch (error) {
-      setViewError(set, workspaceId, conversationId, error);
-    }
-  },
-  refreshFrame: async (workspaceId, conversationId) => {
-    try {
-      await invokeBrowser('browser_screenshot', { workspaceId, conversationId });
-    } catch (error) {
-      setViewError(set, workspaceId, conversationId, error);
-    }
-  },
-  clickAt: async (workspaceId, conversationId, x, y) => {
-    try {
-      await invokeBrowser('browser_click_at', { workspaceId, conversationId, x, y });
-    } catch (error) {
-      setViewError(set, workspaceId, conversationId, error);
-    }
-  },
-  scroll: async (workspaceId, conversationId, deltaX, deltaY) => {
-    try {
-      await invokeBrowser('browser_scroll', { workspaceId, conversationId, deltaX, deltaY });
-    } catch (error) {
-      setViewError(set, workspaceId, conversationId, error);
-    }
-  },
-  stop: () => invokeBrowser('browser_stop'),
-  selectTab: async (workspaceId, conversationId, index) => {
-    try {
-      await invokeBrowser('browser_tabs', {
-        workspaceId,
-        conversationId,
-        action: 'select',
-        index,
-      });
-    } catch (error) {
-      setViewError(set, workspaceId, conversationId, error);
-    }
-  },
-  newTab: async (workspaceId, conversationId) => {
-    try {
-      await invokeBrowser('browser_tabs', {
-        workspaceId,
-        conversationId,
-        action: 'new',
-        url: 'about:blank',
-      });
-    } catch (error) {
-      setViewError(set, workspaceId, conversationId, error);
-    }
-  },
-  closeTab: async (workspaceId, conversationId, index) => {
-    try {
-      await invokeBrowser('browser_tabs', { workspaceId, conversationId, action: 'close', index });
-    } catch (error) {
-      setViewError(set, workspaceId, conversationId, error);
-    }
-  },
-  setBackend: async (workspaceId, conversationId, backend) => {
-    const addressKey = viewAddressKey(viewAddress(workspaceId, conversationId));
-    try {
-      await invokeBrowser('browser_set_backend', { workspaceId, conversationId, backend });
-      set((state) => ({
-        commandErrors: { ...state.commandErrors, [addressKey]: '' },
-        chromeConnected: backend === 'chrome' ? true : state.chromeConnected,
-      }));
-      return null;
-    } catch (error) {
-      setViewError(set, workspaceId, conversationId, error);
-      return errorMessage(error);
-    }
-  },
-  refreshChromeStatus: async () => {
+  refreshChromeStatus: async (scope) => {
     if (!isTauri()) return;
     try {
-      const status = await apiInvoke<{ connected: boolean }>('chrome_setup_status');
+      const status = await apiInvoke<{ connected: boolean }>('chrome_setup_status', {
+        workspaceId: scope.workspace_id,
+        workspaceGeneration: scope.workspace_generation,
+      });
       set({ chromeConnected: status.connected });
     } catch {
       set({ chromeConnected: false });
@@ -356,6 +410,26 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
       ),
       commandErrors: Object.fromEntries(
         Object.entries(state.commandErrors).filter(([key]) => {
+          try {
+            const address = JSON.parse(key) as [string, string];
+            return address[0] !== workspaceId;
+          } catch {
+            return true;
+          }
+        })
+      ),
+      commandPending: Object.fromEntries(
+        Object.entries(state.commandPending).filter(([key]) => {
+          try {
+            const address = JSON.parse(key) as [string, string];
+            return address[0] !== workspaceId;
+          } catch {
+            return true;
+          }
+        })
+      ),
+      commandReceipts: Object.fromEntries(
+        Object.entries(state.commandReceipts).filter(([key]) => {
           try {
             const address = JSON.parse(key) as [string, string];
             return address[0] !== workspaceId;
@@ -379,6 +453,8 @@ function setViewError(
       ...state.commandErrors,
       [addressKey]: errorMessage(error),
     },
+    commandPending: { ...state.commandPending, [addressKey]: '' },
+    commandReceipts: { ...state.commandReceipts, [addressKey]: '' },
     views: updateSession(state.views, state.views[addressKey]?.session.id ?? '', (view) => ({
       ...view,
       error: errorMessage(error),

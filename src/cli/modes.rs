@@ -166,6 +166,8 @@ pub struct HeadlessServiceResources {
     pub mcp_config_runtime:
         std::sync::Arc<echo_agent_app_core::mcp_config_runtime::McpConfigRuntime>,
     pub plugin_runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
+    pub extension_control:
+        std::sync::Arc<echo_agent_app_core::extension_control::ExtensionControlService>,
     pub config_watcher: std::sync::Arc<echo_agent_app_core::config_watcher::ConfigWatcherHandle>,
     pub foreground_turns: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
     pub command_cell_runtime: std::sync::Arc<
@@ -226,6 +228,113 @@ pub struct JsonlRunOptions {
     pub attachment_paths: Vec<std::path::PathBuf>,
 }
 
+async fn run_jsonl_extension_command(
+    request: echo_agent_app_core::extension_commands::ExtensionCommandRequest,
+    scoped_runtime: echo_agent_app_core::state::ScopedChatRuntime,
+    lease: echo_agent_app_core::foreground_turn::ForegroundTurnLease,
+    sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink>,
+    services: &HeadlessServices,
+    conversation_id: &str,
+    options: &JsonlRunOptions,
+) -> Result<()> {
+    let receipt = if options.attachment_paths.is_empty() {
+        echo_agent_app_core::extension_commands::ExtensionCommandDispatcher::new(
+            services.app_state.clone(),
+        )
+        .dispatch(request, Some(scoped_runtime), conversation_id.to_string())
+        .await
+    } else {
+        echo_agent_app_core::extension_commands::ExtensionCommandReceipt::failed(
+            request.kind(),
+            request.identity(),
+            scoped_runtime.execution_scope().workspace_id().to_string(),
+            "JSONL Extension management commands do not accept attachments",
+        )
+    };
+    finish_jsonl_extension_command(lease, sink, receipt)
+}
+
+fn finish_jsonl_extension_command(
+    lease: echo_agent_app_core::foreground_turn::ForegroundTurnLease,
+    sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink>,
+    receipt: echo_agent_app_core::extension_commands::ExtensionCommandReceipt,
+) -> Result<()> {
+    let outcome = extension_receipt_terminal(&receipt);
+    if !sink.on_event(
+        echo_agent_app_core::chat_driver::ChatDriverEvent::ExtensionReceipt(Box::new(receipt)),
+    ) {
+        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+            echo_agent::error::AgentFailure::message(
+                "jsonl_output",
+                "JSONL output closed before the Extension receipt was delivered",
+            ),
+        ));
+        return Err(anyhow::anyhow!(
+            "JSONL output closed before the Extension receipt was delivered"
+        ));
+    }
+    let terminal_status = outcome.status().to_string();
+    let delivered = sink.on_event(
+        echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
+            status: terminal_status,
+        },
+    );
+    lease.settle(outcome.clone());
+    if !delivered {
+        return Err(anyhow::anyhow!(
+            "JSONL output closed before the terminal status was delivered"
+        ));
+    }
+    match outcome {
+        echo_agent_app_core::chat_driver::TurnOutcome::Completed => Ok(()),
+        echo_agent_app_core::chat_driver::TurnOutcome::Cancelled => {
+            Err(anyhow::anyhow!("Extension command was cancelled"))
+        }
+        echo_agent_app_core::chat_driver::TurnOutcome::Failed(failure) => {
+            Err(anyhow::anyhow!("{}: {}", failure.code, failure.message))
+        }
+    }
+}
+
+pub(crate) fn extension_receipt_terminal(
+    receipt: &echo_agent_app_core::extension_commands::ExtensionCommandReceipt,
+) -> echo_agent_app_core::chat_driver::TurnOutcome {
+    use echo_agent_app_core::extension_commands::ExtensionCommandStatus;
+
+    match receipt.status() {
+        ExtensionCommandStatus::Settled => echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+        ExtensionCommandStatus::Committed => echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+            echo_agent::error::AgentFailure::message(
+                "extension_committed",
+                receipt.meta().error.clone().unwrap_or_else(|| {
+                    "Extension durable state is committed; runtime settlement is pending"
+                        .to_string()
+                }),
+            ),
+        ),
+        ExtensionCommandStatus::Degraded => echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+            echo_agent::error::AgentFailure::message(
+                "extension_degraded",
+                receipt
+                    .meta()
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Extension settlement is degraded".to_string()),
+            ),
+        ),
+        ExtensionCommandStatus::Failed => echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+            echo_agent::error::AgentFailure::message(
+                "extension_failed",
+                receipt
+                    .meta()
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Extension command failed".to_string()),
+            ),
+        ),
+    }
+}
+
 /// Run one prompt through the shared finite chat driver and print only the
 /// canonical, already-journaled application envelope stream.
 pub async fn run_jsonl_mode(
@@ -249,11 +358,6 @@ pub async fn run_jsonl_mode(
         )
         .await
         .map_err(anyhow::Error::from)?;
-    let pool_execution = scoped_runtime
-        .agent_for(&conversation_id)
-        .await
-        .map_err(anyhow::Error::from)?;
-    let agent = pool_execution.agent();
     let renderer: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
         std::sync::Arc::new(crate::cli::jsonl::JsonlChatSink::stdout());
     let sink = echo_agent_app_core::chat_event_log::bind_surface_chat_sink(
@@ -265,6 +369,82 @@ pub async fn run_jsonl_mode(
         Some(conversation_id.clone()),
         turn_id.clone(),
     );
+    let identity = echo_agent_app_core::extension_commands::ExtensionCommandIdentity {
+        request_id: turn_id.clone(),
+        operation_id: uuid::Uuid::new_v4().to_string(),
+    };
+    let extension_command =
+        echo_agent_app_core::extension_commands::parse_extension_command(prompt, identity.clone());
+    if extension_command
+        .as_ref()
+        .is_ok_and(|request| request.is_some())
+        || extension_command.is_err()
+    {
+        if !sink.on_event(
+            echo_agent_app_core::chat_driver::ChatDriverEvent::TurnConfiguration {
+                interaction_mode: options.interaction_mode.runtime().as_str().to_string(),
+                permission_mode: options.permission_mode.as_str().to_string(),
+                approval_policy: options.approval_policy.as_str().to_string(),
+                attachments: Vec::new(),
+            },
+        ) || !sink.on_event(
+            echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
+                status: "running".to_string(),
+            },
+        ) {
+            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message(
+                    "jsonl_output",
+                    "JSONL output closed before the Extension command started",
+                ),
+            ));
+            return Err(anyhow::anyhow!(
+                "JSONL output closed before the Extension command started"
+            ));
+        }
+        return match extension_command {
+            Ok(Some(request)) => {
+                run_jsonl_extension_command(
+                    request,
+                    scoped_runtime,
+                    lease,
+                    sink,
+                    services,
+                    &conversation_id,
+                    &options,
+                )
+                .await
+            }
+            Err(error) => {
+                let Some(kind) = error.extension else {
+                    lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                        echo_agent::error::AgentFailure::message(
+                            "extension_identity",
+                            error.to_string(),
+                        ),
+                    ));
+                    return Err(anyhow::Error::new(error));
+                };
+                let receipt =
+                    echo_agent_app_core::extension_commands::ExtensionCommandReceipt::failed(
+                        kind,
+                        identity,
+                        scoped_runtime.execution_scope().workspace_id().to_string(),
+                        error.to_string(),
+                    );
+                finish_jsonl_extension_command(lease, sink, receipt)
+            }
+            Ok(None) => Err(anyhow::anyhow!(
+                "Extension command parser returned no command after claiming the prompt"
+            )),
+        };
+    }
+
+    let pool_execution = scoped_runtime
+        .agent_for(&conversation_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let agent = pool_execution.agent();
     let permission_mode =
         echo_agent_app_core::permission::parse_permission_mode(options.permission_mode.as_str())
             .map_err(anyhow::Error::msg)?;
@@ -490,6 +670,8 @@ pub async fn start_headless_services(
     .with_active_model_id(resources.active_model_id.clone())
     .with_review_integration(resources.review_integration.clone())
     .with_plugin_runtime(Some(resources.plugin_runtime.clone()))
+    .with_extension_control(resources.extension_control.clone())
+    .with_browser_runtime(Some(resources.browser_runtime.clone()))
     .with_config_watcher(Some(resources.config_watcher.clone()))
     .with_foreground_turns(resources.foreground_turns.clone());
     state.webhook.emitter = resources.webhook_emitter;
@@ -527,6 +709,31 @@ pub async fn start_headless_services(
     let scheduler = state.scheduler.runner.clone();
     let app_state = std::sync::Arc::new(state);
     lifecycle.bind_app_state(app_state.clone());
+    match app_state
+        .extension_control
+        .reconcile_enabled_skills_on_load(&app_state)
+        .await
+    {
+        Ok(receipt)
+            if receipt.status
+                == echo_agent_app_core::extension_control::SkillSettlementStatus::Settled =>
+        {
+            tracing::info!(
+                generation = receipt.settled_generation,
+                "Headless Extension skill policy is settled"
+            );
+        }
+        Ok(receipt) => tracing::warn!(
+            desired_generation = receipt.desired_generation,
+            settled_generation = receipt.settled_generation,
+            status = ?receipt.status,
+            "Headless Extension skill repair debt remains pending"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "Headless Extension skill policy reconciliation remains pending"
+        ),
+    }
     if let Err(error) = app_state.recover_agent_deliveries().await {
         tracing::warn!(%error, "failed to resume durable Agent deliveries during headless startup");
     }
@@ -800,6 +1007,34 @@ mod tests {
     use std::sync::Arc;
     #[cfg(feature = "channels")]
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn committed_extension_receipt_is_pending_not_completed() -> Result<()> {
+        let receipt = echo_agent_app_core::extension_commands::ExtensionCommandReceipt::Browser {
+            meta: echo_agent_app_core::extension_commands::ExtensionReceiptMeta {
+                request_id: "request-1".to_string(),
+                operation_id: "operation-1".to_string(),
+                authority_scope: "workspace-a".to_string(),
+                workspace_generation: "generation-a".to_string(),
+                sender_id: None,
+                sender_incarnation: None,
+                status: echo_agent_app_core::extension_commands::ExtensionCommandStatus::Committed,
+                error: None,
+            },
+            receipt: None,
+        };
+
+        match extension_receipt_terminal(&receipt) {
+            echo_agent_app_core::chat_driver::TurnOutcome::Failed(failure) => {
+                assert_eq!(failure.code, "extension_committed");
+                assert!(failure.message.contains("pending"));
+                Ok(())
+            }
+            outcome => Err(anyhow::anyhow!(
+                "committed receipt completed unexpectedly: {outcome:?}"
+            )),
+        }
+    }
 
     #[tokio::test]
     async fn headless_dreaming_owner_cancels_and_joins_its_task() -> Result<()> {

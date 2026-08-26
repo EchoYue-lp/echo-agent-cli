@@ -18,9 +18,9 @@ export type {
 } from '../generated';
 import type {
   BackgroundCellState,
+  ExtensionSkillEntry,
   McpServerInfo as GeneratedMcpServerInfo,
   McpToolInfo as GeneratedMcpToolInfo,
-  SkillInfo as GeneratedSkillInfo,
 } from '../generated';
 // covered by ts-rs, or (c) represent frontend-only state.  When adding
 // or changing a type, prefer updating the Rust-side serde derives and
@@ -423,25 +423,8 @@ export interface ChatEventReplay {
   truncated: boolean;
 }
 
-/** Product projection emitted by the Tauri skills panel commands. */
-export type TauriSkillInfo = Pick<GeneratedSkillInfo, 'name' | 'description'> & {
-  file: string;
-  loaded?: boolean;
-  source?: string;
-  triggers?: string[];
-  tags?: string[];
-  version?: string | null;
-  author?: string | null;
-  has_sandbox?: boolean;
-  depends_on?: string[];
-  // Superpowers deep integration fields
-  category?: string;
-  is_baseline?: boolean;
-  is_builtin?: boolean;
-  upstream_version?: string | null;
-  has_updates?: boolean;
-  missing_dependencies?: string[];
-};
+/** Product DTO emitted directly by the application extension authority. */
+export type TauriSkillInfo = ExtensionSkillEntry;
 
 export type SkillUpdateState =
   | 'up_to_date'
@@ -455,14 +438,6 @@ export interface SkillUpdateStatus {
   state: SkillUpdateState;
   current_revision?: string | null;
   remote_revision?: string | null;
-  message: string;
-}
-
-export interface SkillSyncResult {
-  name: string;
-  success: boolean;
-  updated: boolean;
-  revision?: string | null;
   message: string;
 }
 

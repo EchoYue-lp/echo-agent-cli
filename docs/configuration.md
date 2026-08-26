@@ -174,6 +174,9 @@ MCP 配置源优先级：
 
 EKO 对用户配置的 MCP 不做权限级拦截。stdio 命令只做明显输入校验；HTTP endpoint
 允许本地/内网明文地址，远程地址要求 HTTPS。Plugin 与用户 MCP 同名时，用户配置优先。
+所有配置 mutation 进入 `ExtensionControlService` 并由 `McpConfigRuntime` durable commit +
+真实 reconcile；health 按 captured workspace authority scope 保存，不读取 bootstrap Agent 的
+全局 map。
 
 ## Browser 与 Chrome
 
@@ -206,8 +209,10 @@ Hook 合并顺序从低到高：
 2. `~/.eko/hooks.yaml`
 3. `<project>/.eko/hooks.yaml`
 
-config watcher 监听 create/modify/remove 和原子保存；修改 model/MCP/runtime topology
-仍应通过对应统一 mutation 或重启，不依赖通用文件 watcher 猜测重建。
+config watcher 监听 create/modify/remove 和原子保存；Hooks 与 global/workspace
+`.lsp.yaml` 通过 `ExtensionControlService` 热发布。修改 model/MCP/runtime topology 仍应通过
+对应统一 mutation 或重启，不依赖通用文件 watcher 猜测重建。Hook/LSP reload 使用 admission
+时捕获的 workspace project root，process cwd 不参与 workspace identity。
 
 Webhook endpoint 示例：
 
@@ -231,6 +236,27 @@ secret 用于 HMAC-SHA256 签名，不会写入普通事件日志。
 
 Plugin 使用根 `plugin.json` 和固定组件位置。Skill 安装、启用和上游同步见
 [Skill 同步](./skill-sync.md)。
+
+### Skill desired state 与 settlement
+
+`enabled-skills.json` 是启停策略的唯一 durable desired-state 文件，不另建 repair-debt
+store。version 2 schema 包含 monotonic desired generation、canonical
+content hash、Skill map 和 bounded recent operation identities。文件必须在同一目录 staging，
+完成 file sync 后原子替换并同步父目录；不能使用裸写覆盖作为 durable commit。
+
+durable commit 之后，`ExtensionControlService` 才向 global seed、已加载 workspace 和
+AgentPool generation 发布。runtime fanout 失败不回滚已经提交的配置，而是返回带逐 target
+状态和 repair debt 的 typed degraded receipt。repair 在 restart、workspace load 和下一次
+mutation 前依据 durable desired generation 重放；相同 operation/content 幂等，旧 generation
+不能覆盖新 generation。
+
+当前代码已经写入 version 2 `EnabledSkillsConfig`，并通过 ProductData owned flow 与
+`atomic_write` 执行上述 durable commit；`SkillSyncReceipt` 区分 committed、settled、
+degraded 和 repair debt，并返回 committed file path；结构化 `SkillRepairTargetDebt` 携带
+target/component、expected/observed generation、reason 与 retryability。GUI/headless startup
+在 Agent delivery recovery 前调用 shared
+on-load reconcile，workspace create/switch settlement 也执行相同 repair 并把未收敛 debt
+投影为 degraded subsystem。
 
 ## 项目指令
 

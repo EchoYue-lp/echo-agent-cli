@@ -9,13 +9,15 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// 技能市场条目
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, rename = "SkillHubEntry")]
 pub struct SkillHubEntry {
     /// 技能名称（kebab-case）
     pub name: String,
     /// 描述
     pub description: String,
     /// 安装路径
+    #[ts(type = "string")]
     pub path: PathBuf,
     /// 分类
     #[serde(default)]
@@ -42,8 +44,6 @@ pub struct SkillHubEntry {
     pub author: Option<String>,
     /// 标签
     pub tags: Vec<String>,
-    /// 是否已加载到 agent
-    pub loaded: bool,
     /// 是否声明了沙箱策略
     #[serde(default)]
     pub has_sandbox: bool,
@@ -63,8 +63,6 @@ pub struct SkillsHub {
     root: PathBuf,
     /// 索引：name -> entry
     entries: HashMap<String, SkillHubEntry>,
-    /// 已加载到 agent 的技能名集合
-    loaded_skills: Vec<String>,
 }
 
 impl Default for SkillsHub {
@@ -80,7 +78,6 @@ impl SkillsHub {
         let mut hub = Self {
             root,
             entries: HashMap::new(),
-            loaded_skills: Vec::new(),
         };
         hub.scan();
         hub
@@ -91,7 +88,6 @@ impl SkillsHub {
         let mut hub = Self {
             root,
             entries: HashMap::new(),
-            loaded_skills: Vec::new(),
         };
         hub.scan();
         hub
@@ -106,40 +102,6 @@ impl SkillsHub {
     pub fn refresh(&mut self) {
         self.entries.clear();
         self.scan();
-    }
-
-    /// 更新已加载技能列表
-    pub fn set_loaded_skills(&mut self, names: Vec<String>) {
-        self.loaded_skills = names;
-        for entry in self.entries.values_mut() {
-            entry.loaded = self.loaded_skills.contains(&entry.name);
-        }
-    }
-
-    /// 启用单个技能（添加到已加载列表）
-    pub fn enable_skill(&mut self, name: &str) -> Result<(), String> {
-        if !self.entries.contains_key(name) {
-            return Err(format!("Skill '{}' not found", name));
-        }
-        if !self.loaded_skills.contains(&name.to_string()) {
-            self.loaded_skills.push(name.to_string());
-            if let Some(entry) = self.entries.get_mut(name) {
-                entry.loaded = true;
-            }
-        }
-        Ok(())
-    }
-
-    /// 禁用单个技能（从已加载列表移除）
-    pub fn disable_skill(&mut self, name: &str) -> Result<(), String> {
-        if !self.entries.contains_key(name) {
-            return Err(format!("Skill '{}' not found", name));
-        }
-        self.loaded_skills.retain(|s| s != name);
-        if let Some(entry) = self.entries.get_mut(name) {
-            entry.loaded = false;
-        }
-        Ok(())
     }
 
     /// 列出所有条目
@@ -303,7 +265,6 @@ impl SkillsHub {
                 .get("tags")
                 .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default(),
-            loaded: false,
             has_sandbox: frontmatter.contains_key("sandbox"),
             depends_on: list_fields.get("depends_on").cloned().unwrap_or_default(),
             missing_dependencies,

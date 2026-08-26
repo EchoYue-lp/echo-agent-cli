@@ -38,17 +38,29 @@ impl SlashCommand for DeveloperCommand {
         args: &'a [&'a str],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CommandOutcome> + Send + 'a>> {
         Box::pin(async move {
+            if matches!(self.name, "lsp" | "browser") {
+                let receipt = crate::cli::extension_surface::dispatch_extension_command(
+                    ctx.app_state.as_ref(),
+                    ctx.conversation_id.as_deref(),
+                    self.name,
+                    &args.join(" "),
+                )
+                .await;
+                println!("{}", receipt.display_message());
+                return CommandOutcome::Continue;
+            }
             let Some(app_state) = ctx.app_state.as_ref() else {
                 println!("Developer tools are unavailable during application bootstrap.");
                 return CommandOutcome::Continue;
             };
             let events = app_state.terminal.subscribe();
-            let registry = DeveloperCommandRegistry::new(
-                app_state.terminal.clone(),
-                ctx.plugin_runtime
-                    .clone()
-                    .or_else(|| app_state.plugin_runtime.clone()),
-            );
+            let registry =
+                DeveloperCommandRegistry::new(app_state.terminal.clone(), Some(app_state.clone()))
+                    .with_browser_conversation_id(
+                        ctx.conversation_id
+                            .as_deref()
+                            .unwrap_or("cli-browser-control"),
+                    );
             match registry.execute(self.name, args).await {
                 Ok(output) => {
                     println!("{}", output.message);

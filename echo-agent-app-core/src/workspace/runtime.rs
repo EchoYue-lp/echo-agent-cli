@@ -288,6 +288,10 @@ impl WorkspaceRuntimeHost {
         self.workspace.read().await.clone()
     }
 
+    pub(crate) fn execution_if_loaded(&self) -> Option<Arc<WorkspaceExecutionRuntime>> {
+        self.execution.get().map(Arc::clone)
+    }
+
     pub(crate) fn id(&self) -> &WorkspaceId {
         &self.resources.workspace().id
     }
@@ -714,6 +718,14 @@ impl WorkspaceRuntimeRegistry {
         Ok(host)
     }
 
+    /// Return an already loaded host without creating a second runtime owner.
+    pub(crate) async fn loaded_host(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Option<Arc<WorkspaceRuntimeHost>> {
+        self.hosts.lock().await.get(workspace_id).cloned()
+    }
+
     /// Resolve and pin one host while the registry membership lock is held.
     /// Eviction cannot mark the host Closing between lookup and lease acquire.
     pub(crate) async fn get_or_open_control(
@@ -868,6 +880,34 @@ impl WorkspaceRuntimeRegistry {
             .collect::<Vec<_>>();
         runtimes.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
         runtimes
+    }
+
+    /// Pin every initialized workspace execution generation for one global
+    /// control mutation. Acquiring leases while holding registry membership
+    /// prevents delete/eviction from racing the returned snapshot.
+    pub(crate) async fn loaded_execution_controls(
+        &self,
+    ) -> anyhow::Result<
+        Vec<(
+            WorkspaceId,
+            Arc<WorkspaceExecutionRuntime>,
+            WorkspaceControlLease,
+        )>,
+    > {
+        let hosts = self.hosts.lock().await;
+        let mut controls = Vec::new();
+        for host in hosts.values() {
+            let Some(runtime) = host.execution.get() else {
+                continue;
+            };
+            controls.push((
+                host.id().clone(),
+                Arc::clone(runtime),
+                host.acquire_control_lease()?,
+            ));
+        }
+        controls.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        Ok(controls)
     }
 
     pub(crate) async fn activity_snapshot(&self) -> anyhow::Result<Vec<WorkspaceRuntimeActivity>> {

@@ -2214,12 +2214,21 @@ pub fn run_base_doctor_for_model_with_connectivity(
 ///
 /// **重要**:调用方在调用本函数后,不应再单独加载或注册文件 hooks。
 /// 文件 hooks 已包含在本函数的合并结果里。
+/// `project_root` 必须来自 Agent/workspace execution scope；不得回退到进程 cwd，
+/// 否则 GUI focus 与 headless `--project` 会加载错误项目的 hooks。
 ///
 /// 旧的实现只 register `app_config.hooks`(内嵌),把文件来源留给
 /// `runtime.rs::bootstrap` 单独 register —— 但 `register_user_hooks`
 /// 内部会覆盖 `UserConfig` 单槽位,导致文件来源 clear 掉内嵌来源。
-pub async fn load_user_hooks(agent: &AgentHandle, app_config: &EkoConfig) {
-    let load_result = crate::hook_config_loader::HookConfigLoader::load_merged(app_config);
+pub async fn load_user_hooks(
+    agent: &AgentHandle,
+    app_config: &EkoConfig,
+    project_root: Option<&std::path::Path>,
+) {
+    let load_result = crate::hook_config_loader::HookConfigLoader::load_merged_for_workspace(
+        app_config,
+        project_root,
+    );
     for error in &load_result.errors {
         tracing::warn!(%error, "User hook source was not loaded");
     }

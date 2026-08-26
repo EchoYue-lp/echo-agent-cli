@@ -198,6 +198,8 @@ pub struct ApplicationLifecycleOwner {
     product_data_io: Option<crate::product_data_io::ProductDataIoService>,
     background_tasks: Vec<ApplicationBackgroundTask>,
     external_owners: Vec<ApplicationExternalOwner>,
+    #[cfg(test)]
+    specialist_teardown_started: Option<tokio::sync::oneshot::Sender<()>>,
     shutdown_begun: bool,
     armed: bool,
 }
@@ -219,6 +221,8 @@ impl ApplicationLifecycleOwner {
             product_data_io: None,
             background_tasks: Vec::new(),
             external_owners: Vec::new(),
+            #[cfg(test)]
+            specialist_teardown_started: None,
             shutdown_begun: false,
             armed: true,
         }
@@ -281,6 +285,11 @@ impl ApplicationLifecycleOwner {
         product_data_io: crate::product_data_io::ProductDataIoService,
     ) {
         self.product_data_io = Some(product_data_io);
+    }
+
+    #[cfg(test)]
+    fn install_specialist_teardown_probe(&mut self, started: tokio::sync::oneshot::Sender<()>) {
+        self.specialist_teardown_started = Some(started);
     }
 
     pub fn track_background_task(
@@ -463,7 +472,7 @@ impl ApplicationLifecycleOwner {
             receipt.record("background reviews", error);
         }
         if let Some(state) = self.app_state.as_ref() {
-            if let Err(error) = state.shutdown_workspace_transition().await {
+            if let Err(error) = state.join_workspace_transition().await {
                 receipt.record("workspace transition", error);
             }
             if let Err(error) = state.shutdown_scheduler().await {
@@ -482,15 +491,35 @@ impl ApplicationLifecycleOwner {
                 receipt.record("task hook dispatcher", error);
             }
         }
+        if let Some(state) = self.app_state.as_ref()
+            && let Err(error) = state.shutdown_command_cells().await
+        {
+            receipt.record("command cells", error);
+        }
+        // Product-data admission was sealed in phase one. Extension mutations
+        // hold an owned flow while their durable commit and specialist fanout
+        // settle, so this join must complete while the pool and specialist
+        // runtimes they captured are still alive.
+        if let Some(product_data_io) = self.product_data_io.as_ref()
+            && let Err(error) = product_data_io.join_shutdown().await
+        {
+            receipt.record("product-data I/O", error);
+        }
+        #[cfg(test)]
+        if let Some(started) = self.specialist_teardown_started.take() {
+            let _ = started.send(());
+        }
+        if let Some(state) = self.app_state.as_ref()
+            && let Err(error) = state.shutdown_workspace_runtimes().await
+        {
+            receipt.record("workspace runtimes", error);
+        }
         if let Some(pool) = self.pool.as_ref()
             && let Err(error) = pool.shutdown().await
         {
             receipt.record("agent pool", error);
         }
         if let Some(state) = self.app_state.as_ref() {
-            if let Err(error) = state.shutdown_command_cells().await {
-                receipt.record("command cells", error);
-            }
             if let Err(error) = state.terminal.close_all().await {
                 receipt.record("terminal sessions", error);
             }
@@ -522,14 +551,6 @@ impl ApplicationLifecycleOwner {
                 .await
         {
             receipt.record("primary Agent", error);
-        }
-        // Product-data top-level admission was sealed in phase one. Join it
-        // only after accepted producers have crossed their nested persistence
-        // safe points, including caller-dropped operations.
-        if let Some(product_data_io) = self.product_data_io.as_ref()
-            && let Err(error) = product_data_io.join_shutdown().await
-        {
-            receipt.record("product-data I/O", error);
         }
         receipt
     }
@@ -591,6 +612,7 @@ pub struct AgentRuntime {
     pub plugin_runtime: Arc<crate::plugin_runtime::PluginRuntimeService>,
     /// Canonical durable user MCP configuration shared with application state.
     pub mcp_config_runtime: Arc<crate::mcp_config_runtime::McpConfigRuntime>,
+    pub extension_control: Arc<crate::extension_control::ExtensionControlService>,
     pub command_cell_runtime:
         Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>,
     /// Single application-generation owner for blocking product-data work.
@@ -676,6 +698,8 @@ impl AgentRuntime {
             mcp_config_path.clone(),
             mcp_config_snapshot.clone(),
         ));
+        let extension_control =
+            Arc::new(crate::extension_control::ExtensionControlService::default());
 
         let browser_runtime_injected = params.browser_runtime.is_some();
         let command_cell_runtime_injected = params.command_cell_runtime.is_some();
@@ -863,6 +887,17 @@ impl AgentRuntime {
             }
         }
 
+        // User-installed skills have one EKO enablement authority. Load only
+        // enabled entries and tag exact source ownership so every surface can
+        // hot-disable them through ExtensionControlService.
+        match crate::extension_control::load_enabled_user_skills(&agent_handle).await {
+            Ok(names) if !names.is_empty() => {
+                tracing::info!(skills = ?names, "Enabled user skills loaded")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "Failed to load enabled user skills"),
+        }
+
         // ── 6. User hooks ──
         // Single merged load: eko.yaml inline + ~/.eko/hooks.yaml +
         // .eko/hooks.yaml are merged into one HooksDefinition by
@@ -871,7 +906,8 @@ impl AgentRuntime {
         // clear_user_hooks(), so the second load wiped the first — a silent
         // bug where eko.yaml inline hooks disappeared whenever any
         // hooks.yaml file existed.
-        infra::load_user_hooks(&agent_handle, app_config).await;
+        let hook_project_root = agent_handle.read(|agent| agent.working_dir()).await;
+        infra::load_user_hooks(&agent_handle, app_config, hook_project_root.as_deref()).await;
 
         // ── 8b. Review integration — create when Store is available so
         //       /memory-review and session-end hooks can access it. ──
@@ -949,7 +985,11 @@ impl AgentRuntime {
         // Plugins and built-in project discovery share this single manager;
         // plugin reload atomically replaces its contents while every LSP tool
         // keeps the same Arc handle.
-        let lsp_runtime = register_lsp_tools(&agent_handle).await;
+        let lsp_project_root = agent_handle
+            .read(|agent| agent.working_dir())
+            .await
+            .unwrap_or_else(crate::data_root::user_data_dir);
+        let lsp_runtime = register_lsp_tools(&agent_handle, &lsp_project_root).await;
 
         // ── 10. Plugins ──
         // Discovery, initial wiring, and later live mutations all go through
@@ -1009,6 +1049,7 @@ impl AgentRuntime {
             prompt_assembly,
             plugin_runtime,
             mcp_config_runtime,
+            extension_control,
             command_cell_runtime,
             product_data_io,
         })
@@ -1038,6 +1079,8 @@ impl AgentRuntime {
             .with_review_integration(self.review_integration.clone())
             .with_prompt_assembly(self.prompt_assembly.clone())
             .with_plugin_runtime(Some(self.plugin_runtime.clone()))
+            .with_extension_control(self.extension_control.clone())
+            .with_browser_runtime(Some(self.browser_runtime.clone()))
             .with_command_cell_runtime(self.command_cell_runtime.clone())
             .with_workspace_delete_hook(self.browser_runtime.clone());
         // Note: task_service and scheduler are started separately by the caller
@@ -1213,19 +1256,20 @@ pub(crate) fn configure_intent_router(
     keyword_classifier
 }
 
+/// Register the shared LSP specialist for one explicit workspace identity.
+///
+/// The caller owns workspace selection. Keeping cwd fallback out of this
+/// function prevents a process-level directory from being mistaken for the
+/// active GUI/headless workspace during generation changes.
 pub(crate) async fn register_lsp_tools(
     agent_handle: &AgentHandle,
+    project_root: &std::path::Path,
 ) -> crate::plugin_runtime::PluginLspRuntime {
-    use echo_agent::lsp::{LspConfig, LspManager};
+    use echo_agent::lsp::LspManager;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    let project_root = agent_handle
-        .read(|agent| agent.working_dir())
-        .await
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let mut config = LspConfig::discover(&project_root);
+    let config = crate::plugin_runtime::PluginLspRuntime::config_for_workspace(project_root);
     if !config.servers.is_empty() {
         tracing::info!(
             root = %project_root.display(),
@@ -1234,50 +1278,9 @@ pub(crate) async fn register_lsp_tools(
         );
     }
 
-    // Global preferences override discovery defaults.
-    {
-        let global_lsp = crate::data_root::user_data_path(".lsp.yaml");
-        if global_lsp.is_file() {
-            match LspConfig::from_file(&global_lsp) {
-                Ok(global) => config.merge(global),
-                Err(error) => {
-                    tracing::warn!(path = %global_lsp.display(), %error, "Failed to load global LSP config")
-                }
-            }
-        }
-    }
-
-    // The nearest project config has final precedence.
-    let project_lsp = {
-        let mut dir = project_root.as_path();
-        loop {
-            let candidate = dir.join(".lsp.yaml");
-            if candidate.is_file() {
-                break Some(candidate);
-            }
-            let Some(parent) = dir.parent() else {
-                break None;
-            };
-            dir = parent;
-        }
-    };
-
-    if let Some(ref lsp_path) = project_lsp {
-        match LspConfig::from_file(lsp_path) {
-            Ok(project) => {
-                let language_count = project.servers.len();
-                config.merge(project);
-                tracing::info!(path = %lsp_path.display(), languages = language_count, "LSP config loaded (project)");
-            }
-            Err(error) => {
-                tracing::warn!(path = %lsp_path.display(), %error, "Failed to load project LSP config");
-            }
-        }
-    }
-
     let mut lsp_manager = LspManager::new();
     lsp_manager.load_config(&config);
-    lsp_manager.set_project_root(&project_root);
+    lsp_manager.set_project_root(project_root);
     let languages: Vec<String> = lsp_manager
         .configured_languages()
         .into_iter()
@@ -1307,7 +1310,7 @@ pub(crate) async fn register_lsp_tools(
         })
         .await;
     tracing::info!("LSP tools registered");
-    crate::plugin_runtime::PluginLspRuntime::new(shared_lsp, config, project_root)
+    crate::plugin_runtime::PluginLspRuntime::new(shared_lsp, config, project_root.to_path_buf())
 }
 
 #[cfg(test)]
@@ -1451,6 +1454,56 @@ mod tests {
         assert!(begun.load(std::sync::atomic::Ordering::Acquire));
         let receipt = owner.join(receipt).await;
         assert!(receipt.is_clean(), "unexpected receipt: {receipt}");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_joins_extension_settlement_before_specialist_teardown() -> Result<(), String>
+    {
+        let product_data_io = crate::product_data_io::ProductDataIoService::new();
+        let extension_settlement = product_data_io
+            .begin_owned_flow("extension settlement fixture")
+            .map_err(|error| error.to_string())?;
+        let (teardown_started_tx, mut teardown_started_rx) = tokio::sync::oneshot::channel();
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.bind_product_data_io(product_data_io.clone());
+        owner.install_specialist_teardown_probe(teardown_started_tx);
+
+        let receipt = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        if product_data_io
+            .begin_owned_flow("late extension settlement fixture")
+            .is_ok()
+        {
+            return Err("phase one left extension settlement admission open".to_string());
+        }
+        let settlement = owner.start_join(receipt);
+
+        if tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            &mut teardown_started_rx,
+        )
+        .await
+        .is_ok()
+        {
+            return Err(
+                "specialist teardown started before accepted extension settlement completed"
+                    .to_string(),
+            );
+        }
+
+        extension_settlement.settle(None);
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut teardown_started_rx)
+            .await
+            .map_err(|_| {
+                "specialist teardown did not start after extension settlement".to_string()
+            })?
+            .map_err(|_| "specialist teardown probe closed without a signal".to_string())?;
+        let receipt = tokio::time::timeout(std::time::Duration::from_secs(1), settlement.wait())
+            .await
+            .map_err(|_| "application lifecycle settlement timed out".to_string())?;
+        if !receipt.is_clean() {
+            return Err(format!("unexpected lifecycle receipt: {receipt}"));
+        }
+        Ok(())
     }
 
     #[tokio::test]

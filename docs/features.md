@@ -40,15 +40,32 @@ EKO 拥有文件投影、workspace、review、worktree、资源策略和各 surf
 | 文件与代码修改 | canonical transactional `apply_patch`，不保留平行编辑工具                                | `echo-agent` tool registry                             |
 | 代码执行与分析 | `run_code` 使用 EKO 锁定的 Python analytics runtime                                      | `echo-agent-app-core/src/analysis_runtime.rs`          |
 | Terminal       | 用户交互 terminal session 和 Agent shell 路径分离                                        | `echo-agent-app-core/src/terminal.rs`                  |
-| Browser/Chrome | 托管 Chromium、Chrome extension backend、tab/session/observation 投影                    | `echo-agent-app-core/src/browser/`                     |
+| Browser/Chrome | 托管 Chromium、Chrome extension backend、tab/session/observation 与五入口控制            | Browser runtime + Extension dispatcher                 |
 | 工作流         | 一份 file-backed catalog 与 framework Graph executor；GUI/TUI/CLI/channel 共用服务       | `echo-agent-app-core/src/workflow_service.rs`          |
 | 结构化抽取     | pooled Agent `extract_json`、JSON Schema 输入/输出验证、typed 多 surface outcome         | `echo-agent-app-core/src/structured_extraction.rs`     |
-| MCP            | 一份用户 `mcp.json`、动态连接、plugin name ownership、resource tools                     | `echo-agent-app-core/src/mcp_config_runtime.rs`        |
-| LSP            | 自动发现、诊断、定义、引用、hover 与 repo map                                            | framework LSP tools + app bootstrap                    |
+| MCP            | 一份用户 `mcp.json`、真实 reconcile、scope-keyed health、plugin name ownership           | `McpConfigRuntime` + Extension control                 |
+| LSP            | 自动发现、诊断、定义、引用、hover、repo map、五入口控制与配置热重载                      | framework LSP tools + `ExtensionControlService`        |
 | Tool output    | summary/detail 分离、opaque detail ref、cursor page、文件/JSONL 恢复                     | `echo-agent-app-core/src/tool_execution_projection.rs` |
 | Hooks/Webhooks | 生命周期事件、command/Subagent/MCP actions、配置热重载                                   | `echo-agent-app-core/src/hook_config_loader.rs`        |
 | Plugins        | flat `plugin.json` package、Skills/MCP/Subagents/Hooks/LSP/monitors/themes/output styles | `echo-agent-app-core/src/plugin_runtime.rs`            |
-| Skills         | 递归发现、启停、上游检查与原子同步                                                       | `echo-agent-app-core/src/skills_hub/`                  |
+| Skills         | 递归发现、安装、启停、upstream staging sync 与 durable desired/settled generation        | `skills_hub/` + `extension_control.rs`                 |
+
+### Extension Control Authority
+
+`ExtensionControlService` 是 Skills、Plugins、MCP、Hooks、LSP、Browser 的 EKO mutation
+admission，并把真实执行委托给既有 specialist owner。它不建立第二套 registry、manager 或
+store。
+
+- Skill 使用 v2 durable desired/settled generation、atomic commit、typed degraded/debt
+  receipt 与 caller-drop owned settlement；GUI/headless boot、workspace load 和下一 mutation
+  都重放 debt。
+- GUI 使用 generated typed generic IPC；JSONL 输出 journaled typed `ExtensionReceipt` 且不
+  进入模型；CLI、TUI、channel 使用同一 app-core authority 并保留 terminal settlement。
+- Browser 与 LSP 的完整命令面在 GUI、TUI、CLI/JSONL 和 channel 可达。
+- MCP health 由 Extension control 按 authority scope 维护；Hook/LSP project identity 来自
+  captured workspace root，不使用 process cwd。
+
+完整合同见 [Extension Control ADR](./adr/0012-extension-control-authority.md)。
 
 ## 专业工作台
 
@@ -65,8 +82,8 @@ EKO 拥有文件投影、workspace、review、worktree、资源策略和各 surf
 
 - 动态 Provider 和模型配置支持 Chat Completions、Responses、Anthropic 三种协议，
   以及 text/image/audio/video 输入能力。详见 [Provider 架构](./architecture/providers.md)。
-- GUI、TUI 和 CLI 共享模型、thinking profile、permission mode、MCP、Plugin、Hook、
-  Skill 和 TaskRuntime 权威。
+- GUI、TUI、CLI/JSONL 和 channel 共享模型、thinking profile、permission mode、
+  TaskRuntime 与 Extension authority。
 - JSONL one-shot 可显式选择 interaction mode、permission/approval policy 和附件；HITL 请求
   进入 canonical event stream，不能回传的 input/selection 会明确拒绝而不静默挂起。
 - Browser session、approval receipt、普通 Subagent event 和 workspace 删除投影均使用
