@@ -5020,6 +5020,15 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         assert_eq!(steered_turn, "continuation-turn");
+        let accepted_but_not_settled = foreground_turns
+            .snapshot_scoped(
+                &workspace_id,
+                ForegroundTurnSurface::Channel,
+                "conversation-a",
+            )
+            .ok_or_else(|| "accepted channel steer released the foreground slot".to_string())?;
+        assert_eq!(accepted_but_not_settled.active_turn_id, "continuation-turn");
+        assert!(!accepted_but_not_settled.cancellation_requested);
 
         let settlement = super::channel_cancel_root(
             &foreground_turns,
@@ -5040,6 +5049,15 @@ mod tests {
             .await
             .map_err(|_| "cancelled channel driver did not settle".to_string())?
             .map_err(|error| error.to_string())?;
+        assert!(
+            foreground_turns
+                .snapshot_scoped(
+                    &workspace_id,
+                    ForegroundTurnSurface::Channel,
+                    "conversation-a",
+                )
+                .is_none()
+        );
         let _cleanup = std::fs::remove_dir_all(&temporary);
         Ok(())
     }

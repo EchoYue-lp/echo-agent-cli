@@ -181,6 +181,25 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<serde_json::Value>>);
+
+    impl ChatSink for RecordingSink {
+        fn on_event(&self, event: ChatDriverEvent) -> bool {
+            let value = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
+            lock_events(&self.0).push(value);
+            true
+        }
+    }
+
+    fn lock_events(
+        events: &Mutex<Vec<serde_json::Value>>,
+    ) -> std::sync::MutexGuard<'_, Vec<serde_json::Value>> {
+        events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn stdout_contains_only_canonical_journal_envelopes() -> Result<(), String> {
         let temp = TestDir::new()?;
@@ -286,25 +305,6 @@ mod tests {
 
     #[test]
     fn hitl_provider_emits_typed_request_and_applies_policy() -> Result<(), String> {
-        #[derive(Default)]
-        struct RecordingSink(Mutex<Vec<serde_json::Value>>);
-
-        impl ChatSink for RecordingSink {
-            fn on_event(&self, event: ChatDriverEvent) -> bool {
-                let value = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
-                lock_events(&self.0).push(value);
-                true
-            }
-        }
-
-        fn lock_events(
-            events: &Mutex<Vec<serde_json::Value>>,
-        ) -> std::sync::MutexGuard<'_, Vec<serde_json::Value>> {
-            events
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        }
-
         let sink = Arc::new(RecordingSink::default());
         let provider = JsonlHumanLoopProvider::new(sink.clone(), JsonlApprovalPolicy::AutoApprove);
         let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
@@ -329,6 +329,49 @@ mod tests {
                 .and_then(|event| event.get("source"))
                 .and_then(serde_json::Value::as_str),
             Some("approval_request")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_shot_jsonl_rejects_follow_up_input_and_selection_exact_once() -> Result<(), String>
+    {
+        let sink = Arc::new(RecordingSink::default());
+        let provider = JsonlHumanLoopProvider::new(sink.clone(), JsonlApprovalPolicy::AutoApprove);
+
+        let input = echo_agent::human_loop::HumanLoopProvider::request(
+            &provider,
+            echo_agent::human_loop::HumanLoopRequest::input("Add missing context"),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let selection = echo_agent::human_loop::HumanLoopProvider::request(
+            &provider,
+            echo_agent::human_loop::HumanLoopRequest::selection(
+                "task-1",
+                "Choose next step",
+                vec!["Retry".to_string(), "Skip".to_string()],
+            ),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        for response in [input, selection] {
+            assert!(matches!(
+                response,
+                echo_agent::human_loop::HumanLoopResponse::Rejected { reason: Some(reason) }
+                    if reason == "JSONL one-shot mode cannot accept follow-up HITL input or selection"
+            ));
+        }
+        let events = lock_events(&sink.0);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.get("source"))
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["input_request", "selection_request"]
         );
         Ok(())
     }

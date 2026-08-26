@@ -7308,8 +7308,8 @@ mod tests {
     }
 
     #[test]
-    fn steer_settlement_race_queues_text_and_attachments_once() {
-        let mut app = app();
+    fn steer_fallback_is_fifo_exact_once_and_memory_only() {
+        let mut current = app();
         let attachment = echo_agent_app_core::attachments::AttachmentRef {
             path: std::path::PathBuf::from("/tmp/steer.txt"),
             name: "steer.txt".to_string(),
@@ -7317,17 +7317,28 @@ mod tests {
             source: echo_agent_app_core::types::AttachmentSource::Upload,
         };
 
-        queue_steer_follow_up(&mut app, "continue with this", vec![attachment]);
+        queue_steer_follow_up(&mut current, "continue with this", vec![attachment]);
+        queue_steer_follow_up(&mut current, "then summarize", Vec::new());
 
-        assert_eq!(app.queued_turns.len(), 1);
+        assert_eq!(current.queued_turns.len(), 2);
         assert_eq!(
-            app.queued_turns.front().map(|turn| turn.text.as_str()),
+            current.queued_turns.front().map(|turn| turn.text.as_str()),
             Some("continue with this")
         );
         assert_eq!(
-            app.queued_turns.front().map(|turn| turn.attachments.len()),
+            current
+                .queued_turns
+                .front()
+                .map(|turn| turn.attachments.len()),
             Some(1)
         );
+        assert_eq!(
+            current.queued_turns.get(1).map(|turn| turn.text.as_str()),
+            Some("then summarize")
+        );
+
+        let restarted = app();
+        assert!(restarted.queued_turns.is_empty());
     }
 
     #[test]

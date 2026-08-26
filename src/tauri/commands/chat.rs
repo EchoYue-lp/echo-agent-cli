@@ -1603,6 +1603,71 @@ mod chat_sink_contract_tests {
     }
 
     #[test]
+    fn gui_queue_acceptance_is_fifo_exact_once_and_restart_visible()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TestDir::new()?;
+        let root = temp.path().join("chat-queue");
+        let log = ChatEventLog::open(&root, ChatEventRetention::default())?;
+
+        let accepted = log.enqueue_chat_input(
+            "workspace-1",
+            "conversation-1",
+            "input-1",
+            "first version".to_string(),
+            Vec::new(),
+        )?;
+        assert_eq!(accepted.input_id, "input-1");
+        log.enqueue_chat_input(
+            "workspace-1",
+            "conversation-1",
+            "input-2",
+            "second".to_string(),
+            Vec::new(),
+        )?;
+        log.enqueue_chat_input(
+            "workspace-1",
+            "conversation-1",
+            "input-1",
+            "latest version".to_string(),
+            Vec::new(),
+        )?;
+
+        let queued = log.queued_chat_inputs("workspace-1", "conversation-1")?;
+        assert_eq!(
+            queued
+                .iter()
+                .map(|input| input.input_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["input-1", "input-2"]
+        );
+        assert_eq!(
+            queued.first().map(|input| input.text.as_str()),
+            Some("latest version")
+        );
+        drop(log);
+
+        let reopened = ChatEventLog::open(&root, ChatEventRetention::default())?;
+        let recovered = reopened.queued_chat_inputs("workspace-1", "conversation-1")?;
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|input| input.input_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["input-1", "input-2"]
+        );
+        reopened.remove_queued_chat_input("workspace-1", "conversation-1", "input-1")?;
+        assert_eq!(
+            reopened
+                .queued_chat_inputs("workspace-1", "conversation-1")?
+                .into_iter()
+                .map(|input| input.input_id)
+                .collect::<Vec<_>>(),
+            vec!["input-2".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tauri_renderer_forwards_the_exact_journal_envelope() -> Result<(), Box<dyn std::error::Error>>
     {
         let temp = TestDir::new()?;

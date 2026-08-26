@@ -2461,6 +2461,28 @@ mod tests {
     }
 
     #[test]
+    fn successful_steer_acceptance_preserves_existing_fifo_and_is_memory_only() {
+        let mut queue = ReplTurnQueue::default();
+        queue.enqueue(queued_turn("older fallback"));
+
+        let accepted = settle_steer_attempt(
+            Ok("active-turn".to_string()),
+            queued_turn("live guidance"),
+            &mut queue,
+        );
+
+        assert!(matches!(accepted.as_deref(), Ok("active-turn")));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue
+                .front_for_idle(false)
+                .map(|turn| turn.message.as_str()),
+            Some("older fallback")
+        );
+        assert_eq!(ReplTurnQueue::default().len(), 0);
+    }
+
+    #[test]
     fn queued_admission_retries_preserve_fifo_and_permanent_failure_consumes_front()
     -> Result<(), String> {
         use echo_agent_app_core::foreground_turn::{
