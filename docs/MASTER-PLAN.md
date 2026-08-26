@@ -105,8 +105,11 @@ state、运行边界索引、10k/100k 性能门、真实 Agent/Awaiter/surface �
 
 ### Channel session incarnation and product-data settlement
 
-状态：projection authority 已合入，channel focused compile/fault matrix 全绿；等待正式提交集成与
-full workspace/GUI 门禁。
+状态：projection authority 已合入，channel focused compile/fault matrix 全绿。当前发布采用
+fix-forward：framework 修复已发布为 `echo-agent@9f8d723`，CLI 已修复 Linux `infra.rs`
+`app_config` warning，并将 CI pin 更新到该精确 framework SHA。本地 full workspace、GUI、
+TUI、CLI、channel 与 frontend 门禁按精确 child pair 执行；GitHub workflow-level 调度失败按
+当前研发节奏延后到 Final Integration Gate 统一修复和验证。
 
 - framework sender-scoped session incarnation 是 channel model context 的唯一 identity；稳定 product
   conversation 继续拥有 ChatEventLog、TaskRun 与 UI 历史。
@@ -116,14 +119,18 @@ full workspace/GUI 门禁。
 - `ProductDataIoService` 按 application generation 拥有附件、压缩、删除、CommandCell、analytics 与
   research blocking I/O。process semaphore 只限流；phase one seal 新 direct/flow admission，已接纳
   producer 通过 nested token 完成 safe point，phase two join 全部 settlement；caller drop 不会分离写入。
-- 本阶段不建立第二套 TaskRuntime、session、conversation store 或 deletion authority。最终验收仍需
-  正式提交集成、full workspace/GUI/TUI/CLI/channel 门禁和 website 镜像同步。
+- 本阶段不建立第二套 TaskRuntime、session、conversation store 或 deletion authority。旧的 10 分钟
+  扩展并发 soak 已在 `df049e2` 完成（600.820 秒、1,557 launches、6 次重启、零
+  routing/duplicate-terminal/resource failure；ledger SHA-256 为
+  `073572eb87df3324825763d49cd31ea63b0e19b2505c96963b59e98b5be0330c`）；本轮若仅修复 cfg
+  warning、CI pin、manifest 或文档则沿用该证据，触及 runtime 语义时才重跑。
 
 ## 下一步
 
-Extension Control Authority 已完成。当前只进入本轮重构最终集成、完整门禁、双 reviewer 与
-10 分钟并发 soak；不得提前开始 steer/follow-up、Todo/Task/Subagent 或删除
-`InteractionMode`。
+Extension Control Authority 已完成。当前先完成三仓 release fix-forward：framework 已发布
+`9f8d723`，CLI 以该 SHA 完成本地集成门禁并发布新的 child commit，随后 website 同步公开文档事实
+与最终 revision。三个 child 的本地门禁和远端引用确认后更新顶层 gitlink；远端 CI 失败统一留到
+Final Integration Gate，不在此阶段阻塞功能开发，也不应提前删除 `InteractionMode`。
 
 TaskRuntime async surface 已统一复用进程共享的 bounded `TaskRuntimeBlockingAdapter`，并以
 ts-rs typed receipts 替代 GUI mutation 的 `serde_json::Value`/numeric interaction mode。
@@ -137,9 +144,9 @@ Agent execution governor、四 surface real-provider harness 与 truthful ledger
 真实探针完成 3x3、36 Provider turns、3 Awaiter、3 HITL、2 restart，零失败；10 分钟扩展并发
 运行也完成 1,827 cells 且零失败。两小时尝试按研发节奏调整在 26.6 分钟主动停止，状态记录为
 `interrupted_by_policy`。Task 2 EKO Control Plane 与 Surface 已在
-`refactor/eko-control-surface` 完成全自动门禁；按总集成顺序，先等待 Task 1 framework
-correctness 合并，再将 Task 2 merge 最新 `main`、恢复标准相对依赖并进入 Task 3/4/5 集成。
-10 分钟/2 小时和完整人工 GUI 场景只在项目功能研发全部完成后执行一次 Final Integration Gate。
+`refactor/eko-control-surface` 完成全自动门禁；当前先完成 framework/CLI/website 的 release
+fix-forward 并冻结新的全绿 child 基线，再启动 characterization lanes。10 分钟/2 小时和完整
+人工 GUI 场景只在项目功能研发全部完成后执行一次 Final Integration Gate。
 
 ## 文档生命周期
 

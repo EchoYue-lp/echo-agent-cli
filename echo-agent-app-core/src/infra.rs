@@ -1863,6 +1863,13 @@ pub fn load_shell_env(app_config: &EkoConfig) {
             tracing::info!(vars = loaded.join(", "), "Loaded shell env vars (GUI mode)");
         }
     }
+
+    // Linux and other non-macOS targets do not import login-shell variables,
+    // but keep the shared startup API so callers do not need platform forks.
+    // Mark the configuration as intentionally unused on those targets; this
+    // has no effect on the macOS environment-loading behavior above.
+    #[cfg(not(target_os = "macos"))]
+    let _ = app_config;
 }
 
 pub fn init_logging_for_tui(level: &str) {
