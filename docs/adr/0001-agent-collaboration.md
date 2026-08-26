@@ -2,7 +2,7 @@
 
 > 状态：Proposed
 >
-> 日期：2026-08-24
+> 日期：2026-08-24；实现证据复核：2026-08-25
 >
 > 范围：Codex Desktop/App 的可观察协同机制，以及 EKO 未来的跨会话 Agent 协同功能设计。
 >
@@ -13,6 +13,11 @@
 > - **合理推断**：由可观察工具调用、事件顺序和公开协议推导出的运行方式，不代表私有
 >   后台实现细节。
 > - **EKO 设计**：目标行为，不表示当前代码已经具备该能力。
+>
+> 复核基线：当前 Codex Desktop 内置 `codex-cli 0.149.0-alpha.4`、当前会话实际暴露的
+> App/Collaboration 工具 schema，以及 OpenAI Codex 源码快照
+> `fde2156057c38c0227ce94c8514d04c7498df60d`（2026-08-19）。官方 OpenAI Docs 在本次
+> 复核中返回 HTTP 403，因此本文不把源码内部结构写成稳定的公开产品承诺。
 
 ## 1. 背景
 
@@ -27,6 +32,24 @@
 本 ADR 的决策是：EKO 采用同样的“独立会话 + 共享目录索引 + 精确地址消息 + 事件等待 +
 协调策略”产品模型，但把 EKO 专属策略留在应用层；通用 Agent、Subagent、DAG、取消和
 事件原语仍由通用框架提供。
+
+### 1.1 本文术语
+
+“主 Agent”在日常讨论中有两种含义，必须先拆开，否则会把两套通信机制混成一套：
+
+| 本文术语   | 精确定义                                                       | Codex 身份                                                |
+| ---------- | -------------------------------------------------------------- | --------------------------------------------------------- |
+| App 主任务 | 用户在 Codex App 中创建的独立任务                              | 一个没有 Subagent parent 的 Root Thread                   |
+| 树根 Agent | 某个任务内 Subagent 树的根节点                                 | `AgentPath=/root`，同时也是该树的 Root Thread             |
+| Subagent   | 由树内 Agent 通过 `spawn_agent` 创建的后代                     | 独立 Thread，带 `parentThreadId` 和 canonical `AgentPath` |
+| Agent 实例 | 可跨多个 turn 复用的 Thread 身份及其历史                       | 稳定 `thread_id`，不是一次模型请求                        |
+| Turn       | 一次输入到终态的运行回合                                       | 同一 Agent 可以顺序执行多个 turn                          |
+| Task       | 发给 Agent 的工作说明，或 EKO 的 revisioned TaskRun graph 节点 | 不是通信地址，也不等于 Thread                             |
+| Goal       | Thread 可选的持久目标                                          | 独立于当前 turn、Todo 和消息队列                          |
+| Todo       | 计划/任务状态的展示投影                                        | 不是 Agent，不拥有 mailbox 或执行器                       |
+
+本文说“主 Agent 与主 Agent 通信”时，默认指两个 App 主任务之间通信；说“树根 Agent 与
+Subagent 通信”时，指同一 `AgentControl` 树内的通信。
 
 ## 2. 非目标
 
@@ -123,6 +146,213 @@ OpenAI Codex 开源仓库的 `multi_agents_v2` handlers 包含 `spawn`、`list_a
 任务内 Subagent 适合当前请求的有界并行子任务；App 级 Thread 适合用户可见、可长期恢复、
 彼此独立的任务。EKO 的设计必须保留这两层语义，不能用跨会话目录替代 TaskRun 内的
 Subagent DAG，也不能把用户创建的独立会话降格为某个临时 Subagent。
+
+### 3.4 四个控制面，不是一张全局消息总线
+
+Codex 当前可观察实现至少有四个彼此独立的控制面：
+
+```text
+App 任务目录控制面
+  Root Thread A <---- send_message_to_thread / wait_threads ----> Root Thread B
+
+任务内协作控制面
+  /root <---- send_message / followup_task / wait_agent ----> /root/reviewer
+                                      |
+                                      +----> /root/reviewer/checker
+
+单 Thread 输入控制面
+  用户输入 ---- start_or_steer_turn ----> 当前 Root Thread 的 active turn / 新 turn
+
+事件投影控制面
+  Core Event ---- app-server Item notification ----> Desktop/TUI 渲染
+```
+
+四者不能互相替代：
+
+- App 任务目录连接的是相互独立的 peer Root Thread，不共享 `AgentControl`；
+- 任务内协作只在一个 root session tree 内寻址和投递；
+- 用户 steer 是目标 Thread 自己的 turn admission，不是 Agent-to-Agent 消息；
+- “智能体已更新”是运行时事件的 UI 投影，不是某个 Agent 额外调用了通知工具；
+- 共享 cwd、Git 仓库或 worktree 只构成文件环境关系，不自动建立消息或上下文关系。
+
+### 3.5 Collaboration runtime 维护在哪里
+
+任务内协作运行时在 `codex app-server` 后端进程中维护，而不是在 Desktop 渲染层或模型
+上下文里维护：
+
+```text
+Codex Desktop / TUI
+  |
+  | app-server protocol
+  v
+ThreadManagerState                         进程级已加载 Thread 目录
+  |- threads: thread_id -> CodexThread
+  |- thread_store                         Thread 历史和元数据
+  `- agent_graph_store                    持久 parent/child 拓扑
+       |
+       `- AgentControl                    每棵 root tree 一个，所有后代共享
+            |- session_id                 树内共享 session identity
+            |- AgentRegistry              AgentPath <-> thread_id
+            |- V2Residency                已加载/可重载状态
+            |- AgentExecutionLimiter      并发执行许可
+            `- RolloutBudget              树级 rollout 预算
+
+每个 CodexThread / Session
+  |- active_turn                          当前 turn 与 TaskKind
+  |- InputQueue.mailbox_pending_mails     Agent 间消息队列
+  |- TurnState.pending_input              当前 turn 的 steer/pending input
+  |- status watch channel                 Running/Completed/... 状态订阅
+  `- rollout/event stream                 历史与 UI 事件来源
+```
+
+`AgentControl` 的源码约束是“每个 root thread/session tree 最多创建一个，spawn 出来的每个
+Subagent 共享它”。因此：
+
+- `AgentRegistry` 的作用域是当前根树，不是整个 App；
+- `ThreadManagerState` 可以知道进程中所有已加载 Thread，但树内工具只能通过自己的
+  `AgentControl` 解析目标；
+- 两个独立 App 主任务不会因为处于同一 workspace 就进入同一个 `AgentRegistry`；
+- 跨主任务通信必须经过 App 目录工具，不能拿树内相对路径越界访问。
+
+### 3.6 子智能体树、canonical path 与“找到同族”
+
+每个 V2 Subagent 都有两个身份：
+
+1. `thread_id`：全局稳定的 Thread 身份，用于存储、恢复和精确调用；
+2. `AgentPath`：当前根树内稳定、可读的协作地址。
+
+典型树如下：
+
+```text
+/root
+|- /root/architecture
+|  `- /root/architecture/reviewer
+`- /root/ci
+```
+
+`spawn_agent(task_name="architecture")` 会把调用方路径和 `task_name` 拼成子路径。路径规则是：
+
+- 根路径固定为 `/root`；
+- 名称只接受 ASCII 小写字母、数字和下划线；
+- 相对引用从当前 Agent 向下解析；
+- 绝对引用从 `/root` 开始，可指向同树中的父、兄弟或其它分支；
+- `..` 被禁止，避免路径归一化歧义；
+- 工具也接受精确 `thread_id`，但可读路径更适合模型协作。
+
+因此 `/root/architecture` 发送给 `reviewer`，解析结果是自己的子节点
+`/root/architecture/reviewer`；它若要找兄弟 `/root/ci`，必须使用 canonical
+`/root/ci`，不能写 `../ci`。
+
+寻址链路是：
+
+```text
+target 字符串
+  -> 若是 ThreadId，直接采用
+  -> 否则 current AgentPath.resolve(target)
+  -> AgentRegistry.agent_id_for_path(...)
+  -> ThreadManagerState.get_thread(thread_id)
+  -> 必要时 ensure_v2_agent_loaded(...)
+  -> 向目标 Session 提交 Op
+```
+
+`list_agents` 列的是当前 root tree 中仍可用的 Agent，并可用路径前缀过滤；它不是扫描所有
+Codex 任务，也不是从自然语言标题猜目标。
+
+### 3.7 三种输入队列与安全边界
+
+“给正在运行的 Agent 追加指令”至少有三种不同入口：
+
+| 输入来源                    | Core 入口                     | 队列/信封                             | 是否可自动启动新 turn                         |
+| --------------------------- | ----------------------------- | ------------------------------------- | --------------------------------------------- |
+| 用户对当前 Root Thread 输入 | `start_or_steer_turn`         | turn-local user input                 | idle 时直接启动；active regular turn 时 steer |
+| Agent `send_message`        | `Op::InterAgentCommunication` | session mailbox，`trigger_turn=false` | 否；等待当前或以后某个 turn 消费              |
+| Agent `followup_task`       | `Op::InterAgentCommunication` | session mailbox，`trigger_turn=true`  | 是；目标 idle 时启动 regular turn             |
+
+所谓“安全边界”不是发送方判断“现在看起来安全”，而是目标 Session 的状态机决定：
+
+1. 消息先进入目标 `InputQueue`，不会修改已经发给模型的请求；
+2. regular turn 在下一次模型采样前，从 pending input/mailbox drain 新输入；
+3. 当前模型仍在采样时，消息只能等待下一次采样；
+4. 当前工具调用仍在执行时，消息等待工具调用完成后的模型边界；
+5. turn 已记录用户可见 final answer 后，queue-only 子消息切到 `NextTurn`，不会偷偷延长
+   用户已经看到的答案；
+6. 显式 user steer、模型发起的新工具调用或明确的 follow-up 可以重新打开
+   `CurrentTurn` 消费窗口；
+7. Review 和 Compact turn 明确拒绝 user steer；regular turn 才可 steer；
+8. turn 已经结束时，原 turn 不再可 steer；`start_or_steer_turn` 在同一次原子判定中改为
+   启动新 turn，而不是先失败再由 UI 猜测重试。
+
+所以“当前 turn 仍可接纳 steer”具体要求是：目标仍有 active task、TaskKind 是 Regular、
+输入非空、指定的 expected turn ID 没有发生 ABA 式变化，并且 final-output schema 等 turn
+约束兼容。判定者是目标 `Session::steer_input`；发送方 Agent、App UI 和 LLM 都无权单独
+宣布成功。
+
+### 3.8 内存状态、持久状态与恢复
+
+当前 Codex 实现不是把整个 collaboration runtime 放进一个数据库：
+
+| 数据                                          | 当前权威位置                         | 重启后的性质                                     |
+| --------------------------------------------- | ------------------------------------ | ------------------------------------------------ |
+| 已加载 Thread 句柄、active turn、status watch | `app-server` 进程内存                | 消失，必须重建                                   |
+| `AgentPath <-> thread_id` 活动索引            | `AgentRegistry` 内存 HashMap         | 从持久 Thread 元数据重建                         |
+| 尚未 drain 的 Agent mailbox                   | `InputQueue` 内存 `VecDeque`         | 源码未证明具备 exactly-once 持久恢复             |
+| 父子边                                        | `AgentGraphStore`                    | 本地实现写入 `state_5.sqlite/thread_spawn_edges` |
+| Thread 元数据和历史                           | `ThreadStore`、rollout/history store | 可恢复、分页读取或重建模型上下文                 |
+| Thread goal                                   | 独立 GoalStore                       | 本地实现写入 `goals_1.sqlite`                    |
+
+恢复根 Thread 时，runtime 先读取仍为 Open 的后代边，只恢复 path、role、nickname 和
+thread identity，不立即打开所有后代运行时。后续消息命中某个未加载 Subagent 时，
+`ensure_v2_agent_loaded` 才读取存储历史、恢复配置和模型上下文，再把它装回
+`ThreadManagerState`。这是“身份和历史可恢复”与“当前执行仍在运行”的明确分离。
+
+因此不能声称：Codex 当前的内存 mailbox 已经提供 durable exactly-once。EKO 在 7.7 和
+9 节提出的 durable mailbox、幂等 message ID 和 delivery receipt 是更强的产品目标，不是
+对 Codex 当前实现的照抄。
+
+### 3.9 Agent 状态、turn 终态与长时间复用
+
+当前树内 `AgentStatus` 包含：`PendingInit`、`Running`、`Interrupted`、
+`Completed(final_message?)`、`Errored(error)`、`Shutdown`、`NotFound`。
+
+这里最容易误解的是 `Completed`：它主要表达当前 turn 已结束，不等于这个 Thread 身份被
+删除。只要父子边和 Agent metadata 仍存在，协调者就可以用 `followup_task` 给同一个
+Subagent 新任务；目标继续使用原 `thread_id`、`AgentPath`、历史和角色，再启动下一个 turn。
+
+所以 UI 中一个 Subagent 显示运行或存在十几个小时，不能直接解释为“一次 LLM sampling
+持续了十几个小时”。它可能经历：
+
+```text
+spawn
+  -> turn 1 完成
+  -> idle / 等待
+  -> followup_task
+  -> turn 2 完成
+  -> 等待依赖、工具或用户
+  -> turn 3 ...
+```
+
+是否继续使用旧 Agent，不由经过时长决定，而由上下文连续性决定。新工作依赖原历史、角色、
+文件所有权或未完成推理时，复用同一个 Subagent 更合理；工作目标完全独立、需要隔离历史或
+并行执行时，才 spawn 新 Agent。
+
+### 3.10 Goal、Task、Todo 与 Subagent 的关系
+
+Codex 当前协议为每个 Thread 提供可选的持久 `ThreadGoal`，字段包括 objective、status、
+token budget、tokens/time used 和时间戳；状态包括 Active、Paused、Blocked、UsageLimited、
+BudgetLimited、Complete。它通过 `thread/goal/set|get|clear` 独立维护。
+
+但这不意味着每次 `spawn_agent` 都自动创建一个 Goal，也不意味着后续消息会自动重写 Goal：
+
+- `spawn_agent.message` 是新 Subagent 的首个任务输入；
+- `followup_task.message` 是同一 Agent 的后续任务输入；
+- `ThreadGoal` 只有显式 set/update 才是持久目标；
+- turn status 只描述一次运行回合；
+- Todo/Plan 描述“接下来做什么”，不拥有 Agent 身份；
+- TaskRun/PlanTask 描述 EKO 的工作图，不替代消息路由。
+
+合理模型是：Goal 提供长期方向，Task/PlanTask 提供可执行工作单元，Todo 提供当前投影，
+Subagent 提供执行身份，Turn 提供一次执行尝试，message/receipt 提供因果连接。不要把这六个
+概念压成一个状态机。
 
 ## 4. Codex 协同工具
 
@@ -341,6 +571,210 @@ worktree，除非用户明确要求直接使用保存的项目。创建操作是
 {}
 ```
 
+### 4.8 任务内 Collaboration 工具的真实职责
+
+当前 MultiAgent V2 的六个任务内工具形成一个完整但刻意很小的控制面：
+
+| 工具              | 改变的事实                                                        | 不做什么                                          |
+| ----------------- | ----------------------------------------------------------------- | ------------------------------------------------- |
+| `spawn_agent`     | 创建子 Thread、分配 canonical path、登记父子边、提交首个 NEW_TASK | 不创建 App peer 任务，不共享可变上下文窗口        |
+| `list_agents`     | 从当前 root tree 的 registry 返回 Agent path/status               | 不扫描 App 全部任务，不读取完整历史               |
+| `send_message`    | 投递 `trigger_turn=false` 的 MESSAGE                              | 不为普通 idle Agent 启动新工作，不中断当前工具    |
+| `followup_task`   | 投递 `trigger_turn=true` 的 NEW_TASK                              | 不创建新 Agent，不允许把 root 当 follow-up target |
+| `interrupt_agent` | 给精确的非 root、非自身目标发送 `Op::Interrupt`                   | 不删除 Thread，不清空历史，不改变长期 goal        |
+| `wait_agent`      | 订阅当前 Session 的 mailbox/steer activity，等待任意更新          | 不返回所有消息正文，不持续占用模型采样            |
+
+`send_message` 和 `followup_task` 的 handler 只接受 `target`、`message`，拒绝未知字段；二者
+共用同一条 `handle_message_string_tool` 提交路径。差异不是两套队列，而只是：
+
+```text
+send_message  -> MessageDeliveryMode::QueueOnly  -> trigger_turn=false
+followup_task -> MessageDeliveryMode::TriggerTurn -> trigger_turn=true
+```
+
+两者都会先解析目标、确认目标属于当前树、必要时从持久历史加载目标，再构造：
+
+```text
+InterAgentCommunication {
+  author: AgentPath,
+  recipient: AgentPath,
+  other_recipients: [],
+  content,
+  trigger_turn,
+  ...
+}
+```
+
+然后通过 `AgentControl -> ThreadManagerState.send_op -> target Session::InputQueue` 投递。工具
+调用成功表示目标 Session 已接受这次提交，不等于目标已经理解、执行或完成消息中的任务。
+
+### 4.9 全方向通信矩阵
+
+下面这张表覆盖本文讨论的主 Agent、Subagent、用户和运行时之间的全部主要方向：
+
+| 来源             | 目标                         | 正确通道                                           | 目标 turn 行为                                         | 自动回传                                                    |
+| ---------------- | ---------------------------- | -------------------------------------------------- | ------------------------------------------------------ | ----------------------------------------------------------- |
+| App 主任务 A     | App 主任务 B                 | `send_message_to_thread`                           | B 收到用户可见 follow-up；由 B 的宿主做 turn admission | 无 parent completion；A 应 `wait_threads` 或等待 B 主动回复 |
+| 树根 `/root`     | 直接/间接 Subagent           | `send_message`                                     | 正在运行则在消息边界处理；idle 时仅排队                | mailbox activity 可唤醒 `wait_agent`                        |
+| 树根 `/root`     | 直接/间接 Subagent           | `followup_task`                                    | 正在运行则在边界处理；idle 时启动新 turn               | 新 turn 终态会通知直接 parent                               |
+| Subagent         | 直接 parent                  | `send_message`                                     | parent 当前 turn 边界处理；idle 时仅排队               | parent 的 `wait_agent` 被 mailbox activity 唤醒             |
+| Subagent         | `/root`                      | `send_message("/root", ...)`                       | 同上                                                   | 不自动启动 idle root turn                                   |
+| Subagent         | `/root`                      | `followup_task`                                    | **拒绝**；root 不是 spawned agent                      | 无                                                          |
+| Subagent         | 非 root parent/兄弟/其它分支 | `send_message` 或 `followup_task` + canonical path | 按 queue-only/trigger-turn 语义处理                    | 只对 direct parent 有自动终态通知                           |
+| Subagent         | 自己的新子节点               | `spawn_agent`                                      | 建立下一层 Thread 和 path                              | 子节点每个终态 turn 通知它的直接 parent                     |
+| Subagent runtime | 直接 parent                  | 自动 completion MESSAGE                            | `trigger_turn=false`，不会擅自启动 parent 新 turn      | 这是回传本身                                                |
+| 用户/App         | App Root Thread              | `turn/start` / start-or-steer                      | active regular 时 steer；idle 时新 turn                | 正常 turn event stream                                      |
+| 用户/App         | V2 spawned Subagent          | 直接 app-server turn input                         | **拒绝**，`canAcceptDirectInput=false`                 | 应由树内 Agent 使用 collaboration 工具                      |
+| Core runtime     | UI                           | Item/Event notification                            | 不影响模型运行                                         | UI 渲染“智能体已更新”等状态                                 |
+
+“主 Agent 与子 Agent 可以双向通信”并不表示双方拥有完全对称的控制权。Subagent 可以给
+root 发 MESSAGE，但不能用 `followup_task` 强制 root 启动新 turn，也不能 interrupt root。
+这让根协调者保持调度权，同时允许后代及时汇报。
+
+### 4.10 `send_message` 与 `followup_task` 的状态真值表
+
+| 目标状态                                        | `send_message`                            | `followup_task`                                  |
+| ----------------------------------------------- | ----------------------------------------- | ------------------------------------------------ |
+| regular turn 正在采样，尚未 final               | 入 mailbox；下一次模型边界 drain          | 同一 mailbox；下一次模型边界 drain               |
+| 工具调用正在执行                                | 等工具完成后的边界，不抢占工具            | 等工具完成后的边界，不抢占工具                   |
+| active turn 已输出可见 final，但尚未完全 settle | queue-only 留给以后 turn                  | 保持 trigger work；当前 turn 结束后可拉起新 turn |
+| idle                                            | 只排队，不产生模型调用                    | 运行时保留启动槽并创建 regular turn              |
+| 持久 Thread 未加载                              | 先 `ensure_v2_agent_loaded`，再按上述规则 | 先加载，再按上述规则                             |
+| target 是 `/root`                               | 允许                                      | 拒绝                                             |
+| target 不在当前 root tree                       | 解析失败                                  | 解析失败                                         |
+
+一个窄例外是目标带有 outstanding durable sleep：queue-only 消息可以唤醒这段已经登记的延续
+工作。它不是把普通 `send_message` 升格成 NEW_TASK，而是让原有 durable continuation 响应
+mailbox activity。
+
+所以二者不是“steer 成功/steer 失败的自动降级关系”。它们表达发送方意图：
+
+- `send_message`：这是一条信息；不要因为它单独唤醒一个 idle Agent；
+- `followup_task`：这是一项新工作；如果目标没有运行，就为同一个 Agent 启动新 turn。
+
+最终消息进入当前 turn 还是下一个 turn，仍由接收方 Session 在原子状态和 mailbox phase 上
+决定。发送方只选择是否允许触发 turn，不能指定“必须插入第 N 次模型请求”。
+
+### 4.11 Subagent 到 parent 的结果回传
+
+V2 Subagent 的每一个 terminal turn 都会由目标 Session 自动构造 completion envelope 发给
+它的**直接 parent**。触发点是 `TurnComplete` 或 `TurnAborted`，流程为：
+
+```text
+child turn terminal
+  -> 归约 AgentStatus
+  -> 生成标准 completion message
+  -> author=child AgentPath
+  -> recipient=direct parent AgentPath
+  -> trigger_turn=false
+  -> parent mailbox
+```
+
+边界细节：
+
+- `Completed(Some(message))` 携带 child 最终回复；
+- error 会被截断并附带“如仍需要此 Agent，请再分配任务”的下一步；
+- completion envelope 的预算有界，当前实现上限为约 1,000 tokens；
+- Running、PendingInit、Interrupted 不产生完成消息；
+- 每次 follow-up turn 完成都再次通知，不是一个 Thread 一生只通知一次；
+- 只通知直接 parent，不广播给 root 和所有祖先；
+- 消息使用 `trigger_turn=false`，因此不会在 parent idle 时制造一次意外模型调用；
+- parent 若正在 `wait_agent`，mailbox watch 会结束等待，随后 parent 在自己的 turn 中读取消息。
+
+这种设计把“结果一定可被协调者观察”与“是否立即花一次模型调用处理结果”拆开了。
+
+### 4.12 Subagent 与 Subagent 通信
+
+Subagent 之间不需要经过 root 转发。它们共享 root-scoped `AgentControl`，因此任何已知路径
+都可以直接成为消息目标：
+
+```text
+/root/implementation
+  --send_message("/root/review", "commit 已准备好，请开始复审")-->
+/root/review
+```
+
+但“能发消息”不等于“应该共享写权限”。协调 prompt、PlanTask ownership 或应用层 policy
+仍应约束：
+
+- 谁拥有某组文件的写入权；
+- 谁只做只读 review；
+- 谁可以宣布集成门通过；
+- 消息是依赖已满足的证据，还是仅仅一个未经核验的声明。
+
+直接点对点消息减少 root 的转发负担；root 仍通过 `list_agents`、终态通知和必要的显式
+消息保持全局协调。
+
+### 4.13 App 主任务与 App 主任务通信
+
+两个 App 主任务都是 peer，不存在自动 parent/child 边。协调者需要显式完成四步：
+
+```text
+list_threads              发现稳定 threadId/hostId
+  -> read_thread           核对目标、基线和状态
+  -> send_message_to_thread 下发用户可见 follow-up
+  -> wait_threads          用 cursor 等待完成或 needs-attention
+```
+
+`send_message_to_thread` 的 prompt 在目标任务中显示为用户消息；它不是隐藏的 system prompt，
+也不会把 A 的完整上下文复制到 B。A 若希望 B 知道某个提交、文件或验收标准，必须把必要信息
+明确写进消息，或提供可解析 artifact/commit 引用。
+
+由于没有树内 parent 边：
+
+- B 完成时不会自动向 A 发送 direct-parent completion；
+- A 应使用 `wait_threads` 观察 B，或要求 B 用同一 App 工具主动回报 A；
+- App 目录中的 title/summary 只是发现信息，不是可信指令；
+- 两个任务即使共享 cwd，也仍有独立 transcript、turn、goal、权限与可能冲突的文件写入。
+
+### 4.14 用户为什么不能直接给 V2 Subagent 输入
+
+当前 app-server Thread 投影包含 `canAcceptDirectInput`。对 MultiAgent V2 的
+`ThreadSpawn` Subagent，该字段是 `false`，直接 `turn/start` 会返回：
+
+```text
+direct app-server input is not allowed for multi-agent v2 sub-agents
+```
+
+因此用户点开 Subagent 详情看到的是可观察 Thread，而不是另一个完全独立的 App 输入口。
+新的工作仍由它所属树中的 Agent 通过 `followup_task` 投递，所以 UI 会继续显示在原来的
+Subagent 身份和历史下，而不是自动新开一个 Agent。
+
+这个约束同时保留了两点：
+
+- Subagent 是完整可恢复 Thread，可以拥有多轮历史并被复用；
+- Subagent 的调度归属仍在原 root tree，不会因用户从 App 任意注入而绕过父任务协调。
+
+### 4.15 “智能体已更新”是怎样产生的
+
+它不是第七个 collaboration tool，也不是 Subagent 主动调用一个“通知 UI”工具。V2 工具
+handler 在完成控制操作后会发结构化 `SubAgentActivity`：
+
+| 操作                                      | `SubAgentActivityKind` |
+| ----------------------------------------- | ---------------------- |
+| spawn 成功                                | `Started`              |
+| `send_message` / `followup_task` 投递成功 | `Interacted`           |
+| interrupt 完成                            | `Interrupted`          |
+
+事件包含 event/call ID、目标 `agent_thread_id`、canonical `agent_path` 和 kind。app-server 把
+它映射为 `ThreadItem::SubAgentActivity`，再通过 `item/completed` 通知客户端；Desktop 根据
+kind 和本地化文案渲染成“智能体已更新”等条目。
+
+旧/兼容事件中还有 `CollabAgentToolCallItem`，可携带 tool、sender thread、receiver threads、
+prompt、status 和 receiver states。无论哪种投影，UI 事件都是 runtime tool handler 的副作用：
+
+```text
+Agent 调 collaboration tool
+  -> Core 修改 Thread/registry/mailbox
+  -> Core emit structured activity item
+  -> app-server 转换并广播 item notification
+  -> UI reducer/render
+```
+
+因此连续出现三条“智能体已更新”，通常表示发生了三次可观察协作活动，不表示创建了三个新
+Agent，也不表示每条都已经产生最终业务结果。应展开对应 Subagent 或结合终态消息判断具体
+发生了什么。
+
 ## 5. 工具触发与协同调度
 
 ### 5.1 发现不是持续轮询
@@ -396,6 +830,62 @@ goal 应保持稳定；改变的是代码基线、依赖状态和下一步可执
 - `notLoaded`：持久化 Thread 存在，但当前未加载到内存；需要 resume/唤醒后才能继续。
 
 “idle”不等于“退出协作”；协调者仍可通过精确 Thread ID 发送 follow-up。
+
+### 5.5 一次完整的树内协作时序
+
+以下时序把 spawn、点对点通信、等待、自动结果回传和 Agent 复用连起来：
+
+```text
+User
+  |  “实现功能并独立复审”
+  v
+/root turn-1
+  |-- spawn_agent("implementation", initial task) --> /root/implementation turn-1
+  |-- spawn_agent("review", review contract) ------> /root/review turn-1
+  |
+  |-- wait_agent ----------------------------------- waiting
+  |
+/root/implementation
+  |-- tools / code / tests
+  |-- send_message("/root/review", commit + evidence)
+  `-- terminal --> automatic completion MESSAGE --> /root
+
+/root/review
+  |-- mailbox receives commit + evidence
+  |-- review and report findings
+  `-- terminal --> automatic completion MESSAGE --> /root
+
+/root wait_agent wakes
+  |-- consumes both mailbox messages
+  |-- decides implementation needs one correction
+  |-- followup_task("/root/implementation", correction + acceptance gate)
+  `-- wait_agent
+
+/root/implementation turn-2
+  |-- reuses original Thread/history/path/role
+  `-- terminal --> automatic completion MESSAGE --> /root
+
+/root
+  `-- verifies evidence and completes its own turn
+```
+
+这个过程中没有任何全局共享 prompt：共享的是精确地址、短消息、状态事件、代码/commit 和
+可核验 artifact。每个 Agent 只在自己的 turn 中决定如何处理收到的信息。
+
+### 5.6 复用旧 Agent、发消息、追加任务还是新建 Agent
+
+| 意图                                              | 正确动作                      | 原因                               |
+| ------------------------------------------------- | ----------------------------- | ---------------------------------- |
+| 告知一个正在工作的 Agent 新事实，不要求它单独醒来 | `send_message`                | queue-only，最少打扰               |
+| 要求已有 Subagent 继续做下一项相关工作            | `followup_task`               | 保留历史和身份，idle 时自动新 turn |
+| 目标与原工作独立，需要并行或上下文隔离            | `spawn_agent`                 | 新 Thread、新 path、新执行身份     |
+| 需要用户长期拥有、侧边栏可见的独立主任务          | `create_thread`               | App peer，不属于临时 Subagent 树   |
+| 给另一个 App 主任务纠偏或追加验收条件             | `send_message_to_thread`      | 用户可见的跨任务 follow-up         |
+| 只是等待结果                                      | `wait_agent` / `wait_threads` | 事件驱动，不制造无意义轮询和 turn  |
+
+“初始任务肯定会变化”不是必须新建 Agent 的理由。变化如果是同一责任域内的下一步，应该
+通过 follow-up 演进；变化如果改变了所有权、隔离需求、上下文前提或需要并行，才建立新
+Agent。稳定的是执行身份和因果历史，不是第一条 task 文本永远不变。
 
 ## 6. 隔离、可见性与权限
 
@@ -487,19 +977,21 @@ EKO 应支持用户把大型任务拆成多个独立会话 Agent，再创建一�
 
 ### 7.3 核心产品对象
 
-| 对象                | 作用                                                                                 |
-| ------------------- | ------------------------------------------------------------------------------------ |
-| `AgentAddress`      | 精确定位一个会话 Agent：scope + conversation ID                                      |
-| `AgentEndpoint`     | 可发现的安全元数据：标题、摘要、状态、最近更新时间、能力标签                         |
-| `CoordinationGroup` | 协调者、成员、角色、可见性和策略的持久关系                                           |
-| `CoordinationTask`  | 协调目标、阶段、依赖和验收标准                                                       |
-| `AgentMessage`      | 有 `message_id`、目标、来源、correlation/causation、正文和附件引用的消息             |
-| `DeliveryReceipt`   | queued/claimed/injected/delivered/failed 等消息交付事实                              |
-| `GoalSnapshot`      | 目标的有界、可投影版本，不暴露完整隐藏提示词                                         |
-| `ProgressSnapshot`  | 当前阶段、完成项、阻塞项、下一步和证据引用                                           |
-| `CoordinationEvent` | discovered、message_accepted、agent_started、agent_completed、needs_attention 等事件 |
+| 对象                   | 作用                                                                                  |
+| ---------------------- | ------------------------------------------------------------------------------------- |
+| `AgentAddress`         | 精确定位一个会话 Agent：scope + conversation ID                                       |
+| `AgentEndpoint`        | 可发现的安全元数据：标题、摘要、状态、最近更新时间、能力标签                          |
+| `CoordinationGroup`    | 协调者、成员、角色、可见性和策略的持久关系                                            |
+| `CoordinationTaskView` | 对既有 TaskRun graph 的协调投影，不拥有第二套 task store 或状态机                     |
+| `AgentMessage`         | 有 `message_id`、目标、来源、correlation/causation、正文和附件引用的消息              |
+| `DeliveryReceipt`      | persisted/claimed/drained/turn-settled/failed 等消息交付事实                          |
+| `GoalSnapshot`         | 目标的有界、可投影版本，不暴露完整隐藏提示词                                          |
+| `ProgressSnapshot`     | 当前阶段、完成项、阻塞项、下一步和证据引用                                            |
+| `CoordinationEvent`    | discovered、message_persisted、agent_started、agent_completed、needs_attention 等事件 |
 
 EKO 的会话 Agent、任务运行和 Subagent 仍然使用既有产品术语，不新增第二种执行角色。
+`CoordinationTaskView` 只能引用 `run_id/task_id/plan_revision` 并投影状态；它不得再次拥有依赖
+DAG、ready frontier、重试、取消或完成判定。
 
 ### 7.4 模型可调用工具
 
@@ -562,22 +1054,44 @@ EKO 建议提供三档可见性：
 
 ### 7.7 消息与回执
 
-消息投递采用以下状态：
+EKO 必须区分“消息已可靠保存”“输入已进入目标上下文”和“目标 turn 已完成”。建议投递事实为：
 
 ```text
-accepted -> claimed -> injected -> delivered
-                         └──────> failed/retryable
+Persisted
+  -> Claimed(receiver generation / attempt)
+  -> AcceptedByMailbox
+  -> DrainedIntoContext
+  -> TurnSettled(completed | failed | cancelled | dropped)
+
+任一 pre-drain 阶段
+  -> Failed(retryable | terminal)
 ```
+
+各边界含义：
+
+| 边界                 | 能证明什么                                    | 不能证明什么         |
+| -------------------- | --------------------------------------------- | -------------------- |
+| `Persisted`          | App journal 已拥有消息，重启后不会遗失        | 目标已加载或看到消息 |
+| `Claimed`            | 某个精确 receiver generation/attempt 正在处理 | 已进入模型上下文     |
+| `AcceptedByMailbox`  | 目标 runtime 的真实 mailbox 已接受            | 已发生下一次模型采样 |
+| `DrainedIntoContext` | 消息已被插入目标 ContextManager/turn input    | turn 成功、任务完成  |
+| `TurnSettled`        | 该 owning turn 已有 typed terminal            | 业务验收已经通过     |
+
+框架现有 tracked steering 已提供 `Accepted -> Drained -> TurnSettled` 的真实 turn 边界；应用
+层 durable journal 负责 `Persisted/Claimed`、重试和 boot reconciliation。应用不得从 UI
+渲染、最后一条文本或“Agent 当前 idle”反推 drain。
 
 要求：
 
 - `message_id` 幂等；相同消息重复提交返回原 receipt；
 - `correlation_id` 关联一次协作请求，`causation_id` 指向触发消息；
 - 目标使用精确 `AgentAddress`，不能只用 title 或 cwd；
-- 先持久化 accepted，再尝试唤醒目标；
+- 先产生 `Persisted`，再尝试 claim 或唤醒目标；
 - 目标不可用时进入有界重试和 backoff；
-- restart 后从 journal 恢复 queued/claimed/injected 状态；
-- delivered 必须由目标 turn safe point 或可靠注入事实确认；
+- restart 后从 journal 恢复 persisted/claimed/mailbox-accepted 等未结算状态；
+- `DrainedIntoContext` 必须由目标 turn safe point 或 tracked receipt 确认；
+- `TurnSettled` 与业务完成分离；TaskRun completion gate 仍验证 artifact、测试和 postcondition；
+- receipt 绑定 receiver generation/turn incarnation，旧 attempt 不能结算新 attempt；
 - 结果报告和请求消息都可以是幂等的。
 
 ### 7.8 会话、执行和文件隔离
@@ -617,12 +1131,61 @@ GUI、TUI、CLI/JSONL 和 channel 都应提供同一组能力：
 - 列出协作组和成员；
 - 查看目标/进度/阻塞原因；
 - 发送消息、follow-up、interrupt、resume；
-- 显示 queued/claimed/injected/delivered/failed receipt；
+- 显示 persisted/claimed/mailbox-accepted/drained/turn-settled/failed receipt；
 - 显示依赖图和当前 ready frontier；
 - 查看完成证据和 artifact；
 - 恢复或关闭协作组。
 
 差异只在输入和渲染方式，不得因为某个 surface 当前没有 UI 就删除核心能力。
+
+### 7.11 删除 mode 后如何做路由
+
+通信和 turn admission 不需要 Chat/Task/Auto 这类 mode 状态机。删除 mode 后，决策只依赖
+显式意图和可观察运行时事实：
+
+```text
+用户输入
+  -> 目标是谁？Root Thread / App peer / Subagent
+  -> 当前是否有 active regular turn？
+  -> 是追加信息，还是要求 idle Agent 开始新工作？
+  -> 是否需要 TaskRun graph、依赖、持久恢复和 completion gate？
+  -> 调用 steer / message / follow-up / task_execute 中唯一匹配的入口
+```
+
+对应规则：
+
+- active regular turn 的用户追加走 tracked steer；
+- idle Root Thread 的用户输入启动新 turn；
+- queue-only Agent 消息走 message；
+- 要求已有 Subagent 开始下一项工作走 follow-up；
+- 需要依赖 DAG、并发、恢复和验收的工作进入既有 TaskRun graph；
+- 普通对话不伪造 TaskRun；
+- 不用一个 `mode` enum 同时决定工具可见性、路由、UI、持久化和权限。
+
+这与 Codex 的安全边界一致：判定发生在目标 active-turn/mailbox 状态上，不发生在一个全局
+“当前处于什么模式”的产品标签上。
+
+### 7.12 Todo、TaskRun 与 Subagent 的单一权威
+
+EKO 的任务关系继续只有一条权威链：
+
+```text
+TaskRun(revision)
+  -> PlanTask(DAG node)
+  -> SubagentRun(execution attempt)
+
+TaskPlan = 可编辑、可审阅的版本化 artifact
+TodoItem = TaskRun graph 的 UI/TUI/CLI 投影
+AgentMessage = 引用 run/task/attempt 的通信事实
+```
+
+通信层不得新增 `CoordinationTaskStore`、第二个 Todo store、第二个 Plan executor 或第二套
+ready-frontier 算法。一次 follow-up 若改变了正式任务关系，协调者必须通过既有
+`task_update` 提交新 revision；仅发送一条文本不能静默改写 TaskRun 权威图。
+
+反过来，TaskRun 状态变化也不能假装消息已经交付。任务图负责“应该做什么及依赖是否满足”，
+mailbox/receipt 负责“指令是否被目标接收和消费”，SubagentRun terminal 负责“一次执行如何
+结束”，completion gate 负责“结果是否被接受”。这些事实可以关联，但不能互相替代。
 
 ## 8. 权限模型
 
@@ -634,6 +1197,9 @@ discover < inspect < message < control < execute
 
 权限应按 `actor -> target -> operation -> scope` 判定，并记录授权来源：用户、协调 Agent、
 组策略或系统恢复。每次控制操作返回带 target/attempt/revision 的 receipt。
+
+这是一组能力分类，不要求 EKO 为本地单用户场景增加多租户权限系统。默认仍是同一用户可信；
+只有会造成错投、旧 attempt 干扰新执行、未提交文件覆盖或密钥泄露的本地风险需要硬边界。
 
 ### 8.2 本地个人助理取舍
 
@@ -671,6 +1237,15 @@ artifacts/                  大结果和证据
 
 不把完整上下文复制进全局目录；摘要和结果应有字符/字节上限，长文本转 artifact 引用。
 
+存储归属按通信范围拆分，但不能重复记录同一事实：
+
+- TaskRun 内的 PlanTask/SubagentRun 消息与终态写入既有 TaskRuntime journal；
+- Conversation/App peer 协调写入应用层 conversation coordination journal；
+- framework tracked steer receipt 只提供实时生命周期信号，由应用 journal 选择需要持久化的
+  边界；
+- `coordination-index.json`、Todo 和 UI activity 都是可重建 projection；
+- EKO 使用文件或内存，不为这套协同引入 SQLite。
+
 ## 10. 实施边界
 
 ### 10.1 应用层
@@ -696,6 +1271,19 @@ EKO 应拥有：
 
 框架不应知道 EKO 的 workspace UI、review、worktree 合并策略、产品角色名称或可见性默认值。
 
+### 10.3 实现前分层结论与适配边界
+
+| 层              | 权威职责                                                                                                           | 禁止拥有                                                       |
+| --------------- | ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------- |
+| 通用 framework  | active-turn mailbox、tracked steer、通用 Agent/Subagent identity、消息 envelope、typed terminal、DAG/取消/超时原语 | EKO workspace/group、review policy、UI 字段、worktree 合并策略 |
+| EKO application | App/workspace 目录、durable message journal、boot reconciliation、TaskRuntime 关联、文件 ownership、surface 投影   | 第二套 ReAct loop、第二个 Task DAG、伪造 mailbox drain         |
+| 薄 adapter      | `AgentMessage -> framework input` 转换，注入 run/task/attempt metadata，把 receipt 写回 journal                    | ready frontier、重试主循环、完成 gate、独立状态机              |
+
+新增实现前必须全仓库搜索既有 `Agent::steer_input_tracked`、TaskRuntime journal、
+SubagentRegistry/Executor、ChatEventLog 和 conversation store。能扩展现有权威路径就不新增平行
+store/tool/executor。若 adapter 开始自行判断 ready frontier、重试或 turn terminal，说明边界
+已经放错，应停止实现并重新分层。
+
 ## 11. 验收标准
 
 ### 11.1 功能
@@ -710,7 +1298,7 @@ EKO 应拥有：
 
 ### 11.2 故障
 
-- 目标在 accepted、claimed、injected 任一阶段崩溃后可恢复；
+- 目标在 persisted、claimed、mailbox-accepted、drained 任一阶段崩溃后可恢复或明确结算；
 - 重复消息不产生重复执行；
 - 旧 attempt 的消息、结果和 interrupt 不能影响新 attempt；
 - 目标被删除或 workspace 切换时不会错投；
@@ -731,32 +1319,64 @@ EKO 应拥有：
 最终选择不是“所有 Agent 共享上下文”，也不是“所有任务永远并行”，而是：
 
 ```text
-独立 Thread
-  + App/账户级发现目录
-  + project/workspace/group 过滤
-  + bounded metadata inspection
-  + durable exact-address mailbox
-  + cursor-based event wait
-  + explicit message/control permissions
-  + worktree/file ownership isolation
-  + fan-out -> barrier -> fan-in scheduling
+App peer plane
+  = 独立 Root Thread
+  + App 目录/精确 threadId
+  + bounded inspect/follow-up/cursor wait
+
+Root tree plane
+  = 共享 AgentControl
+  + canonical AgentPath
+  + queue-only message / trigger-turn follow-up
+  + direct-parent completion / mailbox wait
+
+每个目标 Thread 内部
+  = receiver-owned start-or-steer admission
+  + safe-boundary drain
+  + typed turn terminal
+
+EKO 产品可靠性
+  = durable exact-address journal/receipt
+  + 唯一 TaskRun graph/Todo projection
+  + worktree/file ownership
+  + fan-out -> barrier -> fan-in
 ```
 
 Codex 的关键能力来自控制面与模型工具的组合，而不是某一个 `list_threads` 调用。EKO 应
 复用这个产品交互模型，但以自己的地址、消息、任务、权限和文件安全合同实现；不要复制
 Codex 的私有实现，也不要把 EKO 产品策略污染进通用框架。
 
+这套设计值得保留的核心不是工具名称，而是六条分离原则：
+
+1. **身份与执行分离**：Thread/Agent 可长期存在，turn 是一次执行；
+2. **地址与上下文分离**：精确寻址不等于共享 prompt；
+3. **接受与消费分离**：mailbox accepted 不等于 context drained；
+4. **消费与完成分离**：drained 不等于 turn 或业务成功；
+5. **消息与调度分离**：queue-only message 不擅自唤醒，follow-up 才表达新工作；
+6. **运行事实与 UI 分离**：事件/journal 是事实，“智能体已更新”和 Todo 都只是投影。
+
 ## 13. 参考资料与证据边界
 
 完整的当前会话工具入口、参数、触发门和 EKO 工具层参考见
 [Codex 工具能力目录](./0002-codex-tool-capability-catalog.md)。
 
-- [OpenAI Codex app-server](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md)：公开的 Thread/Turn/Item、JSON-RPC、生命周期和事件协议。
-- [OpenAI Codex exec events](https://github.com/openai/codex/blob/main/codex-rs/exec/src/exec_events.rs)：JSONL 事件类型和 `item/started` / `item/completed` / `turn/completed` 终态表达。
-- [OpenAI Codex multi-agents v2 handlers](https://github.com/openai/codex/tree/main/codex-rs/core/src/tools/handlers/multi_agents_v2)：任务内 Subagent 的 spawn、发现、消息、follow-up、等待和中断工具边界。
+- [OpenAI Codex app-server](https://github.com/openai/codex/blob/fde2156057c38c0227ce94c8514d04c7498df60d/codex-rs/app-server/README.md)：Thread/Turn/Item、JSON-RPC、生命周期和事件协议。
+- [App-server Thread protocol](https://github.com/openai/codex/blob/fde2156057c38c0227ce94c8514d04c7498df60d/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs)：`sessionId`、`parentThreadId`、status、source 和 `canAcceptDirectInput`。
+- [AgentControl](https://github.com/openai/codex/blob/fde2156057c38c0227ce94c8514d04c7498df60d/codex-rs/core/src/agent/control.rs) 与 [AgentRegistry](https://github.com/openai/codex/blob/fde2156057c38c0227ce94c8514d04c7498df60d/codex-rs/core/src/agent/registry.rs)：root-scoped 协作控制器、path/thread 索引、状态订阅和消息提交。
+- [MultiAgent V2 message tool](https://github.com/openai/codex/blob/fde2156057c38c0227ce94c8514d04c7498df60d/codex-rs/core/src/tools/handlers/multi_agents_v2/message_tool.rs)：`send_message`/`followup_task` 共用路径、root target 限制和 `trigger_turn` 差异。
+- [AgentPath](https://github.com/openai/codex/blob/fde2156057c38c0227ce94c8514d04c7498df60d/codex-rs/protocol/src/agent_path.rs)：canonical/relative path 解析和命名规则。
+- [InputQueue](https://github.com/openai/codex/blob/fde2156057c38c0227ce94c8514d04c7498df60d/codex-rs/core/src/session/input_queue.rs)、[turn input](https://github.com/openai/codex/blob/fde2156057c38c0227ce94c8514d04c7498df60d/codex-rs/core/src/session/turn_input.rs) 与 [TurnState](https://github.com/openai/codex/blob/fde2156057c38c0227ce94c8514d04c7498df60d/codex-rs/core/src/state/turn.rs)：mailbox、steer admission 和 CurrentTurn/NextTurn 边界。
+- [Subagent terminal forwarding](https://github.com/openai/codex/blob/fde2156057c38c0227ce94c8514d04c7498df60d/codex-rs/core/src/session/mod.rs)：每个 V2 child terminal turn 向 direct parent 回传有界结果。
+- [Direct-input policy](https://github.com/openai/codex/blob/fde2156057c38c0227ce94c8514d04c7498df60d/codex-rs/app-server/src/request_processors/turn_processor.rs)：V2 spawned Subagent 禁止 App 直接 turn input。
+- [Agent graph store](https://github.com/openai/codex/blob/fde2156057c38c0227ce94c8514d04c7498df60d/codex-rs/agent-graph-store/src/local.rs) 与 [spawn-edge migration](https://github.com/openai/codex/blob/fde2156057c38c0227ce94c8514d04c7498df60d/codex-rs/state/migrations/0021_thread_spawn_edges.sql)：持久父子拓扑。
+- [Codex exec events](https://github.com/openai/codex/blob/fde2156057c38c0227ce94c8514d04c7498df60d/codex-rs/exec/src/exec_events.rs)：JSONL 事件与终态表达。
 - [OpenAI Agents SDK multi-agent orchestration](https://github.com/openai/openai-agents-python/blob/main/docs/multi_agent.md)：manager/tool、handoff、代码编排和并行编排的公开对比。
 
 `codex_app__list_threads`、`codex_app__read_thread`、`codex_app__wait_threads`、
-`codex_app__send_message_to_thread` 等字段和触发语义来自 2026-08-24 当前 Codex Desktop
+`codex_app__send_message_to_thread` 等字段和触发语义来自 2026-08-25 当前 Codex Desktop
 工具 schema 与可见调用记录。它们是 App 行为观察，不应被当成公开、长期稳定的 API；如果
 未来 App schema 改变，应重新导出工具定义并更新本 ADR。
+
+OpenAI Docs 的 Codex 页面在本次复核环境中返回 HTTP 403；本文因此只引用可核验的当前
+工具 schema 和 OpenAI 官方开源仓库，不声称掌握 Desktop 私有 renderer、隐藏 prompt 或
+云端调度实现。
