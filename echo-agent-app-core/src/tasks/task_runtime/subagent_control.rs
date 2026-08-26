@@ -1085,6 +1085,56 @@ mod tests {
         AttendedMode, DomainProfile, ExecutionMode, PlanTask, TaskPlan, task_goal_sha256,
     };
 
+    struct SteerableSlowAgent;
+
+    impl echo_agent::agent::Agent for SteerableSlowAgent {
+        fn name(&self) -> &str {
+            "steerable-slow"
+        }
+
+        fn model_name(&self) -> &str {
+            "test"
+        }
+
+        fn system_prompt(&self) -> &str {
+            ""
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _task: &'a str,
+        ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<String>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn execute_stream<'a>(
+            &'a self,
+            _task: &'a str,
+        ) -> futures::future::BoxFuture<
+            'a,
+            echo_agent::error::Result<
+                futures::stream::BoxStream<
+                    'a,
+                    echo_agent::error::Result<echo_agent::agent::AgentEvent>,
+                >,
+            >,
+        > {
+            Box::pin(async {
+                Ok(Box::pin(futures::stream::pending()) as futures::stream::BoxStream<'a, _>)
+            })
+        }
+
+        fn steer_input(
+            &self,
+            expected_turn_id: Option<&str>,
+            _message: echo_agent::prelude::Message,
+        ) -> Result<String, echo_agent::agent::TurnSteerError> {
+            expected_turn_id
+                .map(str::to_string)
+                .ok_or(echo_agent::agent::TurnSteerError::NoActiveTurn)
+        }
+    }
+
     fn store_with_plan(run_id: &str, task_ids: &[&str]) -> Result<Arc<TaskRuntimeStore>, String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         store
@@ -1329,6 +1379,125 @@ mod tests {
                     .and_then(serde_json::Value::as_bool)
                     == Some(false)
         }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_message_receipt_stops_at_delivered_boundary() -> Result<(), String> {
+        use echo_agent::agent::CancellationToken;
+        use echo_agent::agent::subagent::{
+            DispatchRequest, ExecutionMode as FrameworkExecutionMode, SubagentDefinition,
+            SubagentStatus,
+        };
+
+        let store = store_with_plan("run-live-message", &["task-1"])?;
+        let registry = Arc::new(echo_agent::agent::subagent::SubagentRegistry::new());
+        registry
+            .register(
+                SubagentDefinition::new("slow", "Slow Subagent"),
+                Box::new(SteerableSlowAgent),
+            )
+            .await;
+        let executor = Arc::new(SubagentExecutor::new(
+            registry,
+            echo_agent::agent::subagent::SubagentExecutorConfig::default(),
+        ));
+        let execution_id = "run-live-message:task-1:1:1:claim-1";
+        let (_control_identity, framework_identity) =
+            attempt_identity("run-live-message", "task-1", execution_id, 1, 1)
+                .map_err(|error| error.to_string())?;
+        let _route = store
+            .record_controlled_subagent_assigned(
+                "run-live-message",
+                "task-1",
+                execution_id,
+                "slow",
+                "Slow Subagent",
+                1,
+                1,
+                true,
+                false,
+                executor.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+        let handle = executor
+            .dispatch_background_attempt(
+                DispatchRequest {
+                    agent_name: "slow".to_string(),
+                    task: "hold the active turn".to_string(),
+                    mode_override: Some(FrameworkExecutionMode::Sync),
+                    cancel: CancellationToken::new(),
+                    parent_agent: "parent".to_string(),
+                    parent_context: None,
+                    delegation_policy: DispatchRequest::policy_from_depth(0),
+                    runtime_context: None,
+                    message: None,
+                    prompt_payload: None,
+                    constraints: Vec::new(),
+                    background: false,
+                },
+                framework_identity,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let identity = SubagentControlIdentity {
+            run_id: "run-live-message".to_string(),
+            task_id: "task-1".to_string(),
+            execution_id: execution_id.to_string(),
+            plan_revision: 1,
+            attempt: 1,
+            command_id: "message-1".to_string(),
+        };
+        let service = SubagentControlService::new(store.clone());
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.send_message(
+                identity,
+                "continue with the active context",
+                SubagentControlActorSource::Gui,
+            ),
+        )
+        .await
+        .map_err(|_| "active Subagent message did not reach its safe point".to_string())?
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            receipt.status,
+            SubagentControlStatus::Delivered,
+            "active message receipt was {receipt:?}"
+        );
+        assert!(receipt.framework_turn_id.is_some());
+
+        let events = store
+            .list_events("run-live-message", 0)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::SubagentGuidanceQueued)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::SubagentGuidanceDelivered)
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_type != RuntimeEventKind::SubagentGuidanceRejected)
+        );
+
+        handle.cancel();
+        match handle.join().await {
+            Ok(result) => assert_eq!(result.outcome.status, SubagentStatus::Cancelled),
+            Err(echo_agent::error::ReactError::Agent(error))
+                if matches!(*error, echo_agent::error::AgentError::Cancelled(_)) => {}
+            Err(error) => return Err(format!("cancelled Subagent did not settle: {error}")),
+        }
         Ok(())
     }
 
