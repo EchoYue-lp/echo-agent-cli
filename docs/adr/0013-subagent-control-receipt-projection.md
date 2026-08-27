@@ -28,11 +28,23 @@ application never infers drain from rendered text, stream EOF, or foreground
 status. GUI/TUI/CLI/channel active steer calls use the tracked framework API and
 retain their existing FIFO fallback on rejection or terminal-before-drain.
 
-Cold Conversation Agent delivery remains conservative until the shared chat
-driver exposes its initial `TurnInputReceipt` to the AgentRouter adapter. The
-current cold path may only publish its existing `Injected`/`Delivered`
-compatibility projection after the driver terminal; it must not claim an early
-drain.
+Cold Conversation Agent delivery uses the same lifecycle boundaries through
+`AgentTurnDriver::with_input_receipt`. A thin optional observer is carried
+through the existing `drive_chat_turn -> drive_prepared_chat ->
+drive_chat_inner` path. The framework publishes `Accepted` immediately before
+calling the Agent stream API and `Drained` only after the concrete Agent has
+placed the input in model context. The AgentRouter writes its existing
+`Injected` compatibility fact only for that real drain; it never infers drain
+from output, EOF, or terminal settlement.
+
+`InjectionStarted` remains the application effect-started fact for an exact
+message attempt and turn. It is not renamed to mailbox acceptance. Framework
+`Accepted` is observed inside the typed receipt, while the compatibility
+AgentRouter journal persists `Injected` at the drain boundary. A terminal with
+`drained: false` is persisted once through the existing `Failed` event. A
+drained attempt remains `Injected` across restart until the owning foreground
+turn supplies its real terminal settlement, so recovery cannot reclaim or
+replay the input.
 
 ## Consequences
 
@@ -41,7 +53,8 @@ drain.
 - Existing event names and wire status remain replayable for old history.
 - New generated TypeScript types mirror the typed phase/outcome and event
   vocabulary.
-- Cold delivery parity is an explicit follow-up gate for the next F1 slice.
+- Live and cold delivery now share real accepted/drained/turn-settled receipt
+  boundaries while retaining the replayable compatibility event vocabulary.
 - `echo-website` is a static public site for framework/product guidance and has
   no Tauri TaskRun control contract; website synchronization is therefore not
   applicable to this app-internal receipt change.

@@ -1310,6 +1310,19 @@ fn render_agent_delivery_instruction(message: &crate::agent_router::AgentMessage
     )
 }
 
+fn cold_delivery_outcome_detail(
+    outcome: &Result<crate::chat_driver::TurnOutcome, String>,
+) -> String {
+    match outcome {
+        Ok(crate::chat_driver::TurnOutcome::Completed) => "turn completed".to_string(),
+        Ok(crate::chat_driver::TurnOutcome::Cancelled) => "turn was cancelled".to_string(),
+        Ok(crate::chat_driver::TurnOutcome::Failed(failure)) => {
+            format!("turn failed with {}: {}", failure.code, failure.message)
+        }
+        Err(error) => format!("chat driver failed: {error}"),
+    }
+}
+
 fn is_explicit_live_steer_rejection(error: &echo_agent::agent::TurnSteerError) -> bool {
     matches!(
         error,
@@ -4075,7 +4088,68 @@ impl AppState {
         self.agent_router
             .begin_injection(&claim, root_turn_id.clone())
             .await?;
-        let driver = crate::foreground_turn::drive_foreground_chat(lease, &agent, &turn, resources);
+        let (observation_tx, observation_rx) = tokio::sync::oneshot::channel();
+        let observation_tx = Arc::new(Mutex::new(Some(observation_tx)));
+        let router = Arc::clone(&self.agent_router);
+        let observed_claim = claim.clone();
+        let observed_turn_id = root_turn_id.clone();
+        let input_observer: crate::chat_driver::InputReceiptObserver = Arc::new(
+            move |mut receipt| {
+                let observation_tx = Arc::clone(&observation_tx);
+                let router = Arc::clone(&router);
+                let claim = observed_claim.clone();
+                let expected_turn_id = observed_turn_id.clone();
+                Box::pin(async move {
+                    let observation = if receipt.turn_id() != expected_turn_id {
+                        Err(format!(
+                            "cold Agent delivery receipt turn mismatch: expected {expected_turn_id}, got {}",
+                            receipt.turn_id()
+                        ))
+                    } else {
+                        let accepted = receipt.wait_for_accepted().await;
+                        let drained = match accepted {
+                            echo_agent::runtime::TurnInputState::Drained
+                            | echo_agent::runtime::TurnInputState::TurnSettled {
+                                drained: true,
+                                ..
+                            } => true,
+                            echo_agent::runtime::TurnInputState::Accepted => matches!(
+                                receipt.wait_for_drained().await,
+                                echo_agent::runtime::TurnInputState::Drained
+                                    | echo_agent::runtime::TurnInputState::TurnSettled {
+                                        drained: true,
+                                        ..
+                                    }
+                            ),
+                            echo_agent::runtime::TurnInputState::Pending
+                            | echo_agent::runtime::TurnInputState::TurnSettled {
+                                drained: false,
+                                ..
+                            } => false,
+                        };
+                        if drained {
+                            router
+                                .injected(&claim, expected_turn_id)
+                                .await
+                                .map(|_| true)
+                                .map_err(|error| error.to_string())
+                        } else {
+                            Ok(false)
+                        }
+                    };
+                    if let Some(sender) = observation_tx.lock().await.take() {
+                        let _ = sender.send(observation);
+                    }
+                })
+            },
+        );
+        let driver = crate::foreground_turn::drive_foreground_chat_with_input_observer(
+            lease,
+            &agent,
+            &turn,
+            resources,
+            input_observer,
+        );
         tokio::pin!(driver);
         let outcome = tokio::select! {
             biased;
@@ -4085,12 +4159,41 @@ impl AppState {
             }
             outcome = &mut driver => outcome,
         };
+        let input_drained = observation_rx.await.unwrap_or_else(|_| {
+            Err("cold Agent delivery input observer ended without a receipt".to_string())
+        });
         drop(execution);
+        let input_drained = match input_drained {
+            Ok(drained) => drained,
+            Err(error) => {
+                let outcome_detail = cold_delivery_outcome_detail(&outcome);
+                self.agent_router
+                    .failed(
+                        &claim,
+                        format!(
+                            "cold Agent delivery receipt projection failed: {error}; {outcome_detail}"
+                        ),
+                        false,
+                    )
+                    .await?;
+                return Ok(true);
+            }
+        };
+        if !input_drained {
+            let outcome_detail = cold_delivery_outcome_detail(&outcome);
+            self.agent_router
+                .failed(
+                    &claim,
+                    format!(
+                        "cold Agent delivery turn settled before its input reached model context; {outcome_detail}"
+                    ),
+                    false,
+                )
+                .await?;
+            return Ok(true);
+        }
         match outcome {
             Ok(crate::chat_driver::TurnOutcome::Completed) => {
-                self.agent_router
-                    .injected(&claim, root_turn_id.clone())
-                    .await?;
                 let reply_message_id = self
                     .queue_agent_delivery_reply(&claim.message, capture.final_answer())
                     .await;

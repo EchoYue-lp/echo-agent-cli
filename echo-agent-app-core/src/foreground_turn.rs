@@ -1233,6 +1233,33 @@ pub async fn drive_foreground_chat(
     result
 }
 
+/// Run a foreground turn while one application owner observes the framework's
+/// initial-input receipt. The callback is carried through the existing chat
+/// driver; foreground settlement remains owned by this function.
+pub(crate) async fn drive_foreground_chat_with_input_observer(
+    lease: ForegroundTurnLease,
+    agent: &AgentHandle,
+    turn: &PreparedUserTurn,
+    resources: Arc<ChatResources>,
+    input_observer: crate::chat_driver::InputReceiptObserver,
+) -> Result<TurnOutcome, String> {
+    let (result, settlement_outcome) =
+        run_foreground_chat_with(&lease, resources, |controlled_resources| async move {
+            crate::chat_driver::drive_chat_turn_with_input_observer(
+                agent,
+                turn,
+                controlled_resources,
+                None,
+                Some(input_observer),
+            )
+            .await
+            .map(|outcome| outcome.terminal)
+        })
+        .await;
+    lease.settle(settlement_outcome);
+    result
+}
+
 /// Resume or recover an existing TaskRun through the same foreground owner.
 pub async fn drive_foreground_chat_turn(
     lease: ForegroundTurnLease,

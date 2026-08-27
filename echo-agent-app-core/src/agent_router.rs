@@ -1265,6 +1265,73 @@ impl AgentRouter {
             .map_err(|error| AgentRouterError::Task(error.to_string()))?
     }
 
+    #[cfg(test)]
+    pub(crate) async fn event_phases_for_test(
+        &self,
+        target: &AgentAddress,
+        message_id: &str,
+    ) -> Result<Vec<&'static str>, AgentRouterError> {
+        target.validate()?;
+        let root = self.root.clone();
+        let inboxes = Arc::clone(&self.inboxes);
+        let target = target.clone();
+        let message_id = message_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let authority = authority_for(&root, &inboxes, &target)?;
+            let guard = authority
+                .state
+                .lock()
+                .map_err(|_| AgentRouterError::StateUnavailable)?;
+            let state = guard.as_ref().ok_or_else(|| AgentRouterError::Corrupt {
+                path: authority.directory.clone(),
+                message: "Agent inbox authority is closed".to_string(),
+            })?;
+            let mut after = 0;
+            let mut phases = Vec::new();
+            loop {
+                let records = state
+                    .journal
+                    .replay_after(after, 256)
+                    .map_err(|error| journal_error(&authority.directory, error))?;
+                if records.is_empty() {
+                    break;
+                }
+                for record in records {
+                    after = record.sequence;
+                    let (event_message_id, phase) = match record.event.as_ref() {
+                        AgentInboxEvent::Accepted { message, .. } => {
+                            (message.message_id.as_str(), "accepted")
+                        }
+                        AgentInboxEvent::Claimed { message_id, .. } => {
+                            (message_id.as_str(), "claimed")
+                        }
+                        AgentInboxEvent::InjectionStarted { message_id, .. } => {
+                            (message_id.as_str(), "injection_started")
+                        }
+                        AgentInboxEvent::Injected { message_id, .. } => {
+                            (message_id.as_str(), "injected")
+                        }
+                        AgentInboxEvent::Deferred { message_id, .. } => {
+                            (message_id.as_str(), "deferred")
+                        }
+                        AgentInboxEvent::Delivered { message_id, .. } => {
+                            (message_id.as_str(), "delivered")
+                        }
+                        AgentInboxEvent::Failed { message_id, .. } => {
+                            (message_id.as_str(), "failed")
+                        }
+                    };
+                    if event_message_id == message_id {
+                        phases.push(phase);
+                    }
+                }
+            }
+            Ok(phases)
+        })
+        .await
+        .map_err(|error| AgentRouterError::Task(error.to_string()))?
+    }
+
     async fn settle_claim(
         &self,
         claim: &AgentDeliveryClaim,

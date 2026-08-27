@@ -18,8 +18,17 @@ use echo_agent::agent::{Agent, AgentEvent, AgentHandle, EventEnvelope, EventIden
 use echo_agent::prelude::Message;
 use echo_agent::runtime::{AgentTurnDriver, EventSink, SinkControl, TurnMode, TurnRequest};
 use echo_agent::tools::TraceSinkFn;
+use futures::future::BoxFuture;
 
 pub use echo_agent::runtime::TurnOutcome;
+
+/// Optional application observer for the framework-owned initial-input
+/// receipt. The observer receives the pending receipt when the driver starts
+/// and waits on its typed Accepted/Drained/TurnSettled states; it does not
+/// inspect output envelopes.
+pub(crate) type InputReceiptObserver = std::sync::Arc<
+    dyn Fn(echo_agent::runtime::TurnInputReceipt) -> BoxFuture<'static, ()> + Send + Sync,
+>;
 
 use crate::tasks::task_runtime::executor::ExecEvent;
 #[cfg(test)]
@@ -400,10 +409,20 @@ pub async fn drive_chat_turn(
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: Option<RunTurnBinding>,
 ) -> Result<ChatTurnOutcome, String> {
+    drive_chat_turn_with_input_observer(agent, turn, res, binding, None).await
+}
+
+pub(crate) async fn drive_chat_turn_with_input_observer(
+    agent: &AgentHandle,
+    turn: &crate::prepared_turn::PreparedUserTurn,
+    res: std::sync::Arc<crate::chat_resources::ChatResources>,
+    binding: Option<RunTurnBinding>,
+    input_observer: Option<InputReceiptObserver>,
+) -> Result<ChatTurnOutcome, String> {
     wait_for_previous_continuation_driver(&res, binding.as_ref()).await?;
     match prepare_chat_execution(turn, res, binding).await? {
         ChatExecutionPreparation::Ready(prepared) => {
-            drive_prepared_chat(agent.clone(), turn, *prepared, None).await
+            drive_prepared_chat(agent.clone(), turn, *prepared, None, input_observer).await
         }
         ChatExecutionPreparation::Settled(outcome) => Ok(outcome),
     }
@@ -485,7 +504,7 @@ where
         prepared.reject_before_driver_start(&error).await?;
         return Err(error);
     }
-    drive_prepared_chat(agent, turn, *prepared, Some(execution)).await
+    drive_prepared_chat(agent, turn, *prepared, Some(execution), None).await
 }
 
 async fn wait_for_previous_continuation_driver(
@@ -908,6 +927,7 @@ async fn drive_prepared_chat(
     turn: &crate::prepared_turn::PreparedUserTurn,
     mut prepared: PreparedChatExecution,
     pool_execution: Option<crate::agent_pool::AgentPoolExecutionLease>,
+    input_observer: Option<InputReceiptObserver>,
 ) -> Result<ChatTurnOutcome, String> {
     let continuation_dispatch_owned = prepared.binding.transcript_visibility
         == TurnVisibility::Internal
@@ -952,6 +972,7 @@ async fn drive_prepared_chat(
         let owned_trace_sink = prepared.trace_sink.clone();
         let drives_task_run = prepared.drives_task_run;
         let foreground_progress = prepared.foreground_progress.clone();
+        let input_observer = input_observer.clone();
         let waiter = registration.start(move |mut receipt_owner| async move {
             let driver_execution_context = receipt_owner.execution_context_id();
             if let Some(generation) = owned_resources.memory_generation.as_ref() {
@@ -975,6 +996,7 @@ async fn drive_prepared_chat(
                 store,
                 driver_execution_context,
                 foreground_progress,
+                input_observer,
             })
             .await
         });
@@ -1002,6 +1024,7 @@ async fn drive_prepared_chat(
                     origin: prepared.binding.origin,
                     transcript_visibility: TurnVisibility::Visible,
                 },
+                input_observer,
             ),
         )
         .await
@@ -1083,6 +1106,7 @@ struct RegisteredTurnDriver {
     store: std::sync::Arc<crate::tasks::task_runtime::TaskRuntimeStore>,
     driver_execution_context: String,
     foreground_progress: Option<crate::foreground_turn::ForegroundTurnProgress>,
+    input_observer: Option<InputReceiptObserver>,
 }
 
 async fn drive_registered_turn(driver: RegisteredTurnDriver) -> Result<ChatTurnOutcome, String> {
@@ -1104,6 +1128,7 @@ async fn drive_registered_turn(driver: RegisteredTurnDriver) -> Result<ChatTurnO
                 origin: driver.binding.origin,
                 transcript_visibility: driver.binding.transcript_visibility,
             },
+            driver.input_observer,
         ),
     )
     .await;
@@ -1567,6 +1592,7 @@ async fn drive_chat_inner(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     scope: ChatTurnModelScope,
+    input_observer: Option<InputReceiptObserver>,
 ) -> Result<ChatTurnOutcome, String> {
     let ChatTurnModelScope {
         turn_id,
@@ -1694,7 +1720,14 @@ async fn drive_chat_inner(
             .mode(TurnMode::Execute)
             .cancel(cancel)
             .invocation(invocation);
-        let receipt = AgentTurnDriver.drive(&*guard, request, &eko_sink).await;
+        let receipt = if let Some(observer) = input_observer {
+            let (request, input_receipt) = request.with_input_receipt();
+            let driver = AgentTurnDriver.drive(&*guard, request, &eko_sink);
+            let (receipt, ()) = tokio::join!(driver, observer(input_receipt));
+            receipt
+        } else {
+            AgentTurnDriver.drive(&*guard, request, &eko_sink).await
+        };
         eko_sink.finish(turn_id, receipt.outcome)
     })
     .await
@@ -1996,6 +2029,7 @@ mod tests {
                 origin: crate::tasks::task_runtime::RunTurnOrigin::Continuation,
                 transcript_visibility: crate::tasks::task_runtime::TurnVisibility::Internal,
             },
+            None,
         )
         .await?;
         let TurnOutcome::Failed(failure) = &outcome.terminal else {
@@ -4815,12 +4849,34 @@ mod tests {
             human_loop_provider: None,
         });
 
-        let error = drive_chat(&agent, &make_turn("probe"), resources)
-            .await
-            .err()
-            .ok_or_else(|| "mismatched workspace scope was accepted".to_string())?;
+        let (observer_tx, observer_rx) = tokio::sync::oneshot::channel();
+        let observer_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(observer_tx)));
+        let input_observer: InputReceiptObserver = std::sync::Arc::new(move |_receipt| {
+            let observer_tx = std::sync::Arc::clone(&observer_tx);
+            Box::pin(async move {
+                if let Some(sender) = observer_tx.lock().await.take() {
+                    let _ = sender.send(());
+                }
+            })
+        });
+        let error = drive_chat_turn_with_input_observer(
+            &agent,
+            &make_turn("probe"),
+            resources,
+            None,
+            Some(input_observer),
+        )
+        .await
+        .err()
+        .ok_or_else(|| "mismatched workspace scope was accepted".to_string())?;
         if !error.contains("does not match TaskRuntime workspace") {
             return Err(format!("unexpected scope mismatch error: {error}"));
+        }
+        let observer = tokio::time::timeout(std::time::Duration::from_secs(1), observer_rx)
+            .await
+            .map_err(|_| "pre-driver observer sender did not close".to_string())?;
+        if observer.is_ok() {
+            return Err("pre-driver rejection invoked the input observer".to_string());
         }
         Ok(())
     }

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use echo_agent::agent::ReactAgentBuilder;
 use echo_agent::memory::NewConversation;
 use echo_agent::testing::MockLlmClient;
+use futures::future::BoxFuture;
 
 use super::AppState;
 use super::WorkspaceRegistry;
@@ -23,6 +24,95 @@ use crate::agent_handle::AgentHandle;
 use crate::workspace::WorkspaceKind;
 
 type Fixture = (tempfile::TempDir, Arc<AppState>);
+
+struct CheckpointReadBarrier {
+    inner: Arc<dyn echo_agent::state::RuntimeStateStore>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    fail: bool,
+}
+
+impl CheckpointReadBarrier {
+    fn new(inner: Arc<dyn echo_agent::state::RuntimeStateStore>, fail: bool) -> Self {
+        Self {
+            inner,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            fail,
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+impl echo_agent::state::RuntimeStateStore for CheckpointReadBarrier {
+    fn get_checkpoint<'a>(
+        &'a self,
+        conversation_id: &'a str,
+    ) -> BoxFuture<'a, echo_agent::error::Result<Option<echo_agent::state::AgentCheckpoint>>> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.release.notified().await;
+            if self.fail {
+                return Err(echo_agent::error::ReactError::Other(
+                    "checkpoint barrier rejected context restoration".to_string(),
+                ));
+            }
+            self.inner.get_checkpoint(conversation_id).await
+        })
+    }
+
+    fn save_checkpoint<'a>(
+        &'a self,
+        checkpoint: &'a echo_agent::state::AgentCheckpoint,
+    ) -> BoxFuture<'a, echo_agent::error::Result<()>> {
+        self.inner.save_checkpoint(checkpoint)
+    }
+
+    fn save_checkpoint_for_scope<'a>(
+        &'a self,
+        scope_id: &'a str,
+        checkpoint: &'a echo_agent::state::AgentCheckpoint,
+    ) -> BoxFuture<'a, echo_agent::error::Result<()>> {
+        self.inner.save_checkpoint_for_scope(scope_id, checkpoint)
+    }
+
+    fn runtime_state_ids<'a>(
+        &'a self,
+        scope_id: &'a str,
+    ) -> BoxFuture<'a, echo_agent::error::Result<Vec<String>>> {
+        self.inner.runtime_state_ids(scope_id)
+    }
+
+    fn clear_runtime_state<'a>(
+        &'a self,
+        scope_id: &'a str,
+        runtime_state_id: &'a str,
+    ) -> BoxFuture<'a, echo_agent::error::Result<echo_agent::state::RuntimeStateClearReceipt>> {
+        self.inner.clear_runtime_state(scope_id, runtime_state_id)
+    }
+
+    fn clear_runtime_state_scope<'a>(
+        &'a self,
+        scope_id: &'a str,
+    ) -> BoxFuture<'a, echo_agent::error::Result<echo_agent::state::RuntimeStateScopeClearReceipt>>
+    {
+        self.inner.clear_runtime_state_scope(scope_id)
+    }
+
+    fn clear_conversation<'a>(
+        &'a self,
+        conversation_id: &'a str,
+    ) -> BoxFuture<'a, echo_agent::error::Result<()>> {
+        self.inner.clear_conversation(conversation_id)
+    }
+}
 
 async fn isolated_app_state() -> anyhow::Result<Fixture> {
     let temp = tempfile::tempdir()?;
@@ -984,18 +1074,18 @@ async fn f0_idle_text_starts_a_cold_turn() -> anyhow::Result<()> {
             title: Some("F0 cold turn".to_string()),
         })
         .await?;
+    let target =
+        crate::agent_router::AgentAddress::new(target_workspace.id, "f0-cold-conversation");
     let pool = state
-        .connection
-        .pool
-        .clone()
+        .chat_runtime_for_agent(&target)
+        .await?
+        .pool()
         .ok_or_else(|| anyhow::anyhow!("fixture AgentPool is missing"))?;
     pool.set_llm_client_override_for_test(Arc::new(
         MockLlmClient::new().with_responses(["cold turn preflight", "cold turn answer"]),
     ))
     .await;
 
-    let target =
-        crate::agent_router::AgentAddress::new(target_workspace.id, "f0-cold-conversation");
     let message = f0_router_message(&target, "f0-idle-text", "start from idle");
     state.agent_router.enqueue(message.clone()).await?;
     assert!(
@@ -1020,6 +1110,273 @@ async fn f0_idle_text_starts_a_cold_turn() -> anyhow::Result<()> {
         Some(message.delivery_turn_id().as_str())
     );
     assert!(state.agent_router.pending(&target).await?.is_empty());
+    assert!(state.agent_router.in_flight_claim(&target).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn f1_cold_drain_is_durable_before_terminal_and_reopen_visible() -> anyhow::Result<()> {
+    let (temp, state) = isolated_app_state().await?;
+    let target_workspace = state.workspace.registry.create_at(
+        "f1-cold-drain-target",
+        WorkspaceKind::General,
+        temp.path().join("f1-cold-drain-target"),
+    )?;
+    let host = state
+        .workspace
+        .runtimes
+        .get_or_open(target_workspace.clone())
+        .await?;
+    host.resources()
+        .conversation_store()
+        .ensure_conversation(NewConversation {
+            conversation_id: "f1-cold-drain-conversation".to_string(),
+            user_id: "default".to_string(),
+            agent_type: None,
+            title: Some("F1 cold drain".to_string()),
+        })
+        .await?;
+    let target =
+        crate::agent_router::AgentAddress::new(target_workspace.id, "f1-cold-drain-conversation");
+    let pool = state
+        .chat_runtime_for_agent(&target)
+        .await?
+        .pool()
+        .ok_or_else(|| anyhow::anyhow!("fixture AgentPool is missing"))?;
+    pool.set_llm_client_override_for_test(Arc::new(
+        MockLlmClient::new()
+            .with_responses(["cold drain preflight", "cold drain answer"])
+            .with_delay(std::time::Duration::from_millis(200)),
+    ))
+    .await;
+
+    let message = f0_router_message(&target, "f1-cold-drain", "observe initial input");
+    state.agent_router.enqueue(message.clone()).await?;
+    let delivery_state = Arc::clone(&state);
+    let delivery_target = target.clone();
+    let delivery = tokio::spawn(async move {
+        delivery_state
+            .deliver_agent_message_cold(
+                &delivery_target,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+    });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let records = state.agent_router.records(&target).await?;
+        if records.first().is_some_and(|record| {
+            record.status == crate::agent_router::AgentDeliveryStatus::Injected
+        }) {
+            break;
+        }
+        if delivery.is_finished() {
+            anyhow::bail!(
+                "cold turn settled before the drain projection was observable; records={records:?}"
+            );
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("cold input did not reach the framework drain boundary");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        !delivery.is_finished(),
+        "Injected must be projected from input drain, before turn settlement"
+    );
+
+    // Reopen the same journal root while the original owner is live. This
+    // characterizes persisted visibility, not a simulated process restart.
+    let reopened = crate::agent_router::AgentRouter::new(temp.path().join("agent-router"));
+    let recovered = reopened
+        .in_flight_claim(&target)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("reopened router lost the drained attempt"))?;
+    assert_eq!(
+        recovered.status,
+        crate::agent_router::AgentDeliveryStatus::Injected
+    );
+    assert_eq!(recovered.claim.message.message_id, message.message_id);
+    assert_eq!(recovered.turn_id, message.delivery_turn_id());
+
+    let delivered = delivery.await??;
+    assert!(delivered);
+    let terminal = state
+        .agent_router
+        .records(&target)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("cold terminal record is missing"))?;
+    assert_eq!(
+        terminal.status,
+        crate::agent_router::AgentDeliveryStatus::Delivered
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn f1_cold_acceptance_waits_for_real_context_drain() -> anyhow::Result<()> {
+    let (temp, state) = isolated_app_state().await?;
+    let target_workspace = state.workspace.registry.create_at(
+        "f1-cold-barrier-target",
+        WorkspaceKind::General,
+        temp.path().join("f1-cold-barrier-target"),
+    )?;
+    let target =
+        crate::agent_router::AgentAddress::new(target_workspace.id, "f1-cold-barrier-conversation");
+    let runtime = state.chat_runtime_for_agent(&target).await?;
+    runtime
+        .ensure_conversation(NewConversation {
+            conversation_id: target.conversation_id.clone(),
+            user_id: "default".to_string(),
+            agent_type: None,
+            title: Some("F1 cold context barrier".to_string()),
+        })
+        .await?;
+    let state_store = runtime
+        .runtime_state_store()
+        .ok_or_else(|| anyhow::anyhow!("fixture RuntimeStateStore is missing"))?;
+    let barrier = Arc::new(CheckpointReadBarrier::new(state_store, false));
+    let pool = runtime
+        .pool()
+        .ok_or_else(|| anyhow::anyhow!("fixture AgentPool is missing"))?;
+    pool.apply_state_store(barrier.clone()).await;
+    pool.set_llm_client_override_for_test(Arc::new(
+        MockLlmClient::new().with_responses(["barrier preflight", "barrier answer"]),
+    ))
+    .await;
+
+    let message = f0_router_message(&target, "f1-cold-barrier", "wait for context");
+    state.agent_router.enqueue(message).await?;
+    let delivery_state = Arc::clone(&state);
+    let delivery_target = target.clone();
+    let delivery = tokio::spawn(async move {
+        delivery_state
+            .deliver_agent_message_cold(
+                &delivery_target,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        barrier.wait_until_entered(),
+    )
+    .await?;
+
+    let accepted = state
+        .agent_router
+        .records(&target)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("cold accepted record is missing"))?;
+    assert_eq!(
+        accepted.status,
+        crate::agent_router::AgentDeliveryStatus::InjectionStarted,
+        "AgentTurnDriver accepted the request before entering context restore, but the router must not project Injected yet"
+    );
+    barrier.release();
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(5), delivery).await???);
+    let terminal = state
+        .agent_router
+        .records(&target)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("cold barrier terminal is missing"))?;
+    assert_eq!(
+        terminal.status,
+        crate::agent_router::AgentDeliveryStatus::Delivered
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn f1_cold_terminal_before_drain_fails_without_injected_replay() -> anyhow::Result<()> {
+    let (temp, state) = isolated_app_state().await?;
+    let target_workspace = state.workspace.registry.create_at(
+        "f1-cold-reject-target",
+        WorkspaceKind::General,
+        temp.path().join("f1-cold-reject-target"),
+    )?;
+    let target =
+        crate::agent_router::AgentAddress::new(target_workspace.id, "f1-cold-reject-conversation");
+    let runtime = state.chat_runtime_for_agent(&target).await?;
+    runtime
+        .ensure_conversation(NewConversation {
+            conversation_id: target.conversation_id.clone(),
+            user_id: "default".to_string(),
+            agent_type: None,
+            title: Some("F1 cold rejected context".to_string()),
+        })
+        .await?;
+    let state_store = runtime
+        .runtime_state_store()
+        .ok_or_else(|| anyhow::anyhow!("fixture RuntimeStateStore is missing"))?;
+    let barrier = Arc::new(CheckpointReadBarrier::new(state_store, true));
+    runtime
+        .pool()
+        .ok_or_else(|| anyhow::anyhow!("fixture AgentPool is missing"))?
+        .apply_state_store(barrier.clone())
+        .await;
+
+    let message = f0_router_message(&target, "f1-cold-rejected", "reject context");
+    state.agent_router.enqueue(message).await?;
+    let delivery_state = Arc::clone(&state);
+    let delivery_target = target.clone();
+    let delivery = tokio::spawn(async move {
+        delivery_state
+            .deliver_agent_message_cold(
+                &delivery_target,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        barrier.wait_until_entered(),
+    )
+    .await?;
+    assert_eq!(
+        state
+            .agent_router
+            .records(&target)
+            .await?
+            .first()
+            .map(|record| record.status),
+        Some(crate::agent_router::AgentDeliveryStatus::InjectionStarted)
+    );
+    barrier.release();
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(5), delivery).await???);
+    let failed = state
+        .agent_router
+        .records(&target)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("cold rejection terminal is missing"))?;
+    assert_eq!(
+        failed.status,
+        crate::agent_router::AgentDeliveryStatus::Failed
+    );
+    assert!(failed.next_attempt_at.is_none());
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("before its input reached model context"))
+    );
+    assert_eq!(
+        state
+            .agent_router
+            .event_phases_for_test(&target, "f1-cold-rejected")
+            .await?,
+        ["accepted", "claimed", "injection_started", "failed"],
+        "terminal-before-drain must not append an Injected fact"
+    );
     assert!(state.agent_router.in_flight_claim(&target).await?.is_none());
     Ok(())
 }
