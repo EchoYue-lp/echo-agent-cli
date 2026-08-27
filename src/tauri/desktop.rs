@@ -332,6 +332,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         tracing::warn!(%error, "failed to bind plugin monitors to GUI scheduler");
     }
     let state = Arc::new(state_inner);
+    state.register_agent_control_tools().await;
     lifecycle.bind_app_state(state.clone());
     if let Some(store) = state.tasks.runtime.as_ref() {
         lifecycle.bind_task_runtime(store.clone());

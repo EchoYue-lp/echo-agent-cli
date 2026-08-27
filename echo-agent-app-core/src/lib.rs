@@ -1,3 +1,4 @@
+pub mod agent_control;
 pub mod agent_handle;
 pub mod agent_pool;
 pub mod agent_router;

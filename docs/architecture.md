@@ -49,6 +49,11 @@ Browser 和基础 Agent 资源。GUI 通过 `AppState` 持有这些资源；TUI�
 
 - `ForegroundTurnControl`：前台 turn admission、exact cancel 和 typed settlement。
 - `AgentRouter`：跨 workspace/conversation endpoint、durable inbox 和 Agent group。
+- `AgentControlService`：模型协作的薄 routing adapter。它只接受带 discriminator 的
+  `ConversationTarget` / `TaskSubagentTarget`，把 message/follow-up/wait/interrupt 分别
+  交给 AgentRouter、事件 journal 或 SubagentControlService；不拥有 mailbox、TaskRun
+  graph、重试循环或终态 reducer。六个 `agent_*` 工具由 `AppState` 在共享 ToolManager
+  上一次绑定，因而 GUI/TUI/CLI/channel 使用同一 schema、authority 和 fail-closed 校验。
 - `PluginRuntimeService`：Plugin 发现、候选 staging、runtime rewire 和偏好持久化。
 - `McpConfigRuntime`：用户 `mcp.json` 的唯一写入与连接 reconciliation。
 - `BrowserRuntime`：托管 Chromium/Chrome backend 与 browser event projection。

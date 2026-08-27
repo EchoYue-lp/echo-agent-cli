@@ -1,0 +1,53 @@
+# ADR 0015：统一模型 Agent 协作控制面
+
+## 背景
+
+Iteration 3 需要让模型直接发现、检查、消息协作、等待和中断 Agent，同时保持
+Conversation Agent 与 TaskRun 内 Subagent 的语义边界。仓库已经有 `AgentRouter` 的
+durable inbox、`SubagentControlService` 的 exact-attempt guidance/interrupt、以及
+`TaskRuntimeStore` 的事件 journal；再建 mailbox、store、执行器或状态 reducer 会制造
+第二事实源。
+
+参考依据包括本仓库已固定的一手实现对照：Claude Code 的 subagent/消息工具采用显式
+目标和 bounded 结果，OpenAI Codex app-server/exec 采用 Thread/Turn/Item 生命周期、事件
+游标和 wait/interrupt 控制；本阶段只采纳这些跨实现稳定语义，不依赖未公开实现细节。
+
+## 决策
+
+在 `echo-agent-app-core::agent_control` 增加一个薄 application adapter：
+
+- `ConversationTarget { workspace_id, conversation_id, workspace_generation? }` 只路由
+  `AgentRouter`；
+- `TaskSubagentTarget { run_id, task_id, plan_revision, execution_id, attempt,
+  workspace_generation? }` 只路由 `SubagentControlService`；
+- 注册 `agent_list`、`agent_inspect`、`agent_message`、`agent_followup`、`agent_wait`、
+  `agent_interrupt` 六个模型工具；既有 `agent_tool` 继续作为一次有界 dispatch，不新增
+  `agent_spawn`；
+- message/follow-up/interrupt 在进入 owner 前验证 discriminator、revision、attempt 和
+  workspace incarnation；不匹配时返回 typed fail-closed error；
+- `agent_wait` 只读取现有 router/task event cursor，返回 bounded event summaries，不能
+  代替 TaskRun/Subagent terminal authority；取消和超时是 wait 结果，不是任务终态；
+- Conversation message 以 `message_id` 复用 router exact-once 语义；TaskSubagent
+  command 以 `command_id` 复用 `SubagentControlService` durable receipt；
+- 工具通过 `AppState::register_agent_control_tools` 在共享 ToolManager 上注册，故
+  GUI/TUI/CLI/channel 与 pooled Agent 共用同一套 schema、router/registry authority，并
+  在 message 后复用 AppState 的既有 delivery supervisor wake。
+
+## 分层与取舍
+
+通用框架能力仍留在 `echo-agent`（tracked steer、Subagent executor、Tool trait）；EKO
+产品策略与 target discriminator 留在 application；adapter 只转换类型、注入 metadata、
+调用既有 service。没有新增 task graph mutation API，因此模型仍必须通过
+`task_update(base_revision)` 修改正式图。
+
+## 影响
+
+模型获得统一且有界的协作控制面；surface 不再需要各自解析 Agent 地址或实现第二套
+list/message/wait。Conversation 目录优先复用 AgentRouter 的持久化 `target.json` 清单，
+并合并当前进程已见目标；持久化 inbox 和目标发现仍由 AgentRouter 拥有，adapter 不新增
+第二 store。
+
+## 验证
+
+覆盖 target discriminator、exact-once message、cursor target binding、cancel/timeout
+wait，以及六工具 schema/注册；提交前按 `AGENTS.md` 执行 Rust workspace 门禁。

@@ -47,6 +47,7 @@ EKO 拥有文件投影、workspace、review、worktree、资源策略和各 surf
 | MCP            | 一份用户 `mcp.json`、真实 reconcile、scope-keyed health、plugin name ownership           | `McpConfigRuntime` + Extension control                 |
 | LSP            | 自动发现、诊断、定义、引用、hover、repo map、五入口控制与配置热重载                      | framework LSP tools + `ExtensionControlService`        |
 | Tool output    | summary/detail 分离、opaque detail ref、cursor page、文件/JSONL 恢复                     | `echo-agent-app-core/src/tool_execution_projection.rs` |
+| Agent 协作控制面 | discriminated Conversation/TaskSubagent target、bounded list/inspect/message/followup/wait/interrupt | `echo-agent-app-core/src/agent_control.rs` |
 | Hooks/Webhooks | 生命周期事件、command/Subagent/MCP actions、配置热重载                                   | `echo-agent-app-core/src/hook_config_loader.rs`        |
 | Plugins        | flat `plugin.json` package、Skills/MCP/Subagents/Hooks/LSP/monitors/themes/output styles | `echo-agent-app-core/src/plugin_runtime.rs`            |
 | Skills         | 递归发现、安装、启停、upstream staging sync 与 durable desired/settled generation        | `skills_hub/` + `extension_control.rs`                 |

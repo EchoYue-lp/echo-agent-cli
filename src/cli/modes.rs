@@ -751,6 +751,7 @@ pub async fn start_headless_services(
     let task_service = state.tasks.service.clone();
     let scheduler = state.scheduler.runner.clone();
     let app_state = std::sync::Arc::new(state);
+    app_state.register_agent_control_tools().await;
     lifecycle.bind_app_state(app_state.clone());
     match app_state
         .extension_control

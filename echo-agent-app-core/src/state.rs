@@ -3324,6 +3324,39 @@ impl AppState {
         Ok(receipt)
     }
 
+    /// Register the model Agent collaboration controls against this AppState's
+    /// shared router, workspace registry, and delivery supervisor. The
+    /// ToolManager is shared with pooled agents, so binding after pool setup
+    /// updates every surface without constructing a second authority.
+    pub async fn register_agent_control_tools(self: &Arc<Self>) {
+        let Some(task_runtime) = self.tasks.runtime.clone() else {
+            tracing::warn!("Agent control tools require a TaskRuntimeStore");
+            return;
+        };
+        let weak_state = Arc::downgrade(self);
+        let wake: crate::agent_control::DeliveryWake = Arc::new(move |target| {
+            let Some(state) = weak_state.upgrade() else {
+                return Err("AppState is no longer available".to_string());
+            };
+            state
+                .kick_agent_delivery(target)
+                .map_err(|error| error.to_string())
+        });
+        let service = Arc::new(
+            crate::agent_control::AgentControlService::new(
+                Arc::clone(&self.agent_router),
+                task_runtime,
+                Arc::clone(&self.workspace.registry),
+            )
+            .with_delivery_wake(wake),
+        );
+        crate::agent_control::register_agent_control_tools_on_agent(
+            &self.connection.primary_agent(),
+            service,
+        )
+        .await;
+    }
+
     async fn validate_agent_address(
         &self,
         address: &crate::agent_router::AgentAddress,

@@ -1,6 +1,6 @@
 # EKO 当前项目状态
 
-Last updated: 2026-08-26
+Last updated: 2026-08-28
 
 本文是跨会话恢复工作的简短事实源，只记录当前权威路径、未完成工作和下一步。
 已完成里程碑不在这里保留实施日志；长期有效能力见 [功能总览](./features.md)。
@@ -25,6 +25,7 @@ Last updated: 2026-08-26
 | foreground admission/cancel/settlement             | `echo-agent-app-core/src/foreground_turn.rs`     |
 | revisioned TaskRun graph 与文件投影                | `echo-agent-app-core/src/tasks/task_runtime/`    |
 | 跨 address 消息和 groups                           | `echo-agent-app-core/src/agent_router.rs`        |
+| 模型 Agent 协作控制面                              | `echo-agent-app-core/src/agent_control.rs`       |
 | boot recovery 与 unattended admission              | store-scoped reconciler + product owner split    |
 | Extension mutation admission                       | `extension_control.rs` + `extension_commands.rs` |
 | GUI IPC                                            | `src/tauri/commands/`                            |
@@ -45,6 +46,10 @@ Last updated: 2026-08-26
 - dynamic Provider/model/protocol/thinking profile。
 - workspace-qualified session/checkpoint/task/browser/control surface，JSONL mode/policy/attachment/HITL。
 - Workflow GUI 与统一 structured extraction 的 GUI/TUI/CLI/channel 生产入口。
+- Iteration 3 Agent control plane 已接入：六个模型 `agent_*` 工具共享薄 routing adapter，
+  Conversation/TaskSubagent target 分流、exact-once message、attempt/revision/generation
+  fail-closed 与 cursor wait 均复用既有 AgentRouter/SubagentControl/TaskRuntime authority；
+  `agent_tool` 仍是唯一一次性 Subagent dispatch 入口。
 - Public framework boundary：EKO 配置已由 app-core `EkoConfig` 独立拥有，permission mode 在
   app state/pool/framework 间全程 typed 且 DTO 八变体无损 round-trip；CLI/app-core 直接
   `echo_core` 依赖与源码引用均为 0。产品 data root、Theme/Monitor/OutputStyle、coding

@@ -204,6 +204,26 @@ impl AgentMessage {
         }
     }
 
+    /// Construct a model/runtime-authored text message. Unlike `user_text`,
+    /// this origin is rendered as inter-agent guidance and cannot be treated
+    /// as a direct user approval by the receiving Agent.
+    pub fn agent_text(
+        from: Option<AgentAddress>,
+        to: AgentAddress,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            message_id: uuid::Uuid::new_v4().to_string(),
+            from,
+            to,
+            payload: AgentMessagePayload::Text { text: text.into() },
+            correlation_id: None,
+            causation_id: None,
+            origin: AgentMessageOrigin::Agent,
+            created_at: Utc::now(),
+        }
+    }
+
     pub fn agent_reply(
         from: AgentAddress,
         to: AgentAddress,
@@ -988,6 +1008,103 @@ impl AgentRouter {
         &self.root
     }
 
+    /// Discover inbox targets from the router-owned target manifests.
+    ///
+    /// This is metadata discovery only: delivery phases and message history
+    /// remain in each target journal. The manifest lets a cold process expose
+    /// `agent_list` without creating a second address or status store.
+    pub async fn list_targets(&self) -> Result<Vec<AgentAddress>, AgentRouterError> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            let inbox_root = root.join("inboxes");
+            let workspaces = match std::fs::read_dir(&inbox_root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(source) => {
+                    return Err(AgentRouterError::Io {
+                        path: inbox_root,
+                        source,
+                    });
+                }
+            };
+            let mut targets = Vec::new();
+            for workspace_entry in workspaces {
+                let workspace_entry = workspace_entry.map_err(|source| AgentRouterError::Io {
+                    path: inbox_root.clone(),
+                    source,
+                })?;
+                let workspace_path = workspace_entry.path();
+                if !workspace_path.is_dir() {
+                    continue;
+                }
+                let conversations =
+                    std::fs::read_dir(&workspace_path).map_err(|source| AgentRouterError::Io {
+                        path: workspace_path.clone(),
+                        source,
+                    })?;
+                for conversation_entry in conversations {
+                    let conversation_entry =
+                        conversation_entry.map_err(|source| AgentRouterError::Io {
+                            path: workspace_path.clone(),
+                            source,
+                        })?;
+                    let manifest = conversation_entry.path().join("target.json");
+                    let bytes = match std::fs::read(&manifest) {
+                        Ok(bytes) => bytes,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(source) => {
+                            return Err(AgentRouterError::Io {
+                                path: manifest,
+                                source,
+                            });
+                        }
+                    };
+                    let target =
+                        serde_json::from_slice::<AgentAddress>(&bytes).map_err(|error| {
+                            AgentRouterError::Corrupt {
+                                path: manifest,
+                                message: error.to_string(),
+                            }
+                        })?;
+                    target.validate()?;
+                    targets.push(target);
+                }
+            }
+            targets.sort_by(|left, right| {
+                left.workspace_id
+                    .as_str()
+                    .cmp(right.workspace_id.as_str())
+                    .then_with(|| left.conversation_id.cmp(&right.conversation_id))
+            });
+            targets.dedup();
+            Ok(targets)
+        })
+        .await
+        .map_err(|error| AgentRouterError::Task(error.to_string()))?
+    }
+
+    /// Check whether an inbox target has a persisted manifest without opening
+    /// its journal. Read-only inspect/wait adapters use this to reject unknown
+    /// addresses instead of creating phantom inboxes as a side effect.
+    pub async fn target_exists(&self, target: &AgentAddress) -> Result<bool, AgentRouterError> {
+        target.validate()?;
+        let root = self.root.clone();
+        let target = target.clone();
+        tokio::task::spawn_blocking(move || {
+            let manifest = inbox_dir(&root, &target).join("target.json");
+            match std::fs::metadata(&manifest) {
+                Ok(metadata) => Ok(metadata.is_file()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(source) => Err(AgentRouterError::Io {
+                    path: manifest,
+                    source,
+                }),
+            }
+        })
+        .await
+        .map_err(|error| AgentRouterError::Task(error.to_string()))?
+    }
+
     pub fn begin_target_retirement(
         &self,
         target: AgentAddress,
@@ -1318,6 +1435,33 @@ impl AgentRouter {
             .map_err(|error| AgentRouterError::Task(error.to_string()))?
     }
 
+    /// Return the authoritative event cursor for one exact inbox target.
+    ///
+    /// The cursor is the journal sequence, not a derived delivery phase. It is
+    /// intentionally exposed as a read-only primitive so application adapters
+    /// can implement bounded wait without owning a second inbox or status
+    /// reducer.
+    pub async fn event_cursor(&self, target: &AgentAddress) -> Result<u64, AgentRouterError> {
+        target.validate()?;
+        let root = self.root.clone();
+        let inboxes = Arc::clone(&self.inboxes);
+        let target = target.clone();
+        tokio::task::spawn_blocking(move || {
+            let authority = authority_for(&root, &inboxes, &target)?;
+            let guard = authority
+                .state
+                .lock()
+                .map_err(|_| AgentRouterError::StateUnavailable)?;
+            let state = guard.as_ref().ok_or_else(|| AgentRouterError::Corrupt {
+                path: authority.directory.clone(),
+                message: "Agent inbox authority is closed".to_string(),
+            })?;
+            Ok(state.journal.last_sequence())
+        })
+        .await
+        .map_err(|error| AgentRouterError::Task(error.to_string()))?
+    }
+
     #[cfg(test)]
     pub(crate) async fn event_phases_for_test(
         &self,
@@ -1430,6 +1574,17 @@ impl AgentInboxAuthority {
         let directory = inbox.join("journal");
         let checkpoint_path = inbox.join("projection.checkpoint.json");
         let state = Self::open_state(&directory, &checkpoint_path, target)?;
+        let manifest = inbox.join("target.json");
+        let encoded = serde_json::to_vec(target).map_err(|error| AgentRouterError::Corrupt {
+            path: manifest.clone(),
+            message: error.to_string(),
+        })?;
+        echo_agent::utils::fs::atomic_write(&manifest, &encoded).map_err(|source| {
+            AgentRouterError::Io {
+                path: manifest,
+                source,
+            }
+        })?;
         Ok(Arc::new(Self {
             directory,
             checkpoint_path,
