@@ -703,7 +703,7 @@ impl TaskRuntimeStore {
             // Audit allowlist: queued guidance transfer folds the complete
             // durable command journal for one logical attempt.
             let events = self.list_events(&target.run_id, 0)?;
-            let states = command_states(&events);
+            let states = command_states(&events)?;
             let pending = events
                 .iter()
                 .filter(|event| {
@@ -909,8 +909,8 @@ fn existing_receipt(
     store: &TaskRuntimeStore,
     identity: &SubagentControlIdentity,
 ) -> Result<Option<SubagentControlReceipt>, StoreError> {
-    // Audit allowlist: command receipt replay must compare every event sharing
-    // the idempotency key and reject cross-identity reuse.
+    // Audit allowlist: command receipt replay compares every event sharing the
+    // idempotency key and rejects cross-identity reuse before folding state.
     let events = store.list_events(&identity.run_id, 0)?;
     let matches = events
         .iter()
@@ -922,80 +922,31 @@ fn existing_receipt(
                 == Some(identity.command_id.as_str())
         })
         .collect::<Vec<_>>();
-    let Some(first) = matches.first() else {
+    if matches.is_empty() {
         return Ok(None);
-    };
-    if first.task_id.as_deref() != Some(identity.task_id.as_str())
-        || payload_string(first, "execution_id").as_deref() != Some(identity.execution_id.as_str())
-        || payload_u64(first, "plan_revision") != Some(identity.plan_revision)
-        || payload_u64(first, "attempt") != Some(u64::from(identity.attempt))
-    {
-        return Err(StoreError::InvalidPlan(format!(
-            "Subagent command id {} is already bound to another identity",
-            identity.command_id
-        )));
     }
-    let Some(last) = matches.last() else {
-        return Ok(None);
-    };
-    let accepted = last
-        .payload
-        .get("accepted")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let phase = match last.event_type {
-        RuntimeEventKind::SubagentGuidanceMailboxAccepted => {
-            Some(SubagentControlPhase::MailboxAccepted)
-        }
-        RuntimeEventKind::SubagentGuidanceDrained => {
-            let drained = last
-                .payload
-                .get("drained")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            Some(if drained {
-                SubagentControlPhase::Drained
-            } else {
-                SubagentControlPhase::MailboxAccepted
-            })
-        }
-        RuntimeEventKind::SubagentGuidanceSettled => Some(SubagentControlPhase::TurnSettled),
-        RuntimeEventKind::SubagentGuidanceDelivered => Some(SubagentControlPhase::MailboxAccepted),
-        RuntimeEventKind::SubagentGuidanceRejected | RuntimeEventKind::SubagentInterruptSettled => {
-            Some(SubagentControlPhase::Persisted)
-        }
-        _ => None,
-    };
-    let status = match last.event_type {
-        RuntimeEventKind::SubagentGuidanceRejected => SubagentControlStatus::Rejected,
-        RuntimeEventKind::SubagentInterruptSettled if accepted => SubagentControlStatus::Settled,
-        RuntimeEventKind::SubagentInterruptSettled => SubagentControlStatus::Rejected,
-        RuntimeEventKind::SubagentGuidanceSettled => SubagentControlStatus::Settled,
-        RuntimeEventKind::SubagentGuidanceMailboxAccepted
-        | RuntimeEventKind::SubagentGuidanceDrained
-        | RuntimeEventKind::SubagentGuidanceDelivered => SubagentControlStatus::Delivered,
-        _ => SubagentControlStatus::Pending,
-    };
+    let mut projection = None;
+    let mut bound_execution_id = identity.execution_id.clone();
+    for event in matches {
+        validate_command_event_identity(event, identity, &mut bound_execution_id)?;
+        projection = fold_command_event(projection, event);
+    }
+    let projection = projection.unwrap_or_default();
     Ok(Some(SubagentControlReceipt {
         identity: identity.clone(),
-        status,
-        phase: phase.unwrap_or(SubagentControlPhase::Persisted),
-        outcome: payload_string(last, "outcome")
-            .as_deref()
-            .and_then(SubagentControlOutcome::parse),
-        drained: last
-            .payload
-            .get("drained")
-            .and_then(serde_json::Value::as_bool),
-        detail: payload_string(last, "reason").or_else(|| payload_string(last, "terminal_status")),
-        framework_turn_id: payload_string(last, "framework_turn_id"),
+        status: projection.status,
+        phase: projection.phase,
+        outcome: projection.outcome,
+        drained: projection.drained,
+        detail: projection.detail,
+        framework_turn_id: projection.framework_turn_id,
     }))
 }
 
 fn command_states(
     events: &[super::types::RuntimeTaskEvent],
-) -> HashMap<String, SubagentControlStatus> {
-    let mut states = HashMap::new();
+) -> Result<HashMap<String, SubagentControlStatus>, StoreError> {
+    let mut projections = HashMap::<String, CommandFoldState>::new();
     for event in events {
         let Some(command_id) = event
             .payload
@@ -1004,20 +955,205 @@ fn command_states(
         else {
             continue;
         };
-        let status = match event.event_type {
-            RuntimeEventKind::SubagentGuidanceQueued
-            | RuntimeEventKind::SubagentInterruptRequested => SubagentControlStatus::Pending,
-            RuntimeEventKind::SubagentGuidanceDelivered => SubagentControlStatus::Delivered,
-            RuntimeEventKind::SubagentGuidanceMailboxAccepted
-            | RuntimeEventKind::SubagentGuidanceDrained => SubagentControlStatus::Delivered,
-            RuntimeEventKind::SubagentGuidanceSettled => SubagentControlStatus::Settled,
-            RuntimeEventKind::SubagentGuidanceRejected => SubagentControlStatus::Rejected,
-            RuntimeEventKind::SubagentInterruptSettled => SubagentControlStatus::Settled,
-            _ => continue,
+        let mut state = match projections.remove(command_id) {
+            Some(state) => state,
+            None => CommandFoldState::from_event(event, command_id)?,
         };
-        states.insert(command_id.to_string(), status);
+        validate_command_event_identity(event, &state.identity, &mut state.bound_execution_id)?;
+        if let Some(projection) = fold_command_event(Some(state.projection), event) {
+            state.projection = projection;
+            projections.insert(command_id.to_string(), state);
+        }
     }
-    states
+    Ok(projections
+        .into_iter()
+        .map(|(command_id, state)| (command_id, state.projection.status))
+        .collect())
+}
+
+struct CommandFoldState {
+    identity: SubagentControlIdentity,
+    bound_execution_id: String,
+    projection: CommandProjection,
+}
+
+impl CommandFoldState {
+    fn from_event(
+        event: &super::types::RuntimeTaskEvent,
+        command_id: &str,
+    ) -> Result<Self, StoreError> {
+        let task_id = event.task_id.clone().ok_or_else(|| {
+            StoreError::InvalidPlan(format!(
+                "Subagent command id {command_id} is missing its task identity"
+            ))
+        })?;
+        let execution_id = payload_string(event, "execution_id").ok_or_else(|| {
+            StoreError::InvalidPlan(format!(
+                "Subagent command id {command_id} is missing its execution identity"
+            ))
+        })?;
+        let plan_revision = payload_u64(event, "plan_revision").ok_or_else(|| {
+            StoreError::InvalidPlan(format!(
+                "Subagent command id {command_id} is missing its plan revision"
+            ))
+        })?;
+        let attempt = payload_u64(event, "attempt")
+            .and_then(|attempt| u32::try_from(attempt).ok())
+            .ok_or_else(|| {
+                StoreError::InvalidPlan(format!(
+                    "Subagent command id {command_id} has an invalid attempt"
+                ))
+            })?;
+        Ok(Self {
+            identity: SubagentControlIdentity {
+                run_id: event.run_id.clone(),
+                task_id,
+                execution_id: execution_id.clone(),
+                plan_revision,
+                attempt,
+                command_id: command_id.to_string(),
+            },
+            bound_execution_id: execution_id,
+            projection: CommandProjection::default(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CommandProjection {
+    status: SubagentControlStatus,
+    phase: SubagentControlPhase,
+    outcome: Option<SubagentControlOutcome>,
+    drained: Option<bool>,
+    detail: Option<String>,
+    framework_turn_id: Option<String>,
+}
+
+impl Default for CommandProjection {
+    fn default() -> Self {
+        Self {
+            status: SubagentControlStatus::Pending,
+            phase: SubagentControlPhase::Persisted,
+            outcome: None,
+            drained: None,
+            detail: None,
+            framework_turn_id: None,
+        }
+    }
+}
+
+fn fold_command_event(
+    current: Option<CommandProjection>,
+    event: &super::types::RuntimeTaskEvent,
+) -> Option<CommandProjection> {
+    if !matches!(
+        event.event_type,
+        RuntimeEventKind::SubagentGuidanceQueued
+            | RuntimeEventKind::SubagentGuidanceDelivered
+            | RuntimeEventKind::SubagentGuidanceMailboxAccepted
+            | RuntimeEventKind::SubagentGuidanceDrained
+            | RuntimeEventKind::SubagentGuidanceSettled
+            | RuntimeEventKind::SubagentGuidanceRejected
+            | RuntimeEventKind::SubagentInterruptRequested
+            | RuntimeEventKind::SubagentInterruptSettled
+    ) {
+        return current;
+    }
+    let mut projection = current.unwrap_or_default();
+    match event.event_type {
+        RuntimeEventKind::SubagentGuidanceQueued | RuntimeEventKind::SubagentInterruptRequested => {
+            projection = CommandProjection::default();
+        }
+        RuntimeEventKind::SubagentGuidanceDelivered
+        | RuntimeEventKind::SubagentGuidanceMailboxAccepted => {
+            projection.status = SubagentControlStatus::Delivered;
+            projection.phase = SubagentControlPhase::MailboxAccepted;
+        }
+        RuntimeEventKind::SubagentGuidanceDrained => {
+            let drained = payload_bool(event, "drained").unwrap_or(false);
+            projection.status = SubagentControlStatus::Delivered;
+            projection.phase = if drained {
+                SubagentControlPhase::Drained
+            } else {
+                SubagentControlPhase::MailboxAccepted
+            };
+            projection.drained = Some(drained);
+        }
+        RuntimeEventKind::SubagentGuidanceSettled => {
+            projection.status = SubagentControlStatus::Settled;
+            projection.phase = SubagentControlPhase::TurnSettled;
+            projection.outcome = payload_string(event, "outcome")
+                .as_deref()
+                .and_then(SubagentControlOutcome::parse);
+            projection.drained = payload_bool(event, "drained");
+        }
+        RuntimeEventKind::SubagentGuidanceRejected => {
+            projection.status = SubagentControlStatus::Rejected;
+            projection.phase = SubagentControlPhase::Persisted;
+            projection.detail = payload_string(event, "reason");
+        }
+        RuntimeEventKind::SubagentInterruptSettled => {
+            let accepted = payload_bool(event, "accepted").unwrap_or(true);
+            projection.status = if accepted {
+                SubagentControlStatus::Settled
+            } else {
+                SubagentControlStatus::Rejected
+            };
+            projection.phase = if accepted {
+                SubagentControlPhase::TurnSettled
+            } else {
+                SubagentControlPhase::Persisted
+            };
+            projection.outcome = payload_string(event, "terminal_status")
+                .as_deref()
+                .and_then(SubagentControlOutcome::parse);
+            projection.detail = payload_string(event, "reason")
+                .or_else(|| payload_string(event, "terminal_status"));
+        }
+        _ => return Some(projection),
+    }
+    if let Some(turn_id) = payload_string(event, "framework_turn_id") {
+        projection.framework_turn_id = Some(turn_id);
+    }
+    Some(projection)
+}
+
+fn validate_command_event_identity(
+    event: &super::types::RuntimeTaskEvent,
+    identity: &SubagentControlIdentity,
+    bound_execution_id: &mut String,
+) -> Result<(), StoreError> {
+    let event_execution_id = payload_string(event, "execution_id");
+    let stable_identity_matches = event.run_id == identity.run_id
+        && payload_string(event, "run_id").as_deref() == Some(identity.run_id.as_str())
+        && event.task_id.as_deref() == Some(identity.task_id.as_str())
+        && payload_u64(event, "plan_revision") == Some(identity.plan_revision)
+        && payload_u64(event, "attempt") == Some(u64::from(identity.attempt))
+        && event_execution_id.as_deref() == event.step_id.as_deref();
+    let exact_execution_matches =
+        event_execution_id.as_deref() == Some(bound_execution_id.as_str());
+    let next_attempt_handoff = event.event_type == RuntimeEventKind::SubagentGuidanceDelivered
+        && event
+            .payload
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            == Some(SubagentGuidanceKind::NextAttempt.as_str())
+        && event_execution_id.as_deref()
+            == event
+                .payload
+                .get("target_execution_id")
+                .and_then(serde_json::Value::as_str);
+    if stable_identity_matches && (exact_execution_matches || next_attempt_handoff) {
+        if next_attempt_handoff && let Some(execution_id) = event_execution_id {
+            *bound_execution_id = execution_id;
+        }
+        Ok(())
+    } else {
+        Err(StoreError::InvalidPlan(format!(
+            "Subagent command id {} is already bound to another identity",
+            identity.command_id
+        )))
+    }
 }
 
 fn append_guidance_event(
@@ -1159,6 +1295,10 @@ fn payload_string(event: &super::types::RuntimeTaskEvent, key: &str) -> Option<S
 
 fn payload_u64(event: &super::types::RuntimeTaskEvent, key: &str) -> Option<u64> {
     event.payload.get(key).and_then(serde_json::Value::as_u64)
+}
+
+fn payload_bool(event: &super::types::RuntimeTaskEvent, key: &str) -> Option<bool> {
+    event.payload.get(key).and_then(serde_json::Value::as_bool)
 }
 
 fn pending_receipt(identity: SubagentControlIdentity) -> SubagentControlReceipt {
@@ -1476,12 +1616,98 @@ mod tests {
     }
 
     #[test]
+    fn replay_rejects_a_later_event_that_rebinds_command_identity() -> Result<(), String> {
+        let store = store_with_plan("run-event-rebind", &["task-1", "task-2"])?;
+        let original = identity("run-event-rebind", "task-1", 1, "command-1");
+        let rebound = identity("run-event-rebind", "task-2", 1, "command-1");
+        store
+            .commit_runtime_events(
+                &original.run_id,
+                vec![
+                    guidance_event(
+                        &original,
+                        RuntimeEventKind::SubagentGuidanceQueued,
+                        SubagentGuidanceKind::LiveMessage,
+                        SubagentControlActorSource::Cli,
+                        Some("first"),
+                        serde_json::json!({}),
+                    ),
+                    guidance_event(
+                        &rebound,
+                        RuntimeEventKind::SubagentGuidanceDelivered,
+                        SubagentGuidanceKind::LiveMessage,
+                        SubagentControlActorSource::Cli,
+                        None,
+                        serde_json::json!({ "framework_turn_id": "turn-2" }),
+                    ),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let error = existing_receipt(&store, &original)
+            .err()
+            .ok_or_else(|| "later command identity rebind was accepted".to_string())?;
+        assert!(error.to_string().contains("already bound"));
+        let events = store
+            .list_events(&original.run_id, 0)
+            .map_err(|error| error.to_string())?;
+        let error = command_states(&events)
+            .err()
+            .ok_or_else(|| "pending-command fold accepted a rebound identity".to_string())?;
+        assert!(error.to_string().contains("already bound"));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_delivered_fixture_uses_the_canonical_projection() -> Result<(), String> {
+        let store = store_with_plan("run-legacy-delivered", &["task-1"])?;
+        let identity = identity("run-legacy-delivered", "task-1", 1, "command-1");
+        store
+            .commit_runtime_events(
+                &identity.run_id,
+                vec![
+                    guidance_event(
+                        &identity,
+                        RuntimeEventKind::SubagentGuidanceQueued,
+                        SubagentGuidanceKind::LiveMessage,
+                        SubagentControlActorSource::Cli,
+                        Some("legacy guidance"),
+                        serde_json::json!({}),
+                    ),
+                    guidance_event(
+                        &identity,
+                        RuntimeEventKind::SubagentGuidanceDelivered,
+                        SubagentGuidanceKind::LiveMessage,
+                        SubagentControlActorSource::Cli,
+                        None,
+                        serde_json::json!({ "framework_turn_id": "legacy-turn" }),
+                    ),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let events = store
+            .list_events(&identity.run_id, 0)
+            .map_err(|error| error.to_string())?;
+        let states = command_states(&events).map_err(|error| error.to_string())?;
+        let replay = existing_receipt(&store, &identity)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "legacy receipt replay was missing".to_string())?;
+        assert_eq!(states.get(&identity.command_id), Some(&replay.status));
+        assert_eq!(replay.status, SubagentControlStatus::Delivered);
+        assert_eq!(replay.phase, SubagentControlPhase::MailboxAccepted);
+        assert_eq!(replay.framework_turn_id.as_deref(), Some("legacy-turn"));
+        assert_eq!(replay.outcome, None);
+        assert_eq!(replay.drained, None);
+        Ok(())
+    }
+
+    #[test]
     fn queued_guidance_transfers_once_to_exact_framework_attempt() -> Result<(), String> {
         let store = store_with_plan("run-delivery", &["task-1"])?;
         let service = SubagentControlService::new(store.clone());
+        let queued_identity = identity("run-delivery", "task-1", 1, "command-1");
         service
             .queue_guidance(
-                identity("run-delivery", "task-1", 1, "command-1"),
+                queued_identity.clone(),
                 "inspect the latest diff",
                 SubagentControlActorSource::Tui,
             )
@@ -1517,6 +1743,15 @@ mod tests {
                 .count(),
             1
         );
+        let replay = service
+            .queue_guidance(
+                queued_identity,
+                "inspect the latest diff",
+                SubagentControlActorSource::Tui,
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(replay.status, SubagentControlStatus::Delivered);
+        assert_eq!(replay.phase, SubagentControlPhase::MailboxAccepted);
         Ok(())
     }
 
@@ -1543,13 +1778,25 @@ mod tests {
             .interrupt_subagent(
                 SubagentControlIdentity {
                     command_id: "interrupt-1".to_string(),
-                    ..target
+                    ..target.clone()
                 },
                 SubagentControlActorSource::Channel,
             )
             .await
             .map_err(|error| error.to_string())?;
         assert_eq!(interrupt.status, SubagentControlStatus::Rejected);
+        let rejected_replay = service
+            .interrupt_subagent(
+                SubagentControlIdentity {
+                    command_id: "interrupt-1".to_string(),
+                    ..target.clone()
+                },
+                SubagentControlActorSource::Channel,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(rejected_replay.status, SubagentControlStatus::Rejected);
+        assert_eq!(rejected_replay.phase, SubagentControlPhase::Persisted);
         assert_eq!(
             last_frame_event_types(&store, "run-late")?,
             ["subagent_interrupt_requested", "subagent_interrupt_settled"]
@@ -1557,6 +1804,12 @@ mod tests {
         let events = store
             .list_events("run-late", 0)
             .map_err(|error| error.to_string())?;
+        assert_eq!(
+            command_states(&events)
+                .map_err(|error| error.to_string())?
+                .get("interrupt-1"),
+            Some(&SubagentControlStatus::Rejected)
+        );
         assert!(
             events
                 .iter()
@@ -1742,6 +1995,16 @@ mod tests {
         assert_eq!(replay.phase, SubagentControlPhase::TurnSettled);
         assert_eq!(replay.outcome, Some(SubagentControlOutcome::Completed));
         assert_eq!(replay.drained, Some(true));
+        let states = command_states(
+            &store
+                .list_events("run-live-message", 0)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            states.get("message-1"),
+            Some(&SubagentControlStatus::Settled)
+        );
         Ok(())
     }
 
