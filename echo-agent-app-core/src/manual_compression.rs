@@ -108,10 +108,17 @@ impl AppState {
             Ok(execution) => execution,
             Err(error) => {
                 let detail = error.to_string();
-                lease.settle(TurnOutcome::Failed(AgentFailure::message(
-                    "agent_pool",
-                    detail,
-                )));
+                lease
+                    .settle_after_observers(TurnOutcome::Failed(AgentFailure::message(
+                        "agent_pool",
+                        detail.clone(),
+                    )))
+                    .await
+                    .map_err(|settlement| {
+                        ManualCompressionError::Compression(format!(
+                            "{detail}; foreground settlement failed: {settlement}"
+                        ))
+                    })?;
                 return Err(error.into());
             }
         };
@@ -125,7 +132,7 @@ impl AppState {
         self.session
             .foreground_turns
             .supervise(lease, move |lease| async move {
-                let result = start_manual_compression_owned(
+                let mut result = start_manual_compression_owned(
                     product_data_io,
                     chat_events,
                     workspace_id,
@@ -140,13 +147,17 @@ impl AppState {
                 )
                 .await;
                 drop(execution);
-                match &result {
-                    Ok(_) => lease.settle(TurnOutcome::Completed),
-                    Err(error) => lease.settle(TurnOutcome::Failed(AgentFailure::message(
-                        error.code(),
-                        error.to_string(),
-                    ))),
+                let outcome = match &result {
+                    Ok(_) => TurnOutcome::Completed,
+                    Err(error) => {
+                        TurnOutcome::Failed(AgentFailure::message(error.code(), error.to_string()))
+                    }
                 };
+                if let Err(error) = lease.settle_after_observers(outcome).await {
+                    result = Err(ManualCompressionError::Compression(format!(
+                        "foreground settlement failed: {error}"
+                    )));
+                }
                 let _delivered = result_tx.send(result);
             })
             .map_err(|error| {

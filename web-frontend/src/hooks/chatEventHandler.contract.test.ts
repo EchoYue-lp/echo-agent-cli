@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import fixtureText from '../fixtures/chat-event-envelope-v4.json?raw';
 import { useChatStore } from '../stores/chatStore';
 import type { ChatEventEnvelope } from '../types/api';
@@ -19,6 +19,26 @@ describe('canonical chat event v4 contract', () => {
   beforeEach(() => {
     useChatStore.getState().clearMessages();
     resetChatEventCursorsForTest();
+  });
+
+  it('treats InputLifecycle as a Frontier refresh signal only', () => {
+    const base = fixture[0];
+    if (!base) throw new Error('contract fixture is incomplete');
+    const envelope = {
+      ...base,
+      workspace_id: 'workspace-input',
+      conversation_id: 'conversation-input',
+      payload: {
+        source: 'input_lifecycle',
+        event: { phase: 'persisted' },
+      },
+    } as ChatEventEnvelope;
+    const refresh = vi.fn();
+
+    handleChatEventEnvelope(envelope, { ...context(), onInputLifecycle: refresh });
+
+    expect(refresh).toHaveBeenCalledWith('workspace-input', 'conversation-input');
+    expect(useChatStore.getState().messages).toEqual([]);
   });
 
   it('preserves effective invocation and the complete typed tool result through the reducer', () => {

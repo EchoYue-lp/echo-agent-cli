@@ -11,12 +11,21 @@ import { useToastStore } from '../stores/toastStore';
 import { useToolExecutionStore } from '../stores/toolExecutionStore';
 import { useWorkspaceStore } from '../stores/workspaceStore';
 import { isTauri, apiInvoke, errorMessage } from '../lib/tauri-bridge';
-import { viewAddress, viewAddressKey, workspaceIdForView } from '../lib/viewAddress';
+import { workspaceIdForView } from '../lib/viewAddress';
 import { handleChatEventEnvelope } from './chatEventHandler';
 import { ChatEventSequencer } from './chatEventSequencer';
 import { reorderById } from './queuedChat';
-import type { ChatSteerReceipt, ForegroundTurnSnapshot } from '../generated';
-import type { Attachment, ChatEventEnvelope, ChatEventReplay, ToolExecution } from '../types/api';
+import type { ForegroundTurnSnapshot } from '../generated';
+import type {
+  Attachment,
+  ChatEventEnvelope,
+  ChatEventReplay,
+  ConversationInputFrontier,
+  ConversationInputIdentity,
+  ConversationInputProjection,
+  ConversationInputReceipt,
+  ToolExecution,
+} from '../types/api';
 
 export type QueuedChatInput = {
   id: string;
@@ -24,7 +33,7 @@ export type QueuedChatInput = {
   attachments?: Attachment[];
   workspaceId: string;
   conversationId: string;
-  backendManaged?: boolean;
+  identity: ConversationInputIdentity;
 };
 
 type SendChatResult = {
@@ -39,26 +48,18 @@ type SendChatResult = {
   new_message?: string;
 };
 
-type QueuedChatInputWire = {
-  input_id: string;
-  workspace_id: string;
-  conversation_id: string;
-  text: string;
-  attachments: Attachment[];
-  submitted_at_ms: number;
-};
-
 type CancelChatResponse = {
   success: boolean;
   turn_id: string;
   status: 'completed' | 'cancelled' | 'failed' | 'already_settled';
 };
 
-// The queue is a projection keyed by exact address. Keeping the buckets above
-// the hook preserves accepted local fallbacks across ChatPanel remounts while
-// the backend-managed entries are reconciled from their durable receipts.
-const queuedInputBuckets = new Map<string, QueuedChatInput[]>();
-const queuedDispatches = new Set<string>();
+const EMPTY_FRONTIER: ConversationInputFrontier = { queue_revision: 0, items: [] };
+
+type QueuedDispatch = {
+  identity: ConversationInputIdentity;
+  queueRevision: number;
+};
 
 function chatStreamId(workspaceId: string, conversationId?: string, messageKey?: string): string {
   return JSON.stringify([workspaceId, conversationId ?? messageKey ?? '']);
@@ -79,21 +80,23 @@ export function useTauriChat() {
   const previousNewConversationEpochRef = useRef(newConversationEpoch);
   const thinkingIdRef = useRef<string | null>(null);
   const eventSequencerRef = useRef(new ChatEventSequencer());
-  const queuedInputsByAddressRef = useRef(queuedInputBuckets);
-  const visibleQueueKeyRef = useRef<string | null>(
-    activeConversationId
-      ? viewAddressKey(viewAddress(currentWorkspaceId, activeConversationId))
-      : null
-  );
+  const frontierRef = useRef<ConversationInputFrontier>(EMPTY_FRONTIER);
+  const frontierRequestOrdinalRef = useRef(0);
+  const frontierAppliedOrdinalRef = useRef(0);
+  const dispatchingInputIdRef = useRef<string | null>(null);
   const pendingAdmissionRef = useRef<{
     messageKey: string;
     events: ChatEventEnvelope[];
   } | null>(null);
   const dispatchMessageRef = useRef<
-    | ((text: string, attachments: Attachment[] | undefined, inputId?: string) => Promise<boolean>)
+    | ((
+        text: string,
+        attachments: Attachment[] | undefined,
+        queued?: QueuedDispatch
+      ) => Promise<boolean>)
     | null
   >(null);
-  const [queuedInputs, setQueuedInputs] = useState<QueuedChatInput[]>([]);
+  const [frontier, setFrontier] = useState<ConversationInputFrontier>(EMPTY_FRONTIER);
 
   const getActiveTurnSnapshot = useCallback(async () => {
     // Every dispatched GUI turn receives a durable conversation id before it
@@ -125,10 +128,31 @@ export function useTauriChat() {
     }
   }, []);
 
-  const replaceQueue = useCallback((addressKey: string, next: QueuedChatInput[]) => {
-    if (next.length === 0) queuedInputsByAddressRef.current.delete(addressKey);
-    else queuedInputsByAddressRef.current.set(addressKey, next);
-    if (visibleQueueKeyRef.current === addressKey) setQueuedInputs(next);
+  const refreshFrontier = useCallback(async (workspaceId: string, conversationId: string) => {
+    const generation = identityGenerationRef.current;
+    frontierRequestOrdinalRef.current += 1;
+    const requestOrdinal = frontierRequestOrdinalRef.current;
+    const result = await apiInvoke<ConversationInputFrontier>('list_queued_chat_inputs', {
+      workspaceId,
+      conversationId,
+    });
+    const next =
+      result && typeof result.queue_revision === 'number' && Array.isArray(result.items)
+        ? result
+        : EMPTY_FRONTIER;
+    if (
+      identityGenerationRef.current !== generation ||
+      currentWorkspaceIdRef.current !== workspaceId ||
+      useConversationStore.getState().activeId !== conversationId ||
+      requestOrdinal < frontierAppliedOrdinalRef.current ||
+      next.queue_revision < frontierRef.current.queue_revision
+    ) {
+      return next;
+    }
+    frontierAppliedOrdinalRef.current = requestOrdinal;
+    frontierRef.current = next;
+    setFrontier(next);
+    return next;
   }, []);
 
   useEffect(() => {
@@ -140,6 +164,7 @@ export function useTauriChat() {
     previousActiveConversationIdRef.current = activeConversationId;
     previousNewConversationEpochRef.current = newConversationEpoch;
     identityGenerationRef.current += 1;
+    frontierAppliedOrdinalRef.current = frontierRequestOrdinalRef.current;
 
     const adoptsCurrentTurn =
       !startsNewConversation &&
@@ -147,14 +172,8 @@ export function useTauriChat() {
       activeConversationId !== null &&
       activeTurnIdRef.current !== null;
     currentConversationIdRef.current = activeConversationId;
-    visibleQueueKeyRef.current = activeConversationId
-      ? viewAddressKey(viewAddress(currentWorkspaceId, activeConversationId))
-      : null;
-    setQueuedInputs(
-      visibleQueueKeyRef.current
-        ? (queuedInputsByAddressRef.current.get(visibleQueueKeyRef.current) ?? [])
-        : []
-    );
+    frontierRef.current = EMPTY_FRONTIER;
+    setFrontier(EMPTY_FRONTIER);
     if (adoptsCurrentTurn) return;
 
     activeTurnIdRef.current = null;
@@ -165,49 +184,35 @@ export function useTauriChat() {
     pendingAdmissionRef.current = null;
   }, [activeConversationId, currentWorkspaceId, newConversationEpoch]);
 
-  const dispatchNextQueued = useCallback(
-    (workspaceId: string, conversationId: string) => {
-      const addressKey = viewAddressKey(viewAddress(workspaceId, conversationId));
-      if (visibleQueueKeyRef.current !== addressKey) return;
-      const queued = queuedInputsByAddressRef.current.get(addressKey) ?? [];
-      const next = queued[0];
-      if (!next) return;
-      if (next.backendManaged) {
-        if (queuedDispatches.has(next.id)) return;
-        queuedDispatches.add(next.id);
-        queueMicrotask(() => {
-          void (async () => {
-            try {
-              const started = await dispatchMessageRef.current?.(
-                next.text,
-                next.attachments,
-                next.id
-              );
-              if (!started) return;
-              await apiInvoke('remove_queued_chat_input', {
-                workspaceId,
-                conversationId,
-                inputId: next.id,
-              });
-              const current = queuedInputsByAddressRef.current.get(addressKey) ?? [];
-              replaceQueue(
-                addressKey,
-                current.filter((item) => item.id !== next.id)
-              );
-            } finally {
-              queuedDispatches.delete(next.id);
-            }
-          })();
-        });
+  const dispatchNextQueued = useCallback((workspaceId: string, conversationId: string) => {
+    if (
+      currentWorkspaceIdRef.current !== workspaceId ||
+      useConversationStore.getState().activeId !== conversationId
+    ) {
+      return;
+    }
+    const snapshot = frontierRef.current;
+    const next = snapshot.items[0];
+    if (!next) return;
+    const inputId = next.receipt.identity.input_id;
+    if (dispatchingInputIdRef.current === inputId) return;
+    dispatchingInputIdRef.current = inputId;
+    queueMicrotask(() => {
+      const dispatch = dispatchMessageRef.current;
+      if (!dispatch) {
+        dispatchingInputIdRef.current = null;
         return;
       }
-      replaceQueue(addressKey, queued.slice(1));
-      queueMicrotask(() => {
-        void dispatchMessageRef.current?.(next.text, next.attachments);
+      void dispatch(next.payload.text, next.payload.attachments, {
+        identity: next.receipt.identity,
+        queueRevision: snapshot.queue_revision,
+      }).finally(() => {
+        if (dispatchingInputIdRef.current === inputId) {
+          dispatchingInputIdRef.current = null;
+        }
       });
-    },
-    [replaceQueue]
-  );
+    });
+  }, []);
 
   const isCurrentStreamEvent = useCallback((event: ChatEventEnvelope) => {
     if (!event.workspace_id || event.workspace_id !== currentWorkspaceIdRef.current) return false;
@@ -248,6 +253,19 @@ export function useTauriChat() {
 
   const applyEvent = useCallback(
     (event: ChatEventEnvelope) => {
+      if (event.payload.source === 'input_lifecycle') {
+        handleChatEventEnvelope(event, {
+          assistantIdRef,
+          currentMessageKeyRef,
+          currentMessageIdRef: currentMessageKeyRef,
+          isCancelledRef,
+          currentThinkingIdRef: thinkingIdRef,
+          onInputLifecycle: (workspaceId, conversationId) => {
+            void refreshFrontier(workspaceId, conversationId);
+          },
+        });
+        return;
+      }
       if (!isCurrentRunEvent(event)) return;
       rebindEventRefs(event);
       handleChatEventEnvelope(event, {
@@ -256,6 +274,9 @@ export function useTauriChat() {
         currentMessageIdRef: currentMessageKeyRef,
         isCancelledRef,
         currentThinkingIdRef: thinkingIdRef,
+        onInputLifecycle: (workspaceId, conversationId) => {
+          void refreshFrontier(workspaceId, conversationId);
+        },
       });
       const terminalStatus =
         event.payload.source === 'turn_status' &&
@@ -266,11 +287,14 @@ export function useTauriChat() {
         assistantIdRef.current = null;
         thinkingIdRef.current = null;
         if (terminalStatus && event.conversation_id) {
-          dispatchNextQueued(event.workspace_id, event.conversation_id);
+          const conversationId = event.conversation_id;
+          void refreshFrontier(event.workspace_id, conversationId).then(() => {
+            dispatchNextQueued(event.workspace_id, conversationId);
+          });
         }
       }
     },
-    [dispatchNextQueued, isCurrentRunEvent, rebindEventRefs]
+    [dispatchNextQueued, isCurrentRunEvent, rebindEventRefs, refreshFrontier]
   );
 
   const handleEvent = useCallback(
@@ -371,11 +395,6 @@ export function useTauriChat() {
             .getState()
             .loadByConversation(workspaceId, conversationId)
             .catch((e) => console.warn('[TauriChat] Failed to load task run on run_started:', e));
-        } else if (
-          kind === 'run' &&
-          ['run_completed', 'run_failed', 'run_cancelled'].includes(String(payload.event))
-        ) {
-          dispatchNextQueued(workspaceId, conversationId);
         }
       });
       // 卸载发生在第二个 listen 之后、push 之前: 立即注销。
@@ -410,26 +429,8 @@ export function useTauriChat() {
             }
           }
           if (activeConversation) {
-            const queuedResult = await apiInvoke<QueuedChatInputWire[]>('list_queued_chat_inputs', {
-              workspaceId: currentWorkspaceId,
-              conversationId: activeConversation,
-            });
-            const queued = Array.isArray(queuedResult) ? queuedResult : [];
+            await refreshFrontier(currentWorkspaceId, activeConversation);
             if (!aborted && setupIdentityGeneration === identityGenerationRef.current) {
-              const addressKey = viewAddressKey(
-                viewAddress(currentWorkspaceId, activeConversation)
-              );
-              replaceQueue(
-                addressKey,
-                queued.map((input) => ({
-                  id: input.input_id,
-                  text: input.text,
-                  attachments: input.attachments,
-                  workspaceId: input.workspace_id,
-                  conversationId: input.conversation_id,
-                  backendManaged: true,
-                }))
-              );
               if (!snapshot) {
                 dispatchNextQueued(currentWorkspaceId, activeConversation);
               }
@@ -459,12 +460,12 @@ export function useTauriChat() {
     getActiveTurnSnapshot,
     handleEvent,
     isCurrentStreamEvent,
+    refreshFrontier,
     restoreActiveTurnRefs,
-    replaceQueue,
   ]);
 
   const dispatchMessage = useCallback(
-    async (text: string, attachments?: Attachment[], inputId?: string) => {
+    async (text: string, attachments?: Attachment[], queued?: QueuedDispatch) => {
       const store = useChatStore.getState();
       const displayAttachments = attachments?.map((a) => ({
         name: a.name,
@@ -474,10 +475,9 @@ export function useTauriChat() {
         source: a.source,
       }));
       const messageKey =
-        inputId ??
-        (typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        typeof crypto !== 'undefined' && 'randomUUID' in crypto
           ? crypto.randomUUID()
-          : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+          : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const workspaceId = currentWorkspaceIdRef.current;
 
       try {
@@ -509,13 +509,17 @@ export function useTauriChat() {
         currentConversationIdRef.current = conversationId;
         pendingAdmissionRef.current = { messageKey, events: [] };
         const chatResult = await apiInvoke<SendChatResult>('send_chat_message', {
-          workspaceId,
-          message: text,
-          // Multimodal: forward attachments (base64-encoded) so the backend can
-          // persist them and build a multimodal Message for the LLM.
-          attachments: attachments && attachments.length > 0 ? attachments : undefined,
-          conversationId,
-          messageKey,
+          request: {
+            workspaceId,
+            message: text,
+            // Multimodal: forward attachments (base64-encoded) so the backend can
+            // persist them and build a multimodal Message for the LLM.
+            attachments: attachments && attachments.length > 0 ? attachments : undefined,
+            conversationId,
+            messageKey,
+            inputIdentity: queued?.identity,
+            expectedQueueRevision: queued?.queueRevision,
+          },
         });
         const pendingEvents = pendingAdmissionRef.current?.events ?? [];
         pendingAdmissionRef.current = null;
@@ -526,19 +530,7 @@ export function useTauriChat() {
           outcome === 'task_run_conflict' ||
           outcome === 'interrupt_prompt'
         ) {
-          const addressKey = viewAddressKey(viewAddress(workspaceId, conversationId));
-          const currentQueue = queuedInputsByAddressRef.current.get(addressKey) ?? [];
-          replaceQueue(addressKey, [
-            ...currentQueue,
-            {
-              id: chatResult.input_id ?? messageKey,
-              text,
-              attachments,
-              workspaceId,
-              conversationId,
-              backendManaged: Boolean(chatResult.input_id),
-            },
-          ]);
+          await refreshFrontier(workspaceId, conversationId);
           for (const event of pendingEvents) applyEvent(event);
           if (outcome !== 'queued' && chatResult.run_id && chatResult.goal) {
             useTaskRuntimeStore.getState().openInterruptPrompt({
@@ -563,22 +555,15 @@ export function useTauriChat() {
                   runId: chatResult.run_id,
                 });
                 useTaskRuntimeStore.getState().dismissInterruptPrompt();
-                const started = await dispatchMessageRef.current?.(
-                  text,
-                  attachments,
-                  chatResult.input_id
+                const current = await refreshFrontier(workspaceId, conversationId);
+                const selected = current.items.find(
+                  (item) => item.receipt.identity.input_id === chatResult.input_id
                 );
-                if (started && chatResult.input_id) {
-                  await apiInvoke('remove_queued_chat_input', {
-                    workspaceId,
-                    conversationId,
-                    inputId: chatResult.input_id,
+                if (selected) {
+                  await dispatchMessageRef.current?.(text, attachments, {
+                    identity: selected.receipt.identity,
+                    queueRevision: current.queue_revision,
                   });
-                  const queue = queuedInputsByAddressRef.current.get(addressKey) ?? [];
-                  replaceQueue(
-                    addressKey,
-                    queue.filter((item) => item.id !== chatResult.input_id)
-                  );
                 }
               },
             });
@@ -617,13 +602,66 @@ export function useTauriChat() {
         assistantIdRef.current = null;
         currentMessageKeyRef.current = null;
         activeTurnIdRef.current = null;
+        const conversationId = useConversationStore.getState().activeId;
+        if (conversationId) {
+          void refreshFrontier(workspaceId, conversationId);
+        }
         return false;
       }
     },
-    [applyEvent, replaceQueue]
+    [applyEvent, refreshFrontier]
   );
 
   dispatchMessageRef.current = dispatchMessage;
+
+  const steerConversationInput = useCallback(
+    async (queued: ConversationInputProjection, expectedQueueRevision: number) => {
+      const conversationId = useConversationStore.getState().activeId;
+      if (
+        !conversationId ||
+        conversationId !== queued.receipt.identity.address.conversation_id ||
+        currentWorkspaceIdRef.current !== queued.receipt.identity.address.workspace_id
+      ) {
+        return false;
+      }
+      try {
+        const result = await apiInvoke<ConversationInputReceipt>('steer_chat_message', {
+          workspaceId: queued.receipt.identity.address.workspace_id,
+          conversationId,
+          expectedActiveTurnId: activeTurnIdRef.current,
+          identity: queued.receipt.identity,
+          expectedQueueRevision,
+        });
+        await refreshFrontier(
+          queued.receipt.identity.address.workspace_id,
+          queued.receipt.identity.address.conversation_id
+        );
+        if (!result.drained) {
+          useToastStore.getState().addToast('info', '当前阶段不能插入，已保留在排队队列中');
+          return false;
+        }
+        const displayAttachments = queued.payload.attachments.map((attachment) => ({
+          name: attachment.name,
+          mime_type: attachment.mime_type,
+          url: `data:${attachment.mime_type};base64,${attachment.data}`,
+          size: attachment.size,
+          source: attachment.source,
+        }));
+        assistantIdRef.current = useChatStore
+          .getState()
+          .continueAfterSteer(
+            assistantIdRef.current,
+            queued.payload.text || '(附件)',
+            displayAttachments
+          );
+        return true;
+      } catch (error) {
+        useToastStore.getState().addToast('error', `补充当前任务失败：${errorMessage(error)}`);
+        return false;
+      }
+    },
+    [refreshFrontier]
+  );
 
   const sendMessage = useCallback(
     async (text: string, attachments?: Attachment[]) => {
@@ -638,26 +676,20 @@ export function useTauriChat() {
             : `queued-${Date.now()}-${Math.random().toString(36).slice(2)}`;
         if (!activeConversation) return false;
         const workspaceId = currentWorkspaceIdRef.current;
-        const addressKey = viewAddressKey(viewAddress(workspaceId, activeConversation));
-        const accepted = await apiInvoke<QueuedChatInputWire>('queue_chat_input', {
+        const receipt = await apiInvoke<ConversationInputReceipt>('queue_chat_input', {
           workspaceId,
           conversationId: activeConversation,
-          inputId: id,
+          externalId: id,
           text,
           attachments: attachments && attachments.length > 0 ? attachments : undefined,
         });
-        const currentQueue = queuedInputsByAddressRef.current.get(addressKey) ?? [];
-        replaceQueue(addressKey, [
-          ...currentQueue,
-          {
-            id: accepted.input_id,
-            text: accepted.text,
-            attachments: accepted.attachments,
-            workspaceId: accepted.workspace_id,
-            conversationId: accepted.conversation_id,
-            backendManaged: true,
-          },
-        ]);
+        const current = await refreshFrontier(workspaceId, activeConversation);
+        const selected = current.items.find(
+          (item) => item.receipt.identity.input_id === receipt.identity.input_id
+        );
+        if (selected) {
+          await steerConversationInput(selected, current.queue_revision);
+        }
         return true;
       }
       if (activeTurnIdRef.current) {
@@ -667,7 +699,7 @@ export function useTauriChat() {
       }
       return dispatchMessage(text, attachments);
     },
-    [dispatchMessage, replaceQueue]
+    [dispatchMessage, refreshFrontier, steerConversationInput]
   );
 
   const sendApproval = useCallback(
@@ -809,116 +841,84 @@ export function useTauriChat() {
     }
   }, [getActiveTurnSnapshot, handleEvent, restoreActiveTurnRefs]);
 
+  const queuedInputs: QueuedChatInput[] = frontier.items.map((item) => ({
+    id: item.receipt.identity.input_id,
+    text: item.payload.text,
+    attachments: item.payload.attachments,
+    workspaceId: item.receipt.identity.address.workspace_id,
+    conversationId: item.receipt.identity.address.conversation_id,
+    identity: item.receipt.identity,
+  }));
+
   const clearQueuedMessages = useCallback(() => {
-    const addressKey = visibleQueueKeyRef.current;
-    if (!addressKey) return;
-    const queue = queuedInputsByAddressRef.current.get(addressKey) ?? [];
+    const snapshot = frontierRef.current;
+    if (snapshot.items.length === 0) return;
     void (async () => {
-      for (const item of queue.filter((candidate) => candidate.backendManaged)) {
+      for (const item of snapshot.items) {
         await apiInvoke('remove_queued_chat_input', {
-          workspaceId: item.workspaceId,
-          conversationId: item.conversationId,
-          inputId: item.id,
+          identity: item.receipt.identity,
         });
       }
-      replaceQueue(addressKey, []);
+      const address = snapshot.items[0]?.receipt.identity.address;
+      if (address) await refreshFrontier(address.workspace_id, address.conversation_id);
     })().catch((error) => {
       useToastStore.getState().addToast('error', `清空排队消息失败：${errorMessage(error)}`);
     });
-  }, [replaceQueue]);
+  }, [refreshFrontier]);
 
   const removeQueuedMessage = useCallback(
     (id: string) => {
-      const addressKey = visibleQueueKeyRef.current;
-      if (!addressKey) return;
-      const currentQueue = queuedInputsByAddressRef.current.get(addressKey) ?? [];
-      const item = currentQueue.find((candidate) => candidate.id === id);
-      if (item?.backendManaged) {
-        void apiInvoke('remove_queued_chat_input', {
-          workspaceId: item.workspaceId,
-          conversationId: item.conversationId,
-          inputId: item.id,
-        })
-          .then(() => {
-            const latest = queuedInputsByAddressRef.current.get(addressKey) ?? [];
-            replaceQueue(
-              addressKey,
-              latest.filter((candidate) => candidate.id !== id)
-            );
-          })
-          .catch((error) => {
-            useToastStore.getState().addToast('error', `删除排队消息失败：${errorMessage(error)}`);
-          });
-        return;
-      }
-      replaceQueue(
-        addressKey,
-        currentQueue.filter((candidate) => candidate.id !== id)
+      const item = frontierRef.current.items.find(
+        (candidate) => candidate.receipt.identity.input_id === id
       );
+      if (!item) return;
+      void apiInvoke('remove_queued_chat_input', { identity: item.receipt.identity })
+        .then(() =>
+          refreshFrontier(
+            item.receipt.identity.address.workspace_id,
+            item.receipt.identity.address.conversation_id
+          )
+        )
+        .catch((error) => {
+          useToastStore.getState().addToast('error', `删除排队消息失败：${errorMessage(error)}`);
+        });
     },
-    [replaceQueue]
+    [refreshFrontier]
   );
 
   const reorderQueuedMessage = useCallback(
     (sourceId: string, targetId: string) => {
-      const addressKey = visibleQueueKeyRef.current;
-      if (!addressKey) return;
-      const currentQueue = queuedInputsByAddressRef.current.get(addressKey) ?? [];
-      const next = reorderById(currentQueue, sourceId, targetId);
-      replaceQueue(addressKey, next);
-      const addressed = next.find((item) => item.backendManaged);
+      const snapshot = frontierRef.current;
+      const current = snapshot.items.map((item) => ({
+        id: item.receipt.identity.input_id,
+        identity: item.receipt.identity,
+      }));
+      const next = reorderById(current, sourceId, targetId);
+      const addressed = next[0]?.identity.address;
       if (!addressed) return;
       void apiInvoke('reorder_queued_chat_inputs', {
-        workspaceId: addressed.workspaceId,
-        conversationId: addressed.conversationId,
-        inputIds: next.filter((item) => item.backendManaged).map((item) => item.id),
-      }).catch((error) => {
-        replaceQueue(addressKey, currentQueue);
-        useToastStore.getState().addToast('error', `调整排队顺序失败：${errorMessage(error)}`);
-      });
+        workspaceId: addressed.workspace_id,
+        conversationId: addressed.conversation_id,
+        expectedQueueRevision: snapshot.queue_revision,
+        inputIds: next.map((item) => item.id),
+      })
+        .then(() => refreshFrontier(addressed.workspace_id, addressed.conversation_id))
+        .catch((error) => {
+          void refreshFrontier(addressed.workspace_id, addressed.conversation_id);
+          useToastStore.getState().addToast('error', `调整排队顺序失败：${errorMessage(error)}`);
+        });
     },
-    [replaceQueue]
+    [refreshFrontier]
   );
 
   const steerQueuedMessage = useCallback(
     async (id: string) => {
-      const addressKey = visibleQueueKeyRef.current;
-      const queued = addressKey
-        ? queuedInputsByAddressRef.current.get(addressKey)?.find((item) => item.id === id)
-        : undefined;
-      const conversationId = useConversationStore.getState().activeId;
-      if (!queued || !conversationId) return false;
-      try {
-        const result = await apiInvoke<ChatSteerReceipt>('steer_chat_message', {
-          workspaceId: queued.workspaceId,
-          message: queued.text,
-          attachments: queued.attachments,
-          conversationId,
-          expectedRootTurnId: currentMessageKeyRef.current,
-          expectedActiveTurnId: activeTurnIdRef.current,
-        });
-        if (result.kind !== 'accepted' || result.phase !== 'drained') {
-          useToastStore.getState().addToast('info', '当前阶段不能插入，已保留在排队队列中');
-          return false;
-        }
-        const displayAttachments = queued.attachments?.map((attachment) => ({
-          name: attachment.name,
-          mime_type: attachment.mime_type,
-          url: `data:${attachment.mime_type};base64,${attachment.data}`,
-          size: attachment.size,
-          source: attachment.source,
-        }));
-        assistantIdRef.current = useChatStore
-          .getState()
-          .continueAfterSteer(assistantIdRef.current, queued.text || '(附件)', displayAttachments);
-        removeQueuedMessage(id);
-        return true;
-      } catch (error) {
-        useToastStore.getState().addToast('error', `补充当前任务失败：${errorMessage(error)}`);
-        return false;
-      }
+      const snapshot = frontierRef.current;
+      const queued = snapshot.items.find((item) => item.receipt.identity.input_id === id);
+      if (!queued) return false;
+      return steerConversationInput(queued, snapshot.queue_revision);
     },
-    [removeQueuedMessage]
+    [steerConversationInput]
   );
 
   return {

@@ -566,9 +566,12 @@ pub async fn resume_task_run(
     let pool_execution = match runtime.agent_for(&conversation_id).await {
         Ok(execution) => execution,
         Err(error) => {
-            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                echo_agent::error::AgentFailure::message("agent_pool", error.to_string()),
-            ));
+            lease
+                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message("agent_pool", error.to_string()),
+                ))
+                .await
+                .map_err(internal)?;
             return Err(IpcError::Validation(error.to_string()));
         }
     };
@@ -596,9 +599,12 @@ pub async fn resume_task_run(
     {
         Ok(launch) => launch,
         Err(error) => {
-            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                echo_agent::error::AgentFailure::message("planned_resume", error.to_string()),
-            ));
+            lease
+                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message("planned_resume", error.to_string()),
+                ))
+                .await
+                .map_err(internal)?;
             return Err(internal(error));
         }
     };
@@ -628,7 +634,9 @@ pub async fn resume_task_run(
                 )
             }
         };
-        lease.settle(outcome);
+        if let Err(error) = lease.settle_after_observers(outcome).await {
+            tracing::error!(run_id = %launched_run_id, %error, "resumed run foreground settlement failed");
+        }
     });
     tracing::info!(run_id = %run_id, "task run resumed -> Running");
 
@@ -729,9 +737,12 @@ async fn resume_continuation_run(
     let pool_execution = match runtime.agent_for(&conversation_id).await {
         Ok(execution) => execution,
         Err(error) => {
-            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                echo_agent::error::AgentFailure::message("agent_pool", error.to_string()),
-            ));
+            lease
+                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message("agent_pool", error.to_string()),
+                ))
+                .await
+                .map_err(internal)?;
             return Err(IpcError::Validation(error.to_string()));
         }
     };

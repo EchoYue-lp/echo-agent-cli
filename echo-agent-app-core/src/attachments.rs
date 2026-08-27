@@ -21,6 +21,9 @@ use sha2::{Digest, Sha256};
 
 use crate::types::{AttachmentData, AttachmentSource};
 
+pub const MAX_DURABLE_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+pub const MAX_DURABLE_ATTACHMENT_BATCH_BYTES: u64 = 50 * 1024 * 1024;
+
 /// Errors from attachment handling.
 #[derive(Debug, thiserror::Error)]
 pub enum AttachmentError {
@@ -52,6 +55,34 @@ pub enum AttachmentError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("attachment at {path} is too large to represent: {size} bytes")]
+    SizeOverflow { path: PathBuf, size: usize },
+    #[error(
+        "attachment changed while reading {path}: metadata reports {metadata_size} bytes, read {bytes_size} bytes"
+    )]
+    SizeChanged {
+        path: PathBuf,
+        metadata_size: u64,
+        bytes_size: u64,
+    },
+    #[error("attachment at {path} exceeds durable input limit {limit} bytes: {size} bytes")]
+    TooLarge {
+        path: PathBuf,
+        size: u64,
+        limit: u64,
+    },
+    #[error("attachment '{name}' exceeds durable input limit {limit} bytes: {size} bytes")]
+    PayloadTooLarge { name: String, size: u64, limit: u64 },
+    #[error(
+        "attachment '{name}' size mismatch: transport declares {declared_size} bytes, decoded body has {decoded_size} bytes"
+    )]
+    PayloadSizeMismatch {
+        name: String,
+        declared_size: u64,
+        decoded_size: u64,
+    },
+    #[error("attachment batch exceeds durable input limit {limit} bytes: {size} bytes")]
+    BatchTooLarge { size: u64, limit: u64 },
 }
 
 type Result<T> = std::result::Result<T, AttachmentError>;
@@ -74,6 +105,13 @@ pub fn stage_local_attachment(
     source: &Path,
     workspace_root: Option<&Path>,
 ) -> Result<AttachmentRef> {
+    let metadata_size = std::fs::metadata(source)
+        .map_err(|source_error| AttachmentError::Read {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?
+        .len();
+    ensure_durable_attachment_size(source, metadata_size)?;
     let bytes = std::fs::read(source).map_err(|source_error| AttachmentError::Read {
         path: source.to_path_buf(),
         source: source_error,
@@ -155,18 +193,20 @@ fn sanitize_name(name: &str) -> Result<String> {
 /// collisions between uploads with the same filename. The directory is created
 /// if missing.
 pub fn save_attachment(att: &AttachmentData, uploads_dir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(uploads_dir).map_err(|source| AttachmentError::CreateDir {
-        path: uploads_dir.to_path_buf(),
-        source,
-    })?;
-
     let base = sanitize_name(&att.name)?;
+    validate_attachment_payload_before_decode(att)?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&att.data)
         .map_err(|source| AttachmentError::Decode {
             name: att.name.clone(),
             source,
         })?;
+    validate_decoded_attachment_size(att, bytes.len())?;
+
+    std::fs::create_dir_all(uploads_dir).map_err(|source| AttachmentError::CreateDir {
+        path: uploads_dir.to_path_buf(),
+        source,
+    })?;
 
     let file_name = format!("{}_{}", uuid::Uuid::new_v4(), base);
     let path = uploads_dir.join(file_name);
@@ -188,6 +228,7 @@ pub fn save_attachments<'a>(
     attachments: &'a [AttachmentData],
     uploads_dir: &Path,
 ) -> Result<Vec<(PathBuf, &'a AttachmentData)>> {
+    validate_attachment_batch(attachments)?;
     let mut saved = Vec::new();
     for att in attachments {
         match save_attachment(att, uploads_dir) {
@@ -526,6 +567,151 @@ impl AttachmentRef {
     }
 }
 
+/// Rebuild one transport attachment from its durable file reference.
+///
+/// This function performs synchronous file I/O only. Async callers must invoke
+/// it inside the existing product-data blocking boundary rather than spawning
+/// a second owner here.
+pub fn attachment_ref_to_data(
+    attachment: &AttachmentRef,
+) -> std::result::Result<AttachmentData, AttachmentError> {
+    let metadata_size = std::fs::metadata(&attachment.path)
+        .map_err(|source| AttachmentError::Read {
+            path: attachment.path.clone(),
+            source,
+        })?
+        .len();
+    ensure_durable_attachment_size(&attachment.path, metadata_size)?;
+    let bytes = std::fs::read(&attachment.path).map_err(|source| AttachmentError::Read {
+        path: attachment.path.clone(),
+        source,
+    })?;
+    let bytes_size = u64::try_from(bytes.len()).map_err(|_| AttachmentError::SizeOverflow {
+        path: attachment.path.clone(),
+        size: bytes.len(),
+    })?;
+    if metadata_size != bytes_size {
+        return Err(AttachmentError::SizeChanged {
+            path: attachment.path.clone(),
+            metadata_size,
+            bytes_size,
+        });
+    }
+    Ok(AttachmentData {
+        name: attachment.name.clone(),
+        mime_type: attachment.mime_type.clone(),
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        size: bytes_size,
+        source: attachment.source,
+    })
+}
+
+fn ensure_durable_attachment_size(path: &Path, size: u64) -> Result<()> {
+    if size > MAX_DURABLE_ATTACHMENT_BYTES {
+        Err(AttachmentError::TooLarge {
+            path: path.to_path_buf(),
+            size,
+            limit: MAX_DURABLE_ATTACHMENT_BYTES,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_attachment_payload_before_decode(attachment: &AttachmentData) -> Result<()> {
+    if attachment.size > MAX_DURABLE_ATTACHMENT_BYTES {
+        return Err(AttachmentError::PayloadTooLarge {
+            name: attachment.name.clone(),
+            size: attachment.size,
+            limit: MAX_DURABLE_ATTACHMENT_BYTES,
+        });
+    }
+    let encoded_limit = (MAX_DURABLE_ATTACHMENT_BYTES.saturating_add(2) / 3).saturating_mul(4);
+    let encoded_size = u64::try_from(attachment.data.len()).unwrap_or(u64::MAX);
+    if encoded_size > encoded_limit {
+        return Err(AttachmentError::PayloadTooLarge {
+            name: attachment.name.clone(),
+            size: encoded_size,
+            limit: encoded_limit,
+        });
+    }
+    Ok(())
+}
+
+fn validate_decoded_attachment_size(attachment: &AttachmentData, decoded: usize) -> Result<()> {
+    let decoded_size = u64::try_from(decoded).unwrap_or(u64::MAX);
+    if decoded_size > MAX_DURABLE_ATTACHMENT_BYTES {
+        return Err(AttachmentError::PayloadTooLarge {
+            name: attachment.name.clone(),
+            size: decoded_size,
+            limit: MAX_DURABLE_ATTACHMENT_BYTES,
+        });
+    }
+    if attachment.size != decoded_size {
+        return Err(AttachmentError::PayloadSizeMismatch {
+            name: attachment.name.clone(),
+            declared_size: attachment.size,
+            decoded_size,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_attachment_batch(attachments: &[AttachmentData]) -> Result<()> {
+    let size = attachments.iter().try_fold(0_u64, |total, attachment| {
+        validate_attachment_payload_before_decode(attachment)?;
+        total
+            .checked_add(attachment.size)
+            .ok_or(AttachmentError::BatchTooLarge {
+                size: u64::MAX,
+                limit: MAX_DURABLE_ATTACHMENT_BATCH_BYTES,
+            })
+    })?;
+    if size > MAX_DURABLE_ATTACHMENT_BATCH_BYTES {
+        Err(AttachmentError::BatchTooLarge {
+            size,
+            limit: MAX_DURABLE_ATTACHMENT_BATCH_BYTES,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_attachment_ref_batch(attachments: &[AttachmentRef]) -> Result<()> {
+    let mut total = 0_u64;
+    for attachment in attachments {
+        let size = std::fs::metadata(&attachment.path)
+            .map_err(|source| AttachmentError::Read {
+                path: attachment.path.clone(),
+                source,
+            })?
+            .len();
+        ensure_durable_attachment_size(&attachment.path, size)?;
+        total = total
+            .checked_add(size)
+            .ok_or(AttachmentError::BatchTooLarge {
+                size: u64::MAX,
+                limit: MAX_DURABLE_ATTACHMENT_BATCH_BYTES,
+            })?;
+    }
+    if total > MAX_DURABLE_ATTACHMENT_BATCH_BYTES {
+        Err(AttachmentError::BatchTooLarge {
+            size: total,
+            limit: MAX_DURABLE_ATTACHMENT_BATCH_BYTES,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Rebuild transport attachments in the same order as their durable refs.
+pub fn attachment_refs_to_data(
+    attachments: &[AttachmentRef],
+) -> std::result::Result<Vec<AttachmentData>, AttachmentError> {
+    validate_attachment_ref_batch(attachments)?;
+    attachments.iter().map(attachment_ref_to_data).collect()
+}
+
 /// Build a multimodal user [`Message`] from text + attachment refs.
 ///
 /// Re-reads each file from disk (the refs carry no base64 body), so it is
@@ -540,6 +726,7 @@ pub fn build_message_from_refs(
     if attachments.is_empty() {
         return Ok(Message::user(text.to_string()));
     }
+    validate_attachment_ref_batch(attachments).map_err(std::io::Error::other)?;
 
     let mut parts = Vec::with_capacity(attachments.len() + 1);
     parts.push(ContentPart::Text {
@@ -576,11 +763,15 @@ mod tests {
     }
 
     fn att(name: &str, mime: &str, data: &str) -> AttachmentData {
+        let size = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map(|decoded| u64::try_from(decoded.len()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
         AttachmentData {
             name: name.to_string(),
             mime_type: mime.to_string(),
             data: data.to_string(),
-            size: data.len() as u64,
+            size,
             source: AttachmentSource::Upload,
         }
     }
@@ -646,6 +837,201 @@ mod tests {
     fn build_message_no_attachments_is_text() -> std::result::Result<(), String> {
         let msg = build_message_from_refs("plain", &[]).map_err(|error| error.to_string())?;
         assert_eq!(msg.content.as_text(), Some("plain".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn attachment_ref_to_data_preserves_unicode_binary_and_source()
+    -> std::result::Result<(), String> {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = temporary.path().join("研究附件.bin");
+        let bytes = [0_u8, 255, 1, 128, 42];
+        std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
+        let reference = AttachmentRef {
+            path,
+            name: "研究附件.bin".to_string(),
+            mime_type: "application/octet-stream".to_string(),
+            source: AttachmentSource::Message,
+        };
+
+        let converted = attachment_ref_to_data(&reference).map_err(|error| error.to_string())?;
+
+        assert_eq!(converted.name, "研究附件.bin");
+        assert_eq!(converted.mime_type, "application/octet-stream");
+        assert_eq!(converted.source, AttachmentSource::Message);
+        assert_eq!(converted.size, 5);
+        assert_eq!(
+            converted.data,
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn attachment_refs_to_data_preserves_order_and_each_source() -> std::result::Result<(), String>
+    {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let first_path = temporary.path().join("first.txt");
+        let second_path = temporary.path().join("second.bin");
+        std::fs::write(&first_path, b"first").map_err(|error| error.to_string())?;
+        std::fs::write(&second_path, [9_u8, 8, 7]).map_err(|error| error.to_string())?;
+        let references = [
+            AttachmentRef {
+                path: first_path,
+                name: "first.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                source: AttachmentSource::Paste,
+            },
+            AttachmentRef {
+                path: second_path,
+                name: "second.bin".to_string(),
+                mime_type: "application/octet-stream".to_string(),
+                source: AttachmentSource::Channel,
+            },
+        ];
+
+        let converted = attachment_refs_to_data(&references).map_err(|error| error.to_string())?;
+
+        assert_eq!(converted.len(), 2);
+        assert_eq!(
+            converted.first().map(|item| item.name.as_str()),
+            Some("first.txt")
+        );
+        assert_eq!(
+            converted.first().map(|item| item.source),
+            Some(AttachmentSource::Paste)
+        );
+        assert_eq!(
+            converted.get(1).map(|item| item.source),
+            Some(AttachmentSource::Channel)
+        );
+        assert_eq!(converted.get(1).map(|item| item.size), Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn attachment_ref_to_data_returns_read_error_for_missing_file()
+    -> std::result::Result<(), String> {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let missing = temporary.path().join("missing.bin");
+        let reference = AttachmentRef {
+            path: missing.clone(),
+            name: "missing.bin".to_string(),
+            mime_type: "application/octet-stream".to_string(),
+            source: AttachmentSource::Upload,
+        };
+
+        let error = attachment_ref_to_data(&reference)
+            .err()
+            .ok_or_else(|| "missing attachment unexpectedly converted".to_string())?;
+
+        assert!(matches!(
+            error,
+            AttachmentError::Read { path, source }
+                if path == missing && source.kind() == std::io::ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn attachment_ref_rejects_oversize_before_read_and_base64() -> Result<()> {
+        let temporary = tempfile::tempdir().map_err(|source| AttachmentError::CreateDir {
+            path: std::env::temp_dir(),
+            source,
+        })?;
+        let path = temporary.path().join("oversize.bin");
+        let file = std::fs::File::create(&path).map_err(|source| AttachmentError::Write {
+            name: "oversize.bin".to_string(),
+            path: path.clone(),
+            source,
+        })?;
+        file.set_len(MAX_DURABLE_ATTACHMENT_BYTES.saturating_add(1))
+            .map_err(|source| AttachmentError::Write {
+                name: "oversize.bin".to_string(),
+                path: path.clone(),
+                source,
+            })?;
+        let reference = AttachmentRef {
+            path: path.clone(),
+            name: "oversize.bin".to_string(),
+            mime_type: "application/octet-stream".to_string(),
+            source: AttachmentSource::Upload,
+        };
+        assert!(matches!(
+            attachment_ref_to_data(&reference),
+            Err(AttachmentError::TooLarge {
+                size,
+                limit: MAX_DURABLE_ATTACHMENT_BYTES,
+                ..
+            }) if size == MAX_DURABLE_ATTACHMENT_BYTES.saturating_add(1)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn attachment_payload_rejects_declared_size_mismatch_before_write() -> Result<()> {
+        let temporary = tempfile::tempdir().map_err(|source| AttachmentError::CreateDir {
+            path: std::env::temp_dir(),
+            source,
+        })?;
+        let attachment = AttachmentData {
+            name: "mismatch.bin".to_string(),
+            mime_type: "application/octet-stream".to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(b"three"),
+            size: 99,
+            source: AttachmentSource::Upload,
+        };
+        assert!(matches!(
+            save_attachment(&attachment, temporary.path()),
+            Err(AttachmentError::PayloadSizeMismatch {
+                declared_size: 99,
+                decoded_size: 5,
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read_dir(temporary.path())
+                .map_err(|source| AttachmentError::Read {
+                    path: temporary.path().to_path_buf(),
+                    source,
+                })?
+                .count(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn attachment_batch_rejects_total_budget_before_decode_or_write() -> Result<()> {
+        let temporary = tempfile::tempdir().map_err(|source| AttachmentError::CreateDir {
+            path: std::env::temp_dir(),
+            source,
+        })?;
+        let attachments = (0..6)
+            .map(|index| AttachmentData {
+                name: format!("declared-{index}.bin"),
+                mime_type: "application/octet-stream".to_string(),
+                data: "not-decoded".to_string(),
+                size: MAX_DURABLE_ATTACHMENT_BYTES,
+                source: AttachmentSource::Upload,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            save_attachments(&attachments, temporary.path()),
+            Err(AttachmentError::BatchTooLarge {
+                size,
+                limit: MAX_DURABLE_ATTACHMENT_BATCH_BYTES,
+            }) if size == 6 * MAX_DURABLE_ATTACHMENT_BYTES
+        ));
+        assert_eq!(
+            std::fs::read_dir(temporary.path())
+                .map_err(|source| AttachmentError::Read {
+                    path: temporary.path().to_path_buf(),
+                    source,
+                })?
+                .count(),
+            0
+        );
         Ok(())
     }
 

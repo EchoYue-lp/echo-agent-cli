@@ -19,7 +19,7 @@ struct PendingChannelRequest {
 pub enum ChannelHumanLoopResolution {
     NoPending,
     Resolved(String),
-    Invalid(String),
+    Rejected(String),
 }
 
 struct ChannelHumanLoopState {
@@ -93,17 +93,6 @@ impl ChannelHumanLoopProvider {
         self.prompt_tx.subscribe()
     }
 
-    pub async fn has_pending(&self) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if Self::prune_closed(&mut state.pending) {
-            self.publish_front(&state.pending);
-        }
-        !state.pending.is_empty()
-    }
-
     pub async fn reject_front(&self, reason: impl Into<String>) -> ChannelHumanLoopResolution {
         let mut state = self
             .state
@@ -124,7 +113,7 @@ impl ChannelHumanLoopProvider {
         if delivered {
             ChannelHumanLoopResolution::Resolved(format!("Rejected request {request_id}."))
         } else {
-            ChannelHumanLoopResolution::Invalid(
+            ChannelHumanLoopResolution::Rejected(
                 "The pending request already expired; advanced to the next request.".to_string(),
             )
         }
@@ -179,7 +168,10 @@ impl ChannelHumanLoopProvider {
         rejected
     }
 
-    pub async fn resolve_message(&self, message: &str) -> ChannelHumanLoopResolution {
+    /// Resolve one channel message against the current request under a single
+    /// lock acquisition. `NoPending` is the only result that permits the caller
+    /// to route the same message into ordinary conversation ingress.
+    pub fn try_resolve_message(&self, message: &str) -> ChannelHumanLoopResolution {
         let mut state = self
             .state
             .lock()
@@ -191,7 +183,7 @@ impl ChannelHumanLoopProvider {
         let response = match parse_response(&request.request, message) {
             Ok(response) => response,
             Err(reason) => {
-                return ChannelHumanLoopResolution::Invalid(format!(
+                return ChannelHumanLoopResolution::Rejected(format!(
                     "{reason}\n\n{}",
                     format_prompt(&request.request_id, &request.request)
                 ));
@@ -204,7 +196,7 @@ impl ChannelHumanLoopProvider {
         let delivered = request.response_tx.send(response).is_ok();
         self.publish_front(&state.pending);
         if !delivered {
-            return ChannelHumanLoopResolution::Invalid(
+            return ChannelHumanLoopResolution::Rejected(
                 "The pending request already expired; advanced to the next request.".to_string(),
             );
         }
@@ -425,7 +417,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert!(prompt.contains("[input:"));
         assert!(matches!(
-            provider.resolve_message("Use file storage").await,
+            provider.try_resolve_message("Use file storage"),
             ChannelHumanLoopResolution::Resolved(_)
         ));
         let response = task
@@ -457,11 +449,11 @@ mod tests {
             .map_err(|_| "prompt timeout".to_string())?
             .map_err(|error| error.to_string())?;
         assert!(matches!(
-            provider.resolve_message("9").await,
-            ChannelHumanLoopResolution::Invalid(_)
+            provider.try_resolve_message("9"),
+            ChannelHumanLoopResolution::Rejected(_)
         ));
         assert!(matches!(
-            provider.resolve_message("2").await,
+            provider.try_resolve_message("2"),
             ChannelHumanLoopResolution::Resolved(_)
         ));
         let response = task
@@ -518,7 +510,7 @@ mod tests {
         );
 
         assert!(matches!(
-            provider.resolve_message("first answer").await,
+            provider.try_resolve_message("first answer"),
             ChannelHumanLoopResolution::Resolved(message)
                 if message.contains("framework-first")
         ));
@@ -528,7 +520,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert!(second_prompt.contains("[input:framework-second]"));
         assert!(matches!(
-            provider.resolve_message("second answer").await,
+            provider.try_resolve_message("second answer"),
             ChannelHumanLoopResolution::Resolved(message)
                 if message.contains("framework-second")
         ));
@@ -585,7 +577,10 @@ mod tests {
         first.abort();
         let _ = first.await;
 
-        assert!(provider.has_pending().await);
+        assert!(matches!(
+            provider.try_resolve_message(""),
+            ChannelHumanLoopResolution::Rejected(_)
+        ));
         let next_prompt = tokio::time::timeout(std::time::Duration::from_secs(1), prompts.recv())
             .await
             .map_err(|_| "next prompt timeout".to_string())?
@@ -628,7 +623,7 @@ mod tests {
             .ok_or_else(|| "duplicate request id was accepted".to_string())?;
         assert!(error.to_string().contains("same-framework-id"));
         assert!(matches!(
-            provider.resolve_message("first answer").await,
+            provider.try_resolve_message("first answer"),
             ChannelHumanLoopResolution::Resolved(_)
         ));
         let first_response = first
@@ -656,7 +651,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
 
         assert!(matches!(
-            provider.resolve_message("original answer").await,
+            provider.try_resolve_message("original answer"),
             ChannelHumanLoopResolution::Resolved(_)
         ));
         let mut duplicate = HumanLoopRequest::input("Duplicate input");
@@ -706,7 +701,7 @@ mod tests {
                 .map_err(|error| error.to_string())?;
         assert!(replacement_prompt.contains("[input:reusable-after-abort]"));
         assert!(matches!(
-            provider.resolve_message("replacement answer").await,
+            provider.try_resolve_message("replacement answer"),
             ChannelHumanLoopResolution::Resolved(_)
         ));
         let response = replacement_task
@@ -800,7 +795,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert!(next_prompt.contains("[input:persistent-second]"));
         assert!(matches!(
-            provider.resolve_message("second answer").await,
+            provider.try_resolve_message("second answer"),
             ChannelHumanLoopResolution::Resolved(message)
                 if message.contains("persistent-second")
         ));
@@ -812,6 +807,67 @@ mod tests {
             second_response,
             HumanLoopResponse::Text(text) if text == "second answer"
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_messages_linearize_one_resolution_and_one_no_pending() -> Result<(), String>
+    {
+        let provider = Arc::new(ChannelHumanLoopProvider::new());
+        let mut prompts = provider.subscribe_prompts();
+        let request_provider = Arc::clone(&provider);
+        let request = tokio::spawn(async move {
+            request_provider
+                .request(HumanLoopRequest::input("Resolve exactly once"))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), prompts.recv())
+            .await
+            .map_err(|_| "race prompt timeout".to_string())?
+            .map_err(|error| error.to_string())?;
+
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for message in ["first", "second"] {
+            let provider = Arc::clone(&provider);
+            let start = Arc::clone(&start);
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                provider.try_resolve_message(message)
+            }));
+        }
+        start.wait();
+        let mut resolutions = Vec::new();
+        for thread in threads {
+            resolutions.push(
+                thread
+                    .join()
+                    .map_err(|_| "HITL resolution race thread failed".to_string())?,
+            );
+        }
+        assert_eq!(
+            resolutions
+                .iter()
+                .filter(|resolution| {
+                    matches!(resolution, ChannelHumanLoopResolution::Resolved(_))
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            resolutions
+                .iter()
+                .filter(|resolution| {
+                    matches!(resolution, ChannelHumanLoopResolution::NoPending)
+                })
+                .count(),
+            1
+        );
+        let response = request
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(response, HumanLoopResponse::Text(_)));
         Ok(())
     }
 }

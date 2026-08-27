@@ -167,6 +167,7 @@ pub struct AttachmentData {
     pub mime_type: String,
     /// Base64 编码的文件内容
     pub data: String,
+    #[ts(type = "number")]
     pub size: u64,
     #[serde(default)]
     pub source: AttachmentSource,

@@ -63,8 +63,8 @@ reconciler 的 owned singleflight 执行并只缓存成功结果；首个 caller
 TaskRun 的 command-cell Started 事实都会在 boot 被闭合为 typed Interrupted terminal。
 
 跨会话 live delivery 与 Awaiter handoff 都使用 framework tracked steer receipt。mailbox acceptance
-不是消费完成。副作用前先写 DeliveryStarted/InjectionStarted，receipt 到达 Drained 后才写
-Acknowledged/Injected；owner loss 没有 typed terminal 时禁止重放。Agent inbox 使用 framework
+不是消费完成。副作用前先写 DeliveryStarted/EffectStarted，receipt 到达 Accepted/Drained 后分别写
+MailboxAccepted/Drained；owner loss 没有 typed terminal 时禁止重放。Agent inbox 使用 framework
 segmented journal + checkpointed reducer 作为唯一 sequence/append/projection authority，保留持久化
 FIFO frontier、typed durability 与 prepared-batch reconciliation。Conversation/workspace 删除通过
 retirement guard 清理对应 inbox。完整取舍见

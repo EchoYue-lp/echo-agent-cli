@@ -1,8 +1,8 @@
 //! TUI event loop — handles keyboard input, terminal resize, and agent streaming.
 
 use super::{
-    ChatMessage, MessageRole, QueuedTurn, SubagentRuntimeView, TaskRuntimeRequirementView,
-    TaskRuntimeTaskView, TaskRuntimeView, ToolExecutionMessage, ToolExecutionStatus, TuiApp,
+    ChatMessage, MessageRole, SubagentRuntimeView, TaskRuntimeRequirementView, TaskRuntimeTaskView,
+    TaskRuntimeView, ToolExecutionMessage, ToolExecutionStatus, TuiApp, TuiTurnRequest,
 };
 use crate::agent_handle::AgentHandle;
 use crate::tui::clipboard;
@@ -28,6 +28,11 @@ use echo_agent::agent::subagent::SubagentEvent;
 use echo_agent::tools::ToolFailure;
 use echo_agent_app_core::chat_driver::TurnOutcome;
 use echo_agent_app_core::context_window::ContextWindowSnapshot;
+use echo_agent_app_core::conversation_input::{
+    ConversationInputAddress, ConversationInputAttempt, ConversationInputFact,
+    ConversationInputPhase, ConversationInputProjection, ConversationInputReceipt,
+    ConversationInputSource, stable_scoped_input_id,
+};
 use echo_agent_app_core::foreground_turn::{
     ForegroundTurnLease, ForegroundTurnSnapshot, ForegroundTurnSurface,
 };
@@ -348,6 +353,7 @@ enum AgentEvent {
     Notice(String),
     Execution(echo_agent_app_core::tasks::task_runtime::executor::ExecEvent),
     TurnStatus(String),
+    ConversationInputReceipt(Box<ConversationInputReceipt>),
     /// The sole TUI lifecycle terminal, emitted after the driver settles.
     TurnSettled {
         turn_id: String,
@@ -619,6 +625,9 @@ pub async fn run_event_loop(
 
         if last_runtime_refresh.elapsed() >= Duration::from_millis(250) {
             refresh_task_runtime_view(app).await;
+            if let Ok(address) = tui_conversation_input_address(app) {
+                refresh_conversation_input_frontier(app, &address).await;
+            }
             last_runtime_refresh = Instant::now();
         }
 
@@ -874,9 +883,20 @@ pub async fn run_event_loop(
                 AgentEvent::TurnStatus(status) => {
                     app.status_msg = status;
                 }
+                AgentEvent::ConversationInputReceipt(receipt) => {
+                    let service = app
+                        .app_state
+                        .as_ref()
+                        .map(|state| state.conversation_inputs());
+                    render_conversation_input_receipt(app, *receipt, service).await;
+                }
                 AgentEvent::TurnSettled { turn_id, outcome } => {
-                    if apply_turn_settlement(app, &turn_id, &outcome) {
-                        dispatch_next_queued(app, &agent, agent_tx.clone()).await;
+                    let settled_address = tui_conversation_input_address(app).ok();
+                    if apply_turn_settlement(app, &turn_id, &outcome)
+                        && let Some(address) = settled_address
+                    {
+                        dispatch_next_conversation_input(app, &agent, agent_tx.clone(), address)
+                            .await;
                     }
                 }
                 AgentEvent::ExecutionPath {
@@ -901,8 +921,18 @@ pub async fn run_event_loop(
             }
         }
 
-        if !app.is_processing && !app.queued_turns.is_empty() {
-            dispatch_next_queued(app, &agent, agent_tx.clone()).await;
+        if app.conversation_input_queue_len() > 0
+            && let Ok(address) = tui_conversation_input_address(app)
+        {
+            match authoritative_tui_foreground(app, &address) {
+                Ok(None) => {
+                    dispatch_next_conversation_input(app, &agent, agent_tx.clone(), address).await;
+                }
+                Ok(Some(_)) => {}
+                Err(error) => {
+                    app.status_msg = format!("Foreground projection unavailable: {error}")
+                }
+            }
         }
 
         // Handle events.
@@ -1498,7 +1528,7 @@ async fn handle_enter(
         None => return,
     };
     if text.starts_with('/') {
-        if app.is_processing && !slash_command_allowed_while_busy(&text) {
+        if active_tui_turn(app).is_ok() && !slash_command_allowed_while_busy(&text) {
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: "Agent 正在运行。请先按 Esc 中断，或等待当前轮结束后再执行该命令。"
@@ -1515,59 +1545,437 @@ async fn handle_enter(
         return;
     }
 
-    let turn = QueuedTurn {
-        text,
-        attachments: std::mem::take(&mut app.pending_attachments),
-        interaction_mode: app.interaction_mode,
-        run_resume: None,
-    };
-    if app.is_processing {
-        let preview: String = turn.text.chars().take(60).collect();
-        app.queued_turns.push_back(turn);
-        app.status_msg = format!("运行中 · 已排队 {} 条", app.queued_turns.len());
-        tracing::info!(queued = app.queued_turns.len(), preview, "TUI turn queued");
-        return;
-    }
-    if let TurnDispatchResult::Rejected { turn, error, .. } =
-        dispatch_turn(app, agent, agent_tx, turn).await
+    let attachments = std::mem::take(&mut app.pending_attachments);
+    if let Err(error) =
+        submit_tui_conversation_input(app, agent, agent_tx, text.clone(), attachments.clone()).await
     {
-        restore_undispatched_turn(app, *turn, error);
+        restore_undispatched_turn(
+            app,
+            TuiTurnRequest {
+                text,
+                attachments,
+                run_resume: None,
+                input_attempt: None,
+            },
+            error,
+        );
     }
+}
+
+fn tui_conversation_input_address(app: &TuiApp) -> Result<ConversationInputAddress, String> {
+    let active = active_tui_turn(app).ok();
+    let workspace_id = active
+        .as_ref()
+        .map(|snapshot| snapshot.workspace_id.as_str())
+        .or_else(|| Some(app.workspace_execution_scope.workspace_id()))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "TUI workspace identity is unavailable".to_string())?;
+    let conversation_id = active
+        .as_ref()
+        .map(|snapshot| snapshot.conversation_id.as_str())
+        .or(app.conversation_id.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "TUI conversation identity is unavailable".to_string())?;
+    Ok(ConversationInputAddress {
+        workspace_id: workspace_id.to_string(),
+        conversation_id: conversation_id.to_string(),
+    })
+}
+
+fn exact_active_turn_for_address(
+    snapshot: Option<&ForegroundTurnSnapshot>,
+    address: &ConversationInputAddress,
+) -> Option<String> {
+    snapshot
+        .filter(|snapshot| {
+            snapshot.workspace_id == address.workspace_id
+                && snapshot.conversation_id == address.conversation_id
+        })
+        .map(|snapshot| snapshot.active_turn_id.clone())
+}
+
+fn authoritative_tui_foreground(
+    app: &TuiApp,
+    address: &ConversationInputAddress,
+) -> Result<Option<ForegroundTurnSnapshot>, String> {
+    let state = app
+        .app_state
+        .as_ref()
+        .ok_or_else(|| "TUI application state is unavailable".to_string())?;
+    Ok(state.session.foreground_turns.snapshot_scoped(
+        &address.workspace_id,
+        ForegroundTurnSurface::Tui,
+        &address.conversation_id,
+    ))
+}
+
+async fn submit_tui_conversation_input(
+    app: &mut TuiApp,
+    agent: &AgentHandle,
+    agent_tx: mpsc::UnboundedSender<AgentEvent>,
+    text: String,
+    attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
+) -> Result<(), String> {
+    let app_state = app
+        .app_state
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "TUI application state is unavailable".to_string())?;
+    let address = tui_conversation_input_address(app)?;
+    let attachment_data = app_state
+        .session
+        .product_data_io
+        .run("read TUI conversation input attachments", {
+            let attachments = attachments.clone();
+            move || echo_agent_app_core::attachments::attachment_refs_to_data(&attachments)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    let external_id = uuid::Uuid::new_v4().to_string();
+    let input_id = stable_scoped_input_id(&address, ConversationInputSource::Tui, &external_id)
+        .map_err(|error| error.to_string())?;
+    let _submitted = app_state
+        .conversation_inputs()
+        .submit(address.clone(), input_id, text, attachment_data)
+        .await
+        .map_err(|error| error.to_string())?;
+    let retirement = app_state
+        .session
+        .product_data_io
+        .run("retire submitted TUI attachment staging", move || {
+            echo_agent_app_core::attachments::discard_staged_attachment_refs(&attachments)
+        })
+        .await;
+    match retirement {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "failed to retire submitted TUI attachment staging");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "TUI attachment retirement owner was unavailable");
+        }
+    }
+    refresh_conversation_input_frontier(app, &address).await;
+    let active_snapshot = active_tui_turn(app).ok();
+    if let Some(active_turn_id) = exact_active_turn_for_address(active_snapshot.as_ref(), &address)
+    {
+        let projection = match app_state
+            .conversation_inputs()
+            .dispatch_next(&address, active_turn_id)
+            .await
+        {
+            Ok(Some(projection)) => projection,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                app.status_msg = format!("Conversation input dispatch failed: {error}");
+                refresh_conversation_input_frontier(app, &address).await;
+                return Ok(());
+            }
+        };
+        if let Err(error) = steer_conversation_input_projection(
+            app,
+            &app_state,
+            &address,
+            projection.clone(),
+            agent_tx.clone(),
+        )
+        .await
+        {
+            if let Ok(attempt) = exact_conversation_input_attempt(&projection) {
+                let _ = app_state
+                    .conversation_inputs()
+                    .deferred(attempt, error.clone())
+                    .await;
+            }
+            app.status_msg = format!("Conversation input deferred: {error}");
+            refresh_conversation_input_frontier(app, &address).await;
+        }
+    } else {
+        dispatch_next_conversation_input(app, agent, agent_tx, address).await;
+    }
+    Ok(())
+}
+
+async fn refresh_conversation_input_frontier(app: &mut TuiApp, address: &ConversationInputAddress) {
+    let Some(app_state) = app.app_state.as_ref() else {
+        return;
+    };
+    let service = app_state.conversation_inputs();
+    refresh_conversation_input_frontier_with_service(app, &service, address).await;
+}
+
+async fn refresh_conversation_input_frontier_with_service(
+    app: &mut TuiApp,
+    service: &echo_agent_app_core::conversation_input::ConversationInputService,
+    address: &ConversationInputAddress,
+) {
+    match service.list(address).await {
+        Ok(frontier) => app.conversation_input_frontier = Some(frontier),
+        Err(error) => {
+            tracing::warn!(%error, "failed to refresh TUI conversation input frontier");
+            app.status_msg = format!("Conversation input projection unavailable: {error}");
+        }
+    }
+}
+
+async fn render_conversation_input_receipt(
+    app: &mut TuiApp,
+    receipt: ConversationInputReceipt,
+    service: Option<echo_agent_app_core::conversation_input::ConversationInputService>,
+) {
+    let address = receipt.identity.address.clone();
+    app.status_msg = format!(
+        "Input {}: {:?}{}",
+        receipt.identity.input_id,
+        receipt.phase,
+        if receipt.drained { " (drained)" } else { "" }
+    );
+    if let Some(service) = service {
+        refresh_conversation_input_frontier_with_service(app, &service, &address).await;
+    }
+}
+
+fn exact_conversation_input_attempt(
+    projection: &ConversationInputProjection,
+) -> Result<ConversationInputAttempt, String> {
+    Ok(ConversationInputAttempt {
+        identity: projection.receipt.identity.clone(),
+        attempt: projection
+            .receipt
+            .attempt
+            .ok_or_else(|| "conversation input attempt ordinal is missing".to_string())?,
+        attempt_id: projection
+            .receipt
+            .attempt_id
+            .clone()
+            .ok_or_else(|| "conversation input attempt id is missing".to_string())?,
+        turn_id: projection
+            .receipt
+            .turn_id
+            .clone()
+            .ok_or_else(|| "conversation input turn id is missing".to_string())?,
+        observation: Default::default(),
+    })
+}
+
+async fn stage_conversation_input_attachments(
+    app_state: &echo_agent_app_core::state::AppState,
+    workspace_root: std::path::PathBuf,
+    attachments: Vec<echo_agent_app_core::types::AttachmentData>,
+) -> Result<Vec<echo_agent_app_core::attachments::AttachmentRef>, String> {
+    app_state
+        .session
+        .product_data_io
+        .run("stage TUI conversation input attachments", move || {
+            let uploads = echo_agent_app_core::attachments::resolve_uploads_dir(Some(
+                workspace_root.as_path(),
+            ));
+            let saved = echo_agent_app_core::attachments::save_attachments(&attachments, &uploads)?;
+            Ok::<_, echo_agent_app_core::attachments::AttachmentError>(
+                saved
+                    .iter()
+                    .map(|(path, attachment)| {
+                        echo_agent_app_core::attachments::AttachmentRef::from_saved(
+                            path.clone(),
+                            attachment,
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RegisteredTuiSteerError {
+    Registration(String),
+    Handoff(String),
+}
+
+async fn execute_registered_tui_steer<Effect, EffectFuture, ResultValue>(
+    registration: Result<(), echo_agent_app_core::foreground_turn::ForegroundTurnError>,
+    effect: Effect,
+    handoff: tokio::sync::oneshot::Sender<ResultValue>,
+) -> Result<(), RegisteredTuiSteerError>
+where
+    Effect: FnOnce() -> EffectFuture,
+    EffectFuture: std::future::Future<Output = ResultValue>,
+{
+    registration.map_err(|error| RegisteredTuiSteerError::Registration(error.to_string()))?;
+    let result = effect().await;
+    handoff.send(result).map_err(|_| {
+        RegisteredTuiSteerError::Handoff(
+            "tracked steer observer ended before receipt handoff".to_string(),
+        )
+    })
+}
+
+async fn steer_conversation_input_projection(
+    app: &mut TuiApp,
+    app_state: &echo_agent_app_core::state::AppState,
+    address: &ConversationInputAddress,
+    projection: ConversationInputProjection,
+    agent_tx: mpsc::UnboundedSender<AgentEvent>,
+) -> Result<(), String> {
+    let attempt = exact_conversation_input_attempt(&projection)?;
+    let execution_root = app
+        .active_turn_execution_root
+        .clone()
+        .ok_or_else(|| "TUI active execution root is unavailable".to_string())?;
+    let refs = stage_conversation_input_attachments(
+        app_state,
+        execution_root.clone(),
+        projection.payload.attachments.clone(),
+    )
+    .await?;
+    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(
+        execution_root.as_path(),
+    ));
+    let prepared = echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
+        echo_agent_app_core::prepared_turn::UserTurnInput {
+            text: &projection.payload.text,
+            attachments: &refs,
+            spill_dir: &spill_dir,
+            conversation_id: Some(&address.conversation_id),
+            turn_id: Some(&attempt.turn_id),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let message = prepared.to_message().map_err(|error| error.to_string())?;
+    let agent = app
+        .active_turn_agent
+        .as_ref()
+        .ok_or_else(|| "TUI active Agent is unavailable".to_string())?;
+    let service = app_state.conversation_inputs();
+    let observer_attempt = attempt.clone();
+    let receipt_tx = agent_tx;
+    let (steer_tx, steer_rx) = tokio::sync::oneshot::channel();
+    let observer = async move {
+        let result = match steer_rx.await {
+            Ok(result) => result,
+            Err(error) => {
+                let detail = format!("tracked steer handoff failed: {error}");
+                service
+                    .recovery_required(observer_attempt.clone(), detail.clone())
+                    .await
+                    .map_err(|projection| {
+                        format!("{detail}; recovery projection also failed: {projection}")
+                    })?;
+                return Err(detail);
+            }
+        };
+        let receipt = service
+            .observe_steer_through_drain(observer_attempt, result)
+            .await
+            .map_err(|error| error.to_string())?;
+        receipt_tx
+            .send(AgentEvent::ConversationInputReceipt(Box::new(receipt)))
+            .map_err(|_| "TUI conversation input receipt receiver closed".to_string())?;
+        Ok(())
+    };
+    let terminal_service = app_state.conversation_inputs();
+    let terminal_attempt = attempt.clone();
+    let terminal_projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+        Arc::new(move |outcome| {
+            let service = terminal_service.clone();
+            let attempt = terminal_attempt.clone();
+            Box::pin(async move {
+                service
+                    .settle_attempt(&attempt, &outcome)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        });
+    let registration = app_state
+        .session
+        .foreground_turns
+        .supervise_input_lifecycle_scoped(
+            &address.workspace_id,
+            ForegroundTurnSurface::Tui,
+            &address.conversation_id,
+            &attempt.turn_id,
+            observer,
+            terminal_projector,
+        );
+    match execute_registered_tui_steer(
+        registration,
+        || agent.steer_input_tracked(Some(&attempt.turn_id), message),
+        steer_tx,
+    )
+    .await
+    {
+        Ok(()) => {
+            app.status_msg = format!(
+                "Input {} accepted for observation",
+                projection.receipt.identity.input_id
+            );
+        }
+        Err(RegisteredTuiSteerError::Registration(error)) => {
+            let detail = format!("foreground input observer admission failed: {error}");
+            app_state
+                .conversation_inputs()
+                .deferred(attempt, detail.clone())
+                .await
+                .map_err(|settlement| settlement.to_string())?;
+            app.status_msg = detail;
+        }
+        Err(RegisteredTuiSteerError::Handoff(detail)) => {
+            app_state
+                .conversation_inputs()
+                .recovery_required(attempt, detail.clone())
+                .await
+                .map_err(|settlement| settlement.to_string())?;
+            app.status_msg = detail;
+        }
+    }
+    refresh_conversation_input_frontier(app, address).await;
+    Ok(())
 }
 
 enum TurnDispatchResult {
     Started,
     Rejected {
-        turn: Box<QueuedTurn>,
+        turn: Box<TuiTurnRequest>,
         error: String,
-        retryable: bool,
     },
 }
 
-fn tui_admission_error_is_retryable(
-    error: &echo_agent_app_core::state::ScopedChatTurnError,
-) -> bool {
-    matches!(
-        error,
-        echo_agent_app_core::state::ScopedChatTurnError::Control(
-            echo_agent_app_core::state::ScopedControlError::WorkspaceTransition
-        ) | echo_agent_app_core::state::ScopedChatTurnError::Conversation(
-            echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
-                echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy { .. }
-                    | echo_agent_app_core::foreground_turn::ForegroundTurnError::AdmissionSuspended
-            )
-        )
-    )
+async fn settle_rejected_tui_turn(
+    lease: ForegroundTurnLease,
+    code: &'static str,
+    detail: String,
+) -> String {
+    let requested = TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+        code,
+        detail.clone(),
+    ));
+    match lease.settle_after_observers(requested).await {
+        Ok(settlement) => match settlement.outcome {
+            TurnOutcome::Failed(failure) if failure.code != code => {
+                format!("{detail}; terminal [{}]: {}", failure.code, failure.message)
+            }
+            _ => detail,
+        },
+        Err(error) => format!("{detail}; foreground settlement debt: {error}"),
+    }
 }
 
 async fn dispatch_turn(
     app: &mut TuiApp,
     _agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
-    turn: QueuedTurn,
+    turn: TuiTurnRequest,
 ) -> TurnDispatchResult {
-    let turn_id = uuid::Uuid::new_v4().to_string();
-    let run_turn_binding = run_turn_binding_for_queued_turn(&turn, &turn_id);
+    let turn_id = turn
+        .input_attempt
+        .as_ref()
+        .map(|attempt| attempt.turn_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let run_turn_binding = run_turn_binding_for_request(&turn, &turn_id);
     let planned_resume = turn
         .run_resume
         .as_ref()
@@ -1579,7 +1987,6 @@ async fn dispatch_turn(
             return TurnDispatchResult::Rejected {
                 turn: Box::new(turn),
                 error: "TUI application state is unavailable".to_string(),
-                retryable: false,
             };
         }
     };
@@ -1589,11 +1996,9 @@ async fn dispatch_turn(
             Ok(admission) => admission,
             Err(error) => {
                 tracing::warn!(%error, turn_id, "failed to acquire TUI foreground turn");
-                let retryable = tui_admission_error_is_retryable(&error);
                 return TurnDispatchResult::Rejected {
                     turn: Box::new(turn),
                     error: format!("Unable to start foreground turn: {error}"),
-                    retryable,
                 };
             }
         };
@@ -1616,13 +2021,30 @@ async fn dispatch_turn(
             Ok(())
         };
         if let Err(detail) = validation {
-            lease.settle(TurnOutcome::Failed(
-                echo_agent::error::AgentFailure::message("task_run_resume", detail.clone()),
-            ));
+            let detail = settle_rejected_tui_turn(lease, "task_run_resume", detail).await;
             return TurnDispatchResult::Rejected {
                 turn: Box::new(turn),
                 error: detail,
-                retryable: false,
+            };
+        }
+    }
+    if let Some(attempt) = turn.input_attempt.as_ref() {
+        let address = &attempt.identity.address;
+        if address.workspace_id != scoped_runtime.execution_scope().workspace_id()
+            || address.conversation_id != conversation_id
+        {
+            let detail = format!(
+                "Conversation input {} targets {}/{}, but TUI dispatch resolved {}/{}",
+                attempt.identity.input_id,
+                address.workspace_id,
+                address.conversation_id,
+                scoped_runtime.execution_scope().workspace_id(),
+                conversation_id
+            );
+            let detail = settle_rejected_tui_turn(lease, "conversation_input", detail).await;
+            return TurnDispatchResult::Rejected {
+                turn: Box::new(turn),
+                error: detail,
             };
         }
     }
@@ -1630,13 +2052,10 @@ async fn dispatch_turn(
         Ok(execution) => execution,
         Err(error) => {
             let detail = format!("TUI AgentPool admission failed: {error}");
-            lease.settle(TurnOutcome::Failed(
-                echo_agent::error::AgentFailure::message("agent_pool", detail.clone()),
-            ));
+            let detail = settle_rejected_tui_turn(lease, "agent_pool", detail).await;
             return TurnDispatchResult::Rejected {
                 turn: Box::new(turn),
                 error: detail,
-                retryable: true,
             };
         }
     };
@@ -1653,13 +2072,10 @@ async fn dispatch_turn(
         {
             tracing::warn!(error = %error, conversation_id, "failed to ensure TUI conversation metadata");
             let detail = format!("Unable to persist TUI conversation metadata: {error}");
-            lease.settle(TurnOutcome::Failed(
-                echo_agent::error::AgentFailure::message("conversation_store", detail.clone()),
-            ));
+            let detail = settle_rejected_tui_turn(lease, "conversation_store", detail).await;
             return TurnDispatchResult::Rejected {
                 turn: Box::new(turn),
                 error: detail,
-                retryable: false,
             };
         }
     }
@@ -1690,17 +2106,14 @@ async fn dispatch_turn(
         Err(error) => {
             tracing::warn!(%error, "failed to prepare TUI user turn");
             let detail = format!("Failed to prepare user turn: {error}");
-            lease.settle(TurnOutcome::Failed(
-                echo_agent::error::AgentFailure::message("prepared_turn", detail.clone()),
-            ));
+            let detail = settle_rejected_tui_turn(lease, "prepared_turn", detail).await;
             return TurnDispatchResult::Rejected {
                 turn: Box::new(turn),
                 error: detail,
-                retryable: false,
             };
         }
     };
-    let retry_turn = queued_turn_from_prepared(&turn, &prepared);
+    let retry_turn = request_from_prepared(&turn, &prepared);
     let task_attachments = prepared.inline_attachment_refs();
     let display_text = if turn.text.is_empty() {
         format!("[{} attachment(s)]", turn.attachments.len())
@@ -1721,7 +2134,7 @@ async fn dispatch_turn(
         // Bind staged refs so subagents in an autonomous run see them too.
         attachments: task_attachments,
         cancel: lease.cancellation_token(),
-        interaction_mode: turn.interaction_mode,
+        interaction_mode: app.interaction_mode,
         review_integration: scoped_runtime.review_integration(),
         layer_manager: None,
         memory_generation: None,
@@ -1736,16 +2149,24 @@ async fn dispatch_turn(
     let active_turn_execution_root = scoped_runtime.execution_scope().root().to_path_buf();
     let scoped_runtime_guard = scoped_runtime.clone();
     let settled_turn_id = turn_id.clone();
+    let input_observation = turn
+        .input_attempt
+        .clone()
+        .map(|attempt| (app_state.conversation_inputs(), attempt));
     if let Err(error) = foreground_turns.supervise(lease, move |lease| async move {
         let _scoped_runtime_guard = scoped_runtime_guard;
         let outcome = match std::panic::AssertUnwindSafe(send_to_agent(
             &agent_owned,
             prepared,
             res,
-            lease,
-            run_turn_binding,
-            planned_resume,
-            pool_execution,
+            TuiAgentTurnContext {
+                lease,
+                run_turn_binding,
+                planned_resume,
+                pool_execution,
+                input_observation,
+                receipt_tx: agent_tx.clone(),
+            },
         ))
         .catch_unwind()
         .await
@@ -1764,7 +2185,6 @@ async fn dispatch_turn(
         return TurnDispatchResult::Rejected {
             turn: Box::new(retry_turn),
             error: format!("Unable to supervise foreground turn: {error}"),
-            retryable: false,
         };
     }
     app.start_turn(&display_text);
@@ -1776,15 +2196,15 @@ async fn dispatch_turn(
     TurnDispatchResult::Started
 }
 
-fn queued_turn_from_prepared(
-    turn: &QueuedTurn,
+fn request_from_prepared(
+    turn: &TuiTurnRequest,
     prepared: &echo_agent_app_core::prepared_turn::PreparedUserTurn,
-) -> QueuedTurn {
-    QueuedTurn {
+) -> TuiTurnRequest {
+    TuiTurnRequest {
         text: prepared.instruction.clone(),
         attachments: prepared.inline_attachment_refs(),
-        interaction_mode: turn.interaction_mode,
         run_resume: turn.run_resume.clone(),
+        input_attempt: turn.input_attempt.clone(),
     }
 }
 
@@ -1831,7 +2251,7 @@ async fn begin_tui_foreground_turn(
     Ok((runtime, conversation_id, lease))
 }
 
-fn restore_undispatched_turn(app: &mut TuiApp, turn: QueuedTurn, error: String) {
+fn restore_undispatched_turn(app: &mut TuiApp, turn: TuiTurnRequest, error: String) {
     app.pending_attachments.extend(turn.attachments);
     if !turn.text.is_empty() {
         if app.history.last().is_some_and(|entry| entry == &turn.text) {
@@ -1880,78 +2300,100 @@ fn active_tui_turn(app: &TuiApp) -> Result<ForegroundTurnSnapshot, String> {
     Ok(snapshot)
 }
 
-fn active_tui_input_scope(app: &TuiApp) -> Result<(&std::path::Path, &str), String> {
-    let execution_root = app
-        .active_turn_execution_root
-        .as_deref()
-        .ok_or_else(|| "TUI active execution root is unavailable".to_string())?;
-    let conversation_id = app
-        .active_turn_conversation_id
-        .as_deref()
-        .ok_or_else(|| "TUI active conversation identity is unavailable".to_string())?;
-    Ok((execution_root, conversation_id))
-}
-
-async fn dispatch_next_queued(
+async fn dispatch_next_conversation_input(
     app: &mut TuiApp,
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
+    address: ConversationInputAddress,
 ) {
-    let Some(turn) = app.queued_turns.pop_front() else {
+    let Some(app_state) = app.app_state.as_ref().cloned() else {
         return;
     };
-    let result = dispatch_turn(app, agent, agent_tx, turn).await;
-    project_queued_dispatch(app, result);
-}
-
-fn project_queued_dispatch(app: &mut TuiApp, result: TurnDispatchResult) {
-    match result {
-        TurnDispatchResult::Started => {}
-        TurnDispatchResult::Rejected {
-            turn,
-            error,
-            retryable: true,
-        } => {
-            app.queued_turns.push_front(*turn);
-            app.status_msg = format!("Queued turn is waiting for admission: {error}");
+    let service = app_state.conversation_inputs();
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let projection = match service.dispatch_next(&address, turn_id).await {
+        Ok(projection) => projection,
+        Err(error) => {
+            app.status_msg = format!("Conversation input dispatch failed: {error}");
+            refresh_conversation_input_frontier(app, &address).await;
+            return;
         }
-        TurnDispatchResult::Rejected {
-            error,
-            retryable: false,
-            ..
-        } => {
-            app.messages.push(ChatMessage {
-                role: MessageRole::System,
-                content: error,
-            });
-            app.rebuild_message_groups();
+    };
+    let Some(projection) = projection else {
+        refresh_conversation_input_frontier(app, &address).await;
+        return;
+    };
+    let attempt = match exact_conversation_input_attempt(&projection) {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            app.status_msg = error;
+            refresh_conversation_input_frontier(app, &address).await;
+            return;
         }
+    };
+    let attachments = match stage_conversation_input_attachments(
+        &app_state,
+        app.workspace_execution_scope.root().to_path_buf(),
+        projection.payload.attachments.clone(),
+    )
+    .await
+    {
+        Ok(attachments) => attachments,
+        Err(error) => {
+            let _ = service.deferred(attempt, error.clone()).await;
+            app.status_msg = format!("Conversation input staging deferred: {error}");
+            refresh_conversation_input_frontier(app, &address).await;
+            return;
+        }
+    };
+    let result = dispatch_turn(
+        app,
+        agent,
+        agent_tx,
+        TuiTurnRequest {
+            text: projection.payload.text,
+            attachments,
+            run_resume: None,
+            input_attempt: Some(attempt.clone()),
+        },
+    )
+    .await;
+    if let TurnDispatchResult::Rejected { turn, error, .. } = result {
+        if let Err(settlement_error) = service.deferred(attempt, error.clone()).await {
+            tracing::warn!(%settlement_error, "failed to defer rejected TUI conversation input");
+        }
+        let attachments = turn.attachments;
+        let cleanup = app_state
+            .session
+            .product_data_io
+            .run("clean rejected TUI conversation input staging", move || {
+                echo_agent_app_core::attachments::discard_staged_attachment_refs(&attachments)
+            })
+            .await;
+        if !matches!(cleanup, Ok(Ok(()))) {
+            tracing::warn!(?cleanup, "failed to clean rejected TUI input staging");
+        }
+        app.status_msg = format!("Conversation input is waiting for admission: {error}");
+        refresh_conversation_input_frontier(app, &address).await;
     }
 }
 
-fn queue_steer_follow_up(
-    app: &mut TuiApp,
-    instruction: &str,
-    attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
-) {
-    app.queued_turns.push_back(QueuedTurn {
-        text: instruction.to_string(),
-        attachments,
-        interaction_mode: app.interaction_mode,
-        run_resume: None,
-    });
-    app.status_msg = format!(
-        "Current stage is not steerable; queued {} follow-up(s)",
-        app.queued_turns.len()
-    );
-}
-
-fn queue_prepared_steer_follow_up(app: &mut TuiApp, turn: QueuedTurn) {
-    app.queued_turns.push_back(turn);
-    app.status_msg = format!(
-        "Current stage is not steerable; queued {} follow-up(s)",
-        app.queued_turns.len()
-    );
+fn format_conversation_input_fact(fact: &ConversationInputFact) -> String {
+    let phase = match fact {
+        ConversationInputFact::Persisted { .. } => ConversationInputPhase::Persisted,
+        ConversationInputFact::AttemptStarted { .. } => ConversationInputPhase::AttemptStarted,
+        ConversationInputFact::MailboxAccepted { .. } => ConversationInputPhase::MailboxAccepted,
+        ConversationInputFact::Drained { .. } => ConversationInputPhase::Drained,
+        ConversationInputFact::TurnSettled { .. } => ConversationInputPhase::TurnSettled,
+        ConversationInputFact::Deferred { .. } => ConversationInputPhase::Deferred,
+        ConversationInputFact::RecoveryRequired { .. } => ConversationInputPhase::RecoveryRequired,
+        ConversationInputFact::Reordered { .. } => ConversationInputPhase::Persisted,
+        ConversationInputFact::Cancelled { .. } => ConversationInputPhase::Cancelled,
+    };
+    if matches!(fact, ConversationInputFact::Reordered { .. }) {
+        return format!("Input order updated around {}", fact.identity().input_id);
+    }
+    format!("Input {}: {phase:?}", fact.identity().input_id)
 }
 
 fn slash_command_allowed_while_busy(text: &str) -> bool {
@@ -2540,6 +2982,9 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
         let mapped = match event {
             ChatDriverEvent::Execution(event) => AgentEvent::Execution(event),
             ChatDriverEvent::TurnStatus { status } => AgentEvent::TurnStatus(status),
+            ChatDriverEvent::InputLifecycle(fact) => {
+                AgentEvent::Notice(format_conversation_input_fact(&fact))
+            }
             ChatDriverEvent::ExecutionPath {
                 requested_mode,
                 observed_path,
@@ -2566,15 +3011,6 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 goal,
                 new_message,
             },
-            ChatDriverEvent::InputQueued { input_id, .. } => {
-                AgentEvent::Notice(format!("Input queued: {input_id}"))
-            }
-            ChatDriverEvent::InputRemoved { input_id } => {
-                AgentEvent::Notice(format!("Queued input removed: {input_id}"))
-            }
-            ChatDriverEvent::InputReordered { .. } => {
-                AgentEvent::Notice("Queued inputs reordered".to_string())
-            }
             ChatDriverEvent::ApprovalRequest {
                 request_id,
                 tool_name,
@@ -2768,16 +3204,48 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
     }
 }
 
-async fn send_to_agent(
-    agent: &AgentHandle,
-    turn: echo_agent_app_core::prepared_turn::PreparedUserTurn,
-    res: std::sync::Arc<echo_agent_app_core::chat_resources::ChatResources>,
+struct TuiAgentTurnContext {
     lease: ForegroundTurnLease,
     run_turn_binding: Option<echo_agent_app_core::tasks::task_runtime::RunTurnBinding>,
     planned_resume: Option<echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity>,
     pool_execution: echo_agent_app_core::agent_pool::AgentPoolExecutionLease,
+    input_observation: Option<(
+        echo_agent_app_core::conversation_input::ConversationInputService,
+        ConversationInputAttempt,
+    )>,
+    receipt_tx: mpsc::UnboundedSender<AgentEvent>,
+}
+
+async fn settle_planned_resume_foreground(
+    lease: ForegroundTurnLease,
+    outcome: TurnOutcome,
 ) -> TurnOutcome {
-    use echo_agent_app_core::foreground_turn::{drive_foreground_chat, drive_foreground_chat_turn};
+    match lease.settle_after_observers(outcome).await {
+        Ok(settlement) => settlement.outcome,
+        Err(error) => TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+            "planned_resume_settlement",
+            error.to_string(),
+        )),
+    }
+}
+
+async fn send_to_agent(
+    agent: &AgentHandle,
+    turn: echo_agent_app_core::prepared_turn::PreparedUserTurn,
+    res: std::sync::Arc<echo_agent_app_core::chat_resources::ChatResources>,
+    context: TuiAgentTurnContext,
+) -> TurnOutcome {
+    use echo_agent_app_core::foreground_turn::{
+        drive_foreground_chat, drive_foreground_chat_turn, drive_foreground_chat_with_ingress,
+    };
+    let TuiAgentTurnContext {
+        lease,
+        run_turn_binding,
+        planned_resume,
+        pool_execution,
+        input_observation,
+        receipt_tx,
+    } = context;
 
     // TUI does not classify chat versus task locally. The shared foreground
     // driver owns TaskRuntime, memory-generation, and pool admission, while
@@ -2823,12 +3291,43 @@ async fn send_to_agent(
                 error,
             )),
         };
-        lease.settle(outcome.clone());
-        return outcome;
+        return settle_planned_resume_foreground(lease, outcome).await;
     }
     let _pool_execution = pool_execution;
     let result = if let Some(binding) = run_turn_binding {
         drive_foreground_chat_turn(lease, agent, &turn, res, binding).await
+    } else if let Some((service, attempt)) = input_observation {
+        let observer_service = service.clone();
+        let observer_attempt = attempt.clone();
+        let observer: echo_agent_app_core::chat_driver::InputReceiptObserver =
+            Arc::new(move |receipt| {
+                let service = observer_service.clone();
+                let attempt = observer_attempt.clone();
+                let receipt_tx = receipt_tx.clone();
+                Box::pin(async move {
+                    let observed = service
+                        .observe_turn_input_through_drain(attempt, receipt)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    receipt_tx
+                        .send(AgentEvent::ConversationInputReceipt(Box::new(observed)))
+                        .map_err(|_| "TUI initial input receipt receiver closed".to_string())?;
+                    Ok(())
+                })
+            });
+        let terminal_attempt = attempt.clone();
+        drive_foreground_chat_with_ingress(lease, agent, &turn, res, observer, move |outcome| {
+            let service = service.clone();
+            let attempt = terminal_attempt.clone();
+            async move {
+                service
+                    .settle_attempt(&attempt, &outcome)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+        })
+        .await
     } else {
         drive_foreground_chat(lease, agent, &turn, res).await
     };
@@ -2841,8 +3340,8 @@ async fn send_to_agent(
     })
 }
 
-fn run_turn_binding_for_queued_turn(
-    turn: &QueuedTurn,
+fn run_turn_binding_for_request(
+    turn: &TuiTurnRequest,
     turn_id: &str,
 ) -> Option<echo_agent_app_core::tasks::task_runtime::RunTurnBinding> {
     turn.run_resume.as_ref().and_then(|resume| {
@@ -5233,99 +5732,17 @@ async fn handle_slash_command(
                 return;
             }
             let attachments = std::mem::take(&mut app.pending_attachments);
-            let snapshot = match active_tui_turn(app) {
-                Ok(snapshot) => snapshot,
-                Err(_) => {
-                    queue_steer_follow_up(app, instruction, attachments);
-                    return;
-                }
-            };
-            let (execution_root, conversation_id) = match active_tui_input_scope(app) {
-                Ok(scope) => scope,
-                Err(_) => {
-                    queue_steer_follow_up(app, instruction, attachments);
-                    return;
-                }
-            };
-            let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(
-                execution_root,
-            ));
-            let prepared = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
-                echo_agent_app_core::prepared_turn::UserTurnInput {
-                    text: instruction,
-                    attachments: &attachments,
-                    spill_dir: &spill_dir,
-                    conversation_id: Some(conversation_id),
-                    turn_id: Some(&snapshot.active_turn_id),
-                },
-            ) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    app.messages.push(ChatMessage {
-                        role: MessageRole::System,
-                        content: format!("Failed to prepare steer input: {error}"),
-                    });
-                    app.pending_attachments = attachments;
-                    return;
-                }
-            };
-            let retry_turn = queued_turn_from_prepared(
-                &QueuedTurn {
-                    text: instruction.to_string(),
-                    attachments: attachments.clone(),
-                    interaction_mode: app.interaction_mode,
-                    run_resume: None,
-                },
-                &prepared,
-            );
-            let message = match prepared.to_message() {
-                Ok(message) => message,
-                Err(error) => {
-                    app.messages.push(ChatMessage {
-                        role: MessageRole::System,
-                        content: format!("Failed to build steer message: {error}"),
-                    });
-                    queue_prepared_steer_follow_up(app, retry_turn);
-                    return;
-                }
-            };
-            let Some(active_agent) = app.active_turn_agent.as_ref() else {
-                queue_prepared_steer_follow_up(app, retry_turn);
-                return;
-            };
-            match active_agent
-                .steer_input_tracked(Some(&snapshot.active_turn_id), message)
-                .await
+            if let Err(error) = submit_tui_conversation_input(
+                app,
+                agent,
+                agent_tx.clone(),
+                instruction.to_string(),
+                attachments.clone(),
+            )
+            .await
             {
-                Ok(mut receipt) => match receipt.wait_for_drained().await {
-                    echo_agent::agent::AgentSteerState::Drained
-                    | echo_agent::agent::AgentSteerState::TurnSettled { drained: true, .. } => {
-                        let turn_id = receipt.turn_id().to_string();
-                        app.messages.push(ChatMessage {
-                            role: MessageRole::User,
-                            content: instruction.to_string(),
-                        });
-                        app.status_msg = format!("Guidance drained into turn {turn_id}");
-                    }
-                    echo_agent::agent::AgentSteerState::Accepted
-                    | echo_agent::agent::AgentSteerState::TurnSettled { drained: false, .. } => {
-                        queue_prepared_steer_follow_up(app, retry_turn);
-                    }
-                },
-                Err(
-                    echo_agent::agent::TurnSteerError::NoActiveTurn
-                    | echo_agent::agent::TurnSteerError::NotSteerable { .. }
-                    | echo_agent::agent::TurnSteerError::TurnMismatch { .. },
-                ) => {
-                    queue_prepared_steer_follow_up(app, retry_turn);
-                }
-                Err(error) => {
-                    queue_prepared_steer_follow_up(app, retry_turn);
-                    app.messages.push(ChatMessage {
-                        role: MessageRole::System,
-                        content: format!("Steer failed: {error}"),
-                    });
-                }
+                app.pending_attachments.extend(attachments);
+                push_system_message(app, format!("Steer submission failed: {error}"));
             }
         }
         Some(SlashCommand::TaskCancel)
@@ -5404,18 +5821,18 @@ async fn handle_slash_command(
                             app,
                             agent,
                             agent_tx.clone(),
-                            QueuedTurn {
+                            TuiTurnRequest {
                                 text: format!(
                                     "Continue the existing TaskRun {run_id} toward its unchanged Goal."
                                 ),
                                 attachments: Vec::new(),
-                                interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Task,
-                                run_resume: Some(crate::tui::QueuedRunResume {
+                                run_resume: Some(crate::tui::TaskRunResumeWake {
                                     identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(
                                         &resume_state,
                                     ),
                                     is_continuation: true,
                                 }),
+                                input_attempt: None,
                             },
                         )
                         .await
@@ -5428,16 +5845,16 @@ async fn handle_slash_command(
                             app,
                             agent,
                             agent_tx.clone(),
-                            QueuedTurn {
+                            TuiTurnRequest {
                                 text: format!(
                                     "Resume the existing TaskRun {run_id} toward its unchanged Goal."
                                 ),
                                 attachments: Vec::new(),
-                                interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Task,
-                                run_resume: Some(crate::tui::QueuedRunResume {
+                                run_resume: Some(crate::tui::TaskRunResumeWake {
                                     identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(&resume_state),
                                     is_continuation: false,
                                 }),
+                                input_attempt: None,
                             },
                         )
                         .await
@@ -6009,19 +6426,14 @@ async fn handle_slash_command(
                 }
                 _ => String::new(),
             };
-            let result = dispatch_turn(
-                app,
-                agent,
-                agent_tx,
-                QueuedTurn {
-                    text: prompt,
-                    attachments: Vec::new(),
-                    interaction_mode: app.interaction_mode,
-                    run_resume: None,
-                },
-            )
-            .await;
-            project_queued_dispatch(app, result);
+            if let Err(error) =
+                submit_tui_conversation_input(app, agent, agent_tx, prompt, Vec::new()).await
+            {
+                push_system_message(
+                    app,
+                    format!("Conversation input submission failed: {error}"),
+                );
+            }
         }
         None => {
             app.messages.push(ChatMessage {
@@ -6855,19 +7267,21 @@ fn parse_interaction_mode(
 #[cfg(test)]
 mod tests {
     use super::{
-        TurnDispatchResult, active_tui_input_scope, apply_turn_settlement, complete_file_reference,
-        delete_previous_word, dispatch_next_queued, format_task_runtime_view,
+        AgentEvent, ConversationInputAddress, ConversationInputFact, ConversationInputPhase,
+        ConversationInputProjection, ForegroundTurnSnapshot, ForegroundTurnSurface,
+        RegisteredTuiSteerError, apply_turn_settlement, complete_file_reference,
+        delete_previous_word, exact_active_turn_for_address, exact_conversation_input_attempt,
+        execute_registered_tui_steer, format_conversation_input_fact, format_task_runtime_view,
         format_unattended_worktrees, handle_approval_key, handle_esc, move_cursor_vertical,
-        parse_interaction_mode, project_queued_dispatch, queue_steer_follow_up,
-        queued_turn_from_prepared, render_cancelled_event, render_error_event,
-        resolve_tui_workspace_file, retry_tui_task, reverse_history_search,
-        run_turn_binding_for_queued_turn, slash_command_allowed_while_busy,
-        tui_admission_error_is_retryable, update_subagent_runs, validate_tui_task_run_scope,
+        parse_interaction_mode, render_cancelled_event, render_conversation_input_receipt,
+        render_error_event, request_from_prepared, resolve_tui_workspace_file, retry_tui_task,
+        reverse_history_search, run_turn_binding_for_request, settle_planned_resume_foreground,
+        slash_command_allowed_while_busy, update_subagent_runs, validate_tui_task_run_scope,
     };
     use crate::tui::{
-        ChatMessage, MessageRole, QueuedRunResume, QueuedTurn, TaskRuntimeRequirementView,
+        ChatMessage, MessageRole, TaskRunResumeWake, TaskRuntimeRequirementView,
         TaskRuntimeTaskView, TaskRuntimeView, Theme, ToolExecutionMessage, ToolExecutionStatus,
-        TuiApp,
+        TuiApp, TuiTurnRequest,
     };
     use echo_agent_app_core::chat_driver::TurnOutcome;
     use echo_agent_app_core::tasks::task_runtime::{
@@ -6876,6 +7290,7 @@ mod tests {
     };
     use std::sync::Arc;
     use std::time::Instant;
+    use tokio::sync::mpsc;
 
     fn app() -> TuiApp {
         let theme =
@@ -7046,12 +7461,6 @@ mod tests {
         let mut app = app();
         app.is_processing = true;
         app.active_turn_id = Some("turn-1".to_string());
-        app.queued_turns.push_back(QueuedTurn {
-            text: "next".to_string(),
-            attachments: Vec::new(),
-            interaction_mode: InteractionMode::Auto,
-            run_resume: None,
-        });
 
         assert!(!apply_turn_settlement(
             &mut app,
@@ -7060,7 +7469,6 @@ mod tests {
         ));
         assert!(app.is_processing);
         assert_eq!(app.active_turn_id.as_deref(), Some("turn-1"));
-        assert_eq!(app.queued_turns.len(), 1);
 
         assert!(apply_turn_settlement(
             &mut app,
@@ -7070,23 +7478,20 @@ mod tests {
         assert!(!app.is_processing);
         assert!(app.active_turn_id.is_none());
         assert_eq!(app.status_msg, "Cancelled");
-        assert_eq!(app.queued_turns.len(), 1);
 
         assert!(!apply_turn_settlement(
             &mut app,
             "turn-1",
             &TurnOutcome::Cancelled
         ));
-        assert_eq!(app.queued_turns.len(), 1);
     }
 
     #[test]
-    fn queued_resume_builds_exact_run_turn_binding() -> Result<(), String> {
-        let turn = QueuedTurn {
+    fn task_run_resume_wake_builds_exact_run_turn_binding() -> Result<(), String> {
+        let turn = TuiTurnRequest {
             text: "continue".to_string(),
             attachments: Vec::new(),
-            interaction_mode: InteractionMode::Task,
-            run_resume: Some(QueuedRunResume {
+            run_resume: Some(TaskRunResumeWake {
                 identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity {
                     run_id: "exact-run".to_string(),
                     workspace_id: "workspace-a".to_string(),
@@ -7099,9 +7504,10 @@ mod tests {
                 },
                 is_continuation: true,
             }),
+            input_attempt: None,
         };
 
-        let binding = run_turn_binding_for_queued_turn(&turn, "new-turn")
+        let binding = run_turn_binding_for_request(&turn, "new-turn")
             .ok_or_else(|| "resume binding missing".to_string())?;
         assert_eq!(
             turn.run_resume
@@ -7124,26 +7530,12 @@ mod tests {
     }
 
     #[test]
-    fn active_steer_scope_ignores_later_workspace_focus_projection() -> Result<(), String> {
-        let mut app = app();
-        app.active_turn_execution_root = Some(std::path::PathBuf::from("/workspace-a"));
-        app.active_turn_conversation_id = Some("conversation-a".to_string());
-        app.workspace_root = Some(std::path::PathBuf::from("/workspace-b"));
-        app.conversation_id = Some("conversation-b".to_string());
-
-        let (root, conversation_id) = active_tui_input_scope(&app)?;
-        assert_eq!(root, std::path::Path::new("/workspace-a"));
-        assert_eq!(conversation_id, "conversation-a");
-        Ok(())
-    }
-
-    #[test]
-    fn supervision_rejection_requeues_prepared_attachment_identity() {
+    fn prepared_request_preserves_scoped_attachment_identity() {
         let staged = std::path::PathBuf::from("/workspace/.eko/uploads/staged.txt");
         let scoped = std::path::PathBuf::from(
             "/workspace/.eko/artifacts/user-input/conversation/turn/scoped.txt",
         );
-        let turn = QueuedTurn {
+        let request = TuiTurnRequest {
             text: "original".to_string(),
             attachments: vec![echo_agent_app_core::attachments::AttachmentRef {
                 path: staged,
@@ -7151,8 +7543,8 @@ mod tests {
                 mime_type: "text/plain".to_string(),
                 source: echo_agent_app_core::types::AttachmentSource::Upload,
             }],
-            interaction_mode: InteractionMode::Auto,
             run_resume: None,
+            input_attempt: None,
         };
         let prepared = echo_agent_app_core::prepared_turn::PreparedUserTurn {
             instruction: "prepared".to_string(),
@@ -7171,7 +7563,7 @@ mod tests {
             authorship: echo_agent_app_core::prepared_turn::InstructionAuthorship::User,
         };
 
-        let retry = queued_turn_from_prepared(&turn, &prepared);
+        let retry = request_from_prepared(&request, &prepared);
 
         assert_eq!(retry.text, "prepared");
         assert_eq!(
@@ -7181,189 +7573,459 @@ mod tests {
     }
 
     #[test]
-    fn retryable_fifo_rejection_preserves_head_attachments_and_editor_draft() {
+    fn durable_frontier_is_the_only_tui_queue_projection() -> Result<(), String> {
         let mut app = app();
-        app.input = "draft still being edited".to_string();
+        app.input = "unsubmitted editor draft".to_string();
         app.cursor = app.input.len();
-        let attachment = echo_agent_app_core::attachments::AttachmentRef {
-            path: std::path::PathBuf::from("/tmp/queued.txt"),
-            name: "queued.txt".to_string(),
-            mime_type: "text/plain".to_string(),
-            source: echo_agent_app_core::types::AttachmentSource::Upload,
+        let address = ConversationInputAddress {
+            workspace_id: "workspace-a".to_string(),
+            conversation_id: "conversation-a".to_string(),
         };
-        let first = QueuedTurn {
-            text: "first".to_string(),
-            attachments: vec![attachment],
-            interaction_mode: InteractionMode::Auto,
-            run_resume: None,
+        let identity = echo_agent_app_core::conversation_input::ConversationInputIdentity {
+            address,
+            input_id: "input-a".to_string(),
+            revision: 1,
+            payload_sha256: "payload-a".to_string(),
         };
-        let second = QueuedTurn {
-            text: "second".to_string(),
-            attachments: Vec::new(),
-            interaction_mode: InteractionMode::Auto,
-            run_resume: None,
-        };
-        app.queued_turns.push_back(second);
-
-        let transition_error = echo_agent_app_core::state::ScopedChatTurnError::Control(
-            echo_agent_app_core::state::ScopedControlError::WorkspaceTransition,
-        );
-        project_queued_dispatch(
-            &mut app,
-            TurnDispatchResult::Rejected {
-                turn: Box::new(first),
-                error: transition_error.to_string(),
-                retryable: tui_admission_error_is_retryable(&transition_error),
+        app.conversation_input_frontier = Some(
+            echo_agent_app_core::conversation_input::ConversationInputFrontier {
+                queue_revision: 1,
+                items: vec![ConversationInputProjection {
+                    receipt: echo_agent_app_core::conversation_input::ConversationInputReceipt {
+                        identity: identity.clone(),
+                        phase: ConversationInputPhase::Persisted,
+                        attempt: None,
+                        attempt_id: None,
+                        turn_id: None,
+                        outcome: None,
+                        drained: false,
+                        reason: None,
+                        duplicate: false,
+                        queue_revision: 1,
+                    },
+                    payload: echo_agent_app_core::conversation_input::ConversationInputPayload {
+                        text: "durable next input".to_string(),
+                        attachments: Vec::new(),
+                        submitted_at_ms: 1,
+                        payload_sha256: identity.payload_sha256,
+                    },
+                    active_attempt: None,
+                }],
             },
         );
+        let mut second = app
+            .conversation_input_frontier
+            .as_ref()
+            .and_then(|frontier| frontier.items.first())
+            .cloned()
+            .ok_or_else(|| "first durable projection missing".to_string())?;
+        second.receipt.identity.input_id = "input-b".to_string();
+        second.payload.text = "durable second input".to_string();
+        if let Some(frontier) = app.conversation_input_frontier.as_mut() {
+            frontier.items.push(second);
+        }
 
-        assert_eq!(app.input, "draft still being edited");
-        assert_eq!(app.cursor, app.input.len());
-        assert_eq!(app.queued_turns.len(), 2);
+        assert_eq!(app.conversation_input_queue_len(), 2);
         assert_eq!(
-            app.queued_turns.front().map(|turn| turn.text.as_str()),
-            Some("first")
+            app.next_conversation_input_preview().as_deref(),
+            Some("durable next input")
         );
-        assert_eq!(
-            app.queued_turns.front().map(|turn| turn.attachments.len()),
-            Some(1)
+        assert_eq!(app.input, "unsubmitted editor draft");
+        assert!(
+            !app.messages
+                .iter()
+                .any(|message| message.content == "durable next input")
         );
-        assert_eq!(
-            app.queued_turns.get(1).map(|turn| turn.text.as_str()),
-            Some("second")
-        );
+
+        let fact = ConversationInputFact::Persisted {
+            identity: app
+                .conversation_input_frontier
+                .as_ref()
+                .and_then(|frontier| frontier.items.first())
+                .map(|item| item.receipt.identity.clone())
+                .ok_or_else(|| "frontier identity missing".to_string())?,
+            payload: app
+                .conversation_input_frontier
+                .as_ref()
+                .and_then(|frontier| frontier.items.first())
+                .map(|item| item.payload.clone())
+                .ok_or_else(|| "frontier payload missing".to_string())?,
+        };
+        assert!(format_conversation_input_fact(&fact).contains("Persisted"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn real_workspace_transition_retains_and_then_starts_queued_turn_once()
-    -> Result<(), String> {
-        let temp = std::env::temp_dir().join(format!("eko-tui-scope-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&temp).map_err(|error| error.to_string())?;
-        let agent = task_test_agent()?;
-        agent
-            .write(|agent| agent.set_conversation_id("conversation-a".to_string()))
-            .await;
-        let conversation_store: Arc<dyn echo_agent::memory::ConversationStore> = Arc::new(
-            echo_agent::memory::FileConversationStore::new(temp.join("conversations"))
-                .map_err(|error| error.to_string())?,
-        );
-        let mcp_runtime = Arc::new(
-            echo_agent_app_core::mcp_config_runtime::McpConfigRuntime::from_snapshot(
-                temp.join("mcp.json"),
-                echo_agent::mcp::McpConfigFile::default(),
-            ),
-        );
-        let mut state = echo_agent_app_core::state::AppState::from_shared(
-            agent.clone(),
-            None,
-            Arc::new(echo_agent_app_core::hitl::HitlDispatcher::new()),
-            Some(conversation_store),
-            None,
-            Default::default(),
-            mcp_runtime,
-            echo_agent_app_core::product_data_io::ProductDataIoService::new(),
-        )
-        .map_err(|error| error.to_string())?;
-        state.tasks.runtime = Some(Arc::new(
-            echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
-                .map_err(|error| error.to_string())?,
-        ));
-        state.storage.chat_events = Arc::new(
-            echo_agent_app_core::chat_event_log::ChatEventLog::open(
-                temp.join("chat-events"),
-                echo_agent_app_core::chat_event_log::ChatEventRetention::default(),
+    async fn typed_receipt_producer_reaches_render_and_refreshes_frontier()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let log = std::sync::Arc::new(echo_agent_app_core::chat_event_log::ChatEventLog::open(
+            temp.path(),
+            echo_agent_app_core::chat_event_log::ChatEventRetention::default(),
+        )?);
+        let service = echo_agent_app_core::conversation_input::ConversationInputService::new(log);
+        let address = ConversationInputAddress {
+            workspace_id: "workspace-receipt".to_string(),
+            conversation_id: "conversation-receipt".to_string(),
+        };
+        let receipt = service
+            .submit(
+                address.clone(),
+                "input-receipt".to_string(),
+                "refresh from typed receipt".to_string(),
+                Vec::new(),
             )
-            .map_err(|error| error.to_string())?,
-        );
-        state.storage.tool_executions = Arc::new(
-            echo_agent_app_core::tool_execution::ToolExecutionRepository::open(
-                temp.join("tool-executions"),
-            )
-            .map_err(|error| error.to_string())?,
-        );
-        let state = Arc::new(state);
+            .await?;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(AgentEvent::ConversationInputReceipt(Box::new(receipt)))?;
         let mut app = app();
-        app.app_state = Some(Arc::clone(&state));
-        std::fs::write(temp.join("queued.txt"), "queued attachment")
-            .map_err(|error| error.to_string())?;
-        app.queued_turns.push_back(QueuedTurn {
-            text: "exactly once".to_string(),
-            attachments: vec![echo_agent_app_core::attachments::AttachmentRef {
-                path: temp.join("queued.txt"),
-                name: "queued.txt".to_string(),
-                mime_type: "text/plain".to_string(),
-                source: echo_agent_app_core::types::AttachmentSource::Upload,
-            }],
-            interaction_mode: InteractionMode::Auto,
-            run_resume: None,
-        });
-        let lifecycle = state.workspace.transition.write().await;
-        let exit_state = Arc::clone(&state);
-        let exit = tokio::spawn(async move { exit_state.exit_workspace().await });
-        while !state.workspace_transition_in_progress() {
-            tokio::task::yield_now().await;
-        }
-        let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
-        dispatch_next_queued(&mut app, &agent, agent_tx.clone()).await;
-        assert_eq!(app.queued_turns.len(), 1);
-        assert_eq!(
-            app.queued_turns.front().map(|turn| turn.text.as_str()),
-            Some("exactly once")
-        );
-        assert_eq!(
-            app.queued_turns.front().map(|turn| turn.attachments.len()),
-            Some(1)
-        );
 
-        drop(lifecycle);
-        exit.await
-            .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string())?;
-        dispatch_next_queued(&mut app, &agent, agent_tx).await;
-        assert!(app.queued_turns.is_empty());
-        assert!(app.is_processing);
-        assert!(
-            app.active_turn_conversation_id
-                .as_deref()
-                .is_some_and(|conversation_id| {
-                    !conversation_id.is_empty() && conversation_id != "conversation-a"
-                })
+        match rx.recv().await {
+            Some(AgentEvent::ConversationInputReceipt(receipt)) => {
+                render_conversation_input_receipt(&mut app, *receipt, Some(service)).await;
+            }
+            Some(_) => return Err("unexpected TUI receipt event".into()),
+            None => return Err("TUI receipt producer closed before delivery".into()),
+        }
+
+        assert!(app.status_msg.contains("Persisted"));
+        let frontier = app
+            .conversation_input_frontier
+            .as_ref()
+            .ok_or("receipt render did not refresh the Frontier")?;
+        assert_eq!(frontier.items.len(), 1);
+        assert_eq!(
+            frontier
+                .items
+                .first()
+                .map(|item| item.receipt.identity.address.clone()),
+            Some(address)
         );
         Ok(())
     }
 
+    #[tokio::test]
+    async fn exact_tui_terminal_projection_survives_stream_cache_eviction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let log = std::sync::Arc::new(echo_agent_app_core::chat_event_log::ChatEventLog::open(
+            temp.path(),
+            echo_agent_app_core::chat_event_log::ChatEventRetention::default(),
+        )?);
+        let service = echo_agent_app_core::conversation_input::ConversationInputService::new(log);
+        let address = ConversationInputAddress {
+            workspace_id: "workspace-eviction".to_string(),
+            conversation_id: "conversation-target".to_string(),
+        };
+        let persisted = service
+            .submit(
+                address.clone(),
+                "input-target".to_string(),
+                "survive eviction".to_string(),
+                Vec::new(),
+            )
+            .await?;
+        let frontier = service.list(&address).await?;
+        let started = service
+            .dispatch_selected(
+                persisted.identity,
+                frontier.queue_revision,
+                "turn-target".to_string(),
+            )
+            .await?;
+        let attempt = exact_conversation_input_attempt(&started)?;
+
+        for index in 0..130u16 {
+            let other = ConversationInputAddress {
+                workspace_id: "workspace-eviction".to_string(),
+                conversation_id: format!("conversation-{index}"),
+            };
+            service
+                .submit(
+                    other,
+                    format!("input-{index}"),
+                    "cache pressure".to_string(),
+                    Vec::new(),
+                )
+                .await?;
+        }
+
+        let receipt = service
+            .settle_attempt(&attempt, &TurnOutcome::Completed)
+            .await?;
+        assert_eq!(receipt.phase, ConversationInputPhase::TurnSettled);
+        assert_eq!(receipt.identity.address, address);
+        Ok(())
+    }
+
     #[test]
-    fn steer_fallback_is_fifo_exact_once_and_memory_only() {
-        let mut current = app();
-        let attachment = echo_agent_app_core::attachments::AttachmentRef {
-            path: std::path::PathBuf::from("/tmp/steer.txt"),
-            name: "steer.txt".to_string(),
-            mime_type: "text/plain".to_string(),
-            source: echo_agent_app_core::types::AttachmentSource::Upload,
+    fn exact_foreground_snapshot_controls_active_idle_routing() {
+        let address = ConversationInputAddress {
+            workspace_id: "workspace-a".to_string(),
+            conversation_id: "conversation-a".to_string(),
+        };
+        let matching = ForegroundTurnSnapshot {
+            workspace_id: address.workspace_id.clone(),
+            surface: ForegroundTurnSurface::Tui,
+            conversation_id: address.conversation_id.clone(),
+            root_turn_id: "root-a".to_string(),
+            active_turn_id: "active-a".to_string(),
+            cancellation_requested: false,
+        };
+        let stale = ForegroundTurnSnapshot {
+            conversation_id: "conversation-b".to_string(),
+            ..matching.clone()
         };
 
-        queue_steer_follow_up(&mut current, "continue with this", vec![attachment]);
-        queue_steer_follow_up(&mut current, "then summarize", Vec::new());
+        assert_eq!(
+            exact_active_turn_for_address(Some(&matching), &address).as_deref(),
+            Some("active-a")
+        );
+        assert!(exact_active_turn_for_address(Some(&stale), &address).is_none());
+        assert!(exact_active_turn_for_address(None, &address).is_none());
+    }
 
-        assert_eq!(current.queued_turns.len(), 2);
-        assert_eq!(
-            current.queued_turns.front().map(|turn| turn.text.as_str()),
-            Some("continue with this")
+    #[test]
+    fn live_input_lifecycle_is_core_supervised_and_non_blocking() {
+        const SOURCE: &str = include_str!("events.rs");
+        let adapter = SOURCE
+            .split("async fn steer_conversation_input_projection")
+            .nth(1)
+            .and_then(|tail| tail.split("enum TurnDispatchResult").next())
+            .unwrap_or_default();
+        assert!(adapter.contains("steer_input_tracked"));
+        assert!(adapter.contains("ConversationInputReceipt"));
+        assert!(adapter.contains("supervise_input_lifecycle_scoped"));
+        assert!(adapter.contains("observe_steer_through_drain"));
+        assert!(adapter.contains("ForegroundTerminalProjector"));
+        assert!(adapter.contains(".settle_attempt("));
+        let registration = adapter
+            .find("supervise_input_lifecycle_scoped")
+            .unwrap_or(usize::MAX);
+        let effect = adapter.find("steer_input_tracked").unwrap_or(0);
+        assert!(registration < effect);
+        assert!(!adapter.contains("effect_accepted"));
+        assert!(!adapter.contains("wait_for_drained"));
+        assert!(!adapter.contains("tokio::spawn"));
+    }
+
+    #[tokio::test]
+    async fn closed_lifecycle_registration_never_executes_the_steer_effect() -> Result<(), String> {
+        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let lease = control
+            .begin_scoped(
+                "workspace-closed",
+                ForegroundTurnSurface::Tui,
+                "conversation-closed",
+                "turn-closed",
+            )
+            .map_err(|error| error.to_string())?;
+        lease
+            .settle_after_observers(TurnOutcome::Completed)
+            .await
+            .map_err(|error| error.to_string())?;
+        let projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+            Arc::new(|_| Box::pin(async { Ok(()) }));
+        let registration = control.supervise_input_lifecycle_scoped(
+            "workspace-closed",
+            ForegroundTurnSurface::Tui,
+            "conversation-closed",
+            "turn-closed",
+            async { Ok(()) },
+            projector,
         );
-        assert_eq!(
-            current
-                .queued_turns
-                .front()
-                .map(|turn| turn.attachments.len()),
-            Some(1)
-        );
-        assert_eq!(
-            current.queued_turns.get(1).map(|turn| turn.text.as_str()),
-            Some("then summarize")
+        let effects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_effects = std::sync::Arc::clone(&effects);
+        let (handoff, _receiver) = tokio::sync::oneshot::channel();
+
+        let result = execute_registered_tui_steer(
+            registration,
+            move || async move {
+                observed_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                "must-not-run"
+            },
+            handoff,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(RegisteredTuiSteerError::Registration(_))
+        ));
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fast_steer_handoff_keeps_owner_through_terminal_projection() -> Result<(), String> {
+        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let lease = control
+            .begin_scoped(
+                "workspace-fast",
+                ForegroundTurnSurface::Tui,
+                "conversation-fast",
+                "turn-fast",
+            )
+            .map_err(|error| error.to_string())?;
+        let waiter = control
+            .settlement_waiter_scoped(
+                "workspace-fast",
+                ForegroundTurnSurface::Tui,
+                "conversation-fast",
+                "turn-fast",
+            )
+            .map_err(|error| error.to_string())?;
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_by_owner = std::sync::Arc::clone(&observed);
+        let projected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let projected_by_owner = std::sync::Arc::clone(&projected);
+        let (handoff, receiver) = tokio::sync::oneshot::channel();
+        let projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+            Arc::new(move |outcome| {
+                let projected = std::sync::Arc::clone(&projected_by_owner);
+                Box::pin(async move {
+                    if outcome == TurnOutcome::Completed {
+                        projected.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(())
+                })
+            });
+        let registration = control.supervise_input_lifecycle_scoped(
+            "workspace-fast",
+            ForegroundTurnSurface::Tui,
+            "conversation-fast",
+            "turn-fast",
+            async move {
+                if receiver.await.map_err(|error| error.to_string())? == "accepted" {
+                    observed_by_owner.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            },
+            projector,
         );
 
-        let restarted = app();
-        assert!(restarted.queued_turns.is_empty());
+        execute_registered_tui_steer(registration, || async { "accepted" }, handoff)
+            .await
+            .map_err(|error| format!("steer handoff failed: {error:?}"))?;
+        lease
+            .settle_after_observers(TurnOutcome::Completed)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(projected.load(std::sync::atomic::Ordering::SeqCst));
+        let settlement = waiter.wait().await.map_err(|error| error.to_string())?;
+        assert_eq!(settlement.outcome, TurnOutcome::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planned_resume_waits_for_registered_live_terminal_projection() -> Result<(), String> {
+        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let lease = control
+            .begin_scoped(
+                "workspace-resume",
+                ForegroundTurnSurface::Tui,
+                "conversation-resume",
+                "turn-resume",
+            )
+            .map_err(|error| error.to_string())?;
+        let waiter = control
+            .settlement_waiter_scoped(
+                "workspace-resume",
+                ForegroundTurnSurface::Tui,
+                "conversation-resume",
+                "turn-resume",
+            )
+            .map_err(|error| error.to_string())?;
+        let (projected, projection_wait) = tokio::sync::oneshot::channel();
+        let projector = Arc::new(std::sync::Mutex::new(Some(projected)));
+        let terminal_projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+            Arc::new(move |outcome| {
+                let projector = Arc::clone(&projector);
+                Box::pin(async move {
+                    if let Some(sender) = projector
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                    {
+                        sender
+                            .send(outcome)
+                            .map_err(|_| "planned resume projection receiver closed".to_string())?;
+                    }
+                    Ok(())
+                })
+            });
+        control
+            .supervise_input_lifecycle_scoped(
+                "workspace-resume",
+                ForegroundTurnSurface::Tui,
+                "conversation-resume",
+                "turn-resume",
+                async { Ok(()) },
+                terminal_projector,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let outcome = settle_planned_resume_foreground(lease, TurnOutcome::Completed).await;
+        assert_eq!(outcome, TurnOutcome::Completed);
+        assert_eq!(
+            projection_wait.await.map_err(|error| error.to_string())?,
+            TurnOutcome::Completed
+        );
+        let settlement = waiter.wait().await.map_err(|error| error.to_string())?;
+        assert_eq!(settlement.outcome, TurnOutcome::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn initial_input_terminal_is_owned_by_ingress_before_ui_settlement() {
+        const SOURCE: &str = include_str!("events.rs");
+        let driver = SOURCE
+            .split("async fn send_to_agent")
+            .nth(1)
+            .and_then(|tail| tail.split("fn run_turn_binding_for_request").next())
+            .unwrap_or_default();
+        assert!(driver.contains("drive_foreground_chat_with_ingress"));
+        assert!(driver.contains("observe_turn_input_through_drain"));
+        assert!(driver.contains(".settle_attempt("));
+        let event_projection = SOURCE
+            .split("AgentEvent::TurnSettled")
+            .nth(1)
+            .and_then(|tail| tail.split("AgentEvent::ExecutionPath").next())
+            .unwrap_or_default();
+        assert!(!event_projection.contains(".settle_attempt("));
+    }
+
+    #[test]
+    fn task_run_resume_stays_outside_conversation_input_ingress() {
+        const SOURCE: &str = include_str!("events.rs");
+        let driver = SOURCE
+            .split("async fn send_to_agent")
+            .nth(1)
+            .and_then(|tail| tail.split("fn run_turn_binding_for_request").next())
+            .unwrap_or_default();
+        let resume = driver
+            .split("if let Some(expected) = planned_resume")
+            .nth(1)
+            .and_then(|tail| tail.split("let _pool_execution").next())
+            .unwrap_or_default();
+        assert!(resume.contains("launch_planned_run_resume"));
+        assert!(!resume.contains("drive_foreground_chat_with_ingress"));
+        assert!(!resume.contains("ConversationInput"));
+    }
+
+    #[test]
+    fn observer_failure_is_delegated_to_core_failed_terminal() {
+        const SOURCE: &str = include_str!("events.rs");
+        let adapter = SOURCE
+            .split("async fn steer_conversation_input_projection")
+            .nth(1)
+            .and_then(|tail| tail.split("enum TurnDispatchResult").next())
+            .unwrap_or_default();
+        assert!(adapter.contains("observe_steer_through_drain"));
+        assert!(adapter.contains("supervise_input_lifecycle_scoped"));
+        assert!(!adapter.contains("TurnOutcome::Failed"));
     }
 
     #[test]

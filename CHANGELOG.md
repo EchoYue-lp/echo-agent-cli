@@ -32,13 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Conversation follow-ups now have a single application-owned durable ingress
+  contract in the existing ChatEventLog reducer. Revisioned attempts project
+  persisted, mailbox-accepted, drained, settled, deferred, and recovery-required
+  receipts without introducing another mailbox or driver; surface migration is
+  staged behind this core authority.
 - GUI, TUI, CLI, and channel active steering now use the framework tracked
   receipt (`MailboxAccepted -> Drained -> TurnSettled`) through one
-  SubagentControl adapter. The legacy `Delivered` event remains a compatibility
-  mailbox-accepted projection. Cold Conversation Agent delivery now carries the
-  framework initial-input receipt through the shared chat driver and writes its
-  existing `Injected` compatibility fact only after real model-context drain;
-  terminal-before-drain and restart-after-drain remain non-replayable.
+  SubagentControl adapter. Cold Conversation Agent delivery carries the
+  framework initial-input receipt through the shared chat driver; router
+  delivery records expose the same typed phase, outcome, and drained facts.
+  Terminal-before-drain and restart-after-drain remain non-replayable.
 - Channel now carries framework sender-scoped sessions through EKO AgentPool,
   TaskRun, cache, foreground control, exact resume, bounded outbound rendering,
   and bidirectional canonical tool identity quarantine. Framework session

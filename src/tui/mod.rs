@@ -31,7 +31,6 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend};
-use std::collections::VecDeque;
 use std::io;
 use std::time::Instant;
 use textwrap::WordSplitter;
@@ -216,20 +215,22 @@ pub struct TaskProgressEntry {
     pub elapsed_label: String,
 }
 
-/// Exact TaskRun identity retained while a TUI resume turn is queued.
+/// Exact TaskRun identity retained for one explicit resume wake.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct QueuedRunResume {
+pub struct TaskRunResumeWake {
     pub identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity,
     pub is_continuation: bool,
 }
 
-/// A user turn submitted while the foreground agent is still busy.
+/// Ephemeral dispatch payload. Ordinary user input is claimed from the durable
+/// ConversationInput frontier; only explicit TaskRun resume uses this struct
+/// directly.
 #[derive(Clone, Debug)]
-pub struct QueuedTurn {
+pub struct TuiTurnRequest {
     pub text: String,
     pub attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
-    pub interaction_mode: InteractionMode,
-    pub run_resume: Option<QueuedRunResume>,
+    pub run_resume: Option<TaskRunResumeWake>,
+    pub input_attempt: Option<echo_agent_app_core::conversation_input::ConversationInputAttempt>,
 }
 
 /// Read-only TUI projection of the authoritative TaskRuntime state.
@@ -313,8 +314,9 @@ pub struct TuiApp {
     pub active_turn_execution_root: Option<std::path::PathBuf>,
     /// Exact workspace agent retained for steering the active turn.
     pub active_turn_agent: Option<AgentHandle>,
-    /// FIFO turns submitted while the foreground agent is busy.
-    pub queued_turns: VecDeque<QueuedTurn>,
+    /// Read-only projection of the durable ConversationInput authority.
+    pub conversation_input_frontier:
+        Option<echo_agent_app_core::conversation_input::ConversationInputFrontier>,
     /// Current streaming text being received.
     pub streaming_text: String,
     /// Slash command suggestions (shown as completion popup).
@@ -459,13 +461,29 @@ pub struct TuiApp {
 
 impl TuiApp {
     pub(crate) fn discard_unsubmitted_attachments(&mut self) -> Result<(), String> {
-        let mut attachments = std::mem::take(&mut self.pending_attachments);
-        attachments.extend(
-            self.queued_turns
-                .drain(..)
-                .flat_map(|turn| turn.attachments),
-        );
+        let attachments = std::mem::take(&mut self.pending_attachments);
         echo_agent_app_core::attachments::discard_staged_attachment_refs(&attachments)
+    }
+
+    pub(crate) fn conversation_input_queue_len(&self) -> usize {
+        self.conversation_input_frontier
+            .as_ref()
+            .map_or(0, |frontier| {
+                frontier
+                    .items
+                    .iter()
+                    .filter(|item| item.receipt.is_dispatchable())
+                    .count()
+            })
+    }
+
+    pub(crate) fn next_conversation_input_preview(&self) -> Option<String> {
+        self.conversation_input_frontier
+            .as_ref()?
+            .items
+            .iter()
+            .find(|item| item.receipt.is_dispatchable())
+            .map(|item| item.payload.text.chars().take(24).collect())
     }
 }
 
@@ -851,7 +869,7 @@ impl TuiApp {
             active_turn_conversation_id: None,
             active_turn_execution_root: None,
             active_turn_agent: None,
-            queued_turns: VecDeque::new(),
+            conversation_input_frontier: None,
             streaming_text: String::new(),
             suggestions: vec![],
             selected_suggestion: 0,
@@ -1861,7 +1879,7 @@ mod state_tests {
         let driver = tokio::spawn(async move {
             cancelled.cancelled().await;
             tokio::task::yield_now().await;
-            let _ = lease.settle(TurnOutcome::Cancelled);
+            let _ = lease.settle_after_observers(TurnOutcome::Cancelled).await;
         });
 
         super::settle_tui_foreground_on_exit(&control, "global", "conversation")

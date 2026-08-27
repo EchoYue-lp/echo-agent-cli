@@ -133,7 +133,6 @@ describe('chat and TaskRuntime lifecycle separation', () => {
     expect(useChatStore.getState().messages.at(-1)?.isStreaming).toBe(true);
 
     handleChatEvent({ type: 'run_status', status: 'failed' }, context);
-    handleChatEvent({ type: 'done' }, context);
     expect(useChatStore.getState().runStatus).toBe('failed');
     expect(useChatStore.getState().isStreaming).toBe(false);
   });
@@ -213,7 +212,6 @@ describe('chat and TaskRuntime lifecycle separation', () => {
     expect(useChatStore.getState().runStatus).toBe('waiting_input');
 
     handleChatEvent({ type: 'run_status', status: 'cancelled' }, context);
-    handleChatEvent({ type: 'done' }, context);
     expect(useChatStore.getState().pendingHitlRequests).toEqual([]);
     expect(useChatStore.getState().runStatus).toBe('cancelled');
   });

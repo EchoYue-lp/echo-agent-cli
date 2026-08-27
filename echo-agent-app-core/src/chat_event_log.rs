@@ -5,6 +5,12 @@
 //! projections for GUI, TUI, CLI, channels and boot recovery.
 
 use crate::chat_driver::ChatDriverEvent;
+use crate::conversation_input::{
+    ConversationInputAddress, ConversationInputAttempt, ConversationInputError,
+    ConversationInputFact, ConversationInputFrontier, ConversationInputIdentity,
+    ConversationInputOutcome, ConversationInputPayload, ConversationInputPhase,
+    ConversationInputProjection, ConversationInputReceipt,
+};
 use crate::tool_execution::ToolExecutionRepository;
 use crate::tool_execution_projection::ToolExecutionProjector;
 use chrono::{DateTime, Utc};
@@ -72,16 +78,6 @@ pub struct ChatEventReplay {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueuedChatInput {
-    pub input_id: String,
-    pub workspace_id: String,
-    pub conversation_id: String,
-    pub text: String,
-    pub attachments: Vec<crate::types::AttachmentData>,
-    pub submitted_at_ms: u64,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum ChatEventLogError {
     #[error("chat event identity is invalid: {0}")]
@@ -134,13 +130,21 @@ struct RetentionPins {
         ),
     >,
     active_cells: HashMap<String, u64>,
-    queued_inputs: HashMap<String, u64>,
-    queued_latest: HashMap<String, u64>,
+    conversation_inputs: HashMap<String, FoldedConversationInput>,
     queue_order: Vec<String>,
+    queue_revision: u64,
     awaiter_facts: HashMap<String, u64>,
     earliest: Option<u64>,
     #[cfg(test)]
     recovered_records: usize,
+}
+
+#[derive(Debug, Clone)]
+struct FoldedConversationInput {
+    projection: ConversationInputProjection,
+    first_sequence: u64,
+    last_sequence: u64,
+    terminal_fact_self_contained: bool,
 }
 
 #[derive(Debug)]
@@ -466,16 +470,28 @@ impl ChatEventLog {
         root_turn_id: &str,
         event: ChatDriverEvent,
     ) -> Result<ChatEventEnvelope, ChatEventLogError> {
+        if matches!(&event, ChatDriverEvent::InputLifecycle(_)) {
+            return Err(ChatEventLogError::InvalidEvent(
+                "conversation input writes must use ConversationInputService".to_string(),
+            ));
+        }
+        self.append_internal(workspace_id, conversation_id, root_turn_id, event)
+    }
+
+    fn append_internal(
+        &self,
+        workspace_id: &str,
+        conversation_id: Option<&str>,
+        root_turn_id: &str,
+        event: ChatDriverEvent,
+    ) -> Result<ChatEventEnvelope, ChatEventLogError> {
         validate_event_stream_identity(workspace_id, conversation_id, &event)?;
         validate_driver_event(&event)?;
-        if matches!(
-            &event,
-            ChatDriverEvent::InputQueued { input_id, .. }
-                | ChatDriverEvent::InputRemoved { input_id }
-                if input_id != root_turn_id
-        ) {
+        if let ChatDriverEvent::InputLifecycle(fact) = &event
+            && fact.identity().input_id != root_turn_id
+        {
             return Err(ChatEventLogError::InvalidIdentity(
-                "queued chat input identity does not match the journal root".to_string(),
+                "conversation input lifecycle identity does not match the journal root".to_string(),
             ));
         }
         let selected_stream_id = stream_id(workspace_id, conversation_id, root_turn_id)?;
@@ -497,19 +513,49 @@ impl ChatEventLog {
             self.maintain_retention(authority, &selected_stream_id);
         }
 
+        let envelope = self.append_locked(
+            authority,
+            &selected_stream_id,
+            &path,
+            workspace_id,
+            conversation_id,
+            root_turn_id,
+            turn_id,
+            message_id,
+            event,
+        )?;
+        drop(guard);
+        drop(cached);
+        self.evict_inactive_streams(None);
+        Ok(envelope)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_locked(
+        &self,
+        authority: &mut StreamAuthority,
+        selected_stream_id: &str,
+        path: &Path,
+        workspace_id: &str,
+        conversation_id: Option<&str>,
+        root_turn_id: &str,
+        turn_id: String,
+        message_id: String,
+        event: ChatDriverEvent,
+    ) -> Result<ChatEventEnvelope, ChatEventLogError> {
         if let Some(fact_key) = awaiter_fact_key(&event)
             && let Some(sequence) = authority.pins.awaiter_facts.get(&fact_key).copied()
         {
             let record = authority
                 .journal
                 .replay_after(sequence.saturating_sub(1), 1)
-                .map_err(|error| journal_error(&path, error))?
+                .map_err(|error| journal_error(path, error))?
                 .into_iter()
                 .next()
                 .filter(|record| record.sequence == sequence)
                 .ok_or_else(|| {
                     corrupt(
-                        &path,
+                        path,
                         format!("cached durable fact {fact_key} is missing at {sequence}"),
                     )
                 })?;
@@ -519,7 +565,7 @@ impl ChatEventLog {
                 echo_agent::utils::canonical_json::canonical_json_bytes(&record.event.payload)
                     .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
             return if expected == actual {
-                envelope_from_record(record, &path, &selected_stream_id)
+                envelope_from_record(record, path, selected_stream_id)
             } else {
                 Err(ChatEventLogError::InvalidEvent(format!(
                     "conflicting durable fact for {fact_key}"
@@ -529,7 +575,7 @@ impl ChatEventLog {
 
         let persisted = PersistedChatEvent {
             schema_version: CHAT_EVENT_SCHEMA_VERSION,
-            stream_id: selected_stream_id.clone(),
+            stream_id: selected_stream_id.to_string(),
             workspace_id: workspace_id.to_string(),
             conversation_id: conversation_id.map(ToString::to_string),
             root_turn_id: root_turn_id.to_string(),
@@ -542,7 +588,7 @@ impl ChatEventLog {
         let receipt = authority
             .journal
             .append_with_durability(persisted, durability)
-            .map_err(|error| journal_error(&path, error))?;
+            .map_err(|error| journal_error(path, error))?;
         if let JournalDurabilityStatus::Degraded { error } = &receipt.durability {
             tracing::warn!(stream_id = %selected_stream_id, sequence = receipt.record.sequence, %error, "chat event committed with degraded durability; append will not be retried");
         }
@@ -552,15 +598,12 @@ impl ChatEventLog {
         let mut maintain_retention = should_maintain_retention(durability, &receipt.durability);
         if should_mark_barrier_pending(durability, &receipt.durability) {
             authority.barrier_pending = true;
-            maintain_retention = self.retry_pending_barrier(authority, &selected_stream_id);
+            maintain_retention = self.retry_pending_barrier(authority, selected_stream_id);
         }
-        let envelope = envelope_from_record(receipt.record, &path, &selected_stream_id)?;
+        let envelope = envelope_from_record(receipt.record, path, selected_stream_id)?;
         if maintain_retention {
-            self.maintain_retention(authority, &selected_stream_id);
+            self.maintain_retention(authority, selected_stream_id);
         }
-        drop(guard);
-        drop(cached);
-        self.evict_inactive_streams(None);
         Ok(envelope)
     }
 
@@ -734,6 +777,84 @@ impl ChatEventLog {
         Ok(recovered)
     }
 
+    pub fn reconcile_conversation_inputs_at_boot(&self) -> Result<usize, ChatEventLogError> {
+        let mut recovered = 0_usize;
+        for stream in self.enumerate_streams_isolated()? {
+            let Some(conversation_id) = stream.first.conversation_id.clone() else {
+                continue;
+            };
+            let address = ConversationInputAddress {
+                workspace_id: stream.first.workspace_id.clone(),
+                conversation_id,
+            };
+            let cached = match self.stream_journal(&stream.stream_id, false) {
+                Ok(Some(cached)) => cached,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(stream_id = %stream.stream_id, %error, "conversation input boot recovery skipped an unavailable stream");
+                    continue;
+                }
+            };
+            let mut guard = lock_cached_stream(&cached);
+            let Some(authority) = guard.as_mut() else {
+                continue;
+            };
+            let candidates = authority
+                .pins
+                .conversation_inputs
+                .values()
+                .filter(|entry| {
+                    matches!(
+                        entry.projection.receipt.phase,
+                        ConversationInputPhase::AttemptStarted
+                            | ConversationInputPhase::MailboxAccepted
+                            | ConversationInputPhase::Drained
+                            | ConversationInputPhase::RecoveryRequired
+                    )
+                })
+                .map(|entry| entry.projection.clone())
+                .collect::<Vec<_>>();
+            for projection in candidates {
+                let Some(attempt) = conversation_input_attempt_from_receipt(&projection.receipt)
+                else {
+                    continue;
+                };
+                let fact = if projection.receipt.drained {
+                    ConversationInputFact::TurnSettled {
+                        attempt,
+                        outcome: ConversationInputOutcome::Dropped,
+                        drained: true,
+                        settled_at_ms: echo_agent::utils::time::now_millis(),
+                    }
+                } else {
+                    let reason =
+                        "foreground input owner was lost during application restart".to_string();
+                    ConversationInputFact::Cancelled {
+                        identity: attempt.identity.clone(),
+                        attempt: Some(attempt),
+                        drained: projection.receipt.drained,
+                        reason: Some(reason),
+                        cancelled_at_ms: echo_agent::utils::time::now_millis(),
+                    }
+                };
+                let input_id = fact.identity().input_id.clone();
+                if let Err(error) = self.append_conversation_input_event_locked(
+                    authority,
+                    &stream.stream_id,
+                    &stream.path,
+                    &address,
+                    &input_id,
+                    ChatDriverEvent::InputLifecycle(Box::new(fact)),
+                ) {
+                    tracing::warn!(stream_id = %stream.stream_id, input_id = %input_id, %error, "conversation input boot recovery isolated a failed terminal append");
+                    continue;
+                }
+                recovered = recovered.saturating_add(1);
+            }
+        }
+        Ok(recovered)
+    }
+
     pub fn pending_awaiter_results(
         &self,
         workspace_id: &str,
@@ -852,149 +973,936 @@ impl ChatEventLog {
         Ok(started)
     }
 
-    pub fn enqueue_chat_input(
+    fn with_conversation_input_authority<T>(
         &self,
-        workspace_id: &str,
-        conversation_id: &str,
-        input_id: &str,
-        text: String,
-        attachments: Vec<crate::types::AttachmentData>,
-    ) -> Result<QueuedChatInput, ChatEventLogError> {
-        if text.trim().is_empty() && attachments.is_empty() {
-            return Err(ChatEventLogError::InvalidEvent(
-                "queued chat input must contain text or attachments".to_string(),
-            ));
-        }
-        let submitted_at_ms = echo_agent::utils::time::now_millis();
-        self.append(
-            workspace_id,
-            Some(conversation_id),
-            input_id,
-            ChatDriverEvent::InputQueued {
-                input_id: input_id.to_string(),
-                text: text.clone(),
-                attachments: attachments.clone(),
-                submitted_at_ms,
-            },
+        address: &ConversationInputAddress,
+        create: bool,
+        operation: impl FnOnce(&mut StreamAuthority, &str, &Path) -> Result<T, ConversationInputError>,
+    ) -> Result<T, ConversationInputError> {
+        let selected_stream_id = stream_id(
+            &address.workspace_id,
+            Some(&address.conversation_id),
+            &address.conversation_id,
         )?;
-        Ok(QueuedChatInput {
-            input_id: input_id.to_string(),
-            workspace_id: workspace_id.to_string(),
-            conversation_id: conversation_id.to_string(),
-            text,
-            attachments,
-            submitted_at_ms,
-        })
-    }
-
-    pub fn queued_chat_inputs(
-        &self,
-        workspace_id: &str,
-        conversation_id: &str,
-    ) -> Result<Vec<QueuedChatInput>, ChatEventLogError> {
-        let selected_stream_id = stream_id(workspace_id, Some(conversation_id), conversation_id)?;
-        let Some(cached) = self.stream_journal(&selected_stream_id, false)? else {
-            return Ok(Vec::new());
+        let path = self.stream_dir(&selected_stream_id);
+        let Some(cached) = self.stream_journal(&selected_stream_id, create)? else {
+            return Err(ConversationInputError::Validation(
+                "conversation input authority is unavailable".to_string(),
+            ));
         };
         let mut guard = lock_cached_stream(&cached);
-        let Some(authority) = guard.as_mut() else {
-            return Ok(Vec::new());
-        };
+        let authority = guard
+            .as_mut()
+            .ok_or_else(|| corrupt(&path, "conversation input authority was removed"))?;
         if self.retry_pending_barrier(authority, &selected_stream_id) {
             self.maintain_retention(authority, &selected_stream_id);
         }
-        let path = self.stream_dir(&selected_stream_id);
-        let mut queued = Vec::with_capacity(authority.pins.queued_latest.len());
-        for input_id in &authority.pins.queue_order {
-            let Some(sequence) = authority.pins.queued_latest.get(input_id).copied() else {
-                continue;
-            };
-            let record = authority
-                .journal
-                .replay_after(sequence.saturating_sub(1), 1)
-                .map_err(|error| journal_error(&path, error))?
-                .into_iter()
-                .next()
-                .filter(|record| record.sequence == sequence)
-                .ok_or_else(|| {
-                    corrupt(
-                        &path,
-                        format!("queued input {input_id} is missing at {sequence}"),
-                    )
-                })?;
-            let envelope = envelope_from_record(record, &path, &selected_stream_id)?;
-            let ChatDriverEvent::InputQueued {
-                input_id: stored_input_id,
-                text,
-                attachments,
-                submitted_at_ms,
-            } = envelope.payload
-            else {
-                return Err(corrupt(
-                    &path,
-                    format!("queued input {input_id} does not point to an InputQueued fact"),
-                ));
-            };
-            if stored_input_id != *input_id {
-                return Err(corrupt(
-                    &path,
-                    format!("queued input {input_id} points to {stored_input_id}"),
-                ));
-            }
-            queued.push(QueuedChatInput {
-                input_id: stored_input_id,
-                workspace_id: workspace_id.to_string(),
-                conversation_id: conversation_id.to_string(),
-                text,
-                attachments,
-                submitted_at_ms,
-            });
-        }
+        let result = operation(authority, &selected_stream_id, &path);
         drop(guard);
         drop(cached);
         self.evict_inactive_streams(None);
-        Ok(queued)
+        result
     }
 
-    pub fn remove_queued_chat_input(
+    fn append_conversation_input_event_locked(
         &self,
-        workspace_id: &str,
-        conversation_id: &str,
-        input_id: &str,
-    ) -> Result<(), ChatEventLogError> {
-        self.append(
-            workspace_id,
-            Some(conversation_id),
-            input_id,
-            ChatDriverEvent::InputRemoved {
-                input_id: input_id.to_string(),
-            },
+        authority: &mut StreamAuthority,
+        selected_stream_id: &str,
+        path: &Path,
+        address: &ConversationInputAddress,
+        root_turn_id: &str,
+        event: ChatDriverEvent,
+    ) -> Result<(), ConversationInputError> {
+        validate_event_stream_identity(
+            &address.workspace_id,
+            Some(&address.conversation_id),
+            &event,
+        )?;
+        validate_driver_event(&event)?;
+        let message_id = root_turn_id.to_string();
+        self.append_locked(
+            authority,
+            selected_stream_id,
+            path,
+            &address.workspace_id,
+            Some(&address.conversation_id),
+            root_turn_id,
+            message_id,
+            root_turn_id.to_string(),
+            event,
         )?;
         Ok(())
     }
 
-    pub fn reorder_queued_chat_inputs(
-        &self,
-        workspace_id: &str,
-        conversation_id: &str,
+    /// Idempotently persist one revisioned conversation input through the
+    /// existing conversation stream and reducer.
+    pub async fn submit_conversation_input(
+        self: &Arc<Self>,
+        address: ConversationInputAddress,
+        input_id: String,
+        payload: ConversationInputPayload,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        let permit = PROCESS_CHAT_EVENT_IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ConversationInputError::Validation(error.to_string()))?;
+        let log = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            log.with_conversation_input_authority(&address, true, |authority, stream_id, path| {
+                if let Some(existing) =
+                    authority
+                        .pins
+                        .conversation_inputs
+                        .get(&input_id)
+                        .map(|entry| {
+                            normalized_conversation_input_projection(
+                                entry,
+                                authority.pins.queue_revision,
+                            )
+                        })
+                {
+                    if existing.payload.payload_sha256 == payload.payload_sha256 {
+                        let mut receipt = existing.receipt;
+                        receipt.duplicate = true;
+                        return Ok(receipt);
+                    }
+                    return Err(ConversationInputError::IdCollision {
+                        input_id: input_id.clone(),
+                    });
+                }
+                let identity = ConversationInputIdentity {
+                    address: address.clone(),
+                    input_id: input_id.clone(),
+                    revision: 1,
+                    payload_sha256: payload.payload_sha256.clone(),
+                };
+                log.append_conversation_input_event_locked(
+                    authority,
+                    stream_id,
+                    path,
+                    &address,
+                    &input_id,
+                    ChatDriverEvent::InputLifecycle(Box::new(ConversationInputFact::Persisted {
+                        identity,
+                        payload,
+                    })),
+                )?;
+                authority
+                    .pins
+                    .conversation_inputs
+                    .get(&input_id)
+                    .map(|entry| {
+                        normalized_conversation_input_receipt(entry, authority.pins.queue_revision)
+                    })
+                    .ok_or_else(|| {
+                        ConversationInputError::Validation(
+                            "persisted conversation input was not folded".to_string(),
+                        )
+                    })
+            })
+        })
+        .await
+        .map_err(|error| ConversationInputError::Validation(error.to_string()))?
+    }
+
+    pub async fn conversation_input_frontier(
+        self: &Arc<Self>,
+        address: &ConversationInputAddress,
+    ) -> Result<ConversationInputFrontier, ConversationInputError> {
+        let permit = PROCESS_CHAT_EVENT_IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ConversationInputError::Validation(error.to_string()))?;
+        let log = Arc::clone(self);
+        let address = address.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            log.conversation_input_frontier_sync(&address)
+        })
+        .await
+        .map_err(|error| ConversationInputError::Validation(error.to_string()))?
+    }
+
+    pub async fn start_next_conversation_input(
+        self: &Arc<Self>,
+        address: &ConversationInputAddress,
+        turn_id: String,
+    ) -> Result<Option<ConversationInputProjection>, ConversationInputError> {
+        let permit = PROCESS_CHAT_EVENT_IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ConversationInputError::Validation(error.to_string()))?;
+        let log = Arc::clone(self);
+        let address = address.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let selected_stream_id = stream_id(
+                &address.workspace_id,
+                Some(&address.conversation_id),
+                &address.conversation_id,
+            )?;
+            if log.stream_journal(&selected_stream_id, false)?.is_none() {
+                return Ok(None);
+            }
+            log.with_conversation_input_authority(&address, false, |authority, stream_id, path| {
+                if authority.pins.conversation_inputs.values().any(|entry| {
+                    conversation_input_is_frontier(&entry.projection.receipt)
+                        && entry.projection.receipt.blocks_replay()
+                }) {
+                    return Ok(None);
+                }
+                let next = authority
+                    .pins
+                    .queue_order
+                    .iter()
+                    .filter_map(|input_id| authority.pins.conversation_inputs.get(input_id))
+                    .next()
+                    .map(|entry| {
+                        normalized_conversation_input_projection(
+                            entry,
+                            authority.pins.queue_revision,
+                        )
+                    });
+                let Some(next) = next else {
+                    return Ok(None);
+                };
+                if !next.receipt.is_dispatchable() {
+                    return Ok(None);
+                }
+                let attempt = next
+                    .receipt
+                    .attempt
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        ConversationInputError::Validation(
+                            "conversation input attempt exhausted".to_string(),
+                        )
+                    })?;
+                let attempt_identity = ConversationInputAttempt {
+                    identity: next.receipt.identity.clone(),
+                    attempt,
+                    attempt_id: uuid::Uuid::new_v4().to_string(),
+                    turn_id,
+                    observation: Default::default(),
+                };
+                let input_id = attempt_identity.identity.input_id.clone();
+                log.append_conversation_input_event_locked(
+                    authority,
+                    stream_id,
+                    path,
+                    &address,
+                    &input_id,
+                    ChatDriverEvent::InputLifecycle(Box::new(
+                        ConversationInputFact::AttemptStarted {
+                            attempt: attempt_identity,
+                            started_at_ms: echo_agent::utils::time::now_millis(),
+                        },
+                    )),
+                )?;
+                Ok(authority
+                    .pins
+                    .conversation_inputs
+                    .get(&input_id)
+                    .map(|entry| {
+                        normalized_conversation_input_projection(
+                            entry,
+                            authority.pins.queue_revision,
+                        )
+                    }))
+            })
+        })
+        .await
+        .map_err(|error| ConversationInputError::Validation(error.to_string()))?
+    }
+
+    pub async fn start_selected_conversation_input(
+        self: &Arc<Self>,
+        identity: ConversationInputIdentity,
+        expected_queue_revision: u64,
+        turn_id: String,
+    ) -> Result<ConversationInputProjection, ConversationInputError> {
+        let permit = PROCESS_CHAT_EVENT_IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ConversationInputError::Validation(error.to_string()))?;
+        let log = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            log.with_conversation_input_authority(
+                &identity.address,
+                false,
+                |authority, stream_id, path| {
+                    if authority.pins.queue_revision != expected_queue_revision {
+                        return Err(ConversationInputError::StaleRevision {
+                            input_id: identity.input_id.clone(),
+                        });
+                    }
+                    if authority.pins.conversation_inputs.values().any(|entry| {
+                        conversation_input_is_frontier(&entry.projection.receipt)
+                            && entry.projection.receipt.blocks_replay()
+                    }) {
+                        return Err(ConversationInputError::NotDispatchable {
+                            input_id: identity.input_id.clone(),
+                        });
+                    }
+                    let current = authority
+                        .pins
+                        .conversation_inputs
+                        .get(&identity.input_id)
+                        .map(|entry| {
+                            normalized_conversation_input_projection(
+                                entry,
+                                authority.pins.queue_revision,
+                            )
+                        })
+                        .ok_or_else(|| ConversationInputError::StaleRevision {
+                            input_id: identity.input_id.clone(),
+                        })?;
+                    if current.receipt.identity != identity
+                        || !authority.pins.queue_order.contains(&identity.input_id)
+                    {
+                        return Err(ConversationInputError::StaleRevision {
+                            input_id: identity.input_id.clone(),
+                        });
+                    }
+                    if !conversation_input_is_frontier(&current.receipt)
+                        || !current.receipt.is_dispatchable()
+                    {
+                        return Err(ConversationInputError::NotDispatchable {
+                            input_id: identity.input_id.clone(),
+                        });
+                    }
+                    let attempt = current
+                        .receipt
+                        .attempt
+                        .unwrap_or(0)
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            ConversationInputError::Validation(
+                                "conversation input attempt exhausted".to_string(),
+                            )
+                        })?;
+                    let attempt_identity = ConversationInputAttempt {
+                        identity: identity.clone(),
+                        attempt,
+                        attempt_id: uuid::Uuid::new_v4().to_string(),
+                        turn_id,
+                        observation: Default::default(),
+                    };
+                    log.append_conversation_input_event_locked(
+                        authority,
+                        stream_id,
+                        path,
+                        &identity.address,
+                        &identity.input_id,
+                        ChatDriverEvent::InputLifecycle(Box::new(
+                            ConversationInputFact::AttemptStarted {
+                                attempt: attempt_identity,
+                                started_at_ms: echo_agent::utils::time::now_millis(),
+                            },
+                        )),
+                    )?;
+                    authority
+                        .pins
+                        .conversation_inputs
+                        .get(&identity.input_id)
+                        .map(|entry| {
+                            normalized_conversation_input_projection(
+                                entry,
+                                authority.pins.queue_revision,
+                            )
+                        })
+                        .ok_or_else(|| ConversationInputError::StaleRevision {
+                            input_id: identity.input_id.clone(),
+                        })
+                },
+            )
+        })
+        .await
+        .map_err(|error| ConversationInputError::Validation(error.to_string()))?
+    }
+
+    pub async fn settle_conversation_input_turn(
+        self: &Arc<Self>,
+        address: &ConversationInputAddress,
+        turn_id: &str,
+        outcome: ConversationInputOutcome,
+    ) -> Result<Vec<ConversationInputReceipt>, ConversationInputError> {
+        let permit = PROCESS_CHAT_EVENT_IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ConversationInputError::Validation(error.to_string()))?;
+        let log = Arc::clone(self);
+        let address = address.clone();
+        let turn_id = turn_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let selected_stream_id = stream_id(
+                &address.workspace_id,
+                Some(&address.conversation_id),
+                &address.conversation_id,
+            )?;
+            if log.stream_journal(&selected_stream_id, false)?.is_none() {
+                return Ok(Vec::new());
+            }
+            log.with_conversation_input_authority(&address, false, |authority, stream_id, path| {
+                let mut candidates = authority
+                    .pins
+                    .conversation_inputs
+                    .values()
+                    .filter(|entry| {
+                        entry.projection.receipt.turn_id.as_deref() == Some(turn_id.as_str())
+                            && matches!(
+                                entry.projection.receipt.phase,
+                                ConversationInputPhase::AttemptStarted
+                                    | ConversationInputPhase::MailboxAccepted
+                                    | ConversationInputPhase::Drained
+                                    | ConversationInputPhase::RecoveryRequired
+                            )
+                    })
+                    .map(|entry| entry.projection.clone())
+                    .collect::<Vec<_>>();
+                candidates.sort_by(|left, right| {
+                    left.receipt
+                        .identity
+                        .input_id
+                        .cmp(&right.receipt.identity.input_id)
+                });
+                let mut settled_ids = Vec::with_capacity(candidates.len());
+                for current in candidates {
+                    let attempt = conversation_input_attempt_from_receipt(&current.receipt)
+                        .ok_or_else(|| ConversationInputError::StaleAttempt {
+                            input_id: current.receipt.identity.input_id.clone(),
+                        })?;
+                    let terminal_drained = current.receipt.drained;
+                    let fact = if current.receipt.phase == ConversationInputPhase::RecoveryRequired
+                        || attempt.observation.failed()
+                    {
+                        ConversationInputFact::Cancelled {
+                            identity: current.receipt.identity.clone(),
+                            attempt: Some(attempt),
+                            drained: terminal_drained,
+                            reason: current.receipt.reason.clone(),
+                            cancelled_at_ms: echo_agent::utils::time::now_millis(),
+                        }
+                    } else {
+                        ConversationInputFact::TurnSettled {
+                            attempt,
+                            outcome,
+                            drained: terminal_drained,
+                            settled_at_ms: echo_agent::utils::time::now_millis(),
+                        }
+                    };
+                    let mut validation_current = current.clone();
+                    validation_current.receipt.drained = terminal_drained;
+                    log.validate_conversation_input_fact(&validation_current, &fact)?;
+                    let input_id = current.receipt.identity.input_id.clone();
+                    log.append_conversation_input_event_locked(
+                        authority,
+                        stream_id,
+                        path,
+                        &address,
+                        &input_id,
+                        ChatDriverEvent::InputLifecycle(Box::new(fact)),
+                    )?;
+                    settled_ids.push(input_id);
+                }
+                let queue_revision = authority.pins.queue_revision;
+                Ok(settled_ids
+                    .into_iter()
+                    .filter_map(|input_id| {
+                        authority
+                            .pins
+                            .conversation_inputs
+                            .get(&input_id)
+                            .map(|entry| {
+                                normalized_conversation_input_receipt(entry, queue_revision)
+                            })
+                    })
+                    .collect())
+            })
+        })
+        .await
+        .map_err(|error| ConversationInputError::Validation(error.to_string()))?
+    }
+
+    pub async fn settle_conversation_input_attempt(
+        self: &Arc<Self>,
+        attempt: &ConversationInputAttempt,
+        outcome: ConversationInputOutcome,
+        drained: bool,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        let permit = PROCESS_CHAT_EVENT_IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ConversationInputError::Validation(error.to_string()))?;
+        let log = Arc::clone(self);
+        let attempt = attempt.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            log.with_conversation_input_authority(
+                &attempt.identity.address,
+                false,
+                |authority, stream_id, path| {
+                    let current = authority
+                        .pins
+                        .conversation_inputs
+                        .get(&attempt.identity.input_id)
+                        .map(|entry| {
+                            normalized_conversation_input_projection(
+                                entry,
+                                authority.pins.queue_revision,
+                            )
+                        })
+                        .ok_or_else(|| ConversationInputError::StaleAttempt {
+                            input_id: attempt.identity.input_id.clone(),
+                        })?;
+                    if current.receipt.identity != attempt.identity
+                        || current.receipt.attempt != Some(attempt.attempt)
+                        || current.receipt.attempt_id.as_deref()
+                            != Some(attempt.attempt_id.as_str())
+                        || current.receipt.turn_id.as_deref() != Some(attempt.turn_id.as_str())
+                    {
+                        return Err(ConversationInputError::StaleAttempt {
+                            input_id: attempt.identity.input_id.clone(),
+                        });
+                    }
+                    let effective_drained =
+                        drained || current.receipt.drained || attempt.observation.drained();
+                    let fact = if current.receipt.phase == ConversationInputPhase::RecoveryRequired
+                        || attempt.observation.failed()
+                    {
+                        ConversationInputFact::Cancelled {
+                            identity: attempt.identity.clone(),
+                            attempt: Some(attempt.clone()),
+                            drained: effective_drained,
+                            reason: current.receipt.reason.clone().or_else(|| {
+                                attempt.observation.failed().then(|| {
+                                    "input receipt persistence failed before terminal projection"
+                                        .to_string()
+                                })
+                            }),
+                            cancelled_at_ms: echo_agent::utils::time::now_millis(),
+                        }
+                    } else {
+                        ConversationInputFact::TurnSettled {
+                            attempt: attempt.clone(),
+                            outcome,
+                            drained: effective_drained,
+                            settled_at_ms: echo_agent::utils::time::now_millis(),
+                        }
+                    };
+                    if conversation_input_fact_is_duplicate(&current, &fact) {
+                        let mut receipt = current.receipt;
+                        receipt.duplicate = true;
+                        return Ok(receipt);
+                    }
+                    log.validate_conversation_input_fact(&current, &fact)?;
+                    log.append_conversation_input_event_locked(
+                        authority,
+                        stream_id,
+                        path,
+                        &attempt.identity.address,
+                        &attempt.identity.input_id,
+                        ChatDriverEvent::InputLifecycle(Box::new(fact)),
+                    )?;
+                    authority
+                        .pins
+                        .conversation_inputs
+                        .get(&attempt.identity.input_id)
+                        .map(|entry| {
+                            normalized_conversation_input_receipt(
+                                entry,
+                                authority.pins.queue_revision,
+                            )
+                        })
+                        .ok_or_else(|| ConversationInputError::StaleAttempt {
+                            input_id: attempt.identity.input_id.clone(),
+                        })
+                },
+            )
+        })
+        .await
+        .map_err(|error| ConversationInputError::Validation(error.to_string()))?
+    }
+
+    pub async fn append_conversation_input_fact(
+        self: &Arc<Self>,
+        fact: ConversationInputFact,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        let permit = PROCESS_CHAT_EVENT_IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ConversationInputError::Validation(error.to_string()))?;
+        let log = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let identity = fact.identity().clone();
+            log.with_conversation_input_authority(
+                &identity.address,
+                false,
+                |authority, stream_id, path| {
+                    let current = authority
+                        .pins
+                        .conversation_inputs
+                        .get(&identity.input_id)
+                        .map(|entry| {
+                            normalized_conversation_input_projection(
+                                entry,
+                                authority.pins.queue_revision,
+                            )
+                        })
+                        .ok_or_else(|| ConversationInputError::StaleRevision {
+                            input_id: identity.input_id.clone(),
+                        })?;
+                    if conversation_input_fact_is_duplicate(&current, &fact) {
+                        let mut receipt = current.receipt;
+                        receipt.duplicate = true;
+                        return Ok(receipt);
+                    }
+                    log.validate_conversation_input_fact(&current, &fact)?;
+                    log.append_conversation_input_event_locked(
+                        authority,
+                        stream_id,
+                        path,
+                        &identity.address,
+                        &identity.input_id,
+                        ChatDriverEvent::InputLifecycle(Box::new(fact)),
+                    )?;
+                    authority
+                        .pins
+                        .conversation_inputs
+                        .get(&identity.input_id)
+                        .map(|entry| {
+                            normalized_conversation_input_receipt(
+                                entry,
+                                authority.pins.queue_revision,
+                            )
+                        })
+                        .ok_or_else(|| ConversationInputError::StaleRevision {
+                            input_id: identity.input_id.clone(),
+                        })
+                },
+            )
+        })
+        .await
+        .map_err(|error| ConversationInputError::Validation(error.to_string()))?
+    }
+
+    pub async fn cancel_conversation_input(
+        self: &Arc<Self>,
+        identity: ConversationInputIdentity,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        let permit = PROCESS_CHAT_EVENT_IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ConversationInputError::Validation(error.to_string()))?;
+        let log = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            log.with_conversation_input_authority(
+                &identity.address,
+                false,
+                |authority, stream_id, path| {
+                    let current = authority
+                        .pins
+                        .conversation_inputs
+                        .get(&identity.input_id)
+                        .map(|entry| {
+                            normalized_conversation_input_projection(
+                                entry,
+                                authority.pins.queue_revision,
+                            )
+                        })
+                        .ok_or_else(|| ConversationInputError::StaleRevision {
+                            input_id: identity.input_id.clone(),
+                        })?;
+                    if current.receipt.identity != identity {
+                        return Err(ConversationInputError::StaleRevision {
+                            input_id: identity.input_id.clone(),
+                        });
+                    }
+                    if current.receipt.phase == ConversationInputPhase::Cancelled {
+                        let mut receipt = current.receipt;
+                        receipt.duplicate = true;
+                        return Ok(receipt);
+                    }
+                    if !current.receipt.is_dispatchable()
+                        && current.receipt.phase != ConversationInputPhase::RecoveryRequired
+                    {
+                        return Err(ConversationInputError::NotDispatchable {
+                            input_id: identity.input_id.clone(),
+                        });
+                    }
+                    let attempt = conversation_input_attempt_from_receipt(&current.receipt);
+                    log.append_conversation_input_event_locked(
+                        authority,
+                        stream_id,
+                        path,
+                        &identity.address,
+                        &identity.input_id,
+                        ChatDriverEvent::InputLifecycle(Box::new(
+                            ConversationInputFact::Cancelled {
+                                identity: identity.clone(),
+                                attempt,
+                                drained: current.receipt.drained,
+                                reason: current.receipt.reason.clone(),
+                                cancelled_at_ms: echo_agent::utils::time::now_millis(),
+                            },
+                        )),
+                    )?;
+                    authority
+                        .pins
+                        .conversation_inputs
+                        .get(&identity.input_id)
+                        .map(|entry| {
+                            normalized_conversation_input_receipt(
+                                entry,
+                                authority.pins.queue_revision,
+                            )
+                        })
+                        .ok_or_else(|| ConversationInputError::StaleRevision {
+                            input_id: identity.input_id.clone(),
+                        })
+                },
+            )
+        })
+        .await
+        .map_err(|error| ConversationInputError::Validation(error.to_string()))?
+    }
+
+    pub async fn reorder_conversation_inputs(
+        self: &Arc<Self>,
+        address: &ConversationInputAddress,
+        expected_queue_revision: u64,
         input_ids: Vec<String>,
-    ) -> Result<(), ChatEventLogError> {
-        if input_ids.is_empty()
-            || input_ids.iter().any(|input_id| input_id.trim().is_empty())
-            || has_duplicate_ids(&input_ids)
-        {
-            return Err(ChatEventLogError::InvalidEvent(
-                "queued input order must contain unique non-empty identities".to_string(),
-            ));
-        }
-        let root_turn_id = format!("queue-order:{}", uuid::Uuid::new_v4());
-        self.append(
-            workspace_id,
-            Some(conversation_id),
-            &root_turn_id,
-            ChatDriverEvent::InputReordered { input_ids },
+    ) -> Result<u64, ConversationInputError> {
+        let permit = PROCESS_CHAT_EVENT_IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ConversationInputError::Validation(error.to_string()))?;
+        let log = Arc::clone(self);
+        let address = address.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            log.with_conversation_input_authority(&address, false, |authority, stream_id, path| {
+                let current_ids = conversation_input_order_from_authority(authority);
+                if authority.pins.queue_revision != expected_queue_revision {
+                    return Err(ConversationInputError::StaleRevision {
+                        input_id: "queue-order".to_string(),
+                    });
+                }
+                if has_duplicate_ids(&input_ids)
+                    || input_ids.len() != current_ids.len()
+                    || input_ids
+                        .iter()
+                        .any(|input_id| !current_ids.contains(input_id))
+                {
+                    return Err(ConversationInputError::Validation(
+                        "reorder must contain every frontier input exactly once".to_string(),
+                    ));
+                }
+                let anchor_id = input_ids.first().ok_or_else(|| {
+                    ConversationInputError::Validation(
+                        "reorder requires an input anchor".to_string(),
+                    )
+                })?;
+                let anchor = authority
+                    .pins
+                    .conversation_inputs
+                    .get(anchor_id)
+                    .map(|entry| entry.projection.receipt.identity.clone())
+                    .ok_or_else(|| ConversationInputError::StaleRevision {
+                        input_id: "queue-order".to_string(),
+                    })?;
+                let root_turn_id = format!("queue-order:{}", uuid::Uuid::new_v4());
+                log.append_conversation_input_event_locked(
+                    authority,
+                    stream_id,
+                    path,
+                    &address,
+                    &root_turn_id,
+                    ChatDriverEvent::InputLifecycle(Box::new(ConversationInputFact::Reordered {
+                        anchor,
+                        input_ids,
+                        reordered_at_ms: echo_agent::utils::time::now_millis(),
+                    })),
+                )?;
+                Ok(authority.pins.queue_revision)
+            })
+        })
+        .await
+        .map_err(|error| ConversationInputError::Validation(error.to_string()))?
+    }
+
+    fn conversation_input_frontier_sync(
+        &self,
+        address: &ConversationInputAddress,
+    ) -> Result<ConversationInputFrontier, ConversationInputError> {
+        let selected_stream_id = stream_id(
+            &address.workspace_id,
+            Some(&address.conversation_id),
+            &address.conversation_id,
         )?;
-        Ok(())
+        let Some(cached) = self.stream_journal(&selected_stream_id, false)? else {
+            return Ok(ConversationInputFrontier {
+                queue_revision: 0,
+                items: Vec::new(),
+            });
+        };
+        let guard = lock_cached_stream(&cached);
+        let Some(authority) = guard.as_ref() else {
+            return Ok(ConversationInputFrontier {
+                queue_revision: 0,
+                items: Vec::new(),
+            });
+        };
+        let items = authority
+            .pins
+            .queue_order
+            .iter()
+            .filter_map(|input_id| authority.pins.conversation_inputs.get(input_id))
+            .filter(|entry| conversation_input_is_frontier(&entry.projection.receipt))
+            .map(|entry| {
+                normalized_conversation_input_projection(entry, authority.pins.queue_revision)
+            })
+            .collect();
+        Ok(ConversationInputFrontier {
+            queue_revision: authority.pins.queue_revision,
+            items,
+        })
+    }
+
+    fn validate_conversation_input_fact(
+        &self,
+        current: &ConversationInputProjection,
+        fact: &ConversationInputFact,
+    ) -> Result<(), ConversationInputError> {
+        let identity = fact.identity();
+        if current.receipt.identity != *identity {
+            return Err(ConversationInputError::StaleRevision {
+                input_id: identity.input_id.clone(),
+            });
+        }
+        if let ConversationInputFact::Cancelled {
+            attempt, drained, ..
+        } = fact
+        {
+            if attempt.as_ref()
+                != conversation_input_attempt_from_receipt(&current.receipt).as_ref()
+            {
+                return Err(ConversationInputError::StaleAttempt {
+                    input_id: identity.input_id.clone(),
+                });
+            }
+            if *drained != current.receipt.drained
+                && current.receipt.phase != ConversationInputPhase::RecoveryRequired
+            {
+                return Err(ConversationInputError::StaleAttempt {
+                    input_id: identity.input_id.clone(),
+                });
+            }
+            if current.receipt.is_dispatchable()
+                || matches!(
+                    current.receipt.phase,
+                    ConversationInputPhase::AttemptStarted
+                        | ConversationInputPhase::MailboxAccepted
+                        | ConversationInputPhase::Drained
+                        | ConversationInputPhase::RecoveryRequired
+                )
+            {
+                return Ok(());
+            }
+            return Err(ConversationInputError::NotDispatchable {
+                input_id: identity.input_id.clone(),
+            });
+        }
+        if let ConversationInputFact::Reordered { input_ids, .. } = fact {
+            if has_duplicate_ids(input_ids) || input_ids.is_empty() {
+                return Err(ConversationInputError::Validation(
+                    "typed reorder must contain unique inputs".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        let attempt = match fact {
+            ConversationInputFact::AttemptStarted { attempt, .. }
+            | ConversationInputFact::MailboxAccepted { attempt, .. }
+            | ConversationInputFact::Drained { attempt, .. }
+            | ConversationInputFact::TurnSettled { attempt, .. }
+            | ConversationInputFact::Deferred { attempt, .. }
+            | ConversationInputFact::RecoveryRequired { attempt, .. } => attempt,
+            ConversationInputFact::Persisted { .. }
+            | ConversationInputFact::Reordered { .. }
+            | ConversationInputFact::Cancelled { .. } => {
+                return Ok(());
+            }
+        };
+        if current.receipt.attempt != Some(attempt.attempt)
+            || current.receipt.attempt_id.as_deref() != Some(attempt.attempt_id.as_str())
+            || current.receipt.turn_id.as_deref() != Some(attempt.turn_id.as_str())
+        {
+            return Err(ConversationInputError::StaleAttempt {
+                input_id: identity.input_id.clone(),
+            });
+        }
+        let valid = match fact {
+            ConversationInputFact::MailboxAccepted { .. } => {
+                current.receipt.phase == ConversationInputPhase::AttemptStarted
+            }
+            ConversationInputFact::Drained { .. } => {
+                current.receipt.phase == ConversationInputPhase::MailboxAccepted
+            }
+            ConversationInputFact::TurnSettled { drained, .. } => {
+                ((*drained
+                    && matches!(
+                        current.receipt.phase,
+                        ConversationInputPhase::MailboxAccepted
+                            | ConversationInputPhase::Drained
+                            | ConversationInputPhase::RecoveryRequired
+                    ))
+                    || (!*drained
+                        && matches!(
+                            current.receipt.phase,
+                            ConversationInputPhase::AttemptStarted
+                                | ConversationInputPhase::MailboxAccepted
+                        )))
+                    && *drained == current.receipt.drained
+            }
+            ConversationInputFact::Deferred { .. } => {
+                current.receipt.phase == ConversationInputPhase::AttemptStarted
+            }
+            ConversationInputFact::RecoveryRequired { drained, .. } => {
+                matches!(
+                    current.receipt.phase,
+                    ConversationInputPhase::AttemptStarted
+                        | ConversationInputPhase::MailboxAccepted
+                        | ConversationInputPhase::Drained
+                ) && (!current.receipt.drained || *drained)
+            }
+            ConversationInputFact::AttemptStarted { .. } => current.receipt.is_dispatchable(),
+            ConversationInputFact::Persisted { .. }
+            | ConversationInputFact::Reordered { .. }
+            | ConversationInputFact::Cancelled { .. } => true,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(ConversationInputError::StaleAttempt {
+                input_id: identity.input_id.clone(),
+            })
+        }
     }
 
     pub fn remove_conversation(
@@ -1275,6 +2183,67 @@ impl ChatEventLog {
         Ok(streams)
     }
 
+    fn enumerate_streams_isolated(&self) -> Result<Vec<EnumeratedStream>, ChatEventLogError> {
+        if !ensure_real_directory(&self.root, false)? {
+            return Ok(Vec::new());
+        }
+        let entries = fs::read_dir(&self.root).map_err(|source| ChatEventLogError::Io {
+            path: self.root.clone(),
+            source,
+        })?;
+        let mut streams = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(%error, "chat input boot recovery skipped unreadable directory entry");
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let inspected = (|| -> Result<Option<EnumeratedStream>, ChatEventLogError> {
+                let metadata =
+                    fs::symlink_metadata(&path).map_err(|source| ChatEventLogError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+                if metadata.file_type().is_symlink() {
+                    return Err(corrupt(&path, "chat event stream must not be a symlink"));
+                }
+                if !metadata.is_dir() {
+                    return Ok(None);
+                }
+                let journal = StreamJournal::open(
+                    &path,
+                    self.retention.segment_rollover_bytes,
+                    FileDurability::Flush,
+                )
+                .map_err(|error| journal_error(&path, error))?;
+                let floor = journal.retention_metadata().retained_floor;
+                let first = journal
+                    .replay_after(floor.saturating_sub(1), 1)
+                    .map_err(|error| journal_error(&path, error))?
+                    .into_iter()
+                    .next()
+                    .map(|record| envelope_from_record_for_enumeration(record, &path))
+                    .transpose()?;
+                Ok(first.map(|first| EnumeratedStream {
+                    stream_id: first.stream_id.clone(),
+                    path: path.clone(),
+                    first,
+                }))
+            })();
+            match inspected {
+                Ok(Some(stream)) => streams.push(stream),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "chat input boot recovery isolated a corrupt stream");
+                }
+            }
+        }
+        Ok(streams)
+    }
+
     fn remove_stream(&self, stream_id: &str, path: &Path) -> Result<(), ChatEventLogError> {
         self.forget_stream(stream_id);
         let canonical = fs::canonicalize(path).map_err(|source| ChatEventLogError::Io {
@@ -1466,37 +2435,8 @@ impl RetentionPins {
                     .map(|(sequence, _)| sequence);
                 self.refresh_earliest_if_removed(pending.or(started));
             }
-            ChatDriverEvent::InputQueued { input_id, .. } => {
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    self.queued_inputs.entry(input_id.clone())
-                {
-                    entry.insert(sequence);
-                    if !self.queue_order.contains(input_id) {
-                        self.queue_order.push(input_id.clone());
-                    }
-                    self.earliest = Some(self.earliest.map_or(sequence, |old| old.min(sequence)));
-                }
-                self.queued_latest.insert(input_id.clone(), sequence);
-            }
-            ChatDriverEvent::InputRemoved { input_id } => {
-                let removed = self.queued_inputs.remove(input_id);
-                self.queued_latest.remove(input_id);
-                self.queue_order.retain(|queued| queued != input_id);
-                self.refresh_earliest_if_removed(removed);
-            }
-            ChatDriverEvent::InputReordered { input_ids } => {
-                let mut next = Vec::new();
-                for input_id in input_ids {
-                    if self.queued_inputs.contains_key(input_id) && !next.contains(input_id) {
-                        next.push(input_id.clone());
-                    }
-                }
-                for input_id in &self.queue_order {
-                    if self.queued_inputs.contains_key(input_id) && !next.contains(input_id) {
-                        next.push(input_id.clone());
-                    }
-                }
-                self.queue_order = next;
+            ChatDriverEvent::InputLifecycle(fact) => {
+                self.apply_conversation_input_fact(sequence, fact, true);
             }
             _ => {}
         }
@@ -1515,12 +2455,10 @@ impl RetentionPins {
             .retain(|_, (sequence, _)| *sequence >= retained_floor);
         self.active_cells
             .retain(|_, sequence| *sequence >= retained_floor);
-        self.queued_inputs
-            .retain(|_, sequence| *sequence >= retained_floor);
-        self.queued_latest
-            .retain(|_, sequence| *sequence >= retained_floor);
+        self.conversation_inputs
+            .retain(|_, entry| conversation_input_pin_sequence(entry) >= retained_floor);
         self.queue_order
-            .retain(|input_id| self.queued_inputs.contains_key(input_id));
+            .retain(|input_id| self.conversation_inputs.contains_key(input_id));
         self.refresh_earliest();
     }
 
@@ -1531,15 +2469,423 @@ impl RetentionPins {
     }
 
     fn refresh_earliest(&mut self) {
+        let conversation_input_earliest = self
+            .conversation_inputs
+            .values()
+            .map(conversation_input_pin_sequence)
+            .min();
         self.earliest = self
             .pending_awaiters
             .values()
             .chain(self.started_awaiters.values().map(|(sequence, _)| sequence))
             .chain(self.active_cells.values())
-            .chain(self.queued_inputs.values())
+            .chain(conversation_input_earliest.iter())
             .copied()
             .min();
     }
+
+    fn apply_conversation_input_fact(
+        &mut self,
+        sequence: u64,
+        fact: &ConversationInputFact,
+        terminal_fact_self_contained: bool,
+    ) {
+        self.queue_revision = self.queue_revision.max(sequence);
+        match fact {
+            ConversationInputFact::Persisted { identity, payload } => {
+                let receipt = ConversationInputReceipt {
+                    identity: identity.clone(),
+                    phase: ConversationInputPhase::Persisted,
+                    attempt: None,
+                    attempt_id: None,
+                    turn_id: None,
+                    outcome: None,
+                    drained: false,
+                    reason: None,
+                    duplicate: false,
+                    queue_revision: self.queue_revision,
+                };
+                self.conversation_inputs.insert(
+                    identity.input_id.clone(),
+                    FoldedConversationInput {
+                        projection: ConversationInputProjection {
+                            receipt,
+                            payload: payload.clone(),
+                            active_attempt: None,
+                        },
+                        first_sequence: sequence,
+                        last_sequence: sequence,
+                        terminal_fact_self_contained: false,
+                    },
+                );
+                self.queue_order
+                    .retain(|queued| queued != &identity.input_id);
+                self.queue_order.push(identity.input_id.clone());
+            }
+            ConversationInputFact::AttemptStarted { attempt, .. } => {
+                if let Some(entry) = self.conversation_inputs.get_mut(&attempt.identity.input_id) {
+                    entry.projection.receipt.phase = ConversationInputPhase::AttemptStarted;
+                    entry.projection.receipt.attempt = Some(attempt.attempt);
+                    entry.projection.receipt.attempt_id = Some(attempt.attempt_id.clone());
+                    entry.projection.receipt.turn_id = Some(attempt.turn_id.clone());
+                    entry.projection.receipt.outcome = None;
+                    entry.projection.receipt.drained = false;
+                    entry.projection.receipt.reason = None;
+                    entry.projection.receipt.duplicate = false;
+                    entry.last_sequence = sequence;
+                    entry.projection.active_attempt = Some(attempt.clone());
+                }
+                self.queue_order
+                    .retain(|queued| queued != &attempt.identity.input_id);
+                self.queue_order
+                    .insert(0, attempt.identity.input_id.clone());
+            }
+            ConversationInputFact::MailboxAccepted { attempt, .. } => {
+                self.update_attempt_receipt(
+                    sequence,
+                    attempt,
+                    ConversationInputPhase::MailboxAccepted,
+                    None,
+                    false,
+                    None,
+                );
+            }
+            ConversationInputFact::Drained { attempt, .. } => {
+                self.ensure_terminal_tombstone(
+                    sequence,
+                    &attempt.identity,
+                    terminal_fact_self_contained,
+                );
+                self.update_attempt_receipt(
+                    sequence,
+                    attempt,
+                    ConversationInputPhase::Drained,
+                    None,
+                    true,
+                    None,
+                );
+                self.queue_order
+                    .retain(|queued| queued != &attempt.identity.input_id);
+                if let Some(entry) = self.conversation_inputs.get_mut(&attempt.identity.input_id) {
+                    entry.terminal_fact_self_contained = terminal_fact_self_contained;
+                }
+            }
+            ConversationInputFact::TurnSettled {
+                attempt,
+                outcome,
+                drained,
+                ..
+            } => {
+                if *drained {
+                    self.ensure_terminal_tombstone(
+                        sequence,
+                        &attempt.identity,
+                        terminal_fact_self_contained,
+                    );
+                }
+                self.update_attempt_receipt(
+                    sequence,
+                    attempt,
+                    ConversationInputPhase::TurnSettled,
+                    Some(*outcome),
+                    *drained,
+                    None,
+                );
+                if *drained {
+                    self.queue_order
+                        .retain(|queued| queued != &attempt.identity.input_id);
+                    if let Some(entry) =
+                        self.conversation_inputs.get_mut(&attempt.identity.input_id)
+                    {
+                        entry.terminal_fact_self_contained = terminal_fact_self_contained;
+                    }
+                } else if !self.queue_order.contains(&attempt.identity.input_id) {
+                    self.queue_order.push(attempt.identity.input_id.clone());
+                }
+            }
+            ConversationInputFact::Deferred {
+                attempt, reason, ..
+            } => {
+                self.update_attempt_receipt(
+                    sequence,
+                    attempt,
+                    ConversationInputPhase::Deferred,
+                    None,
+                    false,
+                    Some(reason.clone()),
+                );
+            }
+            ConversationInputFact::RecoveryRequired {
+                attempt,
+                reason,
+                drained,
+                ..
+            } => {
+                self.update_attempt_receipt(
+                    sequence,
+                    attempt,
+                    ConversationInputPhase::RecoveryRequired,
+                    None,
+                    *drained,
+                    Some(reason.clone()),
+                );
+            }
+            ConversationInputFact::Cancelled {
+                identity,
+                attempt,
+                drained,
+                reason,
+                ..
+            } => {
+                self.ensure_terminal_tombstone(sequence, identity, terminal_fact_self_contained);
+                if let Some(entry) = self.conversation_inputs.get_mut(&identity.input_id) {
+                    entry.projection.receipt.phase = ConversationInputPhase::Cancelled;
+                    entry.projection.receipt.outcome = Some(ConversationInputOutcome::Cancelled);
+                    entry.projection.receipt.reason = reason.clone();
+                    entry.projection.receipt.duplicate = false;
+                    entry.projection.receipt.drained = *drained;
+                    if let Some(attempt) = attempt {
+                        entry.projection.receipt.attempt = Some(attempt.attempt);
+                        entry.projection.receipt.attempt_id = Some(attempt.attempt_id.clone());
+                        entry.projection.receipt.turn_id = Some(attempt.turn_id.clone());
+                    }
+                    entry.last_sequence = sequence;
+                    entry.terminal_fact_self_contained = terminal_fact_self_contained;
+                }
+                self.queue_order
+                    .retain(|queued| queued != &identity.input_id);
+            }
+            ConversationInputFact::Reordered { input_ids, .. } => {
+                let mut next = Vec::with_capacity(self.queue_order.len());
+                for input_id in input_ids {
+                    if self.conversation_inputs.get(input_id).is_some_and(|entry| {
+                        conversation_input_is_frontier(&entry.projection.receipt)
+                    }) && !next.contains(input_id)
+                    {
+                        next.push(input_id.clone());
+                    }
+                }
+                for input_id in &self.queue_order {
+                    if self.conversation_inputs.get(input_id).is_some_and(|entry| {
+                        conversation_input_is_frontier(&entry.projection.receipt)
+                    }) && !next.contains(input_id)
+                    {
+                        next.push(input_id.clone());
+                    }
+                }
+                self.queue_order = next;
+            }
+        }
+        self.refresh_earliest();
+    }
+
+    fn update_attempt_receipt(
+        &mut self,
+        sequence: u64,
+        attempt: &ConversationInputAttempt,
+        phase: ConversationInputPhase,
+        outcome: Option<ConversationInputOutcome>,
+        drained: bool,
+        reason: Option<String>,
+    ) {
+        if let Some(entry) = self.conversation_inputs.get_mut(&attempt.identity.input_id) {
+            entry.projection.receipt.phase = phase;
+            entry.projection.receipt.attempt = Some(attempt.attempt);
+            entry.projection.receipt.attempt_id = Some(attempt.attempt_id.clone());
+            entry.projection.receipt.turn_id = Some(attempt.turn_id.clone());
+            entry.projection.receipt.outcome = outcome;
+            entry.projection.receipt.drained = drained;
+            entry.projection.receipt.reason = reason;
+            entry.projection.receipt.duplicate = false;
+            entry.last_sequence = sequence;
+        }
+    }
+
+    fn ensure_terminal_tombstone(
+        &mut self,
+        sequence: u64,
+        identity: &ConversationInputIdentity,
+        terminal_fact_self_contained: bool,
+    ) {
+        self.conversation_inputs
+            .entry(identity.input_id.clone())
+            .or_insert_with(|| FoldedConversationInput {
+                projection: ConversationInputProjection {
+                    receipt: ConversationInputReceipt {
+                        identity: identity.clone(),
+                        phase: ConversationInputPhase::RecoveryRequired,
+                        attempt: None,
+                        attempt_id: None,
+                        turn_id: None,
+                        outcome: None,
+                        drained: false,
+                        reason: Some("recovered terminal tombstone".to_string()),
+                        duplicate: false,
+                        queue_revision: self.queue_revision,
+                    },
+                    payload: ConversationInputPayload {
+                        text: String::new(),
+                        attachments: Vec::new(),
+                        submitted_at_ms: 0,
+                        payload_sha256: identity.payload_sha256.clone(),
+                    },
+                    active_attempt: None,
+                },
+                first_sequence: sequence,
+                last_sequence: sequence,
+                terminal_fact_self_contained,
+            });
+    }
+}
+
+fn conversation_input_is_frontier(receipt: &ConversationInputReceipt) -> bool {
+    !matches!(
+        receipt.phase,
+        ConversationInputPhase::Drained | ConversationInputPhase::Cancelled
+    ) && !(receipt.phase == ConversationInputPhase::TurnSettled && receipt.drained)
+}
+
+fn conversation_input_pin_sequence(entry: &FoldedConversationInput) -> u64 {
+    if conversation_input_is_frontier(&entry.projection.receipt) {
+        entry.first_sequence
+    } else if entry.terminal_fact_self_contained {
+        entry.last_sequence
+    } else {
+        entry.first_sequence
+    }
+}
+
+fn conversation_input_order_from_authority(authority: &StreamAuthority) -> Vec<String> {
+    authority
+        .pins
+        .queue_order
+        .iter()
+        .filter(|input_id| {
+            authority
+                .pins
+                .conversation_inputs
+                .get(*input_id)
+                .is_some_and(|entry| conversation_input_is_frontier(&entry.projection.receipt))
+        })
+        .cloned()
+        .collect()
+}
+
+fn normalized_conversation_input_projection(
+    entry: &FoldedConversationInput,
+    queue_revision: u64,
+) -> ConversationInputProjection {
+    let mut projection = entry.projection.clone();
+    projection.receipt.queue_revision = queue_revision;
+    projection
+}
+
+fn normalized_conversation_input_receipt(
+    entry: &FoldedConversationInput,
+    queue_revision: u64,
+) -> ConversationInputReceipt {
+    normalized_conversation_input_projection(entry, queue_revision).receipt
+}
+
+fn conversation_input_attempt_from_receipt(
+    receipt: &ConversationInputReceipt,
+) -> Option<ConversationInputAttempt> {
+    Some(ConversationInputAttempt {
+        identity: receipt.identity.clone(),
+        attempt: receipt.attempt?,
+        attempt_id: receipt.attempt_id.clone()?,
+        turn_id: receipt.turn_id.clone()?,
+        observation: Default::default(),
+    })
+}
+
+fn conversation_input_fact_is_duplicate(
+    current: &ConversationInputProjection,
+    fact: &ConversationInputFact,
+) -> bool {
+    let receipt = &current.receipt;
+    let exact_attempt = |attempt: &ConversationInputAttempt| {
+        receipt.identity == attempt.identity
+            && receipt.attempt == Some(attempt.attempt)
+            && receipt.attempt_id.as_deref() == Some(attempt.attempt_id.as_str())
+            && receipt.turn_id.as_deref() == Some(attempt.turn_id.as_str())
+    };
+    match fact {
+        ConversationInputFact::Persisted { identity, payload } => {
+            receipt.identity == *identity
+                && current.payload.payload_sha256 == payload.payload_sha256
+        }
+        ConversationInputFact::AttemptStarted { attempt, .. } => {
+            exact_attempt(attempt)
+                && matches!(
+                    receipt.phase,
+                    ConversationInputPhase::AttemptStarted
+                        | ConversationInputPhase::MailboxAccepted
+                        | ConversationInputPhase::Drained
+                        | ConversationInputPhase::TurnSettled
+                        | ConversationInputPhase::RecoveryRequired
+                )
+        }
+        ConversationInputFact::MailboxAccepted { attempt, .. } => {
+            exact_attempt(attempt)
+                && matches!(
+                    receipt.phase,
+                    ConversationInputPhase::MailboxAccepted
+                        | ConversationInputPhase::Drained
+                        | ConversationInputPhase::TurnSettled
+                )
+        }
+        ConversationInputFact::Drained { attempt, .. } => exact_attempt(attempt) && receipt.drained,
+        ConversationInputFact::TurnSettled {
+            attempt,
+            outcome,
+            drained,
+            ..
+        } => {
+            exact_attempt(attempt)
+                && receipt.phase == ConversationInputPhase::TurnSettled
+                && receipt.outcome == Some(*outcome)
+                && receipt.drained == *drained
+        }
+        ConversationInputFact::Deferred {
+            attempt, reason, ..
+        } => {
+            exact_attempt(attempt)
+                && receipt.phase == ConversationInputPhase::Deferred
+                && receipt.reason.as_deref() == Some(reason.as_str())
+        }
+        ConversationInputFact::RecoveryRequired {
+            attempt,
+            reason,
+            drained,
+            ..
+        } => {
+            exact_attempt(attempt)
+                && receipt.phase == ConversationInputPhase::RecoveryRequired
+                && receipt.reason.as_deref() == Some(reason.as_str())
+                && receipt.drained == *drained
+        }
+        ConversationInputFact::Cancelled {
+            identity,
+            attempt,
+            drained,
+            reason,
+            ..
+        } => {
+            receipt.identity == *identity
+                && receipt.phase == ConversationInputPhase::Cancelled
+                && attempt.as_ref() == conversation_input_attempt_from_receipt(receipt).as_ref()
+                && receipt.drained == *drained
+                && receipt.reason == *reason
+        }
+        ConversationInputFact::Reordered { input_ids, .. } => {
+            conversation_input_order_from_projection(current).as_slice() == input_ids.as_slice()
+        }
+    }
+}
+
+fn conversation_input_order_from_projection(current: &ConversationInputProjection) -> Vec<String> {
+    vec![current.receipt.identity.input_id.clone()]
 }
 
 fn envelope_from_record(
@@ -1728,9 +3074,7 @@ fn append_durability(event: &ChatDriverEvent) -> FileDurability {
         | ChatDriverEvent::AwaiterResultReady { .. }
         | ChatDriverEvent::AwaiterResultDeliveryStarted { .. }
         | ChatDriverEvent::AwaiterResultAcknowledged { .. }
-        | ChatDriverEvent::InputQueued { .. }
-        | ChatDriverEvent::InputRemoved { .. }
-        | ChatDriverEvent::InputReordered { .. }
+        | ChatDriverEvent::InputLifecycle(_)
         | ChatDriverEvent::ApprovalRequest { .. }
         | ChatDriverEvent::InputRequest { .. }
         | ChatDriverEvent::SelectionRequest { .. }
@@ -1871,6 +3215,14 @@ fn validate_event_stream_identity(
                 "execution event address does not match journal stream".to_string(),
             ));
         }
+        ChatDriverEvent::InputLifecycle(fact)
+            if fact.identity().address.workspace_id != workspace_id
+                || Some(fact.identity().address.conversation_id.as_str()) != conversation_id =>
+        {
+            return Err(ChatEventLogError::InvalidIdentity(
+                "conversation input fact address does not match journal stream".to_string(),
+            ));
+        }
         _ => {}
     }
     Ok(())
@@ -1913,33 +3265,8 @@ fn validate_driver_event(event: &ChatDriverEvent) -> Result<(), ChatEventLogErro
             "unknown turn status {status:?} for chat event schema {CHAT_EVENT_SCHEMA_VERSION}"
         )));
     }
-    if let ChatDriverEvent::InputQueued {
-        input_id,
-        text,
-        attachments,
-        ..
-    } = event
-        && (input_id.trim().is_empty() || (text.trim().is_empty() && attachments.is_empty()))
-    {
-        return Err(ChatEventLogError::InvalidEvent(
-            "queued chat input has an invalid identity or empty payload".to_string(),
-        ));
-    }
-    if let ChatDriverEvent::InputRemoved { input_id } = event
-        && input_id.trim().is_empty()
-    {
-        return Err(ChatEventLogError::InvalidEvent(
-            "removed chat input id must not be empty".to_string(),
-        ));
-    }
-    if let ChatDriverEvent::InputReordered { input_ids } = event
-        && (input_ids.is_empty()
-            || input_ids.iter().any(|input_id| input_id.trim().is_empty())
-            || has_duplicate_ids(input_ids))
-    {
-        return Err(ChatEventLogError::InvalidEvent(
-            "queued input order contains an empty or duplicate identity".to_string(),
-        ));
+    if let ChatDriverEvent::InputLifecycle(fact) = event {
+        validate_conversation_input_event(fact)?;
     }
     match event {
         ChatDriverEvent::CommandCellStarted { cell }
@@ -1981,6 +3308,74 @@ fn validate_driver_event(event: &ChatDriverEvent) -> Result<(), ChatEventLogErro
         {
             Err(ChatEventLogError::InvalidEvent(
                 "Extension receipt identity is incomplete".to_string(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_conversation_input_event(
+    fact: &ConversationInputFact,
+) -> Result<(), ChatEventLogError> {
+    let identity = fact.identity();
+    if identity.address.workspace_id.trim().is_empty()
+        || identity.address.conversation_id.trim().is_empty()
+        || identity.input_id.trim().is_empty()
+        || identity.revision == 0
+    {
+        return Err(ChatEventLogError::InvalidEvent(
+            "conversation input fact identity is incomplete".to_string(),
+        ));
+    }
+    match fact {
+        ConversationInputFact::Persisted { payload, .. }
+            if (payload.text.trim().is_empty() && payload.attachments.is_empty())
+                || payload.payload_sha256.trim().is_empty() =>
+        {
+            Err(ChatEventLogError::InvalidEvent(
+                "persisted conversation input payload is incomplete".to_string(),
+            ))
+        }
+        ConversationInputFact::AttemptStarted { attempt, .. }
+        | ConversationInputFact::MailboxAccepted { attempt, .. }
+        | ConversationInputFact::Drained { attempt, .. }
+        | ConversationInputFact::TurnSettled { attempt, .. }
+        | ConversationInputFact::Deferred { attempt, .. }
+        | ConversationInputFact::RecoveryRequired { attempt, .. }
+            if attempt.attempt == 0
+                || attempt.attempt_id.trim().is_empty()
+                || attempt.turn_id.trim().is_empty() =>
+        {
+            Err(ChatEventLogError::InvalidEvent(
+                "conversation input attempt identity is incomplete".to_string(),
+            ))
+        }
+        ConversationInputFact::Deferred { reason, .. }
+        | ConversationInputFact::RecoveryRequired { reason, .. }
+            if reason.trim().is_empty() =>
+        {
+            Err(ChatEventLogError::InvalidEvent(
+                "conversation input lifecycle reason must not be empty".to_string(),
+            ))
+        }
+        ConversationInputFact::Reordered { input_ids, .. }
+            if input_ids.is_empty()
+                || input_ids.iter().any(|input_id| input_id.trim().is_empty())
+                || has_duplicate_ids(input_ids) =>
+        {
+            Err(ChatEventLogError::InvalidEvent(
+                "typed conversation input reorder is invalid".to_string(),
+            ))
+        }
+        ConversationInputFact::Cancelled {
+            attempt: Some(attempt),
+            ..
+        } if attempt.attempt == 0
+            || attempt.attempt_id.trim().is_empty()
+            || attempt.turn_id.trim().is_empty() =>
+        {
+            Err(ChatEventLogError::InvalidEvent(
+                "cancelled conversation input attempt identity is incomplete".to_string(),
             ))
         }
         _ => Ok(()),
@@ -2380,47 +3775,6 @@ mod tests {
     }
 
     #[test]
-    fn queued_input_pin_ignores_public_cap_then_converges_on_remove() -> Result<(), String> {
-        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let log = ChatEventLog::open(
-            temp.path(),
-            ChatEventRetention {
-                segment_rollover_bytes: 1,
-                max_segments: 1,
-                max_replay_events: 1,
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        log.enqueue_chat_input(
-            "workspace-1",
-            "conversation-1",
-            "input-1",
-            "keep me".to_string(),
-            Vec::new(),
-        )
-        .map_err(|error| error.to_string())?;
-        for _ in 0..4 {
-            append_status(&log, "completed")?;
-        }
-        assert_eq!(
-            log.queued_chat_inputs("workspace-1", "conversation-1")
-                .map_err(|error| error.to_string())?
-                .len(),
-            1
-        );
-        assert!(segment_count(&log)? > 1);
-        log.remove_queued_chat_input("workspace-1", "conversation-1", "input-1")
-            .map_err(|error| error.to_string())?;
-        assert!(
-            log.queued_chat_inputs("workspace-1", "conversation-1")
-                .map_err(|error| error.to_string())?
-                .is_empty()
-        );
-        assert_eq!(segment_count(&log)?, 1);
-        Ok(())
-    }
-
-    #[test]
     fn unacknowledged_awaiter_pins_then_acknowledgement_converges() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let log = ChatEventLog::open(
@@ -2647,15 +4001,6 @@ mod tests {
         assert_eq!(
             append_durability(&ChatDriverEvent::TurnStatus {
                 status: "completed".to_string(),
-            }),
-            FileDurability::SyncData
-        );
-        assert_eq!(
-            append_durability(&ChatDriverEvent::InputQueued {
-                input_id: "input".to_string(),
-                text: "queued".to_string(),
-                attachments: Vec::new(),
-                submitted_at_ms: 1,
             }),
             FileDurability::SyncData
         );
@@ -2940,77 +4285,6 @@ mod tests {
     }
 
     #[test]
-    fn queued_inputs_survive_reopen_reorder_and_scoped_removal() -> Result<(), String> {
-        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let root = temp.path().join("events");
-        let log = ChatEventLog::open(&root, ChatEventRetention::default())
-            .map_err(|error| error.to_string())?;
-        for (input_id, text) in [("input-a", "first"), ("input-b", "second")] {
-            log.enqueue_chat_input(
-                "workspace-a",
-                "conversation-1",
-                input_id,
-                text.to_string(),
-                Vec::new(),
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        log.enqueue_chat_input(
-            "workspace-b",
-            "conversation-1",
-            "other",
-            "other workspace".to_string(),
-            Vec::new(),
-        )
-        .map_err(|error| error.to_string())?;
-        log.reorder_queued_chat_inputs(
-            "workspace-a",
-            "conversation-1",
-            vec!["input-b".to_string(), "input-a".to_string()],
-        )
-        .map_err(|error| error.to_string())?;
-        log.remove_queued_chat_input("workspace-a", "conversation-1", "input-b")
-            .map_err(|error| error.to_string())?;
-        log.enqueue_chat_input(
-            "workspace-a",
-            "conversation-1",
-            "input-b",
-            "requeued at tail".to_string(),
-            Vec::new(),
-        )
-        .map_err(|error| error.to_string())?;
-        assert!(matches!(
-            log.reorder_queued_chat_inputs(
-                "workspace-a",
-                "conversation-1",
-                vec!["input-a".to_string(), "input-a".to_string()],
-            ),
-            Err(ChatEventLogError::InvalidEvent(_))
-        ));
-        drop(log);
-
-        let reopened = ChatEventLog::open(root, ChatEventRetention::default())
-            .map_err(|error| error.to_string())?;
-        assert_eq!(
-            reopened
-                .queued_chat_inputs("workspace-a", "conversation-1")
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(|input| input.input_id)
-                .collect::<Vec<_>>(),
-            vec!["input-a".to_string(), "input-b".to_string()]
-        );
-        assert_eq!(
-            reopened
-                .queued_chat_inputs("workspace-b", "conversation-1")
-                .map_err(|error| error.to_string())?
-                .len(),
-            1
-        );
-        Ok(())
-    }
-
-    #[test]
     fn incremental_pin_projection_does_not_rescan_pinned_history() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root = temp.path().join("events");
@@ -3020,14 +4294,6 @@ mod tests {
             max_replay_events: 1,
         };
         let log = ChatEventLog::open(&root, retention).map_err(|error| error.to_string())?;
-        log.enqueue_chat_input(
-            "workspace-1",
-            "conversation-1",
-            "input-pin",
-            "pinned".to_string(),
-            Vec::new(),
-        )
-        .map_err(|error| error.to_string())?;
         let result = awaiter_result();
         log.append(
             "workspace-1",
@@ -3046,29 +4312,15 @@ mod tests {
         let reopened = ChatEventLog::open(root, retention).map_err(|error| error.to_string())?;
         assert_eq!(
             reopened
-                .queued_chat_inputs("workspace-1", "conversation-1")
-                .map_err(|error| error.to_string())?
-                .len(),
-            1
-        );
-        assert_eq!(
-            reopened
                 .pending_awaiter_results("workspace-1", "conversation-1", "turn-1")
                 .map_err(|error| error.to_string())?
                 .len(),
             1
         );
         let recovered_once = recovered_pin_records(&reopened)?;
-        assert!(recovered_once >= 6);
+        assert!(recovered_once > 0);
         for _ in 0..12 {
             append_status(&reopened, "completed")?;
-            assert_eq!(
-                reopened
-                    .queued_chat_inputs("workspace-1", "conversation-1")
-                    .map_err(|error| error.to_string())?
-                    .len(),
-                1
-            );
             assert_eq!(
                 reopened
                     .pending_awaiter_results("workspace-1", "conversation-1", "turn-1")
@@ -3089,22 +4341,6 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let second = ChatEventLog::open(&root, ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
-        first
-            .enqueue_chat_input(
-                "workspace-1",
-                "conversation-1",
-                "input-shared",
-                "shared".to_string(),
-                Vec::new(),
-            )
-            .map_err(|error| error.to_string())?;
-        assert_eq!(
-            second
-                .queued_chat_inputs("workspace-1", "conversation-1")
-                .map_err(|error| error.to_string())?
-                .len(),
-            1
-        );
         let mismatched = ChatEventLog::open(
             &root,
             ChatEventRetention {
@@ -3113,10 +4349,13 @@ mod tests {
             },
         )
         .map_err(|error| error.to_string())?;
-        assert!(matches!(
-            mismatched.queued_chat_inputs("workspace-1", "conversation-1"),
-            Err(ChatEventLogError::Corrupt { .. })
-        ));
+        assert!(
+            mismatched
+                .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+                .map_err(|error| error.to_string())?
+                .events
+                .is_empty()
+        );
 
         let result = awaiter_result();
         let ready = || ChatDriverEvent::AwaiterResultReady {
@@ -3335,22 +4574,6 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let second = ChatEventLog::open(&root, ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
-        first
-            .enqueue_chat_input(
-                "workspace-lru",
-                "conversation-0",
-                "pinned-input",
-                "survives eviction".to_string(),
-                Vec::new(),
-            )
-            .map_err(|error| error.to_string())?;
-        assert_eq!(
-            second
-                .queued_chat_inputs("workspace-lru", "conversation-0")
-                .map_err(|error| error.to_string())?
-                .len(),
-            1
-        );
         for index in 1..=(MAX_REGISTRY_ENTRIES_BEFORE_PRUNE + 16) {
             let conversation = format!("conversation-{index}");
             first
@@ -3377,18 +4600,6 @@ mod tests {
             .filter(|path| path.starts_with(&canonical_root))
             .count();
         assert!(registered_for_root <= MAX_REGISTRY_ENTRIES_BEFORE_PRUNE + 1);
-        let pinned_stream = stream_id("workspace-lru", Some("conversation-0"), "pinned-input")
-            .map_err(|error| error.to_string())?;
-        assert!(!first.streams.contains_key(&pinned_stream));
-        assert!(!second.streams.contains_key(&pinned_stream));
-        assert_eq!(
-            first
-                .queued_chat_inputs("workspace-lru", "conversation-0")
-                .map_err(|error| error.to_string())?
-                .first()
-                .map(|input| input.text.as_str()),
-            Some("survives eviction")
-        );
         Ok(())
     }
 
@@ -3475,34 +4686,19 @@ mod tests {
             let start = Arc::clone(&start);
             handles.push(std::thread::spawn(move || {
                 start.wait();
-                if index < 16 {
-                    let input_id = format!("input-{index}");
-                    log.append(
-                        "workspace-1",
-                        Some("conversation-1"),
-                        &input_id,
-                        ChatDriverEvent::InputQueued {
-                            input_id: input_id.clone(),
-                            text: format!("queued-{index}"),
-                            attachments: Vec::new(),
-                            submitted_at_ms: u64::try_from(index).unwrap_or(u64::MAX),
-                        },
-                    )
-                } else {
-                    let mut result = awaiter_result();
-                    result.receipt.execution_id = format!("awaiter-{index}");
-                    result.receipt.control_task_id = format!("awaiter:cell-{index}:1");
-                    result.receipt.cell_id = format!("cell-{index}");
-                    result.cell.cell_id = format!("cell-{index}");
-                    log.append(
-                        "workspace-1",
-                        Some("conversation-1"),
-                        &format!("root-{index}"),
-                        ChatDriverEvent::AwaiterResultReady {
-                            result: Box::new(result),
-                        },
-                    )
-                }
+                let mut result = awaiter_result();
+                result.receipt.execution_id = format!("awaiter-{index}");
+                result.receipt.control_task_id = format!("awaiter:cell-{index}:1");
+                result.receipt.cell_id = format!("cell-{index}");
+                result.cell.cell_id = format!("cell-{index}");
+                log.append(
+                    "workspace-1",
+                    Some("conversation-1"),
+                    &format!("root-{index}"),
+                    ChatDriverEvent::AwaiterResultReady {
+                        result: Box::new(result),
+                    },
+                )
                 .map_err(|error| error.to_string())
             }));
         }
@@ -3530,18 +4726,11 @@ mod tests {
             32
         );
         assert_eq!(
-            first
-                .queued_chat_inputs("workspace-1", "conversation-1")
-                .map_err(|error| error.to_string())?
-                .len(),
-            16
-        );
-        assert_eq!(
             second
                 .pending_awaiter_results("workspace-1", "conversation-1", "ignored")
                 .map_err(|error| error.to_string())?
                 .len(),
-            16
+            32
         );
         Ok(())
     }

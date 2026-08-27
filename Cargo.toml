@@ -103,6 +103,7 @@ strip-ansi-escapes = { version = "0.2", optional = true }
 [dev-dependencies]
 echo-agent-app-core = { path = "./echo-agent-app-core", features = ["test-utils"] }
 echo-agent = { version = "0.2.0", package = "echo_agent", path = "../echo-agent", default-features = false, features = ["testing"] }
+tempfile = "3"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

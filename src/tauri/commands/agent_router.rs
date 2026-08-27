@@ -5,6 +5,15 @@ use crate::tauri::state::TauriState;
 use echo_agent_app_core::agent_router::{AgentAddress, AgentGroupMember, AgentMessage};
 use echo_agent_app_core::workspace::WorkspaceId;
 
+fn delivery_status_response(
+    records: Vec<echo_agent_app_core::agent_router::AgentDeliveryRecord>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "count": records.len(),
+        "records": records,
+    })
+}
+
 #[tauri::command]
 pub async fn list_agent_endpoints(
     state: tauri::State<'_, TauriState>,
@@ -40,10 +49,48 @@ pub async fn get_agent_delivery_status(
                 .is_none_or(|id| record.message_id == id)
         })
         .collect::<Vec<_>>();
-    Ok(serde_json::json!({
-        "records": records,
-        "count": records.len(),
-    }))
+    Ok(delivery_status_response(records))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn agent_delivery_wire_uses_only_canonical_receipt_vocabulary() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let router = echo_agent_app_core::agent_router::AgentRouter::new(root.path().to_path_buf());
+        let target = AgentAddress::new(WorkspaceId::from_name("wire-target"), "wire-conversation");
+        let receipt = router
+            .enqueue(AgentMessage::user_text(None, target.clone(), "persist me"))
+            .await
+            .map_err(|error| error.to_string())?;
+        let receipt_json = serde_json::to_value(receipt).map_err(|error| error.to_string())?;
+        assert_eq!(
+            receipt_json.get("phase"),
+            Some(&serde_json::json!("persisted"))
+        );
+        assert_eq!(receipt_json.get("drained"), Some(&serde_json::json!(false)));
+        assert!(receipt_json.get("status").is_none());
+        assert!(receipt_json.get("accepted_at").is_none());
+
+        let response = delivery_status_response(
+            router
+                .records(&target)
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+        let record = response
+            .get("records")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|records| records.first())
+            .ok_or_else(|| "canonical Agent delivery record is missing".to_string())?;
+        assert_eq!(record.get("phase"), Some(&serde_json::json!("persisted")));
+        assert!(record.get("status").is_none());
+        assert!(record.get("settled_at").is_none());
+        assert!(record.get("error").is_none());
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

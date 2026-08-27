@@ -23,7 +23,7 @@ impl Widget for StatusBar {
             _ => t.green,
         };
 
-        let state = if app.is_processing && !app.queued_turns.is_empty() {
+        let state = if app.is_processing && app.conversation_input_queue_len() > 0 {
             "thinking+queued"
         } else if app.is_processing {
             "thinking"

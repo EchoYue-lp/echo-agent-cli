@@ -30,6 +30,12 @@ const turnEnvelope = (sequence: number, turnId: string): ChatEventEnvelope => ({
   message_id: turnId,
 });
 
+const lifecycleEnvelope = (sequence: number, phase: 'persisted' | 'attempt_started') =>
+  ({
+    ...turnEnvelope(sequence, `input-${phase}`),
+    payload: { source: 'input_lifecycle', event: { phase } },
+  }) as ChatEventEnvelope;
+
 describe('ChatEventSequencer', () => {
   beforeEach(resetChatEventCursorsForTest);
 
@@ -94,5 +100,26 @@ describe('ChatEventSequencer', () => {
 
     expect(projected).toEqual(['turn-a', 'turn-b', 'turn-b']);
     expect(sequencer.cursor('conversation:one')).toBe(4);
+  });
+
+  it('applies lifecycle facts continuously without changing latest-turn selection', () => {
+    const sequencer = new ChatEventSequencer();
+    const projected: Array<[number, string]> = [];
+    const apply = (event: ChatEventEnvelope) => projected.push([event.sequence, event.turn_id]);
+
+    sequencer.ingest(lifecycleEnvelope(1, 'persisted'), apply);
+    sequencer.ingest(lifecycleEnvelope(2, 'attempt_started'), apply);
+    sequencer.ingest(turnEnvelope(3, 'turn-live'), apply);
+    sequencer.ingest(lifecycleEnvelope(4, 'attempt_started'), apply);
+    sequencer.ingest(turnEnvelope(5, 'turn-live'), apply);
+
+    expect(projected).toEqual([
+      [1, 'input-persisted'],
+      [2, 'input-attempt_started'],
+      [3, 'turn-live'],
+      [4, 'input-attempt_started'],
+      [5, 'turn-live'],
+    ]);
+    expect(sequencer.cursor('conversation:one')).toBe(5);
   });
 });

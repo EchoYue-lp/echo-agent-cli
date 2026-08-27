@@ -49,7 +49,10 @@ export class ChatEventSequencer {
       const envelope = pending.get(next);
       pending.delete(next);
       if (envelope) {
-        if (shouldProjectTurn(envelope.stream_id, envelope.turn_id)) {
+        if (
+          envelope.payload.source === 'input_lifecycle' ||
+          shouldProjectTurn(envelope.stream_id, envelope.turn_id)
+        ) {
           apply(envelope);
         }
         appliedCursorByStream.set(streamId, next);

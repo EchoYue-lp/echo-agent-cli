@@ -15,9 +15,21 @@ export type {
   ContextStats,
   SessionInfo,
   ToolInfo,
+  ConversationInputAddress,
+  ConversationInputAttempt,
+  ConversationInputFact,
+  ConversationInputFrontier,
+  ConversationInputIdentity,
+  ConversationInputOutcome,
+  ConversationInputPayload,
+  ConversationInputPhase,
+  ConversationInputProjection,
+  ConversationInputReceipt,
+  ConversationInputSource,
 } from '../generated';
 import type {
   BackgroundCellState,
+  ConversationInputFact,
   ExtensionSkillEntry,
   McpServerInfo as GeneratedMcpServerInfo,
   McpToolInfo as GeneratedMcpToolInfo,
@@ -223,7 +235,6 @@ export type ChatEvent = {
   | { type: 'tool_batch_start'; tool_count: number }
   | { type: 'tool_batch_end' }
   | { type: 'interrupt_prompt'; run_id: string; goal: string; new_message: string }
-  | { type: 'done' }
 );
 
 export type AgentFailureCategory =
@@ -321,17 +332,7 @@ export type ChatDriverEvent =
   | { source: 'turn_status'; event: { status: ChatRunStatus } }
   | { source: 'execution_path'; event: { requested_mode: string; observed_path: string } }
   | { source: 'interrupt'; event: { run_id: string; goal: string; new_message: string } }
-  | {
-      source: 'input_queued';
-      event: {
-        input_id: string;
-        text: string;
-        attachments: Attachment[];
-        submitted_at_ms: number;
-      };
-    }
-  | { source: 'input_removed'; event: { input_id: string } }
-  | { source: 'input_reordered'; event: { input_ids: string[] } }
+  | { source: 'input_lifecycle'; event: ConversationInputFact }
   | {
       source: 'approval_request';
       event: { request_id: string; tool_name: string; args: unknown; prompt: string };

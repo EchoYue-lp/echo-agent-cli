@@ -43,6 +43,9 @@ enum ChannelRenderEvent {
 mod outbound;
 
 #[cfg(feature = "channels")]
+mod input_pump;
+
+#[cfg(feature = "channels")]
 use outbound::{
     CHANNEL_EVENT_QUEUE_CAPACITY, ChannelOutboundDraft, ChannelSurfaceSink,
     channel_outbound_chunks, channel_outbound_transport, channel_safe_text,
@@ -121,6 +124,164 @@ struct ChannelActiveTurn {
 }
 
 #[cfg(feature = "channels")]
+fn channel_input_address(
+    workspace_id: &str,
+    conversation_id: &str,
+) -> echo_agent_app_core::conversation_input::ConversationInputAddress {
+    echo_agent_app_core::conversation_input::ConversationInputAddress {
+        workspace_id: workspace_id.to_string(),
+        conversation_id: conversation_id.to_string(),
+    }
+}
+
+#[cfg(feature = "channels")]
+fn channel_input_attempt(
+    projection: &echo_agent_app_core::conversation_input::ConversationInputProjection,
+) -> Result<echo_agent_app_core::conversation_input::ConversationInputAttempt, String> {
+    projection
+        .active_attempt
+        .clone()
+        .ok_or_else(|| "channel input active attempt is missing".to_string())
+}
+
+#[cfg(feature = "channels")]
+fn channel_input_phase_label(
+    phase: echo_agent_app_core::conversation_input::ConversationInputPhase,
+) -> &'static str {
+    use echo_agent_app_core::conversation_input::ConversationInputPhase;
+
+    match phase {
+        ConversationInputPhase::Persisted => "persisted",
+        ConversationInputPhase::AttemptStarted => "attempt_started",
+        ConversationInputPhase::MailboxAccepted => "mailbox_accepted",
+        ConversationInputPhase::Drained => "drained",
+        ConversationInputPhase::TurnSettled => "turn_settled",
+        ConversationInputPhase::Deferred => "deferred",
+        ConversationInputPhase::RecoveryRequired => "recovery_required",
+        ConversationInputPhase::Cancelled => "cancelled",
+    }
+}
+
+#[cfg(feature = "channels")]
+fn channel_input_fact_phase(
+    fact: &echo_agent_app_core::conversation_input::ConversationInputFact,
+) -> Option<echo_agent_app_core::conversation_input::ConversationInputPhase> {
+    use echo_agent_app_core::conversation_input::{ConversationInputFact, ConversationInputPhase};
+
+    match fact {
+        ConversationInputFact::Persisted { .. } => Some(ConversationInputPhase::Persisted),
+        ConversationInputFact::AttemptStarted { .. } => {
+            Some(ConversationInputPhase::AttemptStarted)
+        }
+        ConversationInputFact::MailboxAccepted { .. } => {
+            Some(ConversationInputPhase::MailboxAccepted)
+        }
+        ConversationInputFact::Drained { .. } => Some(ConversationInputPhase::Drained),
+        ConversationInputFact::TurnSettled { .. } => Some(ConversationInputPhase::TurnSettled),
+        ConversationInputFact::Deferred { .. } => Some(ConversationInputPhase::Deferred),
+        ConversationInputFact::Reordered { .. } => None,
+        ConversationInputFact::RecoveryRequired { .. } => {
+            Some(ConversationInputPhase::RecoveryRequired)
+        }
+        ConversationInputFact::Cancelled { .. } => Some(ConversationInputPhase::Cancelled),
+    }
+}
+
+#[cfg(feature = "channels")]
+async fn settle_channel_turn_after_input_observers(
+    lease: echo_agent_app_core::foreground_turn::ForegroundTurnLease,
+    outcome: echo_agent_app_core::chat_driver::TurnOutcome,
+) -> Result<echo_agent_app_core::chat_driver::TurnOutcome, String> {
+    lease
+        .settle_after_observers(outcome)
+        .await
+        .map(|settlement| settlement.outcome)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "channels")]
+fn channel_live_terminal_projector(
+    service: echo_agent_app_core::conversation_input::ConversationInputService,
+    attempt: echo_agent_app_core::conversation_input::ConversationInputAttempt,
+    observed_phase: Arc<
+        std::sync::Mutex<Option<echo_agent_app_core::conversation_input::ConversationInputPhase>>,
+    >,
+) -> echo_agent_app_core::foreground_turn::ForegroundTerminalProjector {
+    use echo_agent_app_core::conversation_input::ConversationInputPhase;
+
+    Arc::new(move |outcome| {
+        let service = service.clone();
+        let attempt = attempt.clone();
+        let phase = observed_phase
+            .lock()
+            .map(|phase| *phase)
+            .map_err(|_| "channel live input phase is unavailable".to_string());
+        Box::pin(async move {
+            let phase = phase?;
+            match phase {
+                Some(
+                    ConversationInputPhase::Drained
+                    | ConversationInputPhase::TurnSettled
+                    | ConversationInputPhase::RecoveryRequired,
+                ) => service
+                    .settle_attempt(&attempt, &outcome)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                None if attempt.observation.failed() => service
+                    .settle_attempt(&attempt, &outcome)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                _ => Ok(()),
+            }
+        })
+    })
+}
+
+#[cfg(feature = "channels")]
+async fn project_channel_input_lifecycle(
+    log: &echo_agent_app_core::chat_event_log::ChatEventLog,
+    identity: &echo_agent_app_core::conversation_input::ConversationInputIdentity,
+    render_tx: &tokio::sync::mpsc::Sender<ChannelRenderEvent>,
+    cursor: &std::sync::Mutex<u64>,
+) -> Result<(), String> {
+    let after_cursor = *cursor
+        .lock()
+        .map_err(|_| "channel input lifecycle cursor is unavailable".to_string())?;
+    let replay = log
+        .replay(
+            &identity.address.workspace_id,
+            Some(&identity.address.conversation_id),
+            &identity.input_id,
+            after_cursor,
+        )
+        .map_err(|error| error.to_string())?;
+    if replay.truncated {
+        return Err(format!(
+            "channel input lifecycle replay for {} was truncated after cursor {}",
+            identity.input_id, after_cursor
+        ));
+    }
+    for envelope in replay.events {
+        let sequence = envelope.sequence;
+        if matches!(
+            &envelope.payload,
+            echo_agent_app_core::chat_driver::ChatDriverEvent::InputLifecycle(_)
+        ) {
+            render_tx
+                .send(ChannelRenderEvent::Driver(envelope.payload))
+                .await
+                .map_err(|_| "channel input lifecycle renderer is closed".to_string())?;
+        }
+        *cursor
+            .lock()
+            .map_err(|_| "channel input lifecycle cursor is unavailable".to_string())? = sequence;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "channels")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ChannelSurfaceIdentity {
     channel_id: String,
@@ -171,9 +332,27 @@ struct ChannelSessionLifecycleRecord {
 
 #[cfg(feature = "channels")]
 #[derive(Default)]
+struct ChannelInputPumpTasks {
+    shutting_down: bool,
+    tasks: tokio::task::JoinSet<Result<(), String>>,
+}
+
+#[cfg(feature = "channels")]
+#[derive(Default)]
 pub(crate) struct ChannelSessionCoordinator {
     active_turns: ChannelActiveTurnMap,
     lifecycle: std::sync::Mutex<HashMap<ChannelSurfaceIdentity, ChannelSessionLifecycleRecord>>,
+    input_pumps: std::sync::Mutex<
+        HashMap<
+            ChannelSurfaceIdentity,
+            Arc<
+                input_pump::ChannelInputPumpSlot<
+                    echo_agent_app_core::conversation_input::ConversationInputIdentity,
+                >,
+            >,
+        >,
+    >,
+    input_pump_tasks: std::sync::Mutex<ChannelInputPumpTasks>,
 }
 
 #[cfg(feature = "channels")]
@@ -201,7 +380,7 @@ impl ChannelSessionCoordinator {
             .lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let record = lifecycle.entry(surface_id).or_default();
+        let record = lifecycle.entry(surface_id.clone()).or_default();
         let explicit_previous = instance.previous_incarnation_id().map(str::to_string);
         let pending_previous = record.pending_ended_incarnation_id.clone();
         let previous = match (explicit_previous, pending_previous) {
@@ -228,6 +407,23 @@ impl ChannelSessionCoordinator {
         Ok((previous, Arc::clone(&record.retirement_gate)))
     }
 
+    fn input_pump(
+        &self,
+        surface_id: &ChannelSurfaceIdentity,
+    ) -> Arc<
+        input_pump::ChannelInputPumpSlot<
+            echo_agent_app_core::conversation_input::ConversationInputIdentity,
+        >,
+    > {
+        Arc::clone(
+            self.input_pumps
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(surface_id.clone())
+                .or_default(),
+        )
+    }
+
     pub(crate) fn record_session_end(&self, info: echo_agent::channels::SessionEndInfo) {
         let surface_id = ChannelSurfaceIdentity {
             channel_id: info.channel_id,
@@ -238,11 +434,174 @@ impl ChannelSessionCoordinator {
             .lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let record = lifecycle.entry(surface_id).or_default();
-        if record.current_incarnation_id.as_deref() == Some(info.incarnation_id.as_str()) {
+        let record = lifecycle.entry(surface_id.clone()).or_default();
+        let ended_current =
+            record.current_incarnation_id.as_deref() == Some(info.incarnation_id.as_str());
+        if ended_current {
             record.current_incarnation_id = None;
             Self::mark_incarnation_pending(&record.retirement_gate, &info.incarnation_id);
             record.pending_ended_incarnation_id = Some(info.incarnation_id);
+        }
+        drop(lifecycle);
+        if ended_current
+            && let Some(slot) = self
+                .input_pumps
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&surface_id)
+        {
+            let _ = slot.begin_shutdown();
+        }
+    }
+
+    fn start_input_pump_task(
+        &self,
+        slot: Arc<
+            input_pump::ChannelInputPumpSlot<
+                echo_agent_app_core::conversation_input::ConversationInputIdentity,
+            >,
+        >,
+        owner: input_pump::ChannelInputPumpOwner<
+            echo_agent_app_core::conversation_input::ConversationInputIdentity,
+        >,
+        adapter: Arc<ChannelInputPumpAdapter>,
+    ) -> Result<(), String> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|error| format!("channel input pump requires a Tokio runtime: {error}"))?;
+        let mut tasks = self
+            .input_pump_tasks
+            .lock()
+            .map_err(|_| "channel input pump task owner is unavailable".to_string())?;
+        if tasks.shutting_down {
+            return Err("channel input pump admission is closed".to_string());
+        }
+        tasks.tasks.spawn_on(
+            async move {
+                let mut owner = Some(owner);
+                loop {
+                    let current = owner
+                        .take()
+                        .ok_or_else(|| "channel pump recovery owner is missing".to_string())?;
+                    match input_pump::run_channel_input_pump(current, Arc::clone(&adapter)).await {
+                        Ok(()) | Err(input_pump::ChannelInputPumpError::ShuttingDown) => {
+                            return Ok(());
+                        }
+                        Err(input_pump::ChannelInputPumpError::DurableDebt(reason)) => {
+                            return Err(format!("channel input durable debt: {reason}"));
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "channel input pump owner failed");
+                            owner = slot
+                                .resume_after_owner_loss()
+                                .map_err(|resume| resume.to_string())?;
+                            if owner.is_none() {
+                                return Err(error.to_string());
+                            }
+                        }
+                    }
+                }
+            },
+            &runtime,
+        );
+        Ok(())
+    }
+
+    fn start_post_settlement_input_task(
+        &self,
+        waiter: echo_agent_app_core::foreground_turn::ForegroundTurnSettlementWaiter,
+        terminal_tx: tokio::sync::oneshot::Sender<echo_agent_app_core::chat_driver::TurnOutcome>,
+        slot: Arc<
+            input_pump::ChannelInputPumpSlot<
+                echo_agent_app_core::conversation_input::ConversationInputIdentity,
+            >,
+        >,
+        adapter: Arc<ChannelInputPumpAdapter>,
+    ) -> Result<(), String> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|error| format!("channel input notifier requires a Tokio runtime: {error}"))?;
+        let mut tasks = self
+            .input_pump_tasks
+            .lock()
+            .map_err(|_| "channel input pump task owner is unavailable".to_string())?;
+        if tasks.shutting_down {
+            return Err("channel input notifier admission is closed".to_string());
+        }
+        tasks.tasks.spawn_on(
+            async move {
+                let settlement = waiter.wait().await.map_err(|error| error.to_string())?;
+                let _ = terminal_tx.send(settlement.outcome);
+                let kick = match slot.kick() {
+                    Ok(kick) => Some(kick),
+                    Err(input_pump::ChannelInputPumpError::ShuttingDown) => None,
+                    Err(error) => return Err(error.to_string()),
+                };
+                if let Some(input_pump::ChannelInputPumpKick::Started(owner)) = kick {
+                    let mut owner = Some(owner);
+                    loop {
+                        let current = owner
+                            .take()
+                            .ok_or_else(|| "channel pump notifier lost owner".to_string())?;
+                        match input_pump::run_channel_input_pump(current, Arc::clone(&adapter))
+                            .await
+                        {
+                            Ok(()) | Err(input_pump::ChannelInputPumpError::ShuttingDown) => break,
+                            Err(input_pump::ChannelInputPumpError::DurableDebt(reason)) => {
+                                return Err(format!("channel input durable debt: {reason}"));
+                            }
+                            Err(error) => {
+                                owner = slot
+                                    .resume_after_owner_loss()
+                                    .map_err(|resume| resume.to_string())?;
+                                if owner.is_none() {
+                                    return Err(error.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            },
+            &runtime,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn begin_input_pump_shutdown(&self) -> Result<(), String> {
+        self.input_pump_tasks
+            .lock()
+            .map_err(|_| "channel input pump task owner is unavailable".to_string())?
+            .shutting_down = true;
+        for slot in self
+            .input_pumps
+            .lock()
+            .map_err(|_| "channel input pump registry is unavailable".to_string())?
+            .values()
+        {
+            slot.begin_shutdown().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn join_input_pumps(&self) -> Result<(), String> {
+        let mut owned = {
+            let mut tasks = self
+                .input_pump_tasks
+                .lock()
+                .map_err(|_| "channel input pump task owner is unavailable".to_string())?;
+            std::mem::take(&mut tasks.tasks)
+        };
+        let mut failures = Vec::new();
+        while let Some(result) = owned.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(error),
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
         }
     }
 
@@ -569,6 +928,31 @@ fn channel_render_event_stream(
     .boxed()
 }
 
+#[cfg(feature = "channels")]
+async fn channel_input_response_stream(
+    receiver: input_pump::ChannelInputReplyReceiver,
+    tool_executions: Arc<echo_agent_app_core::tool_execution::ToolExecutionRepository>,
+) -> futures::stream::BoxStream<
+    'static,
+    echo_agent::error::Result<echo_agent::channels::OutboundMessage>,
+> {
+    let correlation = receiver.correlation;
+    let events = channel_render_event_stream(
+        receiver.render_rx,
+        tokio::sync::broadcast::channel(1).1,
+        receiver.terminal_rx,
+        ChannelStreamDropGuard(echo_agent::agent::CancellationToken::new()),
+    );
+    aggregate_by_sentence_with_repository(
+        events,
+        correlation.channel_id,
+        correlation.to,
+        correlation.chat_type,
+        tool_executions,
+    )
+    .await
+}
+
 /// IM channel 消息处理器：每 `handle` 从 AppState 的 exact scoped runtime 取/复用 per-sender agent。
 ///
 /// TUI/GUI functional parity (AGENTS.md): channels drive chat through the
@@ -589,11 +973,465 @@ pub struct AppChannelMessageHandler {
     initialization_error: Option<String>,
     incarnation_fault: Arc<std::sync::Mutex<Option<String>>>,
     active_turns: ChannelActiveTurnMap,
+    input_pump: Arc<
+        input_pump::ChannelInputPumpSlot<
+            echo_agent_app_core::conversation_input::ConversationInputIdentity,
+        >,
+    >,
     pending_retirement: ChannelSessionRetirementGate,
 }
 
 #[cfg(feature = "channels")]
+struct ChannelInputPumpItem {
+    projection: echo_agent_app_core::conversation_input::ConversationInputProjection,
+    attempt: echo_agent_app_core::conversation_input::ConversationInputAttempt,
+    runtime: echo_agent_app_core::state::ScopedChatRuntime,
+    lease: std::sync::Mutex<Option<echo_agent_app_core::foreground_turn::ForegroundTurnLease>>,
+}
+
+#[cfg(feature = "channels")]
+struct ChannelInputPumpAdapter {
+    app_state: Arc<echo_agent_app_core::state::AppState>,
+    foreground_turns: ForegroundTurnControl,
+    address: echo_agent_app_core::conversation_input::ConversationInputAddress,
+    agent_conversation_id: String,
+    cache_id: String,
+    hitl: Arc<ChannelHumanLoopProvider>,
+    interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode,
+}
+
+#[cfg(feature = "channels")]
+enum ChannelLiveInputRoute {
+    Routed,
+    PumpPending(input_pump::ChannelInputReplyRoute),
+}
+
+#[cfg(feature = "channels")]
+impl input_pump::ChannelInputPumpAdapter for ChannelInputPumpAdapter {
+    type Identity = echo_agent_app_core::conversation_input::ConversationInputIdentity;
+    type Item = ChannelInputPumpItem;
+
+    fn peek_next_identity(
+        &self,
+    ) -> futures::future::BoxFuture<'_, Result<Option<Self::Identity>, String>> {
+        Box::pin(async move {
+            self.app_state
+                .conversation_inputs()
+                .list(&self.address)
+                .await
+                .map(|frontier| {
+                    frontier
+                        .items
+                        .first()
+                        .map(|item| item.receipt.identity.clone())
+                })
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn recover_unroutable<'a>(
+        &'a self,
+        identity: &'a Self::Identity,
+    ) -> futures::future::BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            match self
+                .app_state
+                .conversation_inputs()
+                .cancel(identity.clone())
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    let frontier = self
+                        .app_state
+                        .conversation_inputs()
+                        .list(&self.address)
+                        .await
+                        .map_err(|list_error| list_error.to_string())?;
+                    if frontier
+                        .items
+                        .first()
+                        .is_none_or(|item| item.receipt.identity != *identity)
+                    {
+                        Ok(())
+                    } else {
+                        Err(error.to_string())
+                    }
+                }
+            }
+        })
+    }
+
+    fn claim_next<'a>(
+        &'a self,
+        expected_identity: &'a Self::Identity,
+    ) -> futures::future::BoxFuture<'a, Result<Option<Self::Item>, String>> {
+        Box::pin(async move {
+            let frontier = self
+                .app_state
+                .conversation_inputs()
+                .list(&self.address)
+                .await
+                .map_err(|error| error.to_string())?;
+            let Some(next) = frontier.items.first() else {
+                return Ok(None);
+            };
+            if next.receipt.identity != *expected_identity {
+                return Ok(None);
+            }
+            let runtime = self
+                .app_state
+                .chat_runtime_for_scope(&self.address.workspace_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if runtime.execution_scope().workspace_id() != self.address.workspace_id {
+                return Err("channel input workspace changed before claim".to_string());
+            }
+            let turn_id = format!("channel-input-turn:{}", expected_identity.input_id);
+            let lease = match runtime
+                .begin_turn(
+                    &self.foreground_turns,
+                    ForegroundTurnSurface::Channel,
+                    &self.address.conversation_id,
+                    turn_id.clone(),
+                )
+                .await
+            {
+                Ok(lease) => lease,
+                Err(echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                    ForegroundTurnError::Busy { .. },
+                )) => {
+                    return Err("channel foreground is busy; pump will retry".to_string());
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            let projection = match self
+                .app_state
+                .conversation_inputs()
+                .dispatch_selected(expected_identity.clone(), frontier.queue_revision, turn_id)
+                .await
+            {
+                Ok(projection) => projection,
+                Err(error) => {
+                    settle_channel_turn_after_input_observers(
+                        lease,
+                        echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+                    )
+                    .await
+                    .map_err(|settle| format!("{error}; foreground settlement failed: {settle}"))?;
+                    return Err(error.to_string());
+                }
+            };
+            let attempt = match channel_input_attempt(&projection) {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    let failure = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                        echo_agent::error::AgentFailure::message(
+                            "conversation_input",
+                            error.clone(),
+                        ),
+                    );
+                    if let Err(settle_error) = lease.settle_after_observers(failure).await {
+                        return Err(format!(
+                            "{error}; malformed claim settlement failed: {settle_error}"
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
+            Ok(Some(ChannelInputPumpItem {
+                projection,
+                attempt,
+                runtime,
+                lease: std::sync::Mutex::new(Some(lease)),
+            }))
+        })
+    }
+
+    fn identity<'a>(&self, item: &'a Self::Item) -> &'a Self::Identity {
+        &item.attempt.identity
+    }
+
+    fn execute_claimed<'a>(
+        &'a self,
+        item: &'a Self::Item,
+        reply: input_pump::ChannelInputReplyRoute,
+    ) -> futures::future::BoxFuture<'a, Result<(), input_pump::ChannelInputExecutionError>> {
+        Box::pin(async move {
+            let cancel = match item.lease.lock() {
+                Ok(lease) => match lease.as_ref() {
+                    Some(lease) => lease.cancellation_token(),
+                    None => {
+                        return Err(input_pump::ChannelInputExecutionError::before_driver(
+                            "channel input lease was already consumed",
+                            reply,
+                        ));
+                    }
+                },
+                Err(_) => {
+                    return Err(input_pump::ChannelInputExecutionError::before_driver(
+                        "channel input lease is unavailable",
+                        reply,
+                    ));
+                }
+            };
+            let Some(pool) = item.runtime.pool() else {
+                return Err(input_pump::ChannelInputExecutionError::before_driver(
+                    "channel input runtime has no AgentPool",
+                    reply,
+                ));
+            };
+            let execution = match pool.acquire(&self.agent_conversation_id).await {
+                Ok(execution) => execution,
+                Err(error) => {
+                    return Err(input_pump::ChannelInputExecutionError::before_driver(
+                        error.to_string(),
+                        reply,
+                    ));
+                }
+            };
+            let agent = execution.agent();
+            configure_channel_agent(&agent, &self.cache_id, Arc::clone(&self.hitl)).await;
+            let flow = match self
+                .app_state
+                .session
+                .product_data_io
+                .begin_owned_flow("prepare pumped channel input")
+            {
+                Ok(flow) => flow,
+                Err(error) => {
+                    return Err(input_pump::ChannelInputExecutionError::before_driver(
+                        error.to_string(),
+                        reply,
+                    ));
+                }
+            };
+            let turn = match prepare_channel_turn(
+                ChannelTurnPreparation {
+                    attachments: item.projection.payload.attachments.clone(),
+                    execution_root: item.runtime.execution_scope().root().to_path_buf(),
+                    text: item.projection.payload.text.clone(),
+                    conversation_id: self.address.conversation_id.clone(),
+                    turn_id: item.attempt.turn_id.clone(),
+                    runtime_authored: false,
+                    workspace_io_receipt: item.runtime.workspace_io_receipt(),
+                },
+                &flow,
+            )
+            .await
+            {
+                Ok(turn) => {
+                    flow.settle(None);
+                    turn
+                }
+                Err(error) => {
+                    flow.settle(Some(error.clone()));
+                    return Err(input_pump::ChannelInputExecutionError::before_driver(
+                        error, reply,
+                    ));
+                }
+            };
+            let lease = match item.lease.lock() {
+                Ok(mut lease) => match lease.take() {
+                    Some(lease) => lease,
+                    None => {
+                        return Err(input_pump::ChannelInputExecutionError::before_driver(
+                            "channel input lease was already consumed",
+                            reply,
+                        ));
+                    }
+                },
+                Err(_) => {
+                    return Err(input_pump::ChannelInputExecutionError::before_driver(
+                        "channel input lease is unavailable",
+                        reply,
+                    ));
+                }
+            };
+            let lifecycle_render_tx = reply.render_tx.clone();
+            let lifecycle_terminal_tx = reply.render_tx.clone();
+            let lifecycle_cursor = Arc::clone(&reply.lifecycle_cursor);
+            let terminal_lifecycle_cursor = Arc::clone(&reply.lifecycle_cursor);
+            let lifecycle_log = Arc::clone(&self.app_state.storage.chat_events);
+            let terminal_lifecycle_log = Arc::clone(&self.app_state.storage.chat_events);
+            let lifecycle_identity = item.attempt.identity.clone();
+            let terminal_lifecycle_identity = item.attempt.identity.clone();
+            let inner_sink: Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
+                Arc::new(ChannelSurfaceSink::new(reply.render_tx, cancel.clone()));
+            let terminal_tx = reply.terminal_tx;
+            let sink = echo_agent_app_core::chat_event_log::bind_surface_chat_sink(
+                echo_agent_app_core::chat_event_log::ChatSurface::Channel,
+                inner_sink,
+                self.app_state.storage.chat_events.clone(),
+                self.app_state.storage.tool_executions.clone(),
+                self.address.workspace_id.clone(),
+                Some(self.address.conversation_id.clone()),
+                item.attempt.turn_id.clone(),
+            );
+            let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+                execution_scope: item.runtime.execution_scope().clone(),
+                workspace_io_receipt: Some(item.runtime.workspace_io_receipt()),
+                pool: Some(pool),
+                store: item.runtime.task_runtime(),
+                sink,
+                webhook_emitter: None,
+                conv_id: Some(self.address.conversation_id.clone()),
+                root_message_id: item.attempt.turn_id.clone(),
+                attachments: turn.inline_attachment_refs(),
+                cancel,
+                interaction_mode: self.interaction_mode,
+                review_integration: item.runtime.review_integration(),
+                layer_manager: None,
+                memory_generation: None,
+                human_loop_provider: Some(self.hitl.clone()),
+            });
+            let observer_service = self.app_state.conversation_inputs();
+            let observer_attempt = item.attempt.clone();
+            let observer: echo_agent_app_core::chat_driver::InputReceiptObserver = Arc::new(
+                move |receipt| {
+                    let service = observer_service.clone();
+                    let attempt = observer_attempt.clone();
+                    let render_tx = lifecycle_render_tx.clone();
+                    let cursor = Arc::clone(&lifecycle_cursor);
+                    let log = Arc::clone(&lifecycle_log);
+                    let identity = lifecycle_identity.clone();
+                    Box::pin(async move {
+                        let observed = service
+                            .observe_turn_input_through_drain(attempt, receipt)
+                            .await;
+                        let projected = project_channel_input_lifecycle(
+                            log.as_ref(),
+                            &identity,
+                            &render_tx,
+                            cursor.as_ref(),
+                        )
+                        .await;
+                        match (observed, projected) {
+                            (Ok(_), Ok(())) => Ok(()),
+                            (Err(error), Ok(())) => Err(error.to_string()),
+                            (Ok(_), Err(error)) => {
+                                tracing::warn!(%error, "channel input lifecycle projection was not delivered");
+                                Ok(())
+                            }
+                            (Err(observed), Err(projected)) => {
+                                tracing::warn!(error = %projected, "channel input failure lifecycle projection was not delivered");
+                                Err(observed.to_string())
+                            }
+                        }
+                    })
+                },
+            );
+            let terminal_service = self.app_state.conversation_inputs();
+            let terminal_attempt = item.attempt.clone();
+            let outcome = echo_agent_app_core::foreground_turn::drive_foreground_chat_with_ingress(
+                lease,
+                &agent,
+                &turn,
+                resources,
+                observer,
+                move |outcome| {
+                    let service = terminal_service.clone();
+                    let attempt = terminal_attempt.clone();
+                    let render_tx = lifecycle_terminal_tx.clone();
+                    let cursor = Arc::clone(&terminal_lifecycle_cursor);
+                    let log = Arc::clone(&terminal_lifecycle_log);
+                    let identity = terminal_lifecycle_identity.clone();
+                    async move {
+                        service
+                            .settle_attempt(&attempt, &outcome)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        if let Err(error) = project_channel_input_lifecycle(
+                            log.as_ref(),
+                            &identity,
+                            &render_tx,
+                            cursor.as_ref(),
+                        )
+                        .await
+                        {
+                            tracing::warn!(%error, "channel input terminal lifecycle projection was not delivered");
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .map_err(input_pump::ChannelInputExecutionError::after_driver)?;
+            drop(execution);
+            let _ = terminal_tx.send(outcome);
+            Ok(())
+        })
+    }
+
+    fn recover_claimed<'a>(
+        &'a self,
+        item: &'a Self::Item,
+        reason: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let lease = item
+                .lease
+                .lock()
+                .map_err(|_| "channel input lease is unavailable".to_string())?
+                .take();
+            let Some(lease) = lease else {
+                return Err("channel input foreground terminal debt remains unresolved".to_string());
+            };
+            let service = self.app_state.conversation_inputs();
+            let attempt = item.attempt.clone();
+            let reason = reason.to_string();
+            lease
+                .settle_after(
+                    echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+                    move |_outcome| {
+                        let service = service.clone();
+                        let attempt = attempt.clone();
+                        let reason = reason.clone();
+                        async move {
+                            service
+                                .deferred(attempt, reason)
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| error.to_string())
+                        }
+                    },
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+#[cfg(feature = "channels")]
 impl AppChannelMessageHandler {
+    async fn start_input_pump(
+        &self,
+        address: echo_agent_app_core::conversation_input::ConversationInputAddress,
+        agent_conversation_id: String,
+        cache_id: String,
+    ) -> Result<(), String> {
+        match self.input_pump.kick().map_err(|error| error.to_string())? {
+            input_pump::ChannelInputPumpKick::Notified => Ok(()),
+            input_pump::ChannelInputPumpKick::Started(owner) => {
+                let adapter = Arc::new(ChannelInputPumpAdapter {
+                    app_state: Arc::clone(&self.app_state),
+                    foreground_turns: self.foreground_turns.clone(),
+                    address,
+                    agent_conversation_id,
+                    cache_id,
+                    hitl: Arc::clone(&self.hitl),
+                    interaction_mode: *self.interaction_mode.read().await,
+                });
+                self.session_coordinator.start_input_pump_task(
+                    Arc::clone(&self.input_pump),
+                    owner,
+                    adapter,
+                )
+            }
+        }
+    }
+
     pub(crate) fn new(
         app_state: Arc<echo_agent_app_core::state::AppState>,
         webhook_emitter: Arc<echo_agent_app_core::webhook::WebhookEmitter>,
@@ -606,6 +1444,7 @@ impl AppChannelMessageHandler {
             Ok((_previous_incarnation_id, gate)) => (gate, None),
             Err(error) => (Arc::default(), Some(error)),
         };
+        let surface_id = ChannelSessionCoordinator::surface_id(&session_instance);
         Self {
             app_state,
             webhook_emitter,
@@ -616,6 +1455,7 @@ impl AppChannelMessageHandler {
             )),
             session_instance,
             active_turns: Arc::clone(&session_coordinator.active_turns),
+            input_pump: session_coordinator.input_pump(&surface_id),
             session_coordinator,
             initialization_error,
             incarnation_fault: Arc::new(std::sync::Mutex::new(None)),
@@ -660,6 +1500,297 @@ impl AppChannelMessageHandler {
             conversation_id: conversation_id.to_string(),
             turn_id: snapshot.root_turn_id,
         }))
+    }
+
+    async fn route_live_conversation_input(
+        &self,
+        active_surface_id: &ChannelSurfaceIdentity,
+        conv: &str,
+        agent_conv: &str,
+        submitted: echo_agent_app_core::conversation_input::ConversationInputReceipt,
+        reply: input_pump::ChannelInputReplyRoute,
+    ) -> Result<ChannelLiveInputRoute, String> {
+        use echo_agent_app_core::conversation_input::ConversationInputPhase;
+
+        let Some(active) = self
+            .resolve_active_turn(active_surface_id, conv, agent_conv)
+            .await?
+        else {
+            return Ok(ChannelLiveInputRoute::PumpPending(reply));
+        };
+        let workspace_id = active.runtime.execution_scope().workspace_id().to_string();
+        if submitted.identity.address.workspace_id != workspace_id {
+            return Ok(ChannelLiveInputRoute::PumpPending(reply));
+        }
+        let snapshots = self
+            .foreground_turns
+            .snapshots_for_workspace(&workspace_id)
+            .map_err(|error| error.to_string())?;
+        let Some(snapshot) = channel_snapshot_for_conversation(snapshots, conv)? else {
+            Self::clear_active_turn(&self.active_turns, active_surface_id, &active.turn_id);
+            return Ok(ChannelLiveInputRoute::PumpPending(reply));
+        };
+        if !channel_snapshot_matches_root(&snapshot, &active.turn_id) {
+            Self::clear_active_turn(&self.active_turns, active_surface_id, &active.turn_id);
+            return Ok(ChannelLiveInputRoute::PumpPending(reply));
+        }
+        let active_agent_turn_id = channel_steer_target(&snapshot).to_string();
+        let service = self.app_state.conversation_inputs();
+        let frontier = service
+            .list(&submitted.identity.address)
+            .await
+            .map_err(|error| error.to_string())?;
+        if frontier
+            .items
+            .first()
+            .is_none_or(|item| item.receipt.identity != submitted.identity)
+        {
+            return Ok(ChannelLiveInputRoute::PumpPending(reply));
+        }
+        let projection = match service
+            .dispatch_selected(
+                submitted.identity.clone(),
+                frontier.queue_revision,
+                active_agent_turn_id.clone(),
+            )
+            .await
+        {
+            Ok(projection) => projection,
+            Err(_) => return Ok(ChannelLiveInputRoute::PumpPending(reply)),
+        };
+        let attempt = match channel_input_attempt(&projection) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                let failure = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message("conversation_input", error.clone()),
+                );
+                let _ = reply
+                    .render_tx
+                    .send(ChannelRenderEvent::Token(format!(
+                        "Channel input {} failed before delivery: {error}",
+                        submitted.identity.input_id
+                    )))
+                    .await;
+                let _ = reply.terminal_tx.send(failure);
+                return Ok(ChannelLiveInputRoute::Routed);
+            }
+        };
+        let dispatched_input_id = projection.receipt.identity.input_id.clone();
+        let settlement_waiter = match self.foreground_turns.settlement_waiter_scoped(
+            &workspace_id,
+            ForegroundTurnSurface::Channel,
+            conv,
+            &active.turn_id,
+        ) {
+            Ok(waiter) => waiter,
+            Err(error) => {
+                service
+                    .deferred(attempt, error.to_string())
+                    .await
+                    .map_err(|settle| settle.to_string())?;
+                return Ok(ChannelLiveInputRoute::PumpPending(reply));
+            }
+        };
+        let flow = match self
+            .app_state
+            .session
+            .product_data_io
+            .begin_owned_flow("prepare active channel input")
+        {
+            Ok(flow) => flow,
+            Err(error) => {
+                service
+                    .deferred(attempt, error.to_string())
+                    .await
+                    .map_err(|settle| settle.to_string())?;
+                return Ok(ChannelLiveInputRoute::PumpPending(reply));
+            }
+        };
+        let turn = match prepare_channel_turn(
+            ChannelTurnPreparation {
+                attachments: projection.payload.attachments,
+                execution_root: active.runtime.execution_scope().root().to_path_buf(),
+                text: projection.payload.text,
+                conversation_id: conv.to_string(),
+                turn_id: active_agent_turn_id.clone(),
+                runtime_authored: false,
+                workspace_io_receipt: active.runtime.workspace_io_receipt(),
+            },
+            &flow,
+        )
+        .await
+        {
+            Ok(turn) => {
+                flow.settle(None);
+                turn
+            }
+            Err(error) => {
+                flow.settle(Some(error.clone()));
+                service
+                    .deferred(attempt, error.clone())
+                    .await
+                    .map_err(|settle| settle.to_string())?;
+                return Ok(ChannelLiveInputRoute::PumpPending(reply));
+            }
+        };
+        let Some(pool) = active.runtime.pool() else {
+            service
+                .deferred(attempt, "active workspace has no AgentPool".to_string())
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(ChannelLiveInputRoute::PumpPending(reply));
+        };
+        let execution = match pool.lease_existing(&active.agent_conversation_id).await {
+            Ok(Some(execution)) => execution,
+            Ok(None) => {
+                service
+                    .deferred(attempt, "active channel Agent is unavailable".to_string())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                return Ok(ChannelLiveInputRoute::PumpPending(reply));
+            }
+            Err(error) => {
+                service
+                    .deferred(attempt, error.to_string())
+                    .await
+                    .map_err(|settle| settle.to_string())?;
+                return Ok(ChannelLiveInputRoute::PumpPending(reply));
+            }
+        };
+        let agent = execution.agent();
+        let message = match turn.to_message() {
+            Ok(message) => message,
+            Err(error) => {
+                drop(execution);
+                service
+                    .deferred(attempt, error.to_string())
+                    .await
+                    .map_err(|settle| settle.to_string())?;
+                return Ok(ChannelLiveInputRoute::PumpPending(reply));
+            }
+        };
+        let (steer_tx, steer_rx) = tokio::sync::oneshot::channel();
+        let (drain_tx, drain_rx) = tokio::sync::oneshot::channel();
+        let observer_service = service.clone();
+        let observer_attempt = attempt.clone();
+        let observer_render_tx = reply.render_tx.clone();
+        let observed_phase = Arc::new(std::sync::Mutex::new(None));
+        let observer_phase = Arc::clone(&observed_phase);
+        let pump_slot = Arc::clone(&self.input_pump);
+        let pump_adapter = Arc::new(ChannelInputPumpAdapter {
+            app_state: Arc::clone(&self.app_state),
+            foreground_turns: self.foreground_turns.clone(),
+            address: submitted.identity.address.clone(),
+            agent_conversation_id: agent_conv.to_string(),
+            cache_id: Self::cache_user_id(conv, &self.session_instance.incarnation_id()),
+            hitl: Arc::clone(&self.hitl),
+            interaction_mode: *self.interaction_mode.read().await,
+        });
+        let terminal_projector = channel_live_terminal_projector(
+            service.clone(),
+            attempt.clone(),
+            Arc::clone(&observed_phase),
+        );
+        if let Err(error) = self.foreground_turns.supervise_input_lifecycle_scoped(
+            &workspace_id,
+            ForegroundTurnSurface::Channel,
+            conv,
+            &active_agent_turn_id,
+            async move {
+                let steer = steer_rx.await.map_err(|error| error.to_string())?;
+                let observed = match observer_service
+                    .observe_steer_through_drain(observer_attempt, steer)
+                    .await
+                {
+                    Ok(observed) => observed,
+                    Err(error) => {
+                        *observer_phase
+                            .lock()
+                            .map_err(|_| "channel live input phase is unavailable".to_string())? =
+                            Some(ConversationInputPhase::RecoveryRequired);
+                        return Err(error.to_string());
+                    }
+                };
+                *observer_phase
+                    .lock()
+                    .map_err(|_| "channel live input phase is unavailable".to_string())? =
+                    Some(observed.phase);
+                let _ = observer_render_tx
+                    .send(ChannelRenderEvent::Token(format!(
+                        "Channel input {} is {}.",
+                        dispatched_input_id,
+                        channel_input_phase_label(observed.phase)
+                    )))
+                    .await;
+                let _ = drain_tx.send(observed);
+                Ok(())
+            },
+            terminal_projector,
+        ) {
+            service
+                .deferred(attempt, error.to_string())
+                .await
+                .map_err(|settle| settle.to_string())?;
+            return Ok(ChannelLiveInputRoute::PumpPending(reply));
+        }
+        let steer = agent
+            .steer_input_tracked(Some(&active_agent_turn_id), message)
+            .await;
+        drop(execution);
+        let _ = steer_tx.send(steer);
+        let observed = drain_rx.await.map_err(|error| error.to_string())?;
+        match observed.phase {
+            ConversationInputPhase::Drained | ConversationInputPhase::TurnSettled => {
+                self.session_coordinator.start_post_settlement_input_task(
+                    settlement_waiter,
+                    reply.terminal_tx,
+                    pump_slot,
+                    pump_adapter,
+                )?;
+                Ok(ChannelLiveInputRoute::Routed)
+            }
+            ConversationInputPhase::Deferred => Ok(ChannelLiveInputRoute::PumpPending(reply)),
+            ConversationInputPhase::RecoveryRequired => {
+                let failure = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(
+                        "channel_input_recovery",
+                        observed.reason.unwrap_or_else(|| {
+                            "channel input requires explicit recovery".to_string()
+                        }),
+                    ),
+                );
+                let _ = reply.terminal_tx.send(failure);
+                Ok(ChannelLiveInputRoute::Routed)
+            }
+            ConversationInputPhase::Cancelled => {
+                let _ = reply
+                    .terminal_tx
+                    .send(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+                Ok(ChannelLiveInputRoute::Routed)
+            }
+            ConversationInputPhase::Persisted
+            | ConversationInputPhase::AttemptStarted
+            | ConversationInputPhase::MailboxAccepted => {
+                service
+                    .recovery_required(
+                        attempt,
+                        format!(
+                            "tracked steer observer returned incomplete phase {}",
+                            channel_input_phase_label(observed.phase)
+                        ),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let failure = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(
+                        "channel_input_recovery",
+                        "channel input did not reach a safe replay boundary",
+                    ),
+                );
+                let _ = reply.terminal_tx.send(failure);
+                Ok(ChannelLiveInputRoute::Routed)
+            }
+        }
     }
 
     fn publish_active_turn(
@@ -758,8 +1889,15 @@ impl AppChannelMessageHandler {
             runtime,
             &retirement_turn_id,
         ) {
-            retirement_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
-            return Err(message);
+            return match settle_channel_turn_after_input_observers(
+                retirement_lease,
+                echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+            )
+            .await
+            {
+                Ok(_) => Err(message),
+                Err(error) => Err(format!("{message}; foreground settlement failed: {error}")),
+            };
         }
         let retirement_owner = ChannelActiveTurnOwner::new(
             Arc::clone(&self.active_turns),
@@ -796,15 +1934,23 @@ impl AppChannelMessageHandler {
         .await;
         match retired {
             Ok(()) => {
-                retirement_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+                settle_channel_turn_after_input_observers(
+                    retirement_lease,
+                    echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+                )
+                .await?;
                 drop(retirement_owner);
                 Ok(())
             }
             Err(error) => {
                 let (outcome, message) = channel_retirement_terminal(error);
-                retirement_lease.settle(outcome);
+                let settlement =
+                    settle_channel_turn_after_input_observers(retirement_lease, outcome).await;
                 drop(retirement_owner);
-                Err(message)
+                match settlement {
+                    Ok(_) => Err(message),
+                    Err(error) => Err(format!("{message}; foreground settlement failed: {error}")),
+                }
             }
         }
     }
@@ -1533,8 +2679,19 @@ impl AppChannelMessageHandler {
                     &runtime,
                     &turn_id,
                 ) {
-                    lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
-                    return Some(message);
+                    return Some(
+                        match settle_channel_turn_after_input_observers(
+                            lease,
+                            echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+                        )
+                        .await
+                        {
+                            Ok(_) => message,
+                            Err(error) => {
+                                format!("{message}; foreground settlement failed: {error}")
+                            }
+                        },
+                    );
                 }
                 let active_owner = ChannelActiveTurnOwner::new(
                     Arc::clone(&self.active_turns),
@@ -1544,14 +2701,23 @@ impl AppChannelMessageHandler {
                 let receipts = match Self::generation_receipts(&runtime) {
                     Ok(receipts) => receipts,
                     Err(message) => {
-                        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                            echo_agent::error::AgentFailure::message(
-                                "workspace_generation",
-                                message.clone(),
+                        let settlement = settle_channel_turn_after_input_observers(
+                            lease,
+                            echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                echo_agent::error::AgentFailure::message(
+                                    "workspace_generation",
+                                    message.clone(),
+                                ),
                             ),
-                        ));
+                        )
+                        .await;
                         drop(active_owner);
-                        return Some(message);
+                        return Some(match settlement {
+                            Ok(_) => message,
+                            Err(error) => {
+                                format!("{message}; foreground settlement failed: {error}")
+                            }
+                        });
                     }
                 };
                 self.record_runtime_owner(&runtime, conv, agent_conv);
@@ -1559,14 +2725,24 @@ impl AppChannelMessageHandler {
                     Ok(execution) => execution,
                     Err(error) => {
                         receipts.release_lifo();
-                        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                            echo_agent::error::AgentFailure::message(
-                                "agent_pool",
-                                error.to_string(),
+                        let message = format!("AgentPool admission failed: {error}");
+                        let settlement = settle_channel_turn_after_input_observers(
+                            lease,
+                            echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                echo_agent::error::AgentFailure::message(
+                                    "agent_pool",
+                                    error.to_string(),
+                                ),
                             ),
-                        ));
+                        )
+                        .await;
                         drop(active_owner);
-                        return Some(format!("AgentPool admission failed: {error}"));
+                        return Some(match settlement {
+                            Ok(_) => message,
+                            Err(error) => {
+                                format!("{message}; foreground settlement failed: {error}")
+                            }
+                        });
                     }
                 };
                 let agent = execution.agent();
@@ -1596,36 +2772,40 @@ impl AppChannelMessageHandler {
                                 .await;
                             drop(execution);
                             receipts.release_lifo();
-                            let message = match compression {
+                            let (outcome, message) = match compression {
                                 Err(
                                     echo_agent_app_core::manual_compression::ManualCompressionError::Cancelled,
-                                ) => {
-                                    lease.settle(
-                                        echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
-                                    );
-                                    "Context compression was cancelled.".to_string()
-                                }
-                                Ok(receipt) => {
-                                    lease.settle(
-                                        echo_agent_app_core::chat_driver::TurnOutcome::Completed,
-                                    );
+                                ) => (
+                                    echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+                                    "Context compression was cancelled.".to_string(),
+                                ),
+                                Ok(receipt) => (
+                                    echo_agent_app_core::chat_driver::TurnOutcome::Completed,
                                     format!(
                                         "Context compressed: {} -> {} messages, {} tokens saved.",
                                         receipt.messages_before,
                                         receipt.messages_after,
                                         receipt.tokens_saved()
-                                    )
-                                }
-                                Err(error) => {
-                                    lease.settle(
-                                        echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                    ),
+                                ),
+                                Err(error) => (
+                                    echo_agent_app_core::chat_driver::TurnOutcome::Failed(
                                             echo_agent::error::AgentFailure::message(
                                                 error.code(),
                                                 error.to_string(),
                                             ),
                                         ),
-                                    );
-                                    format!("Context compression failed: {error}")
+                                    format!("Context compression failed: {error}"),
+                                ),
+                            };
+                            let message = match settle_channel_turn_after_input_observers(
+                                lease, outcome,
+                            )
+                            .await
+                            {
+                                Ok(_) => message,
+                                Err(error) => {
+                                    format!("{message}; foreground settlement failed: {error}")
                                 }
                             };
                             drop(active_owner);
@@ -1690,7 +2870,7 @@ impl AppChannelMessageHandler {
                     "No pending approval or input request to cancel.".to_string()
                 }
                 ChannelHumanLoopResolution::Resolved(message)
-                | ChannelHumanLoopResolution::Invalid(message) => message,
+                | ChannelHumanLoopResolution::Rejected(message) => message,
             }),
             "/reset" => {
                 let active = match self
@@ -1780,24 +2960,44 @@ impl AppChannelMessageHandler {
                     &runtime,
                     &reset_turn_id,
                 ) {
-                    reset_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
-                    return Some(message);
+                    return Some(
+                        match settle_channel_turn_after_input_observers(
+                            reset_lease,
+                            echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+                        )
+                        .await
+                        {
+                            Ok(_) => message,
+                            Err(error) => {
+                                format!("{message}; foreground settlement failed: {error}")
+                            }
+                        },
+                    );
                 }
                 let generation_receipts = match Self::generation_receipts(&runtime) {
                     Ok(receipts) => receipts,
                     Err(message) => {
-                        reset_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                            echo_agent::error::AgentFailure::message(
-                                "workspace_generation",
-                                message.clone(),
+                        let settlement = settle_channel_turn_after_input_observers(
+                            reset_lease,
+                            echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                echo_agent::error::AgentFailure::message(
+                                    "workspace_generation",
+                                    message.clone(),
+                                ),
                             ),
-                        ));
+                        )
+                        .await;
                         Self::clear_active_turn(
                             &self.active_turns,
                             active_surface_id,
                             &reset_turn_id,
                         );
-                        return Some(message);
+                        return Some(match settlement {
+                            Ok(_) => message,
+                            Err(error) => {
+                                format!("{message}; foreground settlement failed: {error}")
+                            }
+                        });
                     }
                 };
                 let hitl = Arc::clone(&self.hitl);
@@ -1919,7 +3119,17 @@ impl AppChannelMessageHandler {
                                 Err(error) => channel_retirement_terminal(error),
                             };
                             generation_receipts.release_lifo();
-                            reset_lease.settle(outcome);
+                            let message = match settle_channel_turn_after_input_observers(
+                                reset_lease,
+                                outcome,
+                            )
+                            .await
+                            {
+                                Ok(_) => message,
+                                Err(error) => {
+                                    format!("{message}; foreground settlement failed: {error}")
+                                }
+                            };
                             Self::clear_active_turn(
                                 &active_turns,
                                 &active_surface_id_for_owner,
@@ -1934,86 +3144,6 @@ impl AppChannelMessageHandler {
                 Some(result_rx.await.unwrap_or_else(|_| {
                     "Reset owner ended without publishing its terminal result.".to_string()
                 }))
-            }
-            "/steer" => {
-                if argument.is_empty() {
-                    return Some("Usage: /steer <additional instruction>".to_string());
-                }
-                let active = match self
-                    .resolve_active_turn(active_surface_id, conv, agent_conv)
-                    .await
-                {
-                    Ok(active) => active,
-                    Err(error) => {
-                        return Some(format!("Unable to inspect the active turn: {error}"));
-                    }
-                };
-                let Some(active) = active else {
-                    return Some("No active channel turn to steer.".to_string());
-                };
-                let snapshots = match self
-                    .foreground_turns
-                    .snapshots_for_workspace(active.runtime.execution_scope().workspace_id())
-                {
-                    Ok(snapshots) => snapshots,
-                    Err(error) => {
-                        return Some(format!(
-                            "Unable to inspect the active channel turn: {error}"
-                        ));
-                    }
-                };
-                let Some(snapshot) = snapshots.into_iter().find(|snapshot| {
-                    snapshot.surface == ForegroundTurnSurface::Channel
-                        && snapshot.conversation_id == active.conversation_id
-                }) else {
-                    Self::clear_active_turn(&self.active_turns, active_surface_id, &active.turn_id);
-                    return Some("No active channel turn to steer.".to_string());
-                };
-                if !channel_snapshot_matches_root(&snapshot, &active.turn_id) {
-                    Self::clear_active_turn(&self.active_turns, active_surface_id, &active.turn_id);
-                    return Some("The recorded channel turn already settled.".to_string());
-                }
-                let Some(pool) = active.runtime.pool() else {
-                    return Some("The active workspace has no AgentPool.".to_string());
-                };
-                let execution = match pool.lease_existing(&active.agent_conversation_id).await {
-                    Ok(Some(execution)) => execution,
-                    Ok(None) => {
-                        return Some("The active channel turn has no attached agent.".to_string());
-                    }
-                    Err(error) => {
-                        return Some(format!(
-                            "Unable to access the active channel agent: {error}"
-                        ));
-                    }
-                };
-                let agent = execution.agent();
-                let active_agent_turn_id = channel_steer_target(&snapshot).to_string();
-                let response = match agent
-                    .steer_input_tracked(
-                        Some(&active_agent_turn_id),
-                        echo_agent::prelude::Message::user(argument.to_string()),
-                    )
-                    .await
-                {
-                    Ok(receipt) => {
-                        format!("Additional instruction accepted for {}.", receipt.turn_id())
-                    }
-                    Err(echo_agent::agent::TurnSteerError::NotSteerable { .. }) => {
-                        "The active turn is not currently steerable; try again shortly.".to_string()
-                    }
-                    Err(echo_agent::agent::TurnSteerError::NoActiveTurn) => {
-                        Self::clear_active_turn(
-                            &self.active_turns,
-                            active_surface_id,
-                            &active.turn_id,
-                        );
-                        "The channel turn already settled.".to_string()
-                    }
-                    Err(error) => format!("Unable to steer the active turn: {error}"),
-                };
-                drop(execution);
-                Some(response)
             }
             _ => None,
         }
@@ -2272,7 +3402,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
 
     async fn handle_stream<'a>(
         &'a self,
-        msg: echo_agent::channels::InboundMessage,
+        mut msg: echo_agent::channels::InboundMessage,
     ) -> echo_agent::error::Result<
         futures::stream::BoxStream<
             'a,
@@ -2373,7 +3503,15 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             if let Err(message) =
                 self.publish_active_turn(&active_surface_id, &conv, &agent_conv, &runtime, &turn_id)
             {
-                lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+                let message = match settle_channel_turn_after_input_observers(
+                    lease,
+                    echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+                )
+                .await
+                {
+                    Ok(_) => message,
+                    Err(error) => format!("{message}; foreground settlement failed: {error}"),
+                };
                 return Ok(immediate_channel_response(&msg, message));
             }
             let _active_owner = ChannelActiveTurnOwner::new(
@@ -2452,11 +3590,12 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                         "Channel journal rejected the Extension receipt",
                     ),
                 );
-                lease.settle(failure);
-                return Ok(immediate_channel_response(
-                    &msg,
-                    "Channel journal rejected the Extension receipt.",
-                ));
+                let settlement = settle_channel_turn_after_input_observers(lease, failure).await;
+                let message = settlement.err().map_or_else(
+                    || "Channel journal rejected the Extension receipt.".to_string(),
+                    |error| format!("Channel journal rejected the Extension receipt; foreground settlement failed: {error}"),
+                );
+                return Ok(immediate_channel_response(&msg, message));
             }
             let terminal_delivered = sink.on_event(
                 echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
@@ -2470,13 +3609,17 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                         "Channel journal rejected the Extension terminal",
                     ),
                 );
-                lease.settle(failure);
-                return Ok(immediate_channel_response(
-                    &msg,
-                    "Channel journal rejected the Extension terminal.",
-                ));
+                let settlement = settle_channel_turn_after_input_observers(lease, failure).await;
+                let message = settlement.err().map_or_else(
+                    || "Channel journal rejected the Extension terminal.".to_string(),
+                    |error| format!("Channel journal rejected the Extension terminal; foreground settlement failed: {error}"),
+                );
+                return Ok(immediate_channel_response(&msg, message));
             }
-            lease.settle(outcome);
+            let message = match settle_channel_turn_after_input_observers(lease, outcome).await {
+                Ok(_) => message,
+                Err(error) => format!("{message}; foreground settlement failed: {error}"),
+            };
             return Ok(immediate_channel_response(&msg, message));
         }
         let developer_command = match parse_developer_command(&msg.text) {
@@ -2529,11 +3672,35 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 }
             }
         }
+        let explicit_steer = msg.text.trim().starts_with("/steer")
+            && msg.text.split_whitespace().next() == Some("/steer");
+        if explicit_steer {
+            let instruction = msg
+                .text
+                .trim()
+                .strip_prefix("/steer")
+                .map(str::trim)
+                .unwrap_or_default();
+            if instruction.is_empty() && msg.attachments.is_empty() {
+                return Ok(immediate_channel_response(
+                    &msg,
+                    "Usage: /steer <additional instruction>",
+                ));
+            }
+            msg.text = instruction.to_string();
+        }
         // Product control commands always outrank HITL parsing. `/stop` owns
         // turn cancellation; `/cancel` rejects only the queue front.
-        if let Some(message) = self
-            .control_command_response(&msg.text, &conv, &agent_conv, &cache_id, &active_surface_id)
-            .await
+        if !explicit_steer
+            && let Some(message) = self
+                .control_command_response(
+                    &msg.text,
+                    &conv,
+                    &agent_conv,
+                    &cache_id,
+                    &active_surface_id,
+                )
+                .await
         {
             return Ok(immediate_channel_response(&msg, message));
         }
@@ -2634,7 +3801,17 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                         &runtime,
                         &turn_id,
                     ) {
-                        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+                        let message = match settle_channel_turn_after_input_observers(
+                            lease,
+                            echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+                        )
+                        .await
+                        {
+                            Ok(_) => message,
+                            Err(error) => {
+                                format!("{message}; foreground settlement failed: {error}")
+                            }
+                        };
                         return Ok(immediate_channel_response(&msg, message));
                     }
                     let active_owner = ChannelActiveTurnOwner::new(
@@ -2645,13 +3822,23 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                     let receipts = match Self::generation_receipts(&runtime) {
                         Ok(receipts) => receipts,
                         Err(message) => {
-                            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                                echo_agent::error::AgentFailure::message(
-                                    "workspace_generation",
-                                    message.clone(),
+                            let settlement = settle_channel_turn_after_input_observers(
+                                lease,
+                                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                    echo_agent::error::AgentFailure::message(
+                                        "workspace_generation",
+                                        message.clone(),
+                                    ),
                                 ),
-                            ));
+                            )
+                            .await;
                             drop(active_owner);
+                            let message = match settlement {
+                                Ok(_) => message,
+                                Err(error) => {
+                                    format!("{message}; foreground settlement failed: {error}")
+                                }
+                            };
                             return Ok(immediate_channel_response(&msg, message));
                         }
                     };
@@ -2660,17 +3847,25 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                         Ok(execution) => execution,
                         Err(error) => {
                             receipts.release_lifo();
-                            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                                echo_agent::error::AgentFailure::message(
-                                    "agent_pool",
-                                    error.to_string(),
+                            let message = format!("AgentPool admission failed: {error}");
+                            let settlement = settle_channel_turn_after_input_observers(
+                                lease,
+                                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                    echo_agent::error::AgentFailure::message(
+                                        "agent_pool",
+                                        error.to_string(),
+                                    ),
                                 ),
-                            ));
+                            )
+                            .await;
                             drop(active_owner);
-                            return Ok(immediate_channel_response(
-                                &msg,
-                                format!("AgentPool admission failed: {error}"),
-                            ));
+                            let message = match settlement {
+                                Ok(_) => message,
+                                Err(error) => {
+                                    format!("{message}; foreground settlement failed: {error}")
+                                }
+                            };
+                            return Ok(immediate_channel_response(&msg, message));
                         }
                     };
                     let agent = execution.agent();
@@ -2686,36 +3881,43 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                     .await;
                     drop(execution);
                     receipts.release_lifo();
-                    let message = match extraction {
-                        None => {
-                            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
-                            "Structured extraction was cancelled.".to_string()
-                        }
-                        Some(Ok(outcome)) => {
-                            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
-                            serde_json::to_string_pretty(&outcome).unwrap_or_else(|error| {
+                    let (outcome, message) = match extraction {
+                        None => (
+                            echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+                            "Structured extraction was cancelled.".to_string(),
+                        ),
+                        Some(Ok(extracted)) => (
+                            echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+                            serde_json::to_string_pretty(&extracted).unwrap_or_else(|error| {
                                 format!("Structured extraction serialization failed: {error}")
-                            })
-                        }
-                        Some(Err(error)) => {
-                            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                            }),
+                        ),
+                        Some(Err(error)) => (
+                            echo_agent_app_core::chat_driver::TurnOutcome::Failed(
                                 echo_agent::error::AgentFailure::message(
                                     error.code(),
                                     error.to_string(),
                                 ),
-                            ));
-                            format!("Structured extraction failed: {error}")
-                        }
+                            ),
+                            format!("Structured extraction failed: {error}"),
+                        ),
                     };
+                    let message =
+                        match settle_channel_turn_after_input_observers(lease, outcome).await {
+                            Ok(_) => message,
+                            Err(error) => {
+                                format!("{message}; foreground settlement failed: {error}")
+                            }
+                        };
                     drop(active_owner);
                     return Ok(immediate_channel_response(&msg, message));
                 }
             }
         }
-        if self.hitl.has_pending().await {
-            match self.hitl.resolve_message(&msg.text).await {
+        if !explicit_steer {
+            match self.hitl.try_resolve_message(&msg.text) {
                 ChannelHumanLoopResolution::Resolved(message)
-                | ChannelHumanLoopResolution::Invalid(message) => {
+                | ChannelHumanLoopResolution::Rejected(message) => {
                     return Ok(immediate_channel_response(&msg, message));
                 }
                 ChannelHumanLoopResolution::NoPending => {}
@@ -2753,7 +3955,15 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             let message = parse_channel_mode_command(&msg.text, &self.interaction_mode)
                 .await
                 .unwrap_or_else(|| "Usage: /mode chat|task|auto".to_string());
-            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+            let message = match settle_channel_turn_after_input_observers(
+                lease,
+                echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+            )
+            .await
+            {
+                Ok(_) => message,
+                Err(error) => format!("{message}; foreground settlement failed: {error}"),
+            };
             return Ok(immediate_channel_response(&msg, message));
         }
 
@@ -2816,7 +4026,15 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 &runtime,
                 &command_id,
             ) {
-                lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+                let message = match settle_channel_turn_after_input_observers(
+                    lease,
+                    echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+                )
+                .await
+                {
+                    Ok(_) => message,
+                    Err(error) => format!("{message}; foreground settlement failed: {error}"),
+                };
                 return Ok(immediate_channel_response(&msg, message));
             }
             let _active_owner = ChannelActiveTurnOwner::new(
@@ -2827,12 +4045,22 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             let generation_receipts = match Self::generation_receipts(&runtime) {
                 Ok(receipts) => receipts,
                 Err(message) => {
-                    lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                        echo_agent::error::AgentFailure::message(
-                            "workspace_generation",
-                            message.clone(),
+                    let settlement = settle_channel_turn_after_input_observers(
+                        lease,
+                        echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                            echo_agent::error::AgentFailure::message(
+                                "workspace_generation",
+                                message.clone(),
+                            ),
                         ),
-                    ));
+                    )
+                    .await;
+                    let message = match settlement {
+                        Ok(_) => message,
+                        Err(error) => {
+                            format!("{message}; foreground settlement failed: {error}")
+                        }
+                    };
                     return Ok(immediate_channel_response(&msg, message));
                 }
             };
@@ -2842,9 +4070,19 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 Err(error) => {
                     generation_receipts.release_lifo();
                     let message = format!("AgentPool admission failed: {error}");
-                    lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                        echo_agent::error::AgentFailure::message("agent_pool", message.clone()),
-                    ));
+                    let settlement = settle_channel_turn_after_input_observers(
+                        lease,
+                        echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                            echo_agent::error::AgentFailure::message("agent_pool", message.clone()),
+                        ),
+                    )
+                    .await;
+                    let message = match settlement {
+                        Ok(_) => message,
+                        Err(error) => {
+                            format!("{message}; foreground settlement failed: {error}")
+                        }
+                    };
                     return Ok(immediate_channel_response(&msg, message));
                 }
             };
@@ -2869,8 +4107,15 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             };
             drop(pool_execution);
             generation_receipts.release_lifo();
-            lease.settle(response.terminal);
-            return Ok(immediate_channel_response(&msg, response.message));
+            let message =
+                match settle_channel_turn_after_input_observers(lease, response.terminal).await {
+                    Ok(_) => response.message,
+                    Err(error) => format!(
+                        "{}; foreground settlement failed: {error}",
+                        response.message
+                    ),
+                };
+            return Ok(immediate_channel_response(&msg, message));
         }
 
         if channel_resume_rejects_attachments(resume_task_run.is_some(), msg.attachments.len()) {
@@ -2891,16 +4136,164 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 }
             },
         };
-        if let Err(error) = self
-            .settle_pending_retirement_for_runtime(
-                &retirement_runtime,
-                &conv,
-                &agent_conv,
-                &active_surface_id,
-            )
-            .await
+        if resume_task_run.is_some()
+            && let Err(error) = self
+                .settle_pending_retirement_for_runtime(
+                    &retirement_runtime,
+                    &conv,
+                    &agent_conv,
+                    &active_surface_id,
+                )
+                .await
         {
             return Ok(immediate_channel_response(&msg, error));
+        }
+        if resume_task_run.is_none() {
+            let address =
+                channel_input_address(retirement_runtime.execution_scope().workspace_id(), &conv);
+            let input_id = match echo_agent_app_core::conversation_input::stable_scoped_input_id(
+                &address,
+                echo_agent_app_core::conversation_input::ConversationInputSource::Channel,
+                &msg.message_id,
+            ) {
+                Ok(input_id) => input_id,
+                Err(error) => {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Unable to identify channel input: {error}"),
+                    ));
+                }
+            };
+            let attachments = msg
+                .attachments
+                .iter()
+                .enumerate()
+                .map(|(index, attachment)| channel_attachment_data(index, attachment))
+                .collect::<Vec<_>>();
+            let submitted = match self
+                .app_state
+                .conversation_inputs()
+                .submit(address, input_id, msg.text.clone(), attachments)
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Unable to persist channel input: {error}"),
+                    ));
+                }
+            };
+            if !submitted.is_dispatchable() {
+                return Ok(immediate_channel_response(
+                    &msg,
+                    format!(
+                        "Channel input {} is already {}.",
+                        submitted.identity.input_id,
+                        channel_input_phase_label(submitted.phase)
+                    ),
+                ));
+            }
+            let (reply_route, reply_receiver) = input_pump::channel_input_reply_route(&msg);
+            if let Err(error) = self
+                .settle_pending_retirement_for_runtime(
+                    &retirement_runtime,
+                    &conv,
+                    &agent_conv,
+                    &active_surface_id,
+                )
+                .await
+            {
+                return Ok(immediate_channel_response(
+                    &msg,
+                    format!("Channel input remains persisted: {error}"),
+                ));
+            }
+            if self.active_turn(&active_surface_id).is_some() {
+                match self
+                    .route_live_conversation_input(
+                        &active_surface_id,
+                        &conv,
+                        &agent_conv,
+                        submitted.clone(),
+                        reply_route,
+                    )
+                    .await
+                {
+                    Ok(ChannelLiveInputRoute::Routed) => {
+                        return Ok(channel_input_response_stream(
+                            reply_receiver,
+                            self.app_state.storage.tool_executions.clone(),
+                        )
+                        .await);
+                    }
+                    Ok(ChannelLiveInputRoute::PumpPending(reply_route)) => {
+                        if let Err(error) = self
+                            .input_pump
+                            .register_reply(submitted.identity.clone(), reply_route)
+                        {
+                            return Ok(immediate_channel_response(
+                                &msg,
+                                format!(
+                                    "Channel input is durable but its response route failed: {error}"
+                                ),
+                            ));
+                        }
+                        if let Err(error) = self
+                            .start_input_pump(
+                                submitted.identity.address.clone(),
+                                agent_conv.clone(),
+                                cache_id.clone(),
+                            )
+                            .await
+                        {
+                            return Ok(immediate_channel_response(
+                                &msg,
+                                format!("Channel input is durable but its pump failed: {error}"),
+                            ));
+                        }
+                        return Ok(channel_input_response_stream(
+                            reply_receiver,
+                            self.app_state.storage.tool_executions.clone(),
+                        )
+                        .await);
+                    }
+                    Err(error) => {
+                        return Ok(immediate_channel_response(
+                            &msg,
+                            format!("Unable to deliver durable channel input: {error}"),
+                        ));
+                    }
+                }
+            } else {
+                if let Err(error) = self
+                    .input_pump
+                    .register_reply(submitted.identity.clone(), reply_route)
+                {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Channel input is durable but its response route failed: {error}"),
+                    ));
+                }
+                if let Err(error) = self
+                    .start_input_pump(
+                        submitted.identity.address.clone(),
+                        agent_conv.clone(),
+                        cache_id.clone(),
+                    )
+                    .await
+                {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Channel input is durable but its pump failed: {error}"),
+                    ));
+                }
+                return Ok(channel_input_response_stream(
+                    reply_receiver,
+                    self.app_state.storage.tool_executions.clone(),
+                )
+                .await);
+            }
         }
         let turn_id = uuid::Uuid::new_v4().to_string();
         let admission = match resume_task_run.as_ref() {
@@ -2933,9 +4326,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             )) => {
                 return Ok(immediate_channel_response(
                     &msg,
-                    format!(
-                        "Turn {active_turn_id} is still running. Use /steer <instruction> or /stop."
-                    ),
+                    format!("Turn {active_turn_id} won admission; channel input remains queued."),
                 ));
             }
             Err(error) => {
@@ -2952,18 +4343,34 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             &scoped_runtime,
             &turn_id,
         ) {
-            foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+            let message = match settle_channel_turn_after_input_observers(
+                foreground_lease,
+                echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+            )
+            .await
+            {
+                Ok(_) => message,
+                Err(error) => format!("{message}; foreground settlement failed: {error}"),
+            };
             return Ok(immediate_channel_response(&msg, message));
         }
         self.record_runtime_owner(&scoped_runtime, &conv, &agent_conv);
         let Some(pool) = scoped_runtime.pool() else {
-            foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+            let failure = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
                 echo_agent::error::AgentFailure::message(
                     "agent_pool",
                     "The active workspace has no AgentPool",
                 ),
-            ));
+            );
+            let settlement =
+                settle_channel_turn_after_input_observers(foreground_lease, failure).await;
             Self::clear_active_turn(&self.active_turns, &active_surface_id, &turn_id);
+            if let Err(error) = settlement {
+                return Ok(immediate_channel_response(
+                    &msg,
+                    format!("AgentPool unavailable and foreground settlement failed: {error}"),
+                ));
+            }
             return Ok(immediate_channel_response(
                 &msg,
                 "The active workspace has no AgentPool.",
@@ -3006,10 +4413,20 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 }
             });
             if let Err(detail) = validation {
-                foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                    echo_agent::error::AgentFailure::message("task_run_resume", detail.clone()),
-                ));
+                let settlement = settle_channel_turn_after_input_observers(
+                    foreground_lease,
+                    echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                        echo_agent::error::AgentFailure::message("task_run_resume", detail.clone()),
+                    ),
+                )
+                .await;
                 Self::clear_active_turn(&self.active_turns, &active_surface_id, &turn_id);
+                if let Err(error) = settlement {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("{detail}; foreground settlement failed: {error}"),
+                    ));
+                }
                 return Ok(immediate_channel_response(&msg, detail));
             }
         }
@@ -3035,7 +4452,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             *self.interaction_mode.read().await
         };
         let runtime_authored = resume_task_run.is_some();
-        let prepared_attachments = msg.attachments.clone();
+        let prepared_attachments = Vec::new();
         let prepared_conversation_id = conv.clone();
         let prepared_turn_id = turn_id.clone();
         let prepared_workspace_receipt = workspace_io_receipt.clone();
@@ -3055,13 +4472,21 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             Ok(flow) => flow,
             Err(error) => {
                 let detail = error.to_string();
-                foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                let failure = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
                     echo_agent::error::AgentFailure::message(
                         "product_data_admission",
                         detail.clone(),
                     ),
-                ));
+                );
+                let settlement =
+                    settle_channel_turn_after_input_observers(foreground_lease, failure).await;
                 Self::clear_active_turn(&self.active_turns, &active_surface_id, &turn_id);
+                if let Err(settlement_error) = settlement {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("{detail}; foreground settlement failed: {settlement_error}"),
+                    ));
+                }
                 return Ok(immediate_channel_response(&msg, detail));
             }
         };
@@ -3093,9 +4518,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             self.foreground_turns
                 .supervise(foreground_lease, move |foreground_lease| async move {
                     let _active_owner = active_owner;
-                    use echo_agent_app_core::foreground_turn::{
-                        drive_foreground_pooled_chat, drive_foreground_pooled_chat_turn,
-                    };
+                    use echo_agent_app_core::foreground_turn::drive_foreground_pooled_chat_turn;
 
                     let renderer: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
                         std::sync::Arc::new(ChannelSurfaceSink::new(tx, renderer_cancel));
@@ -3132,7 +4555,18 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                             let outcome = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
                                 echo_agent::error::AgentFailure::message("prepared_turn", error),
                             );
-                            foreground_lease.settle(outcome.clone());
+                            let outcome = match settle_channel_turn_after_input_observers(
+                                foreground_lease,
+                                outcome,
+                            )
+                            .await
+                            {
+                                Ok(outcome) => outcome,
+                                Err(error) => {
+                                    tracing::error!(%error, "channel preparation settlement failed");
+                                    return;
+                                }
+                            };
                             let _delivered = terminal_tx.send(outcome);
                             return;
                         }
@@ -3171,7 +4605,18 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                                         error.to_string(),
                                     ),
                                 );
-                                foreground_lease.settle(outcome.clone());
+                                let outcome = match settle_channel_turn_after_input_observers(
+                                    foreground_lease,
+                                    outcome,
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => outcome,
+                                    Err(error) => {
+                                        tracing::error!(%error, "planned channel resume settlement failed");
+                                        return;
+                                    }
+                                };
                                 let _delivered = terminal_tx.send(outcome);
                                 return;
                             }
@@ -3184,8 +4629,18 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                                     error,
                                 ),
                             );
-                            foreground_lease.settle(outcome.clone());
-                            outcome
+                            match settle_channel_turn_after_input_observers(
+                                foreground_lease,
+                                outcome,
+                            )
+                            .await
+                            {
+                                Ok(outcome) => outcome,
+                                Err(error) => {
+                                    tracing::error!(%error, "planned channel configuration settlement failed");
+                                    return;
+                                }
+                            }
                         } else {
                             let trace_sink =
                                 echo_agent_app_core::chat_driver::subagent_trace_sink_for(
@@ -3237,8 +4692,18 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                                 echo_agent::error::AgentFailure::message("planned_resume", error),
                             ),
                         };
-                            foreground_lease.settle(outcome.clone());
-                            outcome
+                            match settle_channel_turn_after_input_observers(
+                                foreground_lease,
+                                outcome,
+                            )
+                            .await
+                            {
+                                Ok(outcome) => outcome,
+                                Err(error) => {
+                                    tracing::error!(%error, "planned channel launch settlement failed");
+                                    return;
+                                }
+                            }
                         }
                     } else {
                         match explicit_binding {
@@ -3255,15 +4720,24 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                                 .await
                             }
                             None => {
-                                drive_foreground_pooled_chat(
+                                let outcome = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                    echo_agent::error::AgentFailure::message(
+                                        "task_run_resume",
+                                        "TaskRun resume lost its planned or continuation binding",
+                                    ),
+                                );
+                                match settle_channel_turn_after_input_observers(
                                     foreground_lease,
-                                    pool,
-                                    agent_conv_owned,
-                                    configure,
-                                    &turn,
-                                    res,
+                                    outcome,
                                 )
                                 .await
+                                {
+                                    Ok(outcome) => outcome,
+                                    Err(error) => {
+                                        tracing::error!(%error, "channel resume binding settlement failed");
+                                        return;
+                                    }
+                                }
                             }
                         }
                     };
@@ -3510,7 +4984,7 @@ fn channel_attachment_data(
     }
 }
 
-#[cfg(feature = "channels")]
+#[cfg(all(feature = "channels", test))]
 fn stage_channel_attachments(
     attachments: &[echo_agent::channels::MessageAttachment],
     execution_root: &Path,
@@ -3533,13 +5007,38 @@ fn stage_channel_attachments(
     Ok(staged)
 }
 
+#[cfg(feature = "channels")]
+fn stage_channel_attachment_data(
+    attachments: &[echo_agent_app_core::types::AttachmentData],
+    execution_root: &Path,
+) -> Result<Vec<echo_agent_app_core::attachments::AttachmentRef>, String> {
+    let mut staged = Vec::with_capacity(attachments.len());
+    for attachment in attachments {
+        match echo_agent_app_core::attachments::stage_attachment_data(
+            attachment,
+            Some(execution_root),
+        ) {
+            Ok(reference) => staged.push(reference),
+            Err(error) => {
+                let cleanup =
+                    echo_agent_app_core::attachments::discard_staged_attachment_refs(&staged).err();
+                let suffix = cleanup
+                    .map(|cleanup| format!("; staged attachment cleanup failed: {cleanup}"))
+                    .unwrap_or_default();
+                return Err(format!("{error}{suffix}"));
+            }
+        }
+    }
+    Ok(staged)
+}
+
 /// Persist channel attachments and construct the canonical turn on the bounded
 /// product-data I/O pool. The exact workspace receipt remains owned by the
 /// blocking closure, while the foreground supervisor owns this future after
 /// admission, so surface cancellation cannot detach a half-written turn.
 #[cfg(feature = "channels")]
 struct ChannelTurnPreparation {
-    attachments: Vec<echo_agent::channels::MessageAttachment>,
+    attachments: Vec<echo_agent_app_core::types::AttachmentData>,
     execution_root: std::path::PathBuf,
     text: String,
     conversation_id: String,
@@ -3564,7 +5063,7 @@ async fn prepare_channel_turn(
             workspace_io_receipt,
         } = preparation;
         let _workspace_io_receipt = workspace_io_receipt;
-        let attachment_refs = stage_channel_attachments(&attachments, &execution_root)?;
+        let attachment_refs = stage_channel_attachment_data(&attachments, &execution_root)?;
         let spill_dir =
             echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(&execution_root));
         match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
@@ -4017,12 +5516,20 @@ async fn aggregate_by_sentence_with_repository<'a>(
                     flush_all!();
                     yield ChannelOutboundDraft::ordinary(format!("[paused:{run_id}] {goal}; new instruction: {new_message}"));
                 }
-                ChannelRenderEvent::Driver(ChatDriverEvent::InputQueued { input_id, .. }) => {
+                ChannelRenderEvent::Driver(ChatDriverEvent::InputLifecycle(fact)) => {
                     flush_all!();
-                    yield ChannelOutboundDraft::ordinary(format!("[queued:{input_id}]"));
+                    let phase = channel_input_fact_phase(&fact)
+                        .map(channel_input_phase_label)
+                        .unwrap_or("reordered");
+                    yield ChannelOutboundDraft::ordinary(format!(
+                        "[input:{}] {}",
+                        channel_safe_text(
+                            &fact.identity().input_id,
+                            CHANNEL_TOOL_PROGRESS_CHARS,
+                        ),
+                        phase,
+                    ));
                 }
-                ChannelRenderEvent::Driver(ChatDriverEvent::InputRemoved { .. }) => {}
-                ChannelRenderEvent::Driver(ChatDriverEvent::InputReordered { .. }) => {}
                 ChannelRenderEvent::Driver(ChatDriverEvent::CommandCellStarted { cell }) => {
                     flush_all!();
                     yield ChannelOutboundDraft::ordinary(format!("[cell:{}] started: {}", cell.cell_id, cell.name));
@@ -4113,6 +5620,8 @@ async fn aggregate_by_sentence_with_repository<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "channels")]
+    use std::sync::Arc;
     #[cfg(feature = "channels")]
     struct SessionIdentityProbe;
 
@@ -4570,6 +6079,74 @@ mod tests {
 
     #[cfg(feature = "channels")]
     #[test]
+    fn session_end_replaces_only_the_exact_surface_pump_slot() -> Result<(), String> {
+        let coordinator = super::ChannelSessionCoordinator::new();
+        let alice = super::ChannelSurfaceIdentity {
+            channel_id: "qq".to_string(),
+            chat_id: "group".to_string(),
+            sender_id: "alice".to_string(),
+        };
+        let bob = super::ChannelSurfaceIdentity {
+            sender_id: "bob".to_string(),
+            ..alice.clone()
+        };
+        let alice_old = coordinator.input_pump(&alice);
+        let bob_slot = coordinator.input_pump(&bob);
+        coordinator
+            .lifecycle
+            .lock()
+            .map_err(|_| "channel lifecycle test registry is unavailable".to_string())?
+            .entry(alice.clone())
+            .or_default()
+            .current_incarnation_id = Some("ended-incarnation".to_string());
+        coordinator.record_session_end(echo_agent::channels::SessionEndInfo {
+            channel_id: alice.channel_id.clone(),
+            chat_id: alice.chat_id.clone(),
+            sender_id: alice.sender_id.clone(),
+            incarnation_id: "ended-incarnation".to_string(),
+            reason: echo_agent::channels::SessionEndReason::TimeoutReplaced,
+        });
+        let alice_new = coordinator.input_pump(&alice);
+        assert!(!Arc::ptr_eq(&alice_old, &alice_new));
+        assert!(Arc::ptr_eq(&bob_slot, &coordinator.input_pump(&bob)));
+        assert!(alice_old.kick().is_err());
+        assert!(alice_new.kick().is_ok());
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn stale_session_end_does_not_shutdown_the_replacement_pump() -> Result<(), String> {
+        let coordinator = super::ChannelSessionCoordinator::new();
+        let surface = super::ChannelSurfaceIdentity {
+            channel_id: "qq".to_string(),
+            chat_id: "group".to_string(),
+            sender_id: "alice".to_string(),
+        };
+        coordinator
+            .lifecycle
+            .lock()
+            .map_err(|_| "channel lifecycle test registry is unavailable".to_string())?
+            .entry(surface.clone())
+            .or_default()
+            .current_incarnation_id = Some("replacement".to_string());
+        let replacement = coordinator.input_pump(&surface);
+
+        coordinator.record_session_end(echo_agent::channels::SessionEndInfo {
+            channel_id: surface.channel_id.clone(),
+            chat_id: surface.chat_id.clone(),
+            sender_id: surface.sender_id.clone(),
+            incarnation_id: "retired".to_string(),
+            reason: echo_agent::channels::SessionEndReason::TimeoutReplaced,
+        });
+
+        assert!(Arc::ptr_eq(&replacement, &coordinator.input_pump(&surface)));
+        assert!(replacement.kick().is_ok());
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
     fn active_surface_identity_is_typed_and_delimiter_safe() {
         let left =
             super::AppChannelMessageHandler::active_surface_identity("qq", "a:sender:b", "c");
@@ -4816,7 +6393,10 @@ mod tests {
                 )
                 .is_some()
         );
-        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+        lease
+            .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled)
+            .await
+            .map_err(|error| error.to_string())?;
         stop.await
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
@@ -4828,6 +6408,191 @@ mod tests {
                     "stable-product",
                 )
                 .is_none()
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn planned_resume_settlement_waits_for_live_steer_terminal_projection()
+    -> Result<(), String> {
+        use echo_agent_app_core::foreground_turn::{
+            ForegroundTerminalProjector, ForegroundTurnControl, ForegroundTurnSurface,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let control = ForegroundTurnControl::default();
+        let lease = control
+            .begin_scoped(
+                "workspace-planned-resume",
+                ForegroundTurnSurface::Channel,
+                "conversation-planned-resume",
+                "planned-resume-root",
+            )
+            .map_err(|error| error.to_string())?;
+        let (release_observer, observer_release) = tokio::sync::oneshot::channel();
+        let projected = Arc::new(AtomicBool::new(false));
+        let projected_for_callback = Arc::clone(&projected);
+        let projector: ForegroundTerminalProjector = Arc::new(move |_outcome| {
+            let projected = Arc::clone(&projected_for_callback);
+            Box::pin(async move {
+                projected.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        control
+            .supervise_input_lifecycle_scoped(
+                "workspace-planned-resume",
+                ForegroundTurnSurface::Channel,
+                "conversation-planned-resume",
+                "planned-resume-root",
+                async move {
+                    observer_release.await.map_err(|error| error.to_string())?;
+                    Ok(())
+                },
+                projector,
+            )
+            .map_err(|error| error.to_string())?;
+        let settling = tokio::spawn(async move {
+            super::settle_channel_turn_after_input_observers(
+                lease,
+                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(
+                        "planned_resume",
+                        "injected planned resume failure",
+                    ),
+                ),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        assert!(!settling.is_finished());
+        assert!(!projected.load(Ordering::SeqCst));
+        assert!(
+            control
+                .snapshot_scoped(
+                    "workspace-planned-resume",
+                    ForegroundTurnSurface::Channel,
+                    "conversation-planned-resume",
+                )
+                .is_some()
+        );
+        release_observer
+            .send(())
+            .map_err(|_| "planned resume observer already ended".to_string())?;
+        let outcome = settling
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+
+        assert!(matches!(
+            outcome,
+            echo_agent_app_core::chat_driver::TurnOutcome::Failed(_)
+        ));
+        assert!(projected.load(Ordering::SeqCst));
+        assert!(
+            control
+                .snapshot_scoped(
+                    "workspace-planned-resume",
+                    ForegroundTurnSurface::Channel,
+                    "conversation-planned-resume",
+                )
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn live_observer_failure_cancels_exact_recovery_without_poisoning_frontier()
+    -> Result<(), String> {
+        use echo_agent_app_core::chat_event_log::{ChatEventLog, ChatEventRetention};
+        use echo_agent_app_core::conversation_input::{
+            ConversationInputAddress, ConversationInputPhase, ConversationInputService,
+        };
+        use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = ConversationInputService::new(Arc::new(
+            ChatEventLog::open(temporary.path(), ChatEventRetention::default())
+                .map_err(|error| error.to_string())?,
+        ));
+        let address = ConversationInputAddress {
+            workspace_id: "workspace-observer-failure".to_string(),
+            conversation_id: "conversation-observer-failure".to_string(),
+        };
+        service
+            .submit(
+                address.clone(),
+                "observer-failure-input".to_string(),
+                "recover me".to_string(),
+                Vec::new(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let projection = service
+            .dispatch_next(&address, "observer-failure-turn".to_string())
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "observer failure input was not dispatched".to_string())?;
+        let attempt = super::channel_input_attempt(&projection)?;
+        service
+            .recovery_required(attempt.clone(), "injected observer failure".to_string())
+            .await
+            .map_err(|error| error.to_string())?;
+        let observed_phase = Arc::new(std::sync::Mutex::new(Some(
+            ConversationInputPhase::RecoveryRequired,
+        )));
+        let projector =
+            super::channel_live_terminal_projector(service.clone(), attempt, observed_phase);
+        let control = ForegroundTurnControl::default();
+        let lease = control
+            .begin_scoped(
+                &address.workspace_id,
+                ForegroundTurnSurface::Channel,
+                &address.conversation_id,
+                "observer-failure-turn",
+            )
+            .map_err(|error| error.to_string())?;
+        control
+            .supervise_input_lifecycle_scoped(
+                &address.workspace_id,
+                ForegroundTurnSurface::Channel,
+                &address.conversation_id,
+                "observer-failure-turn",
+                async { Err("injected observer runtime failure".to_string()) },
+                projector,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let settlement = lease
+            .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            settlement.outcome,
+            echo_agent_app_core::chat_driver::TurnOutcome::Failed(_)
+        ));
+        let frontier = service
+            .list(&address)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(frontier.items.is_empty());
+        let terminal = service
+            .submit(
+                address,
+                "observer-failure-input".to_string(),
+                "recover me".to_string(),
+                Vec::new(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(terminal.phase, ConversationInputPhase::Cancelled);
+        assert!(!terminal.drained);
+        assert_eq!(
+            terminal.reason.as_deref(),
+            Some("injected observer failure")
         );
         Ok(())
     }
@@ -5510,8 +7275,8 @@ mod tests {
     }
 
     #[cfg(feature = "channels")]
-    #[test]
-    fn downstream_drop_cancels_same_token_without_releasing_registry()
+    #[tokio::test]
+    async fn downstream_drop_cancels_same_token_without_releasing_registry()
     -> Result<(), echo_agent_app_core::foreground_turn::ForegroundTurnError> {
         use echo_agent_app_core::chat_driver::TurnOutcome;
         use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
@@ -5528,7 +7293,7 @@ mod tests {
                 .is_some(),
             "stream disconnect requests cancellation but settlement owns registry release"
         );
-        lease.settle(TurnOutcome::Cancelled);
+        lease.settle_after_observers(TurnOutcome::Cancelled).await?;
         assert!(
             control
                 .snapshot(ForegroundTurnSurface::Channel, "channel:test")
@@ -5706,6 +7471,365 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "channels")]
+    mod durable_ingress {
+        use super::super::{
+            ChannelRenderEvent, channel_input_address, channel_input_attempt,
+            project_channel_input_lifecycle,
+        };
+        use echo_agent_app_core::chat_event_log::{ChatEventLog, ChatEventRetention};
+        use echo_agent_app_core::conversation_input::{
+            ConversationInputPhase, ConversationInputService, ConversationInputSource,
+            stable_scoped_input_id,
+        };
+        use std::sync::Arc;
+
+        struct TestDirectory(std::path::PathBuf);
+
+        impl TestDirectory {
+            fn new(label: &str) -> Result<Self, String> {
+                let path = std::env::temp_dir()
+                    .join(format!("eko-channel-{label}-{}", uuid::Uuid::new_v4()));
+                std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+                Ok(Self(path))
+            }
+
+            fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+        }
+
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn address() -> echo_agent_app_core::conversation_input::ConversationInputAddress {
+            channel_input_address("channel-workspace", "channel-conversation")
+        }
+
+        #[tokio::test]
+        async fn duplicate_transport_message_id_has_one_durable_input() -> Result<(), String> {
+            let temp = TestDirectory::new("duplicate-input")?;
+            let service = ConversationInputService::new(Arc::new(
+                ChatEventLog::open(temp.path(), ChatEventRetention::default())
+                    .map_err(|error| error.to_string())?,
+            ));
+            let inbound = echo_agent::channels::InboundMessage::new(
+                "qq",
+                "sender-1",
+                "chat-1",
+                echo_agent::channels::ChatType::Direct,
+                "hello",
+                "transport-message-1",
+            );
+            let input_id = stable_scoped_input_id(
+                &address(),
+                ConversationInputSource::Channel,
+                &inbound.message_id,
+            )
+            .map_err(|error| error.to_string())?;
+            let first = service
+                .submit(
+                    address(),
+                    input_id.clone(),
+                    inbound.text.clone(),
+                    Vec::new(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let duplicate = service
+                .submit(address(), input_id, "hello".to_string(), Vec::new())
+                .await
+                .map_err(|error| error.to_string())?;
+            assert!(!first.duplicate);
+            assert_eq!(first.phase, ConversationInputPhase::Persisted);
+            assert!(first.attempt.is_none());
+            assert!(duplicate.duplicate);
+            assert_eq!(
+                service
+                    .list(&address())
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .items
+                    .len(),
+                1
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn persisted_channel_input_survives_restart_frontier() -> Result<(), String> {
+            let temp = TestDirectory::new("restart-input")?;
+            let root = temp.path().join("channel-ingress");
+            let service = ConversationInputService::new(Arc::new(
+                ChatEventLog::open(&root, ChatEventRetention::default())
+                    .map_err(|error| error.to_string())?,
+            ));
+            let input_id = stable_scoped_input_id(
+                &address(),
+                ConversationInputSource::Channel,
+                "transport-restart",
+            )
+            .map_err(|error| error.to_string())?;
+            service
+                .submit(
+                    address(),
+                    input_id.clone(),
+                    "survive restart".to_string(),
+                    Vec::new(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            drop(service);
+            let reopened = ConversationInputService::new(Arc::new(
+                ChatEventLog::open(&root, ChatEventRetention::default())
+                    .map_err(|error| error.to_string())?,
+            ));
+            let frontier = reopened
+                .list(&address())
+                .await
+                .map_err(|error| error.to_string())?;
+            let recovered = frontier
+                .items
+                .first()
+                .ok_or_else(|| "restart frontier lost channel input".to_string())?;
+            assert_eq!(recovered.receipt.identity.input_id, input_id);
+            assert_eq!(recovered.payload.text, "survive restart");
+            assert_eq!(recovered.receipt.phase, ConversationInputPhase::Persisted);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn drained_channel_input_settles_once_and_never_reenters_fifo() -> Result<(), String>
+        {
+            let temp = TestDirectory::new("drained-input")?;
+            let service = ConversationInputService::new(Arc::new(
+                ChatEventLog::open(temp.path(), ChatEventRetention::default())
+                    .map_err(|error| error.to_string())?,
+            ));
+            let input_id = stable_scoped_input_id(
+                &address(),
+                ConversationInputSource::Channel,
+                "transport-drained",
+            )
+            .map_err(|error| error.to_string())?;
+            service
+                .submit(address(), input_id, "consume once".to_string(), Vec::new())
+                .await
+                .map_err(|error| error.to_string())?;
+            let started = service
+                .dispatch_next(&address(), "channel-root-turn".to_string())
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "channel input was not dispatched".to_string())?;
+            let attempt = channel_input_attempt(&started)?;
+            service
+                .mailbox_accepted(attempt.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            service
+                .drained(attempt.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            let settled = service
+                .settle_attempt(
+                    &attempt,
+                    &echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(settled.phase, ConversationInputPhase::TurnSettled);
+            assert!(settled.drained);
+            assert!(
+                service
+                    .list(&address())
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .items
+                    .is_empty()
+            );
+            assert!(
+                service
+                    .settle_attempt(
+                        &attempt,
+                        &echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .duplicate
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn canonical_pump_receipts_reach_channel_renderer_in_commit_order()
+        -> Result<(), String> {
+            use echo_agent_app_core::chat_driver::ChatDriverEvent;
+            use echo_agent_app_core::conversation_input::ConversationInputFact;
+
+            let temp = TestDirectory::new("pump-renderer")?;
+            let log = Arc::new(
+                ChatEventLog::open(temp.path(), ChatEventRetention::default())
+                    .map_err(|error| error.to_string())?,
+            );
+            let service = ConversationInputService::new(Arc::clone(&log));
+            let submitted = service
+                .submit(
+                    address(),
+                    "render-completed".to_string(),
+                    "render completed input".to_string(),
+                    Vec::new(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let started = service
+                .dispatch_next(&address(), "render-completed-turn".to_string())
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "completed render input was not dispatched".to_string())?;
+            let attempt = channel_input_attempt(&started)?;
+            service
+                .mailbox_accepted(attempt.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            service
+                .drained(attempt.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            let message = echo_agent::channels::InboundMessage::new(
+                "qq",
+                "sender",
+                "chat",
+                echo_agent::channels::ChatType::Direct,
+                "render",
+                "render-completed",
+            );
+            let (route, mut receiver) =
+                super::super::input_pump::channel_input_reply_route(&message);
+            project_channel_input_lifecycle(
+                log.as_ref(),
+                &submitted.identity,
+                &route.render_tx,
+                route.lifecycle_cursor.as_ref(),
+            )
+            .await?;
+            service
+                .settle_attempt(
+                    &attempt,
+                    &echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            project_channel_input_lifecycle(
+                log.as_ref(),
+                &submitted.identity,
+                &route.render_tx,
+                route.lifecycle_cursor.as_ref(),
+            )
+            .await?;
+
+            let mut completed_phases = Vec::new();
+            while let Ok(event) = receiver.render_rx.try_recv() {
+                if let ChannelRenderEvent::Driver(ChatDriverEvent::InputLifecycle(fact)) = event {
+                    completed_phases.push(match fact.as_ref() {
+                        ConversationInputFact::Persisted { .. } => "persisted",
+                        ConversationInputFact::AttemptStarted { .. } => "attempt_started",
+                        ConversationInputFact::MailboxAccepted { .. } => "mailbox_accepted",
+                        ConversationInputFact::Drained { .. } => "drained",
+                        ConversationInputFact::TurnSettled { .. } => "turn_settled",
+                        ConversationInputFact::Deferred { .. } => "deferred",
+                        ConversationInputFact::Reordered { .. } => "reordered",
+                        ConversationInputFact::RecoveryRequired { .. } => "recovery_required",
+                        ConversationInputFact::Cancelled { .. } => "cancelled",
+                    });
+                }
+            }
+            assert_eq!(
+                completed_phases,
+                vec![
+                    "persisted",
+                    "attempt_started",
+                    "mailbox_accepted",
+                    "drained",
+                    "turn_settled",
+                ]
+            );
+
+            let recovery = service
+                .submit(
+                    address(),
+                    "render-cancelled".to_string(),
+                    "render cancelled input".to_string(),
+                    Vec::new(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let recovery_started = service
+                .dispatch_next(&address(), "render-cancelled-turn".to_string())
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "cancelled render input was not dispatched".to_string())?;
+            let recovery_attempt = channel_input_attempt(&recovery_started)?;
+            service
+                .recovery_required(
+                    recovery_attempt.clone(),
+                    "injected renderer recovery".to_string(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let recovery_message = echo_agent::channels::InboundMessage::new(
+                "qq",
+                "sender",
+                "chat",
+                echo_agent::channels::ChatType::Direct,
+                "recover",
+                "render-cancelled",
+            );
+            let (recovery_route, mut recovery_receiver) =
+                super::super::input_pump::channel_input_reply_route(&recovery_message);
+            project_channel_input_lifecycle(
+                log.as_ref(),
+                &recovery.identity,
+                &recovery_route.render_tx,
+                recovery_route.lifecycle_cursor.as_ref(),
+            )
+            .await?;
+            service
+                .settle_attempt(
+                    &recovery_attempt,
+                    &echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                        echo_agent::error::AgentFailure::message(
+                            "observer",
+                            "injected observer failure",
+                        ),
+                    ),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            project_channel_input_lifecycle(
+                log.as_ref(),
+                &recovery.identity,
+                &recovery_route.render_tx,
+                recovery_route.lifecycle_cursor.as_ref(),
+            )
+            .await?;
+            let mut saw_cancelled = false;
+            while let Ok(event) = recovery_receiver.render_rx.try_recv() {
+                if matches!(
+                    event,
+                    ChannelRenderEvent::Driver(ChatDriverEvent::InputLifecycle(fact))
+                        if matches!(fact.as_ref(), ConversationInputFact::Cancelled { .. })
+                ) {
+                    saw_cancelled = true;
+                }
+            }
+            assert!(saw_cancelled);
+            Ok(())
+        }
+    }
+
     // ── channel attachment transport tests ──────────────────────────────
     #[cfg(feature = "channels")]
     mod multimodal {
@@ -5811,7 +7935,7 @@ mod tests {
                 .map_err(|error| error.to_string())?;
             let turn = prepare_channel_turn(
                 ChannelTurnPreparation {
-                    attachments: vec![attachment],
+                    attachments: vec![channel_attachment_data(0, &attachment)],
                     execution_root: workspace.clone(),
                     text: "inspect the attachment".to_string(),
                     conversation_id: "conversation-a".to_string(),

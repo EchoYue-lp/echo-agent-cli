@@ -251,10 +251,21 @@ async fn run_jsonl_extension_command(
             "JSONL Extension management commands do not accept attachments",
         )
     };
-    finish_jsonl_extension_command(lease, sink, receipt)
+    finish_jsonl_extension_command(lease, sink, receipt).await
 }
 
-fn finish_jsonl_extension_command(
+async fn settle_jsonl_foreground(
+    lease: echo_agent_app_core::foreground_turn::ForegroundTurnLease,
+    outcome: echo_agent_app_core::chat_driver::TurnOutcome,
+) -> Result<()> {
+    lease
+        .settle_after_observers(outcome)
+        .await
+        .map(|_| ())
+        .map_err(anyhow::Error::new)
+}
+
+async fn finish_jsonl_extension_command(
     lease: echo_agent_app_core::foreground_turn::ForegroundTurnLease,
     sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink>,
     receipt: echo_agent_app_core::extension_commands::ExtensionCommandReceipt,
@@ -263,12 +274,16 @@ fn finish_jsonl_extension_command(
     if !sink.on_event(
         echo_agent_app_core::chat_driver::ChatDriverEvent::ExtensionReceipt(Box::new(receipt)),
     ) {
-        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-            echo_agent::error::AgentFailure::message(
-                "jsonl_output",
-                "JSONL output closed before the Extension receipt was delivered",
+        settle_jsonl_foreground(
+            lease,
+            echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message(
+                    "jsonl_output",
+                    "JSONL output closed before the Extension receipt was delivered",
+                ),
             ),
-        ));
+        )
+        .await?;
         return Err(anyhow::anyhow!(
             "JSONL output closed before the Extension receipt was delivered"
         ));
@@ -279,7 +294,7 @@ fn finish_jsonl_extension_command(
             status: terminal_status,
         },
     );
-    lease.settle(outcome.clone());
+    settle_jsonl_foreground(lease, outcome.clone()).await?;
     if !delivered {
         return Err(anyhow::anyhow!(
             "JSONL output closed before the terminal status was delivered"
@@ -392,12 +407,16 @@ pub async fn run_jsonl_mode(
                 status: "running".to_string(),
             },
         ) {
-            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                echo_agent::error::AgentFailure::message(
-                    "jsonl_output",
-                    "JSONL output closed before the Extension command started",
+            settle_jsonl_foreground(
+                lease,
+                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(
+                        "jsonl_output",
+                        "JSONL output closed before the Extension command started",
+                    ),
                 ),
-            ));
+            )
+            .await?;
             return Err(anyhow::anyhow!(
                 "JSONL output closed before the Extension command started"
             ));
@@ -417,12 +436,16 @@ pub async fn run_jsonl_mode(
             }
             Err(error) => {
                 let Some(kind) = error.extension else {
-                    lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                        echo_agent::error::AgentFailure::message(
-                            "extension_identity",
-                            error.to_string(),
+                    settle_jsonl_foreground(
+                        lease,
+                        echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                            echo_agent::error::AgentFailure::message(
+                                "extension_identity",
+                                error.to_string(),
+                            ),
                         ),
-                    ));
+                    )
+                    .await?;
                     return Err(anyhow::Error::new(error));
                 };
                 let receipt =
@@ -432,7 +455,7 @@ pub async fn run_jsonl_mode(
                         scoped_runtime.execution_scope().workspace_id().to_string(),
                         error.to_string(),
                     );
-                finish_jsonl_extension_command(lease, sink, receipt)
+                finish_jsonl_extension_command(lease, sink, receipt).await
             }
             Ok(None) => Err(anyhow::anyhow!(
                 "Extension command parser returned no command after claiming the prompt"
@@ -464,12 +487,16 @@ pub async fn run_jsonl_mode(
                         .err()
                         .map(|cleanup| format!("; attachment cleanup failed: {cleanup}"))
                         .unwrap_or_default();
-                lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                    echo_agent::error::AgentFailure::message(
-                        "jsonl_attachment",
-                        format!("failed to stage {}: {error}{cleanup}", path.display()),
+                settle_jsonl_foreground(
+                    lease,
+                    echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                        echo_agent::error::AgentFailure::message(
+                            "jsonl_attachment",
+                            format!("failed to stage {}: {error}{cleanup}", path.display()),
+                        ),
                     ),
-                ));
+                )
+                .await?;
                 return Err(anyhow::anyhow!(
                     "failed to stage JSONL attachment {}: {error}{cleanup}",
                     path.display()
@@ -495,12 +522,16 @@ pub async fn run_jsonl_mode(
         },
     ) {
         let _ = echo_agent_app_core::attachments::discard_staged_attachment_refs(&attachments);
-        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-            echo_agent::error::AgentFailure::message(
-                "jsonl_output",
-                "JSONL output closed before turn configuration was delivered",
+        settle_jsonl_foreground(
+            lease,
+            echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message(
+                    "jsonl_output",
+                    "JSONL output closed before turn configuration was delivered",
+                ),
             ),
-        ));
+        )
+        .await?;
         return Err(anyhow::anyhow!(
             "JSONL output closed before turn configuration was delivered"
         ));
@@ -510,12 +541,16 @@ pub async fn run_jsonl_mode(
             status: "running".to_string(),
         },
     ) {
-        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-            echo_agent::error::AgentFailure::message(
-                "jsonl_output",
-                "JSONL output closed before the turn started",
+        settle_jsonl_foreground(
+            lease,
+            echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message(
+                    "jsonl_output",
+                    "JSONL output closed before the turn started",
+                ),
             ),
-        ));
+        )
+        .await?;
         return Err(anyhow::anyhow!(
             "JSONL output closed before the turn started"
         ));
@@ -537,9 +572,13 @@ pub async fn run_jsonl_mode(
                 status: "failed".to_string(),
             },
         );
-        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-            echo_agent::error::AgentFailure::message("conversation_store", detail.clone()),
-        ));
+        settle_jsonl_foreground(
+            lease,
+            echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message("conversation_store", detail.clone()),
+            ),
+        )
+        .await?;
         return Err(anyhow::Error::msg(detail));
     }
 
@@ -562,9 +601,13 @@ pub async fn run_jsonl_mode(
                     status: "failed".to_string(),
                 },
             );
-            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                echo_agent::error::AgentFailure::message("prepared_turn", detail.clone()),
-            ));
+            settle_jsonl_foreground(
+                lease,
+                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message("prepared_turn", detail.clone()),
+                ),
+            )
+            .await?;
             return Err(anyhow::Error::msg(detail));
         }
     };
@@ -913,12 +956,18 @@ pub async fn run_channels_mode(args: ChannelsModeArgs) -> Result<()> {
     // handler_factory 每 channel 产出一个 SessionHandler,其内层工厂每
     // (channel,conversation,sender) 产出 AppChannelMessageHandler；handler
     // 从 AppState 解析消息所属 workspace generation 的 exact runtime。
+    let channel_coordinators = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let factory_coordinators = Arc::clone(&channel_coordinators);
     let handler_factory = move |_channel_id: &str| -> Arc<dyn MessageHandler> {
         let session_config = session_config.clone();
         let app_state = app_state.clone();
         let webhook_emitter = webhook_emitter.clone();
         let foreground_turns = foreground_turns.clone();
         let session_coordinator = Arc::new(ChannelSessionCoordinator::new());
+        factory_coordinators
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Arc::clone(&session_coordinator));
         let end_coordinator = Arc::clone(&session_coordinator);
         Arc::new(
             SessionHandler::new(
@@ -964,7 +1013,21 @@ pub async fn run_channels_mode(args: ChannelsModeArgs) -> Result<()> {
     }
     failures.extend(start_failures);
     if started_count == 0 {
+        let coordinators = channel_coordinators
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for coordinator in &coordinators {
+            if let Err(error) = coordinator.begin_input_pump_shutdown() {
+                failures.push(format!("input pump admission: {error}"));
+            }
+        }
         let stop_result = manager.stop_all().await.map_err(anyhow::Error::from);
+        for coordinator in coordinators {
+            if let Err(error) = coordinator.join_input_pumps().await {
+                failures.push(format!("input pump join: {error}"));
+            }
+        }
         return finish_channel_lifecycle(failures, stop_result);
     }
     tracing::info!(started_count, "IM channels started");
@@ -972,7 +1035,21 @@ pub async fn run_channels_mode(args: ChannelsModeArgs) -> Result<()> {
     shutdown.cancelled().await;
 
     tracing::info!("正在关闭 IM 通道...");
+    let coordinators = channel_coordinators
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    for coordinator in &coordinators {
+        if let Err(error) = coordinator.begin_input_pump_shutdown() {
+            failures.push(format!("input pump admission: {error}"));
+        }
+    }
     let stop_result = manager.stop_all().await.map_err(anyhow::Error::from);
+    for coordinator in coordinators {
+        if let Err(error) = coordinator.join_input_pumps().await {
+            failures.push(format!("input pump join: {error}"));
+        }
+    }
     finish_channel_lifecycle(failures, stop_result)
 }
 
@@ -1034,6 +1111,39 @@ mod tests {
                 "committed receipt completed unexpectedly: {outcome:?}"
             )),
         }
+    }
+
+    #[tokio::test]
+    async fn jsonl_foreground_settlement_propagates_durable_terminal_debt() -> Result<()> {
+        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let lease = control.begin_scoped(
+            "workspace-jsonl-debt",
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+            "conversation-jsonl-debt",
+            "turn-jsonl-debt",
+        )?;
+        let projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+            Arc::new(|_| Box::pin(async { Err("jsonl durable terminal debt".to_string()) }));
+        control.supervise_input_lifecycle_scoped(
+            "workspace-jsonl-debt",
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+            "conversation-jsonl-debt",
+            "turn-jsonl-debt",
+            async { Ok(()) },
+            projector,
+        )?;
+
+        let error = settle_jsonl_foreground(
+            lease,
+            echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("JSONL durable terminal debt was swallowed"))?;
+
+        assert!(error.to_string().contains("jsonl durable terminal debt"));
+        assert!(control.has_active_turns());
+        Ok(())
     }
 
     #[tokio::test]

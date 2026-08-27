@@ -14,7 +14,8 @@ import {
 import {
   agentApi,
   type AgentDeliveryRecord,
-  type AgentDeliveryStatus,
+  type AgentDeliveryOutcome,
+  type AgentDeliveryPhase,
   type AgentEndpoint,
 } from '../../api/endpoints';
 import { useConversationStore } from '../../stores/conversationStore';
@@ -28,20 +29,36 @@ interface AgentMessageDialogProps {
   onClose: () => void;
 }
 
-const statusLabels: Record<AgentDeliveryStatus, string> = {
-  queued: '排队中',
-  claimed: '处理中',
-  injection_started: '注入已开始',
-  injected: '已注入当前任务',
-  delivered: '已送达',
-  failed: '失败',
+const phaseLabels: Record<Exclude<AgentDeliveryPhase, 'turn_settled'>, string> = {
+  persisted: '已持久化',
+  claimed: '已认领',
+  mailbox_accepted: '邮箱已接收',
+  drained: '已进入上下文',
 };
 
-function StatusIcon({ status }: { status: AgentDeliveryStatus }) {
-  if (status === 'delivered') return <Check size={13} aria-hidden="true" />;
-  if (status === 'failed') return <XCircle size={13} aria-hidden="true" />;
-  if (status === 'claimed' || status === 'injection_started' || status === 'injected')
+const outcomeLabels: Record<AgentDeliveryOutcome, string> = {
+  completed: '已完成',
+  failed: '失败',
+  cancelled: '已取消',
+  dropped: '已丢弃',
+  outcome_unknown: '结果未知',
+};
+
+function deliveryLabel(record: AgentDeliveryRecord): string {
+  if (record.phase === 'turn_settled') {
+    return record.outcome ? outcomeLabels[record.outcome] : outcomeLabels.outcome_unknown;
+  }
+  return phaseLabels[record.phase];
+}
+
+function StatusIcon({ record }: { record: AgentDeliveryRecord }) {
+  if (record.phase === 'turn_settled' && record.outcome === 'completed') {
+    return <Check size={13} aria-hidden="true" />;
+  }
+  if (record.phase === 'turn_settled') return <XCircle size={13} aria-hidden="true" />;
+  if (record.phase !== 'persisted') {
     return <LoaderCircle size={13} className="animate-spin" aria-hidden="true" />;
+  }
   return <Clock3 size={13} aria-hidden="true" />;
 }
 
@@ -146,13 +163,7 @@ export function AgentMessageDialog({ isOpen, onClose }: AgentMessageDialogProps)
   }, [isOpen, loadRecords, selected]);
 
   useEffect(() => {
-    if (
-      !isOpen ||
-      !selected ||
-      !records.some((record) =>
-        ['queued', 'claimed', 'injection_started', 'injected'].includes(record.status)
-      )
-    ) {
+    if (!isOpen || !selected || !records.some((record) => record.phase !== 'turn_settled')) {
       return;
     }
     const interval = window.setInterval(() => void loadRecords(selected, true), 1200);
@@ -345,15 +356,15 @@ export function AgentMessageDialog({ isOpen, onClose }: AgentMessageDialogProps)
                           <div className="flex min-w-0 items-center gap-2">
                             <span
                               className={`flex shrink-0 items-center gap-1 text-xs ${
-                                record.status === 'failed'
+                                record.phase === 'turn_settled' && record.outcome !== 'completed'
                                   ? 'text-[var(--color-error-text)]'
-                                  : record.status === 'delivered'
+                                  : record.phase === 'turn_settled'
                                     ? 'text-[var(--color-success-text)]'
                                     : 'text-[var(--text-secondary)]'
                               }`}
                             >
-                              <StatusIcon status={record.status} />
-                              {statusLabels[record.status]}
+                              <StatusIcon record={record} />
+                              {deliveryLabel(record)}
                             </span>
                             <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-[var(--text-tertiary)]">
                               {record.message_id}
@@ -362,9 +373,9 @@ export function AgentMessageDialog({ isOpen, onClose }: AgentMessageDialogProps)
                               #{record.attempt}
                             </span>
                           </div>
-                          {(record.reply_message_id || record.error) && (
+                          {(record.reply_message_id || record.reason) && (
                             <div className="mt-1 truncate text-[11px] text-[var(--text-tertiary)]">
-                              {record.error || `回复 ${record.reply_message_id}`}
+                              {record.reason || `回复 ${record.reply_message_id}`}
                             </div>
                           )}
                         </div>

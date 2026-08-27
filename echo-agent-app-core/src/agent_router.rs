@@ -277,13 +277,46 @@ impl AgentMessage {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentDeliveryStatus {
-    Queued,
+pub enum AgentDeliveryPhase {
+    Persisted,
     Claimed,
-    InjectionStarted,
-    Injected,
-    Delivered,
+    MailboxAccepted,
+    Drained,
+    TurnSettled,
+}
+
+impl AgentDeliveryPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Persisted => "persisted",
+            Self::Claimed => "claimed",
+            Self::MailboxAccepted => "mailbox_accepted",
+            Self::Drained => "drained",
+            Self::TurnSettled => "turn_settled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDeliveryOutcome {
+    Completed,
     Failed,
+    Cancelled,
+    Dropped,
+    OutcomeUnknown,
+}
+
+impl AgentDeliveryOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Dropped => "dropped",
+            Self::OutcomeUnknown => "outcome_unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -308,8 +341,11 @@ impl From<JournalDurabilityStatus> for AgentDeliveryDurability {
 pub struct AgentDeliveryReceipt {
     pub message_id: String,
     pub target: AgentAddress,
-    pub status: AgentDeliveryStatus,
-    pub accepted_at: DateTime<Utc>,
+    pub phase: AgentDeliveryPhase,
+    pub outcome: Option<AgentDeliveryOutcome>,
+    pub drained: bool,
+    pub reason: Option<String>,
+    pub persisted_at: DateTime<Utc>,
     pub duplicate: bool,
     /// Typed durability of the authoritative inbox commit. Degraded means the
     /// event owns its sequence and must not be retried.
@@ -327,7 +363,8 @@ pub struct AgentDeliveryClaim {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct AgentDeliveryInFlight {
     pub claim: AgentDeliveryClaim,
-    pub status: AgentDeliveryStatus,
+    pub phase: AgentDeliveryPhase,
+    pub effect_started: bool,
     pub turn_id: String,
 }
 
@@ -336,14 +373,19 @@ pub struct AgentDeliveryRecord {
     pub message: AgentMessage,
     pub message_id: String,
     pub target: AgentAddress,
-    pub status: AgentDeliveryStatus,
-    pub accepted_at: DateTime<Utc>,
+    pub phase: AgentDeliveryPhase,
+    pub outcome: Option<AgentDeliveryOutcome>,
+    pub drained: bool,
+    pub reason: Option<String>,
+    pub persisted_at: DateTime<Utc>,
     pub attempt_id: Option<String>,
     pub attempt: u32,
-    pub settled_at: Option<DateTime<Utc>>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub mailbox_accepted_at: Option<DateTime<Utc>>,
+    pub drained_at: Option<DateTime<Utc>>,
+    pub turn_settled_at: Option<DateTime<Utc>>,
     pub turn_id: Option<String>,
     pub reply_message_id: Option<String>,
-    pub error: Option<String>,
     pub next_attempt_at: Option<DateTime<Utc>>,
 }
 
@@ -358,9 +400,9 @@ pub struct AgentEndpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 enum AgentInboxEvent {
-    Accepted {
+    Persisted {
         message: AgentMessage,
-        accepted_at: DateTime<Utc>,
+        persisted_at: DateTime<Utc>,
     },
     Claimed {
         message_id: String,
@@ -368,16 +410,22 @@ enum AgentInboxEvent {
         attempt: u32,
         claimed_at: DateTime<Utc>,
     },
-    InjectionStarted {
+    EffectStarted {
         message_id: String,
         attempt_id: String,
         started_at: DateTime<Utc>,
         turn_id: String,
     },
-    Injected {
+    MailboxAccepted {
         message_id: String,
         attempt_id: String,
-        injected_at: DateTime<Utc>,
+        accepted_at: DateTime<Utc>,
+        turn_id: String,
+    },
+    Drained {
+        message_id: String,
+        attempt_id: String,
+        drained_at: DateTime<Utc>,
         turn_id: String,
     },
     Deferred {
@@ -388,21 +436,17 @@ enum AgentInboxEvent {
         #[serde(default)]
         next_attempt_at: Option<DateTime<Utc>>,
     },
-    Delivered {
+    TurnSettled {
         message_id: String,
         attempt_id: String,
-        delivered_at: DateTime<Utc>,
-        turn_id: String,
-        reply_message_id: Option<String>,
-    },
-    Failed {
-        message_id: String,
-        attempt_id: String,
-        failed_at: DateTime<Utc>,
-        error: String,
+        settled_at: DateTime<Utc>,
+        turn_id: Option<String>,
+        outcome: AgentDeliveryOutcome,
+        drained: bool,
+        reason: Option<String>,
         retryable: bool,
-        #[serde(default)]
         next_attempt_at: Option<DateTime<Utc>>,
+        reply_message_id: Option<String>,
     },
 }
 
@@ -1196,56 +1240,65 @@ impl AgentRouter {
     ) -> Result<AgentDeliveryReceipt, AgentRouterError> {
         self.settle_claim(
             claim,
-            ClaimSettlement::InjectionStarted {
+            ClaimSettlement::EffectStarted {
                 turn_id: turn_id.into(),
             },
         )
         .await
     }
 
-    pub async fn injected(
+    pub(crate) async fn mailbox_accepted(
         &self,
         claim: &AgentDeliveryClaim,
         turn_id: impl Into<String>,
     ) -> Result<AgentDeliveryReceipt, AgentRouterError> {
         self.settle_claim(
             claim,
-            ClaimSettlement::Injected {
+            ClaimSettlement::MailboxAccepted {
                 turn_id: turn_id.into(),
             },
         )
         .await
     }
 
-    pub async fn delivered(
+    pub(crate) async fn drained(
         &self,
         claim: &AgentDeliveryClaim,
         turn_id: impl Into<String>,
-        reply_message_id: Option<String>,
     ) -> Result<AgentDeliveryReceipt, AgentRouterError> {
         self.settle_claim(
             claim,
-            ClaimSettlement::Delivered {
+            ClaimSettlement::Drained {
                 turn_id: turn_id.into(),
-                reply_message_id,
             },
         )
         .await
     }
 
-    pub async fn failed(
+    // These fields are the terminal fact itself; keeping them explicit avoids
+    // a second mutable builder or status authority at call sites.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn turn_settled(
         &self,
         claim: &AgentDeliveryClaim,
-        error: impl Into<String>,
+        turn_id: Option<String>,
+        outcome: AgentDeliveryOutcome,
+        drained: bool,
+        reason: Option<String>,
         retryable: bool,
+        reply_message_id: Option<String>,
     ) -> Result<AgentDeliveryReceipt, AgentRouterError> {
         let next_attempt_at = retryable.then(|| retry_deadline(claim.attempt));
         self.settle_claim(
             claim,
-            ClaimSettlement::Failed {
-                error: error.into(),
+            ClaimSettlement::TurnSettled {
+                turn_id,
+                outcome,
+                drained: Some(drained),
+                reason,
                 retryable,
                 next_attempt_at,
+                reply_message_id,
             },
         )
         .await
@@ -1299,26 +1352,26 @@ impl AgentRouter {
                 for record in records {
                     after = record.sequence;
                     let (event_message_id, phase) = match record.event.as_ref() {
-                        AgentInboxEvent::Accepted { message, .. } => {
-                            (message.message_id.as_str(), "accepted")
+                        AgentInboxEvent::Persisted { message, .. } => {
+                            (message.message_id.as_str(), "persisted")
                         }
                         AgentInboxEvent::Claimed { message_id, .. } => {
                             (message_id.as_str(), "claimed")
                         }
-                        AgentInboxEvent::InjectionStarted { message_id, .. } => {
-                            (message_id.as_str(), "injection_started")
+                        AgentInboxEvent::EffectStarted { message_id, .. } => {
+                            (message_id.as_str(), "effect_started")
                         }
-                        AgentInboxEvent::Injected { message_id, .. } => {
-                            (message_id.as_str(), "injected")
+                        AgentInboxEvent::MailboxAccepted { message_id, .. } => {
+                            (message_id.as_str(), "mailbox_accepted")
+                        }
+                        AgentInboxEvent::Drained { message_id, .. } => {
+                            (message_id.as_str(), "drained")
                         }
                         AgentInboxEvent::Deferred { message_id, .. } => {
                             (message_id.as_str(), "deferred")
                         }
-                        AgentInboxEvent::Delivered { message_id, .. } => {
-                            (message_id.as_str(), "delivered")
-                        }
-                        AgentInboxEvent::Failed { message_id, .. } => {
-                            (message_id.as_str(), "failed")
+                        AgentInboxEvent::TurnSettled { message_id, .. } => {
+                            (message_id.as_str(), "turn_settled")
                         }
                     };
                     if event_message_id == message_id {
@@ -1347,24 +1400,27 @@ impl AgentRouter {
 }
 
 enum ClaimSettlement {
-    InjectionStarted {
+    EffectStarted {
         turn_id: String,
     },
-    Injected {
+    MailboxAccepted {
+        turn_id: String,
+    },
+    Drained {
         turn_id: String,
     },
     Deferred {
         reason: String,
         next_attempt_at: DateTime<Utc>,
     },
-    Delivered {
-        turn_id: String,
-        reply_message_id: Option<String>,
-    },
-    Failed {
-        error: String,
+    TurnSettled {
+        turn_id: Option<String>,
+        outcome: AgentDeliveryOutcome,
+        drained: Option<bool>,
+        reason: Option<String>,
         retryable: bool,
         next_attempt_at: Option<DateTime<Utc>>,
+        reply_message_id: Option<String>,
     },
 }
 
@@ -1736,23 +1792,29 @@ fn enqueue_sync(
         return Ok(AgentDeliveryReceipt {
             message_id: existing.message.message_id.clone(),
             target: existing.message.to.clone(),
-            status: existing.status,
-            accepted_at: existing.accepted_at,
+            phase: existing.phase,
+            outcome: existing.outcome,
+            drained: existing.drained,
+            reason: existing.reason.clone(),
+            persisted_at: existing.persisted_at,
             duplicate: true,
             durability: AgentDeliveryDurability::Unconfirmed,
         });
     }
 
-    let accepted_at = Utc::now();
-    let durability = authority.append(AgentInboxEvent::Accepted {
+    let persisted_at = Utc::now();
+    let durability = authority.append(AgentInboxEvent::Persisted {
         message: message.clone(),
-        accepted_at,
+        persisted_at,
     })?;
     Ok(AgentDeliveryReceipt {
         message_id: message.message_id,
         target: message.to,
-        status: AgentDeliveryStatus::Queued,
-        accepted_at,
+        phase: AgentDeliveryPhase::Persisted,
+        outcome: None,
+        drained: false,
+        reason: None,
+        persisted_at,
         duplicate: false,
         durability: durability.into(),
     })
@@ -1798,10 +1860,12 @@ fn claim_next_sync(
     let Some(next) = next else {
         return Ok(None);
     };
-    if matches!(
-        next.status,
-        AgentDeliveryStatus::InjectionStarted | AgentDeliveryStatus::Injected
-    ) {
+    if next.effect_started_at.is_some()
+        || matches!(
+            next.phase,
+            AgentDeliveryPhase::MailboxAccepted | AgentDeliveryPhase::Drained
+        )
+    {
         return Ok(None);
     }
     if next
@@ -1837,10 +1901,12 @@ fn in_flight_claim_sync(
         let Some(entry) = projection.frontier_entry().cloned() else {
             return Ok(None);
         };
-        if !matches!(
-            entry.status,
-            AgentDeliveryStatus::InjectionStarted | AgentDeliveryStatus::Injected
-        ) {
+        if entry.effect_started_at.is_none()
+            && !matches!(
+                entry.phase,
+                AgentDeliveryPhase::MailboxAccepted | AgentDeliveryPhase::Drained
+            )
+        {
             return Ok(None);
         }
         let attempt_id = entry.attempt_id.ok_or_else(|| {
@@ -1874,7 +1940,8 @@ fn in_flight_claim_sync(
                 attempt: entry.attempt,
                 claimed_at,
             },
-            status: entry.status,
+            phase: entry.phase,
+            effect_started: entry.effect_started_at.is_some(),
             turn_id,
         }))
     })
@@ -1899,25 +1966,32 @@ fn settle_claim_sync(
             })
     })?;
     let valid_phase = match &settlement {
-        ClaimSettlement::InjectionStarted { .. } => entry.status == AgentDeliveryStatus::Claimed,
-        ClaimSettlement::Injected { turn_id } => {
-            entry.status == AgentDeliveryStatus::InjectionStarted
+        ClaimSettlement::EffectStarted { .. } => {
+            entry.phase == AgentDeliveryPhase::Claimed && entry.effect_started_at.is_none()
+        }
+        ClaimSettlement::MailboxAccepted { turn_id } => {
+            entry.phase == AgentDeliveryPhase::Claimed
+                && entry.effect_started_at.is_some()
                 && entry.turn_id.as_deref() == Some(turn_id)
         }
-        ClaimSettlement::Deferred { .. } => matches!(
-            entry.status,
-            AgentDeliveryStatus::Claimed | AgentDeliveryStatus::InjectionStarted
-        ),
-        ClaimSettlement::Delivered { turn_id, .. } => {
-            entry.status == AgentDeliveryStatus::Injected
+        ClaimSettlement::Drained { turn_id } => {
+            entry.phase == AgentDeliveryPhase::MailboxAccepted
                 && entry.turn_id.as_deref() == Some(turn_id)
         }
-        ClaimSettlement::Failed { .. } => matches!(
-            entry.status,
-            AgentDeliveryStatus::Claimed
-                | AgentDeliveryStatus::InjectionStarted
-                | AgentDeliveryStatus::Injected
-        ),
+        ClaimSettlement::Deferred { .. } => matches!(entry.phase, AgentDeliveryPhase::Claimed),
+        ClaimSettlement::TurnSettled {
+            turn_id, drained, ..
+        } => {
+            matches!(
+                entry.phase,
+                AgentDeliveryPhase::Claimed
+                    | AgentDeliveryPhase::MailboxAccepted
+                    | AgentDeliveryPhase::Drained
+            ) && turn_id
+                .as_deref()
+                .is_none_or(|turn_id| entry.turn_id.as_deref() == Some(turn_id))
+                && drained.is_none_or(|drained| drained == entry.drained)
+        }
     };
     if entry.attempt_id.as_deref() != Some(claim.attempt_id.as_str()) || !valid_phase {
         return Err(AgentRouterError::StaleClaim {
@@ -1925,24 +1999,39 @@ fn settle_claim_sync(
             attempt_id: claim.attempt_id.clone(),
         });
     }
-    let (status, event) = match settlement {
-        ClaimSettlement::InjectionStarted { turn_id } => {
-            let event = AgentInboxEvent::InjectionStarted {
+    let (phase, outcome, drained, reason, event) = match settlement {
+        ClaimSettlement::EffectStarted { turn_id } => {
+            let event = AgentInboxEvent::EffectStarted {
                 message_id: claim.message.message_id.clone(),
                 attempt_id: claim.attempt_id.clone(),
                 started_at: Utc::now(),
                 turn_id,
             };
-            (AgentDeliveryStatus::InjectionStarted, event)
+            (AgentDeliveryPhase::Claimed, None, false, None, event)
         }
-        ClaimSettlement::Injected { turn_id } => {
-            let event = AgentInboxEvent::Injected {
+        ClaimSettlement::MailboxAccepted { turn_id } => {
+            let event = AgentInboxEvent::MailboxAccepted {
                 message_id: claim.message.message_id.clone(),
                 attempt_id: claim.attempt_id.clone(),
-                injected_at: Utc::now(),
+                accepted_at: Utc::now(),
                 turn_id,
             };
-            (AgentDeliveryStatus::Injected, event)
+            (
+                AgentDeliveryPhase::MailboxAccepted,
+                None,
+                false,
+                None,
+                event,
+            )
+        }
+        ClaimSettlement::Drained { turn_id } => {
+            let event = AgentInboxEvent::Drained {
+                message_id: claim.message.message_id.clone(),
+                attempt_id: claim.attempt_id.clone(),
+                drained_at: Utc::now(),
+                turn_id,
+            };
+            (AgentDeliveryPhase::Drained, None, true, None, event)
         }
         ClaimSettlement::Deferred {
             reason,
@@ -1952,47 +2041,59 @@ fn settle_claim_sync(
                 message_id: claim.message.message_id.clone(),
                 attempt_id: claim.attempt_id.clone(),
                 deferred_at: Utc::now(),
-                reason,
+                reason: reason.clone(),
                 next_attempt_at: Some(next_attempt_at),
             };
-            (AgentDeliveryStatus::Queued, event)
+            (
+                AgentDeliveryPhase::Persisted,
+                None,
+                false,
+                Some(reason),
+                event,
+            )
         }
-        ClaimSettlement::Delivered {
+        ClaimSettlement::TurnSettled {
             turn_id,
-            reply_message_id,
-        } => {
-            let event = AgentInboxEvent::Delivered {
-                message_id: claim.message.message_id.clone(),
-                attempt_id: claim.attempt_id.clone(),
-                delivered_at: Utc::now(),
-                turn_id,
-                reply_message_id,
-            };
-            (AgentDeliveryStatus::Delivered, event)
-        }
-        ClaimSettlement::Failed {
-            error,
+            outcome,
+            drained,
+            reason,
             retryable,
             next_attempt_at,
+            reply_message_id,
         } => {
-            let event = AgentInboxEvent::Failed {
+            let drained = drained.unwrap_or(entry.drained);
+            let turn_id = turn_id.or_else(|| entry.turn_id.clone());
+            let event = AgentInboxEvent::TurnSettled {
                 message_id: claim.message.message_id.clone(),
                 attempt_id: claim.attempt_id.clone(),
-                failed_at: Utc::now(),
-                error,
+                settled_at: Utc::now(),
+                turn_id,
+                outcome,
+                drained,
+                reason: reason.clone(),
                 retryable,
                 next_attempt_at,
+                reply_message_id,
             };
-            (AgentDeliveryStatus::Failed, event)
+            (
+                AgentDeliveryPhase::TurnSettled,
+                Some(outcome),
+                drained,
+                reason,
+                event,
+            )
         }
     };
-    let accepted_at = entry.accepted_at;
+    let persisted_at = entry.persisted_at;
     let durability = authority.append(event)?;
     Ok(AgentDeliveryReceipt {
         message_id: claim.message.message_id.clone(),
         target: target.clone(),
-        status,
-        accepted_at,
+        phase,
+        outcome,
+        drained,
+        reason,
+        persisted_at,
         duplicate: false,
         durability: durability.into(),
     })
@@ -2179,15 +2280,20 @@ fn write_groups(path: &Path, groups: &[AgentGroup]) -> Result<(), AgentRouterErr
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FoldedDelivery {
     message: AgentMessage,
-    accepted_at: DateTime<Utc>,
-    status: AgentDeliveryStatus,
+    persisted_at: DateTime<Utc>,
+    phase: AgentDeliveryPhase,
+    outcome: Option<AgentDeliveryOutcome>,
+    drained: bool,
+    reason: Option<String>,
     attempt_id: Option<String>,
     attempt: u32,
     claimed_at: Option<DateTime<Utc>>,
-    settled_at: Option<DateTime<Utc>>,
+    effect_started_at: Option<DateTime<Utc>>,
+    mailbox_accepted_at: Option<DateTime<Utc>>,
+    drained_at: Option<DateTime<Utc>>,
+    turn_settled_at: Option<DateTime<Utc>>,
     turn_id: Option<String>,
     reply_message_id: Option<String>,
-    error: Option<String>,
     next_attempt_at: Option<DateTime<Utc>>,
     terminal: bool,
     retained_bytes: usize,
@@ -2352,9 +2458,9 @@ impl AgentInboxProjection {
 
     fn apply_checked(&mut self, event: &AgentInboxEvent) -> Result<(), String> {
         match event {
-            AgentInboxEvent::Accepted {
+            AgentInboxEvent::Persisted {
                 message,
-                accepted_at,
+                persisted_at,
             } => {
                 if self.entries.contains_key(&message.message_id) {
                     return Err(format!("duplicate acceptance for {}", message.message_id));
@@ -2365,15 +2471,20 @@ impl AgentInboxProjection {
                     message.message_id.clone(),
                     FoldedDelivery {
                         message: message.clone(),
-                        accepted_at: *accepted_at,
-                        status: AgentDeliveryStatus::Queued,
+                        persisted_at: *persisted_at,
+                        phase: AgentDeliveryPhase::Persisted,
+                        outcome: None,
+                        drained: false,
+                        reason: None,
                         attempt_id: None,
                         attempt: 0,
                         claimed_at: None,
-                        settled_at: None,
+                        effect_started_at: None,
+                        mailbox_accepted_at: None,
+                        drained_at: None,
+                        turn_settled_at: None,
                         turn_id: None,
                         reply_message_id: None,
-                        error: None,
                         next_attempt_at: None,
                         terminal: false,
                         retained_bytes: 0,
@@ -2390,17 +2501,22 @@ impl AgentInboxProjection {
                 if entry.terminal {
                     return Err(format!("terminal message {message_id} was claimed again"));
                 }
-                entry.status = AgentDeliveryStatus::Claimed;
+                entry.phase = AgentDeliveryPhase::Claimed;
+                entry.outcome = None;
+                entry.drained = false;
+                entry.reason = None;
                 entry.attempt_id = Some(attempt_id.clone());
                 entry.attempt = *attempt;
                 entry.claimed_at = Some(*claimed_at);
-                entry.settled_at = None;
+                entry.effect_started_at = None;
+                entry.mailbox_accepted_at = None;
+                entry.drained_at = None;
+                entry.turn_settled_at = None;
                 entry.turn_id = None;
                 entry.reply_message_id = None;
-                entry.error = None;
                 entry.next_attempt_at = None;
             }
-            AgentInboxEvent::InjectionStarted {
+            AgentInboxEvent::EffectStarted {
                 message_id,
                 attempt_id,
                 started_at,
@@ -2408,83 +2524,112 @@ impl AgentInboxProjection {
             } => {
                 let entry =
                     projection_claimed_entry_mut(&mut self.entries, message_id, attempt_id)?;
-                if entry.status != AgentDeliveryStatus::Claimed {
+                if entry.phase != AgentDeliveryPhase::Claimed || entry.effect_started_at.is_some() {
                     return Err(format!(
                         "delivery injection was started twice for {message_id}"
                     ));
                 }
-                entry.status = AgentDeliveryStatus::InjectionStarted;
-                entry.settled_at = Some(*started_at);
+                entry.effect_started_at = Some(*started_at);
                 entry.turn_id = Some(turn_id.clone());
             }
-            AgentInboxEvent::Injected {
+            AgentInboxEvent::MailboxAccepted {
                 message_id,
                 attempt_id,
-                injected_at,
+                accepted_at,
                 turn_id,
             } => {
                 let entry =
                     projection_claimed_entry_mut(&mut self.entries, message_id, attempt_id)?;
-                if entry.status != AgentDeliveryStatus::InjectionStarted {
+                if entry.phase != AgentDeliveryPhase::Claimed || entry.effect_started_at.is_none() {
                     return Err(format!(
-                        "delivery was marked injected without a started fact for {message_id}"
+                        "delivery mailbox accepted without an effect-started fact for {message_id}"
                     ));
                 }
                 if entry.turn_id.as_deref() != Some(turn_id) {
-                    return Err(format!("delivery injected turn changed for {message_id}"));
+                    return Err(format!(
+                        "delivery mailbox-accepted turn changed for {message_id}"
+                    ));
                 }
-                entry.status = AgentDeliveryStatus::Injected;
-                entry.settled_at = Some(*injected_at);
-                entry.turn_id = Some(turn_id.clone());
+                entry.phase = AgentDeliveryPhase::MailboxAccepted;
+                entry.mailbox_accepted_at = Some(*accepted_at);
+            }
+            AgentInboxEvent::Drained {
+                message_id,
+                attempt_id,
+                drained_at,
+                turn_id,
+            } => {
+                let entry =
+                    projection_claimed_entry_mut(&mut self.entries, message_id, attempt_id)?;
+                if entry.phase != AgentDeliveryPhase::MailboxAccepted {
+                    return Err(format!(
+                        "delivery drained without mailbox acceptance for {message_id}"
+                    ));
+                }
+                if entry.turn_id.as_deref() != Some(turn_id) {
+                    return Err(format!("delivery drained turn changed for {message_id}"));
+                }
+                entry.phase = AgentDeliveryPhase::Drained;
+                entry.drained = true;
+                entry.drained_at = Some(*drained_at);
             }
             AgentInboxEvent::Deferred {
                 message_id,
                 attempt_id,
-                deferred_at,
-                reason: _,
+                deferred_at: _deferred_at,
+                reason,
                 next_attempt_at,
             } => {
                 let entry =
                     projection_claimed_entry_mut(&mut self.entries, message_id, attempt_id)?;
-                entry.status = AgentDeliveryStatus::Queued;
-                entry.settled_at = Some(*deferred_at);
+                entry.phase = AgentDeliveryPhase::Persisted;
+                entry.outcome = None;
+                entry.drained = false;
+                entry.reason = Some(reason.clone());
+                entry.effect_started_at = None;
+                entry.mailbox_accepted_at = None;
+                entry.drained_at = None;
+                entry.turn_settled_at = None;
                 entry.turn_id = None;
                 entry.next_attempt_at = *next_attempt_at;
             }
-            AgentInboxEvent::Delivered {
+            AgentInboxEvent::TurnSettled {
                 message_id,
                 attempt_id,
-                delivered_at,
+                settled_at,
                 turn_id,
-                reply_message_id,
-            } => {
-                {
-                    let entry =
-                        projection_claimed_entry_mut(&mut self.entries, message_id, attempt_id)?;
-                    entry.status = AgentDeliveryStatus::Delivered;
-                    entry.settled_at = Some(*delivered_at);
-                    entry.turn_id = Some(turn_id.clone());
-                    entry.reply_message_id = reply_message_id.clone();
-                    entry.terminal = true;
-                    entry.next_attempt_at = None;
-                }
-                self.retain_terminal(message_id)?;
-            }
-            AgentInboxEvent::Failed {
-                message_id,
-                attempt_id,
-                failed_at,
-                error,
+                outcome,
+                drained,
+                reason,
                 retryable,
                 next_attempt_at,
+                reply_message_id,
             } => {
-                let terminal = !retryable;
+                let terminal = *drained || !retryable;
                 {
                     let entry =
                         projection_claimed_entry_mut(&mut self.entries, message_id, attempt_id)?;
-                    entry.status = AgentDeliveryStatus::Failed;
-                    entry.settled_at = Some(*failed_at);
-                    entry.error = Some(error.clone());
+                    if *drained != entry.drained {
+                        return Err(format!(
+                            "delivery terminal drain flag changed for {message_id}"
+                        ));
+                    }
+                    if let Some(turn_id) = turn_id
+                        && entry
+                            .turn_id
+                            .as_deref()
+                            .is_some_and(|current| current != turn_id)
+                    {
+                        return Err(format!("delivery terminal turn changed for {message_id}"));
+                    }
+                    entry.phase = AgentDeliveryPhase::TurnSettled;
+                    entry.outcome = Some(*outcome);
+                    entry.reason = reason.clone();
+                    entry.turn_settled_at = Some(*settled_at);
+                    if turn_id.is_some() {
+                        entry.turn_id = turn_id.clone();
+                    }
+                    entry.reply_message_id = reply_message_id.clone();
                     entry.terminal = terminal;
                     entry.next_attempt_at = *next_attempt_at;
                 }
@@ -2562,14 +2707,19 @@ impl FoldedDelivery {
             message_id: message.message_id.clone(),
             target: message.to.clone(),
             message,
-            status: self.status,
-            accepted_at: self.accepted_at,
+            phase: self.phase,
+            outcome: self.outcome,
+            drained: self.drained,
+            reason: self.reason,
+            persisted_at: self.persisted_at,
             attempt_id: self.attempt_id,
             attempt: self.attempt,
-            settled_at: self.settled_at,
+            claimed_at: self.claimed_at,
+            mailbox_accepted_at: self.mailbox_accepted_at,
+            drained_at: self.drained_at,
+            turn_settled_at: self.turn_settled_at,
             turn_id: self.turn_id,
             reply_message_id: self.reply_message_id,
-            error: self.error,
             next_attempt_at: self.next_attempt_at,
         }
     }
@@ -2591,11 +2741,13 @@ fn projection_claimed_entry_mut<'a>(
 ) -> Result<&'a mut FoldedDelivery, String> {
     let entry = projection_entry_mut(entries, message_id)?;
     if !matches!(
-        entry.status,
-        AgentDeliveryStatus::Claimed
-            | AgentDeliveryStatus::InjectionStarted
-            | AgentDeliveryStatus::Injected
-    ) || entry.attempt_id.as_deref() != Some(attempt_id)
+        entry.phase,
+        AgentDeliveryPhase::Claimed
+            | AgentDeliveryPhase::MailboxAccepted
+            | AgentDeliveryPhase::Drained
+            | AgentDeliveryPhase::TurnSettled
+    ) || entry.terminal
+        || entry.attempt_id.as_deref() != Some(attempt_id)
     {
         return Err(format!(
             "delivery event has stale claim {attempt_id} for {message_id}"
@@ -2648,7 +2800,7 @@ mod tests {
         Arc::new(|_| {})
     }
 
-    async fn mark_delivered(
+    async fn mark_completed(
         router: &AgentRouter,
         claim: &AgentDeliveryClaim,
         turn_id: &str,
@@ -2658,11 +2810,23 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         router
-            .injected(claim, turn_id)
+            .mailbox_accepted(claim, turn_id)
             .await
             .map_err(|error| error.to_string())?;
         router
-            .delivered(claim, turn_id, None)
+            .drained(claim, turn_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        router
+            .turn_settled(
+                claim,
+                Some(turn_id.to_string()),
+                AgentDeliveryOutcome::Completed,
+                true,
+                None,
+                false,
+                None,
+            )
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -3041,7 +3205,7 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?
         {
-            mark_delivered(&router, &claim, &claim.message.delivery_turn_id()).await?;
+            mark_completed(&router, &claim, &claim.message.delivery_turn_id()).await?;
             delivered = delivered.saturating_add(1);
         }
         Ok(delivered)
@@ -3144,7 +3308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_message_survives_restart_and_duplicate_retry() -> Result<(), String> {
+    async fn persisted_message_survives_restart_and_duplicate_retry() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let router = AgentRouter::new(temp.path().to_path_buf());
         let mut message = AgentMessage::user_text(None, address(), "question");
@@ -3165,7 +3329,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert!(duplicate.duplicate);
         assert_eq!(duplicate.durability, AgentDeliveryDurability::Unconfirmed);
-        assert_eq!(duplicate.accepted_at, first.accepted_at);
+        assert_eq!(duplicate.persisted_at, first.persisted_at);
         let mut later_retry = message.clone();
         later_retry.created_at += chrono::Duration::seconds(30);
         let later_duplicate = restarted
@@ -3259,9 +3423,9 @@ mod tests {
             SegmentedFileEventJournal::open(&path, INBOX_SEGMENT_BYTES, FileDurability::SyncData)
                 .map_err(|error| error.to_string())?;
         journal
-            .append(AgentInboxEvent::Accepted {
+            .append(AgentInboxEvent::Persisted {
                 message: AgentMessage::user_text(None, target.clone(), "persisted"),
-                accepted_at: Utc::now(),
+                persisted_at: Utc::now(),
             })
             .map_err(|error| error.to_string())?;
         let segment = journal
@@ -3339,7 +3503,7 @@ mod tests {
             .ok_or_else(|| "deferred claim missing".to_string())?;
         assert_eq!(retry.message.message_id, "first");
         assert_eq!(retry.attempt, 2);
-        mark_delivered(&router, &retry, "turn-first").await?;
+        mark_completed(&router, &retry, "turn-first").await?;
         let second_claim = router
             .claim_next(&address())
             .await
@@ -3347,7 +3511,15 @@ mod tests {
             .ok_or_else(|| "second claim missing".to_string())?;
         assert_eq!(second_claim.message, second);
         router
-            .failed(&second_claim, "permanent", false)
+            .turn_settled(
+                &second_claim,
+                None,
+                AgentDeliveryOutcome::Failed,
+                false,
+                Some("permanent".to_string()),
+                false,
+                None,
+            )
             .await
             .map_err(|error| error.to_string())?;
         assert!(
@@ -3363,12 +3535,24 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert_eq!(records.len(), 2);
         assert_eq!(
-            records.first().map(|record| record.status),
-            Some(AgentDeliveryStatus::Delivered)
+            records
+                .first()
+                .map(|record| (record.phase, record.outcome, record.drained)),
+            Some((
+                AgentDeliveryPhase::TurnSettled,
+                Some(AgentDeliveryOutcome::Completed),
+                true,
+            ))
         );
         assert_eq!(
-            records.get(1).map(|record| record.status),
-            Some(AgentDeliveryStatus::Failed)
+            records
+                .get(1)
+                .map(|record| (record.phase, record.outcome, record.drained)),
+            Some((
+                AgentDeliveryPhase::TurnSettled,
+                Some(AgentDeliveryOutcome::Failed),
+                false,
+            ))
         );
         Ok(())
     }
@@ -3399,26 +3583,38 @@ mod tests {
             .ok_or_else(|| "recovered claim missing".to_string())?;
         assert_eq!(recovered.attempt, 2);
         assert!(matches!(
-            restarted.delivered(&abandoned, "stale", None).await,
+            restarted
+                .turn_settled(
+                    &abandoned,
+                    Some("stale".to_string()),
+                    AgentDeliveryOutcome::Completed,
+                    true,
+                    None,
+                    false,
+                    None,
+                )
+                .await,
             Err(AgentRouterError::StaleClaim { .. })
         ));
-        mark_delivered(&restarted, &recovered, "recovered").await?;
+        mark_completed(&restarted, &recovered, "recovered").await?;
         let duplicate = restarted
             .enqueue(recovered.message)
             .await
             .map_err(|error| error.to_string())?;
         assert!(duplicate.duplicate);
-        assert_eq!(duplicate.status, AgentDeliveryStatus::Delivered);
+        assert_eq!(duplicate.phase, AgentDeliveryPhase::TurnSettled);
+        assert_eq!(duplicate.outcome, Some(AgentDeliveryOutcome::Completed));
+        assert!(duplicate.drained);
         Ok(())
     }
 
     #[tokio::test]
-    async fn restart_never_reclaims_an_injected_attempt() -> Result<(), String> {
+    async fn restart_never_reclaims_a_drained_attempt() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let target = address();
         let router = AgentRouter::new(temp.path().to_path_buf());
         let mut message = AgentMessage::user_text(None, target.clone(), "do not replay");
-        message.message_id = "injected-before-restart".to_string();
+        message.message_id = "drained-before-restart".to_string();
         router
             .enqueue(message)
             .await
@@ -3433,7 +3629,11 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         router
-            .injected(&claim, "turn-before-restart")
+            .mailbox_accepted(&claim, "turn-before-restart")
+            .await
+            .map_err(|error| error.to_string())?;
+        router
+            .drained(&claim, "turn-before-restart")
             .await
             .map_err(|error| error.to_string())?;
         drop(router);
@@ -3450,13 +3650,21 @@ mod tests {
             .in_flight_claim(&target)
             .await
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "injected recovery identity missing".to_string())?;
+            .ok_or_else(|| "drained recovery identity missing".to_string())?;
         assert_eq!(recovered.claim.attempt_id, claim.attempt_id);
         assert_eq!(recovered.claim.attempt, claim.attempt);
-        assert_eq!(recovered.status, AgentDeliveryStatus::Injected);
+        assert_eq!(recovered.phase, AgentDeliveryPhase::Drained);
         assert_eq!(recovered.turn_id, "turn-before-restart");
         restarted
-            .failed(&recovered.claim, "outcome indeterminate", false)
+            .turn_settled(
+                &recovered.claim,
+                Some(recovered.turn_id.clone()),
+                AgentDeliveryOutcome::OutcomeUnknown,
+                true,
+                Some("outcome indeterminate".to_string()),
+                false,
+                None,
+            )
             .await
             .map_err(|error| error.to_string())?;
         assert!(
@@ -3472,14 +3680,18 @@ mod tests {
                 .await
                 .map_err(|error| error.to_string())?
                 .first()
-                .map(|record| (record.status, record.attempt)),
-            Some((AgentDeliveryStatus::Failed, 1))
+                .map(|record| (record.phase, record.outcome, record.attempt)),
+            Some((
+                AgentDeliveryPhase::TurnSettled,
+                Some(AgentDeliveryOutcome::OutcomeUnknown),
+                1,
+            ))
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn injection_started_crash_preserves_attempt_and_actual_turn_without_replay()
+    async fn effect_started_crash_preserves_attempt_and_actual_turn_without_replay()
     -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let target = address();
@@ -3515,10 +3727,19 @@ mod tests {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "started recovery missing".to_string())?;
         assert_eq!(in_flight.claim.attempt_id, claim.attempt_id);
-        assert_eq!(in_flight.status, AgentDeliveryStatus::InjectionStarted);
+        assert_eq!(in_flight.phase, AgentDeliveryPhase::Claimed);
+        assert!(in_flight.effect_started);
         assert_eq!(in_flight.turn_id, "actual-active-turn");
         restarted
-            .failed(&in_flight.claim, "outcome unknown", false)
+            .turn_settled(
+                &in_flight.claim,
+                Some(in_flight.turn_id.clone()),
+                AgentDeliveryOutcome::OutcomeUnknown,
+                false,
+                Some("outcome unknown".to_string()),
+                false,
+                None,
+            )
             .await
             .map_err(|error| error.to_string())?;
         let record = restarted
@@ -3528,7 +3749,9 @@ mod tests {
             .into_iter()
             .next()
             .ok_or_else(|| "terminal record missing".to_string())?;
-        assert_eq!(record.status, AgentDeliveryStatus::Failed);
+        assert_eq!(record.phase, AgentDeliveryPhase::TurnSettled);
+        assert_eq!(record.outcome, Some(AgentDeliveryOutcome::OutcomeUnknown));
+        assert!(!record.drained);
         assert_eq!(record.attempt, 1);
         assert_eq!(record.turn_id.as_deref(), Some("actual-active-turn"));
         Ok(())
@@ -3620,9 +3843,9 @@ mod tests {
         let turn_id = format!("scale-turn-{index}");
         let mut message = AgentMessage::user_text(None, target.clone(), text);
         message.message_id = message_id.clone();
-        projection.apply_checked(&AgentInboxEvent::Accepted {
+        projection.apply_checked(&AgentInboxEvent::Persisted {
             message,
-            accepted_at: timestamp,
+            persisted_at: timestamp,
         })?;
         projection.apply_checked(&AgentInboxEvent::Claimed {
             message_id: message_id.clone(),
@@ -3630,23 +3853,34 @@ mod tests {
             attempt: 1,
             claimed_at: timestamp,
         })?;
-        projection.apply_checked(&AgentInboxEvent::InjectionStarted {
+        projection.apply_checked(&AgentInboxEvent::EffectStarted {
             message_id: message_id.clone(),
             attempt_id: attempt_id.clone(),
             started_at: timestamp,
             turn_id: turn_id.clone(),
         })?;
-        projection.apply_checked(&AgentInboxEvent::Injected {
+        projection.apply_checked(&AgentInboxEvent::MailboxAccepted {
             message_id: message_id.clone(),
             attempt_id: attempt_id.clone(),
-            injected_at: timestamp,
+            accepted_at: timestamp,
             turn_id: turn_id.clone(),
         })?;
-        projection.apply_checked(&AgentInboxEvent::Delivered {
+        projection.apply_checked(&AgentInboxEvent::Drained {
+            message_id: message_id.clone(),
+            attempt_id: attempt_id.clone(),
+            drained_at: timestamp,
+            turn_id: turn_id.clone(),
+        })?;
+        projection.apply_checked(&AgentInboxEvent::TurnSettled {
             message_id,
             attempt_id,
-            delivered_at: timestamp,
-            turn_id,
+            settled_at: timestamp,
+            turn_id: Some(turn_id),
+            outcome: AgentDeliveryOutcome::Completed,
+            drained: true,
+            reason: None,
+            retryable: false,
+            next_attempt_at: None,
             reply_message_id: None,
         })
     }
@@ -3786,11 +4020,23 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         router
-            .injected(&claim, "validation-turn")
+            .mailbox_accepted(&claim, "validation-turn")
             .await
             .map_err(|error| error.to_string())?;
         router
-            .delivered(&claim, "validation-turn", None)
+            .drained(&claim, "validation-turn")
+            .await
+            .map_err(|error| error.to_string())?;
+        router
+            .turn_settled(
+                &claim,
+                Some("validation-turn".to_string()),
+                AgentDeliveryOutcome::Completed,
+                true,
+                None,
+                false,
+                None,
+            )
             .await
             .map_err(|error| error.to_string())?;
         let authority = authority_for(temp.path(), &router.inboxes, &target)
@@ -3927,11 +4173,11 @@ mod tests {
                 .await
                 .map_err(|error| error.to_string())?;
             assert_eq!(records.len(), MESSAGES_PER_WORKSPACE);
-            assert!(
-                records
-                    .iter()
-                    .all(|record| record.status == AgentDeliveryStatus::Delivered)
-            );
+            assert!(records.iter().all(|record| {
+                record.phase == AgentDeliveryPhase::TurnSettled
+                    && record.outcome == Some(AgentDeliveryOutcome::Completed)
+                    && record.drained
+            }));
             assert_eq!(
                 records.iter().filter(|record| record.attempt == 2).count(),
                 1
@@ -3943,7 +4189,9 @@ mod tests {
                 .await
                 .map_err(|error| error.to_string())?;
             assert!(duplicate.duplicate);
-            assert_eq!(duplicate.status, AgentDeliveryStatus::Delivered);
+            assert_eq!(duplicate.phase, AgentDeliveryPhase::TurnSettled);
+            assert_eq!(duplicate.outcome, Some(AgentDeliveryOutcome::Completed));
+            assert!(duplicate.drained);
         }
         Ok(())
     }

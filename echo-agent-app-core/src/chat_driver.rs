@@ -26,8 +26,10 @@ pub use echo_agent::runtime::TurnOutcome;
 /// receipt. The observer receives the pending receipt when the driver starts
 /// and waits on its typed Accepted/Drained/TurnSettled states; it does not
 /// inspect output envelopes.
-pub(crate) type InputReceiptObserver = std::sync::Arc<
-    dyn Fn(echo_agent::runtime::TurnInputReceipt) -> BoxFuture<'static, ()> + Send + Sync,
+pub type InputReceiptObserver = std::sync::Arc<
+    dyn Fn(echo_agent::runtime::TurnInputReceipt) -> BoxFuture<'static, Result<(), String>>
+        + Send
+        + Sync,
 >;
 
 use crate::tasks::task_runtime::executor::ExecEvent;
@@ -71,18 +73,8 @@ pub enum ChatDriverEvent {
         goal: String,
         new_message: String,
     },
-    InputQueued {
-        input_id: String,
-        text: String,
-        attachments: Vec<crate::types::AttachmentData>,
-        submitted_at_ms: u64,
-    },
-    InputRemoved {
-        input_id: String,
-    },
-    InputReordered {
-        input_ids: Vec<String>,
-    },
+    /// Typed durable ingress fact folded by the existing ChatEventLog reducer.
+    InputLifecycle(Box<crate::conversation_input::ConversationInputFact>),
     ApprovalRequest {
         request_id: String,
         tool_name: String,
@@ -337,7 +329,7 @@ impl WebhookTurnObserver {
 
     fn finish(self, turn_id: String, terminal: TurnOutcome) -> ChatTurnOutcome {
         let elapsed = self.started.elapsed();
-        if self.completed
+        if self.should_emit_chat_completed(&terminal)
             && let Some(emitter) = self.emitter
         {
             emitter.emit(crate::webhook::WebhookEvent::ChatCompleted {
@@ -358,6 +350,25 @@ impl WebhookTurnObserver {
             final_message_id: self.final_message_id,
         }
     }
+
+    fn should_emit_chat_completed(&self, terminal: &TurnOutcome) -> bool {
+        self.completed && matches!(terminal, TurnOutcome::Completed)
+    }
+}
+
+fn effective_terminal_after_input_observer(
+    framework_terminal: TurnOutcome,
+    observer_result: Result<(), String>,
+) -> TurnOutcome {
+    observer_result.map_or_else(
+        |error| {
+            TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+                "input_observer",
+                format!("input receipt observer failed: {error}"),
+            ))
+        },
+        |_| framework_terminal,
+    )
 }
 
 fn duration_millis(duration: std::time::Duration) -> u64 {
@@ -412,7 +423,7 @@ pub async fn drive_chat_turn(
     drive_chat_turn_with_input_observer(agent, turn, res, binding, None).await
 }
 
-pub(crate) async fn drive_chat_turn_with_input_observer(
+pub async fn drive_chat_turn_with_input_observer(
     agent: &AgentHandle,
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
@@ -1720,15 +1731,20 @@ async fn drive_chat_inner(
             .mode(TurnMode::Execute)
             .cancel(cancel)
             .invocation(invocation);
-        let receipt = if let Some(observer) = input_observer {
+        let (receipt, observer_result) = if let Some(observer) = input_observer {
             let (request, input_receipt) = request.with_input_receipt();
             let driver = AgentTurnDriver.drive(&*guard, request, &eko_sink);
-            let (receipt, ()) = tokio::join!(driver, observer(input_receipt));
-            receipt
+            let (receipt, observer_result) = tokio::join!(driver, observer(input_receipt));
+            (receipt, observer_result)
         } else {
-            AgentTurnDriver.drive(&*guard, request, &eko_sink).await
+            (
+                AgentTurnDriver.drive(&*guard, request, &eko_sink).await,
+                Ok(()),
+            )
         };
-        eko_sink.finish(turn_id, receipt.outcome)
+        let effective_terminal =
+            effective_terminal_after_input_observer(receipt.outcome, observer_result);
+        eko_sink.finish(turn_id, effective_terminal)
     })
     .await
 }
@@ -1774,6 +1790,56 @@ mod tests {
             resources: vec![],
             authorship: crate::prepared_turn::InstructionAuthorship::User,
         }
+    }
+
+    async fn drive_successful_model_with_observer(
+        root_message_id: &str,
+        observer_result: Result<(), String>,
+    ) -> Result<(ChatTurnOutcome, std::sync::Arc<MockChatSink>), String> {
+        let mock = std::sync::Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_model_name("observer-terminal")
+                .with_response("model completed"),
+        );
+        let agent = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("observer-terminal")
+                .llm_client(mock)
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let chat_sink = std::sync::Arc::new(MockChatSink::default());
+        let sink: std::sync::Arc<dyn ChatSink> = chat_sink.clone();
+        let resources = std::sync::Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
+            pool: None,
+            store: None,
+            sink,
+            webhook_emitter: None,
+            conv_id: Some("observer-conversation".to_string()),
+            root_message_id: root_message_id.to_string(),
+            attachments: Vec::new(),
+            cancel: echo_agent::agent::CancellationToken::new(),
+            interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
+            review_integration: None,
+            layer_manager: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let input_observer: InputReceiptObserver = std::sync::Arc::new(move |_receipt| {
+            let result = observer_result.clone();
+            Box::pin(async move { result })
+        });
+        let outcome = drive_chat_turn_with_input_observer(
+            &agent,
+            &make_turn("complete normally"),
+            resources,
+            None,
+            Some(input_observer),
+        )
+        .await?;
+        Ok((outcome, chat_sink))
     }
 
     struct SecondTurnBarrierLlmClient {
@@ -2261,9 +2327,7 @@ mod tests {
                 | ChatDriverEvent::TurnStatus { .. }
                 | ChatDriverEvent::TurnConfiguration { .. }
                 | ChatDriverEvent::Interrupt { .. }
-                | ChatDriverEvent::InputQueued { .. }
-                | ChatDriverEvent::InputRemoved { .. }
-                | ChatDriverEvent::InputReordered { .. }
+                | ChatDriverEvent::InputLifecycle(_)
                 | ChatDriverEvent::ApprovalRequest { .. }
                 | ChatDriverEvent::InputRequest { .. }
                 | ChatDriverEvent::SelectionRequest { .. }
@@ -4405,6 +4469,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_driver_with_failed_input_observer_finishes_once_as_failed()
+    -> Result<(), String> {
+        let (outcome, sink) = drive_successful_model_with_observer(
+            "observer-failed-turn",
+            Err("durable input append failed".to_string()),
+        )
+        .await?;
+
+        assert!(
+            sink.has_final_answer(),
+            "framework driver did not complete successfully"
+        );
+        match &outcome.terminal {
+            TurnOutcome::Failed(failure) => {
+                assert_eq!(failure.code, "input_observer");
+                assert!(failure.message.contains("durable input append failed"));
+            }
+            other => return Err(format!("observer failure finished as {other:?}")),
+        }
+        assert!(outcome.final_answer.is_some());
+        let mut webhook = WebhookTurnObserver::new(None, "observer-terminal".to_string());
+        webhook.completed = true;
+        assert!(!webhook.should_emit_chat_completed(&outcome.terminal));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_input_observer_preserves_completed_driver_outcome() -> Result<(), String> {
+        let (outcome, sink) =
+            drive_successful_model_with_observer("observer-success-turn", Ok(())).await?;
+
+        assert!(sink.has_final_answer());
+        assert_eq!(outcome.terminal, TurnOutcome::Completed);
+        assert_eq!(outcome.final_answer.as_deref(), Some("model completed"));
+        let mut webhook = WebhookTurnObserver::new(None, "observer-terminal".to_string());
+        webhook.completed = true;
+        assert!(webhook.should_emit_chat_completed(&outcome.terminal));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn drive_chat_returns_failed_terminal_after_partial_stream_error() -> Result<(), String> {
         use echo_agent::agent::CancellationToken;
         use echo_agent::llm::types::DeltaMessage;
@@ -4857,6 +4962,7 @@ mod tests {
                 if let Some(sender) = observer_tx.lock().await.take() {
                     let _ = sender.send(());
                 }
+                Ok(())
             })
         });
         let error = drive_chat_turn_with_input_observer(

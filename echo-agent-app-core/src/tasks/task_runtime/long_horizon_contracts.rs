@@ -148,7 +148,7 @@ fn boot_and_inbox_authorities_remain_cancellation_safe_and_bounded() -> Result<(
     )?;
     require(
         APP_AGENT_ROUTER,
-        "AgentDeliveryStatus::InjectionStarted",
+        "AgentDeliveryPhase::Claimed",
         "Agent delivery lost its pre-side-effect durable boundary",
     )?;
     require_absent(
@@ -344,9 +344,9 @@ fn lh5_full_scan_allowlist_is_explicit_and_bounded() -> Result<(), String> {
         + production_completion
             .matches("list_events(run_id, 0)")
             .count();
-    if scans != 7 {
+    if scans != 9 {
         return Err(format!(
-            "LH5 full-scan allowlist changed without review: expected 7, found {scans}"
+            "LH5 full-scan allowlist changed without review: expected 9, found {scans}"
         ));
     }
     let comments = production_store.matches("Audit allowlist:").count()
@@ -565,7 +565,7 @@ fn task_runtime_async_boundaries_keep_file_io_behind_the_bounded_adapter() -> Re
     let tui_dispatch = between(
         APP_TUI_EVENTS,
         "async fn dispatch_turn",
-        "fn run_turn_binding_for_queued_turn",
+        "fn run_turn_binding_for_request",
         "TUI turn-dispatch boundary could not be isolated",
     )?;
     require_absent(
@@ -602,8 +602,8 @@ fn task_runtime_async_boundaries_keep_file_io_behind_the_bounded_adapter() -> Re
     )?;
     require(
         tauri_cancel,
-        "append_chat_projection(",
-        "Tauri cancel orphan projection bypasses bounded product-data I/O",
+        ".wait()",
+        "Tauri cancel no longer waits for the canonical foreground terminal",
     )?;
     let tauri_orphan = between(
         APP_TAURI_CHAT,

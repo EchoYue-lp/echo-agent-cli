@@ -116,19 +116,17 @@ impl Widget for Input {
         f.render_widget(input, text_area);
 
         if footer.height > 0 {
-            let queued = app.queued_turns.front().map_or_else(
+            let queue_len = app.conversation_input_queue_len();
+            let queued = app.next_conversation_input_preview().map_or_else(
                 || "队列 0".to_string(),
-                |turn| {
-                    let preview: String = turn.text.chars().take(24).collect();
-                    format!("队列 {} · next: {}", app.queued_turns.len(), preview)
-                },
+                |preview| format!("队列 {queue_len} · next: {preview}"),
             );
             let footer_line = Line::from(vec![
                 Span::styled("  Enter 发送", Style::default().fg(t.overlay0)),
                 Span::styled("  Shift+Enter 换行", Style::default().fg(t.overlay0)),
                 Span::styled(
                     format!("  {queued}"),
-                    if app.queued_turns.is_empty() {
+                    if queue_len == 0 {
                         Style::default().fg(t.overlay0)
                     } else {
                         Style::default().fg(t.yellow).add_modifier(Modifier::BOLD)

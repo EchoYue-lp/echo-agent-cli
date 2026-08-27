@@ -220,16 +220,15 @@ fn cold_start_and_active_message_boundaries_are_currently_observable() {
         STATE.contains("async fn agent_delivery_cold_starts_target_and_routes_correlated_reply")
     );
     assert!(STATE.contains("live_message.message_id = \"live-steer\""));
-    assert!(STATE.contains("record.status == crate::agent_router::AgentDeliveryStatus::Delivered"));
+    assert!(STATE.contains("record.phase == crate::agent_router::AgentDeliveryPhase::TurnSettled"));
     assert!(
         STATE.contains("assert_eq!(live_record.turn_id.as_deref(), Some(\"active-target-turn\"))")
     );
 
     assert!(SUBAGENT_CONTROL.contains("RuntimeEventKind::SubagentGuidanceQueued"));
-    assert!(SUBAGENT_CONTROL.contains("RuntimeEventKind::SubagentGuidanceDelivered"));
     assert!(SUBAGENT_CONTROL.contains("framework_turn_id"));
-    // Delivered is the current receipt boundary; there is no persisted
-    // followup/wait cursor or completion receipt in this service.
+    // The typed phase/outcome receipt is the current boundary; cursor wait and
+    // model follow-up commands remain later convergence iterations.
     assert!(!SUBAGENT_CONTROL.contains("cursor"));
     assert!(!SUBAGENT_CONTROL.contains("pub async fn wait"));
     assert!(!SUBAGENT_CONTROL.contains("pub async fn followup"));
@@ -238,7 +237,7 @@ fn cold_start_and_active_message_boundaries_are_currently_observable() {
 #[test]
 fn control_receipt_status_is_bounded_to_existing_variants() {
     assert_eq!(SubagentControlStatus::Pending.as_str(), "pending");
-    assert_eq!(SubagentControlStatus::Delivered.as_str(), "delivered");
+    assert_eq!(SubagentControlStatus::Accepted.as_str(), "accepted");
     assert_eq!(SubagentControlStatus::Rejected.as_str(), "rejected");
     assert_eq!(SubagentControlStatus::Settled.as_str(), "settled");
 }

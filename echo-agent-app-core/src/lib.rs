@@ -14,6 +14,7 @@ pub mod config_discovery;
 pub mod config_watcher;
 pub mod context_window;
 pub mod conversation_deletion;
+pub mod conversation_input;
 pub mod conversation_projection;
 pub mod data_root;
 pub mod developer_commands;

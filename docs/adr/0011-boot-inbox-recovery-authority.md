@@ -49,8 +49,8 @@ TaskRuntime 继续以 `events.jsonl` 为事实；AgentRouter 使用 framework se
    唯一 launcher owner。
 3. Running 和已经 Paused 的 TaskRun 都修复 active command cell；没有 TaskRun 的普通 Chat cell
    由 ChatEventLog 恢复为一个 typed Interrupted terminal。Started 在 terminal 前固定 retention。
-4. Agent delivery 在 live steer 或 cold driver 前先提交 `InjectionStarted(actual_turn_id)`；
-   `steer_input_tracked` 到 `Drained` 后才提交 `Injected`。任一 owner-loss 窗口都保留原 attempt，
+4. Agent delivery 在 live steer 或 cold driver 前先提交 `EffectStarted(actual_turn_id)`；
+   framework receipt 到达 Accepted/Drained 后分别提交 `MailboxAccepted`/`Drained`。任一 owner-loss 窗口都保留原 attempt，
    但没有 EKO terminal 时一律 `outcome_unknown` 并禁止自动重放，不能用任意 assistant 文本冒充结果。
 5. Awaiter 先写 Ready，再在 handoff 前写 DeliveryStarted；direct live steer 只在 Drained 后写
    Acknowledged，next-turn prompt projection 因没有 framework tracked drain 而保守写 `outcome_unknown` Ack。Ready、Started、
@@ -75,6 +75,6 @@ TaskRuntime 继续以 `events.jsonl` 为事实；AgentRouter 使用 framework se
 - 不同 target 不再被一个进程级 async mutex 串行。
 - terminal checkpoint、内存占用和显式 records 都受固定窗口约束；完整历史不作为 EKO inbox 的
   长期查询契约。
-- `InjectionStarted` 表示可能开始副作用，`Injected` 表示 framework 已确认进入模型上下文。
+- `EffectStarted` 表示可能开始副作用，`Drained` 表示 framework 已确认进入模型上下文。
 - 已消费但结果不确定的消息需要用户检查后重新发送；这比重复执行本地副作用更安全。
 - GUI、TUI、CLI、JSONL 和 channel 继续共享 app-core authority，不新增 surface 特例。

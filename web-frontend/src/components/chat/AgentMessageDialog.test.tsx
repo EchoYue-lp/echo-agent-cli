@@ -79,8 +79,11 @@ describe('AgentMessageDialog', () => {
           workspace_id: 'target-workspace',
           conversation_id: 'target-conversation',
         },
-        status: 'queued',
-        accepted_at: '2026-08-21T00:00:00Z',
+        phase: 'persisted',
+        outcome: null,
+        drained: false,
+        reason: null,
+        persisted_at: '2026-08-21T00:00:00Z',
         duplicate: false,
         durability: { status: 'confirmed' },
       },
@@ -167,5 +170,58 @@ describe('AgentMessageDialog', () => {
         ],
       })
     );
+  });
+
+  it('renders only canonical delivery phases and typed terminal outcomes', async () => {
+    const base = {
+      message_id: 'message-phase',
+      target: {
+        workspace_id: 'target-workspace',
+        conversation_id: 'target-conversation',
+      },
+      persisted_at: '2026-08-21T00:00:00Z',
+      attempt_id: 'attempt-1',
+      attempt: 1,
+      claimed_at: '2026-08-21T00:00:01Z',
+      mailbox_accepted_at: null,
+      drained_at: null,
+      turn_settled_at: null,
+      turn_id: 'turn-1',
+      reply_message_id: null,
+      next_attempt_at: null,
+      reason: null,
+    };
+    mocks.status.mockResolvedValue({
+      count: 2,
+      records: [
+        {
+          ...base,
+          phase: 'mailbox_accepted',
+          outcome: null,
+          drained: false,
+          mailbox_accepted_at: '2026-08-21T00:00:02Z',
+        },
+        {
+          ...base,
+          message_id: 'message-terminal',
+          phase: 'turn_settled',
+          outcome: 'cancelled',
+          drained: true,
+          mailbox_accepted_at: '2026-08-21T00:00:02Z',
+          drained_at: '2026-08-21T00:00:03Z',
+          turn_settled_at: '2026-08-21T00:00:04Z',
+          reason: 'cancelled by owner',
+        },
+      ],
+    });
+
+    const { findByText, queryByText } = render(<AgentMessageDialog isOpen onClose={vi.fn()} />);
+
+    expect(await findByText('邮箱已接收')).toBeTruthy();
+    expect(await findByText('已取消')).toBeTruthy();
+    expect(await findByText('cancelled by owner')).toBeTruthy();
+    expect(queryByText('注入已开始')).toBeNull();
+    expect(queryByText('已注入当前任务')).toBeNull();
+    expect(queryByText('已送达')).toBeNull();
   });
 });

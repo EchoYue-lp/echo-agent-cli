@@ -12,6 +12,7 @@
 | 多会话 Agent   | `AgentPool` 按 conversation 维护 Agent，忙会话不会被驱逐                      | `echo-agent-app-core/src/agent_pool.rs`         |
 | Channel 会话   | sender-scoped 产品 ID + incarnation Agent/checkpoint/cache ID，reset 保留历史 | `src/cli/channels.rs`                           |
 | 前台 turn 控制 | admission、steer、cancel、settlement 由 app-core 统一拥有                     | `echo-agent-app-core/src/foreground_turn.rs`    |
+| 会话追加输入   | 四个交互 surface 共用 durable frontier、tracked drain 与 exact terminal       | `echo-agent-app-core/src/conversation_input.rs` |
 | 会话历史       | framework `FileConversationStore` 为权威，EKO 只做 workspace 绑定和 UI 投影   | `echo-agent-app-core/src/workspace/runtime.rs`  |
 | 附件与长输入   | 上传文件、长粘贴和超预算文本落到 workspace artifact，再按引用读取             | `echo-agent-app-core/src/attachments.rs`        |
 | 上下文压缩     | summary/sliding/adaptive 策略、手动压缩、usage/context 投影                   | `echo-agent-app-core/src/manual_compression.rs` |

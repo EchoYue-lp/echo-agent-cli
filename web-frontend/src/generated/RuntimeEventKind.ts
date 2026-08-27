@@ -35,7 +35,6 @@ export type RuntimeEventKind =
   | 'subagent_assigned'
   | 'subagent_released'
   | 'subagent_guidance_queued'
-  | 'subagent_guidance_delivered'
   | 'subagent_guidance_mailbox_accepted'
   | 'subagent_guidance_drained'
   | 'subagent_guidance_settled'

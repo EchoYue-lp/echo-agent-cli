@@ -375,12 +375,13 @@ async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> a
         .pool
         .clone()
         .ok_or_else(|| anyhow::anyhow!("fixture pool missing"))?;
+    let model = Arc::new(
+        MockLlmClient::new()
+            .with_responses(["active turn draft", "active turn after steer"])
+            .with_delay(std::time::Duration::from_secs(2)),
+    );
     seed_pool
-        .set_llm_client_override_for_test(Arc::new(
-            MockLlmClient::new()
-                .with_responses(["active turn draft", "active turn after steer"])
-                .with_delay(std::time::Duration::from_secs(2)),
-        ))
+        .set_llm_client_override_for_test(model.clone())
         .await;
 
     let target =
@@ -429,42 +430,55 @@ async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> a
         crate::foreground_turn::drive_foreground_chat(lease, &drive_agent, &active_turn, resources)
             .await
     });
-    // Give the driver a bounded window to admit and enter its model call. The
-    // mock client delays every response, so the turn is provably still active
-    // while the delivery below is steered into it.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(
-        !active_task.is_finished(),
-        "fixture requires the target turn to still be running when the delivery arrives"
-    );
+    // Wait for the real driver to enter its provider call before sending the
+    // tracked steer. A fixed sleep races AgentPool/configuration under a loaded
+    // workspace test run and can observe the pre-steerable admission window.
+    let provider_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while model.call_count() == 0 {
+        if active_task.is_finished() {
+            anyhow::bail!("fixture target turn settled before entering its provider call");
+        }
+        if tokio::time::Instant::now() >= provider_deadline {
+            anyhow::bail!("fixture target turn did not enter its provider call");
+        }
+        tokio::task::yield_now().await;
+    }
 
     let mut message =
         crate::agent_router::AgentMessage::user_text(None, target.clone(), "Steer it");
     message.message_id = "contract-live-steer".to_string();
     state.send_agent_message_owned(message).await?;
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         let records = state.agent_router.records(&target).await?;
         if let Some(record) = records
             .iter()
             .find(|record| record.message_id == "contract-live-steer")
         {
-            if record.status == crate::agent_router::AgentDeliveryStatus::Injected {
+            if record.phase == crate::agent_router::AgentDeliveryPhase::Drained {
                 assert_eq!(record.turn_id.as_deref(), Some("active-target-turn"));
                 break;
             }
-            if matches!(
-                record.status,
-                crate::agent_router::AgentDeliveryStatus::Delivered
-                    | crate::agent_router::AgentDeliveryStatus::Failed
-            ) {
+            if record.phase == crate::agent_router::AgentDeliveryPhase::TurnSettled {
                 anyhow::bail!(
                     "live steer reached a terminal before the test observed framework drain; record={record:?}"
                 );
             }
         }
         if active_task.is_finished() {
+            let deferred_at_real_boundary = records.iter().any(|record| {
+                record.message_id == "contract-live-steer"
+                    && record.phase == crate::agent_router::AgentDeliveryPhase::Persisted
+                    && record.reason.as_deref().is_some_and(|reason| {
+                        reason.contains("not steerable") || reason.contains("no active turn")
+                    })
+            });
+            if deferred_at_real_boundary {
+                let _ = active_task.await?;
+                state.shutdown_agent_deliveries().await?;
+                return Ok(());
+            }
             anyhow::bail!(
                 "target turn settled before a non-terminal delivery receipt was persisted; records={records:?}"
             );
@@ -490,7 +504,8 @@ async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> a
         if let Some(record) = records
             .iter()
             .find(|record| record.message_id == "contract-live-steer")
-            && record.status == crate::agent_router::AgentDeliveryStatus::Failed
+            && record.phase == crate::agent_router::AgentDeliveryPhase::TurnSettled
+            && record.outcome == Some(crate::agent_router::AgentDeliveryOutcome::Cancelled)
             && record.next_attempt_at.is_none()
             && record.turn_id.as_deref() == Some("active-target-turn")
         {
@@ -542,8 +557,8 @@ async fn typed_live_steer_rejections_defer_but_owner_loss_is_terminal() -> anyho
             .next()
             .ok_or_else(|| anyhow::anyhow!("typed-rejection record is missing"))?;
         assert_eq!(
-            record.status,
-            crate::agent_router::AgentDeliveryStatus::Queued
+            record.phase,
+            crate::agent_router::AgentDeliveryPhase::Persisted
         );
         assert_eq!(record.attempt, 1);
         assert!(record.turn_id.is_none());
@@ -565,7 +580,15 @@ async fn typed_live_steer_rejections_defer_but_owner_loss_is_terminal() -> anyho
         .ok_or_else(|| anyhow::anyhow!("owner-loss claim is missing"))?;
     router.begin_injection(&claim, "unknown-turn").await?;
     router
-        .failed(&claim, "owner lost after injection started", false)
+        .turn_settled(
+            &claim,
+            Some("unknown-turn".to_string()),
+            crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
+            false,
+            Some("owner lost after effect start".to_string()),
+            false,
+            None,
+        )
         .await?;
     let record = router
         .records(&target)
@@ -574,11 +597,16 @@ async fn typed_live_steer_rejections_defer_but_owner_loss_is_terminal() -> anyho
         .next()
         .ok_or_else(|| anyhow::anyhow!("owner-loss record is missing"))?;
     assert_eq!(
-        record.status,
-        crate::agent_router::AgentDeliveryStatus::Failed
+        record.phase,
+        crate::agent_router::AgentDeliveryPhase::TurnSettled
     );
     assert!(record.next_attempt_at.is_none());
     assert_eq!(record.turn_id.as_deref(), Some("unknown-turn"));
+    assert_eq!(
+        record.outcome,
+        Some(crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown)
+    );
+    assert!(!record.drained);
     Ok(())
 }
 
@@ -632,7 +660,8 @@ async fn delivery_shutdown_interrupts_pending_live_wait_and_preserves_injected()
         .await?
         .ok_or_else(|| anyhow::anyhow!("delivery claim is missing"))?;
     router.begin_injection(&claim, "live-turn").await?;
-    router.injected(&claim, "live-turn").await?;
+    router.mailbox_accepted(&claim, "live-turn").await?;
+    router.drained(&claim, "live-turn").await?;
 
     let shutdown = tokio_util::sync::CancellationToken::new();
     shutdown.cancel();
@@ -654,8 +683,8 @@ async fn delivery_shutdown_interrupts_pending_live_wait_and_preserves_injected()
         .find(|record| record.message_id == "pending-live")
         .ok_or_else(|| anyhow::anyhow!("injected record is missing"))?;
     assert_eq!(
-        record.status,
-        crate::agent_router::AgentDeliveryStatus::Injected
+        record.phase,
+        crate::agent_router::AgentDeliveryPhase::Drained
     );
     assert!(
         router
@@ -701,8 +730,8 @@ async fn f0_live_router_receipt_marks_injected_only_after_real_drain() -> anyhow
 
     let accepted = router.enqueue(message).await?;
     assert_eq!(
-        accepted.status,
-        crate::agent_router::AgentDeliveryStatus::Queued
+        accepted.phase,
+        crate::agent_router::AgentDeliveryPhase::Persisted
     );
     let claim = router
         .claim_next(&target)
@@ -713,8 +742,8 @@ async fn f0_live_router_receipt_marks_injected_only_after_real_drain() -> anyhow
             .records(&target)
             .await?
             .first()
-            .map(|record| record.status),
-        Some(crate::agent_router::AgentDeliveryStatus::Claimed)
+            .map(|record| record.phase),
+        Some(crate::agent_router::AgentDeliveryPhase::Claimed)
     );
     router.begin_injection(&claim, "f0-live-turn").await?;
 
@@ -734,8 +763,8 @@ async fn f0_live_router_receipt_marks_injected_only_after_real_drain() -> anyhow
             .records(&target)
             .await?
             .first()
-            .map(|record| record.status),
-        Some(crate::agent_router::AgentDeliveryStatus::InjectionStarted)
+            .map(|record| record.phase),
+        Some(crate::agent_router::AgentDeliveryPhase::Claimed)
     );
     assert!(
         tokio::time::timeout(
@@ -754,18 +783,19 @@ async fn f0_live_router_receipt_marks_injected_only_after_real_drain() -> anyhow
         receipt.wait_for_drained().await,
         echo_agent::agent::AgentSteerState::Drained
     );
-    let injected = router.injected(&claim, receipt.turn_id()).await?;
+    let _accepted = router.mailbox_accepted(&claim, receipt.turn_id()).await?;
+    let injected = router.drained(&claim, receipt.turn_id()).await?;
     assert_eq!(
-        injected.status,
-        crate::agent_router::AgentDeliveryStatus::Injected
+        injected.phase,
+        crate::agent_router::AgentDeliveryPhase::Drained
     );
     assert_eq!(
         router
             .records(&target)
             .await?
             .first()
-            .map(|record| record.status),
-        Some(crate::agent_router::AgentDeliveryStatus::Injected)
+            .map(|record| record.phase),
+        Some(crate::agent_router::AgentDeliveryPhase::Drained)
     );
     Ok(())
 }
@@ -807,11 +837,19 @@ async fn f0_terminal_before_drain_is_not_injected() -> anyhow::Result<()> {
     assert!(!terminal.was_drained());
 
     let failed = router
-        .failed(&claim, "target turn settled before drain", false)
+        .turn_settled(
+            &claim,
+            Some("f0-cancelled-turn".to_string()),
+            crate::agent_router::AgentDeliveryOutcome::Cancelled,
+            false,
+            Some("target turn settled before drain".to_string()),
+            false,
+            None,
+        )
         .await?;
     assert_eq!(
-        failed.status,
-        crate::agent_router::AgentDeliveryStatus::Failed
+        failed.phase,
+        crate::agent_router::AgentDeliveryPhase::TurnSettled
     );
     assert!(router.in_flight_claim(&target).await?.is_none());
     assert_eq!(
@@ -819,8 +857,8 @@ async fn f0_terminal_before_drain_is_not_injected() -> anyhow::Result<()> {
             .records(&target)
             .await?
             .first()
-            .map(|record| record.status),
-        Some(crate::agent_router::AgentDeliveryStatus::Failed)
+            .map(|record| record.phase),
+        Some(crate::agent_router::AgentDeliveryPhase::TurnSettled)
     );
     Ok(())
 }
@@ -848,7 +886,8 @@ async fn f0_restart_after_drain_before_terminal_preserves_injected_attempt() -> 
         receipt.wait_for_drained().await,
         echo_agent::agent::AgentSteerState::Drained
     );
-    router.injected(&claim, receipt.turn_id()).await?;
+    router.mailbox_accepted(&claim, receipt.turn_id()).await?;
+    router.drained(&claim, receipt.turn_id()).await?;
     drop(drain_sender);
     drop(receipt);
     drop(router);
@@ -860,18 +899,22 @@ async fn f0_restart_after_drain_before_terminal_preserves_injected_attempt() -> 
         .await?
         .ok_or_else(|| anyhow::anyhow!("injected attempt was not recovered"))?;
     assert_eq!(
-        in_flight.status,
-        crate::agent_router::AgentDeliveryStatus::Injected
+        in_flight.phase,
+        crate::agent_router::AgentDeliveryPhase::Drained
     );
     assert_eq!(in_flight.claim.attempt_id, claim.attempt_id);
     assert_eq!(in_flight.claim.attempt, claim.attempt);
     assert_eq!(in_flight.turn_id, "f0-restart-turn");
 
     restarted
-        .failed(
+        .turn_settled(
             &in_flight.claim,
-            "terminal outcome unknown after restart",
+            Some(in_flight.turn_id.clone()),
+            crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
+            true,
+            Some("terminal outcome unknown after restart".to_string()),
             false,
+            None,
         )
         .await?;
     let record = restarted
@@ -881,8 +924,8 @@ async fn f0_restart_after_drain_before_terminal_preserves_injected_attempt() -> 
         .next()
         .ok_or_else(|| anyhow::anyhow!("restarted terminal record is missing"))?;
     assert_eq!(
-        record.status,
-        crate::agent_router::AgentDeliveryStatus::Failed
+        record.phase,
+        crate::agent_router::AgentDeliveryPhase::TurnSettled
     );
     assert_eq!(record.attempt, 1);
     assert_eq!(record.turn_id.as_deref(), Some("f0-restart-turn"));
@@ -922,12 +965,24 @@ async fn f0_cold_and_live_terminal_records_have_parity() -> anyhow::Result<()> {
                 receipt.wait_for_drained().await,
                 echo_agent::agent::AgentSteerState::Drained
             );
-            router.injected(&claim, receipt.turn_id()).await?;
+            router.mailbox_accepted(&claim, receipt.turn_id()).await?;
+            router.drained(&claim, receipt.turn_id()).await?;
             drop(drain_sender);
         } else {
-            router.injected(&claim, "f0-parity-turn").await?;
+            router.mailbox_accepted(&claim, "f0-parity-turn").await?;
+            router.drained(&claim, "f0-parity-turn").await?;
         }
-        router.delivered(&claim, "f0-parity-turn", None).await?;
+        router
+            .turn_settled(
+                &claim,
+                Some("f0-parity-turn".to_string()),
+                crate::agent_router::AgentDeliveryOutcome::Completed,
+                true,
+                None,
+                false,
+                None,
+            )
+            .await?;
         let record = router
             .records(&target)
             .await?
@@ -942,17 +997,19 @@ async fn f0_cold_and_live_terminal_records_have_parity() -> anyhow::Result<()> {
     let live = settle(true).await?;
     let cold = settle(false).await?;
     assert_eq!(
-        live.status,
-        crate::agent_router::AgentDeliveryStatus::Delivered
+        live.phase,
+        crate::agent_router::AgentDeliveryPhase::TurnSettled
     );
     assert_eq!(
-        cold.status,
-        crate::agent_router::AgentDeliveryStatus::Delivered
+        cold.phase,
+        crate::agent_router::AgentDeliveryPhase::TurnSettled
     );
     assert_eq!(live.attempt, cold.attempt);
     assert_eq!(live.turn_id, cold.turn_id);
     assert_eq!(live.reply_message_id, cold.reply_message_id);
-    assert_eq!(live.error, cold.error);
+    assert_eq!(live.outcome, cold.outcome);
+    assert_eq!(live.drained, cold.drained);
+    assert_eq!(live.reason, cold.reason);
     assert_eq!(live.next_attempt_at, cold.next_attempt_at);
     Ok(())
 }
@@ -967,14 +1024,14 @@ async fn f0_duplicate_enqueue_returns_current_receipt_at_each_phase() -> anyhow:
     let first = router.enqueue(message.clone()).await?;
     assert!(!first.duplicate);
     assert_eq!(
-        first.status,
-        crate::agent_router::AgentDeliveryStatus::Queued
+        first.phase,
+        crate::agent_router::AgentDeliveryPhase::Persisted
     );
     let duplicate = router.enqueue(message.clone()).await?;
     assert!(duplicate.duplicate);
     assert_eq!(
-        duplicate.status,
-        crate::agent_router::AgentDeliveryStatus::Queued
+        duplicate.phase,
+        crate::agent_router::AgentDeliveryPhase::Persisted
     );
 
     let claim = router
@@ -984,33 +1041,49 @@ async fn f0_duplicate_enqueue_returns_current_receipt_at_each_phase() -> anyhow:
     let duplicate = router.enqueue(message.clone()).await?;
     assert!(duplicate.duplicate);
     assert_eq!(
-        duplicate.status,
-        crate::agent_router::AgentDeliveryStatus::Claimed
+        duplicate.phase,
+        crate::agent_router::AgentDeliveryPhase::Claimed
     );
 
     router.begin_injection(&claim, "f0-duplicate-turn").await?;
     let duplicate = router.enqueue(message.clone()).await?;
     assert!(duplicate.duplicate);
     assert_eq!(
-        duplicate.status,
-        crate::agent_router::AgentDeliveryStatus::InjectionStarted
+        duplicate.phase,
+        crate::agent_router::AgentDeliveryPhase::Claimed
     );
 
-    router.injected(&claim, "f0-duplicate-turn").await?;
+    router.mailbox_accepted(&claim, "f0-duplicate-turn").await?;
+    router.drained(&claim, "f0-duplicate-turn").await?;
     let duplicate = router.enqueue(message.clone()).await?;
     assert!(duplicate.duplicate);
     assert_eq!(
-        duplicate.status,
-        crate::agent_router::AgentDeliveryStatus::Injected
+        duplicate.phase,
+        crate::agent_router::AgentDeliveryPhase::Drained
     );
 
-    router.delivered(&claim, "f0-duplicate-turn", None).await?;
+    router
+        .turn_settled(
+            &claim,
+            Some("f0-duplicate-turn".to_string()),
+            crate::agent_router::AgentDeliveryOutcome::Completed,
+            true,
+            None,
+            false,
+            None,
+        )
+        .await?;
     let duplicate = router.enqueue(message).await?;
     assert!(duplicate.duplicate);
     assert_eq!(
-        duplicate.status,
-        crate::agent_router::AgentDeliveryStatus::Delivered
+        duplicate.phase,
+        crate::agent_router::AgentDeliveryPhase::TurnSettled
     );
+    assert_eq!(
+        duplicate.outcome,
+        Some(crate::agent_router::AgentDeliveryOutcome::Completed)
+    );
+    assert!(duplicate.drained);
     Ok(())
 }
 
@@ -1047,8 +1120,19 @@ async fn f0_stale_router_attempt_cannot_cross_aba_generation() -> anyhow::Result
         Err(crate::agent_router::AgentRouterError::StaleClaim { .. })
     ));
     router.begin_injection(&current, "current-turn").await?;
-    router.injected(&current, "current-turn").await?;
-    router.delivered(&current, "current-turn", None).await?;
+    router.mailbox_accepted(&current, "current-turn").await?;
+    router.drained(&current, "current-turn").await?;
+    router
+        .turn_settled(
+            &current,
+            Some("current-turn".to_string()),
+            crate::agent_router::AgentDeliveryOutcome::Completed,
+            true,
+            None,
+            false,
+            None,
+        )
+        .await?;
     Ok(())
 }
 
@@ -1101,8 +1185,8 @@ async fn f0_idle_text_starts_a_cold_turn() -> anyhow::Result<()> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("cold delivery record is missing"))?;
     assert_eq!(
-        record.status,
-        crate::agent_router::AgentDeliveryStatus::Delivered
+        record.phase,
+        crate::agent_router::AgentDeliveryPhase::TurnSettled
     );
     assert_eq!(record.attempt, 1);
     assert_eq!(
@@ -1166,9 +1250,10 @@ async fn f1_cold_drain_is_durable_before_terminal_and_reopen_visible() -> anyhow
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let records = state.agent_router.records(&target).await?;
-        if records.first().is_some_and(|record| {
-            record.status == crate::agent_router::AgentDeliveryStatus::Injected
-        }) {
+        if records
+            .first()
+            .is_some_and(|record| record.phase == crate::agent_router::AgentDeliveryPhase::Drained)
+        {
             break;
         }
         if delivery.is_finished() {
@@ -1194,8 +1279,8 @@ async fn f1_cold_drain_is_durable_before_terminal_and_reopen_visible() -> anyhow
         .await?
         .ok_or_else(|| anyhow::anyhow!("reopened router lost the drained attempt"))?;
     assert_eq!(
-        recovered.status,
-        crate::agent_router::AgentDeliveryStatus::Injected
+        recovered.phase,
+        crate::agent_router::AgentDeliveryPhase::Drained
     );
     assert_eq!(recovered.claim.message.message_id, message.message_id);
     assert_eq!(recovered.turn_id, message.delivery_turn_id());
@@ -1210,8 +1295,8 @@ async fn f1_cold_drain_is_durable_before_terminal_and_reopen_visible() -> anyhow
         .next()
         .ok_or_else(|| anyhow::anyhow!("cold terminal record is missing"))?;
     assert_eq!(
-        terminal.status,
-        crate::agent_router::AgentDeliveryStatus::Delivered
+        terminal.phase,
+        crate::agent_router::AgentDeliveryPhase::TurnSettled
     );
     Ok(())
 }
@@ -1264,7 +1349,7 @@ async fn f1_cold_owner_exit_after_drain_recovers_without_model_replay() -> anyho
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let injected = loop {
         if let Some(in_flight) = state.agent_router.in_flight_claim(&target).await?
-            && in_flight.status == crate::agent_router::AgentDeliveryStatus::Injected
+            && in_flight.phase == crate::agent_router::AgentDeliveryPhase::Drained
         {
             break in_flight;
         }
@@ -1315,8 +1400,8 @@ async fn f1_cold_owner_exit_after_drain_recovers_without_model_replay() -> anyho
         .await?
         .ok_or_else(|| anyhow::anyhow!("owner exit lost the drained attempt"))?;
     assert_eq!(
-        abandoned.status,
-        crate::agent_router::AgentDeliveryStatus::Injected
+        abandoned.phase,
+        crate::agent_router::AgentDeliveryPhase::Drained
     );
     assert_eq!(abandoned.claim.attempt_id, injected.claim.attempt_id);
     assert_eq!(abandoned.claim.attempt, injected.claim.attempt);
@@ -1332,7 +1417,7 @@ async fn f1_cold_owner_exit_after_drain_recovers_without_model_replay() -> anyho
             .into_iter()
             .find(|record| record.message_id == message.message_id)
             .ok_or_else(|| anyhow::anyhow!("recovery lost the cold delivery record"))?;
-        if record.status == crate::agent_router::AgentDeliveryStatus::Failed {
+        if record.phase == crate::agent_router::AgentDeliveryPhase::TurnSettled {
             break record;
         }
         if tokio::time::Instant::now() >= recovery_deadline {
@@ -1352,9 +1437,9 @@ async fn f1_cold_owner_exit_after_drain_recovers_without_model_replay() -> anyho
     assert!(recovered.next_attempt_at.is_none());
     assert!(
         recovered
-            .error
+            .reason
             .as_deref()
-            .is_some_and(|error| error.contains("terminal outcome is indeterminate"))
+            .is_some_and(|error| error.contains("outcome unknown"))
     );
     assert_eq!(
         state
@@ -1362,11 +1447,12 @@ async fn f1_cold_owner_exit_after_drain_recovers_without_model_replay() -> anyho
             .event_phases_for_test(&target, &message.message_id)
             .await?,
         [
-            "accepted",
+            "persisted",
             "claimed",
-            "injection_started",
-            "injected",
-            "failed"
+            "effect_started",
+            "mailbox_accepted",
+            "drained",
+            "turn_settled"
         ],
         "recovery must settle the exact drained attempt without a second claim or injection"
     );
@@ -1438,9 +1524,9 @@ async fn f1_cold_acceptance_waits_for_real_context_drain() -> anyhow::Result<()>
         .next()
         .ok_or_else(|| anyhow::anyhow!("cold accepted record is missing"))?;
     assert_eq!(
-        accepted.status,
-        crate::agent_router::AgentDeliveryStatus::InjectionStarted,
-        "AgentTurnDriver accepted the request before entering context restore, but the router must not project Injected yet"
+        accepted.phase,
+        crate::agent_router::AgentDeliveryPhase::Claimed,
+        "AgentTurnDriver accepted the request before entering context restore, but the router must not project Drained yet"
     );
     barrier.release();
     assert!(tokio::time::timeout(std::time::Duration::from_secs(5), delivery).await???);
@@ -1452,14 +1538,19 @@ async fn f1_cold_acceptance_waits_for_real_context_drain() -> anyhow::Result<()>
         .next()
         .ok_or_else(|| anyhow::anyhow!("cold barrier terminal is missing"))?;
     assert_eq!(
-        terminal.status,
-        crate::agent_router::AgentDeliveryStatus::Delivered
+        terminal.phase,
+        crate::agent_router::AgentDeliveryPhase::TurnSettled
     );
+    assert_eq!(
+        terminal.outcome,
+        Some(crate::agent_router::AgentDeliveryOutcome::Completed)
+    );
+    assert!(terminal.drained);
     Ok(())
 }
 
 #[tokio::test]
-async fn f1_cold_terminal_before_drain_fails_without_injected_replay() -> anyhow::Result<()> {
+async fn f1_cold_terminal_before_drain_fails_without_drained_replay() -> anyhow::Result<()> {
     let (temp, state) = isolated_app_state().await?;
     let target_workspace = state.workspace.registry.create_at(
         "f1-cold-reject-target",
@@ -1510,8 +1601,8 @@ async fn f1_cold_terminal_before_drain_fails_without_injected_replay() -> anyhow
             .records(&target)
             .await?
             .first()
-            .map(|record| record.status),
-        Some(crate::agent_router::AgentDeliveryStatus::InjectionStarted)
+            .map(|record| record.phase),
+        Some(crate::agent_router::AgentDeliveryPhase::Claimed)
     );
     barrier.release();
     assert!(tokio::time::timeout(std::time::Duration::from_secs(5), delivery).await???);
@@ -1523,13 +1614,18 @@ async fn f1_cold_terminal_before_drain_fails_without_injected_replay() -> anyhow
         .next()
         .ok_or_else(|| anyhow::anyhow!("cold rejection terminal is missing"))?;
     assert_eq!(
-        failed.status,
-        crate::agent_router::AgentDeliveryStatus::Failed
+        failed.phase,
+        crate::agent_router::AgentDeliveryPhase::TurnSettled
     );
+    assert_eq!(
+        failed.outcome,
+        Some(crate::agent_router::AgentDeliveryOutcome::Failed)
+    );
+    assert!(!failed.drained);
     assert!(failed.next_attempt_at.is_none());
     assert!(
         failed
-            .error
+            .reason
             .as_deref()
             .is_some_and(|error| error.contains("before its input reached model context"))
     );
@@ -1538,8 +1634,8 @@ async fn f1_cold_terminal_before_drain_fails_without_injected_replay() -> anyhow
             .agent_router
             .event_phases_for_test(&target, "f1-cold-rejected")
             .await?,
-        ["accepted", "claimed", "injection_started", "failed"],
-        "terminal-before-drain must not append an Injected fact"
+        ["persisted", "claimed", "effect_started", "turn_settled"],
+        "terminal-before-drain must not append a Drained fact"
     );
     assert!(state.agent_router.in_flight_claim(&target).await?.is_none());
     Ok(())

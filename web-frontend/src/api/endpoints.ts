@@ -1922,13 +1922,19 @@ export interface AgentEndpoint {
   updated_at: string;
 }
 
-export type AgentDeliveryStatus =
-  | 'queued'
+export type AgentDeliveryPhase =
+  | 'persisted'
   | 'claimed'
-  | 'injection_started'
-  | 'injected'
-  | 'delivered'
-  | 'failed';
+  | 'mailbox_accepted'
+  | 'drained'
+  | 'turn_settled';
+
+export type AgentDeliveryOutcome =
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'dropped'
+  | 'outcome_unknown';
 
 export type AgentDeliveryDurability =
   | { status: 'unconfirmed' }
@@ -1938,8 +1944,11 @@ export type AgentDeliveryDurability =
 export interface AgentDeliveryReceipt {
   message_id: string;
   target: AgentAddress;
-  status: AgentDeliveryStatus;
-  accepted_at: string;
+  phase: AgentDeliveryPhase;
+  outcome: AgentDeliveryOutcome | null;
+  drained: boolean;
+  reason: string | null;
+  persisted_at: string;
   duplicate: boolean;
   durability: AgentDeliveryDurability;
 }
@@ -1947,14 +1956,19 @@ export interface AgentDeliveryReceipt {
 export interface AgentDeliveryRecord {
   message_id: string;
   target: AgentAddress;
-  status: AgentDeliveryStatus;
-  accepted_at: string;
+  phase: AgentDeliveryPhase;
+  outcome: AgentDeliveryOutcome | null;
+  drained: boolean;
+  reason: string | null;
+  persisted_at: string;
   attempt_id: string | null;
   attempt: number;
-  settled_at: string | null;
+  claimed_at: string | null;
+  mailbox_accepted_at: string | null;
+  drained_at: string | null;
+  turn_settled_at: string | null;
   turn_id: string | null;
   reply_message_id: string | null;
-  error: string | null;
   next_attempt_at: string | null;
 }
 

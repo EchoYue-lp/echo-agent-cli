@@ -1323,6 +1323,36 @@ fn cold_delivery_outcome_detail(
     }
 }
 
+fn agent_delivery_outcome(
+    outcome: &crate::chat_driver::TurnOutcome,
+) -> crate::agent_router::AgentDeliveryOutcome {
+    match outcome {
+        crate::chat_driver::TurnOutcome::Completed => {
+            crate::agent_router::AgentDeliveryOutcome::Completed
+        }
+        crate::chat_driver::TurnOutcome::Cancelled => {
+            crate::agent_router::AgentDeliveryOutcome::Cancelled
+        }
+        crate::chat_driver::TurnOutcome::Failed(_) => {
+            crate::agent_router::AgentDeliveryOutcome::Failed
+        }
+    }
+}
+
+fn agent_delivery_reason(outcome: &crate::chat_driver::TurnOutcome) -> Option<String> {
+    match outcome {
+        crate::chat_driver::TurnOutcome::Completed => None,
+        crate::chat_driver::TurnOutcome::Cancelled => Some("turn was cancelled".to_string()),
+        crate::chat_driver::TurnOutcome::Failed(failure) => {
+            Some(format!("{}: {}", failure.code, failure.message))
+        }
+    }
+}
+
+fn agent_delivery_unknown_reason(detail: impl Into<String>) -> Option<String> {
+    Some(format!("outcome unknown: {}", detail.into()))
+}
+
 fn is_explicit_live_steer_rejection(error: &echo_agent::agent::TurnSteerError) -> bool {
     matches!(
         error,
@@ -1397,6 +1427,13 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Construct the stateless conversation-input adapter over the currently
+    /// bound ChatEventLog authority. Tests and workspace transitions may
+    /// replace that authority, so the service is intentionally not cached.
+    pub fn conversation_inputs(&self) -> crate::conversation_input::ConversationInputService {
+        crate::conversation_input::ConversationInputService::new(self.storage.chat_events.clone())
+    }
+
     pub fn workspace_transition_in_progress(&self) -> bool {
         self.workspace
             .transitioning
@@ -2355,6 +2392,27 @@ impl AppState {
             Err(error) => report.failed_scopes.push(format!(
                 "ordinary Chat command-cell recovery owner: {error}"
             )),
+        }
+
+        let chat_events = Arc::clone(&self.storage.chat_events);
+        match self
+            .session
+            .product_data_io
+            .run("reconcile conversation inputs at boot", move || {
+                chat_events.reconcile_conversation_inputs_at_boot()
+            })
+            .await
+        {
+            Ok(Ok(recovered)) if recovered > 0 => {
+                tracing::info!(recovered, "conversation inputs reconciled at boot");
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => report
+                .failed_scopes
+                .push(format!("conversation inputs: {error}")),
+            Err(error) => report
+                .failed_scopes
+                .push(format!("conversation input recovery owner: {error}")),
         }
 
         let global_runtime = self.global_chat_runtime();
@@ -3774,12 +3832,16 @@ impl AppState {
         let Some(in_flight) = self.agent_router.in_flight_claim(target).await? else {
             return Ok(false);
         };
-        if in_flight.status == crate::agent_router::AgentDeliveryStatus::InjectionStarted {
+        if !in_flight.effect_started {
             self.agent_router
-                .failed(
+                .turn_settled(
                     &in_flight.claim,
-                    "Agent delivery injection started before owner loss; mailbox acceptance is unknown and automatic replay is blocked",
+                    Some(in_flight.turn_id.clone()),
+                    crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
                     false,
+                    agent_delivery_unknown_reason("effect started state was not durably observed"),
+                    false,
+                    None,
                 )
                 .await?;
             return Ok(true);
@@ -3789,10 +3851,16 @@ impl AppState {
             .find(|snapshot| snapshot.active_turn_id == in_flight.turn_id);
         let Some(snapshot) = exact else {
             self.agent_router
-                .failed(
+                .turn_settled(
                     &in_flight.claim,
-                    "Agent delivery side effect started before owner loss; terminal outcome is indeterminate and automatic replay is blocked",
+                    Some(in_flight.turn_id),
+                    crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
+                    in_flight.phase == crate::agent_router::AgentDeliveryPhase::Drained,
+                    agent_delivery_unknown_reason(
+                        "Agent delivery side effect started before owner loss; automatic replay is blocked",
+                    ),
                     false,
+                    None,
                 )
                 .await?;
             return Ok(true);
@@ -3818,33 +3886,55 @@ impl AppState {
                 if !in_flight.claim.message.expects_reply() =>
             {
                 self.agent_router
-                    .delivered(&in_flight.claim, in_flight.turn_id, None)
+                    .turn_settled(
+                        &in_flight.claim,
+                        Some(in_flight.turn_id),
+                        crate::agent_router::AgentDeliveryOutcome::Completed,
+                        true,
+                        None,
+                        false,
+                        None,
+                    )
                     .await?;
             }
             crate::chat_driver::TurnOutcome::Completed => {
                 self.agent_router
-                    .failed(
+                    .turn_settled(
                         &in_flight.claim,
-                        "Agent delivery turn completed after owner loss, but no delivery-owned reply terminal was available",
+                        Some(in_flight.turn_id),
+                        crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
+                        true,
+                        agent_delivery_unknown_reason(
+                            "turn completed after owner loss without a delivery-owned reply terminal",
+                        ),
                         false,
+                        None,
                     )
                     .await?;
             }
             crate::chat_driver::TurnOutcome::Cancelled => {
                 self.agent_router
-                    .failed(
+                    .turn_settled(
                         &in_flight.claim,
-                        "Agent delivery target turn was cancelled after injection",
+                        Some(in_flight.turn_id),
+                        crate::agent_router::AgentDeliveryOutcome::Cancelled,
+                        true,
+                        Some("target turn was cancelled after injection".to_string()),
                         false,
+                        None,
                     )
                     .await?;
             }
             crate::chat_driver::TurnOutcome::Failed(failure) => {
                 self.agent_router
-                    .failed(
+                    .turn_settled(
                         &in_flight.claim,
-                        format!("{}: {}", failure.code, failure.message),
+                        Some(in_flight.turn_id),
+                        crate::agent_router::AgentDeliveryOutcome::Failed,
+                        true,
+                        Some(format!("{}: {}", failure.code, failure.message)),
                         false,
+                        None,
                     )
                     .await?;
             }
@@ -3922,52 +4012,97 @@ impl AppState {
             .await
         {
             Ok(mut receipt) => {
+                let turn_id = receipt.turn_id().to_string();
+                self.agent_router
+                    .mailbox_accepted(&claim, turn_id.clone())
+                    .await?;
                 let drained = tokio::select! {
-                    _ = shutdown.cancelled() => return Ok(true),
+                    _ = shutdown.cancelled() => {
+                        let reason = agent_delivery_unknown_reason("delivery shutdown while waiting for model-context drain");
+                        self.agent_router
+                            .turn_settled(
+                                &claim,
+                                Some(turn_id.clone()),
+                                crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
+                                false,
+                                reason,
+                                false,
+                                None,
+                            )
+                            .await?;
+                        return Ok(true);
+                    }
                     state = receipt.wait_for_drained() => state,
                 };
                 if !drained.was_drained() {
+                    let outcome = match drained {
+                        echo_agent::agent::AgentSteerState::TurnSettled { outcome, .. } => {
+                            match outcome {
+                                echo_agent::agent::AgentSteerTurnOutcome::Completed => {
+                                    crate::agent_router::AgentDeliveryOutcome::Completed
+                                }
+                                echo_agent::agent::AgentSteerTurnOutcome::Cancelled => {
+                                    crate::agent_router::AgentDeliveryOutcome::Cancelled
+                                }
+                                echo_agent::agent::AgentSteerTurnOutcome::Failed => {
+                                    crate::agent_router::AgentDeliveryOutcome::Failed
+                                }
+                                echo_agent::agent::AgentSteerTurnOutcome::Dropped => {
+                                    crate::agent_router::AgentDeliveryOutcome::Dropped
+                                }
+                            }
+                        }
+                        _ => crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
+                    };
                     self.agent_router
-                        .failed(
+                        .turn_settled(
                             &claim,
-                            "live Agent delivery mailbox did not confirm consumption before the target turn settled; automatic replay is blocked",
+                            Some(turn_id.clone()),
+                            outcome,
                             false,
+                            agent_delivery_unknown_reason(
+                                "live Agent delivery mailbox did not confirm consumption before the target turn settled",
+                            ),
+                            false,
+                            None,
                         )
                         .await?;
                     return Ok(true);
                 }
-                let turn_id = receipt.turn_id().to_string();
-                self.agent_router.injected(&claim, turn_id.clone()).await?;
+                self.agent_router.drained(&claim, turn_id.clone()).await?;
                 let Some(settlement) =
                     wait_for_live_delivery_or_shutdown(shutdown, waiter.wait()).await
                 else {
+                    self.agent_router
+                        .turn_settled(
+                            &claim,
+                            Some(turn_id.clone()),
+                            crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
+                            true,
+                            agent_delivery_unknown_reason(
+                                "delivery shutdown while waiting for target turn settlement",
+                            ),
+                            false,
+                            None,
+                        )
+                        .await?;
                     return Ok(true);
                 };
-                let settlement = settlement
-                    .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
-                match settlement.outcome {
-                    crate::chat_driver::TurnOutcome::Completed => {
-                        self.agent_router.delivered(&claim, turn_id, None).await?;
-                    }
-                    crate::chat_driver::TurnOutcome::Cancelled => {
-                        self.agent_router
-                            .failed(
-                                &claim,
-                                "live Agent delivery target turn was cancelled",
-                                false,
-                            )
-                            .await?;
-                    }
-                    crate::chat_driver::TurnOutcome::Failed(failure) => {
-                        self.agent_router
-                            .failed(
-                                &claim,
-                                format!("{}: {}", failure.code, failure.message),
-                                false,
-                            )
-                            .await?;
-                    }
-                }
+                let settlement =
+                    settlement.map_err(|error| AgentMessageSendError::Workspace(error.to_string()));
+                let (outcome, reason) = match settlement {
+                    Ok(settlement) => (
+                        agent_delivery_outcome(&settlement.outcome),
+                        agent_delivery_reason(&settlement.outcome),
+                    ),
+                    Err(error) => (
+                        crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
+                        agent_delivery_unknown_reason(error.to_string()),
+                    ),
+                };
+                self.agent_router
+                    .turn_settled(&claim, None, outcome, true, reason, false, None)
+                    .await?;
                 Ok(true)
             }
             Err(error) if is_explicit_live_steer_rejection(&error) => {
@@ -3976,7 +4111,15 @@ impl AppState {
             }
             Err(error) => {
                 self.agent_router
-                    .failed(&claim, error.to_string(), false)
+                    .turn_settled(
+                        &claim,
+                        None,
+                        crate::agent_router::AgentDeliveryOutcome::Failed,
+                        false,
+                        Some(error.to_string()),
+                        false,
+                        None,
+                    )
                     .await?;
                 Ok(true)
             }
@@ -4017,19 +4160,36 @@ impl AppState {
             Err(error) => return Err(AgentMessageSendError::Conversation(error.to_string())),
         };
         if shutdown.is_cancelled() {
+            let _settled = self
+                .agent_router
+                .turn_settled(
+                    &claim,
+                    Some(root_turn_id.clone()),
+                    crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
+                    false,
+                    agent_delivery_unknown_reason("shutdown before cold delivery effect admission"),
+                    false,
+                    None,
+                )
+                .await?;
             drop(lease);
-            return Ok(false);
+            return Ok(true);
         }
         let instruction = render_agent_delivery_instruction(&claim.message);
         let execution = match runtime.agent_for(&target.conversation_id).await {
             Ok(execution) => execution,
             Err(error) => {
                 let detail = format!("AgentPool admission failed: {error}");
-                lease.settle(crate::chat_driver::TurnOutcome::Failed(
-                    echo_agent::error::AgentFailure::message("agent_pool", detail.clone()),
-                ));
                 self.agent_router
-                    .failed(&claim, detail, claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS)
+                    .turn_settled(
+                        &claim,
+                        Some(root_turn_id.clone()),
+                        crate::agent_router::AgentDeliveryOutcome::Failed,
+                        false,
+                        Some(detail),
+                        claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS,
+                        None,
+                    )
                     .await?;
                 return Ok(true);
             }
@@ -4049,10 +4209,17 @@ impl AppState {
             Ok(turn) => turn,
             Err(error) => {
                 let detail = format!("Agent message preparation failed: {error}");
-                lease.settle(crate::chat_driver::TurnOutcome::Failed(
-                    echo_agent::error::AgentFailure::message("prepared_turn", detail.clone()),
-                ));
-                self.agent_router.failed(&claim, detail, false).await?;
+                self.agent_router
+                    .turn_settled(
+                        &claim,
+                        Some(root_turn_id.clone()),
+                        crate::agent_router::AgentDeliveryOutcome::Failed,
+                        false,
+                        Some(detail),
+                        false,
+                        None,
+                    )
+                    .await?;
                 return Ok(true);
             }
         };
@@ -4107,39 +4274,40 @@ impl AppState {
                         ))
                     } else {
                         let accepted = receipt.wait_for_accepted().await;
-                        let drained = match accepted {
+                        let drained_state = match accepted {
+                            echo_agent::runtime::TurnInputState::Accepted => {
+                                receipt.wait_for_drained().await
+                            }
+                            state => state,
+                        };
+                        match drained_state {
                             echo_agent::runtime::TurnInputState::Drained
                             | echo_agent::runtime::TurnInputState::TurnSettled {
                                 drained: true,
                                 ..
-                            } => true,
-                            echo_agent::runtime::TurnInputState::Accepted => matches!(
-                                receipt.wait_for_drained().await,
-                                echo_agent::runtime::TurnInputState::Drained
-                                    | echo_agent::runtime::TurnInputState::TurnSettled {
-                                        drained: true,
-                                        ..
-                                    }
-                            ),
+                            } => {
+                                router
+                                    .mailbox_accepted(&claim, expected_turn_id.clone())
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                                router
+                                    .drained(&claim, expected_turn_id.clone())
+                                    .await
+                                    .map(|_| true)
+                                    .map_err(|error| error.to_string())
+                            }
                             echo_agent::runtime::TurnInputState::Pending
+                            | echo_agent::runtime::TurnInputState::Accepted
                             | echo_agent::runtime::TurnInputState::TurnSettled {
                                 drained: false,
                                 ..
-                            } => false,
-                        };
-                        if drained {
-                            router
-                                .injected(&claim, expected_turn_id)
-                                .await
-                                .map(|_| true)
-                                .map_err(|error| error.to_string())
-                        } else {
-                            Ok(false)
+                            } => Ok(false),
                         }
                     };
                     if let Some(sender) = observation_tx.lock().await.take() {
                         let _ = sender.send(observation);
                     }
+                    Ok(())
                 })
             },
         );
@@ -4168,12 +4336,16 @@ impl AppState {
             Err(error) => {
                 let outcome_detail = cold_delivery_outcome_detail(&outcome);
                 self.agent_router
-                    .failed(
+                    .turn_settled(
                         &claim,
-                        format!(
-                            "cold Agent delivery receipt projection failed: {error}; {outcome_detail}"
-                        ),
+                        Some(root_turn_id.clone()),
+                        crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
                         false,
+                        agent_delivery_unknown_reason(format!(
+                            "cold Agent delivery receipt projection failed: {error}; {outcome_detail}"
+                        )),
+                        false,
+                        None,
                     )
                     .await?;
                 return Ok(true);
@@ -4182,12 +4354,26 @@ impl AppState {
         if !input_drained {
             let outcome_detail = cold_delivery_outcome_detail(&outcome);
             self.agent_router
-                .failed(
+                .turn_settled(
                     &claim,
-                    format!(
-                        "cold Agent delivery turn settled before its input reached model context; {outcome_detail}"
-                    ),
+                    Some(root_turn_id.clone()),
+                    match &outcome {
+                        Ok(crate::chat_driver::TurnOutcome::Cancelled) => {
+                            crate::agent_router::AgentDeliveryOutcome::Cancelled
+                        }
+                        Ok(crate::chat_driver::TurnOutcome::Failed(_)) => {
+                            crate::agent_router::AgentDeliveryOutcome::Failed
+                        }
+                        Ok(crate::chat_driver::TurnOutcome::Completed) | Err(_) => {
+                            crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown
+                        }
+                    },
                     false,
+                    agent_delivery_unknown_reason(format!(
+                        "cold Agent delivery turn settled before its input reached model context; {outcome_detail}"
+                    )),
+                    false,
+                    None,
                 )
                 .await?;
             return Ok(true);
@@ -4199,31 +4385,71 @@ impl AppState {
                     .await;
                 if claim.message.expects_reply() && reply_message_id.is_none() {
                     self.agent_router
-                        .failed(
+                        .turn_settled(
                             &claim,
-                            "Agent delivery completed without a durable correlated reply",
+                            Some(root_turn_id.clone()),
+                            crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
+                            true,
+                            agent_delivery_unknown_reason(
+                                "Agent delivery completed without a durable correlated reply",
+                            ),
                             false,
+                            None,
                         )
                         .await?;
                 } else {
                     self.agent_router
-                        .delivered(&claim, root_turn_id, reply_message_id)
+                        .turn_settled(
+                            &claim,
+                            Some(root_turn_id.clone()),
+                            crate::agent_router::AgentDeliveryOutcome::Completed,
+                            true,
+                            None,
+                            false,
+                            reply_message_id,
+                        )
                         .await?;
                 }
             }
             Ok(crate::chat_driver::TurnOutcome::Failed(failure)) => {
                 let detail = format!("{}: {}", failure.code, failure.message);
-                self.agent_router.failed(&claim, detail, false).await?;
+                self.agent_router
+                    .turn_settled(
+                        &claim,
+                        Some(root_turn_id.clone()),
+                        crate::agent_router::AgentDeliveryOutcome::Failed,
+                        true,
+                        Some(detail),
+                        false,
+                        None,
+                    )
+                    .await?;
             }
             Ok(crate::chat_driver::TurnOutcome::Cancelled) => {
-                if !shutdown.is_cancelled() {
-                    self.agent_router
-                        .failed(&claim, "Agent delivery turn was cancelled", false)
-                        .await?;
-                }
+                self.agent_router
+                    .turn_settled(
+                        &claim,
+                        Some(root_turn_id.clone()),
+                        crate::agent_router::AgentDeliveryOutcome::Cancelled,
+                        true,
+                        Some("Agent delivery turn was cancelled".to_string()),
+                        false,
+                        None,
+                    )
+                    .await?;
             }
             Err(error) => {
-                self.agent_router.failed(&claim, error, false).await?;
+                self.agent_router
+                    .turn_settled(
+                        &claim,
+                        Some(root_turn_id),
+                        crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
+                        true,
+                        agent_delivery_unknown_reason(error),
+                        false,
+                        None,
+                    )
+                    .await?;
             }
         }
         Ok(true)
@@ -4719,9 +4945,16 @@ impl AppState {
             Ok(execution) => execution,
             Err(error) => {
                 let error = StructuredExtractionError::AgentPool(error.to_string());
-                foreground.settle(crate::chat_driver::TurnOutcome::Failed(
-                    echo_agent::error::AgentFailure::message(error.code(), error.to_string()),
-                ));
+                let settlement = foreground
+                    .settle_after_observers(crate::chat_driver::TurnOutcome::Failed(
+                        echo_agent::error::AgentFailure::message(error.code(), error.to_string()),
+                    ))
+                    .await;
+                if let Err(settlement_error) = settlement {
+                    return Err(StructuredExtractionError::Admission(format!(
+                        "{error}; foreground settlement failed: {settlement_error}"
+                    )));
+                }
                 return Err(error);
             }
         };
@@ -4731,13 +4964,18 @@ impl AppState {
             .extract(&execution.agent(), request)
             .await;
         drop(execution);
-        match &result {
-            Ok(_) => foreground.settle(crate::chat_driver::TurnOutcome::Completed),
-            Err(error) => foreground.settle(crate::chat_driver::TurnOutcome::Failed(
+        let outcome = match &result {
+            Ok(_) => crate::chat_driver::TurnOutcome::Completed,
+            Err(error) => crate::chat_driver::TurnOutcome::Failed(
                 echo_agent::error::AgentFailure::message(error.code(), error.to_string()),
-            )),
+            ),
         };
-        result
+        match foreground.settle_after_observers(outcome).await {
+            Ok(_) => result,
+            Err(settlement_error) => Err(StructuredExtractionError::Admission(format!(
+                "structured extraction foreground settlement failed: {settlement_error}"
+            ))),
+        }
     }
 
     /// Parse and execute the shared `/extract` contract for terminal and
@@ -7353,8 +7591,8 @@ mod workspace_transition_tests {
             .await
             .map_err(|error| error.to_string())?;
         assert_eq!(
-            receipt.status,
-            crate::agent_router::AgentDeliveryStatus::Queued
+            receipt.phase,
+            crate::agent_router::AgentDeliveryPhase::Persisted
         );
         assert_eq!(
             state
@@ -7500,7 +7738,9 @@ mod workspace_transition_tests {
                 .into_iter()
                 .find(|record| {
                     record.message_id == message.message_id
-                        && record.status == crate::agent_router::AgentDeliveryStatus::Delivered
+                        && record.phase == crate::agent_router::AgentDeliveryPhase::TurnSettled
+                        && record.outcome
+                            == Some(crate::agent_router::AgentDeliveryOutcome::Completed)
                 });
             if let Some(record) = record {
                 break record;
@@ -7536,7 +7776,9 @@ mod workspace_transition_tests {
                 .into_iter()
                 .find(|record| {
                     record.message_id == reply_id
-                        && record.status == crate::agent_router::AgentDeliveryStatus::Delivered
+                        && record.phase == crate::agent_router::AgentDeliveryPhase::TurnSettled
+                        && record.outcome
+                            == Some(crate::agent_router::AgentDeliveryOutcome::Completed)
                 });
             if let Some(record) = record {
                 break record;
@@ -7648,8 +7890,12 @@ mod workspace_transition_tests {
             .find(|record| record.message_id == crash_message.message_id)
             .ok_or_else(|| "crash-window delivery record missing".to_string())?;
         assert_eq!(
-            recovered_record.status,
-            crate::agent_router::AgentDeliveryStatus::Failed
+            recovered_record.phase,
+            crate::agent_router::AgentDeliveryPhase::TurnSettled
+        );
+        assert_eq!(
+            recovered_record.outcome,
+            Some(crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown)
         );
         assert_eq!(recovered_record.attempt, 1);
         assert_eq!(
@@ -7761,7 +8007,9 @@ mod workspace_transition_tests {
                 .into_iter()
                 .find(|record| {
                     record.message_id == "live-steer"
-                        && record.status == crate::agent_router::AgentDeliveryStatus::Delivered
+                        && record.phase == crate::agent_router::AgentDeliveryPhase::TurnSettled
+                        && record.outcome
+                            == Some(crate::agent_router::AgentDeliveryOutcome::Completed)
                 });
             if let Some(record) = record {
                 break record;
@@ -7822,7 +8070,7 @@ mod workspace_transition_tests {
                 .into_iter()
                 .any(|record| {
                     record.message_id == "busy-fifo"
-                        && record.status == crate::agent_router::AgentDeliveryStatus::Queued
+                        && record.phase == crate::agent_router::AgentDeliveryPhase::Persisted
                         && record.attempt > 0
                 });
             if deferred {
@@ -7851,7 +8099,9 @@ mod workspace_transition_tests {
                 .into_iter()
                 .find(|record| {
                     record.message_id == "busy-fifo"
-                        && record.status == crate::agent_router::AgentDeliveryStatus::Delivered
+                        && record.phase == crate::agent_router::AgentDeliveryPhase::TurnSettled
+                        && record.outcome
+                            == Some(crate::agent_router::AgentDeliveryOutcome::Completed)
                 });
             if let Some(record) = record {
                 break record;

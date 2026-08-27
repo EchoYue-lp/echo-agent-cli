@@ -48,8 +48,8 @@ manual/delete/analysis/research/CommandCell/workspace flow 持 cloneable shared 
 token 完成 provider/transform 后的 blocking safe point。phase two 等这些 flow 与 nested I/O 全部归零，
 并聚合 caller 不再等待时留下的 durable failure debt。
 
-Agent delivery 的 live settlement wait 必须同时监听 supervisor cancel。取消后 `Injected` 保持
-非终态并留给下次启动恢复，不能伪造 `Delivered`。delivery driver 使用 RAII 清理 active target；
+Agent delivery 的 live settlement wait 必须同时监听 supervisor cancel。取消后已 `Drained` 的输入
+保持非重放并由 owner 或 boot 写入 typed `TurnSettled`。delivery driver 使用 RAII 清理 active target；
 panic/cancel 的 join failure 通过 Tokio task ID 关联 target 后进入聚合回执。active/dirty owner 带
 generation；旧 driver 的延迟 Drop 不能清理新 owner，dirty driver 异常退出会通过 durable inbox
 既有 wake path 重启。

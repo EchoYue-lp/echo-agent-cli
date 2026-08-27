@@ -8,7 +8,7 @@
  */
 
 import { useChatStore } from '../stores/chatStore';
-import type { AgentEvent, ChatEvent, ChatEventEnvelope, ChatRunStatus } from '../types/api';
+import type { AgentEvent, ChatEvent, ChatEventEnvelope } from '../types/api';
 
 interface EventContext {
   assistantIdRef: React.MutableRefObject<string | null>;
@@ -16,6 +16,7 @@ interface EventContext {
   currentMessageIdRef: React.MutableRefObject<string | null>;
   isCancelledRef: React.MutableRefObject<boolean>;
   currentThinkingIdRef: React.MutableRefObject<string | null>;
+  onInputLifecycle?: (workspaceId: string, conversationId: string) => void;
 }
 
 export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventContext): void {
@@ -26,9 +27,7 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
       break;
     }
     case 'turn_status': {
-      const terminalStatus = turnTerminalStatus(payload.event.status);
       handleChatEvent({ type: 'run_status', status: payload.event.status }, ctx);
-      if (terminalStatus) handleChatEvent({ type: 'done' }, ctx);
       break;
     }
     case 'execution_path':
@@ -37,10 +36,10 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
     case 'interrupt':
       handleChatEvent({ type: 'interrupt_prompt', ...payload.event }, ctx);
       break;
-    case 'input_queued':
-    case 'input_removed':
-    case 'input_reordered':
-      // Queue projection is hydrated and mutated by useTauriChat.
+    case 'input_lifecycle':
+      if (envelope.conversation_id) {
+        ctx.onInputLifecycle?.(envelope.workspace_id, envelope.conversation_id);
+      }
       break;
     case 'approval_request':
       handleChatEvent({ type: 'approval_request', ...payload.event }, ctx);
@@ -101,12 +100,6 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
     default:
       assertNever(payload, 'chat driver event');
   }
-}
-
-function turnTerminalStatus(
-  status: ChatRunStatus
-): Extract<ChatRunStatus, 'completed' | 'failed' | 'cancelled'> | null {
-  return status === 'completed' || status === 'failed' || status === 'cancelled' ? status : null;
 }
 
 function handleAgentEvent(event: AgentEvent, ctx: EventContext): void {
@@ -333,6 +326,7 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
             assertNever(event.status, 'chat run status');
         }
       }
+      if (terminal) settleTurnProjection(store, ctx);
       break;
     }
     case 'notice': {
@@ -356,20 +350,17 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
       // duplicate dialog.
       break;
     }
-    case 'done': {
-      store.clearHitlRequests();
-      if (ctx.assistantIdRef.current) {
-        store.settleAssistantMessage(ctx.assistantIdRef.current);
-      }
-      ctx.assistantIdRef.current = null;
-      ctx.currentMessageKeyRef.current = null;
-      ctx.currentMessageIdRef.current = null;
-      ctx.isCancelledRef.current = false;
-      // Also close any thinking segment
-      if (ctx.currentThinkingIdRef.current) {
-        ctx.currentThinkingIdRef.current = null;
-      }
-      break;
-    }
   }
+}
+
+function settleTurnProjection(store: ReturnType<typeof useChatStore.getState>, ctx: EventContext) {
+  store.clearHitlRequests();
+  if (ctx.assistantIdRef.current) {
+    store.settleAssistantMessage(ctx.assistantIdRef.current);
+  }
+  ctx.assistantIdRef.current = null;
+  ctx.currentMessageKeyRef.current = null;
+  ctx.currentMessageIdRef.current = null;
+  ctx.isCancelledRef.current = false;
+  ctx.currentThinkingIdRef.current = null;
 }

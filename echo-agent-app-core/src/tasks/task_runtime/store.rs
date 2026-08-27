@@ -5332,6 +5332,7 @@ impl TaskRuntimeStore {
                 recovered = recovered.saturating_add(1);
             }
         }
+        super::subagent_control::reconcile_subagent_guidance_at_boot(self)?;
         Ok(recovered)
     }
 
@@ -6843,26 +6844,40 @@ impl TaskRuntimeStore {
             usage,
             dispatch_hook,
         } = record;
-        let summary = result.map(|value| bounded_event_text(&value.summary, 2_000));
-        self.commit_runtime_event(RuntimeJournalEvent::for_append(
-            run_id,
-            Some(task_id),
-            Some(execution_id),
-            RuntimeEventKind::SubagentReleased,
-            serde_json::json!({
-                "execution_id": execution_id,
-                "agent_name": agent_name,
-                "title": task_subject,
-                "plan_revision": plan_revision,
-                "attempt": attempt,
-                "status": status,
-                "summary": summary,
-                "result": result,
-                "full_output": full_output,
-                "usage": usage,
-                "dispatch_hook": dispatch_hook,
-            }),
-        ))
+        self.with_run_lock(run_id, || {
+            let summary = result.map(|value| bounded_event_text(&value.summary, 2_000));
+            let mut events = vec![RuntimeJournalEvent::for_append(
+                run_id,
+                Some(task_id),
+                Some(execution_id),
+                RuntimeEventKind::SubagentReleased,
+                serde_json::json!({
+                    "execution_id": execution_id,
+                    "agent_name": agent_name,
+                    "title": task_subject,
+                    "plan_revision": plan_revision,
+                    "attempt": attempt,
+                    "status": status,
+                    "summary": summary,
+                    "result": result,
+                    "full_output": full_output,
+                    "usage": usage,
+                    "dispatch_hook": dispatch_hook,
+                }),
+            )];
+            events.extend(
+                super::subagent_control::control_settlements_for_subagent_release(
+                    self,
+                    run_id,
+                    task_id,
+                    execution_id,
+                    plan_revision,
+                    attempt,
+                    status,
+                )?,
+            );
+            self.commit_runtime_events(run_id, events).map(|_| ())
+        })
     }
 
     /// Persist a tool dispatch before execution. Raw arguments are deliberately
@@ -11568,7 +11583,7 @@ mod tests {
             .read_run_state("r1")
             .map_err(|error| StoreError::InvalidPlan(error.to_string()))?
             .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?;
-        assert_eq!(stale_projection.run.status, TaskRunStatus::Running);
+        assert_eq!(stale_projection.run.status, TaskRunStatus::Paused);
         assert_eq!(
             store
                 .get_run("r1")?

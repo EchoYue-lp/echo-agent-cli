@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use echo_agent_app_core::agent_router::{
-    AgentAddress, AgentDeliveryRecord, AgentDeliveryStatus, AgentGroupMember, AgentMessage,
+    AgentAddress, AgentDeliveryRecord, AgentGroupMember, AgentMessage,
 };
 use echo_agent_app_core::state::AppState;
 use echo_agent_app_core::workspace::WorkspaceId;
@@ -230,26 +230,24 @@ fn format_delivery_records(records: Vec<AgentDeliveryRecord>, message_id: Option
     matching
         .into_iter()
         .map(|record| {
-            let status = match record.status {
-                AgentDeliveryStatus::Queued => "queued",
-                AgentDeliveryStatus::Claimed => "claimed",
-                AgentDeliveryStatus::InjectionStarted => "injection_started",
-                AgentDeliveryStatus::Injected => "injected",
-                AgentDeliveryStatus::Delivered => "delivered",
-                AgentDeliveryStatus::Failed => "failed",
-            };
             let mut details = vec![format!(
-                "{}  {}  attempt {}",
-                record.message_id, status, record.attempt
+                "{}  {}  attempt {}  drained {}",
+                record.message_id,
+                record.phase.as_str(),
+                record.attempt,
+                record.drained
             )];
+            if let Some(outcome) = record.outcome {
+                details.push(format!("outcome {}", outcome.as_str()));
+            }
             if let Some(turn_id) = record.turn_id {
                 details.push(format!("turn {turn_id}"));
             }
             if let Some(reply_message_id) = record.reply_message_id {
                 details.push(format!("reply {reply_message_id}"));
             }
-            if let Some(error) = record.error {
-                details.push(format!("error {error}"));
+            if let Some(reason) = record.reason {
+                details.push(format!("reason {reason}"));
             }
             details.join("  ")
         })
@@ -367,28 +365,42 @@ mod tests {
     use chrono::Utc;
 
     #[test]
-    fn delivery_projection_filters_and_renders_terminal_metadata() {
+    fn delivery_projection_filters_and_renders_canonical_terminal_metadata() -> Result<(), String> {
         let target = AgentAddress::new(WorkspaceId::from_raw("target".to_string()), "conv");
         let message = AgentMessage::user_text(None, target.clone(), "hello");
         let message_id = message.message_id.clone();
-        let records = vec![AgentDeliveryRecord {
-            message,
-            message_id: message_id.clone(),
-            target,
-            status: AgentDeliveryStatus::Delivered,
-            accepted_at: Utc::now(),
-            attempt_id: Some("attempt-1".to_string()),
-            attempt: 1,
-            settled_at: Some(Utc::now()),
-            turn_id: Some("turn-1".to_string()),
-            reply_message_id: Some("reply-1".to_string()),
-            error: None,
-            next_attempt_at: None,
-        }];
+        let timestamp = Utc::now();
+        let record: AgentDeliveryRecord = serde_json::from_value(serde_json::json!({
+            "message": message,
+            "message_id": message_id.clone(),
+            "target": target,
+            "phase": "turn_settled",
+            "outcome": "completed",
+            "drained": true,
+            "reason": null,
+            "persisted_at": timestamp,
+            "attempt_id": "attempt-1",
+            "attempt": 1,
+            "claimed_at": timestamp,
+            "mailbox_accepted_at": timestamp,
+            "drained_at": timestamp,
+            "turn_settled_at": timestamp,
+            "turn_id": "turn-1",
+            "reply_message_id": "reply-1",
+            "next_attempt_at": null
+        }))
+        .map_err(|error| format!("canonical Agent delivery fixture is invalid: {error}"))?;
+        let records = vec![record];
         let rendered = format_delivery_records(records, Some(&message_id));
-        assert!(rendered.contains("delivered"));
+        assert!(rendered.contains("turn_settled"));
+        assert!(rendered.contains("outcome completed"));
+        assert!(rendered.contains("drained true"));
         assert!(rendered.contains("turn turn-1"));
         assert!(rendered.contains("reply reply-1"));
+        for legacy in ["injection_started", "injected", "delivered"] {
+            assert!(!rendered.contains(legacy));
+        }
+        Ok(())
     }
 
     #[test]

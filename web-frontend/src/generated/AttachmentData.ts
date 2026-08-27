@@ -8,6 +8,6 @@ export type AttachmentData = {
    * Base64 编码的文件内容
    */
   data: string;
-  size: bigint;
+  size: number;
   source: AttachmentSource;
 };

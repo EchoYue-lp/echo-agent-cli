@@ -11,15 +11,20 @@ use echo_agent_app_core::chat_driver::ChatSink;
 use echo_agent_app_core::chat_event_log::{
     ChatEventEnvelope, ChatEventLog, ChatSurface, bind_surface_chat_sink,
 };
+#[cfg(test)]
+use echo_agent_app_core::conversation_input::ConversationInputPhase;
+use echo_agent_app_core::conversation_input::{
+    ConversationInputAddress, ConversationInputAttempt, ConversationInputIdentity,
+    ConversationInputProjection, ConversationInputReceipt, ConversationInputSource,
+    stable_scoped_input_id,
+};
 use echo_agent_app_core::tasks::task_runtime::executor::{ExecEvent, ExecEventScope};
 use echo_agent_app_core::tool_execution::{ToolExecutionRepository, ToolExecutionSummary};
 use echo_agent_app_core::tool_execution_projection::{
     ToolExecutionProjectionKind, ToolExecutionProjectionUpdate, ToolExecutionProjector,
 };
-use echo_agent_app_core::types::{
-    ChatSteerKind, ChatSteerOutcome, ChatSteerPhase, ChatSteerReceipt,
-};
 use futures::future::BoxFuture;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use tauri::Emitter;
@@ -32,6 +37,104 @@ pub(crate) fn emit_chat_envelope(app: &tauri::AppHandle, envelope: &ChatEventEnv
         return false;
     }
     true
+}
+
+fn conversation_input_address(
+    workspace_id: &str,
+    conversation_id: &str,
+) -> ConversationInputAddress {
+    ConversationInputAddress {
+        workspace_id: workspace_id.to_string(),
+        conversation_id: conversation_id.to_string(),
+    }
+}
+
+fn conversation_input_attempt(
+    projection: &ConversationInputProjection,
+) -> Result<ConversationInputAttempt, IpcError> {
+    let receipt = &projection.receipt;
+    let attempt = projection.active_attempt.clone().ok_or_else(|| {
+        IpcError::Internal("conversation input active attempt is missing".to_string())
+    })?;
+    if attempt.identity != receipt.identity
+        || receipt.attempt != Some(attempt.attempt)
+        || receipt.attempt_id.as_deref() != Some(attempt.attempt_id.as_str())
+        || receipt.turn_id.as_deref() != Some(attempt.turn_id.as_str())
+    {
+        return Err(IpcError::Internal(
+            "conversation input active attempt does not match its receipt".to_string(),
+        ));
+    }
+    Ok(attempt)
+}
+
+fn emit_conversation_input_lifecycle_after(
+    app: &tauri::AppHandle,
+    log: &ChatEventLog,
+    address: &ConversationInputAddress,
+    after_cursor: u64,
+) -> Result<(), IpcError> {
+    let replay = log
+        .replay(
+            &address.workspace_id,
+            Some(&address.conversation_id),
+            &address.conversation_id,
+            after_cursor,
+        )
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let mut failed = 0usize;
+    for envelope in replay.events {
+        if matches!(&envelope.payload, ChatDriverEvent::InputLifecycle(_))
+            && !emit_chat_envelope(app, &envelope)
+        {
+            failed = failed.saturating_add(1);
+        }
+    }
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(IpcError::Internal(format!(
+            "failed to emit {failed} durable conversation input event(s)"
+        )))
+    }
+}
+
+fn record_gui_transport_debt(operation: &'static str, error: impl std::fmt::Display) {
+    tracing::error!(%error, operation, "GUI transport debt recorded after durable commit");
+}
+
+fn emit_gui_turn_status(sink: &Arc<dyn ChatSink>, status: &str) -> bool {
+    let delivered = sink.on_event(ChatDriverEvent::TurnStatus {
+        status: status.to_string(),
+    });
+    if !delivered {
+        record_gui_transport_debt("turn_status", format!("failed to emit {status}"));
+    }
+    delivered
+}
+
+async fn settle_gui_input_attempt(
+    service: &echo_agent_app_core::conversation_input::ConversationInputService,
+    attempt: &ConversationInputAttempt,
+    outcome: &echo_agent_app_core::chat_driver::TurnOutcome,
+) -> Result<u64, String> {
+    let receipt = service
+        .settle_attempt(attempt, outcome)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(receipt.queue_revision.saturating_sub(1))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendChatMessageRequest {
+    workspace_id: String,
+    message: String,
+    conversation_id: Option<String>,
+    message_key: Option<String>,
+    attachments: Option<Vec<echo_agent_app_core::types::AttachmentData>>,
+    input_identity: Option<ConversationInputIdentity>,
+    expected_queue_revision: Option<u64>,
 }
 
 pub(crate) struct ExecutionEventProjection<'a> {
@@ -383,17 +486,83 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
 pub async fn send_chat_message(
     state: tauri::State<'_, TauriState>,
     app: tauri::AppHandle,
-    workspace_id: String,
-    message: String,
-    conversation_id: Option<String>,
-    message_key: Option<String>,
-    attachments: Option<Vec<echo_agent_app_core::types::AttachmentData>>,
+    request: SendChatMessageRequest,
 ) -> Result<serde_json::Value, IpcError> {
+    let SendChatMessageRequest {
+        workspace_id,
+        message,
+        conversation_id,
+        message_key,
+        attachments,
+        input_identity,
+        expected_queue_revision,
+    } = request;
+    let conversation_id = conversation_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| IpcError::Validation("conversation_id is required".to_string()))?;
     let scoped_runtime = state
         .app_state
         .chat_runtime_for_scope(&workspace_id)
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let message_key = message_key.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let address = conversation_input_address(&workspace_id, &conversation_id);
+    let input_service = state.app_state.conversation_inputs();
+    let frontier_before = input_service
+        .list(&address)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let (input_identity, input_frontier) = if let Some(identity) = input_identity {
+        if identity.address != address {
+            return Err(IpcError::Validation(
+                "queued input belongs to another conversation".to_string(),
+            ));
+        }
+        let expected = expected_queue_revision.ok_or_else(|| {
+            IpcError::Validation("expected_queue_revision is required".to_string())
+        })?;
+        if frontier_before.queue_revision != expected {
+            return Ok(serde_json::json!({
+                "kind": "queued",
+                "workspace_id": workspace_id,
+                "conversation_id": conversation_id,
+                "input_id": identity.input_id,
+            }));
+        }
+        (identity, frontier_before)
+    } else {
+        let input_id = stable_scoped_input_id(&address, ConversationInputSource::Gui, &message_key)
+            .map_err(|error| IpcError::Validation(error.to_string()))?;
+        let receipt = input_service
+            .submit(
+                address.clone(),
+                input_id,
+                message,
+                attachments.unwrap_or_default(),
+            )
+            .await
+            .map_err(|error| IpcError::Validation(error.to_string()))?;
+        if let Err(error) = emit_conversation_input_lifecycle_after(
+            &app,
+            state.app_state.storage.chat_events.as_ref(),
+            &address,
+            frontier_before.queue_revision,
+        ) {
+            record_gui_transport_debt("persisted_input_lifecycle", error);
+        }
+        let frontier = input_service
+            .list(&address)
+            .await
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        (receipt.identity, frontier)
+    };
+    let queued_input = input_frontier
+        .items
+        .iter()
+        .find(|item| item.receipt.identity == input_identity)
+        .cloned()
+        .ok_or_else(|| IpcError::Validation("queued input is no longer pending".to_string()))?;
+    let dispatch_queue_revision = input_frontier.queue_revision;
     let ws_root = scoped_runtime.execution_scope().root().to_path_buf();
     // ── Persist attachments + build multimodal message (if any) ──────────
     // The frontend base64-encodes uploads; we write them to a per-workspace
@@ -402,7 +571,7 @@ pub async fn send_chat_message(
     // resources). Attachments are persisted first, then converted to refs; the
     // turn's to_message() rebuilds the multimodal Message from disk (the refs
     // path), so the in-memory `build_message` helper is no longer used here.
-    let saved_attachments = attachments.unwrap_or_default();
+    let saved_attachments = queued_input.payload.attachments.clone();
     let (attachment_refs, mut staged_attachment_batch): (
         Vec<echo_agent_app_core::attachments::AttachmentRef>,
         Option<echo_agent_app_core::attachments::StagedAttachmentBatch>,
@@ -434,12 +603,11 @@ pub async fn send_chat_message(
         );
     }
 
-    let message_key = message_key.unwrap_or_else(|| Uuid::new_v4().to_string());
     let sink = tauri_chat_sink(
         app.clone(),
         workspace_id.clone(),
         message_key.clone(),
-        conversation_id.clone(),
+        Some(conversation_id.clone()),
         state.app_state.storage.tool_executions.clone(),
         state.app_state.storage.chat_events.clone(),
     );
@@ -449,10 +617,8 @@ pub async fn send_chat_message(
     // run, do NOT start a new one. Instead, emit an InterruptPrompt event
     // so the GUI can ask the user what to do (resume / edit-and-resume /
     // abandon).
-    let in_progress_run = if let (Some(conv_id), Some(store)) =
-        (conversation_id.as_ref(), scoped_runtime.task_runtime())
-    {
-        let conv_id = conv_id.clone();
+    let in_progress_run = if let Some(store) = scoped_runtime.task_runtime() {
+        let conv_id = conversation_id.clone();
         echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
             .run_store("load GUI in-progress TaskRun", move |store| {
                 store.find_in_progress_run_by_conversation(&conv_id)
@@ -471,22 +637,10 @@ pub async fn send_chat_message(
         )
     {
         let conv_id = existing.conversation_id.clone();
-        let queued = state
-            .app_state
-            .storage
-            .chat_events
-            .enqueue_chat_input(
-                &workspace_id,
-                &conv_id,
-                &message_key,
-                message.clone(),
-                saved_attachments.clone(),
-            )
-            .map_err(|error| IpcError::Internal(error.to_string()))?;
         if !sink.on_event(ChatDriverEvent::Interrupt {
             run_id: existing.run_id.clone(),
             goal: existing.goal.clone(),
-            new_message: message.clone(),
+            new_message: queued_input.payload.text.clone(),
         }) {
             return Err(IpcError::Internal(
                 "failed to persist the interrupt prompt".to_string(),
@@ -499,16 +653,14 @@ pub async fn send_chat_message(
             "run_id": existing.run_id,
             "run_status": existing.status.as_str(),
             "goal": existing.goal,
-            "new_message": message,
+            "new_message": queued_input.payload.text,
             "message_key": message_key,
-            "input_id": queued.input_id,
+            "input_id": input_identity.input_id,
         }));
     }
 
-    let active_turn_key = conversation_id
-        .clone()
-        .unwrap_or_else(|| format!("message:{message_key}"));
-    let foreground_lease = scoped_runtime
+    let active_turn_key = conversation_id.clone();
+    let foreground_lease = match scoped_runtime
         .begin_turn(
             &state.app_state.session.foreground_turns,
             echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
@@ -516,33 +668,30 @@ pub async fn send_chat_message(
             message_key.clone(),
         )
         .await
-        .map_err(|error| match &error {
-            echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
-                echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy {
-                    active_turn_id,
-                    ..
-                },
-            ) => IpcError::Validation(format!("chat_turn_busy:{active_turn_id}")),
-            other => IpcError::Validation(other.to_string()),
-        })?;
+    {
+        Ok(lease) => lease,
+        Err(echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+            echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy { .. },
+        )) => {
+            return Ok(serde_json::json!({
+                "kind": "queued",
+                "workspace_id": workspace_id,
+                "conversation_id": conversation_id,
+                "input_id": input_identity.input_id,
+            }));
+        }
+        Err(error) => return Err(IpcError::Validation(error.to_string())),
+    };
     let cancel_token = foreground_lease.cancellation_token();
 
     // Foreground admission must precede pool admission. Retain the pool
     // receipt in the spawned turn until the shared driver and HITL reset have
     // both settled, so workspace publication cannot race an issued handle.
-    let pool_execution = match conversation_id.as_deref() {
-        Some(conversation_id) => Some(
-            scoped_runtime
-                .agent_for(conversation_id)
-                .await
-                .map_err(|error| IpcError::Validation(error.to_string()))?,
-        ),
-        None => None,
-    };
-    let agent_handle = pool_execution
-        .as_ref()
-        .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
-        .unwrap_or_else(|| scoped_runtime.primary_agent());
+    let pool_execution = scoped_runtime
+        .agent_for(&conversation_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let agent_handle = pool_execution.agent();
 
     // Ensure stable cache_user_id for KVCache isolation (DeepSeek requires this
     // for prompt cache reuse across requests; without it, cache hit rate drops
@@ -597,12 +746,6 @@ pub async fn send_chat_message(
     // (normal reply AND any complex runs the agent autonomously spins up via
     // create_complex_task) through the single shared `drive_chat` entry. The
     // agent decides complexity itself (Phase B3) — no code route pre-judgment.
-    // Signal the chat-turn lifecycle so the GUI shows the spinner / terminal
-    // badge. Ordinary chat turns are not TaskRuntime runs.
-    let _ = sink.on_event(ChatDriverEvent::TurnStatus {
-        status: "running".to_string(),
-    });
-
     let agent_handle_clone = agent_handle.clone();
     // Build the prepared turn (instruction + input resources, with long pastes
     // spilled to user-input artifacts). Replaces the old
@@ -611,28 +754,30 @@ pub async fn send_chat_message(
         echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(&ws_root));
     let prepared_turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
         echo_agent_app_core::prepared_turn::UserTurnInput {
-            text: &message,
+            text: &queued_input.payload.text,
             attachments: &attachment_refs,
             spill_dir: &spill_dir,
-            conversation_id: conversation_id.as_deref(),
+            conversation_id: Some(&conversation_id),
             turn_id: Some(&message_key),
         },
     ) {
         Ok(turn) => turn,
         Err(e) => {
             tracing::warn!(error = %e, "failed to prepare user turn");
-            foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                echo_agent::error::AgentFailure::message("prepared_turn", e.to_string()),
-            ));
-            let _ = sink.on_event(ChatDriverEvent::TurnStatus {
-                status: "failed".to_string(),
-            });
+            let settlement_error = foreground_lease
+                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message("prepared_turn", e.to_string()),
+                ))
+                .await
+                .err();
             let cleanup = staged_attachment_batch
                 .take()
                 .and_then(|batch| batch.rollback().err());
-            let cleanup_suffix = cleanup
-                .map(|error| format!("; staged attachment cleanup failed: {error}"))
-                .unwrap_or_default();
+            let cleanup_suffix = settlement_error
+                .map(|error| format!("; foreground settlement failed: {error}"))
+                .into_iter()
+                .chain(cleanup.map(|error| format!("; staged attachment cleanup failed: {error}")))
+                .collect::<String>();
             return Err(IpcError::Validation(format!(
                 "failed to prepare user turn: {e}{cleanup_suffix}"
             )));
@@ -655,34 +800,134 @@ pub async fn send_chat_message(
         memory_generation: None,
         human_loop_provider: Some(hitl_handler),
     });
+    let started_input = match input_service
+        .dispatch_selected(input_identity, dispatch_queue_revision, message_key.clone())
+        .await
+    {
+        Ok(started) => started,
+        Err(error) => {
+            let settlement_error = foreground_lease
+                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled)
+                .await
+                .err();
+            browser_approval_registration.close().await;
+            let prepared_cleanup = prepared_turn.cleanup_resources(&spill_dir).err();
+            let staged_cleanup = staged_attachment_batch
+                .take()
+                .and_then(|batch| batch.rollback().err());
+            let suffix = prepared_cleanup
+                .map(|cleanup| format!("; prepared artifact cleanup failed: {cleanup}"))
+                .into_iter()
+                .chain(
+                    staged_cleanup
+                        .map(|cleanup| format!("; staged attachment cleanup failed: {cleanup}")),
+                )
+                .chain(
+                    settlement_error
+                        .map(|settlement| format!("; foreground settlement failed: {settlement}")),
+                )
+                .collect::<String>();
+            return Err(IpcError::Validation(format!("{error}{suffix}")));
+        }
+    };
+    if let Err(error) = emit_conversation_input_lifecycle_after(
+        &app,
+        state.app_state.storage.chat_events.as_ref(),
+        &address,
+        dispatch_queue_revision,
+    ) {
+        record_gui_transport_debt("attempt_started_lifecycle", error);
+    }
+    let input_attempt = conversation_input_attempt(&started_input)?;
+    let observer_service = input_service.clone();
+    let observer_attempt = input_attempt.clone();
+    let observer_address = address.clone();
+    let observer_app = app.clone();
+    let observer_log = state.app_state.storage.chat_events.clone();
+    let observer_after_cursor = started_input.receipt.queue_revision;
+    let input_observer: echo_agent_app_core::chat_driver::InputReceiptObserver =
+        Arc::new(move |receipt| {
+            let service = observer_service.clone();
+            let attempt = observer_attempt.clone();
+            let address = observer_address.clone();
+            let app = observer_app.clone();
+            let log = observer_log.clone();
+            Box::pin(async move {
+                let observed = service
+                    .observe_turn_input_through_drain(attempt, receipt)
+                    .await
+                    .map_err(|error| error.to_string());
+                if let Err(error) = emit_conversation_input_lifecycle_after(
+                    &app,
+                    log.as_ref(),
+                    &address,
+                    observer_after_cursor,
+                ) {
+                    record_gui_transport_debt("initial_input_lifecycle", error);
+                }
+                observed.map(|_| ())
+            })
+        });
+    // The durable attempt exists before the visible running projection.
+    let _ = emit_gui_turn_status(&sink, "running");
     if let Some(batch) = staged_attachment_batch.take() {
         batch.commit();
     }
+    let terminal_service = input_service.clone();
+    let terminal_address = address.clone();
+    let terminal_attempt = input_attempt;
+    let durable_app = app.clone();
+    let durable_log = state.app_state.storage.chat_events.clone();
     tokio::spawn(async move {
         let start = std::time::Instant::now();
         // The prepared turn carries instruction + inline resources (images /
         // files re-read from disk via refs). Background runs created by
         // create_complex_task pick up attachments via ChatResources.attachments
         // (already bound above).
-        let outcome = echo_agent_app_core::foreground_turn::drive_foreground_chat(
+        let outcome = echo_agent_app_core::foreground_turn::drive_foreground_chat_with_ingress(
             foreground_lease,
             &agent_handle_clone,
             &prepared_turn,
             res,
+            input_observer,
+            move |outcome| {
+                let service = terminal_service.clone();
+                let address = terminal_address.clone();
+                let attempt = terminal_attempt.clone();
+                let app = durable_app.clone();
+                let log = durable_log.clone();
+                async move {
+                    let after_cursor =
+                        settle_gui_input_attempt(&service, &attempt, &outcome).await?;
+                    if let Err(error) = emit_conversation_input_lifecycle_after(
+                        &app,
+                        log.as_ref(),
+                        &address,
+                        after_cursor,
+                    ) {
+                        record_gui_transport_debt("terminal_input_lifecycle", error);
+                    }
+                    Ok(())
+                }
+            },
         )
         .await;
         let terminal_status = match &outcome {
-            Ok(outcome) => outcome.status(),
-            Err(_) => "failed",
+            Ok(terminal_outcome) => {
+                let status = terminal_outcome.status();
+                // `drive_foreground_chat_with_ingress` publishes an outcome only
+                // after exact durable input settlement and lease release.
+                let _ = emit_gui_turn_status(&sink, status);
+                status
+            }
+            Err(error) => {
+                tracing::error!(%error, "GUI foreground terminal remains durable debt");
+                "settlement_debt"
+            }
         };
-        if let Err(e) = &outcome {
-            tracing::warn!(error = %e, "drive_chat chat turn errored");
+        if let Err(error) = &outcome {
+            tracing::warn!(%error, "drive_chat chat turn errored");
         }
-        // Release all execution ownership before emitting Done. The frontend
-        // may immediately dispatch the next queued turn when it receives it.
-        let _ = sink.on_event(ChatDriverEvent::TurnStatus {
-            status: terminal_status.to_string(),
-        });
         agent_handle_clone
             .write_async(|agent| {
                 Box::pin(async move {
@@ -700,35 +945,12 @@ pub async fn send_chat_message(
         );
     });
 
-    if let Some(conversation_id) = conversation_id.as_deref() {
-        match state
-            .app_state
-            .storage
-            .chat_events
-            .queued_chat_inputs(&workspace_id, conversation_id)
-        {
-            Ok(queued) if queued.iter().any(|input| input.input_id == message_key) => {
-                if let Err(error) = state
-                    .app_state
-                    .storage
-                    .chat_events
-                    .remove_queued_chat_input(&workspace_id, conversation_id, &message_key)
-                {
-                    tracing::warn!(%error, %workspace_id, %conversation_id, %message_key, "started chat turn could not settle its durable queued input");
-                }
-            }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(%error, %workspace_id, %conversation_id, %message_key, "started chat turn could not inspect its durable queued input");
-            }
-        }
-    }
-
     Ok(serde_json::json!({
         "kind": "started",
         "success": true,
         "workspace_id": workspace_id,
         "conversation_id": conversation_id,
+        "input_id": started_input.receipt.identity.input_id,
         "message_key": message_key,
         "root_turn_id": message_key,
         "active_turn_id": message_key,
@@ -739,14 +961,18 @@ pub async fn send_chat_message(
 #[tauri::command]
 pub async fn steer_chat_message(
     state: tauri::State<'_, TauriState>,
+    app: tauri::AppHandle,
     workspace_id: String,
-    message: String,
     conversation_id: String,
     expected_active_turn_id: String,
-    attachments: Option<Vec<echo_agent_app_core::types::AttachmentData>>,
-) -> Result<ChatSteerReceipt, IpcError> {
-    if message.trim().is_empty() && attachments.as_ref().is_none_or(Vec::is_empty) {
-        return Err(IpcError::Validation("steer input is empty".to_string()));
+    identity: ConversationInputIdentity,
+    expected_queue_revision: u64,
+) -> Result<ConversationInputReceipt, IpcError> {
+    let address = conversation_input_address(&workspace_id, &conversation_id);
+    if identity.address != address {
+        return Err(IpcError::Validation(
+            "queued input belongs to another conversation".to_string(),
+        ));
     }
     let scoped_runtime = state
         .app_state
@@ -769,7 +995,23 @@ pub async fn steer_chat_message(
         )));
     }
     let expected_turn_id = snapshot.active_turn_id.clone();
-    let saved_attachments = attachments.unwrap_or_default();
+    let service = state.app_state.conversation_inputs();
+    let frontier = service
+        .list(&address)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    if frontier.queue_revision != expected_queue_revision {
+        return Err(IpcError::Validation(
+            "queued input frontier changed; refresh and retry".to_string(),
+        ));
+    }
+    let queued = frontier
+        .items
+        .iter()
+        .find(|item| item.receipt.identity == identity)
+        .cloned()
+        .ok_or_else(|| IpcError::Validation("queued input is no longer pending".to_string()))?;
+    let saved_attachments = queued.payload.attachments.clone();
     let ws_root = scoped_runtime.execution_scope().root();
     let uploads_dir = echo_agent_app_core::attachments::resolve_uploads_dir(Some(ws_root));
     let saved =
@@ -788,7 +1030,7 @@ pub async fn steer_chat_message(
     let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(ws_root));
     let prepared = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
         echo_agent_app_core::prepared_turn::UserTurnInput {
-            text: &message,
+            text: &queued.payload.text,
             attachments: &attachment_refs,
             spill_dir: &spill_dir,
             conversation_id: Some(&conversation_id),
@@ -806,9 +1048,6 @@ pub async fn steer_chat_message(
             return Err(IpcError::Validation(format!("{error}{suffix}")));
         }
     };
-    if let Some(batch) = staged_attachment_batch.take() {
-        batch.commit();
-    }
     let steer_message = match prepared.to_message() {
         Ok(message) => message,
         Err(error) => {
@@ -830,123 +1069,199 @@ pub async fn steer_chat_message(
         }
     };
     let agent = agent_execution.agent();
-    let result = agent
+    let started = match service
+        .dispatch_selected(identity, expected_queue_revision, expected_turn_id.clone())
+        .await
+    {
+        Ok(started) => started,
+        Err(error) => {
+            let prepared_cleanup = prepared.cleanup_resources(&spill_dir).err();
+            let staged_cleanup = staged_attachment_batch
+                .take()
+                .and_then(|batch| batch.rollback().err());
+            let suffix = prepared_cleanup
+                .map(|cleanup| format!("; prepared artifact cleanup failed: {cleanup}"))
+                .into_iter()
+                .chain(
+                    staged_cleanup
+                        .map(|cleanup| format!("; staged attachment cleanup failed: {cleanup}")),
+                )
+                .collect::<String>();
+            return Err(IpcError::Validation(format!("{error}{suffix}")));
+        }
+    };
+    if let Err(error) = emit_conversation_input_lifecycle_after(
+        &app,
+        state.app_state.storage.chat_events.as_ref(),
+        &address,
+        expected_queue_revision,
+    ) {
+        record_gui_transport_debt("steer_attempt_lifecycle", error);
+    }
+    let attempt = conversation_input_attempt(&started)?;
+    let observer_service = service.clone();
+    let observer_attempt = attempt.clone();
+    let observer_address = address.clone();
+    let observer_log = state.app_state.storage.chat_events.clone();
+    let observer_app = app.clone();
+    let observer_after_cursor = started.receipt.queue_revision;
+    let observer_prepared = prepared.clone();
+    let observer_spill_dir = spill_dir.clone();
+    let terminal_service = service.clone();
+    let terminal_address = address.clone();
+    let terminal_attempt = attempt.clone();
+    let terminal_app = app.clone();
+    let terminal_log = state.app_state.storage.chat_events.clone();
+    let terminal_projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+        Arc::new(move |outcome| {
+            let service = terminal_service.clone();
+            let address = terminal_address.clone();
+            let attempt = terminal_attempt.clone();
+            let app = terminal_app.clone();
+            let log = terminal_log.clone();
+            Box::pin(async move {
+                let after_cursor = settle_gui_input_attempt(&service, &attempt, &outcome).await?;
+                if let Err(error) = emit_conversation_input_lifecycle_after(
+                    &app,
+                    log.as_ref(),
+                    &address,
+                    after_cursor,
+                ) {
+                    record_gui_transport_debt("live_terminal_input_lifecycle", error);
+                }
+                Ok(())
+            })
+        });
+    let (steer_tx, steer_rx) = tokio::sync::oneshot::channel();
+    let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+    let observer = async move {
+        let result: Result<ConversationInputReceipt, String> = match steer_rx.await {
+            Ok(steer_result) => match observer_service
+                .observe_steer_through_drain(observer_attempt.clone(), steer_result)
+                .await
+            {
+                Ok(receipt) if receipt.drained => {
+                    if let Some(batch) = staged_attachment_batch.take() {
+                        batch.commit();
+                    }
+                    Ok(receipt)
+                }
+                Ok(receipt) => {
+                    let cleanup = observer_prepared
+                        .cleanup_resources(&observer_spill_dir)
+                        .err()
+                        .map(|error| error.to_string())
+                        .into_iter()
+                        .chain(
+                            staged_attachment_batch
+                                .take()
+                                .and_then(|batch| batch.rollback().err()),
+                        )
+                        .collect::<Vec<_>>();
+                    if !cleanup.is_empty() {
+                        record_gui_transport_debt(
+                            "steer_input_resource_cleanup",
+                            cleanup.join("; "),
+                        );
+                    }
+                    Ok(receipt)
+                }
+                Err(error) => {
+                    let reason = std::iter::once(error.to_string())
+                        .chain(
+                            observer_prepared
+                                .cleanup_resources(&observer_spill_dir)
+                                .err()
+                                .map(|cleanup| cleanup.to_string()),
+                        )
+                        .chain(
+                            staged_attachment_batch
+                                .take()
+                                .and_then(|batch| batch.rollback().err()),
+                        )
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    Err(reason)
+                }
+            },
+            Err(error) => {
+                let prepared_cleanup = observer_prepared
+                    .cleanup_resources(&observer_spill_dir)
+                    .err()
+                    .map(|cleanup| cleanup.to_string());
+                let staged_cleanup = staged_attachment_batch
+                    .take()
+                    .and_then(|batch| batch.rollback().err());
+                let mut reasons = std::iter::once(format!("tracked steer handoff failed: {error}"))
+                    .chain(prepared_cleanup)
+                    .chain(staged_cleanup)
+                    .collect::<Vec<_>>();
+                let reason = reasons.join("; ");
+                if let Err(recovery) = observer_service
+                    .recovery_required_with_drain(observer_attempt.clone(), reason.clone(), false)
+                    .await
+                {
+                    reasons.push(format!("recovery-required persistence failed: {recovery}"));
+                }
+                Err(reasons.join("; "))
+            }
+        };
+        if let Err(error) = emit_conversation_input_lifecycle_after(
+            &observer_app,
+            observer_log.as_ref(),
+            &observer_address,
+            observer_after_cursor,
+        ) {
+            record_gui_transport_debt("steer_input_lifecycle", error);
+        }
+        let supervisor_result = result.as_ref().map(|_| ()).map_err(Clone::clone);
+        let _ = observed_tx.send(result);
+        supervisor_result
+    };
+    if let Err(error) = state
+        .app_state
+        .session
+        .foreground_turns
+        .supervise_input_lifecycle_scoped(
+            &workspace_id,
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            &conversation_id,
+            &expected_turn_id,
+            observer,
+            terminal_projector,
+        )
+    {
+        let cleanup = prepared
+            .cleanup_resources(&spill_dir)
+            .err()
+            .map(|cleanup| cleanup.to_string());
+        let reason = std::iter::once(error.to_string())
+            .chain(cleanup)
+            .collect::<Vec<_>>()
+            .join("; ");
+        let receipt = service
+            .deferred(attempt, reason)
+            .await
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        return Ok(receipt);
+    }
+    let steer_result = agent
         .steer_input_tracked(Some(&expected_turn_id), steer_message)
         .await;
-    match result {
-        Ok(mut receipt) => {
-            let state = receipt.wait_for_drained().await;
-            match state {
-                echo_agent::agent::AgentSteerState::Drained => Ok(ChatSteerReceipt {
-                    kind: ChatSteerKind::Accepted,
-                    phase: Some(ChatSteerPhase::Drained),
-                    turn_id: Some(receipt.turn_id().to_string()),
-                    outcome: None,
-                    expected: None,
-                    actual: None,
-                    cleanup_error: None,
-                }),
-                echo_agent::agent::AgentSteerState::TurnSettled {
-                    outcome,
-                    drained: true,
-                } => Ok(ChatSteerReceipt {
-                    kind: ChatSteerKind::Settled,
-                    phase: Some(ChatSteerPhase::TurnSettled),
-                    turn_id: Some(receipt.turn_id().to_string()),
-                    outcome: Some(chat_steer_outcome(outcome)),
-                    expected: None,
-                    actual: None,
-                    cleanup_error: None,
-                }),
-                echo_agent::agent::AgentSteerState::TurnSettled {
-                    outcome,
-                    drained: false,
-                } => {
-                    let cleanup_error = prepared
-                        .cleanup_resources(&spill_dir)
-                        .err()
-                        .map(|cleanup| cleanup.to_string());
-                    Ok(ChatSteerReceipt {
-                        kind: ChatSteerKind::Settled,
-                        phase: Some(ChatSteerPhase::TurnSettled),
-                        turn_id: Some(receipt.turn_id().to_string()),
-                        outcome: Some(chat_steer_outcome(outcome)),
-                        expected: None,
-                        actual: None,
-                        cleanup_error,
-                    })
-                }
-                echo_agent::agent::AgentSteerState::Accepted => {
-                    let cleanup_error = prepared
-                        .cleanup_resources(&spill_dir)
-                        .err()
-                        .map(|cleanup| cleanup.to_string());
-                    Ok(ChatSteerReceipt {
-                        kind: ChatSteerKind::NotSteerable,
-                        phase: None,
-                        turn_id: Some(receipt.turn_id().to_string()),
-                        outcome: None,
-                        expected: None,
-                        actual: None,
-                        cleanup_error,
-                    })
-                }
-            }
-        }
-        Err(error) => {
-            let cleanup = prepared
-                .cleanup_resources(&spill_dir)
-                .err()
-                .map(|cleanup| cleanup.to_string());
-            let suffix = cleanup
-                .as_ref()
-                .map(|cleanup| format!("; prepared artifact cleanup failed: {cleanup}"))
-                .unwrap_or_default();
-            match error {
-                echo_agent::agent::TurnSteerError::NotSteerable { turn_id } => {
-                    Ok(ChatSteerReceipt {
-                        kind: ChatSteerKind::NotSteerable,
-                        phase: None,
-                        turn_id: Some(turn_id),
-                        outcome: None,
-                        expected: None,
-                        actual: None,
-                        cleanup_error: cleanup,
-                    })
-                }
-                echo_agent::agent::TurnSteerError::NoActiveTurn => Ok(ChatSteerReceipt {
-                    kind: ChatSteerKind::NoActiveTurn,
-                    phase: None,
-                    turn_id: None,
-                    outcome: None,
-                    expected: None,
-                    actual: None,
-                    cleanup_error: cleanup,
-                }),
-                echo_agent::agent::TurnSteerError::TurnMismatch { expected, actual } => {
-                    Ok(ChatSteerReceipt {
-                        kind: ChatSteerKind::TurnMismatch,
-                        phase: None,
-                        turn_id: None,
-                        outcome: None,
-                        expected: Some(expected),
-                        actual: Some(actual),
-                        cleanup_error: cleanup,
-                    })
-                }
-                error => Err(IpcError::Validation(format!("{error}{suffix}"))),
-            }
-        }
+    if steer_tx.send(steer_result).is_err() {
+        let reason = "tracked steer observer ended before receipt handoff".to_string();
+        let recovery = service
+            .recovery_required_with_drain(attempt, reason.clone(), false)
+            .await
+            .err()
+            .map(|error| format!("; recovery-required persistence failed: {error}"))
+            .unwrap_or_default();
+        return Err(IpcError::Internal(format!("{reason}{recovery}")));
     }
-}
-
-fn chat_steer_outcome(outcome: echo_agent::agent::AgentSteerTurnOutcome) -> ChatSteerOutcome {
-    match outcome {
-        echo_agent::agent::AgentSteerTurnOutcome::Completed => ChatSteerOutcome::Completed,
-        echo_agent::agent::AgentSteerTurnOutcome::Failed => ChatSteerOutcome::Failed,
-        echo_agent::agent::AgentSteerTurnOutcome::Cancelled => ChatSteerOutcome::Cancelled,
-        echo_agent::agent::AgentSteerTurnOutcome::Dropped => ChatSteerOutcome::Dropped,
-    }
+    observed_rx
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?
+        .map_err(IpcError::Internal)
 }
 
 fn select_active_chat_turn(
@@ -1070,25 +1385,40 @@ async fn validate_queue_address(
 #[tauri::command]
 pub async fn queue_chat_input(
     state: tauri::State<'_, TauriState>,
+    app: tauri::AppHandle,
     workspace_id: String,
     conversation_id: String,
-    input_id: String,
+    external_id: String,
     text: String,
     attachments: Option<Vec<echo_agent_app_core::types::AttachmentData>>,
-) -> Result<echo_agent_app_core::chat_event_log::QueuedChatInput, IpcError> {
+) -> Result<ConversationInputReceipt, IpcError> {
     validate_queue_address(&state, &workspace_id, &conversation_id).await?;
-    state
-        .app_state
-        .storage
-        .chat_events
-        .enqueue_chat_input(
-            &workspace_id,
-            &conversation_id,
-            &input_id,
+    let address = conversation_input_address(&workspace_id, &conversation_id);
+    let service = state.app_state.conversation_inputs();
+    let before = service
+        .list(&address)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let input_id = stable_scoped_input_id(&address, ConversationInputSource::Gui, &external_id)
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let receipt = service
+        .submit(
+            address.clone(),
+            input_id,
             text,
             attachments.unwrap_or_default(),
         )
-        .map_err(|error| IpcError::Internal(error.to_string()))
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    if let Err(error) = emit_conversation_input_lifecycle_after(
+        &app,
+        state.app_state.storage.chat_events.as_ref(),
+        &address,
+        before.queue_revision,
+    ) {
+        record_gui_transport_debt("queued_input_lifecycle", error);
+    }
+    Ok(receipt)
 }
 
 #[tauri::command]
@@ -1096,48 +1426,74 @@ pub async fn list_queued_chat_inputs(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
     conversation_id: String,
-) -> Result<Vec<echo_agent_app_core::chat_event_log::QueuedChatInput>, IpcError> {
+) -> Result<echo_agent_app_core::conversation_input::ConversationInputFrontier, IpcError> {
     validate_queue_address(&state, &workspace_id, &conversation_id).await?;
     state
         .app_state
-        .storage
-        .chat_events
-        .queued_chat_inputs(&workspace_id, &conversation_id)
+        .conversation_inputs()
+        .list(&conversation_input_address(&workspace_id, &conversation_id))
+        .await
         .map_err(|error| IpcError::Internal(error.to_string()))
 }
 
 #[tauri::command]
 pub async fn remove_queued_chat_input(
     state: tauri::State<'_, TauriState>,
-    workspace_id: String,
-    conversation_id: String,
-    input_id: String,
-) -> Result<serde_json::Value, IpcError> {
-    validate_queue_address(&state, &workspace_id, &conversation_id).await?;
-    state
-        .app_state
-        .storage
-        .chat_events
-        .remove_queued_chat_input(&workspace_id, &conversation_id, &input_id)
+    app: tauri::AppHandle,
+    identity: ConversationInputIdentity,
+) -> Result<ConversationInputReceipt, IpcError> {
+    validate_queue_address(
+        &state,
+        &identity.address.workspace_id,
+        &identity.address.conversation_id,
+    )
+    .await?;
+    let service = state.app_state.conversation_inputs();
+    let before = service
+        .list(&identity.address)
+        .await
         .map_err(|error| IpcError::Internal(error.to_string()))?;
-    Ok(serde_json::json!({"success": true, "input_id": input_id}))
+    let receipt = service
+        .cancel(identity.clone())
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    if let Err(error) = emit_conversation_input_lifecycle_after(
+        &app,
+        state.app_state.storage.chat_events.as_ref(),
+        &identity.address,
+        before.queue_revision,
+    ) {
+        record_gui_transport_debt("cancelled_input_lifecycle", error);
+    }
+    Ok(receipt)
 }
 
 #[tauri::command]
 pub async fn reorder_queued_chat_inputs(
     state: tauri::State<'_, TauriState>,
+    app: tauri::AppHandle,
     workspace_id: String,
     conversation_id: String,
+    expected_queue_revision: u64,
     input_ids: Vec<String>,
-) -> Result<serde_json::Value, IpcError> {
+) -> Result<u64, IpcError> {
     validate_queue_address(&state, &workspace_id, &conversation_id).await?;
-    state
+    let address = conversation_input_address(&workspace_id, &conversation_id);
+    let queue_revision = state
         .app_state
-        .storage
-        .chat_events
-        .reorder_queued_chat_inputs(&workspace_id, &conversation_id, input_ids)
-        .map_err(|error| IpcError::Internal(error.to_string()))?;
-    Ok(serde_json::json!({"success": true}))
+        .conversation_inputs()
+        .reorder(&address, expected_queue_revision, input_ids)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    if let Err(error) = emit_conversation_input_lifecycle_after(
+        &app,
+        state.app_state.storage.chat_events.as_ref(),
+        &address,
+        expected_queue_revision,
+    ) {
+        record_gui_transport_debt("reordered_input_lifecycle", error);
+    }
+    Ok(queue_revision)
 }
 
 /// Cancel an active chat stream.
@@ -1221,16 +1577,6 @@ pub async fn cancel_chat(
         &expected_root_turn_id,
     )?
     else {
-        append_chat_projection(
-            &state,
-            &workspace_id,
-            &conversation_id,
-            &expected_root_turn_id,
-            ChatDriverEvent::TurnStatus {
-                status: "cancelled".to_string(),
-            },
-        )
-        .await?;
         return Ok(serde_json::json!({
             "success": true,
             "turn_id": expected_root_turn_id,
@@ -1648,6 +1994,14 @@ mod chat_sink_contract_tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    struct RejectingChatSink;
+
+    impl ChatSink for RejectingChatSink {
+        fn on_event(&self, _event: ChatDriverEvent) -> bool {
+            false
+        }
+    }
+
     struct TestDir(PathBuf);
 
     impl TestDir {
@@ -1682,67 +2036,340 @@ mod chat_sink_contract_tests {
     }
 
     #[test]
-    fn gui_queue_acceptance_is_fifo_exact_once_and_restart_visible()
+    fn send_chat_request_uses_one_camel_case_wire_object() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let request: SendChatMessageRequest = serde_json::from_value(serde_json::json!({
+            "workspaceId": "workspace-1",
+            "message": "hello",
+            "conversationId": "conversation-1",
+            "messageKey": "message-1",
+            "attachments": null,
+            "inputIdentity": null,
+            "expectedQueueRevision": null
+        }))?;
+        assert_eq!(request.workspace_id, "workspace-1");
+        assert_eq!(request.conversation_id.as_deref(), Some("conversation-1"));
+        assert_eq!(request.message_key.as_deref(), Some("message-1"));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_transport_rejection_is_reported_without_panicking() {
+        let sink: Arc<dyn ChatSink> = Arc::new(RejectingChatSink);
+        assert!(!emit_gui_turn_status(&sink, "completed"));
+    }
+
+    #[tokio::test]
+    async fn pre_driver_terminal_settlement_remains_replayable_when_not_drained()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = TestDir::new()?;
-        let root = temp.path().join("chat-queue");
-        let log = ChatEventLog::open(&root, ChatEventRetention::default())?;
+        let log = Arc::new(ChatEventLog::open(
+            temp.path().join("pre-driver-ingress"),
+            ChatEventRetention::default(),
+        )?);
+        let service = echo_agent_app_core::conversation_input::ConversationInputService::new(log);
+        let address = conversation_input_address("workspace-1", "conversation-1");
+        let persisted = service
+            .submit(
+                address.clone(),
+                "input-pre-driver".to_string(),
+                "retry me".to_string(),
+                Vec::new(),
+            )
+            .await?;
+        let frontier = service.list(&address).await?;
+        let started = service
+            .dispatch_selected(
+                persisted.identity,
+                frontier.queue_revision,
+                "turn-pre-driver".to_string(),
+            )
+            .await?;
+        let attempt = conversation_input_attempt(&started)?;
 
-        let accepted = log.enqueue_chat_input(
-            "workspace-1",
-            "conversation-1",
-            "input-1",
-            "first version".to_string(),
-            Vec::new(),
-        )?;
-        assert_eq!(accepted.input_id, "input-1");
-        log.enqueue_chat_input(
-            "workspace-1",
-            "conversation-1",
-            "input-2",
-            "second".to_string(),
-            Vec::new(),
-        )?;
-        log.enqueue_chat_input(
-            "workspace-1",
-            "conversation-1",
-            "input-1",
-            "latest version".to_string(),
-            Vec::new(),
-        )?;
+        settle_gui_input_attempt(
+            &service,
+            &attempt,
+            &echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message(
+                    "pre_driver",
+                    "driver preparation failed before observer invocation",
+                ),
+            ),
+        )
+        .await?;
 
-        let queued = log.queued_chat_inputs("workspace-1", "conversation-1")?;
-        assert_eq!(
-            queued
-                .iter()
-                .map(|input| input.input_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["input-1", "input-2"]
+        let settled = service.list(&address).await?;
+        let receipt = settled
+            .items
+            .first()
+            .map(|projection| &projection.receipt)
+            .ok_or_else(|| std::io::Error::other("replayable input left the frontier"))?;
+        assert_eq!(receipt.phase, ConversationInputPhase::TurnSettled);
+        assert!(!receipt.drained);
+        assert!(receipt.is_dispatchable());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exact_projector_survives_stream_eviction_and_keeps_observed_drain_non_replayable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TestDir::new()?;
+        let root = temp.path().join("exact-projector-eviction");
+        let log = Arc::new(ChatEventLog::open(&root, ChatEventRetention::default())?);
+        let service = echo_agent_app_core::conversation_input::ConversationInputService::new(
+            Arc::clone(&log),
         );
-        assert_eq!(
-            queued.first().map(|input| input.text.as_str()),
-            Some("latest version")
-        );
+        let address = conversation_input_address("workspace-1", "conversation-held");
+        let persisted = service
+            .submit(
+                address.clone(),
+                "input-held".to_string(),
+                "execute exactly once".to_string(),
+                Vec::new(),
+            )
+            .await?;
+        let frontier = service.list(&address).await?;
+        let started = service
+            .dispatch_selected(
+                persisted.identity,
+                frontier.queue_revision,
+                "turn-held".to_string(),
+            )
+            .await?;
+        let attempt = conversation_input_attempt(&started)?;
+        attempt.observation.mark_drained();
+        service.mailbox_accepted(attempt.clone()).await?;
+        service.drained(attempt.clone()).await?;
+
+        for index in 0..132_u32 {
+            let noise_address =
+                conversation_input_address("workspace-1", &format!("conversation-noise-{index}"));
+            service
+                .submit(
+                    noise_address,
+                    format!("input-noise-{index}"),
+                    format!("noise {index}"),
+                    Vec::new(),
+                )
+                .await?;
+        }
+
+        settle_gui_input_attempt(
+            &service,
+            &attempt,
+            &echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+        )
+        .await?;
+        assert!(service.list(&address).await?.items.is_empty());
+        drop(service);
         drop(log);
 
-        let reopened = ChatEventLog::open(&root, ChatEventRetention::default())?;
-        let recovered = reopened.queued_chat_inputs("workspace-1", "conversation-1")?;
-        assert_eq!(
-            recovered
-                .iter()
-                .map(|input| input.input_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["input-1", "input-2"]
+        let reopened = echo_agent_app_core::conversation_input::ConversationInputService::new(
+            Arc::new(ChatEventLog::open(&root, ChatEventRetention::default())?),
         );
-        reopened.remove_queued_chat_input("workspace-1", "conversation-1", "input-1")?;
-        assert_eq!(
-            reopened
-                .queued_chat_inputs("workspace-1", "conversation-1")?
-                .into_iter()
-                .map(|input| input.input_id)
-                .collect::<Vec<_>>(),
-            vec!["input-2".to_string()]
+        assert!(reopened.list(&address).await?.items.is_empty());
+        let duplicate = reopened
+            .submit(
+                address,
+                "input-held".to_string(),
+                "execute exactly once".to_string(),
+                Vec::new(),
+            )
+            .await?;
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.phase, ConversationInputPhase::TurnSettled);
+        assert!(duplicate.drained);
+        assert!(duplicate.blocks_replay());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_terminal_projector_commits_before_foreground_waiter_release()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TestDir::new()?;
+        let log = Arc::new(ChatEventLog::open(
+            temp.path().join("live-terminal-projector"),
+            ChatEventRetention::default(),
+        )?);
+        let service = echo_agent_app_core::conversation_input::ConversationInputService::new(log);
+        let address = conversation_input_address("workspace-1", "conversation-live");
+        let persisted = service
+            .submit(
+                address.clone(),
+                "input-live".to_string(),
+                "live guidance".to_string(),
+                Vec::new(),
+            )
+            .await?;
+        let frontier = service.list(&address).await?;
+        let started = service
+            .dispatch_selected(
+                persisted.identity,
+                frontier.queue_revision,
+                "turn-live".to_string(),
+            )
+            .await?;
+        let attempt = conversation_input_attempt(&started)?;
+        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let lease = control.begin_scoped(
+            "workspace-1",
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            "conversation-live",
+            "turn-live",
+        )?;
+        let waiter = control.settlement_waiter_scoped(
+            "workspace-1",
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            "conversation-live",
+            "turn-live",
+        )?;
+        let projector_service = service.clone();
+        let projector_attempt = attempt;
+        let projector_entered = Arc::new(tokio::sync::Notify::new());
+        let projector_release = Arc::new(tokio::sync::Notify::new());
+        let entered_for_projector = Arc::clone(&projector_entered);
+        let release_for_projector = Arc::clone(&projector_release);
+        let projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+            Arc::new(move |outcome| {
+                let service = projector_service.clone();
+                let attempt = projector_attempt.clone();
+                let entered = Arc::clone(&entered_for_projector);
+                let release = Arc::clone(&release_for_projector);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    settle_gui_input_attempt(&service, &attempt, &outcome)
+                        .await
+                        .map(|_| ())
+                })
+            });
+        control.supervise_input_lifecycle_scoped(
+            "workspace-1",
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            "conversation-live",
+            "turn-live",
+            async { Ok(()) },
+            projector,
+        )?;
+        let settling = tokio::spawn(async move {
+            lease
+                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+                .await
+        });
+        projector_entered.notified().await;
+        let mut waiting = Box::pin(waiter.wait());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
         );
+        projector_release.notify_one();
+        settling.await??;
+        let projected = service.list(&address).await?;
+        let receipt = projected
+            .items
+            .first()
+            .map(|item| &item.receipt)
+            .ok_or_else(|| std::io::Error::other("live terminal projection is missing"))?;
+        assert_eq!(receipt.phase, ConversationInputPhase::TurnSettled);
+        let settlement = waiting.await?;
+        assert_eq!(
+            settlement.outcome,
+            echo_agent_app_core::chat_driver::TurnOutcome::Completed
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_observer_failure_returns_and_shutdown_is_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TestDir::new()?;
+        let log = Arc::new(ChatEventLog::open(
+            temp.path().join("live-observer-failure"),
+            ChatEventRetention::default(),
+        )?);
+        let service = echo_agent_app_core::conversation_input::ConversationInputService::new(log);
+        let address = conversation_input_address("workspace-1", "conversation-failure");
+        let persisted = service
+            .submit(
+                address.clone(),
+                "input-live-failure".to_string(),
+                "ambiguous guidance".to_string(),
+                Vec::new(),
+            )
+            .await?;
+        let frontier = service.list(&address).await?;
+        let started = service
+            .dispatch_selected(
+                persisted.identity,
+                frontier.queue_revision,
+                "turn-live-failure".to_string(),
+            )
+            .await?;
+        let attempt = conversation_input_attempt(&started)?;
+        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let lease = control.begin_scoped(
+            "workspace-1",
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            "conversation-failure",
+            "turn-live-failure",
+        )?;
+        let waiter = control.settlement_waiter_scoped(
+            "workspace-1",
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            "conversation-failure",
+            "turn-live-failure",
+        )?;
+        let observer_service = service.clone();
+        let observer_attempt = attempt.clone();
+        let projector_service = service.clone();
+        let projector_attempt = attempt;
+        let projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+            Arc::new(move |outcome| {
+                let service = projector_service.clone();
+                let attempt = projector_attempt.clone();
+                Box::pin(async move {
+                    settle_gui_input_attempt(&service, &attempt, &outcome)
+                        .await
+                        .map(|_| ())
+                })
+            });
+        control.supervise_input_lifecycle_scoped(
+            "workspace-1",
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            "conversation-failure",
+            "turn-live-failure",
+            async move {
+                let reason = "injected permanent live observer failure".to_string();
+                observer_service
+                    .recovery_required_with_drain(observer_attempt, reason.clone(), false)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Err(reason)
+            },
+            projector,
+        )?;
+
+        let settlement = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            lease.settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("GUI observer settlement exceeded its bound"))??;
+        assert!(matches!(
+            settlement.outcome,
+            echo_agent_app_core::chat_driver::TurnOutcome::Failed(_)
+        ));
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(1), waiter.wait())
+            .await
+            .map_err(|_| std::io::Error::other("GUI settlement waiter exceeded its bound"))??;
+        assert_eq!(observed, settlement);
+        assert!(service.list(&address).await?.items.is_empty());
+        tokio::time::timeout(std::time::Duration::from_secs(1), control.shutdown())
+            .await
+            .map_err(|_| std::io::Error::other("GUI shutdown waited forever on observer debt"))??;
+        assert!(!control.has_active_turns());
         Ok(())
     }
 
@@ -2277,8 +2904,8 @@ mod foreground_turn_command_tests {
     use super::*;
     use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
 
-    #[test]
-    fn active_snapshot_returns_real_message_scope_without_product_conversation()
+    #[tokio::test]
+    async fn active_snapshot_returns_real_message_scope_without_product_conversation()
     -> Result<(), Box<dyn std::error::Error>> {
         let control = ForegroundTurnControl::default();
         let lease = control.begin(ForegroundTurnSurface::Gui, "message:turn-1", "turn-1")?;
@@ -2287,12 +2914,14 @@ mod foreground_turn_command_tests {
         assert_eq!(snapshot.conversation_id, "message:turn-1");
         assert_eq!(snapshot.root_turn_id, "turn-1");
         assert_eq!(snapshot.active_turn_id, "turn-1");
-        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+        lease
+            .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+            .await?;
         Ok(())
     }
 
-    #[test]
-    fn active_snapshot_requires_scope_when_multiple_gui_turns_exist()
+    #[tokio::test]
+    async fn active_snapshot_requires_scope_when_multiple_gui_turns_exist()
     -> Result<(), Box<dyn std::error::Error>> {
         let control = ForegroundTurnControl::default();
         let first = control.begin(ForegroundTurnSurface::Gui, "conversation-1", "turn-1")?;
@@ -2306,13 +2935,17 @@ mod foreground_turn_command_tests {
             .ok_or_else(|| "missing exact active snapshot".to_string())?;
         assert_eq!(snapshot.root_turn_id, "turn-2");
         assert_eq!(snapshot.active_turn_id, "turn-2");
-        first.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
-        second.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+        first
+            .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+            .await?;
+        second
+            .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+            .await?;
         Ok(())
     }
 
-    #[test]
-    fn stop_is_idempotent_after_the_exact_gui_turn_settles()
+    #[tokio::test]
+    async fn stop_is_idempotent_after_the_exact_gui_turn_settles()
     -> Result<(), Box<dyn std::error::Error>> {
         let control = ForegroundTurnControl::default();
         let lease = control.begin_scoped(
@@ -2321,7 +2954,9 @@ mod foreground_turn_command_tests {
             "conversation-1",
             "turn-1",
         )?;
-        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+        lease
+            .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+            .await?;
 
         let waiter = request_chat_cancel(&control, "workspace-1", "conversation-1", "turn-1")?;
 
@@ -2329,8 +2964,8 @@ mod foreground_turn_command_tests {
         Ok(())
     }
 
-    #[test]
-    fn stop_still_rejects_a_stale_root_when_another_gui_turn_is_active()
+    #[tokio::test]
+    async fn stop_still_rejects_a_stale_root_when_another_gui_turn_is_active()
     -> Result<(), Box<dyn std::error::Error>> {
         let control = ForegroundTurnControl::default();
         let lease = control.begin_scoped(
@@ -2350,7 +2985,9 @@ mod foreground_turn_command_tests {
             Err(IpcError::Validation(message)) if message.contains("foreground turn mismatch")
         ));
         assert!(!lease.cancellation_token().is_cancelled());
-        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+        lease
+            .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+            .await?;
         Ok(())
     }
 }

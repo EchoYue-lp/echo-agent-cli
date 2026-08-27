@@ -684,8 +684,6 @@ pub enum RuntimeEventKind {
     SubagentReleased,
     /// A user instruction was durably accepted for one exact Subagent attempt.
     SubagentGuidanceQueued,
-    /// The framework accepted the instruction for live or next-attempt delivery.
-    SubagentGuidanceDelivered,
     /// The framework tracked mailbox confirmed that a live instruction was
     /// inserted into the active turn's input queue.
     SubagentGuidanceMailboxAccepted,
@@ -777,7 +775,6 @@ impl RuntimeEventKind {
             SubagentAssigned => "subagent_assigned",
             SubagentReleased => "subagent_released",
             SubagentGuidanceQueued => "subagent_guidance_queued",
-            SubagentGuidanceDelivered => "subagent_guidance_delivered",
             SubagentGuidanceMailboxAccepted => "subagent_guidance_mailbox_accepted",
             SubagentGuidanceDrained => "subagent_guidance_drained",
             SubagentGuidanceSettled => "subagent_guidance_settled",
@@ -878,7 +875,6 @@ impl RuntimeEventKind {
             "subagent_assigned" => SubagentAssigned,
             "subagent_released" => SubagentReleased,
             "subagent_guidance_queued" => SubagentGuidanceQueued,
-            "subagent_guidance_delivered" => SubagentGuidanceDelivered,
             "subagent_guidance_mailbox_accepted" => SubagentGuidanceMailboxAccepted,
             "subagent_guidance_drained" => SubagentGuidanceDrained,
             "subagent_guidance_settled" => SubagentGuidanceSettled,
@@ -2442,13 +2438,14 @@ impl SubagentGuidanceKind {
     }
 }
 
-/// Stable command status returned identically by GUI/TUI/CLI/channel adapters.
+/// Read-only convenience label derived from `SubagentControlReceipt.phase` and
+/// rejection detail. It is never persisted or reduced as lifecycle authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "SubagentControlStatus")]
 pub enum SubagentControlStatus {
     Pending,
-    Delivered,
+    Accepted,
     Rejected,
     Settled,
 }
@@ -2457,7 +2454,7 @@ impl SubagentControlStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
-            Self::Delivered => "delivered",
+            Self::Accepted => "accepted",
             Self::Rejected => "rejected",
             Self::Settled => "settled",
         }
