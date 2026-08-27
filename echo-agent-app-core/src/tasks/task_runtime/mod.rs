@@ -7,9 +7,9 @@
 //!
 //! # Module layout
 //!
-//! - [`types`] — `DomainProfile`, `TaskRunStatus` state machine, and all
-//!   persisted structs (`TaskRun`, `TaskPlan`, `PlanTask`, `TodoItem`,
-//!   `RuntimeTaskEvent`, `Artifact`, `ReviewResult`, `TaskExecutionSummary`).
+//! - [`types`] — `DomainProfile`, `TaskRunStatus` state machine, the persisted
+//!   `TaskRun`/`PlanRevision`/`RunStateSnapshot` projections, and the internal
+//!   `TaskPlan`/`PlanTask` spec-execution join used by the runtime.
 //! - [`store`] — file-backed `TaskRuntimeStore`; every state mutation appends a
 //!   `RuntimeTaskEvent` before rebuilding the projections.
 //! - [`profiles`] — per-domain plan templates (subagent roles, prompt suffix,

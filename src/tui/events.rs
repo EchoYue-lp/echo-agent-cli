@@ -8479,6 +8479,57 @@ mod tests {
     }
 
     #[test]
+    fn tui_task_projection_follows_plan_revision_order() -> Result<(), String> {
+        let make_spec = |id: &str, title: &str| {
+            PlanTask {
+                id: id.to_string(),
+                title: title.to_string(),
+                agent_role: "general".to_string(),
+                ..PlanTask::default()
+            }
+            .spec()
+        };
+        let plan = PlanRevision {
+            plan_id: "plan-order".to_string(),
+            run_id: "run-order".to_string(),
+            revision: 2,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: "goal-hash".to_string(),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![make_spec("second", "Second"), make_spec("first", "First")],
+        };
+        let todos = ["first", "second"]
+            .into_iter()
+            .map(|task_id| TodoItem {
+                id: format!("todo-{task_id}"),
+                run_id: "run-order".to_string(),
+                task_id: task_id.to_string(),
+                title: task_id.to_string(),
+                status: TodoStatus::Pending,
+                retry_count: 0,
+                max_retries: 3,
+                owner_agent: None,
+                started_at: None,
+                completed_at: None,
+                summary: None,
+            })
+            .collect::<Vec<_>>();
+
+        let views = project_tui_task_views(&plan, &todos);
+        assert_eq!(
+            views
+                .iter()
+                .map(|view| view.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Second", "First"]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn stale_workspace_view_cannot_select_same_run_id_in_new_workspace() {
         let created_at = chrono::Utc::now();
         let view = TaskRuntimeView {

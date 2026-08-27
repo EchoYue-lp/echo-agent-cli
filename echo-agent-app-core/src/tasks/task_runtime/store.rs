@@ -242,7 +242,7 @@ fn prepare_revisioned_graph_commit(
 ) -> Result<PreparedRevisionCommit, StoreError> {
     let echo_agent::tasks::TaskGraphCommit {
         expected_revision,
-        next,
+        mut next,
         reason,
         effects,
     } = commit;
@@ -300,6 +300,14 @@ fn prepare_revisioned_graph_commit(
             run_id: run_id.to_string(),
             reason: "initial TaskPlan Goal binding does not match TaskRun".to_string(),
         });
+    }
+    if effects.reordered {
+        for (position, task) in next.snapshot.tasks.iter_mut().enumerate() {
+            let mut extension: EkoTaskExtension =
+                serde_json::from_value(task.spec.extension.clone())?;
+            extension.sort_order = i64::try_from(position).unwrap_or(i64::MAX);
+            task.spec.extension = serde_json::to_value(extension)?;
+        }
     }
     let mut specifications = Vec::with_capacity(next.snapshot.tasks.len());
     for task in &next.snapshot.tasks {
@@ -12374,6 +12382,98 @@ mod tests {
             evs.last().map(|event| event.event_type),
             Some(RuntimeEventKind::PlanRevisionCommitted)
         );
+    }
+
+    #[test]
+    fn reorder_keeps_plan_todos_and_framework_graph_in_one_order() -> Result<(), StoreError> {
+        let store = TaskRuntimeStore::new_in_memory()
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+        store.create_run(
+            "reorder-run",
+            "ws",
+            "c-reorder",
+            "m-reorder",
+            DomainProfile::General,
+            "reorder",
+            "",
+            AttendedMode::Attended,
+        )?;
+        let plan = TaskPlan {
+            plan_id: "reorder-plan".to_string(),
+            run_id: "reorder-run".to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("reorder"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![
+                PlanTask {
+                    id: "first".to_string(),
+                    title: "First".to_string(),
+                    sort_order: 0,
+                    ..PlanTask::default()
+                },
+                PlanTask {
+                    id: "second".to_string(),
+                    title: "Second".to_string(),
+                    sort_order: 1,
+                    ..PlanTask::default()
+                },
+            ],
+        };
+        store.attach_plan_for_test(&plan)?;
+        store.transition_run("reorder-run", TaskRunStatus::Running)?;
+
+        let reordered = store.apply_task_patch_for_test(
+            "reorder-run",
+            &TaskUpdateRequest {
+                base_revision: 1,
+                reason: "surface parity reorder".to_string(),
+                operations: vec![TaskUpdateOperation::Reorder {
+                    task_ids: vec!["second".to_string(), "first".to_string()],
+                }],
+            },
+        )?;
+        assert_eq!(
+            reordered
+                .tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
+        assert_eq!(
+            reordered
+                .tasks
+                .iter()
+                .map(|task| task.sort_order)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        let todos = store.list_todos("reorder-run")?;
+        assert_eq!(
+            todos
+                .iter()
+                .map(|todo| todo.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
+        let graph = store
+            .load_revisioned_task_graph("reorder-run")?
+            .ok_or_else(|| StoreError::PlanNotFound("reorder-run".to_string()))?;
+        assert_eq!(
+            graph
+                .snapshot
+                .tasks
+                .iter()
+                .map(|task| task.spec.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
+        Ok(())
     }
 
     #[test]
