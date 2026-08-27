@@ -1419,6 +1419,9 @@ pub struct AppState {
     pub browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     /// Durable cross-workspace conversation inbox authority.
     pub agent_router: Arc<crate::agent_router::AgentRouter>,
+    /// Delivery wake callback shared by global and workspace Agent control
+    /// tools after the AppState Arc has been published.
+    agent_control_wake: Arc<std::sync::OnceLock<crate::agent_control::DeliveryWake>>,
     /// Owned lifetime for asynchronous inbox consumers.
     pub agent_deliveries: Arc<crate::agent_router::AgentDeliverySupervisor>,
     /// Product projections that must be retired before workspace metadata can
@@ -1627,6 +1630,7 @@ impl AppState {
             terminal: crate::terminal::TerminalService::new(),
             browser_runtime: None,
             agent_router: crate::agent_router::AgentRouter::at_default_root(),
+            agent_control_wake: Arc::new(std::sync::OnceLock::new()),
             agent_deliveries: Arc::new(crate::agent_router::AgentDeliverySupervisor::default()),
             workspace_delete_hook: None,
         })
@@ -3333,6 +3337,15 @@ impl AppState {
             tracing::warn!("Agent control tools require a TaskRuntimeStore");
             return;
         };
+        self.register_agent_control_tools_for(&self.connection.primary_agent(), task_runtime)
+            .await;
+    }
+
+    async fn register_agent_control_tools_for(
+        self: &Arc<Self>,
+        agent: &crate::agent_handle::AgentHandle,
+        task_runtime: Arc<crate::tasks::task_runtime::TaskRuntimeStore>,
+    ) {
         let weak_state = Arc::downgrade(self);
         let wake: crate::agent_control::DeliveryWake = Arc::new(move |target| {
             let Some(state) = weak_state.upgrade() else {
@@ -3342,6 +3355,17 @@ impl AppState {
                 .kick_agent_delivery(target)
                 .map_err(|error| error.to_string())
         });
+        let _ = self.agent_control_wake.set(Arc::clone(&wake));
+        self.register_agent_control_tools_with_wake(agent, task_runtime, wake)
+            .await;
+    }
+
+    async fn register_agent_control_tools_with_wake(
+        &self,
+        agent: &crate::agent_handle::AgentHandle,
+        task_runtime: Arc<crate::tasks::task_runtime::TaskRuntimeStore>,
+        wake: crate::agent_control::DeliveryWake,
+    ) {
         let service = Arc::new(
             crate::agent_control::AgentControlService::new(
                 Arc::clone(&self.agent_router),
@@ -3350,11 +3374,7 @@ impl AppState {
             )
             .with_delivery_wake(wake),
         );
-        crate::agent_control::register_agent_control_tools_on_agent(
-            &self.connection.primary_agent(),
-            service,
-        )
-        .await;
+        crate::agent_control::register_agent_control_tools_on_agent(agent, service).await;
     }
 
     async fn validate_agent_address(
@@ -3670,6 +3690,14 @@ impl AppState {
         })?;
         let execution = host.get_or_open_execution(seed_pool).await?;
         let task_runtime = execution.task_runtime();
+        if let Some(wake) = self.agent_control_wake.get() {
+            self.register_agent_control_tools_with_wake(
+                &execution.primary_agent(),
+                task_runtime.clone(),
+                Arc::clone(wake),
+            )
+            .await;
+        }
         self.attach_task_execution_target_resolver(&task_runtime, seed_pool);
         Ok(ScopedChatRuntime {
             _lifetime: ScopedRuntimeLifetime::Workspace {

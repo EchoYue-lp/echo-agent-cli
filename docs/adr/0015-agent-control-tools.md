@@ -18,8 +18,8 @@ durable inbox、`SubagentControlService` 的 exact-attempt guidance/interrupt、
 
 - `ConversationTarget { workspace_id, conversation_id, workspace_generation? }` 只路由
   `AgentRouter`；
-- `TaskSubagentTarget { run_id, task_id, plan_revision, execution_id, attempt,
-  workspace_generation? }` 只路由 `SubagentControlService`；
+- `TaskSubagentTarget { workspace_id, run_id, task_id, plan_revision, execution_id,
+  attempt, workspace_generation? }` 只路由 workspace-scoped `SubagentControlService`；
 - 注册 `agent_list`、`agent_inspect`、`agent_message`、`agent_followup`、`agent_wait`、
   `agent_interrupt` 六个模型工具；既有 `agent_tool` 继续作为一次有界 dispatch，不新增
   `agent_spawn`；
@@ -27,11 +27,13 @@ durable inbox、`SubagentControlService` 的 exact-attempt guidance/interrupt、
   workspace incarnation；不匹配时返回 typed fail-closed error；
 - `agent_wait` 只读取现有 router/task event cursor，返回 bounded event summaries，不能
   代替 TaskRun/Subagent terminal authority；取消和超时是 wait 结果，不是任务终态；
-- Conversation message 以 `message_id` 复用 router exact-once 语义；TaskSubagent
-  command 以 `command_id` 复用 `SubagentControlService` durable receipt；
+- Conversation `agent_message` 以 `message_id` 复用 router exact-once 语义但只持久化信息，
+  不自动启动 turn；`agent_followup` 才复用 AppState delivery supervisor wake。TaskSubagent
+  command 以 `command_id` 复用其 workspace `SubagentControlService` durable receipt；
 - 工具通过 `AppState::register_agent_control_tools` 在共享 ToolManager 上注册，故
-  GUI/TUI/CLI/channel 与 pooled Agent 共用同一套 schema、router/registry authority，并
-  在 message 后复用 AppState 的既有 delivery supervisor wake。
+  GUI/TUI/CLI/channel、global pool 与 workspace pool 共用同一套 schema 和
+  router/registry authority；每个 pool 绑定自己的 TaskRuntimeStore，follow-up 复用 AppState
+  的既有 delivery supervisor wake。
 
 ## 分层与取舍
 
