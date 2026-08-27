@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use echo_agent::agent::AgentHandle;
-use echo_agent::memory::ConversationStore;
+use echo_agent::memory::{ConversationFilter, ConversationStore};
 use echo_agent::tools::{Tool, ToolContext, ToolParameters, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -493,6 +493,19 @@ impl AgentControlService {
                 .await
                 .map_err(|error| AgentControlError::Router(error.to_string()))?;
             known.extend(persisted);
+            if let (Some(store), Some(workspace_id)) = (
+                self.conversation_store.as_ref(),
+                self.conversation_workspace_id.as_deref(),
+            ) {
+                let conversations = store
+                    .list_conversations(ConversationFilter::default())
+                    .await
+                    .map_err(|error| AgentControlError::Runtime(error.to_string()))?;
+                let workspace = WorkspaceId::from_raw(workspace_id.to_string());
+                known.extend(conversations.into_iter().map(|conversation| {
+                    AgentAddress::new(workspace.clone(), conversation.conversation_id)
+                }));
+            }
             let mut known = known.into_iter().collect::<Vec<_>>();
             known.sort_by(|left, right| {
                 left.workspace_id
@@ -2003,7 +2016,7 @@ mod tests {
             })
             .await
             .map_err(|e| e.to_string())?;
-        assert_eq!(listed.count, 1);
+        assert_eq!(listed.count, 2);
         let inspected = service
             .inspect(target.clone())
             .await
