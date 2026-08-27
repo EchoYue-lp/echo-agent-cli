@@ -260,10 +260,7 @@ export function useTauriChat() {
       const terminalStatus =
         event.payload.source === 'turn_status' &&
         ['completed', 'failed', 'cancelled'].includes(event.payload.event.status);
-      const terminalAgent =
-        event.payload.source === 'agent' &&
-        ['final_answer', 'cancelled', 'error'].includes(event.payload.event.payload.type);
-      if (terminalStatus || terminalAgent) {
+      if (terminalStatus) {
         activeTurnIdRef.current = null;
         currentMessageKeyRef.current = null;
         assistantIdRef.current = null;
@@ -407,36 +404,8 @@ export function useTauriChat() {
             });
             if (!aborted && setupIdentityGeneration === identityGenerationRef.current) {
               eventSequencerRef.current.ingestReplay(replay, handleEvent);
-              if (!snapshot) {
-                const hasTerminal = replay.events.some((event) => {
-                  if (event.payload.source === 'turn_status') {
-                    return ['completed', 'failed', 'cancelled'].includes(
-                      event.payload.event.status
-                    );
-                  }
-                  return (
-                    event.payload.source === 'agent' &&
-                    ['final_answer', 'cancelled', 'error'].includes(
-                      event.payload.event.payload.type
-                    )
-                  );
-                });
-                const orphanRoot = replay.events.at(-1)?.root_turn_id;
-                if (!hasTerminal && orphanRoot && conversationId) {
-                  await apiInvoke('cancel_chat', {
-                    workspaceId: currentWorkspaceId,
-                    conversationId,
-                    expectedRootTurnId: orphanRoot,
-                    expectedActiveTurnId: null,
-                  });
-                  const repaired = await apiInvoke<ChatEventReplay>('replay_chat_events', {
-                    workspaceId: currentWorkspaceId,
-                    conversationId,
-                    messageKey: orphanRoot,
-                    afterCursor: eventSequencerRef.current.cursor(streamId),
-                  });
-                  eventSequencerRef.current.ingestReplay(repaired, handleEvent);
-                }
+              if (!snapshot && useChatStore.getState().isStreaming) {
+                useChatStore.getState().clearInactiveTurnProjection();
               }
             }
           }
@@ -793,7 +762,7 @@ export function useTauriChat() {
           if (replay?.events) eventSequencerRef.current.ingestReplay(replay, handleEvent);
         }
         if (useChatStore.getState().isStreaming) {
-          useChatStore.getState().settleOrphanedTurn();
+          useChatStore.getState().clearInactiveTurnProjection();
         }
         activeTurnIdRef.current = null;
         currentMessageKeyRef.current = null;
@@ -824,7 +793,7 @@ export function useTauriChat() {
           console.warn('[TauriChat] Failed to reconcile an already-settled turn:', error);
         }
         if (useChatStore.getState().isStreaming) {
-          useChatStore.getState().settleOrphanedTurn();
+          useChatStore.getState().clearInactiveTurnProjection();
         }
         activeTurnIdRef.current = null;
         currentMessageKeyRef.current = null;

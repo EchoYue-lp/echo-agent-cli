@@ -82,15 +82,14 @@ interface ChatState {
   endToolBatch: () => void;
   applyFinalAnswer: (id: string, content: string) => void;
   settleAssistantMessage: (id: string) => void;
-  failAssistantMessage: (id: string, error: string) => void;
+  projectAssistantError: (id: string, error: string) => void;
   handoffToTaskRuntime: (id: string, content: string, isRunning: boolean) => void;
   /** Insert a non-streaming assistant note (e.g. background subagent finished). */
   appendLocalAssistantNote: (content: string) => void;
   setStreaming: (v: boolean) => void;
   setThinking: (v: boolean) => void;
   setRunStatus: (status: ChatRunStatus) => void;
-  settleOrphanedTurn: () => void;
-  markCancelled: () => void;
+  clearInactiveTurnProjection: () => void;
   enqueueHitlRequest: (request: PendingHitlRequest) => void;
   removeHitlRequest: (requestId: string) => void;
   clearHitlRequests: () => void;
@@ -379,19 +378,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
     scheduleAutoSave();
   },
 
-  failAssistantMessage: (id, error) => {
+  projectAssistantError: (id, error) => {
     set((s) => ({
-      isStreaming: false,
-      isThinking: false,
-      runStatus: 'failed',
-      pendingHitlRequests: [],
       messages: s.messages.map((message) => {
         if (message.id !== id) return message;
         const errorNote = `[Error] ${error}`;
         return {
           ...message,
           content: message.content ? `${message.content}\n\n${errorNote}` : errorNote,
-          isStreaming: false,
         };
       }),
     }));
@@ -436,36 +430,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
         : state.pendingHitlRequests,
     })),
 
-  settleOrphanedTurn: () => {
+  clearInactiveTurnProjection: () => {
     set((state) => ({
       isStreaming: false,
       isThinking: false,
-      runStatus: 'failed',
+      isCancelled: false,
+      runStatus: 'idle',
       pendingHitlRequests: [],
       messages: state.messages.map((message) =>
         message.isStreaming ? { ...message, isStreaming: false } : message
       ),
     }));
     scheduleAutoSave();
-  },
-
-  markCancelled: () => {
-    set((s) => ({
-      isStreaming: false,
-      isCancelled: true,
-      isThinking: false,
-      runStatus: 'cancelled',
-      pendingHitlRequests: [],
-      messages: s.messages.map((m) =>
-        m.isStreaming
-          ? {
-              ...m,
-              isStreaming: false,
-              content: m.content || '',
-            }
-          : m
-      ),
-    }));
   },
 
   enqueueHitlRequest: (request) =>

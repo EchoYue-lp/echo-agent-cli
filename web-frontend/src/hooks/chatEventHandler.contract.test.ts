@@ -106,7 +106,7 @@ describe('canonical chat event v4 contract', () => {
     }
   );
 
-  it('projects a typed cancellation failure as cancelled rather than failed', () => {
+  it('keeps a typed cancellation failure non-terminal until turn_status settles it', () => {
     const base = fixture[0];
     if (!base || base.payload.source !== 'agent') throw new Error('expected agent fixture');
     const assistantId = useChatStore.getState().startAssistantMessage('assistant-cancelled-error');
@@ -138,6 +138,19 @@ describe('canonical chat event v4 contract', () => {
     } as ChatEventEnvelope;
 
     handleChatEventEnvelope(cancelledError, refs);
+    expect(useChatStore.getState().runStatus).toBe('running');
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    expect(refs.assistantIdRef.current).toBe(assistantId);
+    expect(refs.isCancelledRef.current).toBe(true);
+
+    handleChatEventEnvelope(
+      {
+        ...base,
+        sequence: 2,
+        payload: { source: 'turn_status', event: { status: 'cancelled' } },
+      } as ChatEventEnvelope,
+      refs
+    );
     expect(useChatStore.getState().runStatus).toBe('cancelled');
     expect(useChatStore.getState().isStreaming).toBe(false);
   });
@@ -170,6 +183,9 @@ describe('canonical chat event v4 contract', () => {
     } as ChatEventEnvelope;
 
     handleChatEventEnvelope(cancelled, refs);
+    expect(useChatStore.getState().runStatus).toBe('running');
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    expect(refs.assistantIdRef.current).toBe(assistantId);
     handleChatEventEnvelope(contradictoryTerminal, refs);
     handleChatEventEnvelope(lateToken, refs);
 

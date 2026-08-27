@@ -111,7 +111,7 @@ describe('chat and TaskRuntime lifecycle separation', () => {
     });
   });
 
-  it('keeps partial output and the failed terminal state on an error event', () => {
+  it('keeps partial output active until turn_status settles an error event', () => {
     const assistantId = useChatStore.getState().startAssistantMessage('assistant-1');
     useChatStore.getState().appendToken(assistantId, 'partial answer');
     const context = {
@@ -124,11 +124,18 @@ describe('chat and TaskRuntime lifecycle separation', () => {
 
     handleChatEvent({ type: 'error', message: 'provider disconnected' }, context);
 
-    const state = useChatStore.getState();
-    expect(state.runStatus).toBe('failed');
-    expect(state.messages.at(-1)?.content).toContain('partial answer');
-    expect(state.messages.at(-1)?.content).toContain('[Error] provider disconnected');
-    expect(state.messages.at(-1)?.isStreaming).toBe(false);
+    expect(useChatStore.getState().runStatus).toBe('running');
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    expect(useChatStore.getState().messages.at(-1)?.content).toContain('partial answer');
+    expect(useChatStore.getState().messages.at(-1)?.content).toContain(
+      '[Error] provider disconnected'
+    );
+    expect(useChatStore.getState().messages.at(-1)?.isStreaming).toBe(true);
+
+    handleChatEvent({ type: 'run_status', status: 'failed' }, context);
+    handleChatEvent({ type: 'done' }, context);
+    expect(useChatStore.getState().runStatus).toBe('failed');
+    expect(useChatStore.getState().isStreaming).toBe(false);
   });
 
   it('queues concurrent HITL requests and removes only the exact request id', () => {
@@ -186,7 +193,7 @@ describe('chat and TaskRuntime lifecycle separation', () => {
     expect(useChatStore.getState().runStatus).toBe('running');
   });
 
-  it('clears every projected HITL request only on a real terminal event', () => {
+  it('clears every projected HITL request only on typed turn_status', () => {
     useChatStore.getState().enqueueHitlRequest({
       kind: 'input',
       requestId: 'input-terminal',
@@ -202,6 +209,11 @@ describe('chat and TaskRuntime lifecycle separation', () => {
 
     handleChatEvent({ type: 'cancelled' }, context);
 
+    expect(useChatStore.getState().pendingHitlRequests).toHaveLength(1);
+    expect(useChatStore.getState().runStatus).toBe('waiting_input');
+
+    handleChatEvent({ type: 'run_status', status: 'cancelled' }, context);
+    handleChatEvent({ type: 'done' }, context);
     expect(useChatStore.getState().pendingHitlRequests).toEqual([]);
     expect(useChatStore.getState().runStatus).toBe('cancelled');
   });

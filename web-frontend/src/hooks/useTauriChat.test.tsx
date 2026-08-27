@@ -648,6 +648,81 @@ describe('useTauriChat foreground turn recovery', () => {
     hook.unmount();
   });
 
+  it('does not cancel or fail a replay with no active snapshot and no terminal fact', async () => {
+    const conversationId = 'conversation-inactive-partial-replay';
+    const rootTurnId = 'inactive-partial-turn';
+    useConversationStore.setState({ activeId: conversationId });
+    useChatStore.getState().startAssistantMessage(rootTurnId);
+    const replay: ChatEventReplay = {
+      events: [
+        agentEnvelope(
+          rootTurnId,
+          1,
+          { type: 'token', data: 'durable partial output' },
+          conversationId,
+          rootTurnId
+        ),
+      ],
+      retained_earliest_cursor: 1,
+      returned_earliest_cursor: 1,
+      latest_cursor: 1,
+      truncated: false,
+    };
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replay_chat_events') return replay;
+      return null;
+    });
+
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(useChatStore.getState().runStatus).toBe('idle'));
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(useChatStore.getState().messages.at(-1)?.content).toBe('durable partial output');
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('cancel_chat', expect.anything());
+    hook.unmount();
+  });
+
+  it('keeps exact control refs until turn_status follows a final answer', async () => {
+    const conversationId = 'conversation-final-before-status';
+    const snapshot = { ...activeSnapshot, conversation_id: conversationId };
+    useConversationStore.setState({ activeId: conversationId });
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return snapshot;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'cancel_chat') {
+        return { success: true, turn_id: snapshot.root_turn_id, status: 'cancelled' };
+      }
+      return null;
+    });
+
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(mocks.listeners.has('chat://event')).toBe(true));
+    act(() => {
+      mocks.listeners.get('chat://event')?.({
+        payload: agentEnvelope(
+          snapshot.active_turn_id,
+          1,
+          { type: 'final_answer', data: 'answer before settlement' },
+          conversationId,
+          snapshot.root_turn_id
+        ),
+      });
+    });
+    expect(useChatStore.getState().runStatus).toBe('running');
+    expect(useChatStore.getState().isStreaming).toBe(true);
+
+    await act(async () => {
+      await hook.result.current.cancel();
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('cancel_chat', {
+      workspaceId: 'global',
+      conversationId,
+      expectedRootTurnId: snapshot.root_turn_id,
+      expectedActiveTurnId: snapshot.active_turn_id,
+    });
+    hook.unmount();
+  });
+
   it('ignores a late remount replay after a newer turn starts in the same conversation', async () => {
     const conversationId = 'conversation-replay-race';
     const oldRootTurnId = 'old-turn';
@@ -741,12 +816,12 @@ describe('useTauriChat foreground turn recovery', () => {
     });
     act(() => {
       mocks.listeners.get('chat://event')?.({
-        payload: agentEnvelope(
+        payload: turnStatusEnvelope(
           activeSnapshot.active_turn_id,
+          activeSnapshot.root_turn_id,
           1,
-          { type: 'cancelled' },
-          activeSnapshot.conversation_id,
-          activeSnapshot.root_turn_id
+          'cancelled',
+          activeSnapshot.conversation_id
         ),
       });
     });
@@ -763,7 +838,7 @@ describe('useTauriChat foreground turn recovery', () => {
     hook.unmount();
   });
 
-  it('settles stale UI state when no active backend turn can be recovered', async () => {
+  it('clears transient UI without fabricating failure when no active turn is recovered', async () => {
     mocks.apiInvoke.mockResolvedValue(null);
     const hook = renderHook(() => useTauriChat());
     await act(async () => {
@@ -771,7 +846,7 @@ describe('useTauriChat foreground turn recovery', () => {
     });
     expect(useToastStore.getState().toasts).toEqual([]);
     expect(mocks.apiInvoke).not.toHaveBeenCalledWith('cancel_chat', expect.anything());
-    expect(useChatStore.getState().runStatus).toBe('failed');
+    expect(useChatStore.getState().runStatus).toBe('idle');
     expect(useChatStore.getState().isStreaming).toBe(false);
     expect(useChatStore.getState().isCancelled).toBe(false);
     hook.unmount();
@@ -838,7 +913,7 @@ describe('useTauriChat foreground turn recovery', () => {
     hook.unmount();
   });
 
-  it('settles stale UI without a Stop error when terminal replay is unavailable', async () => {
+  it('clears transient UI without inventing an outcome when terminal replay is unavailable', async () => {
     const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const conversationId = 'conversation-stop-replay-failure';
     const rootTurnId = 'root-stop-replay-failure';
@@ -875,7 +950,7 @@ describe('useTauriChat foreground turn recovery', () => {
     });
 
     expect(useToastStore.getState().toasts).toEqual([]);
-    expect(useChatStore.getState().runStatus).toBe('failed');
+    expect(useChatStore.getState().runStatus).toBe('idle');
     expect(useChatStore.getState().isStreaming).toBe(false);
     expect(consoleWarn).toHaveBeenCalledWith(
       '[TauriChat] Failed to reconcile an already-settled turn:',

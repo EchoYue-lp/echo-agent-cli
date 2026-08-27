@@ -9,7 +9,6 @@
 
 import { useChatStore } from '../stores/chatStore';
 import type { AgentEvent, ChatEvent, ChatEventEnvelope, ChatRunStatus } from '../types/api';
-import { recordTerminalStatusForTurn, terminalStatusForTurn } from './chatEventSequencer';
 
 interface EventContext {
   assistantIdRef: React.MutableRefObject<string | null>;
@@ -21,36 +20,13 @@ interface EventContext {
 
 export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventContext): void {
   const payload = envelope.payload;
-  const terminalAlreadyEstablished =
-    terminalStatusForTurn(envelope.stream_id, envelope.turn_id) !== null;
-  if (
-    terminalAlreadyEstablished &&
-    payload.source !== 'agent' &&
-    payload.source !== 'turn_status' &&
-    payload.source !== 'command_cell_started' &&
-    payload.source !== 'command_cell_settled' &&
-    payload.source !== 'awaiter_result_ready' &&
-    payload.source !== 'awaiter_result_delivery_started' &&
-    payload.source !== 'awaiter_result_acknowledged'
-  ) {
-    return;
-  }
   switch (payload.source) {
     case 'agent': {
-      if (terminalAlreadyEstablished) return;
       handleAgentEvent(payload.event.payload, ctx);
       break;
     }
     case 'turn_status': {
       const terminalStatus = turnTerminalStatus(payload.event.status);
-      if (!terminalStatus && terminalAlreadyEstablished) return;
-      if (
-        terminalStatus &&
-        !recordTerminalStatusForTurn(envelope.stream_id, envelope.turn_id, terminalStatus)
-      ) {
-        handleChatEvent({ type: 'done' }, ctx);
-        return;
-      }
       handleChatEvent({ type: 'run_status', status: payload.event.status }, ctx);
       if (terminalStatus) handleChatEvent({ type: 'done' }, ctx);
       break;
@@ -328,21 +304,13 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     case 'error': {
       ctx.isCancelledRef.current = true;
       if (ctx.assistantIdRef.current) {
-        store.failAssistantMessage(ctx.assistantIdRef.current, event.message);
-      } else {
-        store.setRunStatus('failed');
+        store.projectAssistantError(ctx.assistantIdRef.current, event.message);
       }
-      ctx.assistantIdRef.current = null;
       break;
     }
     case 'cancelled': {
-      store.setRunStatus('cancelled');
-      if (ctx.assistantIdRef.current) {
-        store.settleAssistantMessage(ctx.assistantIdRef.current);
-      }
-      ctx.assistantIdRef.current = null;
-      // Preserve the local guard until TurnStatus closes the stream. This
-      // rejects late deltas while still allowing the canonical status to win.
+      // Reject late deltas, but leave lifecycle state and control refs intact
+      // until the canonical turn_status fact closes the turn.
       ctx.isCancelledRef.current = true;
       break;
     }

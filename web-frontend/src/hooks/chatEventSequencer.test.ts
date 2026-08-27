@@ -3,9 +3,7 @@ import type { ChatEventEnvelope } from '../types/api';
 import {
   ChatEventSequencer,
   forgetChatEventStream,
-  recordTerminalStatusForTurn,
   resetChatEventCursorsForTest,
-  terminalStatusForTurn,
 } from './chatEventSequencer';
 
 const envelope = (sequence: number): ChatEventEnvelope => ({
@@ -82,27 +80,6 @@ describe('ChatEventSequencer', () => {
 
     expect(applied).toEqual([1, 1, 2]);
     expect(sequencer.cursor('conversation:one')).toBe(2);
-  });
-
-  it('preserves terminal monotonicity across remount and clears it with stream deletion', () => {
-    expect(recordTerminalStatusForTurn('conversation:one', 'turn-1', 'cancelled')).toBe(true);
-
-    const remounted = new ChatEventSequencer();
-    expect(remounted.cursor('conversation:one')).toBe(0);
-    expect(terminalStatusForTurn('conversation:one', 'turn-1')).toBe('cancelled');
-    expect(recordTerminalStatusForTurn('conversation:one', 'turn-1', 'completed')).toBe(false);
-
-    forgetChatEventStream('conversation:one');
-    expect(terminalStatusForTurn('conversation:one', 'turn-1')).toBeNull();
-  });
-
-  it('does not let an older turn erase a newer turn terminal', () => {
-    expect(recordTerminalStatusForTurn('conversation:one', 'turn-b', 'failed')).toBe(true);
-    expect(recordTerminalStatusForTurn('conversation:one', 'turn-a', 'completed')).toBe(true);
-
-    expect(terminalStatusForTurn('conversation:one', 'turn-b')).toBe('failed');
-    expect(recordTerminalStatusForTurn('conversation:one', 'turn-b', 'completed')).toBe(false);
-    expect(terminalStatusForTurn('conversation:one', 'turn-a')).toBe('completed');
   });
 
   it('advances the cursor without projecting an observed older turn over the latest turn', () => {

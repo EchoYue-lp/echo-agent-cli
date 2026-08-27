@@ -4,34 +4,9 @@ import type { ChatEventEnvelope, ChatEventReplay } from '../types/api';
 // must survive as well. Otherwise replay can apply the same material event twice.
 const appliedCursorByStream = new Map<string, number>();
 const generationByStream = new Map<string, number>();
-type TerminalChatStatus = 'completed' | 'failed' | 'cancelled';
-const MAX_TERMINAL_TURNS_PER_STREAM = 64;
-const terminalByStream = new Map<string, Map<string, TerminalChatStatus>>();
 const MAX_OBSERVED_TURNS_PER_STREAM = 256;
 const latestTurnByStream = new Map<string, string>();
 const observedTurnsByStream = new Map<string, Map<string, true>>();
-
-export function terminalStatusForTurn(streamId: string, turnId: string): TerminalChatStatus | null {
-  return terminalByStream.get(streamId)?.get(turnId) ?? null;
-}
-
-export function recordTerminalStatusForTurn(
-  streamId: string,
-  turnId: string,
-  status: TerminalChatStatus
-): boolean {
-  const current = terminalStatusForTurn(streamId, turnId);
-  if (current) return current === status;
-  const terminals = terminalByStream.get(streamId) ?? new Map<string, TerminalChatStatus>();
-  terminals.set(turnId, status);
-  while (terminals.size > MAX_TERMINAL_TURNS_PER_STREAM) {
-    const oldestTurnId = terminals.keys().next().value;
-    if (typeof oldestTurnId !== 'string') break;
-    terminals.delete(oldestTurnId);
-  }
-  terminalByStream.set(streamId, terminals);
-  return true;
-}
 
 export class ChatEventSequencer {
   private pendingByStream = new Map<string, Map<number, ChatEventEnvelope>>();
@@ -111,7 +86,6 @@ function shouldProjectTurn(streamId: string, turnId: string): boolean {
 /** Forget a deleted stream so a later conversation with the same ID starts at cursor zero. */
 export function forgetChatEventStream(streamId: string): void {
   appliedCursorByStream.delete(streamId);
-  terminalByStream.delete(streamId);
   latestTurnByStream.delete(streamId);
   observedTurnsByStream.delete(streamId);
   generationByStream.set(streamId, (generationByStream.get(streamId) ?? 0) + 1);
@@ -120,7 +94,6 @@ export function forgetChatEventStream(streamId: string): void {
 export function resetChatEventCursorsForTest(): void {
   appliedCursorByStream.clear();
   generationByStream.clear();
-  terminalByStream.clear();
   latestTurnByStream.clear();
   observedTurnsByStream.clear();
 }
