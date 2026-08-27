@@ -498,7 +498,10 @@ impl AgentControlService {
                 self.conversation_workspace_id.as_deref(),
             ) {
                 let conversations = store
-                    .list_conversations(ConversationFilter::default())
+                    .list_conversations(ConversationFilter {
+                        limit: Some(MAX_LIST_LIMIT),
+                        ..ConversationFilter::default()
+                    })
                     .await
                     .map_err(|error| AgentControlError::Runtime(error.to_string()))?;
                 let workspace = WorkspaceId::from_raw(workspace_id.to_string());
@@ -525,9 +528,16 @@ impl AgentControlService {
                     target: ConversationTarget {
                         workspace_id: address.workspace_id.to_string(),
                         conversation_id: address.conversation_id.clone(),
-                        workspace_generation: None,
+                        workspace_generation: self
+                            .workspace_generation(address.workspace_id.as_str())
+                            .await,
                     },
                 };
+                if let AgentTarget::Conversation { target } = &target
+                    && target.workspace_generation.is_none()
+                {
+                    continue;
+                }
                 match self.require_readable_target(&target).await {
                     Ok(()) => {}
                     Err(AgentControlError::TargetUnavailable(_)) => continue,
@@ -606,9 +616,16 @@ impl AgentControlService {
                             plan_revision,
                             execution_id: subagent.subagent_run_id.clone(),
                             attempt: subagent.attempt,
-                            workspace_generation: None,
+                            workspace_generation: self
+                                .workspace_generation(&run.workspace_id)
+                                .await,
                         },
                     };
+                    if let AgentTarget::TaskSubagent { target } = &target
+                        && target.workspace_generation.is_none()
+                    {
+                        continue;
+                    }
                     let status = subagent.status.as_str().to_string();
                     if request
                         .status
@@ -679,7 +696,7 @@ impl AgentControlService {
                 // Inspection is valid for a settled attempt as well as a live
                 // one; exact_subagent below enforces identity without
                 // requiring Running status.
-                self.validate_task_target(task, false, false).await?;
+                self.validate_observable_task_target(task).await?;
                 let subagent = self.exact_subagent(task).await?;
                 let events = self.list_events(&task.run_id, 0).await?;
                 let latest = events
@@ -914,7 +931,7 @@ impl AgentControlService {
         for target in &request.targets {
             self.validate_target(target).await?;
             if let AgentTarget::TaskSubagent { target } = target {
-                self.validate_task_target(target, false, false).await?;
+                self.validate_observable_task_target(target).await?;
                 self.exact_subagent(target).await?;
             }
             self.require_readable_target(target).await?;
@@ -1046,13 +1063,22 @@ impl AgentControlService {
                 self.validate_workspace_generation(
                     &target.workspace_id,
                     target.workspace_generation.as_deref(),
-                )?;
+                )
+                .await?;
                 Ok(())
             }
             AgentTarget::TaskSubagent { target } => {
-                self.validate_task_target(target, false, false).await
+                self.validate_observable_task_target(target).await
             }
         }
+    }
+
+    async fn validate_observable_task_target(
+        &self,
+        target: &TaskSubagentTarget,
+    ) -> Result<(), AgentControlError> {
+        self.validate_task_target_impl(target, false, false, true)
+            .await
     }
 
     async fn require_readable_target(&self, target: &AgentTarget) -> Result<(), AgentControlError> {
@@ -1095,6 +1121,17 @@ impl AgentControlService {
         require_active: bool,
         reject_terminal: bool,
     ) -> Result<(), AgentControlError> {
+        self.validate_task_target_impl(target, require_active, reject_terminal, false)
+            .await
+    }
+
+    async fn validate_task_target_impl(
+        &self,
+        target: &TaskSubagentTarget,
+        require_active: bool,
+        reject_terminal: bool,
+        allow_historical_revision: bool,
+    ) -> Result<(), AgentControlError> {
         for (field, value) in [
             ("workspace_id", target.workspace_id.as_str()),
             ("run_id", target.run_id.as_str()),
@@ -1125,7 +1162,8 @@ impl AgentControlService {
         self.validate_workspace_generation(
             &run.workspace_id,
             target.workspace_generation.as_deref(),
-        )?;
+        )
+        .await?;
         if run.workspace_id != target.workspace_id {
             return Err(AgentControlError::TargetUnavailable(format!(
                 "TaskRun {} belongs to workspace {}, not {}",
@@ -1146,14 +1184,14 @@ impl AgentControlService {
         let plan = self.get_plan(&target.run_id).await?.ok_or_else(|| {
             AgentControlError::TargetUnavailable(format!("plan for {}", target.run_id))
         })?;
-        if plan.revision != target.plan_revision {
+        if !allow_historical_revision && plan.revision != target.plan_revision {
             return Err(AgentControlError::WrongRevision {
                 run_id: target.run_id.clone(),
                 expected: target.plan_revision,
                 current: plan.revision,
             });
         }
-        if !plan.tasks.iter().any(|task| task.id == target.task_id) {
+        if !allow_historical_revision && !plan.tasks.iter().any(|task| task.id == target.task_id) {
             return Err(AgentControlError::TargetUnavailable(format!(
                 "task {} in run {}",
                 target.task_id, target.run_id
@@ -1232,7 +1270,7 @@ impl AgentControlService {
         Ok(AgentAddress::new(workspace, target.conversation_id.clone()))
     }
 
-    fn validate_workspace_generation(
+    async fn validate_workspace_generation(
         &self,
         workspace_id: &str,
         generation: Option<&str>,
@@ -1248,18 +1286,40 @@ impl AgentControlService {
                 workspace_id: workspace_id.to_string(),
             });
         }
-        let workspace = self
-            .workspace_registry
-            .inspect(&WorkspaceId::from_raw(workspace_id.to_string()))
-            .map_err(|_| AgentControlError::WrongWorkspaceGeneration {
-                workspace_id: workspace_id.to_string(),
-            })?;
-        if workspace.opaque_product_data_generation() != generation {
+        let registry = Arc::clone(&self.workspace_registry);
+        let workspace_id_owned = workspace_id.to_string();
+        let current = tokio::task::spawn_blocking(move || {
+            registry
+                .inspect(&WorkspaceId::from_raw(workspace_id_owned))
+                .ok()
+                .map(|workspace| workspace.opaque_product_data_generation())
+        })
+        .await
+        .ok()
+        .flatten();
+        if current.as_deref() != Some(generation) {
             return Err(AgentControlError::WrongWorkspaceGeneration {
                 workspace_id: workspace_id.to_string(),
             });
         }
         Ok(())
+    }
+
+    async fn workspace_generation(&self, workspace_id: &str) -> Option<String> {
+        if workspace_id == "global" {
+            return Some("global".to_string());
+        }
+        let registry = Arc::clone(&self.workspace_registry);
+        let workspace_id = workspace_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            registry
+                .inspect(&WorkspaceId::from_raw(workspace_id))
+                .ok()
+                .map(|workspace| workspace.opaque_product_data_generation())
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     fn validate_text(&self, text: &str) -> Result<(), AgentControlError> {
@@ -2017,6 +2077,13 @@ mod tests {
             .await
             .map_err(|e| e.to_string())?;
         assert_eq!(listed.count, 2);
+        assert!(listed.entries.iter().all(|entry| {
+            matches!(
+                &entry.target,
+                AgentTarget::Conversation { target }
+                    if target.workspace_generation.as_deref() == Some("global")
+            )
+        }));
         let inspected = service
             .inspect(target.clone())
             .await

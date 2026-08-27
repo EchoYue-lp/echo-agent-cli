@@ -36,7 +36,10 @@ durable inbox、`SubagentControlService` 的 exact-attempt guidance/interrupt、
 - 工具通过 `AppState::register_agent_control_tools` 在共享 ToolManager 上注册，故
   GUI/TUI/CLI/channel、global pool 与 workspace pool 共用同一套 schema 和
   router/registry authority；每个 pool 绑定自己的 TaskRuntimeStore，follow-up 复用 AppState
-  的既有 delivery supervisor wake。
+  的既有 delivery supervisor wake。每个注册的 `AgentControlService` 是单 workspace
+  scope：global primary 与各 workspace pooled primary 分别绑定自己的 TaskRuntimeStore /
+  ConversationStore；跨 workspace target 不在 service 内动态 retarget，而是 typed
+  `target_unavailable` fail-closed，调用方必须先取得目标 workspace 的 scoped primary。
 
 ## 分层与取舍
 
@@ -49,8 +52,10 @@ durable inbox、`SubagentControlService` 的 exact-attempt guidance/interrupt、
 
 模型获得统一且有界的协作控制面；surface 不再需要各自解析 Agent 地址或实现第二套
 list/message/wait。Conversation 的存在性由绑定 workspace `ConversationStore` 判定，Router
-只负责 inbox/journal；list 会过滤 router-only phantom target。TaskRuntime 的所有读操作
-经 `TaskRuntimeBlockingAdapter` 离开 async executor；当前底层 `list_events`/
+只负责 inbox/journal；list 会过滤 router-only phantom target，并为每个列出的 target
+写入当前 workspace generation（global 使用固定 `global`）。WorkspaceRegistry generation
+读取通过 blocking boundary 完成。TaskRuntime 的所有读操作经
+`TaskRuntimeBlockingAdapter` 离开 async executor；当前底层 `list_events`/
 `list_subagent_runs` API 仍返回完整向量，adapter 保证 exact-target 过滤发生在
 `MAX_EVENTS` 截断之前，避免 false timeout；新增真正的 bounded query API 留作 R1/P0
 integration，不能在本 ADR 中伪称已解决。
