@@ -1946,6 +1946,14 @@ fn queue_steer_follow_up(
     );
 }
 
+fn queue_prepared_steer_follow_up(app: &mut TuiApp, turn: QueuedTurn) {
+    app.queued_turns.push_back(turn);
+    app.status_msg = format!(
+        "Current stage is not steerable; queued {} follow-up(s)",
+        app.queued_turns.len()
+    );
+}
+
 fn slash_command_allowed_while_busy(text: &str) -> bool {
     let command = text.split_whitespace().next().unwrap_or("");
     matches!(
@@ -5261,6 +5269,15 @@ async fn handle_slash_command(
                     return;
                 }
             };
+            let retry_turn = queued_turn_from_prepared(
+                &QueuedTurn {
+                    text: instruction.to_string(),
+                    attachments: attachments.clone(),
+                    interaction_mode: app.interaction_mode,
+                    run_resume: None,
+                },
+                &prepared,
+            );
             let message = match prepared.to_message() {
                 Ok(message) => message,
                 Err(error) => {
@@ -5268,34 +5285,42 @@ async fn handle_slash_command(
                         role: MessageRole::System,
                         content: format!("Failed to build steer message: {error}"),
                     });
-                    app.pending_attachments = attachments;
+                    queue_prepared_steer_follow_up(app, retry_turn);
                     return;
                 }
             };
             let Some(active_agent) = app.active_turn_agent.as_ref() else {
-                queue_steer_follow_up(app, instruction, attachments);
+                queue_prepared_steer_follow_up(app, retry_turn);
                 return;
             };
             match active_agent
-                .steer_input(Some(&snapshot.active_turn_id), message)
+                .steer_input_tracked(Some(&snapshot.active_turn_id), message)
                 .await
             {
-                Ok(turn_id) => {
-                    app.messages.push(ChatMessage {
-                        role: MessageRole::User,
-                        content: instruction.to_string(),
-                    });
-                    app.status_msg = format!("Guidance injected into turn {turn_id}");
-                }
+                Ok(mut receipt) => match receipt.wait_for_drained().await {
+                    echo_agent::agent::AgentSteerState::Drained
+                    | echo_agent::agent::AgentSteerState::TurnSettled { drained: true, .. } => {
+                        let turn_id = receipt.turn_id().to_string();
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::User,
+                            content: instruction.to_string(),
+                        });
+                        app.status_msg = format!("Guidance drained into turn {turn_id}");
+                    }
+                    echo_agent::agent::AgentSteerState::Accepted
+                    | echo_agent::agent::AgentSteerState::TurnSettled { drained: false, .. } => {
+                        queue_prepared_steer_follow_up(app, retry_turn);
+                    }
+                },
                 Err(
                     echo_agent::agent::TurnSteerError::NoActiveTurn
                     | echo_agent::agent::TurnSteerError::NotSteerable { .. }
                     | echo_agent::agent::TurnSteerError::TurnMismatch { .. },
                 ) => {
-                    queue_steer_follow_up(app, instruction, attachments);
+                    queue_prepared_steer_follow_up(app, retry_turn);
                 }
                 Err(error) => {
-                    app.pending_attachments = attachments;
+                    queue_prepared_steer_follow_up(app, retry_turn);
                     app.messages.push(ChatMessage {
                         role: MessageRole::System,
                         content: format!("Steer failed: {error}"),

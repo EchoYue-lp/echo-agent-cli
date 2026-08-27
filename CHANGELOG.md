@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- GUI, TUI, CLI, and channel active steering now use the framework tracked
+  receipt (`MailboxAccepted -> Drained -> TurnSettled`) through one
+  SubagentControl adapter. The legacy `Delivered` event remains a compatibility
+  mailbox-accepted projection; cold Conversation Agent receipt parity is
+  explicitly deferred to the next slice.
 - Channel now carries framework sender-scoped sessions through EKO AgentPool,
   TaskRun, cache, foreground control, exact resume, bounded outbound rendering,
   and bidirectional canonical tool identity quarantine. Framework session

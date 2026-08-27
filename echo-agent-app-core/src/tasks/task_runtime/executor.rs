@@ -4955,6 +4955,7 @@ async fn run_main_agent_task(
                     history: None,
                     runtime_state_id,
                     transcript_generation_id,
+                    input_lifecycle: None,
                     runtime: Some(echo_agent::tools::ExternalRunContext {
                         conversation_id: Some(run_record.conversation_id.clone()),
                         run_id: Some(run_id.clone()),
@@ -5286,6 +5287,7 @@ async fn drive_owned_agent_turn(
                 history: None,
                 runtime_state_id,
                 transcript_generation_id,
+                input_lifecycle: None,
                 runtime: Some(echo_agent::tools::ExternalRunContext {
                     conversation_id: Some(conversation_id),
                     run_id: Some(run_id.clone()),

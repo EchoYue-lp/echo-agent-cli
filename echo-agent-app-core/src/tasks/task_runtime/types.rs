@@ -686,6 +686,13 @@ pub enum RuntimeEventKind {
     SubagentGuidanceQueued,
     /// The framework accepted the instruction for live or next-attempt delivery.
     SubagentGuidanceDelivered,
+    /// The framework tracked mailbox confirmed that a live instruction was
+    /// inserted into the active turn's input queue.
+    SubagentGuidanceMailboxAccepted,
+    /// The tracked instruction reached the target model context.
+    SubagentGuidanceDrained,
+    /// The owning target turn reached its typed terminal outcome.
+    SubagentGuidanceSettled,
     /// The exact target rejected an instruction; it was not rerouted.
     SubagentGuidanceRejected,
     /// A user requested cancellation of one exact Subagent attempt.
@@ -771,6 +778,9 @@ impl RuntimeEventKind {
             SubagentReleased => "subagent_released",
             SubagentGuidanceQueued => "subagent_guidance_queued",
             SubagentGuidanceDelivered => "subagent_guidance_delivered",
+            SubagentGuidanceMailboxAccepted => "subagent_guidance_mailbox_accepted",
+            SubagentGuidanceDrained => "subagent_guidance_drained",
+            SubagentGuidanceSettled => "subagent_guidance_settled",
             SubagentGuidanceRejected => "subagent_guidance_rejected",
             SubagentInterruptRequested => "subagent_interrupt_requested",
             SubagentInterruptSettled => "subagent_interrupt_settled",
@@ -869,6 +879,9 @@ impl RuntimeEventKind {
             "subagent_released" => SubagentReleased,
             "subagent_guidance_queued" => SubagentGuidanceQueued,
             "subagent_guidance_delivered" => SubagentGuidanceDelivered,
+            "subagent_guidance_mailbox_accepted" => SubagentGuidanceMailboxAccepted,
+            "subagent_guidance_drained" => SubagentGuidanceDrained,
+            "subagent_guidance_settled" => SubagentGuidanceSettled,
             "subagent_guidance_rejected" => SubagentGuidanceRejected,
             "subagent_interrupt_requested" => SubagentInterruptRequested,
             "subagent_interrupt_settled" => SubagentInterruptSettled,
@@ -2375,6 +2388,51 @@ pub enum SubagentGuidanceKind {
     NextAttempt,
 }
 
+/// Product projection of the framework tracked receipt for one exact
+/// Subagent command. The framework remains the live authority; this value is
+/// only the durable app boundary exposed to surfaces and recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "SubagentControlPhase")]
+pub enum SubagentControlPhase {
+    Persisted,
+    MailboxAccepted,
+    Drained,
+    TurnSettled,
+}
+
+/// Terminal outcome of the owning framework turn, when one is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "SubagentControlOutcome")]
+pub enum SubagentControlOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+    Dropped,
+}
+
+impl SubagentControlOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Dropped => "dropped",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            "dropped" => Self::Dropped,
+            _ => return None,
+        })
+    }
+}
+
 impl SubagentGuidanceKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -2412,6 +2470,9 @@ impl SubagentControlStatus {
 pub struct SubagentControlReceipt {
     pub identity: SubagentControlIdentity,
     pub status: SubagentControlStatus,
+    pub phase: SubagentControlPhase,
+    pub outcome: Option<SubagentControlOutcome>,
+    pub drained: Option<bool>,
     pub detail: Option<String>,
     pub framework_turn_id: Option<String>,
 }

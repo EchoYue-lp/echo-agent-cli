@@ -958,6 +958,30 @@ fn settle_steer_attempt(
     }
 }
 
+async fn tracked_steer(
+    agent: &AgentHandle,
+    expected_turn_id: Option<&str>,
+    message: echo_agent::prelude::Message,
+) -> Result<String, echo_agent::agent::TurnSteerError> {
+    let mut receipt = agent.steer_input_tracked(expected_turn_id, message).await?;
+    match receipt.wait_for_drained().await {
+        echo_agent::agent::AgentSteerState::Drained
+        | echo_agent::agent::AgentSteerState::TurnSettled { drained: true, .. } => {
+            Ok(receipt.turn_id().to_string())
+        }
+        echo_agent::agent::AgentSteerState::Accepted => {
+            Err(echo_agent::agent::TurnSteerError::NotSteerable {
+                turn_id: receipt.turn_id().to_string(),
+            })
+        }
+        echo_agent::agent::AgentSteerState::TurnSettled { drained: false, .. } => {
+            Err(echo_agent::agent::TurnSteerError::NotSteerable {
+                turn_id: receipt.turn_id().to_string(),
+            })
+        }
+    }
+}
+
 async fn wait_for_queued_follow_up<F, I>(
     active: &mut ActiveReplTurn,
     hitl_rx: &mut tokio::sync::mpsc::UnboundedReceiver<
@@ -1896,7 +1920,7 @@ async fn route_active_input(
                         .filter(|snapshot| snapshot.root_turn_id == active.turn_id)
                         .map(|snapshot| snapshot.active_turn_id);
                     let steer = match active_turn_id.as_deref() {
-                        Some(turn_id) => agent.steer_input(Some(turn_id), message).await,
+                        Some(turn_id) => tracked_steer(agent, Some(turn_id), message).await,
                         None => Err(echo_agent::agent::TurnSteerError::NoActiveTurn),
                     };
                     match settle_steer_attempt(steer, fallback, queued) {

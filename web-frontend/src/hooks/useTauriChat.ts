@@ -15,7 +15,7 @@ import { viewAddress, viewAddressKey, workspaceIdForView } from '../lib/viewAddr
 import { handleChatEventEnvelope } from './chatEventHandler';
 import { ChatEventSequencer } from './chatEventSequencer';
 import { reorderById } from './queuedChat';
-import type { ForegroundTurnSnapshot } from '../generated';
+import type { ChatSteerReceipt, ForegroundTurnSnapshot } from '../generated';
 import type { Attachment, ChatEventEnvelope, ChatEventReplay, ToolExecution } from '../types/api';
 
 export type QueuedChatInput = {
@@ -920,7 +920,7 @@ export function useTauriChat() {
       const conversationId = useConversationStore.getState().activeId;
       if (!queued || !conversationId) return false;
       try {
-        const result = await apiInvoke<{ kind: string }>('steer_chat_message', {
+        const result = await apiInvoke<ChatSteerReceipt>('steer_chat_message', {
           workspaceId: queued.workspaceId,
           message: queued.text,
           attachments: queued.attachments,
@@ -928,7 +928,7 @@ export function useTauriChat() {
           expectedRootTurnId: currentMessageKeyRef.current,
           expectedActiveTurnId: activeTurnIdRef.current,
         });
-        if (result.kind !== 'accepted') {
+        if (result.kind !== 'accepted' || result.phase !== 'drained') {
           useToastStore.getState().addToast('info', '当前阶段不能插入，已保留在排队队列中');
           return false;
         }

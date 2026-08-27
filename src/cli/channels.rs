@@ -1990,13 +1990,15 @@ impl AppChannelMessageHandler {
                 let agent = execution.agent();
                 let active_agent_turn_id = channel_steer_target(&snapshot).to_string();
                 let response = match agent
-                    .steer_input(
+                    .steer_input_tracked(
                         Some(&active_agent_turn_id),
                         echo_agent::prelude::Message::user(argument.to_string()),
                     )
                     .await
                 {
-                    Ok(turn_id) => format!("Additional instruction accepted for {turn_id}."),
+                    Ok(receipt) => {
+                        format!("Additional instruction accepted for {}.", receipt.turn_id())
+                    }
                     Err(echo_agent::agent::TurnSteerError::NotSteerable { .. }) => {
                         "The active turn is not currently steerable; try again shortly.".to_string()
                     }
@@ -5012,14 +5014,19 @@ mod tests {
         };
         assert!(super::channel_snapshot_matches_root(&snapshot, "root-turn"));
         let steer_target = super::channel_steer_target(&snapshot).to_string();
-        let steered_turn = agent_for_steer
-            .steer_input(
+        let mut steer_receipt = agent_for_steer
+            .steer_input_tracked(
                 Some(&steer_target),
                 echo_agent::prelude::Message::user("steer continuation".to_string()),
             )
             .await
             .map_err(|error| error.to_string())?;
-        assert_eq!(steered_turn, "continuation-turn");
+        assert!(matches!(
+            steer_receipt.state(),
+            echo_agent::agent::AgentSteerState::Accepted
+                | echo_agent::agent::AgentSteerState::Drained
+        ));
+        assert_eq!(steer_receipt.turn_id(), "continuation-turn");
         let accepted_but_not_settled = foreground_turns
             .snapshot_scoped(
                 &workspace_id,
@@ -5045,6 +5052,16 @@ mod tests {
                 settlement.outcome
             ));
         }
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            steer_receipt.wait_for_turn_settled(),
+        )
+        .await
+        .map_err(|_| "tracked channel steer did not settle".to_string())?;
+        assert!(matches!(
+            settled,
+            echo_agent::agent::AgentSteerState::TurnSettled { .. }
+        ));
         let _driver_outcome = tokio::time::timeout(std::time::Duration::from_secs(2), driver)
             .await
             .map_err(|_| "cancelled channel driver did not settle".to_string())?

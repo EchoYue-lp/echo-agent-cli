@@ -1659,6 +1659,7 @@ async fn drive_chat_inner(
             history: None,
             runtime_state_id,
             transcript_generation_id,
+            input_lifecycle: None,
             runtime: Some(echo_agent::tools::ExternalRunContext {
                 conversation_id,
                 // A real pre-created Task-mode run is value-carried across

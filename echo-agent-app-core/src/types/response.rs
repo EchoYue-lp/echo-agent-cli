@@ -5,6 +5,50 @@ use serde::Serialize;
 use serde_json::Value;
 use ts_rs::TS;
 
+/// Lifecycle phase returned by the GUI active-steer command. The command
+/// waits for the framework tracked receipt and never reports an unconfirmed
+/// mailbox as a successful continuation.
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "ChatSteerPhase")]
+pub enum ChatSteerPhase {
+    Drained,
+    TurnSettled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "ChatSteerOutcome")]
+pub enum ChatSteerOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+    Dropped,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "ChatSteerKind")]
+pub enum ChatSteerKind {
+    Accepted,
+    Settled,
+    NotSteerable,
+    NoActiveTurn,
+    TurnMismatch,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, rename = "ChatSteerReceipt")]
+pub struct ChatSteerReceipt {
+    pub kind: ChatSteerKind,
+    pub phase: Option<ChatSteerPhase>,
+    pub turn_id: Option<String>,
+    pub outcome: Option<ChatSteerOutcome>,
+    pub expected: Option<String>,
+    pub actual: Option<String>,
+    pub cleanup_error: Option<String>,
+}
+
 // ── 对话相关 ─────────────────────────────────────────────────
 
 /// POST /api/chat 响应

@@ -449,7 +449,7 @@ describe('useTauriChat foreground turn recovery', () => {
         };
       }
       if (command === 'steer_chat_message') {
-        return { kind: 'accepted', turn_id: activeSnapshot.active_turn_id };
+        return { kind: 'accepted', phase: 'drained', turn_id: activeSnapshot.active_turn_id };
       }
       return { success: true };
     });
@@ -492,6 +492,60 @@ describe('useTauriChat foreground turn recovery', () => {
       mocks.apiInvoke.mock.calls.filter(([command]) => command === 'remove_queued_chat_input')
     ).toHaveLength(1);
     expect(useChatStore.getState().runStatus).toBe('running');
+    hook.unmount();
+  });
+
+  it('keeps a queued item when tracked steer settles before a new continuation', async () => {
+    const conversationId = 'conversation-steer-settled';
+    useConversationStore.setState({ activeId: conversationId });
+    mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'get_active_chat_turn') {
+        return { ...activeSnapshot, conversation_id: conversationId };
+      }
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return [];
+      if (command === 'queue_chat_input') {
+        return {
+          input_id: String(args?.inputId),
+          workspace_id: 'global',
+          conversation_id: conversationId,
+          text: String(args?.text),
+          attachments: [],
+          submitted_at_ms: 1,
+        };
+      }
+      if (command === 'steer_chat_message') {
+        return {
+          kind: 'settled',
+          phase: 'turn_settled',
+          turn_id: activeSnapshot.active_turn_id,
+          outcome: 'cancelled',
+        };
+      }
+      return { success: true };
+    });
+
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => {
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('list_queued_chat_inputs', {
+        workspaceId: 'global',
+        conversationId,
+      });
+    });
+    await act(async () => {
+      await hook.result.current.sendMessage('retain after settled steer');
+    });
+    const queuedId = hook.result.current.queuedInputs.at(0)?.id;
+    expect(queuedId).toBeTruthy();
+    await act(async () => {
+      await expect(hook.result.current.steerQueuedMessage(String(queuedId))).resolves.toBe(false);
+    });
+    expect(hook.result.current.queuedInputs).toEqual([
+      expect.objectContaining({ id: queuedId, backendManaged: true }),
+    ]);
+    expect(
+      mocks.apiInvoke.mock.calls.filter(([command]) => command === 'remove_queued_chat_input')
+    ).toHaveLength(0);
     hook.unmount();
   });
 

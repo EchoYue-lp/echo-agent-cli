@@ -16,6 +16,9 @@ use echo_agent_app_core::tool_execution::{ToolExecutionRepository, ToolExecution
 use echo_agent_app_core::tool_execution_projection::{
     ToolExecutionProjectionKind, ToolExecutionProjectionUpdate, ToolExecutionProjector,
 };
+use echo_agent_app_core::types::{
+    ChatSteerKind, ChatSteerOutcome, ChatSteerPhase, ChatSteerReceipt,
+};
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, MutexGuard as StdMutexGuard};
@@ -741,7 +744,7 @@ pub async fn steer_chat_message(
     conversation_id: String,
     expected_active_turn_id: String,
     attachments: Option<Vec<echo_agent_app_core::types::AttachmentData>>,
-) -> Result<serde_json::Value, IpcError> {
+) -> Result<ChatSteerReceipt, IpcError> {
     if message.trim().is_empty() && attachments.as_ref().is_none_or(Vec::is_empty) {
         return Err(IpcError::Validation("steer input is empty".to_string()));
     }
@@ -828,13 +831,68 @@ pub async fn steer_chat_message(
     };
     let agent = agent_execution.agent();
     let result = agent
-        .steer_input(Some(&expected_turn_id), steer_message)
+        .steer_input_tracked(Some(&expected_turn_id), steer_message)
         .await;
     match result {
-        Ok(turn_id) => Ok(serde_json::json!({
-            "kind": "accepted",
-            "turn_id": turn_id,
-        })),
+        Ok(mut receipt) => {
+            let state = receipt.wait_for_drained().await;
+            match state {
+                echo_agent::agent::AgentSteerState::Drained => Ok(ChatSteerReceipt {
+                    kind: ChatSteerKind::Accepted,
+                    phase: Some(ChatSteerPhase::Drained),
+                    turn_id: Some(receipt.turn_id().to_string()),
+                    outcome: None,
+                    expected: None,
+                    actual: None,
+                    cleanup_error: None,
+                }),
+                echo_agent::agent::AgentSteerState::TurnSettled {
+                    outcome,
+                    drained: true,
+                } => Ok(ChatSteerReceipt {
+                    kind: ChatSteerKind::Settled,
+                    phase: Some(ChatSteerPhase::TurnSettled),
+                    turn_id: Some(receipt.turn_id().to_string()),
+                    outcome: Some(chat_steer_outcome(outcome)),
+                    expected: None,
+                    actual: None,
+                    cleanup_error: None,
+                }),
+                echo_agent::agent::AgentSteerState::TurnSettled {
+                    outcome,
+                    drained: false,
+                } => {
+                    let cleanup_error = prepared
+                        .cleanup_resources(&spill_dir)
+                        .err()
+                        .map(|cleanup| cleanup.to_string());
+                    Ok(ChatSteerReceipt {
+                        kind: ChatSteerKind::Settled,
+                        phase: Some(ChatSteerPhase::TurnSettled),
+                        turn_id: Some(receipt.turn_id().to_string()),
+                        outcome: Some(chat_steer_outcome(outcome)),
+                        expected: None,
+                        actual: None,
+                        cleanup_error,
+                    })
+                }
+                echo_agent::agent::AgentSteerState::Accepted => {
+                    let cleanup_error = prepared
+                        .cleanup_resources(&spill_dir)
+                        .err()
+                        .map(|cleanup| cleanup.to_string());
+                    Ok(ChatSteerReceipt {
+                        kind: ChatSteerKind::NotSteerable,
+                        phase: None,
+                        turn_id: Some(receipt.turn_id().to_string()),
+                        outcome: None,
+                        expected: None,
+                        actual: None,
+                        cleanup_error,
+                    })
+                }
+            }
+        }
         Err(error) => {
             let cleanup = prepared
                 .cleanup_resources(&spill_dir)
@@ -846,27 +904,48 @@ pub async fn steer_chat_message(
                 .unwrap_or_default();
             match error {
                 echo_agent::agent::TurnSteerError::NotSteerable { turn_id } => {
-                    Ok(serde_json::json!({
-                        "kind": "not_steerable",
-                        "turn_id": turn_id,
-                        "cleanup_error": cleanup,
-                    }))
+                    Ok(ChatSteerReceipt {
+                        kind: ChatSteerKind::NotSteerable,
+                        phase: None,
+                        turn_id: Some(turn_id),
+                        outcome: None,
+                        expected: None,
+                        actual: None,
+                        cleanup_error: cleanup,
+                    })
                 }
-                echo_agent::agent::TurnSteerError::NoActiveTurn => Ok(serde_json::json!({
-                    "kind": "no_active_turn",
-                    "cleanup_error": cleanup,
-                })),
+                echo_agent::agent::TurnSteerError::NoActiveTurn => Ok(ChatSteerReceipt {
+                    kind: ChatSteerKind::NoActiveTurn,
+                    phase: None,
+                    turn_id: None,
+                    outcome: None,
+                    expected: None,
+                    actual: None,
+                    cleanup_error: cleanup,
+                }),
                 echo_agent::agent::TurnSteerError::TurnMismatch { expected, actual } => {
-                    Ok(serde_json::json!({
-                    "kind": "turn_mismatch",
-                    "expected": expected,
-                    "actual": actual,
-                    "cleanup_error": cleanup,
-                    }))
+                    Ok(ChatSteerReceipt {
+                        kind: ChatSteerKind::TurnMismatch,
+                        phase: None,
+                        turn_id: None,
+                        outcome: None,
+                        expected: Some(expected),
+                        actual: Some(actual),
+                        cleanup_error: cleanup,
+                    })
                 }
                 error => Err(IpcError::Validation(format!("{error}{suffix}"))),
             }
         }
+    }
+}
+
+fn chat_steer_outcome(outcome: echo_agent::agent::AgentSteerTurnOutcome) -> ChatSteerOutcome {
+    match outcome {
+        echo_agent::agent::AgentSteerTurnOutcome::Completed => ChatSteerOutcome::Completed,
+        echo_agent::agent::AgentSteerTurnOutcome::Failed => ChatSteerOutcome::Failed,
+        echo_agent::agent::AgentSteerTurnOutcome::Cancelled => ChatSteerOutcome::Cancelled,
+        echo_agent::agent::AgentSteerTurnOutcome::Dropped => ChatSteerOutcome::Dropped,
     }
 }
 

@@ -9,14 +9,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use echo_agent::agent::subagent::{
-    SubagentAttemptIdentity, SubagentControlPhase, SubagentExecutor,
+    SubagentAttemptIdentity, SubagentControlPhase as FrameworkSubagentControlPhase,
+    SubagentExecutor,
 };
 
 use super::run_authority::RuntimeJournalEvent;
 use super::store::{StoreError, TaskRuntimeStore};
 use super::types::{
-    RuntimeEventKind, SubagentControlActorSource, SubagentControlIdentity, SubagentControlReceipt,
-    SubagentControlStatus, SubagentGuidanceKind, TaskRunStatus,
+    RuntimeEventKind, SubagentControlActorSource, SubagentControlIdentity, SubagentControlOutcome,
+    SubagentControlPhase, SubagentControlReceipt, SubagentControlStatus, SubagentGuidanceKind,
+    TaskRunStatus,
 };
 
 #[derive(Clone)]
@@ -262,19 +264,20 @@ impl SubagentControlService {
         let delivery_instruction = instruction.clone();
         let delivery = match tokio::spawn(async move {
             delivery_executor
-                .send_message(
+                .send_message_tracked(
                     &delivery_execution_id,
                     delivery_attempt,
                     &delivery_instruction,
                 )
                 .await
-                .map(|receipt| receipt.turn_id)
                 .map_err(|error| error.to_string())
         })
         .await
         {
             Ok(delivery) => delivery,
-            Err(error) => Err(format!("framework Subagent guidance panicked: {error}")),
+            Err(error) => Err(format!(
+                "framework Subagent guidance task failed to join: {error}"
+            )),
         };
         let run_id = identity.run_id.clone();
         let settlement_identity = identity.clone();
@@ -290,26 +293,39 @@ impl SubagentControlService {
             let operation_run_id = run_id.clone();
             let operation_identity = settlement_identity.clone();
             let operation_delivery = delivery.clone();
-            match self
+            let settled = self
                 .blocking
                 .run_store("settle live Subagent guidance", move |store| {
                     store.with_run_lock(&operation_run_id, || match operation_delivery {
-                        Ok(turn_id) => {
-                            append_guidance_event(
-                                &store,
-                                &operation_identity,
-                                RuntimeEventKind::SubagentGuidanceDelivered,
-                                SubagentGuidanceKind::LiveMessage,
-                                actor_source,
-                                None,
-                                serde_json::json!({ "framework_turn_id": turn_id }),
+                        Ok(receipt) => {
+                            let turn_id = receipt.receipt().turn_id().to_string();
+                            store.commit_runtime_events(
+                                &operation_identity.run_id,
+                                vec![
+                                    guidance_event(
+                                        &operation_identity,
+                                        RuntimeEventKind::SubagentGuidanceMailboxAccepted,
+                                        SubagentGuidanceKind::LiveMessage,
+                                        actor_source,
+                                        None,
+                                        serde_json::json!({
+                                            "framework_turn_id": turn_id,
+                                        }),
+                                    ),
+                                    guidance_event(
+                                        &operation_identity,
+                                        RuntimeEventKind::SubagentGuidanceDelivered,
+                                        SubagentGuidanceKind::LiveMessage,
+                                        actor_source,
+                                        None,
+                                        serde_json::json!({
+                                            "framework_turn_id": turn_id,
+                                            "boundary": "mailbox_accepted",
+                                        }),
+                                    ),
+                                ],
                             )?;
-                            Ok(SubagentControlReceipt {
-                                identity: operation_identity,
-                                status: SubagentControlStatus::Delivered,
-                                detail: None,
-                                framework_turn_id: Some(turn_id),
-                            })
+                            Ok(Ok((receipt, turn_id)))
                         }
                         Err(detail) => {
                             append_guidance_event(
@@ -321,13 +337,34 @@ impl SubagentControlService {
                                 None,
                                 serde_json::json!({ "reason": detail }),
                             )?;
-                            Ok(rejected_receipt(operation_identity, detail))
+                            Ok(Err(detail))
                         }
                     })
                 })
-                .await
-            {
-                Ok(receipt) => return Ok(receipt),
+                .await;
+            match settled {
+                Ok(Ok((receipt, turn_id))) => {
+                    if let Err(error) = self.spawn_live_guidance_observer(
+                        settlement_identity.clone(),
+                        actor_source,
+                        receipt,
+                    ) {
+                        self.blocking
+                            .record_lifecycle_debt("observe Subagent guidance lifecycle", &error);
+                    }
+                    return Ok(SubagentControlReceipt {
+                        identity: settlement_identity,
+                        status: SubagentControlStatus::Delivered,
+                        phase: SubagentControlPhase::MailboxAccepted,
+                        outcome: None,
+                        drained: None,
+                        detail: None,
+                        framework_turn_id: Some(turn_id),
+                    });
+                }
+                Ok(Err(detail)) => {
+                    return Ok(rejected_receipt(settlement_identity, detail));
+                }
                 Err(error) => {
                     tracing::warn!(%error, command_id = %identity.command_id, "retrying live Subagent guidance settlement");
                     tokio::time::sleep(delay).await;
@@ -337,6 +374,79 @@ impl SubagentControlService {
                 }
             }
         }
+    }
+
+    /// Keep framework drain and turn settlement durable after the caller has
+    /// received mailbox acceptance. The framework receipt remains the only
+    /// real-time lifecycle authority; typed app events are a rebuildable EKO
+    /// projection and never drive delivery themselves.
+    fn spawn_live_guidance_observer(
+        &self,
+        identity: SubagentControlIdentity,
+        actor_source: SubagentControlActorSource,
+        receipt: echo_agent::agent::subagent::SubagentMessageReceipt,
+    ) -> Result<(), StoreError> {
+        let reservation = self
+            .blocking
+            .reserve_settlement("observe Subagent guidance lifecycle")?;
+        let blocking = self.blocking.clone();
+        let observer_blocking = blocking.clone();
+        let observer_identity = identity.clone();
+        self.blocking.spawn_reserved_settlement(
+            "observe Subagent guidance lifecycle",
+            reservation,
+            async move {
+                let mut receipt = receipt;
+                let drained = receipt.wait_for_drained().await;
+                let turn_id = receipt.receipt().turn_id().to_string();
+                if drained.was_drained() {
+                    let drained_identity = observer_identity.clone();
+                    let drained_turn_id = turn_id.clone();
+                    observer_blocking
+                        .run_store("persist Subagent guidance drain", move |store| {
+                            append_guidance_event(
+                                &store,
+                                &drained_identity,
+                                RuntimeEventKind::SubagentGuidanceDrained,
+                                SubagentGuidanceKind::LiveMessage,
+                                actor_source,
+                                None,
+                                serde_json::json!({
+                                    "framework_turn_id": drained_turn_id,
+                                    "drained": true,
+                                }),
+                            )
+                        })
+                        .await?;
+                }
+                let settled = receipt.wait_for_turn_settled().await;
+                let (outcome, drained) = match settled {
+                    echo_agent::agent::AgentSteerState::TurnSettled { outcome, drained } => {
+                        (framework_outcome_name(outcome), drained)
+                    }
+                    state => ("dropped".to_string(), state.was_drained()),
+                };
+                let settled_identity = observer_identity;
+                blocking
+                    .run_store("persist Subagent guidance settlement", move |store| {
+                        append_guidance_event(
+                            &store,
+                            &settled_identity,
+                            RuntimeEventKind::SubagentGuidanceSettled,
+                            SubagentGuidanceKind::LiveMessage,
+                            actor_source,
+                            None,
+                            serde_json::json!({
+                                "framework_turn_id": turn_id,
+                                "outcome": outcome,
+                                "drained": drained,
+                            }),
+                        )
+                    })
+                    .await
+            },
+        );
+        Ok(())
     }
 
     /// Interrupt one exact active attempt without pausing or cancelling its
@@ -488,6 +598,9 @@ impl SubagentControlService {
                         Ok(SubagentControlReceipt {
                             identity: operation_identity,
                             status: operation_status,
+                            phase: SubagentControlPhase::TurnSettled,
+                            outcome: None,
+                            drained: None,
                             detail: operation_detail,
                             framework_turn_id: None,
                         })
@@ -830,16 +943,50 @@ fn existing_receipt(
         .get("accepted")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
+    let phase = match last.event_type {
+        RuntimeEventKind::SubagentGuidanceMailboxAccepted => {
+            Some(SubagentControlPhase::MailboxAccepted)
+        }
+        RuntimeEventKind::SubagentGuidanceDrained => {
+            let drained = last
+                .payload
+                .get("drained")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            Some(if drained {
+                SubagentControlPhase::Drained
+            } else {
+                SubagentControlPhase::MailboxAccepted
+            })
+        }
+        RuntimeEventKind::SubagentGuidanceSettled => Some(SubagentControlPhase::TurnSettled),
+        RuntimeEventKind::SubagentGuidanceDelivered => Some(SubagentControlPhase::MailboxAccepted),
+        RuntimeEventKind::SubagentGuidanceRejected | RuntimeEventKind::SubagentInterruptSettled => {
+            Some(SubagentControlPhase::Persisted)
+        }
+        _ => None,
+    };
     let status = match last.event_type {
-        RuntimeEventKind::SubagentGuidanceDelivered => SubagentControlStatus::Delivered,
         RuntimeEventKind::SubagentGuidanceRejected => SubagentControlStatus::Rejected,
         RuntimeEventKind::SubagentInterruptSettled if accepted => SubagentControlStatus::Settled,
         RuntimeEventKind::SubagentInterruptSettled => SubagentControlStatus::Rejected,
+        RuntimeEventKind::SubagentGuidanceSettled => SubagentControlStatus::Settled,
+        RuntimeEventKind::SubagentGuidanceMailboxAccepted
+        | RuntimeEventKind::SubagentGuidanceDrained
+        | RuntimeEventKind::SubagentGuidanceDelivered => SubagentControlStatus::Delivered,
         _ => SubagentControlStatus::Pending,
     };
     Ok(Some(SubagentControlReceipt {
         identity: identity.clone(),
         status,
+        phase: phase.unwrap_or(SubagentControlPhase::Persisted),
+        outcome: payload_string(last, "outcome")
+            .as_deref()
+            .and_then(SubagentControlOutcome::parse),
+        drained: last
+            .payload
+            .get("drained")
+            .and_then(serde_json::Value::as_bool),
         detail: payload_string(last, "reason").or_else(|| payload_string(last, "terminal_status")),
         framework_turn_id: payload_string(last, "framework_turn_id"),
     }))
@@ -861,6 +1008,9 @@ fn command_states(
             RuntimeEventKind::SubagentGuidanceQueued
             | RuntimeEventKind::SubagentInterruptRequested => SubagentControlStatus::Pending,
             RuntimeEventKind::SubagentGuidanceDelivered => SubagentControlStatus::Delivered,
+            RuntimeEventKind::SubagentGuidanceMailboxAccepted
+            | RuntimeEventKind::SubagentGuidanceDrained => SubagentControlStatus::Delivered,
+            RuntimeEventKind::SubagentGuidanceSettled => SubagentControlStatus::Settled,
             RuntimeEventKind::SubagentGuidanceRejected => SubagentControlStatus::Rejected,
             RuntimeEventKind::SubagentInterruptSettled => SubagentControlStatus::Settled,
             _ => continue,
@@ -1015,6 +1165,9 @@ fn pending_receipt(identity: SubagentControlIdentity) -> SubagentControlReceipt 
     SubagentControlReceipt {
         identity,
         status: SubagentControlStatus::Pending,
+        phase: SubagentControlPhase::Persisted,
+        outcome: None,
+        drained: None,
         detail: None,
         framework_turn_id: None,
     }
@@ -1024,6 +1177,9 @@ fn rejected_receipt(identity: SubagentControlIdentity, detail: String) -> Subage
     SubagentControlReceipt {
         identity,
         status: SubagentControlStatus::Rejected,
+        phase: SubagentControlPhase::Persisted,
+        outcome: None,
+        drained: None,
         detail: Some(detail),
         framework_turn_id: None,
     }
@@ -1039,12 +1195,21 @@ fn parse_actor_source(value: &str) -> Option<SubagentControlActorSource> {
     }
 }
 
-fn phase_name(phase: SubagentControlPhase) -> &'static str {
+fn phase_name(phase: FrameworkSubagentControlPhase) -> &'static str {
     match phase {
-        SubagentControlPhase::Starting => "starting",
-        SubagentControlPhase::Running => "running",
-        SubagentControlPhase::InterruptRequested => "interrupt_requested",
-        SubagentControlPhase::Settled => "settled",
+        FrameworkSubagentControlPhase::Starting => "starting",
+        FrameworkSubagentControlPhase::Running => "running",
+        FrameworkSubagentControlPhase::InterruptRequested => "interrupt_requested",
+        FrameworkSubagentControlPhase::Settled => "settled",
+    }
+}
+
+fn framework_outcome_name(outcome: echo_agent::agent::AgentSteerTurnOutcome) -> String {
+    match outcome {
+        echo_agent::agent::AgentSteerTurnOutcome::Completed => "completed".to_string(),
+        echo_agent::agent::AgentSteerTurnOutcome::Failed => "failed".to_string(),
+        echo_agent::agent::AgentSteerTurnOutcome::Cancelled => "cancelled".to_string(),
+        echo_agent::agent::AgentSteerTurnOutcome::Dropped => "dropped".to_string(),
     }
 }
 
@@ -1132,6 +1297,32 @@ mod tests {
             expected_turn_id
                 .map(str::to_string)
                 .ok_or(echo_agent::agent::TurnSteerError::NoActiveTurn)
+        }
+
+        fn steer_input_tracked(
+            &self,
+            expected_turn_id: Option<&str>,
+            _message: echo_agent::prelude::Message,
+        ) -> Result<echo_agent::agent::AgentSteerReceipt, echo_agent::agent::TurnSteerError>
+        {
+            let turn_id = expected_turn_id
+                .map(str::to_string)
+                .ok_or(echo_agent::agent::TurnSteerError::NoActiveTurn)?;
+            let (sender, receiver) =
+                tokio::sync::watch::channel(echo_agent::agent::AgentSteerState::Accepted);
+            tokio::spawn(async move {
+                let _ = sender.send(echo_agent::agent::AgentSteerState::Drained);
+                tokio::task::yield_now().await;
+                let _ = sender.send(echo_agent::agent::AgentSteerState::TurnSettled {
+                    outcome: echo_agent::agent::AgentSteerTurnOutcome::Completed,
+                    drained: true,
+                });
+            });
+            Ok(echo_agent::agent::AgentSteerReceipt::new(
+                "test-steer".to_string(),
+                turn_id,
+                receiver,
+            ))
         }
     }
 
@@ -1383,7 +1574,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_message_receipt_stops_at_delivered_boundary() -> Result<(), String> {
+    async fn active_message_receipt_tracks_mailbox_drain_and_turn_settlement() -> Result<(), String>
+    {
         use echo_agent::agent::CancellationToken;
         use echo_agent::agent::subagent::{
             DispatchRequest, ExecutionMode as FrameworkExecutionMode, SubagentDefinition,
@@ -1498,6 +1690,115 @@ mod tests {
                 if matches!(*error, echo_agent::error::AgentError::Cancelled(_)) => {}
             Err(error) => return Err(format!("cancelled Subagent did not settle: {error}")),
         }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let events = loop {
+            let events = store
+                .list_events("run-live-message", 0)
+                .map_err(|error| error.to_string())?;
+            let lifecycle = events
+                .iter()
+                .filter(|event| {
+                    event
+                        .payload
+                        .get("command_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("message-1")
+                })
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>();
+            if lifecycle.contains(&RuntimeEventKind::SubagentGuidanceSettled) {
+                break lifecycle;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("tracked Subagent lifecycle observer did not settle".to_string());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        let event_types = events;
+        assert_eq!(
+            event_types,
+            vec![
+                RuntimeEventKind::SubagentGuidanceQueued,
+                RuntimeEventKind::SubagentGuidanceMailboxAccepted,
+                RuntimeEventKind::SubagentGuidanceDelivered,
+                RuntimeEventKind::SubagentGuidanceDrained,
+                RuntimeEventKind::SubagentGuidanceSettled,
+            ]
+        );
+        let replay = existing_receipt(
+            &store,
+            &SubagentControlIdentity {
+                run_id: "run-live-message".to_string(),
+                task_id: "task-1".to_string(),
+                execution_id: execution_id.to_string(),
+                plan_revision: 1,
+                attempt: 1,
+                command_id: "message-1".to_string(),
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "tracked receipt replay was missing".to_string())?;
+        assert_eq!(replay.status, SubagentControlStatus::Settled);
+        assert_eq!(replay.phase, SubagentControlPhase::TurnSettled);
+        assert_eq!(replay.outcome, Some(SubagentControlOutcome::Completed));
+        assert_eq!(replay.drained, Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_before_drain_keeps_mailbox_phase_without_drain_fact() -> Result<(), String> {
+        let store = store_with_plan("run-terminal-before-drain", &["task-1"])?;
+        let identity = identity("run-terminal-before-drain", "task-1", 1, "message-1");
+        store
+            .commit_runtime_events(
+                &identity.run_id,
+                vec![
+                    guidance_event(
+                        &identity,
+                        RuntimeEventKind::SubagentGuidanceMailboxAccepted,
+                        SubagentGuidanceKind::LiveMessage,
+                        SubagentControlActorSource::Gui,
+                        None,
+                        serde_json::json!({ "framework_turn_id": "turn-1" }),
+                    ),
+                    guidance_event(
+                        &identity,
+                        RuntimeEventKind::SubagentGuidanceDelivered,
+                        SubagentGuidanceKind::LiveMessage,
+                        SubagentControlActorSource::Gui,
+                        None,
+                        serde_json::json!({ "framework_turn_id": "turn-1" }),
+                    ),
+                    guidance_event(
+                        &identity,
+                        RuntimeEventKind::SubagentGuidanceSettled,
+                        SubagentGuidanceKind::LiveMessage,
+                        SubagentControlActorSource::Gui,
+                        None,
+                        serde_json::json!({
+                            "framework_turn_id": "turn-1",
+                            "outcome": "cancelled",
+                            "drained": false,
+                        }),
+                    ),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let replay = existing_receipt(&store, &identity)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "terminal receipt replay was missing".to_string())?;
+        assert_eq!(replay.status, SubagentControlStatus::Settled);
+        assert_eq!(replay.phase, SubagentControlPhase::TurnSettled);
+        assert_eq!(replay.outcome, Some(SubagentControlOutcome::Cancelled));
+        assert_eq!(replay.drained, Some(false));
+        let events = store
+            .list_events(&identity.run_id, 0)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event_type == RuntimeEventKind::SubagentGuidanceDrained)
+        );
         Ok(())
     }
 
