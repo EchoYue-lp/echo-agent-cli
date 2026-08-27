@@ -578,7 +578,7 @@ pub async fn apply_eko_task_update(
     store: Arc<TaskRuntimeStore>,
     run_id: &str,
     request: TaskUpdateRequest,
-) -> Result<super::types::TaskPlan, TaskRevisionError> {
+) -> Result<super::types::PlanRevision, TaskRevisionError> {
     let patch = request
         .to_task_plan_patch()
         .map_err(|message| TaskRevisionError::InvalidInput { message })?;
@@ -586,7 +586,7 @@ pub async fn apply_eko_task_update(
     let owned_run_id = run_id.to_string();
     TaskRuntimeBlockingAdapter::new(store)
         .run_store("load committed task update", move |store| {
-            store.get_plan(&owned_run_id)
+            store.get_plan_revision(&owned_run_id)
         })
         .await
         .map_err(|error| TaskRevisionError::Backend {

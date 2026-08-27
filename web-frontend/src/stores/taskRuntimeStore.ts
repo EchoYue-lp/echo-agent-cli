@@ -30,7 +30,7 @@ import {
 } from './toolExecutionStore';
 import type {
   TaskRun,
-  TaskPlan,
+  PlanRevision,
   TodoItem,
   RuntimeTaskEvent,
   RuntimeArtifact,
@@ -45,7 +45,7 @@ import type {
 
 type RunSnapshot = {
   run: TaskRun;
-  plan: TaskPlan | null;
+  plan: PlanRevision | null;
   todos: TodoItem[];
   artifacts: RuntimeArtifact[];
   recoveryBlockers: RecoveryBlocker[];
@@ -98,7 +98,7 @@ export interface TaskRuntimeState {
   /// The run the right rail is currently focused on (latest for the active
   /// conversation). Null when no complex task is in flight.
   activeRun: TaskRun | null;
-  plan: TaskPlan | null;
+  plan: PlanRevision | null;
   todos: TodoItem[];
   events: RuntimeTaskEvent[];
   artifacts: RuntimeArtifact[];

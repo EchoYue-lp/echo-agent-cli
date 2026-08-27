@@ -25,7 +25,7 @@ export type RuntimeEventKind =
   | 'task_timed_out'
   | 'task_skipped'
   | 'task_blocked'
-  | 'todo_updated'
+  | 'task_status_changed'
   | 'started'
   | 'running'
   | 'completed'

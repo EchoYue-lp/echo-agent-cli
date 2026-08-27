@@ -14,8 +14,8 @@ use echo_agent_app_core::tasks::task_runtime::store::{RunTurnClaimOutcome, RunTu
 use echo_agent_app_core::tasks::task_runtime::{
     Artifact, ArtifactKind, AttendedMode, BootAutoResumeOutcome, DomainProfile, ExecutionMode,
     PlanTask, PlanTaskKind, RunPauseReason, RunTurnOrigin, RunTurnStatus, TaskPlan,
-    TaskRunResumeIdentity, TaskRunStatus, TaskRuntimeStore, TodoStatus, TurnVisibility,
-    commit_eko_task_plan, task_goal_sha256,
+    TaskRunResumeIdentity, TaskRunStatus, TaskRuntimeStore, TurnVisibility, commit_eko_task_plan,
+    task_goal_sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -483,8 +483,7 @@ fn soak_plan(run_id: &str) -> TaskPlan {
             retry_count: 0,
             max_retries: 1,
             failure_fingerprint: None,
-            status: TodoStatus::Pending,
-            status_detail: None,
+            status: echo_agent::tasks::TaskStatus::Pending,
             claim: None,
             sort_order: 0,
         }],

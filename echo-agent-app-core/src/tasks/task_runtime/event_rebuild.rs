@@ -24,7 +24,7 @@ use super::types::{
     PlanRevision, PlanTask, ProviderRetryState, RecoveryBlocker, ReviewOutcome, ReviewResult,
     RunContinuationState, RunPause, RunPauseReason, RunStateEventIndex, RunStateSnapshot,
     RunTurnOrigin, RunTurnStatus, RunTurnSummary, RuntimeEventKind, RuntimeTaskEvent,
-    TaskExecutionSummary, TaskPlan, TaskRun, TaskRunStatus, TodoStatus, TurnVisibility,
+    TaskExecutionSummary, TaskPlan, TaskRun, TaskRunStatus, TurnVisibility,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -547,12 +547,10 @@ impl EventFoldState {
                             .unwrap_or_default();
                         for task in tasks.iter_mut() {
                             if skipped.contains(task.id.as_str()) {
-                                task.status = TodoStatus::Skipped;
-                                task.status_detail = None;
+                                task.status = echo_agent::tasks::TaskStatus::Skipped;
                                 task.claim = None;
                             } else if reset.contains(task.id.as_str()) {
-                                task.status = TodoStatus::Pending;
-                                task.status_detail = None;
+                                task.status = echo_agent::tasks::TaskStatus::Pending;
                                 task.claim = None;
                                 todo_runtime.remove(&task.id);
                             }
@@ -586,21 +584,17 @@ impl EventFoldState {
                 | K::TaskTimedOut
                 | K::TaskSkipped
                 | K::TaskBlocked
-                | K::TodoUpdated => {
+                | K::TaskStatusChanged => {
                     if let Some(task_id) = ev.task_id.as_ref() {
                         let status = ev
                             .payload
                             .get("status")
-                            .and_then(|v| v.as_str())
-                            .and_then(TodoStatus::from_str);
+                            .and_then(|value| task_status_from_event(value, &ev.payload));
                         if let Some(status) = status {
                             #[allow(clippy::collapsible_if)]
                             // nested let-Option guard reads clearer than a let-chain
                             if let Some(t) = tasks.iter_mut().find(|t| &t.id == task_id) {
                                 t.status = status;
-                                if let Some(value) = ev.payload.get("status_detail") {
-                                    t.status_detail = value.as_str().map(str::to_string);
-                                }
                                 if let Some(value) = ev.payload.get("claim") {
                                     t.claim = serde_json::from_value(value.clone()).ok();
                                 }
@@ -1318,11 +1312,10 @@ fn apply_todo_runtime_event(runtime: &mut TodoRuntimeProjection, event: &Runtime
     let status = event
         .payload
         .get("status")
-        .and_then(serde_json::Value::as_str)
-        .and_then(TodoStatus::from_str);
-    if status == Some(TodoStatus::Pending)
+        .and_then(serde_json::Value::as_str);
+    if status == Some("pending")
         || event.event_type == RuntimeEventKind::TaskStarted
-        || status == Some(TodoStatus::Running)
+        || matches!(status, Some("running" | "retrying"))
     {
         *runtime = TodoRuntimeProjection::default();
     }
@@ -1514,21 +1507,48 @@ fn apply_boot_recovery(
             };
             let Some(status) = recovered
                 .get("status")
-                .and_then(serde_json::Value::as_str)
-                .and_then(TodoStatus::from_str)
+                .and_then(|value| task_status_from_event(value, recovered))
             else {
                 continue;
             };
             if let Some(task) = tasks.iter_mut().find(|task| task.id == task_id) {
                 task.status = status;
-                task.status_detail = recovered
-                    .get("status_detail")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string);
                 task.claim = None;
             }
         }
     }
+}
+
+fn task_status_from_event(
+    value: &serde_json::Value,
+    payload: &serde_json::Value,
+) -> Option<echo_agent::tasks::TaskStatus> {
+    let status = value.as_str()?;
+    let detail = payload
+        .get("status_detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(status)
+        .to_string();
+    Some(match status {
+        "pending" => echo_agent::tasks::TaskStatus::Pending,
+        "running" => echo_agent::tasks::TaskStatus::Running,
+        "blocked" => echo_agent::tasks::TaskStatus::Blocked(detail),
+        "completed" => echo_agent::tasks::TaskStatus::Completed,
+        "failed" => echo_agent::tasks::TaskStatus::Failed(detail),
+        "skipped" => echo_agent::tasks::TaskStatus::Skipped,
+        "cancelled" => echo_agent::tasks::TaskStatus::Cancelled,
+        "timed_out" => echo_agent::tasks::TaskStatus::TimedOut { error: detail },
+        "retrying" => echo_agent::tasks::TaskStatus::Retrying {
+            attempt: payload
+                .get("retry_count")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_default(),
+            last_error: detail,
+        },
+        "paused" => echo_agent::tasks::TaskStatus::Paused(detail),
+        _ => return None,
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1589,8 +1609,7 @@ mod tests {
     };
     use crate::tasks::task_runtime::types::{
         DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, RunTurnOrigin, RunTurnStatus,
-        TaskPatch, TaskPlan, TaskRunStatus, TaskUpdateOperation, TaskUpdateRequest, TodoStatus,
-        TurnVisibility,
+        TaskPatch, TaskPlan, TaskRunStatus, TaskUpdateOperation, TaskUpdateRequest, TurnVisibility,
     };
 
     fn fresh() -> TaskRuntimeStore {
@@ -1616,8 +1635,7 @@ mod tests {
             retry_count: 0,
             max_retries: 3,
             failure_fingerprint: None,
-            status: TodoStatus::Pending,
-            status_detail: None,
+            status: echo_agent::tasks::TaskStatus::Pending,
             claim: None,
             sort_order: 0,
         }
@@ -1664,8 +1682,14 @@ mod tests {
         s.attach_plan_for_test(&plan).unwrap();
 
         // 4. mutate a task status
-        s.set_task_status("r1", "t1", TodoStatus::Running, Some("code_reviewer"), None)
-            .unwrap();
+        s.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Running,
+            Some("code_reviewer"),
+            None,
+        )
+        .unwrap();
 
         // 5. Read SQL ground truth.
         let sql_run = s.get_run("r1").unwrap().unwrap();
@@ -1714,7 +1738,7 @@ mod tests {
         assert_eq!(rebuilt_t1.files, vec!["src/a.rs".to_string()]);
         assert_eq!(rebuilt_t1.allowed_tools, vec!["read_file".to_string()]);
         // status was set to Running after attach.
-        assert_eq!(rebuilt_t1.status, TodoStatus::Running);
+        assert_eq!(rebuilt_t1.status, echo_agent::tasks::TaskStatus::Running);
     }
 
     /// A committed revision patch must be visible in the rebuilt specification.

@@ -272,8 +272,7 @@ pub fn build_fix_task(original: &PlanTask, review: &ReviewResult) -> PlanTask {
         retry_count: original.retry_count + 1,
         max_retries: original.max_retries,
         failure_fingerprint: review.failure_fingerprint.clone(),
-        status: TodoStatus::Pending,
-        status_detail: None,
+        status: echo_agent::tasks::TaskStatus::Pending,
         claim: None,
         sort_order: original.sort_order,
     }

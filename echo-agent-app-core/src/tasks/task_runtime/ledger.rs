@@ -235,13 +235,19 @@ mod tests {
         store.attach_plan_for_test(&plan).unwrap();
         store.transition_run("r1", TaskRunStatus::Running).unwrap();
         store
-            .set_task_status("r1", "t1", TodoStatus::Running, Some("code_reviewer"), None)
+            .set_task_status(
+                "r1",
+                "t1",
+                echo_agent::tasks::TaskStatus::Running,
+                Some("code_reviewer"),
+                None,
+            )
             .unwrap();
         store
             .set_task_status(
                 "r1",
                 "t1",
-                TodoStatus::Completed,
+                echo_agent::tasks::TaskStatus::Completed,
                 Some("code_reviewer"),
                 Some("found router gap"),
             )

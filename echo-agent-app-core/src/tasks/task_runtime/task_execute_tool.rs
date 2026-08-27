@@ -31,7 +31,7 @@ use super::executor::{
 };
 use super::store::{StoreError, TaskRuntimeStore};
 use super::types::{
-    AttendedMode, TaskExecutionSummary, TaskRunStatus, TodoItem, TodoStatus, UnattendedWriteMode,
+    AttendedMode, TaskExecutionSummary, TaskRunStatus, TodoItem, UnattendedWriteMode,
 };
 use crate::agent_handle::AgentHandle;
 
@@ -710,7 +710,7 @@ fn build_run_summaries(store: &TaskRuntimeStore, run_id: &str) -> Result<String,
     let mut sections = Vec::new();
     for task in tasks {
         let todo = todos.iter().find(|t| t.task_id == task.id);
-        if todo.map(|todo| todo.status) != Some(TodoStatus::Completed) {
+        if task.status != echo_agent::tasks::TaskStatus::Completed {
             continue;
         }
         let owner = todo
@@ -742,18 +742,7 @@ fn has_unresolved_tasks(store: &TaskRuntimeStore, run_id: &str) -> Result<bool, 
     store
         .get_plan(run_id)?
         .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))
-        .map(|plan| {
-            plan.tasks.iter().any(|task| {
-                !matches!(
-                    task.status,
-                    TodoStatus::Completed
-                        | TodoStatus::Failed
-                        | TodoStatus::Cancelled
-                        | TodoStatus::TimedOut
-                        | TodoStatus::Skipped
-                )
-            })
-        })
+        .map(|plan| plan.tasks.iter().any(|task| !task.status.is_terminal()))
 }
 
 fn todo_summary(todo: &TodoItem) -> Option<String> {
@@ -1050,7 +1039,7 @@ mod tests {
             .set_task_status(
                 "r1",
                 "t1",
-                TodoStatus::Completed,
+                echo_agent::tasks::TaskStatus::Completed,
                 Some("explorer"),
                 Some("梳理 runtime、agent_pool、task_runtime 的职责"),
             )

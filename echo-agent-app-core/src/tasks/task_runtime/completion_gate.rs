@@ -247,7 +247,7 @@ fn assess_requirement(
                     .map(str::to_string),
             },
         ));
-        if task.status == TodoStatus::Skipped {
+        if task.status == echo_agent::tasks::TaskStatus::Skipped {
             return RequirementAssessment {
                 requirement,
                 status: RequirementStatus::Skipped,
@@ -257,19 +257,19 @@ fn assess_requirement(
     }
 
     let mut status = RequirementStatus::Accepted;
-    if task.status != TodoStatus::Completed {
+    if task.status != echo_agent::tasks::TaskStatus::Completed {
         blockers.push(blocker(
-            if task.status == TodoStatus::Skipped {
+            if task.status == echo_agent::tasks::TaskStatus::Skipped {
                 CompletionBlockerCode::RequirementUncovered
             } else {
                 CompletionBlockerCode::TaskNotComplete
             },
             Some(&requirement),
             Some(&task.id),
-            if task.status == TodoStatus::Skipped {
+            if task.status == echo_agent::tasks::TaskStatus::Skipped {
                 "task is skipped without an explicit user-confirmed requirement Skip".to_string()
             } else {
-                format!("task is {}", task.status.as_str())
+                format!("task is {:?}", task.status)
             },
         ));
         status = RequirementStatus::Pending;
@@ -774,7 +774,13 @@ mod tests {
             suggested_tasks: Vec::new(),
             created_at: Utc::now(),
         })?;
-        store.set_task_status("run", "task", TodoStatus::Completed, None, Some("verified"))
+        store.set_task_status(
+            "run",
+            "task",
+            echo_agent::tasks::TaskStatus::Completed,
+            None,
+            Some("verified"),
+        )
     }
 
     #[test]

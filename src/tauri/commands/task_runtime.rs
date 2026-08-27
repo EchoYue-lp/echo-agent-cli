@@ -353,10 +353,10 @@ pub async fn get_task_plan(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
     run_id: String,
-) -> Result<Option<TaskPlan>, IpcError> {
+) -> Result<Option<PlanRevision>, IpcError> {
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     task_runtime_io(&store, "load TaskRun plan", move |store| {
-        store.get_plan(&run_id)
+        store.get_plan_revision(&run_id)
     })
     .await
 }
@@ -993,7 +993,7 @@ pub async fn update_tasks(
     workspace_id: String,
     run_id: String,
     request: TaskUpdateRequest,
-) -> Result<TaskPlan, IpcError> {
+) -> Result<PlanRevision, IpcError> {
     let (runtime, store, run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     let execution = runtime
         .agent_for(&run.conversation_id)
@@ -1245,13 +1245,15 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let (task_status, summary, run_status) = if recovery {
             (
-                TodoStatus::Blocked,
+                echo_agent::tasks::TaskStatus::Blocked(
+                    "mutating side effect is indeterminate after restart".to_string(),
+                ),
                 "mutating side effect is indeterminate after restart",
                 TaskRunStatus::Paused,
             )
         } else {
             (
-                TodoStatus::Failed,
+                echo_agent::tasks::TaskStatus::Failed("acceptance failed".to_string()),
                 "acceptance failed",
                 TaskRunStatus::Failed,
             )
@@ -1276,13 +1278,10 @@ mod tests {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("run missing: {run_id}"))?;
         let task = store
-            .get_plan(run_id)
+            .list_todos(run_id)
             .map_err(|error| error.to_string())?
-            .and_then(|plan| {
-                plan.tasks
-                    .first()
-                    .map(|task| (task.status, task.retry_count))
-            });
+            .first()
+            .map(|task| (task.status, task.retry_count));
         let event_count = store
             .list_events(run_id, 0)
             .map_err(|error| error.to_string())?

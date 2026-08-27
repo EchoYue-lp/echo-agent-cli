@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Made framework `TaskStatus` the sole PlanTask execution authority, exposed
+  immutable `PlanRevision` artifacts to surfaces, and reduced Todo state to a
+  read-only projection with no reverse mutation path.
+
 ### Added
 
 - **技能分类体系**: 6 个 category（methodology / development / document /

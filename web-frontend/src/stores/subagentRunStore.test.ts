@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import type { RuntimeTaskEvent, TaskPlan, TaskRun } from '../generated';
+import type { PlanRevision, RuntimeTaskEvent, TaskRun } from '../generated';
 import {
   ingestTaskRuntimeSubagentEvents,
   latestSubagentRunsByTask,
@@ -188,7 +188,7 @@ describe('subagentRunStore terminal result', () => {
           agent_role: 'explorer',
         },
       ],
-    } as TaskPlan;
+    } as PlanRevision;
     const events = [
       {
         seq: '12',

@@ -21,7 +21,7 @@ import type {
   SubagentTaskResult,
   SubagentTouchedFiles,
   SubagentVerificationResult,
-  TaskPlan,
+  PlanRevision,
   TaskRun,
 } from '../generated';
 
@@ -332,7 +332,7 @@ function runtimeEventTimestamp(timestamp: string): number | undefined {
  */
 export function taskRuntimeSubagentExecutionEvents(
   run: TaskRun,
-  plan: TaskPlan | null,
+  plan: PlanRevision | null,
   events: readonly RuntimeTaskEvent[]
 ): ExecutionEvent[] {
   const projected: ExecutionEvent[] = [];
@@ -540,7 +540,7 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
 
 export function ingestTaskRuntimeSubagentEvents(
   run: TaskRun,
-  plan: TaskPlan | null,
+  plan: PlanRevision | null,
   events: readonly RuntimeTaskEvent[]
 ): void {
   for (const event of taskRuntimeSubagentExecutionEvents(run, plan, events)) {

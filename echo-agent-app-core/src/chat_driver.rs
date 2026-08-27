@@ -4136,10 +4136,10 @@ mod tests {
             .ok_or_else(|| format!("{mode:?} task_create did not persist a plan"))?;
         assert_eq!(plan.run_id, run_id);
         assert_eq!(plan.tasks.len(), 1);
-        let task_status = plan.tasks.first().map(|task| task.status);
+        let task_status = plan.tasks.first().map(|task| task.status.clone());
         assert_ne!(
             task_status,
-            Some(crate::tasks::task_runtime::TodoStatus::Pending),
+            Some(echo_agent::tasks::TaskStatus::Pending),
             "{mode:?} task_execute must advance the task created under outer run {run_id}"
         );
         store

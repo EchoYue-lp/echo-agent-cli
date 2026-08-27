@@ -404,7 +404,7 @@ fn is_run_progress_event(event: &RuntimeTaskEvent) -> bool {
             | RuntimeEventKind::TaskTimedOut
             | RuntimeEventKind::TaskSkipped
             | RuntimeEventKind::TaskBlocked
-            | RuntimeEventKind::TodoUpdated
+            | RuntimeEventKind::TaskStatusChanged
             | RuntimeEventKind::ArtifactProduced
             | RuntimeEventKind::MergeStarted
             | RuntimeEventKind::MergeCompleted
@@ -1008,7 +1008,7 @@ struct TaskStatusEvent<'a> {
     run_id: &'a str,
     task_id: &'a str,
     task_subject: &'a str,
-    status: TodoStatus,
+    status: echo_agent::tasks::TaskStatus,
     owner_agent: Option<&'a str>,
     summary: Option<&'a str>,
     claim: Option<&'a echo_agent::tasks::TaskClaim>,
@@ -1044,41 +1044,35 @@ fn review_runtime_event(
     )
 }
 
-fn runtime_status_projection(status: &echo_agent::tasks::TaskStatus) -> (TodoStatus, Option<&str>) {
+fn task_status_wire(status: &echo_agent::tasks::TaskStatus) -> (&'static str, Option<&str>) {
     match status {
-        echo_agent::tasks::TaskStatus::Pending => (TodoStatus::Pending, None),
-        echo_agent::tasks::TaskStatus::Running => (TodoStatus::Running, None),
-        echo_agent::tasks::TaskStatus::Blocked(detail) => {
-            (TodoStatus::Blocked, Some(detail.as_str()))
-        }
-        echo_agent::tasks::TaskStatus::Completed => (TodoStatus::Completed, None),
-        echo_agent::tasks::TaskStatus::Failed(detail) => {
-            (TodoStatus::Failed, Some(detail.as_str()))
-        }
-        echo_agent::tasks::TaskStatus::Skipped => (TodoStatus::Skipped, None),
-        echo_agent::tasks::TaskStatus::Cancelled => (TodoStatus::Cancelled, None),
-        echo_agent::tasks::TaskStatus::TimedOut { error } => {
-            (TodoStatus::TimedOut, Some(error.as_str()))
-        }
+        echo_agent::tasks::TaskStatus::Pending => ("pending", None),
+        echo_agent::tasks::TaskStatus::Running => ("running", None),
+        echo_agent::tasks::TaskStatus::Blocked(detail) => ("blocked", Some(detail.as_str())),
+        echo_agent::tasks::TaskStatus::Completed => ("completed", None),
+        echo_agent::tasks::TaskStatus::Failed(detail) => ("failed", Some(detail.as_str())),
+        echo_agent::tasks::TaskStatus::Skipped => ("skipped", None),
+        echo_agent::tasks::TaskStatus::Cancelled => ("cancelled", None),
+        echo_agent::tasks::TaskStatus::TimedOut { error } => ("timed_out", Some(error.as_str())),
         echo_agent::tasks::TaskStatus::Retrying { last_error, .. } => {
-            (TodoStatus::Running, Some(last_error.as_str()))
+            ("retrying", Some(last_error.as_str()))
         }
-        echo_agent::tasks::TaskStatus::Paused(detail) => {
-            (TodoStatus::Pending, Some(detail.as_str()))
-        }
+        echo_agent::tasks::TaskStatus::Paused(detail) => ("paused", Some(detail.as_str())),
     }
 }
 
-fn runtime_task_event_kind(status: TodoStatus) -> RuntimeEventKind {
+fn runtime_task_event_kind(status: &echo_agent::tasks::TaskStatus) -> RuntimeEventKind {
     match status {
-        TodoStatus::Running => RuntimeEventKind::TaskStarted,
-        TodoStatus::Completed => RuntimeEventKind::TaskCompleted,
-        TodoStatus::Failed => RuntimeEventKind::TaskFailed,
-        TodoStatus::Cancelled => RuntimeEventKind::TaskCancelled,
-        TodoStatus::TimedOut => RuntimeEventKind::TaskTimedOut,
-        TodoStatus::Skipped => RuntimeEventKind::TaskSkipped,
-        TodoStatus::Blocked => RuntimeEventKind::TaskBlocked,
-        TodoStatus::Pending => RuntimeEventKind::TodoUpdated,
+        echo_agent::tasks::TaskStatus::Running => RuntimeEventKind::TaskStarted,
+        echo_agent::tasks::TaskStatus::Completed => RuntimeEventKind::TaskCompleted,
+        echo_agent::tasks::TaskStatus::Failed(_) => RuntimeEventKind::TaskFailed,
+        echo_agent::tasks::TaskStatus::Cancelled => RuntimeEventKind::TaskCancelled,
+        echo_agent::tasks::TaskStatus::TimedOut { .. } => RuntimeEventKind::TaskTimedOut,
+        echo_agent::tasks::TaskStatus::Skipped => RuntimeEventKind::TaskSkipped,
+        echo_agent::tasks::TaskStatus::Blocked(_) => RuntimeEventKind::TaskBlocked,
+        echo_agent::tasks::TaskStatus::Pending
+        | echo_agent::tasks::TaskStatus::Retrying { .. }
+        | echo_agent::tasks::TaskStatus::Paused(_) => RuntimeEventKind::TaskStatusChanged,
     }
 }
 
@@ -1099,7 +1093,7 @@ fn runtime_execution_change_event(
     }
     let extension =
         EkoTaskSpec::from_task_spec(after.spec.clone()).map_err(StoreError::InvalidPlan)?;
-    let (status, status_detail) = runtime_status_projection(&after.execution.status);
+    let (status, status_detail) = task_status_wire(&after.execution.status);
     let now = echo_agent::utils::time::now_local().to_rfc3339();
     let started = matches!(
         after.execution.status,
@@ -1110,9 +1104,9 @@ fn runtime_execution_change_event(
         run_id,
         Some(&after.spec.id),
         None,
-        runtime_task_event_kind(status),
+        runtime_task_event_kind(&after.execution.status),
         serde_json::json!({
-            "status": status.as_str(),
+            "status": status,
             "status_detail": status_detail,
             "claim": after.execution.claim,
             "execution_id": after
@@ -3063,7 +3057,7 @@ impl TaskRuntimeStore {
                 .iter()
                 .find(|item| item.id == requirement.task_id)
                 .ok_or_else(|| StoreError::TaskNotFound(requirement.task_id.clone()))?;
-            if task.status != TodoStatus::Skipped {
+            if task.status != echo_agent::tasks::TaskStatus::Skipped {
                 return Err(StoreError::RequirementSkipRejected {
                     run_id: run_id.to_string(),
                     reason: format!(
@@ -4036,7 +4030,7 @@ impl TaskRuntimeStore {
                 ));
             }
             if plan.tasks.iter().any(|task| {
-                task.status != TodoStatus::Pending
+                task.status != echo_agent::tasks::TaskStatus::Pending
                     || task.retry_count != 0
                     || task.failure_fingerprint.is_some()
             }) {
@@ -4286,7 +4280,7 @@ impl TaskRuntimeStore {
                     run_id,
                     task_id: &task.id,
                     task_subject: &task.title,
-                    status: TodoStatus::Running,
+                    status: echo_agent::tasks::TaskStatus::Running,
                     owner_agent: Some(&task.agent_role),
                     summary: None,
                     claim: None,
@@ -4305,7 +4299,7 @@ impl TaskRuntimeStore {
                     run_id,
                     task_id: &task.id,
                     task_subject: &task.title,
-                    status: TodoStatus::Completed,
+                    status: echo_agent::tasks::TaskStatus::Completed,
                     owner_agent: Some(&task.agent_role),
                     summary: Some(task_summary),
                     claim: None,
@@ -4486,13 +4480,31 @@ impl TaskRuntimeStore {
         &self,
         run_id: &str,
         task_id: &str,
-        status: TodoStatus,
+        status: echo_agent::tasks::TaskStatus,
         owner_agent: Option<&str>,
         summary: Option<&str>,
     ) -> Result<(), StoreError> {
         self.with_run_lock(run_id, || {
+            let status = match status {
+                echo_agent::tasks::TaskStatus::Failed(detail) if detail.is_empty() => {
+                    echo_agent::tasks::TaskStatus::Failed(
+                        summary.unwrap_or("task failed").to_string(),
+                    )
+                }
+                echo_agent::tasks::TaskStatus::Blocked(detail) if detail.is_empty() => {
+                    echo_agent::tasks::TaskStatus::Blocked(
+                        summary.unwrap_or("task blocked").to_string(),
+                    )
+                }
+                echo_agent::tasks::TaskStatus::TimedOut { error } if error.is_empty() => {
+                    echo_agent::tasks::TaskStatus::TimedOut {
+                        error: summary.unwrap_or("task timed out").to_string(),
+                    }
+                }
+                other => other,
+            };
             // U1c phase-0/0bc step-2: file authority. Validate the task exists
-            // (read plan from file), then append the Task*/TodoUpdated event with
+            // (read plan from file), then append the canonical task status event with
             // explicit started_at/completed_at and rewrite plan.json. No SQL write.
             let plan = self
                 .get_plan(run_id)?
@@ -5426,7 +5438,7 @@ impl TaskRuntimeStore {
             let running_task_ids = state
                 .tasks
                 .iter()
-                .filter(|task| TodoStatus::project_task_status(&task.status) == TodoStatus::Running)
+                .filter(|task| task.status.is_running())
                 .map(|task| task.task_id.clone())
                 .collect::<Vec<_>>();
             let mut recovered_tasks = Vec::with_capacity(running_task_ids.len());
@@ -5459,18 +5471,23 @@ impl TaskRuntimeStore {
                     .cloned();
                 let (next_status, summary) = if completed_subagent.is_some() {
                     (
-                        TodoStatus::Pending,
+                        echo_agent::tasks::TaskStatus::Pending,
                         "Subagent completed before interruption; pending review",
                     )
                 } else if active_tool.is_some() || active_subagent.is_some() {
                     (
-                        TodoStatus::Blocked,
+                        echo_agent::tasks::TaskStatus::Blocked(
+                            "mutating side effect is indeterminate after restart".to_string(),
+                        ),
                         "mutating side effect is indeterminate after restart",
                     )
                 } else {
-                    (TodoStatus::Pending, "interrupted; pending resume")
+                    (
+                        echo_agent::tasks::TaskStatus::Pending,
+                        "interrupted; pending resume",
+                    )
                 };
-                let blocker = if next_status == TodoStatus::Blocked {
+                let blocker = if matches!(&next_status, echo_agent::tasks::TaskStatus::Blocked(_)) {
                     let (boundary_execution_id, call_id, tool_name) =
                         if let Some(tool) = active_tool {
                             (tool.execution_id, Some(tool.call_id), Some(tool.tool_name))
@@ -5488,10 +5505,11 @@ impl TaskRuntimeStore {
                 } else {
                     None
                 };
+                let (status_name, status_detail) = task_status_wire(&next_status);
                 recovered_tasks.push(serde_json::json!({
                     "task_id": task_id,
-                    "status": next_status.as_str(),
-                    "status_detail": (next_status == TodoStatus::Blocked).then_some(summary),
+                    "status": status_name,
+                    "status_detail": status_detail,
                     "summary": summary,
                     "blocker": blocker,
                 }));
@@ -5591,6 +5609,14 @@ impl TaskRuntimeStore {
         self.file_store()?
             .get_plan(run_id)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
+    }
+
+    /// Return the immutable revision artifact without joining execution state.
+    /// Surface callers combine this with the read-only Todo projection.
+    pub fn get_plan_revision(&self, run_id: &str) -> Result<Option<PlanRevision>, StoreError> {
+        self.file_store()?
+            .get_plan_revision(run_id)
+            .map_err(|error| StoreError::InvalidPlan(format!("file read: {error}")))
     }
 
     pub fn list_todos(&self, run_id: &str) -> Result<Vec<TodoItem>, StoreError> {
@@ -7038,19 +7064,24 @@ impl TaskRuntimeStore {
                     .collect::<std::collections::BTreeMap<_, _>>()
             })
             .unwrap_or_default();
-        // The blocked Todo projection is itself durable. If the dedicated
-        // RecoveryBlocked append was interrupted after TaskBlocked landed,
-        // synthesize the barrier so resume still fails closed.
-        for todo in self.list_todos(run_id)?.into_iter().filter(|todo| {
-            todo.status == TodoStatus::Blocked
-                && todo.summary.as_deref()
-                    == Some("mutating side effect is indeterminate after restart")
+        // If the dedicated RecoveryBlocked append was interrupted after the
+        // canonical TaskStatus landed, synthesize the barrier so resume fails closed.
+        let tasks = self
+            .get_plan(run_id)?
+            .map(|plan| plan.tasks)
+            .unwrap_or_default();
+        for task in tasks.into_iter().filter(|task| {
+            matches!(
+                &task.status,
+                echo_agent::tasks::TaskStatus::Blocked(detail)
+                    if detail == "mutating side effect is indeterminate after restart"
+            )
         }) {
             blockers
-                .entry(todo.task_id.clone())
+                .entry(task.id.clone())
                 .or_insert_with(|| RecoveryBlocker {
                     run_id: run_id.to_string(),
-                    task_id: todo.task_id,
+                    task_id: task.id,
                     execution_id: None,
                     call_id: None,
                     tool_name: None,
@@ -7208,37 +7239,17 @@ fn task_status_runtime_event(event: TaskStatusEvent<'_>) -> RuntimeJournalEvent 
         claim,
     } = event;
     let now = echo_agent::utils::time::now_local().to_rfc3339();
-    let started = matches!(status, TodoStatus::Running);
-    let finished = matches!(
-        status,
-        TodoStatus::Completed
-            | TodoStatus::Failed
-            | TodoStatus::Cancelled
-            | TodoStatus::TimedOut
-            | TodoStatus::Skipped
-    );
-    let kind = match status {
-        TodoStatus::Running => RuntimeEventKind::TaskStarted,
-        TodoStatus::Completed => RuntimeEventKind::TaskCompleted,
-        TodoStatus::Failed => RuntimeEventKind::TaskFailed,
-        TodoStatus::Cancelled => RuntimeEventKind::TaskCancelled,
-        TodoStatus::TimedOut => RuntimeEventKind::TaskTimedOut,
-        TodoStatus::Skipped => RuntimeEventKind::TaskSkipped,
-        TodoStatus::Blocked => RuntimeEventKind::TaskBlocked,
-        TodoStatus::Pending => RuntimeEventKind::TodoUpdated,
-    };
-    let status_detail = matches!(
-        status,
-        TodoStatus::Failed | TodoStatus::Blocked | TodoStatus::Cancelled | TodoStatus::TimedOut
-    )
-    .then(|| summary.unwrap_or_else(|| status.as_str()));
+    let started = status.is_running();
+    let finished = status.is_terminal();
+    let kind = runtime_task_event_kind(&status);
+    let (status_name, status_detail) = task_status_wire(&status);
     RuntimeJournalEvent::for_append(
         run_id,
         Some(task_id),
         None,
         kind,
         serde_json::json!({
-            "status": status.as_str(),
+            "status": status_name,
             "status_detail": status_detail,
             "owner_agent": owner_agent,
             "title": task_subject,
@@ -7714,7 +7725,7 @@ mod tests {
             .set_task_status(
                 &run_id,
                 "task-a",
-                TodoStatus::Completed,
+                echo_agent::tasks::TaskStatus::Completed,
                 Some("subagent"),
                 Some("projected"),
             )
@@ -8151,7 +8162,7 @@ mod tests {
         store.set_task_status(
             run_id,
             task_id,
-            TodoStatus::Failed,
+            echo_agent::tasks::TaskStatus::Failed(String::new()),
             None,
             Some("acceptance failed"),
         )?;
@@ -9543,8 +9554,14 @@ mod tests {
     fn set_task_status_updates_task_todo_and_event_together() {
         let s = fresh();
         seed_plan(&s);
-        s.set_task_status("r1", "t1", TodoStatus::Running, Some("code_reviewer"), None)
-            .unwrap();
+        s.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Running,
+            Some("code_reviewer"),
+            None,
+        )
+        .unwrap();
         let todos = s.list_todos("r1").unwrap();
         assert_eq!(todos[0].status, TodoStatus::Running);
         assert_eq!(todos[0].owner_agent.as_deref(), Some("code_reviewer"));
@@ -9564,7 +9581,7 @@ mod tests {
         failed.set_task_status(
             "r1",
             "t1",
-            TodoStatus::Failed,
+            echo_agent::tasks::TaskStatus::Failed(String::new()),
             Some("code_reviewer"),
             Some("the report mentions timeout and cancelled behavior"),
         )?;
@@ -9586,7 +9603,9 @@ mod tests {
         timed_out.set_task_status(
             "r1",
             "t1",
-            TodoStatus::TimedOut,
+            echo_agent::tasks::TaskStatus::TimedOut {
+                error: String::new(),
+            },
             Some("code_reviewer"),
             Some("provider deadline elapsed"),
         )?;
@@ -9602,7 +9621,7 @@ mod tests {
         cancelled.set_task_status(
             "r1",
             "t1",
-            TodoStatus::Cancelled,
+            echo_agent::tasks::TaskStatus::Cancelled,
             Some("code_reviewer"),
             Some("stopped by parent run"),
         )?;
@@ -9723,21 +9742,23 @@ mod tests {
         store.set_task_status(
             run_id,
             "upstream",
-            TodoStatus::Failed,
+            echo_agent::tasks::TaskStatus::Failed(String::new()),
             Some("implementer"),
             Some("upstream failed"),
         )?;
         store.set_task_status(
             run_id,
             "blocked",
-            TodoStatus::Blocked,
+            echo_agent::tasks::TaskStatus::Blocked(String::new()),
             Some("reviewer"),
             Some("awaiting explicit decision"),
         )?;
         store.set_task_status(
             run_id,
             "timed-out",
-            TodoStatus::TimedOut,
+            echo_agent::tasks::TaskStatus::TimedOut {
+                error: String::new(),
+            },
             Some("reviewer"),
             Some("deadline elapsed"),
         )?;
@@ -9910,7 +9931,7 @@ mod tests {
         store.set_task_status(
             recovery_id,
             "recovery-task",
-            TodoStatus::Running,
+            echo_agent::tasks::TaskStatus::Running,
             Some("subagent"),
             Some("interrupted before completion"),
         )?;
@@ -11190,7 +11211,13 @@ mod tests {
         let store = fresh();
         seed_plan(&store);
         store
-            .set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)
+            .set_task_status(
+                "r1",
+                "t1",
+                echo_agent::tasks::TaskStatus::Running,
+                Some("subagent"),
+                None,
+            )
             .map_err(|error| error.to_string())?;
         assert!(
             store
@@ -11335,7 +11362,7 @@ mod tests {
         store.set_task_status(
             "r1",
             "t1",
-            TodoStatus::Running,
+            echo_agent::tasks::TaskStatus::Running,
             Some("code_reviewer"),
             Some("started review"),
         )?;
@@ -11432,14 +11459,14 @@ mod tests {
         store.set_task_status(
             "retry-run",
             "upstream",
-            TodoStatus::Failed,
+            echo_agent::tasks::TaskStatus::Failed(String::new()),
             Some("implementer"),
             Some("execution failed"),
         )?;
         store.set_task_status(
             "retry-run",
             "acceptance-blocked",
-            TodoStatus::Blocked,
+            echo_agent::tasks::TaskStatus::Blocked(String::new()),
             Some("reviewer"),
             Some("review needs fix; awaiting explicit retry"),
         )?;
@@ -11490,7 +11517,7 @@ mod tests {
         );
         assert_eq!(
             last_frame_event_types(&store, "retry-run").map_err(StoreError::InvalidPlan)?,
-            ["todo_updated", "note", "run_status_changed"]
+            ["task_status_changed", "note", "run_status_changed"]
         );
         assert!(store.list_events("retry-run", 0)?.iter().all(|event| {
             event
@@ -11509,7 +11536,7 @@ mod tests {
         s.set_task_status(
             "r1",
             "t1",
-            TodoStatus::Completed,
+            echo_agent::tasks::TaskStatus::Completed,
             Some("explorer"),
             Some("verified"),
         )?;
@@ -11533,7 +11560,13 @@ mod tests {
     fn boot_recovery_failure_keeps_running_marker_and_is_retryable() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
-        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
+        store.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Running,
+            Some("subagent"),
+            None,
+        )?;
         let event_count_before = store.list_events("r1", 0)?.len();
         store.fail_next_recovery_commit_for_test();
 
@@ -11574,7 +11607,13 @@ mod tests {
     fn boot_recovery_repairs_projection_after_atomic_event_commit() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
-        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
+        store.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Running,
+            Some("subagent"),
+            None,
+        )?;
         store.fail_next_recovery_projection_for_test();
 
         assert_eq!(store.recover_incomplete()?, 1);
@@ -11764,7 +11803,13 @@ mod tests {
     fn pause_request_stops_driver_and_keeps_run_resumable() -> Result<(), StoreError> {
         let store = std::sync::Arc::new(fresh());
         seed_plan(&store);
-        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
+        store.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Running,
+            Some("subagent"),
+            None,
+        )?;
         let token = echo_agent::agent::CancellationToken::new();
         let registration = store.register_run_cancellation("r1", token.clone())?;
 
@@ -11935,7 +11980,13 @@ mod tests {
     fn boot_recovery_requeues_orphaned_running_task() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
-        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
+        store.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Running,
+            Some("subagent"),
+            None,
+        )?;
 
         assert_eq!(store.recover_incomplete()?, 1);
         let todo = store
@@ -12108,7 +12159,13 @@ mod tests {
                 }],
             },
         )?;
-        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
+        store.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Running,
+            Some("subagent"),
+            None,
+        )?;
         store.record_subagent_assigned(
             "r1", "t1", "t1:1", "subagent", "Task 1", 1, 1, false, true,
         )?;
@@ -12130,7 +12187,7 @@ mod tests {
         store.resolve_recovery_task("r1", "t1", RecoveryDecision::Retry)?;
         assert_eq!(
             last_frame_event_types(&store, "r1").map_err(StoreError::InvalidPlan)?,
-            ["recovery_resolved", "todo_updated"]
+            ["recovery_resolved", "task_status_changed"]
         );
         assert!(store.list_recovery_blockers("r1")?.is_empty());
         let todo = store
@@ -12162,7 +12219,13 @@ mod tests {
                 }],
             },
         )?;
-        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
+        store.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Running,
+            Some("subagent"),
+            None,
+        )?;
         store.record_subagent_assigned(
             "r1", "t1", "t1:1", "subagent", "Task 1", 2, 1, false, true,
         )?;
@@ -12689,7 +12752,7 @@ mod tests {
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
         assert_eq!(
             persisted.execution.status,
-            echo_agent::tasks::TaskStatus::Pending
+            echo_agent::tasks::TaskStatus::Paused("user requested pause".to_string())
         );
         assert_eq!(persisted.execution.retry_count, retry_count_before_resume);
         store.transition_run("r1", TaskRunStatus::Paused)?;
@@ -12857,7 +12920,7 @@ mod tests {
             .into_iter()
             .find(|task| task.id == "t1")
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
-        assert_eq!(task.status, TodoStatus::Skipped);
+        assert_eq!(task.status, echo_agent::tasks::TaskStatus::Skipped);
         assert!(task.claim.is_none());
         Ok(())
     }
@@ -12885,7 +12948,7 @@ mod tests {
         store.set_task_status(
             "r1",
             "t1",
-            TodoStatus::Skipped,
+            echo_agent::tasks::TaskStatus::Skipped,
             None,
             Some("cancelled by user"),
         )?;
@@ -12909,7 +12972,7 @@ mod tests {
             .into_iter()
             .find(|task| task.id == "t1")
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
-        assert_eq!(task.status, TodoStatus::Skipped);
+        assert_eq!(task.status, echo_agent::tasks::TaskStatus::Skipped);
         Ok(())
     }
 
@@ -12967,7 +13030,7 @@ mod tests {
         store.set_task_status(
             "r1",
             "t1",
-            TodoStatus::Blocked,
+            echo_agent::tasks::TaskStatus::Blocked(String::new()),
             Some("code_reviewer"),
             Some("requires a revised contract"),
         )?;
@@ -13047,7 +13110,7 @@ mod tests {
             .unwrap();
         assert_eq!(plan.revision, 2);
         assert_eq!(plan.tasks.len(), 1);
-        assert_eq!(plan.tasks[0].status, TodoStatus::Skipped);
+        assert_eq!(plan.tasks[0].status, echo_agent::tasks::TaskStatus::Skipped);
     }
 
     #[test]
@@ -13057,7 +13120,7 @@ mod tests {
         s.set_task_status(
             "r1",
             "t1",
-            TodoStatus::Blocked,
+            echo_agent::tasks::TaskStatus::Blocked(String::new()),
             Some("reviewer"),
             Some("needs a clearer brief"),
         )
@@ -13079,7 +13142,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(plan.revision, 2);
-        assert_eq!(plan.tasks[0].status, TodoStatus::Pending);
+        assert_eq!(plan.tasks[0].status, echo_agent::tasks::TaskStatus::Pending);
         assert_eq!(
             plan.tasks[0].description,
             "Review the clarified runtime boundary"
@@ -13107,7 +13170,13 @@ mod tests {
             })
         };
         persist_summary("t1")?;
-        s.set_task_status("r1", "t1", TodoStatus::Completed, Some("explorer"), None)?;
+        s.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Completed,
+            Some("explorer"),
+            None,
+        )?;
         let follow_up = PlanTask {
             id: "t2".to_string(),
             title: "Verify follow-up".to_string(),
@@ -13130,7 +13199,13 @@ mod tests {
         )?;
         assert!(!s.complete_run_if_quiescent("r1")?);
         persist_summary("t2")?;
-        s.set_task_status("r1", "t2", TodoStatus::Completed, Some("explorer"), None)?;
+        s.set_task_status(
+            "r1",
+            "t2",
+            echo_agent::tasks::TaskStatus::Completed,
+            Some("explorer"),
+            None,
+        )?;
         assert!(s.complete_run_if_quiescent("r1")?);
         assert_eq!(
             s.get_run("r1")?
@@ -13145,7 +13220,13 @@ mod tests {
     fn task_update_rejects_running_task_contract_change() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
-        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
+        store.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Running,
+            Some("subagent"),
+            None,
+        )?;
         let result = store.apply_task_patch_for_test(
             "r1",
             &TaskUpdateRequest {
@@ -13263,7 +13344,13 @@ mod tests {
         seed_plan(&s);
         let before = s.list_events("r1", 0).unwrap().len();
         let err = s
-            .set_task_status("r1", "nope", TodoStatus::Running, None, None)
+            .set_task_status(
+                "r1",
+                "nope",
+                echo_agent::tasks::TaskStatus::Running,
+                None,
+                None,
+            )
             .unwrap_err();
         assert!(matches!(err, StoreError::TaskNotFound(_)));
         assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
@@ -13339,7 +13426,13 @@ mod tests {
             Err(StoreError::WorkspaceTransitionBusy { .. })
         ));
         assert!(matches!(
-            store.set_task_status("run-b", "task-b", TodoStatus::Running, None, None),
+            store.set_task_status(
+                "run-b",
+                "task-b",
+                echo_agent::tasks::TaskStatus::Running,
+                None,
+                None
+            ),
             Err(StoreError::WorkspaceTransitionBusy { .. })
         ));
         assert!(matches!(
@@ -14348,7 +14441,7 @@ mod tests {
             .set_task_status(
                 "reset-run",
                 "reset-task",
-                TodoStatus::Completed,
+                echo_agent::tasks::TaskStatus::Completed,
                 Some("old-owner"),
                 Some("old-summary"),
             )
@@ -14383,7 +14476,7 @@ mod tests {
             .set_task_status(
                 "reset-run",
                 "reset-task",
-                TodoStatus::Running,
+                echo_agent::tasks::TaskStatus::Running,
                 Some("new-owner"),
                 None,
             )
@@ -15215,8 +15308,7 @@ mod tests {
             retry_count: 0,
             max_retries: 3,
             failure_fingerprint: None,
-            status: TodoStatus::Pending,
-            status_detail: None,
+            status: echo_agent::tasks::TaskStatus::Pending,
             claim: None,
             sort_order: 0,
         }

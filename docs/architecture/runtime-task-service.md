@@ -27,7 +27,9 @@ claim 覆盖新 attempt、暂停消耗 retry、依赖阻塞长期写入 journal�
 - adapter：无损转换 `PlanTask` extension，调用 framework pure transforms，并把 task 变化、
   EKO summary 和 claim-bound review 作为一个 `append_batch` 提交。
 
-`events.jsonl` 是 EKO 权威。`plan.json`、run state 和 Todo 是可重建投影。projection refresh
+`events.jsonl` 是 EKO 权威。`plan.json`、run state 和 Todo 是可重建投影。`plan.json` 只保存
+`PlanRevision` specification，run state 保存无损 framework `TaskStatus`；Todo 只能由两者投影，
+不能反向驱动调度、completion 或 recovery。projection refresh
 降级发生在 journal 已提交之后时，调用方保留 typed mutation outcome，后续读取自愈；
 batch outcome unknown 则 fail closed。依赖失败只通过 `DagExecutionState` 派生到 Todo read
 model，绝不写 descendant `Blocked` 事实。

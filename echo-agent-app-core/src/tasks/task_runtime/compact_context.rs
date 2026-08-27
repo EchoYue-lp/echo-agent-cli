@@ -686,7 +686,7 @@ mod tests {
                     description: "读取 ContextManager 和 TaskRuntimeStore".to_string(),
                     kind: PlanTaskKind::Investigation,
                     agent_role: "explorer".to_string(),
-                    status: TodoStatus::Pending,
+                    status: echo_agent::tasks::TaskStatus::Pending,
                     sort_order: 0,
                     ..PlanTask::default()
                 },
@@ -697,7 +697,7 @@ mod tests {
                     kind: PlanTaskKind::Implementation,
                     agent_role: "implementer".to_string(),
                     depends_on: vec!["t1".to_string()],
-                    status: TodoStatus::Pending,
+                    status: echo_agent::tasks::TaskStatus::Pending,
                     sort_order: 1,
                     ..PlanTask::default()
                 },
@@ -707,10 +707,22 @@ mod tests {
             .attach_plan_for_test(&plan)
             .map_err(|err| format!("seed plan commit failed: {err}"))?;
         store
-            .set_task_status("r1", "t1", TodoStatus::Completed, Some("explorer"), None)
+            .set_task_status(
+                "r1",
+                "t1",
+                echo_agent::tasks::TaskStatus::Completed,
+                Some("explorer"),
+                None,
+            )
             .map_err(|err| format!("seed t1 status failed: {err}"))?;
         store
-            .set_task_status("r1", "t2", TodoStatus::Running, Some("implementer"), None)
+            .set_task_status(
+                "r1",
+                "t2",
+                echo_agent::tasks::TaskStatus::Running,
+                Some("implementer"),
+                None,
+            )
             .map_err(|err| format!("seed t2 status failed: {err}"))?;
         store
             .put_summary(&TaskExecutionSummary {

@@ -21,6 +21,7 @@
 | [Boot 与 Agent Inbox ADR](./adr/0011-boot-inbox-recovery-authority.md)                | boot owner、tracked steer、orphan 与 inbox journal              |
 | [Extension Control ADR](./adr/0012-extension-control-authority.md)                    | durable Skill settlement、specialist 边界与多入口 typed control |
 | [Conversation input ADR](./adr/0014-durable-conversation-input-ingress.md)           | 多入口 durable follow-up、tracked drain 与 exact terminal       |
+| [Task graph status ADR](./adr/0015-task-graph-status-authority.md)                    | canonical TaskStatus、PlanRevision artifact 与只读 Todo 投影     |
 | [Agent 协同 ADR](./adr/0001-agent-collaboration.md)                                   | Codex 协同机制与 EKO 功能设计                                   |
 | [Codex 工具目录 ADR](./adr/0002-codex-tool-capability-catalog.md)                     | Codex 工具能力与 EKO 参考设计                                   |
 | [Claude Code 能力目录](./adr/0003-claude-code-capability-catalog.md)                  | Claude Code 工具、子智能体和 Skills 快照                        |

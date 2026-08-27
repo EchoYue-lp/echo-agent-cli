@@ -594,16 +594,7 @@ pub async fn execute_run(
         let unresolved_count = plan
             .tasks
             .iter()
-            .filter(|task| {
-                !matches!(
-                    task.status,
-                    TodoStatus::Completed
-                        | TodoStatus::Failed
-                        | TodoStatus::Cancelled
-                        | TodoStatus::TimedOut
-                        | TodoStatus::Skipped
-                )
-            })
+            .filter(|task| !task.status.is_terminal())
             .count();
         if unresolved_count == 0 {
             let report_run_id = run_id.to_string();
@@ -4375,21 +4366,25 @@ fn collect_dependency_summaries(
     if task.depends_on.is_empty() {
         return Ok(Vec::new());
     }
+    let plan = store
+        .get_plan(run_id)?
+        .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
     let todos = store.list_todos(run_id)?;
     let summaries = task
         .depends_on
         .iter()
         .map(|dep_id| {
-            todos
+            plan.tasks
                 .iter()
-                .find(|t| &t.task_id == dep_id)
-                .map_or(Ok(None), |t| {
-                    if t.status != TodoStatus::Completed {
+                .find(|dependency| &dependency.id == dep_id)
+                .map_or(Ok(None), |dependency| {
+                    if dependency.status != echo_agent::tasks::TaskStatus::Completed {
                         return Ok(None);
                     }
+                    let todo = todos.iter().find(|todo| todo.task_id == dependency.id);
                     // Prefer the structured summary when available; fall back to
                     // the truncated todo text for tasks that predate put_summary.
-                    let structured = store.get_summary(run_id, &t.task_id)?.map(|s| {
+                    let structured = store.get_summary(run_id, &dependency.id)?.map(|s| {
                         let mut parts: Vec<String> = Vec::new();
                         if !s.result.summary.trim().is_empty() {
                             parts.push(format!("完成: {}", s.result.summary));
@@ -4403,12 +4398,11 @@ fn collect_dependency_summaries(
                         if !s.decisions.is_empty() {
                             parts.push(format!("决策: {}", s.decisions.join("; ")));
                         }
-                        (t.title.clone(), parts.join(" | "))
+                        (dependency.title.clone(), parts.join(" | "))
                     });
                     Ok(structured.or_else(|| {
-                        t.summary
-                            .as_deref()
-                            .map(|s| (t.title.clone(), s.to_string()))
+                        todo.and_then(|item| item.summary.as_deref())
+                            .map(|s| (dependency.title.clone(), s.to_string()))
                     }))
                 })
         })
@@ -6433,8 +6427,7 @@ mod tests {
             retry_count: 0,
             max_retries: 0,
             failure_fingerprint: None,
-            status: TodoStatus::Pending,
-            status_detail: None,
+            status: echo_agent::tasks::TaskStatus::Pending,
             claim: None,
             sort_order: 0,
         }
@@ -7500,13 +7493,19 @@ Read the runtime path and found one missing branch.
             .transition_run("r1", TaskRunStatus::Running)
             .map_err(|error| error.to_string())?;
         store
-            .set_task_status("r1", "t1", TodoStatus::Running, Some("code_reviewer"), None)
+            .set_task_status(
+                "r1",
+                "t1",
+                echo_agent::tasks::TaskStatus::Running,
+                Some("code_reviewer"),
+                None,
+            )
             .map_err(|error| error.to_string())?;
         store
             .set_task_status(
                 "r1",
                 "t1",
-                TodoStatus::Completed,
+                echo_agent::tasks::TaskStatus::Completed,
                 Some("code_reviewer"),
                 Some("done"),
             )
@@ -7947,7 +7946,7 @@ Read the runtime path and found one missing branch.
             .set_task_status(
                 &run_id,
                 &task.id,
-                TodoStatus::Completed,
+                echo_agent::tasks::TaskStatus::Completed,
                 Some(&task.agent_role),
                 Some("claimed complete"),
             )
@@ -8593,14 +8592,14 @@ Read the runtime path and found one missing branch.
         assert_eq!(
             plan.tasks
                 .iter()
-                .filter(|task| task.status == TodoStatus::Completed)
+                .filter(|task| task.status == echo_agent::tasks::TaskStatus::Completed)
                 .count(),
             4
         );
         assert_eq!(
             plan.tasks
                 .iter()
-                .filter(|task| task.status == TodoStatus::Pending)
+                .filter(|task| { matches!(&task.status, echo_agent::tasks::TaskStatus::Paused(_)) })
                 .count(),
             4
         );
@@ -8780,7 +8779,7 @@ Read the runtime path and found one missing branch.
         assert!(
             plan.tasks
                 .iter()
-                .all(|task| task.status == TodoStatus::Completed)
+                .all(|task| task.status == echo_agent::tasks::TaskStatus::Completed)
         );
         Ok(())
     }
@@ -8990,12 +8989,12 @@ Read the runtime path and found one missing branch.
             .set_task_status(
                 &run_id,
                 "in_flight",
-                TodoStatus::Running,
+                echo_agent::tasks::TaskStatus::Running,
                 Some("explorer"),
                 None,
             )
             .map_err(|error| error.to_string())?;
-        in_flight.status = TodoStatus::Running;
+        in_flight.status = echo_agent::tasks::TaskStatus::Running;
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.succeed("pending", "done");
         let pending_gate = dispatcher.gate("pending");
@@ -9025,7 +9024,7 @@ Read the runtime path and found one missing branch.
             .set_task_status(
                 &run_id,
                 "in_flight",
-                TodoStatus::Completed,
+                echo_agent::tasks::TaskStatus::Completed,
                 Some("explorer"),
                 Some("sibling done"),
             )

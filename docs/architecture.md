@@ -151,8 +151,11 @@ input
 TaskRun -> PlanTask -> SubagentRun
 ```
 
-`TaskPlan` 是可编辑、版本化 artifact；`TodoItem` 是 UI 投影。它们不拥有独立 store 或
-执行器。framework 提供 `task_create/task_update/task_list` 和通用 DAG 机制，EKO 增加
+`PlanRevision` 是可编辑、版本化的 TaskPlan artifact；framework `TaskStatus` 是唯一任务执行
+状态。`TodoItem` 只在查询边界由 canonical execution 投影，不能反向写入 task graph，也不拥有
+独立 store、reducer 或执行器。完整决策见
+[Task graph status authority ADR](./adr/0015-task-graph-status-authority.md)。framework 提供
+`task_create/task_update/task_list` 和通用 DAG 机制，EKO 增加
 `task_execute`、文件投影、workspace policy、review、worktree 和 surface 控制。
 
 `TaskRuntimeStore` 以 `events.jsonl` 为权威事件账本，run/plan/todo/result/checkpoint 是

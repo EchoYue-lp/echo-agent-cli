@@ -22,7 +22,6 @@ use echo_agent::prelude::{MemoryMeta, MemorySource, MemoryType};
 
 use super::executor::TaskRuntimeBlockingAdapter;
 use super::store::TaskRuntimeStore;
-use super::types::*;
 
 /// How a run's terminal memory write should be performed (B5.1).
 ///
@@ -171,27 +170,41 @@ async fn build_candidates(
 ) -> Result<Vec<MemoryCandidate>, String> {
     match event {
         MemoryEvent::RunCompleted { run_id, goal } => {
-            // Summarize completed todos into a decision/fix memory.
+            // Summarize canonical completed tasks into a decision/fix memory.
             let load_run_id = run_id.clone();
-            let todos = TaskRuntimeBlockingAdapter::new(store.clone())
-                .run("load memory candidate todos", move |store| {
-                    store.list_todos(&load_run_id)
+            let completed = TaskRuntimeBlockingAdapter::new(store.clone())
+                .run("load memory candidate tasks", move |store| {
+                    let tasks = store
+                        .get_plan(&load_run_id)?
+                        .map(|plan| plan.tasks)
+                        .unwrap_or_default();
+                    let fallback_summaries = store
+                        .list_todos(&load_run_id)?
+                        .into_iter()
+                        .filter_map(|todo| todo.summary.map(|summary| (todo.task_id, summary)))
+                        .collect::<std::collections::HashMap<_, _>>();
+                    tasks
+                        .into_iter()
+                        .filter(|task| task.status == echo_agent::tasks::TaskStatus::Completed)
+                        .map(|task| {
+                            let summary = store
+                                .get_summary(&load_run_id, &task.id)?
+                                .map(|summary| summary.result.summary)
+                                .filter(|summary| !summary.trim().is_empty())
+                                .or_else(|| fallback_summaries.get(&task.id).cloned())
+                                .unwrap_or_else(|| "(no summary)".to_string());
+                            Ok((task.title, summary))
+                        })
+                        .collect::<Result<Vec<_>, super::store::StoreError>>()
                 })
                 .await
                 .map_err(|error| error.to_string())?;
-            let completed: Vec<&TodoItem> = todos
-                .iter()
-                .filter(|t| t.status == TodoStatus::Completed)
-                .collect();
             if completed.is_empty() {
                 return Ok(Vec::new());
             }
             let body = completed
                 .iter()
-                .map(|t| {
-                    let summary = t.summary.as_deref().unwrap_or("(no summary)");
-                    format!("- {}: {}", t.title, summary)
-                })
+                .map(|(title, summary)| format!("- {title}: {summary}"))
                 .collect::<Vec<_>>()
                 .join("\n");
             let content = format!("Completed complex task.\nGoal: {goal}\nAccomplished:\n{body}");
@@ -262,6 +275,9 @@ async fn build_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks::task_runtime::types::{
+        AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan, TaskRunStatus,
+    };
 
     fn seeded_store() -> Arc<TaskRuntimeStore> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
@@ -301,7 +317,7 @@ mod tests {
             .set_task_status(
                 "r1",
                 "t1",
-                TodoStatus::Completed,
+                echo_agent::tasks::TaskStatus::Completed,
                 Some("code_reviewer"),
                 Some("found gap"),
             )

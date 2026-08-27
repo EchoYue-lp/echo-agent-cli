@@ -216,6 +216,13 @@ impl FileTaskStore {
         }))
     }
 
+    pub(crate) fn get_plan_revision(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<PlanRevision>, FileReadError> {
+        self.read_plan_resilient(run_id)
+    }
+
     /// Derive the todo projection from the rebuilt plan + the runtime fields
     /// carried on `Task*` events (owner_agent/started_at/completed_at/summary).
     pub(crate) fn list_todos(&self, run_id: &str) -> Result<Vec<TodoItem>, FileReadError> {
@@ -239,10 +246,11 @@ impl FileTaskStore {
             .dependency_states(&runtime_tasks);
         let mut todos = Vec::with_capacity(plan.tasks.len());
         for task in &plan.tasks {
-            let default_status = execution
+            let canonical_status = execution
                 .get(task.id.as_str())
-                .map(|task| task.status)
-                .unwrap_or(TodoStatus::Pending);
+                .map(|task| &task.status)
+                .unwrap_or(&echo_agent::tasks::TaskStatus::Pending);
+            let default_status = TodoStatus::project_task_status(canonical_status);
             let dependency_block = dependency_states
                 .get(&task.id)
                 .and_then(|state| match state {
@@ -281,6 +289,8 @@ impl FileTaskStore {
                 // stored in EkoTaskExecution; otherwise an earlier Blocked event
                 // can overwrite a later plan skip/reset.
                 status,
+                retry_count: task.retry_count,
+                max_retries: task.max_retries,
                 owner_agent: runtime.owner_agent,
                 started_at: runtime.started_at,
                 completed_at: runtime.completed_at,
@@ -381,8 +391,7 @@ mod tests {
             retry_count: 0,
             max_retries: 3,
             failure_fingerprint: None,
-            status: TodoStatus::Pending,
-            status_detail: None,
+            status: echo_agent::tasks::TaskStatus::Pending,
             claim: None,
             sort_order: 0,
         }
@@ -493,7 +502,7 @@ mod tests {
             .set_task_status(
                 "r1",
                 "t1",
-                TodoStatus::Running,
+                echo_agent::tasks::TaskStatus::Running,
                 Some("explorer"),
                 Some("starting"),
             )
@@ -502,7 +511,7 @@ mod tests {
             .set_task_status(
                 "r1",
                 "t1",
-                TodoStatus::Completed,
+                echo_agent::tasks::TaskStatus::Completed,
                 Some("explorer"),
                 Some("done"),
             )
@@ -578,7 +587,7 @@ mod tests {
         store.set_task_status(
             "r1",
             "t1",
-            TodoStatus::Blocked,
+            echo_agent::tasks::TaskStatus::Blocked(String::new()),
             Some("reviewer"),
             Some("review needs fix"),
         )?;
@@ -796,7 +805,7 @@ mod tests {
         store.set_task_status(
             "derived-block",
             "upstream",
-            TodoStatus::Failed,
+            echo_agent::tasks::TaskStatus::Failed(String::new()),
             None,
             Some("upstream failed"),
         )?;

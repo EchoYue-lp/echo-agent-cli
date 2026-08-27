@@ -6821,7 +6821,11 @@ async fn refresh_task_runtime_view(app: &mut TuiApp) {
             .into_iter()
             .map(|task| TaskRuntimeTaskView {
                 title: task.title,
-                status: task.status.as_str().to_string(),
+                status: echo_agent_app_core::tasks::task_runtime::TodoStatus::project_task_status(
+                    &task.status,
+                )
+                .as_str()
+                .to_string(),
                 agent_role: task.agent_role,
             })
             .collect(),
@@ -7286,7 +7290,7 @@ mod tests {
     use echo_agent_app_core::chat_driver::TurnOutcome;
     use echo_agent_app_core::tasks::task_runtime::{
         AttendedMode, DomainProfile, ExecutionMode, InteractionMode, PlanTask, TaskPlan,
-        TaskRunStatus, TaskRuntimeStore, TodoStatus, commit_eko_task_plan,
+        TaskRunStatus, TaskRuntimeStore, commit_eko_task_plan,
     };
     use std::sync::Arc;
     use std::time::Instant;
@@ -7359,7 +7363,7 @@ mod tests {
             .set_task_status(
                 "tui-retry-closed",
                 "retry-task",
-                TodoStatus::Failed,
+                echo_agent::tasks::TaskStatus::Failed(String::new()),
                 None,
                 Some("acceptance failed"),
             )

@@ -73,22 +73,20 @@ export function TasksPanel() {
       for (const task of data) {
         if (task.source !== 'run' || task.status !== 'in_progress') continue;
         try {
-          const plan = await taskRuntimeApi.getPlan(workspaceId, task.id);
-          if (plan && plan.tasks.length > 0) {
-            const done = plan.tasks.filter(
-              (t: { status: string }) => t.status === 'completed'
-            ).length;
-            const pct = Math.round((done / plan.tasks.length) * 100);
+          const todos = await taskRuntimeApi.listTodos(workspaceId, task.id);
+          if (todos.length > 0) {
+            const done = todos.filter((todo) => todo.status === 'completed').length;
+            const pct = Math.round((done / todos.length) * 100);
             setProgressMap((prev) => ({
               ...prev,
               [task.id]: {
                 percentage: pct,
-                phase: `${done}/${plan.tasks.length}`,
+                phase: `${done}/${todos.length}`,
               },
             }));
           }
         } catch {
-          // plan not yet generated — skip
+          // Todo projection not yet available - skip.
         }
       }
     } catch (e) {

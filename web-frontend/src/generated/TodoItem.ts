@@ -11,6 +11,8 @@ export type TodoItem = {
   task_id: string;
   title: string;
   status: TodoStatus;
+  retry_count: number;
+  max_retries: number;
   owner_agent: string | null;
   started_at: string | null;
   completed_at: string | null;

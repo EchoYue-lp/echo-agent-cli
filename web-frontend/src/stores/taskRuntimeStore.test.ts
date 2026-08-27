@@ -27,7 +27,7 @@ vi.mock('../api/endpoints', () => ({
   toolExecutionApi: { list: mocks.listToolExecutions },
 }));
 
-import type { RunContinuationState, TaskPlan, TaskRun } from '../generated';
+import type { PlanRevision, RunContinuationState, TaskRun } from '../generated';
 import { subagentRunStoreKey, useSubagentRunStore } from './subagentRunStore';
 import { useTaskRuntimeStore } from './taskRuntimeStore';
 import { useToolExecutionStore } from './toolExecutionStore';
@@ -189,7 +189,7 @@ describe('taskRuntimeStore recovery controls', () => {
 
   it('updates a task through one revisioned plan patch', async () => {
     useTaskRuntimeStore.setState({
-      plan: { run_id: 'run-1', revision: 3 } as TaskPlan,
+      plan: { run_id: 'run-1', revision: 3 } as PlanRevision,
     });
 
     await useTaskRuntimeStore.getState().updateTask('task-1', { title: 'Refined title' });
@@ -303,7 +303,7 @@ describe('taskRuntimeStore conversation loading', () => {
           agent_role: 'explorer',
         },
       ],
-    } as TaskPlan);
+    } as PlanRevision);
     mocks.listEvents.mockResolvedValueOnce([
       {
         seq: '5',

@@ -542,50 +542,6 @@ export function traceRunsForTaskRun(
     : [];
 }
 
-export function displayedTodoStatus(
-  todo: { status: TodoStatus; task_id: string },
-  runs: SubagentRunState[]
-): TodoStatus {
-  const run = traceRunForTodo(todo, runs);
-  if (!run) return todo.status;
-  // Persisted authoritative statuses must NOT be overwritten by trace signals.
-  // A task that the executor marked Blocked (acceptance pending) or Failed
-  // (terminal) stays that way even if a SubagentRun trace later reports
-  // completed/failed — the executor already incorporated that signal when
-  // deciding the persisted status. Overwriting here hid the retry button
-  // for tasks that needed it most.
-  if (
-    todo.status === ('blocked' as TodoStatus) ||
-    todo.status === ('failed' as TodoStatus) ||
-    todo.status === ('cancelled' as TodoStatus) ||
-    todo.status === ('timed_out' as TodoStatus) ||
-    todo.status === ('completed' as TodoStatus) ||
-    todo.status === ('skipped' as TodoStatus)
-  ) {
-    return todo.status;
-  }
-  // Inline Subagents spawned directly by the primary agent do not drive the
-  // TaskRuntime executor, so their matching plan todo can remain Pending for
-  // the whole run. Project the latest trace lifecycle while it is still
-  // Pending. Once the executor persists Running, review/integration may still
-  // be in progress, so the persisted status remains authoritative.
-  if (todo.status === ('pending' as TodoStatus)) {
-    switch (run.status) {
-      case 'running':
-        return 'running' as TodoStatus;
-      case 'completed':
-        return 'completed' as TodoStatus;
-      case 'failed':
-        return 'failed' as TodoStatus;
-      case 'timed_out':
-        return 'timed_out' as TodoStatus;
-      case 'cancelled':
-        return 'cancelled' as TodoStatus;
-    }
-  }
-  return todo.status;
-}
-
 export function todoStatusDescription(
   todo: { status: TodoStatus; task_id: string },
   runs: SubagentRunState[]
@@ -690,10 +646,7 @@ export function TaskRuntimePanel() {
   const completedCount = todos.filter((todo) => todo.status === ('completed' as TodoStatus)).length;
   const executionCompletedCount = todos.filter((todo) => {
     const trace = traceRunForTodo(todo, activeTaskTraceRuns);
-    return (
-      trace?.status === 'completed' ||
-      displayedTodoStatus(todo, activeTaskTraceRuns) === ('completed' as TodoStatus)
-    );
+    return trace?.status === 'completed' || todo.status === ('completed' as TodoStatus);
   }).length;
   const currentTurn = continuation?.active_turn ?? continuation?.last_turn;
   const activeCellCount = backgroundCells.filter((cell) =>
@@ -1099,13 +1052,13 @@ export function TaskRuntimePanel() {
             {todos.map((todo) => {
               const task = plan?.tasks.find((t) => t.id === todo.task_id);
               const execution = traceRunForTodo(todo, activeTaskTraceRuns);
-              const status = displayedTodoStatus(todo, activeTaskTraceRuns);
+              const status = todo.status;
               const statusDescription = todoStatusDescription(todo, activeTaskTraceRuns);
               const canPatch = status === 'pending' || status === 'blocked';
               const canRetry =
                 (status === 'blocked' || status === 'failed' || status === 'timed_out') &&
                 (activeRun?.status === 'paused' || activeRun?.status === 'failed') &&
-                (task?.retry_count ?? 0) < (task?.max_retries ?? 0);
+                todo.retry_count < todo.max_retries;
               return (
                 <div
                   key={todo.id}
@@ -1145,7 +1098,7 @@ export function TaskRuntimePanel() {
                       {canRetry && (
                         <button
                           className="rounded-md p-0.5 hover:bg-[var(--bg-active)]"
-                          title={`重试(当前 attempt ${(task?.retry_count ?? 0) + 1}/${(task?.max_retries ?? 0) + 1})`}
+                          title={`重试(当前 attempt ${todo.retry_count + 1}/${todo.max_retries + 1})`}
                           onClick={() => {
                             useTaskRuntimeStore.getState().retryBlockedTask(todo.task_id);
                           }}

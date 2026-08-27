@@ -1257,13 +1257,15 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let (task_status, summary, run_status) = if recovery {
             (
-                TodoStatus::Blocked,
+                echo_agent::tasks::TaskStatus::Blocked(
+                    "mutating side effect is indeterminate after restart".to_string(),
+                ),
                 "mutating side effect is indeterminate after restart",
                 TaskRunStatus::Paused,
             )
         } else {
             (
-                TodoStatus::Failed,
+                echo_agent::tasks::TaskStatus::Failed("execution failed".to_string()),
                 "execution failed",
                 TaskRunStatus::Failed,
             )
@@ -1295,9 +1297,10 @@ mod tests {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("run missing: {run_id}"))?;
         let task = store
-            .get_plan(run_id)
+            .list_todos(run_id)
             .map_err(|error| error.to_string())?
-            .and_then(|plan| plan.tasks.into_iter().next())
+            .into_iter()
+            .next()
             .ok_or_else(|| format!("task missing: {run_id}"))?;
         Ok((
             run.status,
@@ -1534,7 +1537,7 @@ mod tests {
             .set_task_status(
                 "retry-run",
                 "retry-task",
-                TodoStatus::Failed,
+                echo_agent::tasks::TaskStatus::Failed(String::new()),
                 Some("researcher"),
                 Some("execution failed"),
             )

@@ -222,8 +222,7 @@ mod tests {
             retry_count: 0,
             max_retries: 0,
             failure_fingerprint: None,
-            status: crate::tasks::task_runtime::types::TodoStatus::Pending,
-            status_detail: None,
+            status: echo_agent::tasks::TaskStatus::Pending,
             claim: None,
             sort_order: 0,
         }

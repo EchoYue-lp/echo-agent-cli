@@ -1101,7 +1101,7 @@ mod tests {
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
         AttendedMode, DomainProfile, ExecutionMode, PlanRevision, PlanTask, PlanTaskKind,
-        TaskPatch, TaskPlan, TaskRunStatus, TaskUpdateOperation, TaskUpdateRequest, TodoStatus,
+        TaskPatch, TaskPlan, TaskRunStatus, TaskUpdateOperation, TaskUpdateRequest,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1124,8 +1124,7 @@ mod tests {
             retry_count: 0,
             max_retries: 3,
             failure_fingerprint: None,
-            status: TodoStatus::Pending,
-            status_detail: None,
+            status: echo_agent::tasks::TaskStatus::Pending,
             claim: None,
             sort_order: 0,
         }
@@ -1472,7 +1471,7 @@ mod tests {
             .set_task_status(
                 "first",
                 "first-a",
-                TodoStatus::Running,
+                echo_agent::tasks::TaskStatus::Running,
                 Some("explorer"),
                 None,
             )
