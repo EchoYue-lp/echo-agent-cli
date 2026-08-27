@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use echo_agent::agent::AgentHandle;
+use echo_agent::memory::ConversationStore;
 use echo_agent::tools::{Tool, ToolContext, ToolParameters, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,8 +20,9 @@ use ts_rs::TS;
 
 use crate::agent_router::{AgentAddress, AgentDeliveryReceipt, AgentRouter};
 use crate::tasks::task_runtime::{
-    RuntimeEventKind, SubagentControlActorSource, SubagentControlIdentity, SubagentControlPhase,
-    SubagentControlReceipt, SubagentControlService, SubagentRun, TaskRunStatus, TaskRuntimeStore,
+    RuntimeEventKind, StoreError, SubagentControlActorSource, SubagentControlIdentity,
+    SubagentControlPhase, SubagentControlReceipt, SubagentControlService, SubagentGuidanceKind,
+    SubagentRun, TaskPlan, TaskRun, TaskRunStatus, TaskRuntimeBlockingAdapter, TaskRuntimeStore,
 };
 use crate::workspace::WorkspaceId;
 use crate::workspace::registry::WorkspaceRegistry;
@@ -311,14 +313,52 @@ impl AgentControlError {
     }
 }
 
+fn runtime_control_error(error: StoreError, target: &TaskSubagentTarget) -> AgentControlError {
+    match error {
+        StoreError::RunNotFound(_) => AgentControlError::RunNotFound {
+            run_id: target.run_id.clone(),
+        },
+        StoreError::PlanNotFound(_) | StoreError::TaskNotFound(_) => {
+            AgentControlError::TargetUnavailable(format!(
+                "task {} in run {} is unavailable",
+                target.task_id, target.run_id
+            ))
+        }
+        StoreError::PlanConflict { current, .. } => AgentControlError::WrongRevision {
+            run_id: target.run_id.clone(),
+            expected: target.plan_revision,
+            current,
+        },
+        StoreError::InvalidPlan(detail)
+            if detail.contains("attempt") || detail.contains("execution") =>
+        {
+            AgentControlError::StaleAttempt {
+                execution_id: target.execution_id.clone(),
+                attempt: target.attempt,
+            }
+        }
+        StoreError::InvalidPlan(detail)
+            if detail.contains("different command payload")
+                || detail.contains("different command")
+                || detail.contains("already bound") =>
+        {
+            AgentControlError::DuplicateConflict
+        }
+        other => AgentControlError::Runtime(other.to_string()),
+    }
+}
+
 /// Thin routing adapter shared by all model invocations and all surfaces.
 #[derive(Clone)]
 pub struct AgentControlService {
     router: Arc<AgentRouter>,
     task_runtime: Arc<TaskRuntimeStore>,
+    task_runtime_blocking: TaskRuntimeBlockingAdapter,
     workspace_registry: Arc<WorkspaceRegistry>,
     known_conversations: Arc<std::sync::Mutex<HashSet<AgentAddress>>>,
     delivery_wake: Option<DeliveryWake>,
+    conversation_store: Option<Arc<dyn ConversationStore>>,
+    conversation_workspace_id: Option<String>,
 }
 
 impl AgentControlService {
@@ -329,10 +369,13 @@ impl AgentControlService {
     ) -> Self {
         Self {
             router,
-            task_runtime,
+            task_runtime: Arc::clone(&task_runtime),
+            task_runtime_blocking: TaskRuntimeBlockingAdapter::new(Arc::clone(&task_runtime)),
             workspace_registry,
             known_conversations: Arc::new(std::sync::Mutex::new(HashSet::new())),
             delivery_wake: None,
+            conversation_store: None,
+            conversation_workspace_id: None,
         }
     }
 
@@ -344,12 +387,84 @@ impl AgentControlService {
         self
     }
 
+    /// Bind the ConversationStore for this service's workspace. Router target
+    /// manifests are an inbox concern; persisted conversations remain owned by
+    /// ConversationStore and may legitimately predate their first delivery.
+    pub fn with_conversation_store(
+        mut self,
+        store: Arc<dyn ConversationStore>,
+        workspace_id: String,
+    ) -> Self {
+        self.conversation_store = Some(store);
+        self.conversation_workspace_id = Some(workspace_id);
+        self
+    }
+
     pub fn router(&self) -> Arc<AgentRouter> {
         Arc::clone(&self.router)
     }
 
     pub fn task_runtime(&self) -> Arc<TaskRuntimeStore> {
         Arc::clone(&self.task_runtime)
+    }
+
+    async fn get_run(&self, run_id: &str) -> Result<Option<TaskRun>, AgentControlError> {
+        let run_id = run_id.to_string();
+        self.task_runtime_blocking
+            .run_store("read Agent control TaskRun", move |store| {
+                store.get_run(&run_id)
+            })
+            .await
+            .map_err(|error| AgentControlError::Runtime(error.to_string()))
+    }
+
+    async fn get_plan(&self, run_id: &str) -> Result<Option<TaskPlan>, AgentControlError> {
+        let run_id = run_id.to_string();
+        self.task_runtime_blocking
+            .run_store("read Agent control TaskPlan", move |store| {
+                store.get_plan(&run_id)
+            })
+            .await
+            .map_err(|error| AgentControlError::Runtime(error.to_string()))
+    }
+
+    async fn list_events(
+        &self,
+        run_id: &str,
+        since_seq: i64,
+    ) -> Result<Vec<crate::tasks::task_runtime::RuntimeTaskEvent>, AgentControlError> {
+        let run_id = run_id.to_string();
+        self.task_runtime_blocking
+            .run_store("read Agent control events", move |store| {
+                store.list_events(&run_id, since_seq)
+            })
+            .await
+            .map_err(|error| AgentControlError::Runtime(error.to_string()))
+    }
+
+    async fn list_subagent_runs(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<SubagentRun>, AgentControlError> {
+        let run_id = run_id.to_string();
+        self.task_runtime_blocking
+            .run_store("read Agent control Subagent runs", move |store| {
+                store.list_subagent_runs(&run_id)
+            })
+            .await
+            .map_err(|error| AgentControlError::Runtime(error.to_string()))
+    }
+
+    async fn list_runs_in(
+        &self,
+        statuses: Vec<TaskRunStatus>,
+    ) -> Result<Vec<TaskRun>, AgentControlError> {
+        self.task_runtime_blocking
+            .run_store("list Agent control TaskRuns", move |store| {
+                store.list_runs_in(&statuses)
+            })
+            .await
+            .map_err(|error| AgentControlError::Runtime(error.to_string()))
     }
 
     pub async fn list(
@@ -400,6 +515,11 @@ impl AgentControlService {
                         workspace_generation: None,
                     },
                 };
+                match self.require_readable_target(&target).await {
+                    Ok(()) => {}
+                    Err(AgentControlError::TargetUnavailable(_)) => continue,
+                    Err(error) => return Err(error),
+                }
                 let (status, summary, cursor) = self.inspect_conversation(&target).await?;
                 if request
                     .status
@@ -437,10 +557,7 @@ impl AgentControlService {
                 TaskRunStatus::Failed,
                 TaskRunStatus::Completed,
             ];
-            let runs = self
-                .task_runtime
-                .list_runs_in(&statuses)
-                .map_err(|error| AgentControlError::Runtime(error.to_string()))?;
+            let runs = self.list_runs_in(statuses.to_vec()).await?;
             for run in runs {
                 if request
                     .workspace_id
@@ -449,16 +566,22 @@ impl AgentControlService {
                 {
                     continue;
                 }
-                for subagent in self
-                    .task_runtime
-                    .list_subagent_runs(&run.run_id)
-                    .map_err(|error| AgentControlError::Runtime(error.to_string()))?
-                {
-                    let Some(plan_revision) = self
-                        .task_runtime
-                        .get_plan(&subagent.run_id)
-                        .map_err(|error| AgentControlError::Runtime(error.to_string()))?
-                        .map(|plan| plan.revision)
+                for subagent in self.list_subagent_runs(&run.run_id).await? {
+                    // A retry can outlive a later plan revision. Recover the
+                    // revision recorded on this exact Assigned boundary rather
+                    // than binding historical attempts to today's plan.
+                    let events = self.list_events(&subagent.run_id, 0).await?;
+                    let Some(plan_revision) = events
+                        .iter()
+                        .rev()
+                        .find(|event| {
+                            event.event_type == RuntimeEventKind::SubagentAssigned
+                                && event.step_id.as_deref()
+                                    == Some(subagent.subagent_run_id.as_str())
+                        })
+                        .and_then(|event| {
+                            event.payload.get("plan_revision").and_then(Value::as_u64)
+                        })
                     else {
                         continue;
                     };
@@ -481,10 +604,7 @@ impl AgentControlService {
                     {
                         continue;
                     }
-                    let sequence = self
-                        .task_runtime
-                        .list_events(&subagent.run_id, 0)
-                        .map_err(|error| AgentControlError::Runtime(error.to_string()))?
+                    let sequence = events
                         .iter()
                         .rev()
                         .find(|event| {
@@ -543,11 +663,12 @@ impl AgentControlService {
                 })
             }
             AgentTarget::TaskSubagent { target: task } => {
-                let task_runtime = self.runtime_for_target(task)?;
-                let subagent = self.exact_subagent(task)?;
-                let events = task_runtime
-                    .list_events(&task.run_id, 0)
-                    .map_err(|error| AgentControlError::Runtime(error.to_string()))?;
+                // Inspection is valid for a settled attempt as well as a live
+                // one; exact_subagent below enforces identity without
+                // requiring Running status.
+                self.validate_task_target(task, false, false).await?;
+                let subagent = self.exact_subagent(task).await?;
+                let events = self.list_events(&task.run_id, 0).await?;
                 let latest = events
                     .iter()
                     .rev()
@@ -605,12 +726,26 @@ impl AgentControlService {
                         "next_attempt delivery is only valid for TaskSubagentTarget".to_string(),
                     ));
                 }
+                // AgentRouter enqueue creates an inbox on demand. Guard the
+                // model-facing path with the persisted ConversationStore so a
+                // typo cannot create a phantom conversation; explicit
+                // conversation creation remains owned by AppState.
+                self.require_readable_target(&AgentTarget::Conversation {
+                    target: target.clone(),
+                })
+                .await?;
                 let address = self.conversation_address(&target)?;
                 let from = request
                     .from
                     .as_ref()
                     .map(|source| self.conversation_address(source))
                     .transpose()?;
+                if let Some(source) = request.from.as_ref() {
+                    self.require_readable_target(&AgentTarget::Conversation {
+                        target: source.clone(),
+                    })
+                    .await?;
+                }
                 let mut message = crate::agent_router::AgentMessage::agent_text(
                     from,
                     address.clone(),
@@ -651,17 +786,41 @@ impl AgentControlService {
                     attempt: target.attempt,
                     command_id,
                 };
-                if request.delivery == AgentMessageDelivery::Live {
-                    self.validate_task_target(&target, true, true).await?;
-                }
-                let duplicate = self.command_exists(&target, &identity.command_id)?;
                 let task_runtime = self.runtime_for_target(&target)?;
                 let control = SubagentControlService::new(task_runtime);
+                let guidance_kind = match request.delivery {
+                    AgentMessageDelivery::Live => SubagentGuidanceKind::LiveMessage,
+                    AgentMessageDelivery::NextAttempt => SubagentGuidanceKind::NextAttempt,
+                };
+                if let Some(existing) = control
+                    .existing_guidance_receipt_async(
+                        identity.clone(),
+                        guidance_kind,
+                        request.text.clone(),
+                    )
+                    .await
+                    .map_err(|error| runtime_control_error(error, &target))?
+                {
+                    return Ok(subagent_receipt("message", target, existing));
+                }
+                if request.delivery == AgentMessageDelivery::Live {
+                    self.validate_task_target(&target, true, true).await?;
+                } else if target.execution_id
+                    != format!(
+                        "pending:{}:{}:{}:{}",
+                        target.run_id, target.task_id, target.plan_revision, target.attempt
+                    )
+                {
+                    return Err(AgentControlError::StaleAttempt {
+                        execution_id: target.execution_id.clone(),
+                        attempt: target.attempt,
+                    });
+                }
                 let receipt = match request.delivery {
                     AgentMessageDelivery::Live => control
                         .send_message(identity, &request.text, SubagentControlActorSource::Cli)
                         .await
-                        .map_err(|error| AgentControlError::Runtime(error.to_string()))?,
+                        .map_err(|error| runtime_control_error(error, &target))?,
                     AgentMessageDelivery::NextAttempt => control
                         .queue_guidance_async(
                             identity,
@@ -669,9 +828,9 @@ impl AgentControlService {
                             SubagentControlActorSource::Cli,
                         )
                         .await
-                        .map_err(|error| AgentControlError::Runtime(error.to_string()))?,
+                        .map_err(|error| runtime_control_error(error, &target))?,
                 };
-                Ok(subagent_receipt("message", target, receipt, duplicate))
+                Ok(subagent_receipt("message", target, receipt))
             }
         }
     }
@@ -712,15 +871,21 @@ impl AgentControlService {
             attempt: target.attempt,
             command_id: self.validate_id(&request.command_id, "command_id")?,
         };
-        self.validate_task_target(&target, true, true).await?;
-        let duplicate = self.command_exists(&target, &identity.command_id)?;
         let task_runtime = self.runtime_for_target(&target)?;
         let control = SubagentControlService::new(task_runtime);
+        if let Some(existing) = control
+            .existing_command_receipt_async(identity.clone())
+            .await
+            .map_err(|error| runtime_control_error(error, &target))?
+        {
+            return Ok(subagent_receipt("interrupt", target, existing));
+        }
+        self.validate_task_target(&target, true, true).await?;
         let receipt = control
             .interrupt_subagent(identity, SubagentControlActorSource::Cli)
             .await
-            .map_err(|error| AgentControlError::Runtime(error.to_string()))?;
-        Ok(subagent_receipt("interrupt", target, receipt, duplicate))
+            .map_err(|error| runtime_control_error(error, &target))?;
+        Ok(subagent_receipt("interrupt", target, receipt))
     }
 
     pub async fn wait(
@@ -735,6 +900,10 @@ impl AgentControlService {
         }
         for target in &request.targets {
             self.validate_target(target).await?;
+            if let AgentTarget::TaskSubagent { target } = target {
+                self.validate_task_target(target, false, false).await?;
+                self.exact_subagent(target).await?;
+            }
             self.require_readable_target(target).await?;
             self.remember_target(target);
         }
@@ -827,15 +996,22 @@ impl AgentControlService {
                 }))
             }
             AgentTarget::TaskSubagent { target: task } => {
-                let task_runtime = self.runtime_for_target(task)?;
-                let events = task_runtime
-                    .list_events(&task.run_id, after)
-                    .map_err(|error| AgentControlError::Runtime(error.to_string()))?;
-                let event = events.into_iter().find(|event| {
-                    event.step_id.as_deref() == Some(task.execution_id.as_str())
-                        && (matches!(event.event_type, RuntimeEventKind::SubagentReleased)
-                            || event.event_type.is_attention_event())
-                });
+                let events = self.list_events(&task.run_id, after).await?;
+                let event = events
+                    .into_iter()
+                    .filter(|event| {
+                        event.step_id.as_deref() == Some(task.execution_id.as_str())
+                            && (matches!(event.event_type, RuntimeEventKind::SubagentReleased)
+                                || matches!(
+                                    event.event_type,
+                                    RuntimeEventKind::SubagentGuidanceMailboxAccepted
+                                        | RuntimeEventKind::SubagentGuidanceDrained
+                                        | RuntimeEventKind::SubagentGuidanceSettled
+                                )
+                                || event.event_type.is_attention_event())
+                    })
+                    .take(MAX_EVENTS)
+                    .next();
                 Ok(event.map(|event| AgentWaitEvent {
                     target: target.clone(),
                     kind: event.event_type.as_str().to_string(),
@@ -871,17 +1047,31 @@ impl AgentControlService {
             return Ok(());
         };
         let address = self.conversation_address(target)?;
-        let exists = self
-            .router
-            .target_exists(&address)
-            .await
-            .map_err(|error| AgentControlError::Router(error.to_string()))?;
-        if exists {
-            Ok(())
-        } else {
+        if let (Some(store), Some(workspace_id)) = (
+            self.conversation_store.as_ref(),
+            self.conversation_workspace_id.as_deref(),
+        ) {
+            if workspace_id != address.workspace_id.as_str() {
+                return Err(AgentControlError::TargetUnavailable(format!(
+                    "conversation {}/{}",
+                    target.workspace_id, target.conversation_id
+                )));
+            }
+            let conversation = store
+                .get_conversation(&address.conversation_id)
+                .await
+                .map_err(|error| AgentControlError::Runtime(error.to_string()))?;
+            if conversation.is_some() {
+                return Ok(());
+            }
             Err(AgentControlError::TargetUnavailable(format!(
                 "conversation {}/{}",
                 target.workspace_id, target.conversation_id
+            )))
+        } else {
+            Err(AgentControlError::TargetUnavailable(format!(
+                "ConversationStore is unavailable for workspace {}",
+                target.workspace_id
             )))
         }
     }
@@ -892,17 +1082,43 @@ impl AgentControlService {
         require_active: bool,
         reject_terminal: bool,
     ) -> Result<(), AgentControlError> {
-        let run = self
-            .runtime_for_target(target)?
-            .get_run(&target.run_id)
-            .map_err(|error| AgentControlError::Runtime(error.to_string()))?
-            .ok_or_else(|| AgentControlError::RunNotFound {
-                run_id: target.run_id.clone(),
-            })?;
+        for (field, value) in [
+            ("workspace_id", target.workspace_id.as_str()),
+            ("run_id", target.run_id.as_str()),
+            ("task_id", target.task_id.as_str()),
+            ("execution_id", target.execution_id.as_str()),
+        ] {
+            if value.trim().is_empty() || value.contains('\0') {
+                return Err(AgentControlError::Invalid(format!(
+                    "{field} must contain non-empty text without NUL"
+                )));
+            }
+        }
+        if target.plan_revision == 0 || target.attempt == 0 {
+            return Err(AgentControlError::Invalid(
+                "plan_revision and attempt must be positive".to_string(),
+            ));
+        }
+        // A service is bound to one immutable workspace TaskRuntime. Reject
+        // foreign targets before touching that store, so a same-named run in a
+        // different workspace can never be mistaken for this target.
+        self.runtime_for_target(target)?;
+        let run =
+            self.get_run(&target.run_id)
+                .await?
+                .ok_or_else(|| AgentControlError::RunNotFound {
+                    run_id: target.run_id.clone(),
+                })?;
         self.validate_workspace_generation(
             &run.workspace_id,
             target.workspace_generation.as_deref(),
         )?;
+        if run.workspace_id != target.workspace_id {
+            return Err(AgentControlError::TargetUnavailable(format!(
+                "TaskRun {} belongs to workspace {}, not {}",
+                target.run_id, run.workspace_id, target.workspace_id
+            )));
+        }
         if reject_terminal
             && matches!(
                 run.status,
@@ -914,13 +1130,9 @@ impl AgentControlService {
                 target.run_id
             )));
         }
-        let task_runtime = self.runtime_for_target(target)?;
-        let plan = task_runtime
-            .get_plan(&target.run_id)
-            .map_err(|error| AgentControlError::Runtime(error.to_string()))?
-            .ok_or_else(|| {
-                AgentControlError::TargetUnavailable(format!("plan for {}", target.run_id))
-            })?;
+        let plan = self.get_plan(&target.run_id).await?.ok_or_else(|| {
+            AgentControlError::TargetUnavailable(format!("plan for {}", target.run_id))
+        })?;
         if plan.revision != target.plan_revision {
             return Err(AgentControlError::WrongRevision {
                 run_id: target.run_id.clone(),
@@ -935,7 +1147,7 @@ impl AgentControlService {
             )));
         }
         if require_active {
-            let subagent = self.exact_subagent(target)?;
+            let subagent = self.exact_subagent(target).await?;
             if subagent.status != crate::tasks::task_runtime::SubagentRunStatus::Running {
                 return Err(AgentControlError::StaleAttempt {
                     execution_id: target.execution_id.clone(),
@@ -961,14 +1173,11 @@ impl AgentControlService {
         }
     }
 
-    fn exact_subagent(
+    async fn exact_subagent(
         &self,
         target: &TaskSubagentTarget,
     ) -> Result<SubagentRun, AgentControlError> {
-        let task_runtime = self.runtime_for_target(target)?;
-        let runs = task_runtime
-            .list_subagent_runs(&target.run_id)
-            .map_err(|error| AgentControlError::Runtime(error.to_string()))?;
+        let runs = self.list_subagent_runs(&target.run_id).await?;
         let Some(run) = runs
             .into_iter()
             .find(|run| run.subagent_run_id == target.execution_id)
@@ -987,21 +1196,6 @@ impl AgentControlService {
         Ok(run)
     }
 
-    fn command_exists(
-        &self,
-        target: &TaskSubagentTarget,
-        command_id: &str,
-    ) -> Result<bool, AgentControlError> {
-        let task_runtime = self.runtime_for_target(target)?;
-        Ok(task_runtime
-            .list_events(&target.run_id, 0)
-            .map_err(|error| AgentControlError::Runtime(error.to_string()))?
-            .iter()
-            .any(|event| {
-                event.payload.get("command_id").and_then(Value::as_str) == Some(command_id)
-            }))
-    }
-
     fn conversation_address(
         &self,
         target: &ConversationTarget,
@@ -1009,6 +1203,11 @@ impl AgentControlService {
         if target.workspace_id.trim().is_empty() || target.conversation_id.trim().is_empty() {
             return Err(AgentControlError::Invalid(
                 "workspace_id and conversation_id must not be empty".to_string(),
+            ));
+        }
+        if target.workspace_id.contains('\0') || target.conversation_id.contains('\0') {
+            return Err(AgentControlError::Invalid(
+                "workspace_id and conversation_id must not contain NUL".to_string(),
             ));
         }
         let workspace = WorkspaceId::from_raw(target.workspace_id.clone());
@@ -1056,6 +1255,11 @@ impl AgentControlService {
                 "text/reason must not be empty".to_string(),
             ));
         }
+        if text.contains('\0') {
+            return Err(AgentControlError::Invalid(
+                "text must not contain NUL characters".to_string(),
+            ));
+        }
         if text.chars().count() > MAX_TEXT_CHARS {
             return Err(AgentControlError::Invalid(format!(
                 "text exceeds {MAX_TEXT_CHARS} characters"
@@ -1066,7 +1270,7 @@ impl AgentControlService {
 
     fn validate_id(&self, value: &str, field: &str) -> Result<String, AgentControlError> {
         let value = value.trim();
-        if value.is_empty() || value.chars().count() > 128 {
+        if value.is_empty() || value.chars().count() > 128 || value.contains('\0') {
             return Err(AgentControlError::Invalid(format!(
                 "{field} must contain 1-128 characters"
             )));
@@ -1293,7 +1497,6 @@ fn subagent_receipt(
     operation: &str,
     target: TaskSubagentTarget,
     receipt: SubagentControlReceipt,
-    duplicate: bool,
 ) -> AgentControlReceipt {
     AgentControlReceipt {
         operation: operation.to_string(),
@@ -1301,7 +1504,7 @@ fn subagent_receipt(
         status: receipt.status.as_str().to_string(),
         phase: control_phase_name(receipt.phase).to_string(),
         outcome: receipt.outcome.map(|outcome| outcome.as_str().to_string()),
-        duplicate,
+        duplicate: receipt.duplicate,
         message_id: None,
         command_id: Some(receipt.identity.command_id),
         cursor: None,
@@ -1612,6 +1815,7 @@ mod tests {
     use crate::tasks::task_runtime::{
         AttendedMode, DomainProfile, ExecutionMode, PlanTask, TaskPlan, task_goal_sha256,
     };
+    use echo_agent::memory::{ConversationStore, FileConversationStore, NewConversation};
 
     fn service(root: &std::path::Path) -> Result<AgentControlService, String> {
         let router = Arc::new(AgentRouter::new(root.join("router")));
@@ -1623,7 +1827,34 @@ mod tests {
             WorkspaceRegistry::with_base_dir(root.join("workspaces"))
                 .map_err(|error| error.to_string())?,
         );
-        Ok(AgentControlService::new(router, task_runtime, registry))
+        let conversation_store: Arc<dyn ConversationStore> = Arc::new(
+            FileConversationStore::new(root.join("conversation-store"))
+                .map_err(|error| error.to_string())?,
+        );
+        Ok(AgentControlService::new(router, task_runtime, registry)
+            .with_conversation_store(conversation_store, "global".to_string()))
+    }
+
+    async fn seed_conversations(
+        service: &AgentControlService,
+        conversation_ids: &[&str],
+    ) -> Result<(), String> {
+        let store = service
+            .conversation_store
+            .as_ref()
+            .ok_or_else(|| "conversation store fixture is missing".to_string())?;
+        for conversation_id in conversation_ids {
+            store
+                .create_conversation(NewConversation {
+                    conversation_id: (*conversation_id).to_string(),
+                    user_id: "default".to_string(),
+                    agent_type: None,
+                    title: None,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     fn conversation(workspace_id: &str, conversation_id: &str) -> AgentTarget {
@@ -1733,6 +1964,7 @@ mod tests {
     {
         let root = tempfile::tempdir().map_err(|error| error.to_string())?;
         let service = service(root.path())?;
+        seed_conversations(&service, &["conversation-a", "conversation-b"]).await?;
         let target = conversation("global", "conversation-a");
         let request = AgentMessageRequest {
             target: target.clone(),
@@ -1818,6 +2050,7 @@ mod tests {
             observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }));
+        seed_conversations(&service, &["conversation-a"]).await?;
         service
             .message(AgentMessageRequest {
                 target: conversation("global", "conversation-a"),
@@ -1853,6 +2086,18 @@ mod tests {
         let root = tempfile::tempdir().map_err(|error| error.to_string())?;
         let service = service(root.path())?;
         let target = conversation("global", "unknown");
+        // A router manifest alone is not a persisted Conversation. This
+        // simulates a stale/phantom inbox and ensures Store-first validation
+        // cannot be bypassed by the router target_exists fast path.
+        service
+            .router
+            .enqueue(crate::agent_router::AgentMessage::agent_text(
+                None,
+                AgentAddress::new(WorkspaceId::from_raw("global".to_string()), "unknown"),
+                "phantom",
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
         let error = match service.inspect(target).await {
             Ok(_) => return Err("unknown target was accepted".to_string()),
             Err(error) => error,
@@ -1908,6 +2153,7 @@ mod tests {
     async fn wait_honors_cancellation_without_claiming_terminal_state() -> Result<(), String> {
         let root = tempfile::tempdir().map_err(|error| error.to_string())?;
         let service = service(root.path())?;
+        seed_conversations(&service, &["conversation-a"]).await?;
         service
             .router
             .enqueue(crate::agent_router::AgentMessage::agent_text(
@@ -1943,8 +2189,12 @@ mod tests {
         let root = tempfile::tempdir().map_err(|error| error.to_string())?;
         let service = service(root.path())?;
         seed_task_plan(&service.task_runtime, "run-a")?;
+        let mut target = task_subagent_target("run-a");
+        if let AgentTarget::TaskSubagent { target } = &mut target {
+            target.execution_id = "pending:run-a:task-a:1:1".to_string();
+        }
         let request = AgentMessageRequest {
-            target: task_subagent_target("run-a"),
+            target,
             text: "use the latest fixture".to_string(),
             command_id: Some("command-a".to_string()),
             message_id: None,
@@ -1960,6 +2210,63 @@ mod tests {
         assert!(!first.duplicate);
         assert!(second.duplicate);
         assert_eq!(first.command_id, second.command_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inspect_and_wait_allow_a_settled_subagent_attempt() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = service(root.path())?;
+        seed_task_plan(&service.task_runtime, "run-terminal")?;
+        service
+            .task_runtime
+            .record_subagent_assigned(
+                "run-terminal",
+                "task-a",
+                "execution-a",
+                "reviewer",
+                "Task A",
+                1,
+                1,
+                true,
+                false,
+            )
+            .map_err(|error| error.to_string())?;
+        service
+            .task_runtime
+            .record_subagent_released(crate::tasks::task_runtime::store::SubagentReleaseRecord {
+                run_id: "run-terminal",
+                task_id: "task-a",
+                execution_id: "execution-a",
+                agent_name: "reviewer",
+                task_subject: "Task A",
+                plan_revision: 1,
+                attempt: 1,
+                status: "completed",
+                result: None,
+                full_output: None,
+                usage: None,
+                dispatch_hook: false,
+            })
+            .map_err(|error| error.to_string())?;
+        let target = task_subagent_target("run-terminal");
+        let inspected = service
+            .inspect(target.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(inspected.status, "completed");
+        let waited = service
+            .wait(
+                AgentWaitRequest {
+                    targets: vec![target],
+                    after_cursor: Some(inspected.cursor),
+                    timeout_ms: 0,
+                },
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(waited.status, AgentWaitStatus::Timeout);
         Ok(())
     }
 

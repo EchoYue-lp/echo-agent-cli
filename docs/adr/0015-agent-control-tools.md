@@ -27,9 +27,12 @@ durable inbox、`SubagentControlService` 的 exact-attempt guidance/interrupt、
   workspace incarnation；不匹配时返回 typed fail-closed error；
 - `agent_wait` 只读取现有 router/task event cursor，返回 bounded event summaries，不能
   代替 TaskRun/Subagent terminal authority；取消和超时是 wait 结果，不是任务终态；
-- Conversation `agent_message` 以 `message_id` 复用 router exact-once 语义但只持久化信息，
-  不自动启动 turn；`agent_followup` 才复用 AppState delivery supervisor wake。TaskSubagent
-  command 以 `command_id` 复用其 workspace `SubagentControlService` durable receipt；
+- Conversation `agent_message`/`agent_followup` 先通过绑定 workspace 的
+  `ConversationStore` 验证持久化会话，再以 `message_id` 复用 router exact-once 语义；router
+  的 `target.json` 单独不能制造会话。`agent_message` 只持久化信息、不自动启动 turn，
+  `agent_followup` 才复用 AppState delivery supervisor wake。TaskSubagent command 以
+  `command_id` 复用其 workspace `SubagentControlService` durable receipt，并在 duplicate
+  replay 前校验 command kind/content；
 - 工具通过 `AppState::register_agent_control_tools` 在共享 ToolManager 上注册，故
   GUI/TUI/CLI/channel、global pool 与 workspace pool 共用同一套 schema 和
   router/registry authority；每个 pool 绑定自己的 TaskRuntimeStore，follow-up 复用 AppState
@@ -45,11 +48,15 @@ durable inbox、`SubagentControlService` 的 exact-attempt guidance/interrupt、
 ## 影响
 
 模型获得统一且有界的协作控制面；surface 不再需要各自解析 Agent 地址或实现第二套
-list/message/wait。Conversation 目录优先复用 AgentRouter 的持久化 `target.json` 清单，
-并合并当前进程已见目标；持久化 inbox 和目标发现仍由 AgentRouter 拥有，adapter 不新增
-第二 store。
+list/message/wait。Conversation 的存在性由绑定 workspace `ConversationStore` 判定，Router
+只负责 inbox/journal；list 会过滤 router-only phantom target。TaskRuntime 的所有读操作
+经 `TaskRuntimeBlockingAdapter` 离开 async executor；当前底层 `list_events`/
+`list_subagent_runs` API 仍返回完整向量，adapter 保证 exact-target 过滤发生在
+`MAX_EVENTS` 截断之前，避免 false timeout；新增真正的 bounded query API 留作 R1/P0
+integration，不能在本 ADR 中伪称已解决。
 
 ## 验证
 
-覆盖 target discriminator、exact-once message、cursor target binding、cancel/timeout
-wait，以及六工具 schema/注册；提交前按 `AGENTS.md` 执行 Rust workspace 门禁。
+覆盖 target discriminator、ConversationStore-first phantom rejection、exact-once message、
+cursor target binding、settled attempt inspect/wait、cancel/timeout wait，以及六工具
+schema/注册；提交前按 `AGENTS.md` 执行 Rust workspace 门禁。

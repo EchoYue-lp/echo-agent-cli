@@ -2389,6 +2389,10 @@ impl SubagentControlStatus {
 #[ts(export, rename = "SubagentControlReceipt")]
 pub struct SubagentControlReceipt {
     pub identity: SubagentControlIdentity,
+    /// True when the durable command already existed and this call replayed
+    /// its authoritative receipt rather than appending a second command.
+    #[serde(default)]
+    pub duplicate: bool,
     pub status: SubagentControlStatus,
     pub phase: SubagentControlPhase,
     pub outcome: Option<SubagentControlOutcome>,

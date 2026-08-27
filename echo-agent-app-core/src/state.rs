@@ -3356,8 +3356,13 @@ impl AppState {
                 .map_err(|error| error.to_string())
         });
         let _ = self.agent_control_wake.set(Arc::clone(&wake));
-        self.register_agent_control_tools_with_wake(agent, task_runtime, wake)
-            .await;
+        self.register_agent_control_tools_with_wake(
+            agent,
+            task_runtime,
+            wake,
+            self.workspace.global_conversation.store.clone(),
+        )
+        .await;
     }
 
     async fn register_agent_control_tools_with_wake(
@@ -3365,15 +3370,20 @@ impl AppState {
         agent: &crate::agent_handle::AgentHandle,
         task_runtime: Arc<crate::tasks::task_runtime::TaskRuntimeStore>,
         wake: crate::agent_control::DeliveryWake,
+        conversation_store: Option<Arc<dyn ConversationStore>>,
     ) {
-        let service = Arc::new(
-            crate::agent_control::AgentControlService::new(
-                Arc::clone(&self.agent_router),
-                task_runtime,
-                Arc::clone(&self.workspace.registry),
-            )
-            .with_delivery_wake(wake),
-        );
+        let workspace_id = task_runtime.active_workspace_id();
+        let service = crate::agent_control::AgentControlService::new(
+            Arc::clone(&self.agent_router),
+            task_runtime,
+            Arc::clone(&self.workspace.registry),
+        )
+        .with_delivery_wake(wake);
+        let service = match conversation_store {
+            Some(store) => service.with_conversation_store(store, workspace_id),
+            None => service,
+        };
+        let service = Arc::new(service);
         crate::agent_control::register_agent_control_tools_on_agent(agent, service).await;
     }
 
@@ -3695,6 +3705,7 @@ impl AppState {
                 &execution.primary_agent(),
                 task_runtime.clone(),
                 Arc::clone(wake),
+                Some(host.resources().conversation_store()),
             )
             .await;
         }

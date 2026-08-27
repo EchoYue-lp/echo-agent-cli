@@ -89,6 +89,61 @@ impl SubagentControlService {
         }
     }
 
+    /// Read an existing durable command receipt without claiming a new
+    /// attempt. Callers use this to replay terminal commands before live
+    /// attempt validation; a concurrent writer is still serialized by the
+    /// command methods' per-run lock.
+    pub fn existing_command_receipt(
+        &self,
+        identity: &SubagentControlIdentity,
+    ) -> Result<Option<SubagentControlReceipt>, StoreError> {
+        let Some(receipt) = existing_receipt(&self.store, identity)? else {
+            return Ok(None);
+        };
+        validate_existing_command(&self.store, identity, None)?;
+        Ok(Some(receipt))
+    }
+
+    pub fn existing_guidance_receipt(
+        &self,
+        identity: &SubagentControlIdentity,
+        kind: SubagentGuidanceKind,
+        instruction: &str,
+    ) -> Result<Option<SubagentControlReceipt>, StoreError> {
+        let Some(receipt) = existing_receipt(&self.store, identity)? else {
+            return Ok(None);
+        };
+        validate_existing_command(&self.store, identity, Some((kind, instruction)))?;
+        Ok(Some(receipt))
+    }
+
+    pub async fn existing_guidance_receipt_async(
+        &self,
+        identity: SubagentControlIdentity,
+        kind: SubagentGuidanceKind,
+        instruction: String,
+    ) -> Result<Option<SubagentControlReceipt>, StoreError> {
+        let blocking = self.blocking.clone();
+        blocking
+            .run_store("read existing Subagent guidance receipt", move |store| {
+                let service = Self::new(store);
+                service.existing_guidance_receipt(&identity, kind, &instruction)
+            })
+            .await
+    }
+
+    pub async fn existing_command_receipt_async(
+        &self,
+        identity: SubagentControlIdentity,
+    ) -> Result<Option<SubagentControlReceipt>, StoreError> {
+        let blocking = self.blocking.clone();
+        blocking
+            .run_store("read existing Subagent command receipt", move |store| {
+                Self::new(store).existing_command_receipt(&identity)
+            })
+            .await
+    }
+
     #[cfg(test)]
     fn with_command_test_barrier(mut self, barrier: Arc<SubagentControlTestBarrier>) -> Self {
         self.command_test_barrier = Some(barrier);
@@ -1011,6 +1066,7 @@ fn existing_receipt(
     let projection = projection.unwrap_or_default();
     Ok(Some(SubagentControlReceipt {
         identity: identity.clone(),
+        duplicate: true,
         status: projection.status(),
         phase: projection.phase,
         outcome: projection.outcome,
@@ -1801,6 +1857,7 @@ fn pending_receipt(identity: SubagentControlIdentity) -> SubagentControlReceipt 
     let phase = SubagentControlPhase::Persisted;
     SubagentControlReceipt {
         identity,
+        duplicate: false,
         status: derive_control_status(phase, None),
         phase,
         outcome: None,
@@ -1814,6 +1871,7 @@ fn rejected_receipt(identity: SubagentControlIdentity, detail: String) -> Subage
     let phase = SubagentControlPhase::Persisted;
     SubagentControlReceipt {
         identity,
+        duplicate: false,
         status: derive_control_status(phase, Some(&detail)),
         phase,
         outcome: None,
