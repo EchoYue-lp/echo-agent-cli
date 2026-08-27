@@ -1217,6 +1217,170 @@ async fn f1_cold_drain_is_durable_before_terminal_and_reopen_visible() -> anyhow
 }
 
 #[tokio::test]
+async fn f1_cold_owner_exit_after_drain_recovers_without_model_replay() -> anyhow::Result<()> {
+    let (temp, state) = isolated_app_state().await?;
+    let target_workspace = state.workspace.registry.create_at(
+        "f1-cold-owner-exit-target",
+        WorkspaceKind::General,
+        temp.path().join("f1-cold-owner-exit-target"),
+    )?;
+    let target = crate::agent_router::AgentAddress::new(
+        target_workspace.id,
+        "f1-cold-owner-exit-conversation",
+    );
+    let runtime = state.chat_runtime_for_agent(&target).await?;
+    runtime
+        .ensure_conversation(NewConversation {
+            conversation_id: target.conversation_id.clone(),
+            user_id: "default".to_string(),
+            agent_type: None,
+            title: Some("F1 cold owner exit".to_string()),
+        })
+        .await?;
+    let pool = runtime
+        .pool()
+        .ok_or_else(|| anyhow::anyhow!("fixture AgentPool is missing"))?;
+    let model = Arc::new(
+        MockLlmClient::new()
+            .with_responses(["owner exit preflight", "owner exit answer"])
+            .with_delay(std::time::Duration::from_secs(30)),
+    );
+    pool.set_llm_client_override_for_test(model.clone()).await;
+
+    let message = f0_router_message(&target, "f1-cold-owner-exit", "interrupt after drain");
+    let expected_turn_id = message.delivery_turn_id();
+    state.agent_router.enqueue(message.clone()).await?;
+    let delivery_state = Arc::clone(&state);
+    let delivery_target = target.clone();
+    let delivery = tokio::spawn(async move {
+        delivery_state
+            .deliver_agent_message_cold(
+                &delivery_target,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+    });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let injected = loop {
+        if let Some(in_flight) = state.agent_router.in_flight_claim(&target).await?
+            && in_flight.status == crate::agent_router::AgentDeliveryStatus::Injected
+        {
+            break in_flight;
+        }
+        if delivery.is_finished() {
+            anyhow::bail!("cold owner settled before the durable drain boundary");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("cold owner did not publish its drained attempt");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert_eq!(injected.claim.message.message_id, message.message_id);
+    assert_eq!(injected.claim.attempt, 1);
+    assert_eq!(injected.turn_id, expected_turn_id);
+
+    while model.call_count() == 0 {
+        if delivery.is_finished() {
+            anyhow::bail!("cold owner settled before entering the provider call");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("cold owner did not enter the provider call after drain");
+        }
+        tokio::task::yield_now().await;
+    }
+    let calls_before_owner_exit = model.call_count();
+    assert_eq!(calls_before_owner_exit, 1);
+    delivery.abort();
+    let owner_exit = delivery.await;
+    assert!(
+        owner_exit.is_err_and(|error| error.is_cancelled()),
+        "the simulated cold owner exit must abort the real delivery future"
+    );
+    assert!(
+        state
+            .session
+            .foreground_turns
+            .snapshots_for_conversation_scoped(
+                target.workspace_id.as_str(),
+                &target.conversation_id,
+            )?
+            .is_empty(),
+        "aborting the cold owner must retire its foreground turn before recovery"
+    );
+
+    let abandoned = state
+        .agent_router
+        .in_flight_claim(&target)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("owner exit lost the drained attempt"))?;
+    assert_eq!(
+        abandoned.status,
+        crate::agent_router::AgentDeliveryStatus::Injected
+    );
+    assert_eq!(abandoned.claim.attempt_id, injected.claim.attempt_id);
+    assert_eq!(abandoned.claim.attempt, injected.claim.attempt);
+    assert_eq!(abandoned.turn_id, injected.turn_id);
+
+    assert_eq!(state.recover_agent_deliveries().await?, 1);
+    let recovery_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let recovered = loop {
+        let record = state
+            .agent_router
+            .records(&target)
+            .await?
+            .into_iter()
+            .find(|record| record.message_id == message.message_id)
+            .ok_or_else(|| anyhow::anyhow!("recovery lost the cold delivery record"))?;
+        if record.status == crate::agent_router::AgentDeliveryStatus::Failed {
+            break record;
+        }
+        if tokio::time::Instant::now() >= recovery_deadline {
+            anyhow::bail!("cold recovery did not settle the abandoned drained attempt");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        recovered.attempt_id.as_deref(),
+        Some(injected.claim.attempt_id.as_str())
+    );
+    assert_eq!(recovered.attempt, injected.claim.attempt);
+    assert_eq!(
+        recovered.turn_id.as_deref(),
+        Some(injected.turn_id.as_str())
+    );
+    assert!(recovered.next_attempt_at.is_none());
+    assert!(
+        recovered
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("terminal outcome is indeterminate"))
+    );
+    assert_eq!(
+        state
+            .agent_router
+            .event_phases_for_test(&target, &message.message_id)
+            .await?,
+        [
+            "accepted",
+            "claimed",
+            "injection_started",
+            "injected",
+            "failed"
+        ],
+        "recovery must settle the exact drained attempt without a second claim or injection"
+    );
+    assert_eq!(
+        model.call_count(),
+        calls_before_owner_exit,
+        "recovery must not replay the model input after durable drain"
+    );
+    assert!(state.agent_router.in_flight_claim(&target).await?.is_none());
+    state.shutdown_agent_deliveries().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn f1_cold_acceptance_waits_for_real_context_drain() -> anyhow::Result<()> {
     let (temp, state) = isolated_app_state().await?;
     let target_workspace = state.workspace.registry.create_at(
