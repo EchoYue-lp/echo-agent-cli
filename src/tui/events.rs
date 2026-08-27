@@ -6762,6 +6762,34 @@ async fn tui_conversation_execution(
         .map_err(anyhow::Error::msg)
 }
 
+/// Join immutable plan specifications with the canonical Todo projection.
+///
+/// `list_todos` owns dependency-derived badges (including failed-ancestor
+/// blocking) and runtime metadata; this helper only aligns those rows with the
+/// plan's stable display order and EKO role/title fields.
+fn project_tui_task_views(
+    plan: &echo_agent_app_core::tasks::task_runtime::PlanRevision,
+    todos: &[echo_agent_app_core::tasks::task_runtime::TodoItem],
+) -> Vec<TaskRuntimeTaskView> {
+    plan.tasks
+        .iter()
+        .filter_map(|spec| {
+            todos
+                .iter()
+                .find(|todo| todo.task_id == spec.id)
+                .map(|todo| TaskRuntimeTaskView {
+                    title: spec.title.clone(),
+                    status: todo.status.as_str().to_string(),
+                    agent_role: spec.agent_role.clone(),
+                    owner_agent: todo.owner_agent.clone(),
+                    started_at: todo.started_at,
+                    completed_at: todo.completed_at,
+                    summary: todo.summary.clone(),
+                })
+        })
+        .collect()
+}
+
 async fn refresh_task_runtime_view(app: &mut TuiApp) {
     let (runtime, store) = match current_tui_task_runtime(app).await {
         Ok(control) => control,
@@ -6786,7 +6814,8 @@ async fn refresh_task_runtime_view(app: &mut TuiApp) {
             let Some(run) = store.latest_run_for_conversation(&lookup_conversation_id)? else {
                 return Ok(None);
             };
-            let plan = store.get_plan(&run.run_id)?;
+            let plan = store.get_plan_revision(&run.run_id)?;
+            let todos = store.list_todos(&run.run_id)?;
             let continuation = store
                 .get_run_state(&run.run_id)?
                 .and_then(|state| state.continuation);
@@ -6799,13 +6828,14 @@ async fn refresh_task_runtime_view(app: &mut TuiApp) {
             Ok(Some((
                 run,
                 plan,
+                todos,
                 continuation,
                 active_cell_count,
                 completion,
             )))
         })
         .await;
-    let Some((run, plan, continuation, active_cell_count, completion)) = (match projection {
+    let Some((run, plan, todos, continuation, active_cell_count, completion)) = (match projection {
         Ok(projection) => projection,
         Err(error) => {
             tracing::warn!(%error, "TUI failed to refresh TaskRuntime projection");
@@ -6815,22 +6845,9 @@ async fn refresh_task_runtime_view(app: &mut TuiApp) {
         app.task_runtime_view = None;
         return;
     };
-    let tasks = match plan {
-        Some(plan) => plan
-            .tasks
-            .into_iter()
-            .map(|task| TaskRuntimeTaskView {
-                title: task.title,
-                status: echo_agent_app_core::tasks::task_runtime::TodoStatus::project_task_status(
-                    &task.status,
-                )
-                .as_str()
-                .to_string(),
-                agent_role: task.agent_role,
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+    let tasks = plan
+        .map(|plan| project_tui_task_views(&plan, &todos))
+        .unwrap_or_default();
     let completion_ready = completion.ready;
     let requirements = completion
         .requirements
@@ -7277,9 +7294,10 @@ mod tests {
         delete_previous_word, exact_active_turn_for_address, exact_conversation_input_attempt,
         execute_registered_tui_steer, format_conversation_input_fact, format_task_runtime_view,
         format_unattended_worktrees, handle_approval_key, handle_esc, move_cursor_vertical,
-        parse_interaction_mode, render_cancelled_event, render_conversation_input_receipt,
-        render_error_event, request_from_prepared, resolve_tui_workspace_file, retry_tui_task,
-        reverse_history_search, run_turn_binding_for_request, settle_planned_resume_foreground,
+        parse_interaction_mode, project_tui_task_views, render_cancelled_event,
+        render_conversation_input_receipt, render_error_event, request_from_prepared,
+        resolve_tui_workspace_file, retry_tui_task, reverse_history_search,
+        run_turn_binding_for_request, settle_planned_resume_foreground,
         slash_command_allowed_while_busy, update_subagent_runs, validate_tui_task_run_scope,
     };
     use crate::tui::{
@@ -7289,8 +7307,8 @@ mod tests {
     };
     use echo_agent_app_core::chat_driver::TurnOutcome;
     use echo_agent_app_core::tasks::task_runtime::{
-        AttendedMode, DomainProfile, ExecutionMode, InteractionMode, PlanTask, TaskPlan,
-        TaskRunStatus, TaskRuntimeStore, commit_eko_task_plan,
+        AttendedMode, DomainProfile, ExecutionMode, InteractionMode, PlanRevision, PlanTask,
+        TaskPlan, TaskRunStatus, TaskRuntimeStore, TodoItem, TodoStatus, commit_eko_task_plan,
     };
     use std::sync::Arc;
     use std::time::Instant;
@@ -8384,6 +8402,10 @@ mod tests {
                 title: "实现队列".to_string(),
                 status: "completed".to_string(),
                 agent_role: "implementer".to_string(),
+                owner_agent: None,
+                started_at: None,
+                completed_at: None,
+                summary: None,
             }],
             completion_ready: true,
             requirements: vec![TaskRuntimeRequirementView {
@@ -8401,6 +8423,59 @@ mod tests {
         assert!(text.contains("[completed] 实现队列 (implementer)"));
         assert!(text.contains("Completion gate: ready"));
         assert!(text.contains("[accepted] req:tui: TUI 功能对等"));
+    }
+
+    #[test]
+    fn tui_task_projection_preserves_canonical_block_and_metadata() -> Result<(), String> {
+        let created_at = chrono::Utc::now();
+        let spec = PlanTask {
+            id: "child".to_string(),
+            title: "依赖失败后暂停".to_string(),
+            agent_role: "reviewer".to_string(),
+            ..PlanTask::default()
+        }
+        .spec();
+        let plan = PlanRevision {
+            plan_id: "plan-1".to_string(),
+            run_id: "run-1".to_string(),
+            revision: 2,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: "goal-hash".to_string(),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![spec],
+        };
+        let todos = vec![TodoItem {
+            id: "todo-child".to_string(),
+            run_id: "run-1".to_string(),
+            task_id: "child".to_string(),
+            title: "依赖失败后暂停".to_string(),
+            status: TodoStatus::Blocked,
+            retry_count: 1,
+            max_retries: 3,
+            owner_agent: Some("reviewer".to_string()),
+            started_at: Some(created_at),
+            completed_at: None,
+            summary: Some("blocked by failed ancestor task(s): parent".to_string()),
+        }];
+
+        let views = project_tui_task_views(&plan, &todos);
+        assert_eq!(views.len(), 1);
+        let view = views
+            .first()
+            .ok_or_else(|| "missing projected TUI task".to_string())?;
+        assert_eq!(view.title, "依赖失败后暂停");
+        assert_eq!(view.status, "blocked");
+        assert_eq!(view.agent_role, "reviewer");
+        assert_eq!(view.owner_agent.as_deref(), Some("reviewer"));
+        assert_eq!(view.started_at, Some(created_at));
+        assert_eq!(
+            view.summary.as_deref(),
+            Some("blocked by failed ancestor task(s): parent")
+        );
+        Ok(())
     }
 
     #[test]

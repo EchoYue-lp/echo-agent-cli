@@ -264,6 +264,10 @@ pub struct TaskRuntimeTaskView {
     pub title: String,
     pub status: String,
     pub agent_role: String,
+    pub owner_agent: Option<String>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Debug)]
