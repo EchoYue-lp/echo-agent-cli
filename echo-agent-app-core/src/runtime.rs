@@ -1,7 +1,8 @@
-//! Agent runtime bootstrap — shared initialization for TUI and GUI entry points.
+//! Agent runtime bootstrap and application-service composition shared by every
+//! EKO interaction surface.
 //!
 //! This module consolidates the common agent initialization logic that was
-//! previously duplicated in `main.rs` (TUI) and `desktop.rs` (GUI).
+//! previously duplicated in `main.rs` (TUI/CLI/channel) and `desktop.rs` (GUI).
 //!
 //! # Usage
 //!
@@ -619,6 +620,287 @@ pub struct AgentRuntime {
     pub product_data_io: crate::product_data_io::ProductDataIoService,
 }
 
+/// Canonical EKO application composition shared by every interaction surface.
+///
+/// This is deliberately application-side: it wires framework/runtime primitives
+/// to EKO product policy, while each surface retains only its input/output and
+/// bridge lifetime. The lifecycle owner is kept private so a surface cannot
+/// accidentally bypass the shared shutdown order.
+pub struct ApplicationServices {
+    pub app_state: Arc<AppState>,
+    pub pool: Arc<crate::agent_pool::AgentPool>,
+    lifecycle: Option<ApplicationLifecycleOwner>,
+}
+
+impl ApplicationServices {
+    /// Compose one complete EKO application generation around an Agent runtime.
+    ///
+    /// `explicit_config` is the same user-selected config path used for loading.
+    /// Resolving both the watcher source and immutable save target here prevents
+    /// workspace changes from redirecting later configuration mutations.
+    pub async fn compose(
+        runtime: &AgentRuntime,
+        explicit_config: Option<&str>,
+        conversation_store: Option<Arc<dyn echo_agent::memory::ConversationStore>>,
+        initial_pool_permission: echo_agent::tools::permission::PermissionMode,
+    ) -> anyhow::Result<Self> {
+        let root_cancel = tokio_util::sync::CancellationToken::new();
+        let mut lifecycle = runtime.lifecycle_owner(root_cancel.clone());
+        infra::inject_conversation_store(&runtime.agent_handle, &conversation_store);
+
+        let webhook_emitter = Arc::new(crate::webhook::WebhookEmitter::from_config(
+            &runtime.app_config,
+        ));
+        let config_path = crate::config_watcher::resolve_config_path(explicit_config);
+        let config_save_path = crate::config_watcher::resolve_config_save_path(explicit_config);
+        let config_workspace_root = runtime
+            .agent_handle
+            .read(|agent| agent.working_dir())
+            .await
+            .unwrap_or_else(|| PathBuf::from("."));
+        let config_watcher = Arc::new(crate::config_watcher::spawn_config_watcher(
+            config_path,
+            runtime.agent_handle.clone(),
+            config_workspace_root,
+            Some(runtime.plugin_runtime.clone()),
+            runtime.extension_control.clone(),
+            Some(webhook_emitter.clone()),
+            root_cancel.clone(),
+        ));
+        lifecycle.bind_config_watcher(config_watcher.clone());
+
+        let mut state = match AppState::from_shared(
+            runtime.agent_handle.clone(),
+            Some(runtime.model_consumers.clone()),
+            runtime.hitl_dispatcher.clone(),
+            conversation_store,
+            runtime.state_store.clone(),
+            runtime.app_config.clone(),
+            runtime.mcp_config_runtime.clone(),
+            runtime.product_data_io.clone(),
+        ) {
+            Ok(state) => state,
+            Err(error) => return Err(rollback_composition(lifecycle, error).await),
+        };
+        if let Some(active_model) = runtime.active_runtime_model.as_ref() {
+            state = state.with_active_model_id(active_model.id.clone());
+        }
+        state = state
+            .with_config_path(config_save_path)
+            .with_review_integration(runtime.review_integration.clone())
+            .with_prompt_assembly(runtime.prompt_assembly.clone())
+            .with_plugin_runtime(Some(runtime.plugin_runtime.clone()))
+            .with_extension_control(runtime.extension_control.clone())
+            .with_browser_runtime(Some(runtime.browser_runtime.clone()))
+            .with_config_watcher(Some(config_watcher))
+            .with_command_cell_runtime(runtime.command_cell_runtime.clone())
+            .with_workspace_delete_hook(runtime.browser_runtime.clone());
+        state.webhook.emitter = webhook_emitter;
+
+        match state.recover_committed_conversation_deletions().await {
+            Ok(receipts) if !receipts.is_empty() => tracing::info!(
+                count = receipts.len(),
+                "Recovered committed conversation deletion finalizers"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                %error,
+                "Some committed conversation deletion finalizers remain pending"
+            ),
+        }
+
+        let task_runtime = match state.tasks.runtime.clone() {
+            Some(store) => store,
+            None => {
+                return Err(rollback_composition(
+                    lifecycle,
+                    anyhow::anyhow!("application TaskRuntime store is unavailable"),
+                )
+                .await);
+            }
+        };
+        lifecycle.bind_task_runtime(task_runtime.clone());
+        crate::tasks::task_runtime::register_task_tools_on_agent(
+            &runtime.agent_handle,
+            task_runtime.clone(),
+        )
+        .await;
+
+        let pool = match runtime
+            .init_pool(
+                crate::agent_pool::PoolConfig::default(),
+                Some(task_runtime.clone()),
+            )
+            .await
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                lifecycle.bind_app_state(Arc::new(state));
+                return Err(rollback_composition(lifecycle, error).await);
+            }
+        };
+        lifecycle.bind_pool(pool.clone());
+        // Apply the surface's initial pool policy before boot recovery can
+        // resume a TaskRun. LH6 deliberately bypasses prompts; product surfaces
+        // start in Default and may publish later user changes.
+        pool.apply_permission_mode(initial_pool_permission).await;
+        crate::tasks::task_runtime::bind_task_execute_to_pool(
+            &runtime.agent_handle,
+            task_runtime,
+            &pool,
+        )
+        .await;
+        // This setter also installs the workspace-aware execution-target
+        // resolver. Direct field assignment leaves headless TaskRuns unable to
+        // resolve cold or switched workspace targets.
+        state.set_pool(pool.clone());
+
+        let scheduler_store: Arc<dyn echo_agent::memory::Store> = {
+            let file_path = crate::data_root::user_data_path("scheduler_store");
+            match echo_agent::memory::FileStore::new(&file_path) {
+                Ok(store) => Arc::new(store),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to create scheduler store; using in-memory");
+                    Arc::new(echo_agent::memory::InMemoryStore::new())
+                }
+            }
+        };
+        if let Err(error) = state
+            .start_scheduler_and_task_service(Some(scheduler_store))
+            .await
+        {
+            lifecycle.bind_app_state(Arc::new(state));
+            return Err(rollback_composition(lifecycle, anyhow::Error::new(error)).await);
+        }
+        if let Some(scheduler) = state.scheduler.runner.as_ref()
+            && let Err(error) = runtime
+                .plugin_runtime
+                .bind_scheduler(scheduler.clone())
+                .await
+        {
+            tracing::warn!(%error, "failed to bind plugin monitors to application scheduler");
+        }
+
+        let app_state = Arc::new(state);
+        app_state.register_agent_control_tools().await;
+        lifecycle.bind_app_state(app_state.clone());
+        match app_state
+            .extension_control
+            .reconcile_enabled_skills_on_load(&app_state)
+            .await
+        {
+            Ok(receipt)
+                if receipt.status == crate::extension_control::SkillSettlementStatus::Settled =>
+            {
+                tracing::info!(
+                    generation = receipt.settled_generation,
+                    "Extension Skill generation settled during application startup"
+                );
+            }
+            Ok(receipt) => tracing::warn!(
+                desired_generation = receipt.desired_generation,
+                settled_generation = receipt.settled_generation,
+                status = ?receipt.status,
+                "Extension Skill repair remains pending after application startup"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                "Extension Skill policy reconciliation remains pending"
+            ),
+        }
+        if let Err(error) = app_state.recover_agent_deliveries().await {
+            tracing::warn!(%error, "failed to resume durable Agent deliveries during startup");
+        }
+
+        let health_task = infra::spawn_mcp_health_check(app_state.clone(), root_cancel.clone());
+        lifecycle.track_background_task("MCP health check", health_task);
+        if let Some(review_integration) = app_state.review_integration.clone() {
+            let dreaming_task = infra::spawn_dreaming_task(
+                review_integration,
+                runtime.agent_handle.clone(),
+                Some(pool.clone()),
+                root_cancel,
+            );
+            lifecycle.track_background_task("Dreaming", dreaming_task);
+        }
+
+        Ok(Self {
+            app_state,
+            pool,
+            lifecycle: Some(lifecycle),
+        })
+    }
+
+    /// Add a surface-only bridge to the canonical application settlement.
+    pub fn track_external_owner<Begin, Join>(
+        &mut self,
+        name: impl Into<String>,
+        begin: Begin,
+        join: Join,
+    ) -> anyhow::Result<()>
+    where
+        Begin: FnOnce() -> Result<(), String> + Send + 'static,
+        Join: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let lifecycle = self
+            .lifecycle
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("application lifecycle owner is unavailable"))?;
+        lifecycle.track_external_owner(name, begin, join);
+        Ok(())
+    }
+
+    pub fn begin_shutdown(
+        &mut self,
+        reason: ApplicationLifecycleReason,
+        primary_error: Option<anyhow::Error>,
+    ) -> anyhow::Result<ApplicationLifecycleReceipt> {
+        let lifecycle = self
+            .lifecycle
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("application lifecycle owner is unavailable"))?;
+        Ok(lifecycle.begin_shutdown(reason, primary_error))
+    }
+
+    pub async fn join(
+        mut self,
+        mut receipt: ApplicationLifecycleReceipt,
+    ) -> ApplicationLifecycleReceipt {
+        match self.lifecycle.take() {
+            Some(lifecycle) => lifecycle.join(receipt).await,
+            None => {
+                receipt.record("application lifecycle", "settlement owner is unavailable");
+                receipt
+            }
+        }
+    }
+
+    pub async fn settle(
+        mut self,
+        reason: ApplicationLifecycleReason,
+        primary_error: Option<anyhow::Error>,
+    ) -> ApplicationLifecycleReceipt {
+        match self.lifecycle.take() {
+            Some(lifecycle) => lifecycle.settle(reason, primary_error).await,
+            None => {
+                let mut receipt = ApplicationLifecycleReceipt::new(reason, primary_error);
+                receipt.record("application lifecycle", "settlement owner is unavailable");
+                receipt
+            }
+        }
+    }
+}
+
+async fn rollback_composition(
+    lifecycle: ApplicationLifecycleOwner,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let receipt = lifecycle
+        .settle(ApplicationLifecycleReason::BootstrapRollback, Some(error))
+        .await;
+    anyhow::Error::new(receipt.into_error())
+}
+
 impl AgentRuntime {
     /// Establish the process root owner immediately after bootstrap commits.
     /// Later construction binds TaskRuntime, AgentPool, AppState and surface
@@ -1053,39 +1335,6 @@ impl AgentRuntime {
             command_cell_runtime,
             product_data_io,
         })
-    }
-
-    /// Convenience: build `AppState` from the runtime context.
-    ///
-    /// GUI entry uses this to create the Tauri-managed application state.
-    pub fn into_app_state(
-        self,
-        conversation_store: Option<Arc<dyn echo_agent::memory::ConversationStore>>,
-    ) -> anyhow::Result<AppState> {
-        let mut state = AppState::from_shared(
-            self.agent_handle.clone(),
-            Some(self.model_consumers.clone()),
-            self.hitl_dispatcher.clone(),
-            conversation_store,
-            self.state_store.clone(),
-            self.app_config.clone(),
-            self.mcp_config_runtime.clone(),
-            self.product_data_io.clone(),
-        )?;
-        if let Some(runtime) = self.active_runtime_model.as_ref() {
-            state = state.with_active_model_id(runtime.id.clone());
-        }
-        state = state
-            .with_review_integration(self.review_integration.clone())
-            .with_prompt_assembly(self.prompt_assembly.clone())
-            .with_plugin_runtime(Some(self.plugin_runtime.clone()))
-            .with_extension_control(self.extension_control.clone())
-            .with_browser_runtime(Some(self.browser_runtime.clone()))
-            .with_command_cell_runtime(self.command_cell_runtime.clone())
-            .with_workspace_delete_hook(self.browser_runtime.clone());
-        // Note: task_service and scheduler are started separately by the caller
-        // because they need a Store which may be created differently per entry.
-        Ok(state)
     }
 
     /// Initialize an `AgentPool` from this runtime for multi-conversation

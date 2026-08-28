@@ -24,19 +24,6 @@ use clap::Parser;
 
 // ── 主入口 ─────────────────────────────────────────────────────
 
-/// Build a `TaskRuntimeStore` for headless (non-GUI) entry points (TUI / channels).
-///
-/// Headless modes support complex tasks (TUI/GUI parity), so root authority
-/// and cross-process lease failures abort bootstrap instead of silently
-/// switching persistence semantics.
-#[cfg(any(feature = "tui", feature = "gui", feature = "channels"))]
-fn build_task_runtime_store_for_headless()
--> anyhow::Result<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>> {
-    Ok(std::sync::Arc::new(
-        echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new()?,
-    ))
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 加载 .env 文件
@@ -95,10 +82,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     if args.verbose {
         app_config.logging.level = "debug".to_string();
     }
-    let webhook_emitter = std::sync::Arc::new(
-        echo_agent_app_core::webhook::WebhookEmitter::from_config(&app_config),
-    );
-
     let is_tui_entry =
         args.tui || (!args.web && !args.cli && !args.channels && args.jsonl.is_none());
 
@@ -179,64 +162,65 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     let runtime =
         echo_agent_app_core::runtime::AgentRuntime::bootstrap(&app_config, params, mcp_config_path)
             .await?;
-    let cancel_token = tokio_util::sync::CancellationToken::new();
-    let mut lifecycle = runtime.lifecycle_owner(cancel_token.clone());
     let agent_handle = runtime.agent_handle.clone();
-    echo_agent_app_core::infra::inject_conversation_store(&agent_handle, &conversation_store);
 
-    // Every headless surface is a full Agent surface. Build one TaskRuntime
-    // store, register the same task tools on the primary agent, and inject the
-    // store into the shared pool before any pooled agent is created.
-    let task_runtime_store = match build_task_runtime_store_for_headless() {
-        Ok(store) => store,
-        Err(error) => {
-            let receipt = lifecycle
-                .settle(
-                    echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
-                    Some(error),
-                )
-                .await;
-            return Err(anyhow::Error::new(receipt.into_error()));
-        }
-    };
-    lifecycle.bind_task_runtime(task_runtime_store.clone());
-    echo_agent_app_core::tasks::task_runtime::register_task_tools_on_agent(
-        &agent_handle,
-        task_runtime_store.clone(),
-    )
-    .await;
-    let task_runtime_store = Some(task_runtime_store);
-    let pool = {
-        let pool = match echo_agent_app_core::agent_pool::AgentPool::from_runtime(
-            &runtime,
-            echo_agent_app_core::agent_pool::PoolConfig::default(),
-            task_runtime_store.clone(),
-        )
-        .await
-        {
-            Ok(pool) => pool,
-            Err(error) => {
-                let receipt = lifecycle
-                    .settle(
-                        echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
-                        Some(error),
-                    )
-                    .await;
-                return Err(anyhow::Error::new(receipt.into_error()));
-            }
-        };
-        lifecycle.bind_pool(pool.clone());
-        if let Some(store) = task_runtime_store.clone() {
-            echo_agent_app_core::tasks::task_runtime::bind_task_execute_to_pool(
-                &agent_handle,
-                store,
-                &pool,
-            )
+    let run_jsonl = args.jsonl.is_some();
+    let run_cli = args.cli;
+    let run_channels = args.channels;
+
+    // Register interactive transports before application recovery can emit an
+    // attended request. Surface rendering still starts only after composition.
+    #[cfg(feature = "tui")]
+    let mut tui_session = if is_tui_entry {
+        use echo_agent_app_core::hitl::TuiHumanLoopProvider;
+        let provider = std::sync::Arc::new(TuiHumanLoopProvider::new());
+        let pending = provider.pending_handle();
+        let registration = runtime
+            .hitl_dispatcher
+            .register_owned("tui", provider.clone())
             .await;
-        }
-        pool
+        tracing::info!("HITL: TUI provider registered");
+        Some((provider, pending, registration))
+    } else {
+        None
     };
-    let foreground_turns = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+
+    // CLI is the sole Reedline/stdin owner. Register its HITL transport
+    // before scheduler and TaskRun recovery can emit interactive requests.
+    let mut repl_hitl_session = if run_cli {
+        Some(cli::ReplHumanLoopSession::register(runtime.hitl_dispatcher.clone()).await)
+    } else {
+        None
+    };
+
+    #[cfg_attr(not(feature = "channels"), allow(unused_mut))]
+    let mut application_services = match echo_agent_app_core::runtime::ApplicationServices::compose(
+        &runtime,
+        args.config.as_deref(),
+        conversation_store.clone(),
+        echo_agent::tools::permission::PermissionMode::Default,
+    )
+    .await
+    {
+        Ok(services) => services,
+        Err(error) => {
+            #[cfg(feature = "tui")]
+            if let Some((provider, _, registration)) = tui_session.take() {
+                provider.close_now("TUI bootstrap failed");
+                drop(registration);
+            }
+            let hitl_shutdown_error = match repl_hitl_session.take() {
+                Some(session) => session.shutdown("CLI bootstrap failed").await.err(),
+                None => None,
+            };
+            return match hitl_shutdown_error {
+                Some(hitl_error) => Err(anyhow::anyhow!(
+                    "{error}; REPL HITL bootstrap shutdown failed: {hitl_error}"
+                )),
+                None => Err(error),
+            };
+        }
+    };
 
     if requested_conversation_id.is_some() {
         let restore_result = async {
@@ -255,7 +239,15 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         let (conversation, messages) = match restore_result {
             Ok(restored) => restored,
             Err(error) => {
-                let receipt = lifecycle
+                #[cfg(feature = "tui")]
+                if let Some((provider, _, registration)) = tui_session.take() {
+                    provider.close_now("TUI conversation restore failed");
+                    drop(registration);
+                }
+                if let Some(session) = repl_hitl_session.take() {
+                    let _ = session.shutdown("CLI conversation restore failed").await;
+                }
+                let receipt = application_services
                     .settle(
                         echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
                         Some(error),
@@ -280,102 +272,29 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         }
     }
 
-    // Spawn config watcher (reloads hooks + webhook endpoints on change).
-    let config_path = echo_agent_cli::config_watcher::resolve_config_path(args.config.as_deref());
-    let config_workspace_root = agent_handle
-        .read(|agent| agent.working_dir())
-        .await
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let config_watcher = std::sync::Arc::new(echo_agent_cli::config_watcher::spawn_config_watcher(
-        config_path,
-        agent_handle.clone(),
-        config_workspace_root,
-        Some(runtime.plugin_runtime.clone()),
-        runtime.extension_control.clone(),
-        Some(webhook_emitter.clone()),
-        cancel_token.clone(),
-    ));
-    lifecycle.bind_config_watcher(config_watcher.clone());
+    let pool = application_services.pool.clone();
+    let task_runtime_store = application_services.app_state.tasks.runtime.clone();
+    let webhook_emitter = application_services.app_state.webhook.emitter.clone();
 
     // ── User-facing TUI mode (default) ─────────────────────────────────
     #[cfg(feature = "tui")]
     if is_tui_entry {
+        let (tui_provider, tui_pending, tui_hitl_registration) = match tui_session.take() {
+            Some(session) => session,
+            None => {
+                let receipt = application_services
+                    .settle(
+                        echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
+                        Some(anyhow::anyhow!("TUI HITL session owner is unavailable")),
+                    )
+                    .await;
+                return Err(anyhow::Error::new(receipt.into_error()));
+            }
+        };
         tracing::info!(
             pool_size = pool.pool_size().await,
             "AgentPool initialized for TUI (background task isolation)"
         );
-
-        // TUI owns its provider for the full-screen session. The REPL provider
-        // is registered only by CLI startup, so no provider swap is needed.
-        use echo_agent_app_core::hitl::TuiHumanLoopProvider;
-        let tui_provider = std::sync::Arc::new(TuiHumanLoopProvider::new());
-        let tui_pending = tui_provider.pending_handle();
-        let tui_hitl_registration = runtime
-            .hitl_dispatcher
-            .register_owned("tui", tui_provider.clone())
-            .await;
-        tracing::info!("HITL: TUI provider registered");
-        let tui_services = cli::start_headless_services(
-            agent_handle.clone(),
-            runtime.hitl_dispatcher.clone(),
-            &app_config,
-            cli::HeadlessServiceResources {
-                model_consumers: runtime.model_consumers.clone(),
-                active_model_id: runtime
-                    .active_runtime_model
-                    .as_ref()
-                    .map(|model| model.id.clone())
-                    .unwrap_or_default(),
-                pool: pool.clone(),
-                task_runtime_store: task_runtime_store.clone(),
-                webhook_emitter: webhook_emitter.clone(),
-                conversation_store: conversation_store.clone(),
-                runtime_state_store: runtime.state_store.clone(),
-                review_integration: runtime.review_integration.clone(),
-                mcp_config_runtime: runtime.mcp_config_runtime.clone(),
-                plugin_runtime: runtime.plugin_runtime.clone(),
-                extension_control: runtime.extension_control.clone(),
-                config_watcher: config_watcher.clone(),
-                foreground_turns: foreground_turns.clone(),
-                command_cell_runtime: runtime.command_cell_runtime.clone(),
-                product_data_io: runtime.product_data_io.clone(),
-                browser_runtime: runtime.browser_runtime.clone(),
-                lifecycle,
-            },
-        )
-        .await;
-        let tui_services = match tui_services {
-            Ok(services) => services,
-            Err(error) => {
-                tui_provider.close_now("TUI bootstrap failed");
-                drop(tui_hitl_registration);
-                cancel_token.cancel();
-                return Err(error);
-            }
-        };
-        let tui_scheduler = tui_services.scheduler_runner.clone();
-        let tui_app_state = tui_services.app_state.clone();
-        if let Some(scheduler) = tui_scheduler.as_ref()
-            && let Err(error) = runtime
-                .plugin_runtime
-                .bind_scheduler(scheduler.clone())
-                .await
-        {
-            tracing::warn!(%error, "failed to bind plugin monitors to TUI scheduler");
-        }
-
-        let tui_dreaming_owner = runtime.review_integration.as_ref().map(|integration| {
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let settlement = echo_agent_app_core::infra::spawn_dreaming_task(
-                integration.clone(),
-                agent_handle.clone(),
-                Some(pool.clone()),
-                cancel.clone(),
-            );
-            tracing::info!("Dreaming task spawned for TUI session");
-            cli::HeadlessDreamingOwner::new(cancel, settlement)
-        });
-
         let tui_result = echo_agent_cli::tui::run_tui(
             agent_handle.clone(),
             &app_config.tui,
@@ -383,7 +302,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             tui_pending,
             tui_provider.clone(),
             webhook_emitter.clone(),
-            tui_scheduler,
+            application_services.app_state.scheduler.runner.clone(),
             conversation_store.clone(),
             conversation_id.clone(),
             app_config
@@ -400,104 +319,22 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             runtime.browser_runtime.clone(),
             runtime.prompt_assembly.clone(),
             runtime.plugin_runtime.clone(),
-            tui_app_state.clone(),
+            application_services.app_state.clone(),
             args.no_alt_screen,
         )
         .await;
 
         tui_provider.close_now("TUI session ended");
         drop(tui_hitl_registration);
-        let shutdown_result = cli::shutdown_headless_services(
+        let shutdown_result = cli::shutdown_application_services(
             tui_result,
-            tui_services,
-            tui_dreaming_owner,
+            application_services,
             Some(agent_handle.clone()),
         )
         .await;
         drop(runtime);
         return shutdown_result;
     }
-
-    // ── Hidden legacy/internal modes ───────────────────────────────────
-    let run_jsonl = args.jsonl.is_some();
-    let run_cli = args.cli;
-    let run_channels = args.channels;
-
-    // CLI is the sole Reedline/stdin owner. Register its HITL transport
-    // before scheduler and TaskRun recovery can emit interactive requests.
-    let mut repl_hitl_session = if run_cli {
-        Some(cli::ReplHumanLoopSession::register(runtime.hitl_dispatcher.clone()).await)
-    } else {
-        None
-    };
-
-    // CLI-only, channel-only, and combined mode share one application service
-    // bootstrap. Surface composition below only owns input/output lifetimes.
-    #[cfg_attr(not(feature = "channels"), allow(unused_mut))]
-    let mut headless_services = match cli::start_headless_services(
-        agent_handle.clone(),
-        runtime.hitl_dispatcher.clone(),
-        &app_config,
-        cli::HeadlessServiceResources {
-            model_consumers: runtime.model_consumers.clone(),
-            active_model_id: runtime
-                .active_runtime_model
-                .as_ref()
-                .map(|model| model.id.clone())
-                .unwrap_or_default(),
-            pool: pool.clone(),
-            task_runtime_store: task_runtime_store.clone(),
-            webhook_emitter: webhook_emitter.clone(),
-            conversation_store: conversation_store.clone(),
-            runtime_state_store: runtime.state_store.clone(),
-            review_integration: runtime.review_integration.clone(),
-            mcp_config_runtime: runtime.mcp_config_runtime.clone(),
-            plugin_runtime: runtime.plugin_runtime.clone(),
-            extension_control: runtime.extension_control.clone(),
-            config_watcher: config_watcher.clone(),
-            foreground_turns: foreground_turns.clone(),
-            command_cell_runtime: runtime.command_cell_runtime.clone(),
-            product_data_io: runtime.product_data_io.clone(),
-            browser_runtime: runtime.browser_runtime.clone(),
-            lifecycle,
-        },
-    )
-    .await
-    {
-        Ok(services) => services,
-        Err(error) => {
-            let hitl_shutdown_error = match repl_hitl_session.take() {
-                Some(session) => session.shutdown("CLI bootstrap failed").await.err(),
-                None => None,
-            };
-            cancel_token.cancel();
-            return match hitl_shutdown_error {
-                Some(hitl_error) => Err(anyhow::anyhow!(
-                    "{error}; REPL HITL bootstrap shutdown failed: {hitl_error}"
-                )),
-                None => Err(error),
-            };
-        }
-    };
-    if let Some(scheduler) = headless_services.scheduler_runner.as_ref()
-        && let Err(error) = runtime
-            .plugin_runtime
-            .bind_scheduler(scheduler.clone())
-            .await
-    {
-        tracing::warn!(%error, "failed to bind plugin monitors to headless scheduler");
-    }
-
-    let dreaming_owner = runtime.review_integration.as_ref().map(|integration| {
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let settlement = echo_agent_app_core::infra::spawn_dreaming_task(
-            integration.clone(),
-            agent_handle.clone(),
-            Some(pool.clone()),
-            cancel.clone(),
-        );
-        cli::HeadlessDreamingOwner::new(cancel, settlement)
-    });
 
     let mut mode_error: Option<anyhow::Error> = None;
     if run_jsonl {
@@ -506,7 +343,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             agent_handle.clone(),
             prompt,
             conversation_id.clone(),
-            &headless_services,
+            &application_services,
             cli::JsonlRunOptions {
                 permission_mode: args.jsonl_permission,
                 approval_policy: args.jsonl_approval,
@@ -526,15 +363,19 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             );
             let channels_cancel = echo_agent::agent::CancellationToken::new();
             let channels_handle = tokio::spawn(cli::run_channels_mode(cli::ChannelsModeArgs {
-                app_state: headless_services.app_state.clone(),
+                app_state: application_services.app_state.clone(),
                 app_config: app_config.clone(),
                 webhook_emitter: webhook_emitter.clone(),
-                foreground_turns: foreground_turns.clone(),
+                foreground_turns: application_services
+                    .app_state
+                    .session
+                    .foreground_turns
+                    .clone(),
                 shutdown: channels_cancel.clone(),
             }));
-            let channel_observer = headless_services.bind_companion(
-                cli::CompanionModeShutdown::new("channels", channels_cancel, channels_handle),
-            )?;
+            let channel_observer =
+                cli::CompanionModeShutdown::new("channels", channels_cancel, channels_handle)
+                    .bind(&mut application_services)?;
 
             if run_cli {
                 let cli_result = match repl_hitl_session.take() {
@@ -549,7 +390,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                             conversation_id.clone(),
                             webhook_emitter.clone(),
                             runtime.plugin_runtime.clone(),
-                            &headless_services,
+                            &application_services,
                             session,
                         )
                         .await
@@ -590,7 +431,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     conversation_id.clone(),
                     webhook_emitter.clone(),
                     runtime.plugin_runtime.clone(),
-                    &headless_services,
+                    &application_services,
                     session,
                 )
                 .await
@@ -616,10 +457,9 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         });
     }
     let mode_result = mode_error.map_or(Ok(()), Err);
-    let shutdown_result = cli::shutdown_headless_services(
+    let shutdown_result = cli::shutdown_application_services(
         mode_result,
-        headless_services,
-        dreaming_owner,
+        application_services,
         (run_cli || run_jsonl).then_some(agent_handle.clone()),
     )
     .await;

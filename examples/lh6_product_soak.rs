@@ -11,23 +11,22 @@ use echo_agent::human_loop::{
 };
 use echo_agent::memory::NewConversation;
 use echo_agent::tools::cell::{CommandCellOwner, CommandCellRequest};
-use echo_agent_app_core::agent_pool::{AgentPool, PoolConfig, agent_execution_resource_snapshot};
+use echo_agent_app_core::agent_pool::agent_execution_resource_snapshot;
 use echo_agent_app_core::chat_driver::{ChatDriverEvent, ChatSink, TurnOutcome};
 use echo_agent_app_core::chat_event_log::{ChatEventEnvelope, ChatSurface, bind_surface_chat_sink};
 use echo_agent_app_core::chat_resources::ChatResources;
 use echo_agent_app_core::config;
-use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+use echo_agent_app_core::foreground_turn::ForegroundTurnSurface;
 use echo_agent_app_core::prepared_turn::{PreparedUserTurn, UserTurnInput};
-use echo_agent_app_core::runtime::AgentRuntime;
+use echo_agent_app_core::runtime::{AgentRuntime, ApplicationServices};
 use echo_agent_app_core::tasks::task_runtime::store::RunTurnClaimOutcome;
 use echo_agent_app_core::tasks::task_runtime::{
     AttendedMode, DomainProfile, ExecutionMode, PlanTask, RunTurnOrigin, RunTurnStatus,
     SubagentControlActorSource, SubagentControlIdentity, SubagentControlService, TaskPlan,
-    TaskRunStatus, TaskRuntimeStore, TurnVisibility, commit_eko_task_plan,
-    process_execution_resource_snapshot, task_goal_sha256,
+    TaskRunStatus, TurnVisibility, commit_eko_task_plan, process_execution_resource_snapshot,
+    task_goal_sha256,
 };
 use echo_agent_app_core::workspace::{WorkspaceExecutionScope, WorkspaceKind};
-use echo_agent_cli::cli::{HeadlessServiceResources, HeadlessServices};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -249,7 +248,7 @@ impl ChatSink for MetricsSink {
 
 struct ProductContext {
     runtime: AgentRuntime,
-    services: HeadlessServices,
+    services: ApplicationServices,
     hitl_registration: Option<echo_agent_app_core::hitl::HitlProviderRegistration>,
 }
 
@@ -486,105 +485,19 @@ async fn bootstrap(
     let mcp_path =
         echo_agent_app_core::mcp_config_runtime::resolve_mcp_config_path(None, app_config);
     let runtime = AgentRuntime::bootstrap(app_config, params, mcp_path).await?;
-    let root_cancel = tokio_util::sync::CancellationToken::new();
-    let mut lifecycle = runtime.lifecycle_owner(root_cancel.clone());
-    echo_agent_app_core::infra::inject_conversation_store(
-        &runtime.agent_handle,
-        &conversation_store,
-    );
-    let task_runtime = match TaskRuntimeStore::new() {
-        Ok(store) => Arc::new(store),
-        Err(error) => {
-            let receipt = lifecycle
-                .settle(
-                    echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
-                    Some(error),
-                )
-                .await;
-            return Err(anyhow::Error::new(receipt.into_error()));
-        }
-    };
-    lifecycle.bind_task_runtime(task_runtime.clone());
-    echo_agent_app_core::tasks::task_runtime::register_task_tools_on_agent(
-        &runtime.agent_handle,
-        task_runtime.clone(),
-    )
-    .await;
-    let pool =
-        match AgentPool::from_runtime(&runtime, PoolConfig::default(), Some(task_runtime.clone()))
-            .await
-        {
-            Ok(pool) => pool,
-            Err(error) => {
-                let receipt = lifecycle
-                    .settle(
-                        echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
-                        Some(error),
-                    )
-                    .await;
-                return Err(anyhow::Error::new(receipt.into_error()));
-            }
-        };
-    lifecycle.bind_pool(pool.clone());
-    pool.apply_permission_mode(echo_agent::tools::permission::PermissionMode::BypassPermissions)
-        .await;
-    echo_agent_app_core::tasks::task_runtime::bind_task_execute_to_pool(
-        &runtime.agent_handle,
-        task_runtime.clone(),
-        &pool,
-    )
-    .await;
-    let foreground_turns = ForegroundTurnControl::default();
-    let config_watcher = Arc::new(echo_agent_app_core::config_watcher::spawn_config_watcher(
-        Some(args.config.clone()),
-        runtime.agent_handle.clone(),
-        runtime
-            .agent_handle
-            .read(|agent| agent.working_dir())
-            .await
-            .unwrap_or_else(|| std::path::PathBuf::from(".")),
-        Some(runtime.plugin_runtime.clone()),
-        runtime.extension_control.clone(),
-        None,
-        root_cancel.clone(),
-    ));
-    lifecycle.bind_config_watcher(config_watcher.clone());
     let hitl_registration = runtime
         .hitl_dispatcher
         .register_owned("lh6-soak", hitl)
         .await;
-    let services = echo_agent_cli::cli::start_headless_services(
-        runtime.agent_handle.clone(),
-        runtime.hitl_dispatcher.clone(),
-        app_config,
-        HeadlessServiceResources {
-            model_consumers: runtime.model_consumers.clone(),
-            active_model_id: runtime
-                .active_runtime_model
-                .as_ref()
-                .map(|model| model.id.clone())
-                .unwrap_or_default(),
-            pool: pool.clone(),
-            task_runtime_store: Some(task_runtime),
-            webhook_emitter: Arc::new(echo_agent_app_core::webhook::WebhookEmitter::from_config(
-                app_config,
-            )),
-            conversation_store,
-            runtime_state_store: runtime.state_store.clone(),
-            review_integration: runtime.review_integration.clone(),
-            mcp_config_runtime: runtime.mcp_config_runtime.clone(),
-            plugin_runtime: runtime.plugin_runtime.clone(),
-            extension_control: runtime.extension_control.clone(),
-            config_watcher: config_watcher.clone(),
-            foreground_turns,
-            command_cell_runtime: runtime.command_cell_runtime.clone(),
-            product_data_io: runtime.product_data_io.clone(),
-            browser_runtime: runtime.browser_runtime.clone(),
-            lifecycle,
-        },
+    let explicit_config = args.config.to_string_lossy();
+    let services = ApplicationServices::compose(
+        &runtime,
+        Some(explicit_config.as_ref()),
+        conversation_store,
+        echo_agent::tools::permission::PermissionMode::BypassPermissions,
     )
     .await
-    .map_err(|error| anyhow::anyhow!("LH6 headless bootstrap rolled back: {error}"))?;
+    .map_err(|error| anyhow::anyhow!("LH6 application bootstrap rolled back: {error}"))?;
     Ok(ProductContext {
         runtime,
         services,
@@ -595,7 +508,14 @@ async fn bootstrap(
 impl ProductContext {
     async fn shutdown(mut self) -> Result<()> {
         self.hitl_registration.take();
-        echo_agent_cli::cli::shutdown_headless_services(Ok(()), self.services, None, None).await
+        self.services
+            .settle(
+                echo_agent_app_core::runtime::ApplicationLifecycleReason::Shutdown,
+                None,
+            )
+            .await
+            .into_result()
+            .map_err(anyhow::Error::new)
     }
 }
 
