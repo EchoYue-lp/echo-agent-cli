@@ -52,7 +52,7 @@ launcher 不再维护跨 TaskRun metadata DAG 或轮询器。CLI 使用 `/tasks 
 | Tool output    | summary/detail 分离、opaque detail ref、cursor page、文件/JSONL 恢复                     | `echo-agent-app-core/src/tool_execution_projection.rs` |
 | Agent 协作控制面 | discriminated Conversation/TaskSubagent target、bounded list/inspect/message/followup/wait/interrupt | `echo-agent-app-core/src/agent_control.rs` |
 | Hooks/Webhooks | 生命周期事件、command/Subagent/MCP actions、配置热重载                                   | `echo-agent-app-core/src/hook_config_loader.rs`        |
-| Plugins        | flat `plugin.json` package、Skills/MCP/Subagents/Hooks/LSP/monitors/themes/output styles | `echo-agent-app-core/src/plugin_runtime.rs`            |
+| Plugins        | framework prepared generation、captured target fanout、typed generation receipt、Subagents/LSP/scope-qualified monitors/themes/styles | `echo-agent-app-core/src/plugin_runtime.rs` |
 | Skills         | 递归发现、安装、启停、upstream staging sync 与 durable desired/settled generation        | `skills_hub/` + `extension_control.rs`                 |
 
 ### Extension Control Authority
@@ -69,8 +69,13 @@ store。
 - Browser 与 LSP 的完整命令面在 GUI、TUI、CLI/JSONL 和 channel 可达。
 - MCP health 由 Extension control 按 authority scope 维护；Hook/LSP project identity 来自
   captured workspace root，不使用 process cwd。
+- Plugin portable components 只由 framework prepare/apply；EKO mutation 使用一次捕获的
+  workspace/ABA target cut。cold workspace 继承 committed framework generation，LSP config
+  更新不再触发完整 Plugin reload，monitor key 按 target scope 隔离；所有 surface 收到 overall
+  status 以及 previous/candidate generation 的逐 target typed receipt。
 
-完整合同见 [Extension Control ADR](./adr/0012-extension-control-authority.md)。
+完整合同见 [Extension Control ADR](./adr/0012-extension-control-authority.md) 和
+[framework prepared Plugin generation ADR](./adr/0022-framework-prepared-plugin-generations.md)。
 
 ## 专业工作台
 

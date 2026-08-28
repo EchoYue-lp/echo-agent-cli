@@ -1169,17 +1169,6 @@ impl AgentRuntime {
             }
         }
 
-        // User-installed skills have one EKO enablement authority. Load only
-        // enabled entries and tag exact source ownership so every surface can
-        // hot-disable them through ExtensionControlService.
-        match crate::extension_control::load_enabled_user_skills(&agent_handle).await {
-            Ok(names) if !names.is_empty() => {
-                tracing::info!(skills = ?names, "Enabled user skills loaded")
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(%error, "Failed to load enabled user skills"),
-        }
-
         // ── 6. User hooks ──
         // Single merged load: eko.yaml inline + ~/.eko/hooks.yaml +
         // .eko/hooks.yaml are merged into one HooksDefinition by
@@ -1276,12 +1265,21 @@ impl AgentRuntime {
         // ── 10. Plugins ──
         // Discovery, initial wiring, and later live mutations all go through
         // one runtime owner. This avoids bootstrap/reload double registration.
-        let plugin_runtime = crate::plugin_runtime::PluginRuntimeService::new(
+        let plugin_runtime = match crate::plugin_runtime::PluginRuntimeService::new(
             agent_handle.clone(),
             lsp_runtime,
             mcp_config_runtime.ownership(),
         )
-        .await;
+        .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let receipt = bootstrap_lifecycle
+                    .settle(ApplicationLifecycleReason::BootstrapRollback, Some(error))
+                    .await;
+                return Err(anyhow::Error::new(receipt.into_error()));
+            }
+        };
         bootstrap_lifecycle.bind_plugin_runtime(plugin_runtime.clone());
 
         // ── 11. File-backed research library ──

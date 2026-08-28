@@ -108,7 +108,6 @@ pub(crate) struct WorkspaceExecutionRuntime {
     task_runtime: Arc<TaskRuntimeStore>,
     review_integration: Arc<ReviewIntegration>,
     plugin_runtime: Option<Arc<crate::plugin_runtime::PluginRuntimeService>>,
-    mcp_ownership: Arc<crate::mcp_config_runtime::McpNameOwnershipRegistry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,7 +459,7 @@ impl WorkspaceRuntimeHost {
                 ));
                 let workspace = self.workspace().await;
                 let workspace_io_identity = self.workspace_io_identity();
-                let (pool, plugin_runtime, mcp_ownership) = seed_pool
+                let (pool, plugin_runtime, _mcp_ownership) = seed_pool
                     .fork_for_workspace(WorkspaceAgentPoolResources {
                         root: self.root().to_path_buf(),
                         kind: workspace.kind,
@@ -483,7 +482,6 @@ impl WorkspaceRuntimeHost {
                         task_runtime,
                         review_integration,
                         plugin_runtime,
-                        mcp_ownership,
                     },
                 ))
             })
@@ -607,14 +605,6 @@ impl WorkspaceExecutionRuntime {
         &self,
     ) -> Option<Arc<crate::plugin_runtime::PluginRuntimeService>> {
         self.plugin_runtime.clone()
-    }
-
-    pub(crate) fn mcp_reconcile_target(&self) -> crate::mcp_config_runtime::McpReconcileTarget {
-        crate::mcp_config_runtime::McpReconcileTarget::new(
-            self.primary_agent(),
-            Arc::clone(&self.mcp_ownership),
-            Some(self.pool()),
-        )
     }
 
     pub(crate) fn activity(
@@ -890,6 +880,7 @@ impl WorkspaceRuntimeRegistry {
     ) -> anyhow::Result<
         Vec<(
             WorkspaceId,
+            String,
             Arc<WorkspaceExecutionRuntime>,
             WorkspaceControlLease,
         )>,
@@ -902,6 +893,7 @@ impl WorkspaceRuntimeRegistry {
             };
             controls.push((
                 host.id().clone(),
+                host.workspace().await.opaque_product_data_generation(),
                 Arc::clone(runtime),
                 host.acquire_control_lease()?,
             ));
@@ -1554,6 +1546,10 @@ mod tests {
             temp.path().join("mcp.json"),
             Default::default(),
         ));
+        let ownerships = runtimes
+            .iter()
+            .map(|_| crate::mcp_config_runtime::McpNameOwnershipRegistry::new(Vec::<String>::new()))
+            .collect::<Vec<_>>();
         let mut final_name = String::new();
         for generation in 1..=24 {
             final_name = format!("fixture-{generation}");
@@ -1568,7 +1564,14 @@ mod tests {
             );
             let targets = runtimes
                 .iter()
-                .map(|runtime| runtime.mcp_reconcile_target())
+                .zip(ownerships.iter())
+                .map(|(runtime, ownership)| {
+                    crate::mcp_config_runtime::McpReconcileTarget::new(
+                        runtime.primary_agent(),
+                        Arc::clone(ownership),
+                        Some(runtime.pool()),
+                    )
+                })
                 .collect();
             let committed = mcp
                 .replace_and_reconcile(targets, candidate)
@@ -1580,7 +1583,7 @@ mod tests {
         let expected =
             serde_json::to_value(mcp.snapshot().await).map_err(|error| error.to_string())?;
         let mut tool_managers = Vec::new();
-        for runtime in &runtimes {
+        for (runtime, ownership) in runtimes.iter().zip(&ownerships) {
             let snapshot = runtime
                 .pool()
                 .mcp_config_snapshot_for_test()
@@ -1590,7 +1593,7 @@ mod tests {
                 serde_json::to_value(snapshot).map_err(|error| error.to_string())?,
                 expected
             );
-            assert!(runtime.mcp_ownership.is_user_owned(&final_name).await);
+            assert!(ownership.is_user_owned(&final_name).await);
             tool_managers.push(
                 runtime
                     .primary_agent()

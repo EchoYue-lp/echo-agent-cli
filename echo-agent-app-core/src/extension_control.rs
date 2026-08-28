@@ -19,7 +19,9 @@ use crate::skills_hub::enabled_skills::{
     SkillRepairDebt, SkillRepairTargetDebt,
 };
 use crate::skills_hub::{SkillHubEntry, SkillsHub};
-use crate::state::{AppState, McpHealthStatus, ScopedChatRuntime, ScopedExtensionControl};
+use crate::state::{
+    AppState, ExtensionRuntimeTargets, McpHealthStatus, ScopedChatRuntime, ScopedExtensionControl,
+};
 
 const USER_SKILL_SOURCE_PREFIX: &str = "eko:user-skill:";
 
@@ -84,11 +86,40 @@ pub struct PluginOutputStyleSnapshot {
 #[derive(Debug)]
 pub struct PluginMutationReceipt {
     pub authority_scope: String,
+    pub status: PluginSettlementStatus,
     pub plugin_id: Option<String>,
     pub entry: Option<echo_agent::plugin::PluginEntry>,
     pub summary: crate::plugin_runtime::ReloadSummary,
+    pub target_receipts: Vec<PluginTargetGenerationReceipt>,
     pub theme: PluginThemeSnapshot,
     pub output_style: PluginOutputStyleSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginSettlementStatus {
+    Settled,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginTargetSettlementStatus {
+    Settled,
+    Degraded,
+}
+
+/// Result of publishing one prepared plugin generation to one host captured at
+/// mutation admission. Both generations are opaque framework identities; the
+/// workspace generation independently fences delete/recreate ABA.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginTargetGenerationReceipt {
+    pub target: String,
+    pub workspace_generation: String,
+    pub previous_prepared_generation: String,
+    pub candidate_prepared_generation: Option<String>,
+    pub status: PluginTargetSettlementStatus,
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -448,6 +479,15 @@ impl ExtensionControlService {
         runtime.rebind_workspace(root).await
     }
 
+    pub async fn reload_plugin_lsp(
+        &self,
+        runtime: Arc<crate::plugin_runtime::PluginRuntimeService>,
+        root: PathBuf,
+    ) -> anyhow::Result<usize> {
+        let _mutation = self.mutation.lock().await;
+        runtime.reload_lsp_generation(root).await
+    }
+
     pub async fn reload_plugins(
         self: &Arc<Self>,
         state: &Arc<AppState>,
@@ -460,32 +500,42 @@ impl ExtensionControlService {
         state: &Arc<AppState>,
         runtime: Option<&ScopedChatRuntime>,
     ) -> anyhow::Result<PluginMutationReceipt> {
-        let targets = state.extension_runtime_targets().await?;
         let control = self.scoped_context(state, runtime).await?;
+        let targets = state.extension_runtime_targets().await?;
         let authority_scope = control
             .runtime()
             .execution_scope()
             .workspace_id()
             .to_string();
         let authority = control.plugin_runtime();
+        if !captured_targets_include_authority(&targets, &authority) {
+            anyhow::bail!(
+                "captured plugin targets do not contain the selected authority generation"
+            );
+        }
         let flow = state
             .session
             .product_data_io
             .begin_owned_flow("reload and settle plugins")
             .map_err(anyhow::Error::new)?;
         let service = Arc::clone(self);
-        let state = Arc::clone(state);
         await_owned_extension_settlement(
             flow,
             async move {
                 let _mutation = service.mutation.lock().await;
-                let _targets = targets;
                 let _control = control;
                 let mut summary = authority.reload().await?;
-                state
-                    .reload_plugin_followers(&authority, &mut summary)
-                    .await;
-                Ok(plugin_mutation_receipt(authority_scope, &authority, None, None, summary).await)
+                let target_receipts =
+                    settle_captured_plugin_targets(&targets, &authority, &mut summary).await;
+                Ok(plugin_mutation_receipt(
+                    authority_scope,
+                    &authority,
+                    None,
+                    None,
+                    summary,
+                    target_receipts,
+                )
+                .await)
             },
             |error| anyhow::anyhow!("Plugin reload settlement task failed: {error}"),
         )
@@ -508,14 +558,19 @@ impl ExtensionControlService {
         source: &echo_agent::plugin::InstallSource,
         scope: echo_agent::plugin::PluginScope,
     ) -> anyhow::Result<PluginMutationReceipt> {
-        let targets = state.extension_runtime_targets().await?;
         let control = self.scoped_context(state, runtime).await?;
+        let targets = state.extension_runtime_targets().await?;
         let authority_scope = control
             .runtime()
             .execution_scope()
             .workspace_id()
             .to_string();
         let authority = control.plugin_runtime();
+        if !captured_targets_include_authority(&targets, &authority) {
+            anyhow::bail!(
+                "captured plugin targets do not contain the selected authority generation"
+            );
+        }
         let source = source.clone();
         let flow = state
             .session
@@ -523,17 +578,14 @@ impl ExtensionControlService {
             .begin_owned_flow("install and settle plugin")
             .map_err(anyhow::Error::new)?;
         let service = Arc::clone(self);
-        let state = Arc::clone(state);
         await_owned_extension_settlement(
             flow,
             async move {
                 let _mutation = service.mutation.lock().await;
-                let _targets = targets;
                 let _control = control;
                 let (plugin_id, mut summary) = authority.install(&source, scope).await?;
-                state
-                    .reload_plugin_followers(&authority, &mut summary)
-                    .await;
+                let target_receipts =
+                    settle_captured_plugin_targets(&targets, &authority, &mut summary).await;
                 let entry = authority.get(&plugin_id).await;
                 Ok(plugin_mutation_receipt(
                     authority_scope,
@@ -541,6 +593,7 @@ impl ExtensionControlService {
                     Some(plugin_id),
                     entry,
                     summary,
+                    target_receipts,
                 )
                 .await)
             },
@@ -566,14 +619,19 @@ impl ExtensionControlService {
         name: &str,
         keep_data: bool,
     ) -> anyhow::Result<PluginMutationReceipt> {
-        let targets = state.extension_runtime_targets().await?;
         let control = self.scoped_context(state, runtime).await?;
+        let targets = state.extension_runtime_targets().await?;
         let authority_scope = control
             .runtime()
             .execution_scope()
             .workspace_id()
             .to_string();
         let authority = control.plugin_runtime();
+        if !captured_targets_include_authority(&targets, &authority) {
+            anyhow::bail!(
+                "captured plugin targets do not contain the selected authority generation"
+            );
+        }
         let name = name.to_string();
         let flow = state
             .session
@@ -581,21 +639,23 @@ impl ExtensionControlService {
             .begin_owned_flow("uninstall and settle plugin")
             .map_err(anyhow::Error::new)?;
         let service = Arc::clone(self);
-        let state = Arc::clone(state);
         await_owned_extension_settlement(
             flow,
             async move {
                 let _mutation = service.mutation.lock().await;
-                let _targets = targets;
                 let _control = control;
                 let mut summary = authority.uninstall(&name, keep_data).await?;
-                state
-                    .reload_plugin_followers(&authority, &mut summary)
-                    .await;
-                Ok(
-                    plugin_mutation_receipt(authority_scope, &authority, Some(name), None, summary)
-                        .await,
+                let target_receipts =
+                    settle_captured_plugin_targets(&targets, &authority, &mut summary).await;
+                Ok(plugin_mutation_receipt(
+                    authority_scope,
+                    &authority,
+                    Some(name),
+                    None,
+                    summary,
+                    target_receipts,
                 )
+                .await)
             },
             |error| anyhow::anyhow!("Plugin uninstall settlement task failed: {error}"),
         )
@@ -619,14 +679,19 @@ impl ExtensionControlService {
         name: &str,
         enabled: bool,
     ) -> anyhow::Result<PluginMutationReceipt> {
-        let targets = state.extension_runtime_targets().await?;
         let control = self.scoped_context(state, runtime).await?;
+        let targets = state.extension_runtime_targets().await?;
         let authority_scope = control
             .runtime()
             .execution_scope()
             .workspace_id()
             .to_string();
         let authority = control.plugin_runtime();
+        if !captured_targets_include_authority(&targets, &authority) {
+            anyhow::bail!(
+                "captured plugin targets do not contain the selected authority generation"
+            );
+        }
         let name = name.to_string();
         let flow = state
             .session
@@ -634,32 +699,28 @@ impl ExtensionControlService {
             .begin_owned_flow("toggle and settle plugin")
             .map_err(anyhow::Error::new)?;
         let service = Arc::clone(self);
-        let state = Arc::clone(state);
         await_owned_extension_settlement(
             flow,
             async move {
                 let _mutation = service.mutation.lock().await;
-                let _targets = targets;
                 let _control = control;
                 let mut summary = if enabled {
                     authority.enable(&name).await?
                 } else {
                     authority.disable(&name).await?
                 };
-                state
-                    .reload_plugin_followers(&authority, &mut summary)
-                    .await;
+                let target_receipts =
+                    settle_captured_plugin_targets(&targets, &authority, &mut summary).await;
                 let entry = authority.get(&name).await;
-                Ok(
-                    plugin_mutation_receipt(
-                        authority_scope,
-                        &authority,
-                        Some(name),
-                        entry,
-                        summary,
-                    )
-                    .await,
+                Ok(plugin_mutation_receipt(
+                    authority_scope,
+                    &authority,
+                    Some(name),
+                    entry,
+                    summary,
+                    target_receipts,
                 )
+                .await)
             },
             |error| anyhow::anyhow!("Plugin toggle settlement task failed: {error}"),
         )
@@ -683,14 +744,19 @@ impl ExtensionControlService {
         name: &str,
         values: HashMap<String, serde_json::Value>,
     ) -> anyhow::Result<PluginMutationReceipt> {
-        let targets = state.extension_runtime_targets().await?;
         let control = self.scoped_context(state, runtime).await?;
+        let targets = state.extension_runtime_targets().await?;
         let authority_scope = control
             .runtime()
             .execution_scope()
             .workspace_id()
             .to_string();
         let authority = control.plugin_runtime();
+        if !captured_targets_include_authority(&targets, &authority) {
+            anyhow::bail!(
+                "captured plugin targets do not contain the selected authority generation"
+            );
+        }
         let name = name.to_string();
         let flow = state
             .session
@@ -698,28 +764,24 @@ impl ExtensionControlService {
             .begin_owned_flow("configure and settle plugin")
             .map_err(anyhow::Error::new)?;
         let service = Arc::clone(self);
-        let state = Arc::clone(state);
         await_owned_extension_settlement(
             flow,
             async move {
                 let _mutation = service.mutation.lock().await;
-                let _targets = targets;
                 let _control = control;
                 let mut summary = authority.configure(&name, values).await?;
-                state
-                    .reload_plugin_followers(&authority, &mut summary)
-                    .await;
+                let target_receipts =
+                    settle_captured_plugin_targets(&targets, &authority, &mut summary).await;
                 let entry = authority.get(&name).await;
-                Ok(
-                    plugin_mutation_receipt(
-                        authority_scope,
-                        &authority,
-                        Some(name),
-                        entry,
-                        summary,
-                    )
-                    .await,
+                Ok(plugin_mutation_receipt(
+                    authority_scope,
+                    &authority,
+                    Some(name),
+                    entry,
+                    summary,
+                    target_receipts,
                 )
+                .await)
             },
             |error| anyhow::anyhow!("Plugin configuration settlement task failed: {error}"),
         )
@@ -974,8 +1036,7 @@ impl ExtensionControlService {
             flow,
             async move {
                 let _mutation = service.mutation.lock().await;
-                let _targets = targets;
-                let generation = state.replace_mcp_config_owned(config).await?;
+                let generation = state.replace_mcp_config_owned(&targets, config).await?;
                 state.plugins.mcp_health.write().await.clear();
                 Ok(generation)
             },
@@ -1006,8 +1067,9 @@ impl ExtensionControlService {
             flow,
             async move {
                 let _mutation = service.mutation.lock().await;
-                let _targets = targets;
-                let generation = state.upsert_mcp_server_owned(name.clone(), entry).await?;
+                let generation = state
+                    .upsert_mcp_server_owned(&targets, name.clone(), entry)
+                    .await?;
                 service.clear_mcp_health_for_server(&state, &name).await;
                 Ok(generation)
             },
@@ -1038,8 +1100,7 @@ impl ExtensionControlService {
             flow,
             async move {
                 let _mutation = service.mutation.lock().await;
-                let _targets = targets;
-                let generation = state.remove_mcp_server_owned(&name).await?;
+                let generation = state.remove_mcp_server_owned(&targets, &name).await?;
                 service.clear_mcp_health_for_server(&state, &name).await;
                 Ok(generation)
             },
@@ -1488,68 +1549,6 @@ impl ExtensionControlService {
         };
         match state.extension_runtime_targets().await {
             Ok(targets) => {
-                let registry = Arc::clone(&state.workspace.registry);
-                let generations = flow
-                    .run("capture skill workspace generations", move || {
-                        registry
-                            .list()
-                            .map(|workspaces| {
-                                workspaces
-                                    .into_iter()
-                                    .map(|workspace| {
-                                        (
-                                            workspace.id.to_string(),
-                                            workspace.opaque_product_data_generation(),
-                                        )
-                                    })
-                                    .collect::<BTreeMap<_, _>>()
-                            })
-                            .map_err(|error| error.to_string())
-                    })
-                    .await;
-                let generations = match generations {
-                    Ok(Ok(generations)) => generations,
-                    Ok(Err(error)) => {
-                        target_receipts.push(SkillTargetSettlementReceipt {
-                            target: "workspace-generations".to_string(),
-                            workspace_generation: "unknown".to_string(),
-                            specialist_generation: config.desired_generation,
-                            status: SkillTargetSettlementStatus::Degraded,
-                            changed_entries: Vec::new(),
-                            error: Some(error),
-                        });
-                        return settle_skill_generation(
-                            flow,
-                            self.enabled_config_path.clone(),
-                            config,
-                            operation_id,
-                            idempotent,
-                            durable_committed,
-                            target_receipts,
-                        )
-                        .await;
-                    }
-                    Err(error) => {
-                        target_receipts.push(SkillTargetSettlementReceipt {
-                            target: "workspace-generations".to_string(),
-                            workspace_generation: "unknown".to_string(),
-                            specialist_generation: config.desired_generation,
-                            status: SkillTargetSettlementStatus::Degraded,
-                            changed_entries: Vec::new(),
-                            error: Some(error.to_string()),
-                        });
-                        return settle_skill_generation(
-                            flow,
-                            self.enabled_config_path.clone(),
-                            config,
-                            operation_id,
-                            idempotent,
-                            durable_committed,
-                            target_receipts,
-                        )
-                        .await;
-                    }
-                };
                 for target in targets.iter() {
                     if !skill_commit_is_current(flow, self.enabled_config_path.clone(), &config)
                         .await?
@@ -1557,14 +1556,7 @@ impl ExtensionControlService {
                         target_receipts.push(stale_skill_generation_receipt(&config));
                         break;
                     }
-                    let workspace_generation = if target.scope() == "global" {
-                        "global".to_string()
-                    } else {
-                        generations
-                            .get(target.scope())
-                            .cloned()
-                            .unwrap_or_else(|| "unknown".to_string())
-                    };
+                    let workspace_generation = target.workspace_generation().to_string();
                     let receipt = match reconcile_target_skills(target, &desired, &skill_root).await
                     {
                         Ok(mut changed_entries) => {
@@ -2319,13 +2311,8 @@ impl ExtensionControlService {
             flow,
             async move {
                 let _mutation = service.mutation.lock().await;
-                let _targets = targets;
-                let snapshot = state.plugins.mcp_config.snapshot().await;
-                if !snapshot.mcp_servers.contains_key(&name) {
-                    anyhow::bail!("MCP server '{name}' is not present in the user config");
-                }
                 let generation = state
-                    .set_mcp_server_enabled_owned(&name, true)
+                    .set_mcp_server_enabled_owned(&targets, &name, true)
                     .await
                     .map_err(anyhow::Error::new)?;
                 service.clear_mcp_health_for_server(&state, &name).await;
@@ -2354,9 +2341,8 @@ impl ExtensionControlService {
             flow,
             async move {
                 let _mutation = service.mutation.lock().await;
-                let _targets = targets;
                 let generation = state
-                    .set_mcp_server_enabled_owned(&name, false)
+                    .set_mcp_server_enabled_owned(&targets, &name, false)
                     .await
                     .map_err(anyhow::Error::new)?;
                 service.clear_mcp_health_for_server(&state, &name).await;
@@ -2742,11 +2728,21 @@ async fn plugin_mutation_receipt(
     plugin_id: Option<String>,
     entry: Option<echo_agent::plugin::PluginEntry>,
     summary: crate::plugin_runtime::ReloadSummary,
+    target_receipts: Vec<PluginTargetGenerationReceipt>,
 ) -> PluginMutationReceipt {
     let active_theme = authority.active_theme().await;
     let themes = authority.themes().await;
     let active_output_style = authority.active_output_style().await;
     let styles = authority.output_styles().await;
+    let status = if !summary.errors.is_empty()
+        || target_receipts
+            .iter()
+            .any(|target| target.status == PluginTargetSettlementStatus::Degraded)
+    {
+        PluginSettlementStatus::Degraded
+    } else {
+        PluginSettlementStatus::Settled
+    };
     PluginMutationReceipt {
         theme: PluginThemeSnapshot {
             authority_scope: authority_scope.clone(),
@@ -2759,10 +2755,65 @@ async fn plugin_mutation_receipt(
             styles,
         },
         authority_scope,
+        status,
         plugin_id,
         entry,
         summary,
+        target_receipts,
     }
+}
+
+fn captured_targets_include_authority(
+    targets: &ExtensionRuntimeTargets,
+    authority: &Arc<crate::plugin_runtime::PluginRuntimeService>,
+) -> bool {
+    targets
+        .iter()
+        .any(|target| Arc::ptr_eq(&target.plugin_runtime(), authority))
+}
+
+async fn settle_captured_plugin_targets(
+    targets: &ExtensionRuntimeTargets,
+    authority: &Arc<crate::plugin_runtime::PluginRuntimeService>,
+    summary: &mut crate::plugin_runtime::ReloadSummary,
+) -> Vec<PluginTargetGenerationReceipt> {
+    let mut receipts = Vec::new();
+    for target in targets.iter() {
+        let runtime = target.plugin_runtime();
+        let is_authority = Arc::ptr_eq(authority, &runtime);
+        let settlement = if is_authority {
+            Ok(summary.errors.clone())
+        } else {
+            runtime.reload().await.map(|follower| follower.errors)
+        };
+        let previous = target.prepared_generation_identity().to_string();
+        let candidate = runtime.prepared_generation_identity().await;
+        let (committed, diagnostics) = match settlement {
+            Ok(diagnostics) => (true, diagnostics),
+            Err(error) => (false, vec![error.to_string()]),
+        };
+        let status = if committed && diagnostics.is_empty() {
+            PluginTargetSettlementStatus::Settled
+        } else {
+            if !is_authority {
+                summary.errors.extend(
+                    diagnostics
+                        .iter()
+                        .map(|error| format!("plugin host {}: {error}", target.scope())),
+                );
+            }
+            PluginTargetSettlementStatus::Degraded
+        };
+        receipts.push(PluginTargetGenerationReceipt {
+            target: target.scope().to_string(),
+            workspace_generation: target.workspace_generation().to_string(),
+            previous_prepared_generation: previous,
+            candidate_prepared_generation: Some(candidate),
+            status,
+            diagnostics,
+        });
+    }
+    receipts
 }
 
 fn promote_curated_skill_artifact(
@@ -2902,18 +2953,6 @@ async fn skill_source_present(
             agent.skill_descriptors().iter().any(|descriptor| {
                 descriptor.name == name && descriptor.source.as_deref() == Some(source)
             })
-        })
-        .await
-}
-
-async fn unregister_skill_source(
-    agent: &crate::agent_handle::AgentHandle,
-    source: &str,
-) -> Vec<String> {
-    let source = source.to_string();
-    agent
-        .write_async(|agent| {
-            Box::pin(async move { agent.unregister_skills_by_source(&source).await })
         })
         .await
 }
@@ -3700,52 +3739,6 @@ fn degraded_skill_receipt(
     }
 }
 
-/// Load only EKO-enabled user skills and tag exact ownership for hot removal.
-pub async fn load_enabled_user_skills(
-    agent: &crate::agent_handle::AgentHandle,
-) -> anyhow::Result<Vec<String>> {
-    load_enabled_user_skills_from(
-        agent,
-        crate::data_root::user_data_path("enabled-skills.json"),
-        SkillsHub::default_skills_dir(),
-    )
-    .await
-}
-
-async fn load_enabled_user_skills_from(
-    agent: &crate::agent_handle::AgentHandle,
-    path: PathBuf,
-    skill_root: PathBuf,
-) -> anyhow::Result<Vec<String>> {
-    let selected = enabled_skill_entries(path, skill_root).await?;
-    clear_user_skill_sources(agent).await;
-    let mut loaded_all = Vec::new();
-    for (name, path) in selected {
-        let source = user_skill_source(&name);
-        let loaded = match load_exact_user_skill(agent, &name, path, source).await {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                clear_user_skill_sources(agent).await;
-                return Err(error);
-            }
-        };
-        loaded_all.extend(loaded);
-    }
-    loaded_all.sort();
-    loaded_all.dedup();
-    Ok(loaded_all)
-}
-
-async fn enabled_skill_entries(
-    path: PathBuf,
-    skill_root: PathBuf,
-) -> anyhow::Result<Vec<(String, PathBuf)>> {
-    let config = tokio::task::spawn_blocking(move || EnabledSkillsConfig::load(&path))
-        .await
-        .map_err(|error| anyhow::anyhow!("Skill config reader task failed: {error}"))??;
-    Ok(desired_skill_entries(&config, skill_root))
-}
-
 fn desired_skill_entries(
     config: &EnabledSkillsConfig,
     skill_root: PathBuf,
@@ -3818,24 +3811,7 @@ async fn reconcile_target_skills(
     Ok(loaded)
 }
 
-async fn clear_user_skill_sources(agent: &crate::agent_handle::AgentHandle) {
-    let mut sources = agent
-        .read(|agent| {
-            agent
-                .skill_descriptors()
-                .iter()
-                .filter_map(|descriptor| descriptor.source.clone())
-                .filter(|source| source.starts_with(USER_SKILL_SOURCE_PREFIX))
-                .collect::<Vec<_>>()
-        })
-        .await;
-    sources.sort();
-    sources.dedup();
-    for source in sources {
-        unregister_skill_source(agent, &source).await;
-    }
-}
-
+#[cfg(test)]
 async fn load_exact_user_skill(
     agent: &crate::agent_handle::AgentHandle,
     requested: &str,
@@ -3945,7 +3921,8 @@ mod tests {
             temp.path().join("plugins.json"),
             temp.path().join("plugin-data"),
         )
-        .await;
+        .await
+        .map_err(|error| error.to_string())?;
         let seed_pool = Arc::new(
             crate::agent_pool::AgentPool::new_for_test(primary.clone(), None, None, 8, false).await,
         );
@@ -5625,6 +5602,20 @@ mod tests {
                 .map(|entry| entry.manifest.name.as_str()),
             Some("receipt-plugin")
         );
+        assert_eq!(receipt.target_receipts.len(), 2);
+        assert_eq!(receipt.status, PluginSettlementStatus::Settled);
+        for target in &receipt.target_receipts {
+            assert!(!target.workspace_generation.is_empty());
+            assert!(!target.previous_prepared_generation.is_empty());
+            assert!(
+                target
+                    .candidate_prepared_generation
+                    .as_deref()
+                    .is_some_and(|generation| !generation.is_empty())
+            );
+            assert_eq!(target.status, PluginTargetSettlementStatus::Settled);
+            assert!(target.diagnostics.is_empty());
+        }
         Ok(())
     }
 }

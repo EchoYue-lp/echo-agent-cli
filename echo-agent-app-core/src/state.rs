@@ -821,6 +821,8 @@ pub struct ScopedExtensionControl {
 /// extension policy mutation.
 pub struct ExtensionRuntimeTarget {
     scope: String,
+    workspace_generation: String,
+    prepared_generation_identity: String,
     _lifetime: ScopedRuntimeLifetime,
     primary_agent: AgentHandle,
     pool: Arc<crate::agent_pool::AgentPool>,
@@ -948,6 +950,14 @@ impl ExtensionRuntimeTarget {
         self.primary_agent.clone()
     }
 
+    pub fn workspace_generation(&self) -> &str {
+        &self.workspace_generation
+    }
+
+    pub fn prepared_generation_identity(&self) -> &str {
+        &self.prepared_generation_identity
+    }
+
     pub fn pool(&self) -> Arc<crate::agent_pool::AgentPool> {
         Arc::clone(&self.pool)
     }
@@ -960,6 +970,14 @@ impl ExtensionRuntimeTarget {
 impl ExtensionRuntimeTargets {
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &ExtensionRuntimeTarget> {
         self.targets.iter()
+    }
+
+    async fn mcp_reconcile_targets(&self) -> Vec<crate::mcp_config_runtime::McpReconcileTarget> {
+        let mut targets = Vec::with_capacity(self.targets.len());
+        for target in &self.targets {
+            targets.push(target.plugin_runtime.mcp_reconcile_target().await);
+        }
+        targets
     }
 }
 
@@ -4652,94 +4670,50 @@ impl AppState {
         Ok(resumed)
     }
 
-    async fn mcp_reconcile_targets(&self) -> Vec<crate::mcp_config_runtime::McpReconcileTarget> {
-        let mut targets = vec![crate::mcp_config_runtime::McpReconcileTarget::new(
-            self.connection.primary_agent(),
-            self.plugins.mcp_config.ownership(),
-            self.connection.pool.clone(),
-        )];
-        targets.extend(
-            self.workspace
-                .runtimes
-                .loaded_execution_runtimes()
-                .await
-                .into_iter()
-                .map(|(_, runtime)| runtime.mcp_reconcile_target()),
-        );
-        targets
-    }
-
     pub(crate) async fn replace_mcp_config_owned(
         self: &Arc<Self>,
+        targets: &ExtensionRuntimeTargets,
         candidate: echo_agent::mcp::McpConfigFile,
     ) -> Result<u64, crate::mcp_config_runtime::McpConfigRuntimeError> {
         self.plugins
             .mcp_config
-            .replace_and_reconcile(self.mcp_reconcile_targets().await, candidate)
+            .replace_and_reconcile(targets.mcp_reconcile_targets().await, candidate)
             .await
     }
 
     pub(crate) async fn upsert_mcp_server_owned(
         self: &Arc<Self>,
+        targets: &ExtensionRuntimeTargets,
         name: String,
         entry: echo_agent::mcp::McpServerEntry,
     ) -> Result<u64, crate::mcp_config_runtime::McpConfigRuntimeError> {
         self.plugins
             .mcp_config
-            .upsert_and_reconcile(self.mcp_reconcile_targets().await, name, entry)
+            .upsert_and_reconcile(targets.mcp_reconcile_targets().await, name, entry)
             .await
     }
 
     pub(crate) async fn set_mcp_server_enabled_owned(
         self: &Arc<Self>,
+        targets: &ExtensionRuntimeTargets,
         name: &str,
         enabled: bool,
     ) -> Result<u64, crate::mcp_config_runtime::McpConfigRuntimeError> {
         self.plugins
             .mcp_config
-            .set_enabled_and_reconcile(self.mcp_reconcile_targets().await, name, enabled)
+            .set_enabled_and_reconcile(targets.mcp_reconcile_targets().await, name, enabled)
             .await
     }
 
     pub(crate) async fn remove_mcp_server_owned(
         self: &Arc<Self>,
+        targets: &ExtensionRuntimeTargets,
         name: &str,
     ) -> Result<u64, crate::mcp_config_runtime::McpConfigRuntimeError> {
         self.plugins
             .mcp_config
-            .remove_and_reconcile(self.mcp_reconcile_targets().await, name)
+            .remove_and_reconcile(targets.mcp_reconcile_targets().await, name)
             .await
-    }
-
-    async fn plugin_runtime_targets(
-        &self,
-    ) -> Vec<(String, Arc<crate::plugin_runtime::PluginRuntimeService>)> {
-        let mut targets = Vec::new();
-        if let Some(runtime) = self.plugin_runtime.as_ref() {
-            targets.push(("global".to_string(), Arc::clone(runtime)));
-        }
-        for (workspace_id, execution) in self.workspace.runtimes.loaded_execution_runtimes().await {
-            let Some(runtime) = execution.plugin_runtime() else {
-                continue;
-            };
-            if targets
-                .iter()
-                .any(|(_, candidate)| Arc::ptr_eq(candidate, &runtime))
-            {
-                continue;
-            }
-            targets.push((workspace_id.to_string(), runtime));
-        }
-        targets
-    }
-
-    pub(crate) async fn reload_plugin_followers(
-        &self,
-        authority: &Arc<crate::plugin_runtime::PluginRuntimeService>,
-        summary: &mut crate::plugin_runtime::ReloadSummary,
-    ) {
-        reload_plugin_runtime_followers(authority, summary, self.plugin_runtime_targets().await)
-            .await;
     }
 
     /// Capture all execution authorities for the currently focused workspace.
@@ -4895,7 +4869,7 @@ impl AppState {
                 .await
                 .map_err(|error| ScopedControlError::Runtime(error.to_string()))?;
             let mut matched = None;
-            for (candidate_id, execution, _lease) in controls {
+            for (candidate_id, _workspace_generation, execution, _lease) in controls {
                 if candidate_id.as_str() != workspace_id {
                     continue;
                 }
@@ -4939,6 +4913,8 @@ impl AppState {
         })?;
         let mut targets = vec![ExtensionRuntimeTarget {
             scope: "global".to_string(),
+            workspace_generation: "global".to_string(),
+            prepared_generation_identity: global_runtime.prepared_generation_identity().await,
             _lifetime: ScopedRuntimeLifetime::Global,
             primary_agent: self.connection.primary_agent(),
             pool: global_pool,
@@ -4950,7 +4926,12 @@ impl AppState {
             .loaded_execution_controls()
             .await
             .map_err(|error| ScopedControlError::Runtime(error.to_string()))?;
-        for (workspace_id, execution, lease) in controls {
+        for (workspace_id, workspace_generation, execution, lease) in controls {
+            if workspace_generation.is_empty() {
+                return Err(ScopedControlError::Runtime(format!(
+                    "workspace '{workspace_id}' extension generation is invalid"
+                )));
+            }
             let plugin_runtime = execution.plugin_runtime().ok_or_else(|| {
                 ScopedControlError::Runtime(format!(
                     "workspace '{workspace_id}' plugin runtime is not initialized"
@@ -4958,6 +4939,8 @@ impl AppState {
             })?;
             targets.push(ExtensionRuntimeTarget {
                 scope: workspace_id.to_string(),
+                workspace_generation,
+                prepared_generation_identity: plugin_runtime.prepared_generation_identity().await,
                 _lifetime: ScopedRuntimeLifetime::Workspace { _lease: lease },
                 primary_agent: execution.primary_agent(),
                 pool: execution.pool(),
@@ -5637,31 +5620,6 @@ where
         biased;
         _ = shutdown.cancelled() => None,
         settlement = &mut settlement => Some(settlement),
-    }
-}
-
-async fn reload_plugin_runtime_followers(
-    authority: &Arc<crate::plugin_runtime::PluginRuntimeService>,
-    summary: &mut crate::plugin_runtime::ReloadSummary,
-    targets: Vec<(String, Arc<crate::plugin_runtime::PluginRuntimeService>)>,
-) {
-    for (target, runtime) in targets {
-        if Arc::ptr_eq(authority, &runtime) {
-            continue;
-        }
-        match runtime.reload().await {
-            Ok(follower) => {
-                summary.errors.extend(
-                    follower
-                        .errors
-                        .into_iter()
-                        .map(|error| format!("plugin host {target}: {error}")),
-                );
-            }
-            Err(error) => summary
-                .errors
-                .push(format!("plugin host {target}: {error}")),
-        }
     }
 }
 
@@ -8291,67 +8249,6 @@ mod workspace_transition_tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn plugin_generation_reload_reaches_global_and_three_workspace_targets()
-    -> Result<(), String> {
-        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let mut runtimes = Vec::new();
-        for position in 0..4 {
-            let root = temp.path().join(format!("plugin-host-{position}"));
-            std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-            let agent = ReactAgentBuilder::new()
-                .llm_client(Arc::new(MockLlmClient::new()))
-                .system_prompt("plugin generation test")
-                .build()
-                .map(AgentHandle::new)
-                .map_err(|error| error.to_string())?;
-            runtimes.push(
-                crate::plugin_runtime::PluginRuntimeService::new_for_test(
-                    agent,
-                    root.clone(),
-                    root.join("plugins.json"),
-                    root.join("data"),
-                )
-                .await,
-            );
-        }
-        let authority = runtimes
-            .first()
-            .cloned()
-            .ok_or_else(|| "plugin authority missing".to_string())?;
-        let before =
-            futures::future::join_all(runtimes.iter().map(|runtime| runtime.generation_for_test()))
-                .await;
-        let mut summary = authority
-            .reload()
-            .await
-            .map_err(|error| error.to_string())?;
-        reload_plugin_runtime_followers(
-            &authority,
-            &mut summary,
-            runtimes
-                .iter()
-                .enumerate()
-                .map(|(position, runtime)| (format!("plugin-host-{position}"), Arc::clone(runtime)))
-                .collect(),
-        )
-        .await;
-        assert!(summary.errors.is_empty());
-        for (previous, runtime) in before.into_iter().zip(&runtimes) {
-            assert_eq!(
-                runtime.generation_for_test().await,
-                previous.saturating_add(1)
-            );
-        }
-        for runtime in runtimes {
-            runtime
-                .shutdown()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    }
-
     fn workspace(name: &str, root: std::path::PathBuf) -> Workspace {
         Workspace {
             id: crate::workspace::WorkspaceId::from_name(name),
@@ -8401,7 +8298,8 @@ mod workspace_transition_tests {
             root.join("global-plugins.json"),
             root.join("global-plugin-data"),
         )
-        .await;
+        .await
+        .map_err(|error| error.to_string())?;
         let mcp_runtime = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
             root.join("mcp.json"),
             Default::default(),
@@ -8504,7 +8402,11 @@ mod workspace_transition_tests {
         )
         .map_err(|error| error.to_string())?;
         assert_eq!(enabled.settled_generation, enabled.desired_generation);
-        assert!(enabled.repair_debt.is_none());
+        assert!(
+            enabled.repair_debt.is_none(),
+            "unexpected extension repair debt: {:?}",
+            enabled.repair_debt
+        );
         Ok(())
     }
 

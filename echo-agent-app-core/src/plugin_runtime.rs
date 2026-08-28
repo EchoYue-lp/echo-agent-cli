@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
 use echo_agent::lsp::{LspConfig, LspManager, LspServerStatus};
-use echo_agent::mcp::McpConfigFile;
 use echo_agent::plugin::{
     AGENT_PLUGIN_SCHEMA_V1, InstallSource, PluginEntry, PluginIntegrator, PluginLifecycle,
-    PluginLifecycleManager, PluginRegistry, PluginScope, PluginWiringResult, WiredPluginComponents,
+    PluginLifecycleManager, PluginPreparationDiagnostic, PluginRegistry, PluginScope,
+    PluginWiringResult, PreparedPluginSet, WiredPluginComponents,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -121,15 +121,16 @@ impl ReloadSummary {
     fn from_components(
         total: usize,
         enabled: usize,
-        wiring: &PluginWiringResult,
+        wiring: Option<&PluginWiringResult>,
+        generation: Option<&PreparedPluginSet>,
         application: &PreparedApplicationComponents,
     ) -> Self {
         Self {
             total,
             enabled,
-            skills_loaded: wiring.skills_loaded.len(),
-            hooks_registered: wiring.hooks_registered.len(),
-            mcp_connected: wiring.mcp_connected.len(),
+            skills_loaded: wiring.map_or(0, |receipt| receipt.skills_loaded.len()),
+            hooks_registered: wiring.map_or(0, |receipt| receipt.hooks_registered.len()),
+            mcp_connected: wiring.map_or(0, |receipt| receipt.mcp_connected.len()),
             agents_loaded: application.agents.len(),
             lsp_languages_loaded: application
                 .lsp_configs
@@ -139,7 +140,14 @@ impl ReloadSummary {
             monitors_loaded: application.monitors.len(),
             themes_loaded: application.themes.len(),
             output_styles_loaded: application.output_styles.len(),
-            errors: wiring.warnings.clone(),
+            errors: generation
+                .into_iter()
+                .flat_map(PreparedPluginSet::diagnostics)
+                .filter(|diagnostic| {
+                    diagnostic.severity() == echo_agent::plugin::PluginDiagnosticSeverity::Error
+                })
+                .map(ToString::to_string)
+                .collect(),
         }
     }
 }
@@ -239,6 +247,8 @@ type PluginMcpDeclarations = HashMap<String, Vec<String>>;
 struct PluginRuntimeState {
     registry: PluginRegistry,
     framework_components: HashMap<String, WiredPluginComponents>,
+    framework_generation: Option<Arc<PreparedPluginSet>>,
+    framework_receipt: Option<PluginWiringResult>,
     mcp_ownership: PluginMcpOwnership,
     prepared: PreparedApplicationComponents,
     lifecycle: PluginLifecycleManager,
@@ -286,6 +296,8 @@ pub struct PluginRuntimeService {
     lsp: PluginLspRuntime,
     scheduler: RwLock<Option<Arc<SchedulerRunner>>>,
     mcp_ownership: Arc<McpNameOwnershipRegistry>,
+    integrator: PluginIntegrator,
+    target_scope: String,
     registry_source: RegistrySource,
     preferences_file: PathBuf,
     state: Mutex<PluginRuntimeState>,
@@ -298,8 +310,26 @@ impl PluginRuntimeService {
         agent_handle: AgentHandle,
         lsp: PluginLspRuntime,
         mcp_ownership: Arc<McpNameOwnershipRegistry>,
-    ) -> Arc<Self> {
-        Self::new_with_source(agent_handle, lsp, mcp_ownership, RegistrySource::Default).await
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::new_for_scope(agent_handle, lsp, mcp_ownership, "global".to_string(), None).await
+    }
+
+    pub(crate) async fn new_for_scope(
+        agent_handle: AgentHandle,
+        lsp: PluginLspRuntime,
+        mcp_ownership: Arc<McpNameOwnershipRegistry>,
+        target_scope: String,
+        authority_generation: Option<AgentPluginGeneration>,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::new_with_source(
+            agent_handle,
+            lsp,
+            mcp_ownership,
+            RegistrySource::Default,
+            target_scope,
+            authority_generation,
+        )
+        .await
     }
 
     async fn new_with_source(
@@ -307,7 +337,15 @@ impl PluginRuntimeService {
         lsp: PluginLspRuntime,
         mcp_ownership: Arc<McpNameOwnershipRegistry>,
         registry_source: RegistrySource,
-    ) -> Arc<Self> {
+        target_scope: String,
+        authority_generation: Option<AgentPluginGeneration>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let framework_generation = authority_generation
+            .as_ref()
+            .and_then(AgentPluginGeneration::framework_generation);
+        let authority_revision = authority_generation
+            .as_ref()
+            .map_or(0, AgentPluginGeneration::revision);
         let preferences_file = match &registry_source {
             RegistrySource::Default => crate::data_root::user_data_dir()
                 .join("plugins")
@@ -323,27 +361,47 @@ impl PluginRuntimeService {
             lsp,
             scheduler: RwLock::new(None),
             mcp_ownership,
+            integrator: PluginIntegrator::default(),
+            target_scope,
             registry_source,
             preferences_file,
             state: Mutex::new(PluginRuntimeState {
                 registry: PluginRegistry::new(crate::data_root::user_data_dir(), None),
                 framework_components: HashMap::new(),
+                framework_generation,
+                framework_receipt: None,
                 mcp_ownership: HashMap::new(),
                 prepared: PreparedApplicationComponents::default(),
                 lifecycle: PluginLifecycleManager::new(),
                 cleanup_quarantine: Vec::new(),
                 active_theme: preferences.active_theme,
                 active_output_style: preferences.active_output_style,
-                generation: 0,
+                generation: authority_revision,
                 shut_down: false,
             }),
             agent_pool: RwLock::new(None),
             mutation_supervisor: Mutex::new(PluginMutationSupervisor::default()),
         });
-        if let Err(error) = service.reload().await {
-            tracing::warn!(%error, "initial plugin load failed; previous runtime kept");
+        if let Some(authority_generation) = authority_generation {
+            // A cold workspace primary is created from the global pool's exact
+            // committed projection. Retire it before applying the workspace's
+            // full User + Project + Local prepared set so global project-only
+            // descriptors cannot survive in the new target.
+            service
+                .agent_handle
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        crate::agent_pool::remove_agent_plugin_generation(
+                            agent,
+                            &authority_generation,
+                        )
+                        .await;
+                    })
+                })
+                .await;
         }
-        service
+        service.reload().await?;
+        Ok(service)
     }
 
     #[cfg(test)]
@@ -352,7 +410,7 @@ impl PluginRuntimeService {
         project_root: PathBuf,
         state_file: PathBuf,
         data_dir: PathBuf,
-    ) -> Arc<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         Self::new_for_test_with_ownership(
             agent_handle,
             project_root,
@@ -370,8 +428,9 @@ impl PluginRuntimeService {
         state_file: PathBuf,
         data_dir: PathBuf,
         mcp_ownership: Arc<McpNameOwnershipRegistry>,
-    ) -> Arc<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         let manager = Arc::new(RwLock::new(LspManager::new()));
+        let target_scope = format!("test:{}", project_root.display());
         let lsp = PluginLspRuntime::new(manager, LspConfig::default(), project_root);
         Self::new_with_source(
             agent_handle,
@@ -382,6 +441,8 @@ impl PluginRuntimeService {
                 data_dir,
                 scopes: vec![PluginScope::Project, PluginScope::Local],
             },
+            target_scope,
+            None,
         )
         .await
     }
@@ -457,7 +518,8 @@ impl PluginRuntimeService {
                 &state.prepared,
                 state.active_output_style.as_deref(),
             )
-            .await;
+            .await
+            .with_framework_generation(state.framework_generation.clone());
         let mut publication = pool_owner
             .begin_plugin_publication()
             .await
@@ -558,7 +620,8 @@ impl PluginRuntimeService {
             primary.skill_descriptors(),
             state.prepared.agents.clone(),
             active_output_style_instructions(&state),
-        );
+        )
+        .with_framework_generation(state.framework_generation.clone());
         if let Some(publication) = pool_publication.as_mut()
             && let Err(error) = publication
                 .prepare_application_skill(generation, name, source)
@@ -657,7 +720,8 @@ impl PluginRuntimeService {
             primary.skill_descriptors(),
             state.prepared.agents.clone(),
             active_output_style_instructions(&state),
-        );
+        )
+        .with_framework_generation(state.framework_generation.clone());
         if let Some(publication) = pool_publication.as_mut()
             && let Err(error) = publication
                 .prepare_application_skill(generation, name, source)
@@ -746,12 +810,11 @@ impl PluginRuntimeService {
         };
         let mut candidate = self.registry_for(binding.project_root.clone());
         self.scan_registry(&mut candidate)?;
-        candidate
-            .resolve_enabled_dependencies()
-            .map_err(|error| anyhow::anyhow!("Plugin dependency validation failed: {error}"))?;
-        let prepared = prepare_application_components(&mut candidate)
+        let framework_generation =
+            require_applicable_generation(self.integrator.prepare(&mut candidate).await)?;
+        let prepared = prepare_application_components(&framework_generation, &self.target_scope)
             .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
-        let declarations = plugin_mcp_declarations(&mut candidate)?;
+        let declarations = plugin_mcp_declarations(&framework_generation)?;
         let state = self.state.lock().await;
         if state.shut_down {
             return Err(anyhow::anyhow!("plugin runtime is shut down"));
@@ -937,15 +1000,15 @@ impl PluginRuntimeService {
             });
         }
 
-        let previous_framework = std::mem::take(&mut state.framework_components);
+        state.framework_components.clear();
+        state.framework_generation.take();
+        let previous_framework_receipt = state.framework_receipt.take();
         let previous_mcp_ownership = std::mem::take(&mut state.mcp_ownership);
         let mut ownership_guard = self.mcp_ownership.lock().await;
-        let exact_framework = exact_plugin_framework_receipts(
-            &previous_framework,
-            &previous_mcp_ownership,
-            &ownership_guard,
-        );
-        unload_agent_components(&mut primary, &exact_framework, &previous_prepared).await;
+        if let Some(receipt) = previous_framework_receipt.as_ref() {
+            self.integrator.rollback(&mut primary, receipt).await;
+        }
+        unload_application_components(&mut primary, &previous_prepared).await;
         primary
             .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, None)
             .await;
@@ -1067,6 +1130,33 @@ impl PluginRuntimeService {
         self.lsp.binding().await.project_root
     }
 
+    /// Opaque identity of the prepared framework generation currently exposed
+    /// by this target.
+    pub(crate) async fn prepared_generation_identity(&self) -> String {
+        let state = self.state.lock().await;
+        state
+            .framework_generation
+            .as_ref()
+            .map(|generation| generation.identity().to_string())
+            .unwrap_or_else(|| format!("unprepared:{}", state.generation))
+    }
+
+    pub(crate) async fn mcp_reconcile_target(
+        &self,
+    ) -> crate::mcp_config_runtime::McpReconcileTarget {
+        let pool = self
+            .agent_pool
+            .read()
+            .await
+            .as_ref()
+            .and_then(Weak::upgrade);
+        crate::mcp_config_runtime::McpReconcileTarget::new(
+            self.agent_handle.clone(),
+            Arc::clone(&self.mcp_ownership),
+            pool,
+        )
+    }
+
     pub async fn lsp_configured_languages(&self) -> Vec<String> {
         let _state = self.state.lock().await;
         let manager = self.lsp.manager.read().await;
@@ -1132,6 +1222,43 @@ impl PluginRuntimeService {
         .await
     }
 
+    /// Rebuild only the LSP manager for this exact target. Config-file changes
+    /// must not rescan plugins or republish Skills, MCP, Subagents and monitors.
+    pub(crate) async fn reload_lsp_generation(
+        self: &Arc<Self>,
+        project_root: PathBuf,
+    ) -> anyhow::Result<usize> {
+        self.run_owned_mutation(move |service| async move {
+            let state = service.state.lock().await;
+            if state.shut_down {
+                return Err(anyhow::anyhow!("plugin runtime is shut down"));
+            }
+            let current = service.lsp.binding().await;
+            if current.project_root != project_root {
+                anyhow::bail!(
+                    "LSP target root changed from '{}' to '{}'",
+                    current.project_root.display(),
+                    project_root.display()
+                );
+            }
+            let binding = PluginLspBinding {
+                base_config: PluginLspRuntime::config_for_workspace(&project_root),
+                project_root,
+            };
+            let replacement = service.prepare_lsp(&state.prepared, &binding).await?;
+            let configured = replacement.configured_languages().len();
+            let mut previous = {
+                let mut current = service.lsp.manager.write().await;
+                std::mem::replace(&mut *current, replacement)
+            };
+            service.lsp.publish_binding(binding).await;
+            previous.shutdown_all().await;
+            drop(state);
+            Ok(configured)
+        })
+        .await
+    }
+
     pub async fn bind_scheduler(
         self: &Arc<Self>,
         scheduler: Arc<SchedulerRunner>,
@@ -1177,7 +1304,9 @@ impl PluginRuntimeService {
 
         errors.extend(state.lifecycle.shutdown());
         errors.extend(settlement_error.map(|error| error.to_string()));
-        let previous_framework = std::mem::take(&mut state.framework_components);
+        state.framework_components.clear();
+        state.framework_generation.take();
+        let previous_framework_receipt = state.framework_receipt.take();
         let previous_mcp_ownership = std::mem::take(&mut state.mcp_ownership);
         let previous_prepared = std::mem::take(&mut state.prepared);
         if !previous_prepared.monitors.is_empty()
@@ -1199,17 +1328,14 @@ impl PluginRuntimeService {
         }
 
         let mut ownership_guard = self.mcp_ownership.lock().await;
-        let exact_framework = exact_plugin_framework_receipts(
-            &previous_framework,
-            &previous_mcp_ownership,
-            &ownership_guard,
-        );
+        let integrator = self.integrator.clone();
         self.agent_handle
             .write_async(|agent| {
                 Box::pin(async move {
-                    // Pass only plugin-owned receipts. Global user MCP
-                    // reconciliation stays with the independent MCP owner.
-                    unload_agent_components(agent, &exact_framework, &previous_prepared).await;
+                    if let Some(receipt) = previous_framework_receipt.as_ref() {
+                        integrator.rollback(agent, receipt).await;
+                    }
+                    unload_application_components(agent, &previous_prepared).await;
                     agent
                         .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, None)
                         .await;
@@ -1619,7 +1745,8 @@ impl PluginRuntimeService {
             primary.skill_descriptors(),
             state.prepared.agents.clone(),
             instructions,
-        );
+        )
+        .with_framework_generation(state.framework_generation.clone());
         if let Some(publication) = pool_publication.as_mut()
             && let Err(error) = publication.prepare(generation).await
         {
@@ -1768,9 +1895,8 @@ impl PluginRuntimeService {
             .generation
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("plugin generation revision exhausted"))?;
-        candidate
-            .resolve_enabled_dependencies()
-            .map_err(|error| anyhow::anyhow!("Plugin dependency validation failed: {error}"))?;
+        let framework_generation =
+            require_applicable_generation(self.integrator.prepare(&mut candidate).await)?;
         let candidate_plugins = candidate
             .list_enabled()
             .into_iter()
@@ -1782,9 +1908,9 @@ impl PluginRuntimeService {
             .into_iter()
             .map(|entry| entry.manifest.name.clone())
             .collect::<Vec<_>>();
-        let prepared = prepare_application_components(&mut candidate)
+        let prepared = prepare_application_components(&framework_generation, &self.target_scope)
             .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
-        let candidate_mcp_declarations = plugin_mcp_declarations(&mut candidate)?;
+        let candidate_mcp_declarations = plugin_mcp_declarations(&framework_generation)?;
         self.validate_agent_collisions(state, &prepared).await?;
         let mut replacement_lsp = self.prepare_lsp(&prepared, binding).await?;
 
@@ -1854,6 +1980,8 @@ impl PluginRuntimeService {
             self.registry_for(binding.project_root.clone()),
         );
         let previous_framework = std::mem::take(&mut state.framework_components);
+        let previous_framework_generation = state.framework_generation.take();
+        let previous_framework_receipt = state.framework_receipt.take();
         let previous_mcp_ownership = std::mem::take(&mut state.mcp_ownership);
         let previous_prepared = std::mem::take(&mut state.prepared);
         let apply = self
@@ -1861,9 +1989,12 @@ impl PluginRuntimeService {
                 &mut primary,
                 previous_registry,
                 previous_framework,
+                previous_framework_generation,
+                previous_framework_receipt,
                 previous_mcp_ownership,
                 previous_prepared,
                 candidate,
+                Some(framework_generation),
                 candidate_mcp_declarations,
                 prepared,
             )
@@ -1874,6 +2005,8 @@ impl PluginRuntimeService {
             Err(mut failed) => {
                 state.registry = failed.registry;
                 state.framework_components = failed.framework_components;
+                state.framework_generation = failed.framework_generation;
+                state.framework_receipt = failed.framework_receipt;
                 state.mcp_ownership = failed.mcp_ownership;
                 state.prepared = failed.prepared;
                 if let Some(scheduler) = scheduler.as_ref()
@@ -1906,20 +2039,29 @@ impl PluginRuntimeService {
                 state.active_output_style.as_deref(),
                 &applied.prepared,
             ),
-        );
+        )
+        .with_framework_generation(applied.framework_generation.clone());
         if let Some(publication) = pool_publication.as_mut()
             && let Err(pool_error) = publication.prepare(candidate_generation).await
         {
             let candidate_monitors = applied.prepared.monitors.clone();
             let previous_monitors = applied.previous_prepared.monitors.clone();
+            let candidate_framework = applied
+                .wiring
+                .as_ref()
+                .map(|receipt| receipt.components_by_plugin.clone())
+                .unwrap_or_default();
             let rollback = self
                 .replace_agent_components(
                     &mut primary,
                     applied.registry,
-                    applied.wiring.components_by_plugin,
+                    candidate_framework,
+                    applied.framework_generation,
+                    applied.wiring,
                     applied.mcp_ownership,
                     applied.prepared,
                     applied.previous_registry,
+                    applied.previous_framework_generation,
                     applied.previous_mcp_declarations,
                     applied.previous_prepared,
                 )
@@ -1940,7 +2082,13 @@ impl PluginRuntimeService {
                         errors.push(format!("rollback plugin monitors failed: {error}"));
                     }
                     state.registry = restored.registry;
-                    state.framework_components = restored.wiring.components_by_plugin;
+                    state.framework_components = restored
+                        .wiring
+                        .as_ref()
+                        .map(|receipt| receipt.components_by_plugin.clone())
+                        .unwrap_or_default();
+                    state.framework_generation = restored.framework_generation;
+                    state.framework_receipt = restored.wiring;
                     state.mcp_ownership = restored.mcp_ownership;
                     state.prepared = restored.prepared;
                     errors.extend(
@@ -1956,6 +2104,8 @@ impl PluginRuntimeService {
                     ));
                     state.registry = failed.registry;
                     state.framework_components = failed.framework_components;
+                    state.framework_generation = failed.framework_generation;
+                    state.framework_receipt = failed.framework_receipt;
                     state.mcp_ownership = failed.mcp_ownership;
                     state.prepared = failed.prepared;
                     errors.extend(
@@ -1986,14 +2136,22 @@ impl PluginRuntimeService {
 
             let candidate_monitors = applied.prepared.monitors.clone();
             let previous_monitors = applied.previous_prepared.monitors.clone();
+            let candidate_framework = applied
+                .wiring
+                .as_ref()
+                .map(|receipt| receipt.components_by_plugin.clone())
+                .unwrap_or_default();
             let rollback = self
                 .replace_agent_components(
                     &mut primary,
                     applied.registry,
-                    applied.wiring.components_by_plugin,
+                    candidate_framework,
+                    applied.framework_generation,
+                    applied.wiring,
                     applied.mcp_ownership,
                     applied.prepared,
                     applied.previous_registry,
+                    applied.previous_framework_generation,
                     applied.previous_mcp_declarations,
                     applied.previous_prepared,
                 )
@@ -2016,7 +2174,13 @@ impl PluginRuntimeService {
                         candidate_lsp.shutdown_all().await;
                     }
                     state.registry = restored.registry;
-                    state.framework_components = restored.wiring.components_by_plugin;
+                    state.framework_components = restored
+                        .wiring
+                        .as_ref()
+                        .map(|receipt| receipt.components_by_plugin.clone())
+                        .unwrap_or_default();
+                    state.framework_generation = restored.framework_generation;
+                    state.framework_receipt = restored.wiring;
                     state.mcp_ownership = restored.mcp_ownership;
                     state.prepared = restored.prepared;
                     errors.extend(
@@ -2033,6 +2197,8 @@ impl PluginRuntimeService {
                     previous_lsp.shutdown_all().await;
                     state.registry = failed.registry;
                     state.framework_components = failed.framework_components;
+                    state.framework_generation = failed.framework_generation;
+                    state.framework_receipt = failed.framework_receipt;
                     state.mcp_ownership = failed.mcp_ownership;
                     state.prepared = failed.prepared;
                     errors.extend(
@@ -2060,7 +2226,13 @@ impl PluginRuntimeService {
         let active_style = state.active_output_style.clone();
         let active_theme = state.active_theme.clone();
         state.registry = applied.registry;
-        state.framework_components = applied.wiring.components_by_plugin.clone();
+        state.framework_components = applied
+            .wiring
+            .as_ref()
+            .map(|receipt| receipt.components_by_plugin.clone())
+            .unwrap_or_default();
+        state.framework_generation = applied.framework_generation;
+        state.framework_receipt = applied.wiring;
         state.mcp_ownership = applied.mcp_ownership;
         state.prepared = applied.prepared;
         state.generation = candidate_revision;
@@ -2100,8 +2272,13 @@ impl PluginRuntimeService {
 
         let total = state.registry.count();
         let enabled = state.registry.list_enabled().len();
-        let mut summary =
-            ReloadSummary::from_components(total, enabled, &applied.wiring, &state.prepared);
+        let mut summary = ReloadSummary::from_components(
+            total,
+            enabled,
+            state.framework_receipt.as_ref(),
+            state.framework_generation.as_deref(),
+            &state.prepared,
+        );
         if let Err(error) = persist_preferences(
             &self.preferences_file,
             &PluginPreferences {
@@ -2132,22 +2309,31 @@ impl PluginRuntimeService {
     async fn replace_agent_components(
         &self,
         agent: &mut echo_agent::agent::react::ReactAgent,
-        mut previous_registry: PluginRegistry,
+        previous_registry: PluginRegistry,
         previous_framework: HashMap<String, WiredPluginComponents>,
+        previous_framework_generation: Option<Arc<PreparedPluginSet>>,
+        previous_framework_receipt: Option<PluginWiringResult>,
         previous_mcp_ownership: PluginMcpOwnership,
         previous_prepared: PreparedApplicationComponents,
-        mut candidate: PluginRegistry,
+        candidate: PluginRegistry,
+        candidate_framework_generation: Option<Arc<PreparedPluginSet>>,
         candidate_mcp_declarations: PluginMcpDeclarations,
         candidate_prepared: PreparedApplicationComponents,
     ) -> Result<AppliedAgentComponents, FailedAgentComponents> {
         let candidate_monitors = candidate_prepared.monitors.clone();
-        let previous_mcp_declarations = match plugin_mcp_declarations(&mut previous_registry) {
-            Ok(declarations) => declarations,
+        let previous_mcp_declarations = match previous_framework_generation
+            .as_deref()
+            .map(plugin_mcp_declarations)
+            .transpose()
+        {
+            Ok(declarations) => declarations.unwrap_or_default(),
             Err(error) => {
                 return Err(FailedAgentComponents {
-                    error: format!("Failed to inspect previous plugin MCP receipts: {error}"),
+                    error: format!("Failed to inspect prepared plugin MCP receipts: {error}"),
                     registry: previous_registry,
                     framework_components: previous_framework,
+                    framework_generation: previous_framework_generation,
+                    framework_receipt: previous_framework_receipt,
                     mcp_ownership: previous_mcp_ownership,
                     prepared: previous_prepared,
                     candidate_monitors,
@@ -2164,82 +2350,133 @@ impl PluginRuntimeService {
                 error,
                 registry: previous_registry,
                 framework_components: previous_framework,
+                framework_generation: previous_framework_generation,
+                framework_receipt: previous_framework_receipt,
                 mcp_ownership: previous_mcp_ownership,
                 prepared: previous_prepared,
                 candidate_monitors,
             });
         }
 
-        let exact_previous = exact_plugin_framework_receipts(
-            &previous_framework,
-            &previous_mcp_ownership,
-            &ownership_guard,
-        );
-        let previous_prepared_for_unload = previous_prepared.clone();
-        unload_agent_components(agent, &exact_previous, &previous_prepared_for_unload).await;
+        if let Some(receipt) = previous_framework_receipt.as_ref() {
+            self.integrator.rollback(agent, receipt).await;
+        }
+        unload_application_components(agent, &previous_prepared).await;
         release_plugin_mcp_claims(&mut ownership_guard, &previous_mcp_ownership);
-        let candidate_mcp_ownership =
-            match claim_plugin_mcp_names(&mut ownership_guard, &candidate_mcp_declarations) {
-                Ok(ownership) => ownership,
-                Err(error) => {
-                    return Err(FailedAgentComponents {
-                        error,
-                        registry: previous_registry,
-                        framework_components: HashMap::new(),
-                        mcp_ownership: HashMap::new(),
-                        prepared: PreparedApplicationComponents::default(),
-                        candidate_monitors,
-                    });
+        let candidate_mcp_ownership = match claim_plugin_mcp_names(
+            &mut ownership_guard,
+            &candidate_mcp_declarations,
+        ) {
+            Ok(ownership) => ownership,
+            Err(error) => {
+                let restored_mcp_ownership = match claim_plugin_mcp_names(
+                    &mut ownership_guard,
+                    &previous_mcp_declarations,
+                ) {
+                    Ok(ownership) => ownership,
+                    Err(restore_error) => {
+                        return Err(FailedAgentComponents {
+                            error: format!(
+                                "{error}; rollback MCP ownership failed: {restore_error}"
+                            ),
+                            registry: previous_registry,
+                            framework_components: HashMap::new(),
+                            framework_generation: None,
+                            framework_receipt: None,
+                            mcp_ownership: HashMap::new(),
+                            prepared: PreparedApplicationComponents::default(),
+                            candidate_monitors,
+                        });
+                    }
+                };
+                let restored = match previous_framework_generation.as_deref() {
+                    Some(generation) => {
+                        match self.integrator.wire_prepared(agent, generation).await {
+                            Ok(receipt) => Some(receipt),
+                            Err(restore_error) => {
+                                return Err(FailedAgentComponents {
+                                    error: format!(
+                                        "{error}; rollback framework wiring failed: {restore_error}"
+                                    ),
+                                    registry: previous_registry,
+                                    framework_components: HashMap::new(),
+                                    framework_generation: None,
+                                    framework_receipt: None,
+                                    mcp_ownership: restored_mcp_ownership,
+                                    prepared: PreparedApplicationComponents::default(),
+                                    candidate_monitors,
+                                });
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                let restore_agent_error = register_plugin_agents(agent, &previous_prepared.agents)
+                    .await
+                    .err();
+                crate::runtime::configure_intent_router(agent);
+                let mut errors = vec![error];
+                if let Some(error) = restore_agent_error {
+                    errors.push(format!("rollback Subagent wiring failed: {error}"));
                 }
-            };
+                return Err(FailedAgentComponents {
+                    error: errors.join("; "),
+                    registry: previous_registry,
+                    framework_components: restored
+                        .as_ref()
+                        .map(|receipt| receipt.components_by_plugin.clone())
+                        .unwrap_or_default(),
+                    framework_generation: previous_framework_generation,
+                    framework_receipt: restored,
+                    mcp_ownership: restored_mcp_ownership,
+                    prepared: previous_prepared,
+                    candidate_monitors,
+                });
+            }
+        };
 
-        let candidate_prepared_for_wiring = candidate_prepared.clone();
-        let wiring = PluginIntegrator::new()
-            .wire_all(agent, &mut candidate)
-            .await;
-        let candidate_outcome = if !wiring.errors.is_empty() {
-            Err((
-                format!("Plugin wiring failed: {}", wiring.errors.join("; ")),
-                candidate,
-                wiring,
-            ))
-        } else if let Err(error) =
-            register_plugin_agents(agent, &candidate_prepared_for_wiring.agents).await
-        {
-            unload_agent_components(
-                agent,
-                &wiring.components_by_plugin,
-                &candidate_prepared_for_wiring,
-            )
-            .await;
-            Err((
-                format!("Plugin Subagent registration failed: {error}"),
-                candidate,
-                wiring,
-            ))
-        } else {
-            crate::runtime::configure_intent_router(agent);
-            Ok((candidate, wiring))
+        let wiring = match candidate_framework_generation.as_deref() {
+            Some(generation) => self
+                .integrator
+                .wire_prepared(agent, generation)
+                .await
+                .map(Some)
+                .map_err(|error| error.to_string()),
+            None => Ok(None),
+        };
+        let candidate_outcome = match wiring {
+            Ok(wiring) => match register_plugin_agents(agent, &candidate_prepared.agents).await {
+                Ok(_) => {
+                    crate::runtime::configure_intent_router(agent);
+                    Ok((candidate, wiring))
+                }
+                Err(error) => {
+                    if let Some(receipt) = wiring.as_ref() {
+                        self.integrator.rollback(agent, receipt).await;
+                    }
+                    unload_application_components(agent, &candidate_prepared).await;
+                    Err((
+                        format!("Plugin Subagent registration failed: {error}"),
+                        candidate,
+                    ))
+                }
+            },
+            Err(error) => Err((format!("Plugin wiring failed: {error}"), candidate)),
         };
 
         match candidate_outcome {
-            Ok((registry, wiring)) => {
-                let candidate_mcp_ownership = retain_connected_plugin_mcp_claims(
-                    &mut ownership_guard,
-                    &wiring,
-                    candidate_mcp_ownership,
-                );
-                Ok(AppliedAgentComponents {
-                    registry,
-                    wiring,
-                    mcp_ownership: candidate_mcp_ownership,
-                    prepared: candidate_prepared,
-                    previous_registry,
-                    previous_mcp_declarations,
-                    previous_prepared,
-                })
-            }
-            Err((error, _candidate_registry, _candidate_wiring)) => {
+            Ok((registry, wiring)) => Ok(AppliedAgentComponents {
+                registry,
+                wiring,
+                framework_generation: candidate_framework_generation,
+                mcp_ownership: candidate_mcp_ownership,
+                prepared: candidate_prepared,
+                previous_registry,
+                previous_framework_generation,
+                previous_mcp_declarations,
+                previous_prepared,
+            }),
+            Err((error, _candidate_registry)) => {
                 release_plugin_mcp_claims(&mut ownership_guard, &candidate_mcp_ownership);
                 let restored_mcp_ownership = match claim_plugin_mcp_names(
                     &mut ownership_guard,
@@ -2253,44 +2490,48 @@ impl PluginRuntimeService {
                             ),
                             registry: previous_registry,
                             framework_components: HashMap::new(),
+                            framework_generation: None,
+                            framework_receipt: None,
                             mcp_ownership: HashMap::new(),
                             prepared: PreparedApplicationComponents::default(),
                             candidate_monitors,
                         });
                     }
                 };
-                let previous_prepared_for_restore = previous_prepared.clone();
-                let restored = PluginIntegrator::new()
-                    .wire_all(agent, &mut previous_registry)
-                    .await;
-                let restore_agent_error = if restored.errors.is_empty() {
-                    register_plugin_agents(agent, &previous_prepared_for_restore.agents)
+                let restored = match previous_framework_generation.as_deref() {
+                    Some(generation) => self
+                        .integrator
+                        .wire_prepared(agent, generation)
                         .await
-                        .err()
-                } else {
-                    None
+                        .map(Some)
+                        .map_err(|error| error.to_string()),
+                    None => Ok(None),
                 };
+                let restore_agent_error = register_plugin_agents(agent, &previous_prepared.agents)
+                    .await
+                    .err();
                 crate::runtime::configure_intent_router(agent);
                 let registry = previous_registry;
                 let mut errors = vec![error];
-                if !restored.errors.is_empty() {
-                    errors.push(format!(
-                        "rollback framework wiring failed: {}",
-                        restored.errors.join("; ")
-                    ));
-                }
+                let restored = match restored {
+                    Ok(restored) => restored,
+                    Err(error) => {
+                        errors.push(format!("rollback framework wiring failed: {error}"));
+                        None
+                    }
+                };
                 if let Some(error) = restore_agent_error {
                     errors.push(format!("rollback Subagent wiring failed: {error}"));
                 }
-                let restored_mcp_ownership = retain_connected_plugin_mcp_claims(
-                    &mut ownership_guard,
-                    &restored,
-                    restored_mcp_ownership,
-                );
                 Err(FailedAgentComponents {
                     error: errors.join("; "),
                     registry,
-                    framework_components: restored.components_by_plugin,
+                    framework_components: restored
+                        .as_ref()
+                        .map(|receipt| receipt.components_by_plugin.clone())
+                        .unwrap_or_default(),
+                    framework_generation: previous_framework_generation,
+                    framework_receipt: restored,
                     mcp_ownership: restored_mcp_ownership,
                     prepared: previous_prepared,
                     candidate_monitors,
@@ -2551,10 +2792,12 @@ fn persist_preferences(path: &Path, preferences: &PluginPreferences) -> anyhow::
 
 struct AppliedAgentComponents {
     registry: PluginRegistry,
-    wiring: PluginWiringResult,
+    wiring: Option<PluginWiringResult>,
+    framework_generation: Option<Arc<PreparedPluginSet>>,
     mcp_ownership: PluginMcpOwnership,
     prepared: PreparedApplicationComponents,
     previous_registry: PluginRegistry,
+    previous_framework_generation: Option<Arc<PreparedPluginSet>>,
     previous_mcp_declarations: PluginMcpDeclarations,
     previous_prepared: PreparedApplicationComponents,
 }
@@ -2563,6 +2806,8 @@ struct FailedAgentComponents {
     error: String,
     registry: PluginRegistry,
     framework_components: HashMap<String, WiredPluginComponents>,
+    framework_generation: Option<Arc<PreparedPluginSet>>,
+    framework_receipt: Option<PluginWiringResult>,
     mcp_ownership: PluginMcpOwnership,
     prepared: PreparedApplicationComponents,
     candidate_monitors: Vec<CronTask>,
@@ -2615,50 +2860,66 @@ fn agent_name(agent: &crate::plugin_components::PreparedPluginAgent) -> String {
     agent.name().to_string()
 }
 
-fn plugin_mcp_declarations(registry: &mut PluginRegistry) -> anyhow::Result<PluginMcpDeclarations> {
-    let plugin_ids = registry
-        .list_enabled()
-        .into_iter()
-        .map(|entry| entry.manifest.name.clone())
-        .collect::<Vec<_>>();
+fn plugin_mcp_declarations(
+    generation: &PreparedPluginSet,
+) -> anyhow::Result<PluginMcpDeclarations> {
     let mut declarations = HashMap::new();
     let mut declared_by = HashMap::<String, String>::new();
 
-    for plugin_id in plugin_ids {
-        let variables = registry
-            .variables_for(&plugin_id)
-            .map_err(|error| anyhow::anyhow!(error))?;
-        let resolved = registry
-            .resolve_components(&plugin_id)
-            .map_err(|error| anyhow::anyhow!(error))?;
-        let Some(config_file) = resolved.mcp_config_file else {
+    for plugin in generation.plugins() {
+        let plugin_id = plugin.id();
+        let Some(config) = plugin.mcp() else {
             continue;
         };
-        let content = std::fs::read_to_string(&config_file).map_err(|error| {
-            anyhow::anyhow!(
-                "Plugin '{plugin_id}' MCP config {}: {error}",
-                config_file.display()
-            )
-        })?;
-        let config = McpConfigFile::parse(&variables.substitute(&content)).map_err(|error| {
-            anyhow::anyhow!(
-                "Plugin '{plugin_id}' MCP config {}: {error}",
-                config_file.display()
-            )
-        })?;
         let mut names = config.mcp_servers.keys().cloned().collect::<Vec<_>>();
         names.sort();
         for name in &names {
-            if let Some(previous) = declared_by.insert(name.clone(), plugin_id.clone()) {
+            if let Some(previous) = declared_by.insert(name.clone(), plugin_id.to_string()) {
                 return Err(anyhow::anyhow!(
                     "Plugin MCP server name '{name}' is declared by both '{previous}' and '{plugin_id}'"
                 ));
             }
         }
-        declarations.insert(plugin_id, names);
+        declarations.insert(plugin_id.to_string(), names);
     }
     Ok(declarations)
 }
+
+fn require_applicable_generation(
+    generation: Arc<PreparedPluginSet>,
+) -> anyhow::Result<Arc<PreparedPluginSet>> {
+    if generation.is_applicable() {
+        return Ok(generation);
+    }
+    Err(anyhow::Error::new(PluginPreparationRejected {
+        generation: generation.generation(),
+        diagnostics: generation.diagnostics().to_vec(),
+    }))
+}
+
+#[derive(Debug)]
+struct PluginPreparationRejected {
+    generation: u64,
+    diagnostics: Vec<PluginPreparationDiagnostic>,
+}
+
+impl std::fmt::Display for PluginPreparationRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let diagnostics = self
+            .diagnostics
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        write!(
+            formatter,
+            "prepared plugin generation {} is not applicable: {}",
+            self.generation, diagnostics
+        )
+    }
+}
+
+impl std::error::Error for PluginPreparationRejected {}
 
 fn validate_plugin_mcp_claims(
     guard: &McpNameOwnershipGuard,
@@ -2709,6 +2970,7 @@ fn claim_plugin_mcp_names(
     Ok(claimed)
 }
 
+#[cfg(test)]
 fn exact_plugin_framework_receipts(
     framework: &HashMap<String, WiredPluginComponents>,
     ownership: &PluginMcpOwnership,
@@ -2727,31 +2989,6 @@ fn exact_plugin_framework_receipts(
             (plugin_id.clone(), exact)
         })
         .collect()
-}
-
-fn retain_connected_plugin_mcp_claims(
-    guard: &mut McpNameOwnershipGuard,
-    wiring: &PluginWiringResult,
-    mut ownership: PluginMcpOwnership,
-) -> PluginMcpOwnership {
-    for (plugin_id, tokens) in &mut ownership {
-        let connected = wiring
-            .components_by_plugin
-            .get(plugin_id)
-            .map(|components| components.mcp_servers.as_slice())
-            .unwrap_or_default();
-        let released = tokens
-            .iter()
-            .filter(|(name, _)| !connected.contains(name))
-            .map(|(name, token)| (name.clone(), *token))
-            .collect::<Vec<_>>();
-        for (name, token) in released {
-            guard.release_plugin(plugin_id, &name, token);
-            tokens.remove(&name);
-        }
-    }
-    ownership.retain(|_, tokens| !tokens.is_empty());
-    ownership
 }
 
 fn workspace_scope_plugin_ids(registry: &PluginRegistry) -> Vec<String> {
@@ -2782,15 +3019,13 @@ fn retire_plugin_lifecycles(
     (errors, failed_plugin_ids)
 }
 
-async fn unload_agent_components(
+async fn unload_application_components(
     agent: &mut echo_agent::agent::react::ReactAgent,
-    framework: &HashMap<String, WiredPluginComponents>,
     application: &PreparedApplicationComponents,
 ) {
     for plugin_agent in &application.agents {
         let _ = agent.unregister_subagent(plugin_agent.name()).await;
     }
-    echo_agent::plugin::PluginIntegrator::unwire(agent, framework).await;
 }
 
 async fn replace_plugin_monitors(
@@ -3168,13 +3403,40 @@ done
             .working_dir(root)
             .build()
             .map_err(|error| error.to_string())?;
-        Ok(PluginRuntimeService::new_for_test(
+        PluginRuntimeService::new_for_test(
             AgentHandle::new(agent),
             root.to_path_buf(),
             root.join("registry.json"),
             root.join("plugin-data"),
         )
-        .await)
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn constructor_rejects_an_invalid_initial_generation() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
+        std::fs::write(plugin.join("agents/example.md"), "not valid frontmatter")
+            .map_err(|error| error.to_string())?;
+        let agent = ReactAgentBuilder::new()
+            .llm_client(Arc::new(MockLlmClient::new()))
+            .system_prompt("constructor rejection test")
+            .working_dir(temp.path())
+            .build()
+            .map(AgentHandle::new)
+            .map_err(|error| error.to_string())?;
+
+        let result = PluginRuntimeService::new_for_test(
+            agent,
+            temp.path().to_path_buf(),
+            temp.path().join("registry.json"),
+            temp.path().join("plugin-data"),
+        )
+        .await;
+
+        assert!(result.is_err());
+        Ok(())
     }
 
     async fn bind_test_pool(runtime: &Arc<PluginRuntimeService>) -> Result<Arc<AgentPool>, String> {
@@ -3297,12 +3559,13 @@ done
             PluginLspRuntime::config_for_workspace(root),
             root.to_path_buf(),
         );
-        Ok(PluginRuntimeService::new(
+        PluginRuntimeService::new(
             AgentHandle::new(agent),
             lsp,
             McpNameOwnershipRegistry::new(Vec::<String>::new()),
         )
-        .await)
+        .await
+        .map_err(|error| error.to_string())
     }
 
     async fn wait_until_mutation_holds_state(runtime: &PluginRuntimeService) -> Result<(), String> {
@@ -4284,7 +4547,17 @@ done
             .await
             .err()
             .ok_or_else(|| "malformed hook reload unexpectedly succeeded".to_string())?;
-        assert!(error.to_string().contains("hooks YAML parse"));
+        let rejection = error
+            .downcast_ref::<PluginPreparationRejected>()
+            .ok_or_else(|| format!("reload did not preserve prepared diagnostics: {error}"))?;
+        assert!(rejection.diagnostics.iter().any(|diagnostic| {
+            diagnostic.plugin_id() == Some("runtime-fixture")
+                && diagnostic.component() == "hooks"
+                && diagnostic.severity() == echo_agent::plugin::PluginDiagnosticSeverity::Error
+                && diagnostic
+                    .path()
+                    .is_some_and(|path| path.ends_with("hooks/hooks.yaml"))
+        }));
         assert!(
             registry.contains("runtime-fixture-specialist").await,
             "reload rollback did not restore the previous Subagent: {error}"

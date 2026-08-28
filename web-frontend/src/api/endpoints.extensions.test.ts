@@ -208,6 +208,20 @@ describe('typed Extension IPC adapters', () => {
         projection: {
           plugin_id: 'formatter',
           plugin: null,
+          status: 'degraded',
+          target_receipts: {
+            items: [
+              {
+                target: 'workspace-a',
+                workspace_generation: 'workspace-generation-a',
+                previous_prepared_generation: 'prepared-1',
+                candidate_prepared_generation: 'prepared-2',
+                status: 'degraded',
+                diagnostics: { items: ['hook fanout failed'], omitted: 0 },
+              },
+            ],
+            omitted: 0,
+          },
           summary: {
             total: 1,
             enabled: 1,
@@ -234,6 +248,18 @@ describe('typed Extension IPC adapters', () => {
       wiring_ok: false,
       errors: ['hook fanout failed'],
       errors_omitted: 0,
+      settlement_status: 'degraded',
+      target_receipts: {
+        items: [
+          expect.objectContaining({
+            target: 'workspace-a',
+            previous_prepared_generation: 'prepared-1',
+            candidate_prepared_generation: 'prepared-2',
+            status: 'degraded',
+          }),
+        ],
+        omitted: 0,
+      },
       meta: { ...meta, status: 'degraded' },
       projection: { plugin_id: 'formatter' },
     });

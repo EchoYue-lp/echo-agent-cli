@@ -9,7 +9,7 @@ use echo_agent::agent::subagent::{
 };
 use echo_agent::agent::{Agent, ReactAgent, ReactAgentBuilder};
 use echo_agent::lsp::LspConfig;
-use echo_agent::plugin::{PluginRegistry, PluginVariables, ResolvedComponents};
+use echo_agent::plugin::{PluginVariables, PreparedPluginSet, ResolvedComponents};
 use serde::{Deserialize, Serialize};
 
 use crate::scheduler::{CronTask, CronTaskStatus};
@@ -101,11 +101,9 @@ fn default_true() -> bool {
 }
 
 pub(crate) fn prepare_application_components(
-    registry: &mut PluginRegistry,
+    generation: &PreparedPluginSet,
+    target_scope: &str,
 ) -> Result<PreparedApplicationComponents, Vec<String>> {
-    let ordered = registry
-        .resolve_enabled_dependencies()
-        .map_err(|error| vec![error])?;
     let mut prepared = PreparedApplicationComponents::default();
     let mut agent_names = HashSet::new();
     let mut lsp_languages = HashSet::new();
@@ -114,45 +112,25 @@ pub(crate) fn prepare_application_components(
     let mut output_style_names = HashSet::new();
     let mut errors = Vec::new();
 
-    for plugin in ordered {
-        let root = match registry.get(&plugin) {
-            Some(entry) => entry.root.clone(),
-            None => {
-                errors.push(format!("Plugin '{plugin}' disappeared during resolution"));
-                continue;
-            }
-        };
-        let variables = match registry.variables_for(&plugin) {
-            Ok(variables) => variables,
-            Err(error) => {
-                errors.push(error);
-                continue;
-            }
-        };
-        let resolved = match registry.resolve_components(&plugin) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                errors.push(error);
-                continue;
-            }
-        };
-        let eko_components = match resolve_eko_components(&root) {
+    for plugin in generation.plugins() {
+        let plugin_id = plugin.id();
+        let root = plugin.root();
+        let variables = plugin.variables();
+        let eko_components = match resolve_eko_components(root) {
             Ok(components) => components,
             Err(error) => {
-                errors.push(format!("Plugin '{plugin}' EKO components: {error}"));
+                errors.push(format!("Plugin '{plugin_id}' EKO components: {error}"));
                 continue;
             }
         };
-        if let Some(path) = resolved.hooks_file.as_ref() {
-            validate_hooks_file(&plugin, path, &variables, &mut errors);
-        }
-        for path in resolved.agent_files {
-            match read_plugin_agent_with_variables(&plugin, &path, Some(&variables)) {
+        for document in plugin.subagent_documents() {
+            match read_plugin_agent_document(plugin_id, document.source_path(), document.contents())
+            {
                 Ok(agent) => {
                     let name = agent.definition.name.clone();
                     if !agent_names.insert(name.clone()) {
                         errors.push(format!(
-                            "Plugin '{plugin}' declares duplicate Subagent '{name}'"
+                            "Plugin '{plugin_id}' declares duplicate Subagent '{name}'"
                         ));
                     } else {
                         prepared.agents.push(agent);
@@ -162,10 +140,8 @@ pub(crate) fn prepare_application_components(
             }
         }
 
-        if let Some(path) = resolved.lsp_config_file {
-            match read_component_text(&path, Some(&variables))
-                .and_then(|content| LspConfig::from_yaml(&content))
-            {
+        if let Some(document) = plugin.lsp_document() {
+            match LspConfig::from_yaml(document.contents()) {
                 Ok(config) => {
                     let duplicate = config
                         .servers
@@ -173,27 +149,28 @@ pub(crate) fn prepare_application_components(
                         .find(|language| lsp_languages.contains(*language));
                     if let Some(language) = duplicate {
                         errors.push(format!(
-                            "Plugin '{plugin}' declares duplicate LSP language '{language}'"
+                            "Plugin '{plugin_id}' declares duplicate LSP language '{language}'"
                         ));
                     } else {
                         lsp_languages.extend(config.servers.keys().cloned());
-                        prepared.lsp_configs.push((plugin.clone(), config));
+                        prepared.lsp_configs.push((plugin_id.to_string(), config));
                     }
                 }
                 Err(error) => errors.push(format!(
-                    "Plugin '{plugin}' LSP config '{}': {error}",
-                    path.display()
+                    "Plugin '{plugin_id}' LSP config '{}': {error}",
+                    document.source_path().display()
                 )),
             }
         }
 
         if let Some(path) = eko_components.monitors_file {
-            match read_monitors_with_variables(&plugin, &path, Some(&variables)) {
+            match read_monitors_with_variables(plugin_id, &path, Some(variables)) {
                 Ok(monitors) => {
                     for monitor in monitors {
+                        let monitor = scope_monitor(target_scope, monitor);
                         if !monitor_ids.insert(monitor.id.clone()) {
                             errors.push(format!(
-                                "Plugin '{plugin}' declares duplicate monitor id '{}'",
+                                "Plugin '{plugin_id}' declares duplicate monitor id '{}'",
                                 monitor.id
                             ));
                         } else {
@@ -206,11 +183,11 @@ pub(crate) fn prepare_application_components(
         }
 
         for path in eko_components.theme_files {
-            match read_theme_with_variables(&plugin, &path, Some(&variables)) {
+            match read_theme_with_variables(plugin_id, &path, Some(variables)) {
                 Ok(theme) => {
                     if !theme_names.insert(theme.name.clone()) {
                         errors.push(format!(
-                            "Plugin '{plugin}' declares duplicate theme '{}'",
+                            "Plugin '{plugin_id}' declares duplicate theme '{}'",
                             theme.name
                         ));
                     } else {
@@ -222,11 +199,11 @@ pub(crate) fn prepare_application_components(
         }
 
         for path in eko_components.output_style_files {
-            match read_output_style_with_variables(&plugin, &path, Some(&variables)) {
+            match read_output_style_with_variables(plugin_id, &path, Some(variables)) {
                 Ok(style) => {
                     if !output_style_names.insert(style.name.clone()) {
                         errors.push(format!(
-                            "Plugin '{plugin}' declares duplicate output style '{}'",
+                            "Plugin '{plugin_id}' declares duplicate output style '{}'",
                             style.name
                         ));
                     } else {
@@ -243,6 +220,11 @@ pub(crate) fn prepare_application_components(
     } else {
         Err(errors)
     }
+}
+
+fn scope_monitor(target_scope: &str, mut monitor: CronTask) -> CronTask {
+    monitor.id = format!("{target_scope}:{}", monitor.id);
+    monitor
 }
 
 pub(crate) fn validate_application_component_files(
@@ -555,7 +537,15 @@ fn read_plugin_agent_with_variables(
             path.display()
         )
     })?;
-    let mut definition = crate::subagent_loader::parse_subagent_md(&content, None)
+    read_plugin_agent_document(plugin, path, &content)
+}
+
+fn read_plugin_agent_document(
+    plugin: &str,
+    path: &Path,
+    content: &str,
+) -> Result<PreparedPluginAgent, String> {
+    let mut definition = crate::subagent_loader::parse_subagent_md(content, None)
         .map_err(|error| format!("Plugin '{plugin}' Subagent '{}': {error}", path.display()))?;
     definition.source = format!("plugin:{plugin}:{}", path.display());
     Ok(PreparedPluginAgent {
@@ -841,6 +831,17 @@ fn build_plugin_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_binding_keys_are_qualified_by_target_scope() {
+        let monitor = CronTask::new("daily", "0 0 * * * *", "review");
+        let global = scope_monitor("global", monitor.clone());
+        let workspace = scope_monitor("workspace-a", monitor);
+
+        assert_ne!(global.id, workspace.id);
+        assert!(global.id.starts_with("global:"));
+        assert!(workspace.id.starts_with("workspace-a:"));
+    }
 
     #[test]
     fn output_style_frontmatter_is_utf8_safe() -> Result<(), String> {

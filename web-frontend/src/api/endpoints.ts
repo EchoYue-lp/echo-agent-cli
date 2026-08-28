@@ -2306,6 +2306,8 @@ export interface PluginMutationResult {
   wiring_ok?: boolean;
   errors?: string[];
   errors_omitted?: number;
+  settlement_status?: PluginMutationProjection['status'];
+  target_receipts?: PluginMutationProjection['target_receipts'];
   projection?: PluginMutationProjection;
   meta?: ExtensionReceiptMeta;
   receipt?: ExtensionCommandReceipt;
@@ -2406,6 +2408,8 @@ function pluginMutationFromReceipt(
     error: receipt.meta.error ?? (!success ? errors.join('; ') || receipt.meta.status : undefined),
     errors,
     errors_omitted: projection?.summary.errors.omitted,
+    settlement_status: projection?.status,
+    target_receipts: projection?.target_receipts,
     projection,
     meta: receipt.meta,
     receipt,

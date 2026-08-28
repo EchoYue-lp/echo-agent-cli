@@ -95,6 +95,7 @@ pub(crate) struct AgentPluginGeneration {
     skill_descriptors: Vec<echo_agent::skills::external::SkillDescriptor>,
     plugin_agents: Vec<PreparedPluginAgent>,
     output_style: Option<String>,
+    framework_generation: Option<Arc<echo_agent::plugin::PreparedPluginSet>>,
 }
 
 #[derive(Clone)]
@@ -115,7 +116,26 @@ impl AgentPluginGeneration {
             skill_descriptors,
             plugin_agents,
             output_style,
+            framework_generation: None,
         }
+    }
+
+    pub(crate) fn with_framework_generation(
+        mut self,
+        generation: Option<Arc<echo_agent::plugin::PreparedPluginSet>>,
+    ) -> Self {
+        self.framework_generation = generation;
+        self
+    }
+
+    pub(crate) fn framework_generation(
+        &self,
+    ) -> Option<Arc<echo_agent::plugin::PreparedPluginSet>> {
+        self.framework_generation.clone()
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 }
 
@@ -1117,6 +1137,12 @@ impl AgentPool {
             execution_scope,
             workspace_io_identity,
         } = resources;
+        let plugin_target_scope = format!(
+            "{}@{}",
+            execution_scope.workspace_id(),
+            workspace_io_identity.host_generation()
+        );
+        let authority_plugin_generation = self.agent_generation.read().await.clone();
         let mcp_config_snapshot = self.mcp_config_snapshot.read().await.clone();
         let shared = SharedResources {
             tool_manager: None,
@@ -1151,7 +1177,7 @@ impl AgentPool {
             app_config: RwLock::new(self.app_config.read().await.clone()),
             working_dir: RwLock::new(Some(root.clone())),
             permission_mode: RwLock::new(*self.permission_mode.read().await),
-            agent_generation: RwLock::new(self.agent_generation.read().await.clone()),
+            agent_generation: RwLock::new(authority_plugin_generation.clone()),
             cleanup_cancel: CancellationToken::new(),
             cleanup_handle: Mutex::new(None),
             memory_store_override: RwLock::new(None),
@@ -1217,12 +1243,14 @@ impl AgentPool {
                 let ownership = crate::mcp_config_runtime::McpNameOwnershipRegistry::new(
                     mcp_config.mcp_servers.keys().cloned(),
                 );
-                let runtime = crate::plugin_runtime::PluginRuntimeService::new(
+                let runtime = crate::plugin_runtime::PluginRuntimeService::new_for_scope(
                     primary.handle.clone(),
                     lsp_runtime,
                     Arc::clone(&ownership),
+                    plugin_target_scope,
+                    Some(authority_plugin_generation.clone()),
                 )
-                .await;
+                .await?;
                 runtime.bind_agent_pool(Arc::downgrade(&pool)).await?;
                 (Some(runtime), ownership)
             }
@@ -2627,7 +2655,7 @@ async fn replace_agent_plugin_generation(
         .await
 }
 
-async fn remove_agent_plugin_generation(
+pub(crate) async fn remove_agent_plugin_generation(
     agent: &mut echo_agent::agent::react::ReactAgent,
     generation: &AgentPluginGeneration,
 ) {

@@ -54,7 +54,9 @@ Browser 和基础 Agent 资源。GUI 通过 `AppState` 持有这些资源；TUI�
   交给 AgentRouter、事件 journal 或 SubagentControlService；不拥有 mailbox、TaskRun
   graph、重试循环或终态 reducer。六个 `agent_*` 工具由 `AppState` 在共享 ToolManager
   上一次绑定，因而 GUI/TUI/CLI/channel 使用同一 schema、authority 和 fail-closed 校验。
-- `PluginRuntimeService`：Plugin 发现、候选 staging、runtime rewire 和偏好持久化。
+- `PluginRuntimeService`：保存 framework `PreparedPluginSet` 与 apply receipt，负责 EKO
+  Subagent/LSP/monitor/theme/style policy、target publication 和偏好持久化；portable component
+  的解析、apply 与 rollback 只走 framework authority。
 - `McpConfigRuntime`：用户 `mcp.json` 的唯一写入与连接 reconciliation。
 - `BrowserRuntime`：托管 Chromium/Chrome backend 与 browser event projection。
 - `ExtensionControlService`：在当前 workspace generation 上协调 Skills、Hooks、MCP、
@@ -241,7 +243,9 @@ EKO 启动时把 framework 用户数据根设置为 `~/.eko`，也可用 `EKO_DA
 
 - Provider/模型：Provider 保存连接与认证，模型保存协议、输入模态和上下文参数。
 - MCP：用户配置与 Plugin receipt 共享 name ownership，用户配置优先。
-- Plugin：根 `plugin.json` 加固定组件目录，候选完整验证后才替换 live generation。
+- Plugin：framework 从根 `plugin.json` 和固定组件目录生成不可变 prepared generation；EKO
+  在 captured workspace target 上补充产品组件，完整验证后才替换 live generation。rollback
+  使用 exact apply receipt，不重读旧文件。
 - Skill：内置和用户 Skill 都通过 framework loader；SkillsHub 负责 artifact
   discovery/install/sync，不拥有第二份 live registry。
 - 分析/研究：计划、脚本、数据、source/evidence/review/report 都保存为可检查 artifact。
@@ -290,6 +294,14 @@ request/receipt。GUI 使用 typed Tauri IPC；JSONL 把 typed `ExtensionReceipt
 journal/event stream且不进入模型；CLI、TUI、channel 通过同一 app-core service 做文本适配和
 terminal settlement。MCP health 按 authority scope 保存，Hook/LSP 使用 captured project root，
 Browser 和 LSP 在五类产品入口功能对等。
+
+Plugin 与 MCP mutation 在 admission 时一次捕获 global seed 和全部 loaded workspace target；
+receipt 固定 scope、workspace generation、previous/candidate prepared generation、typed
+settled/degraded status 与 bounded diagnostics；Tauri/frontend 只做无损 wire projection。
+fanout 不再从 `AppState` 重新枚举 follower。cold workspace 从 authority 当前 framework
+generation/revision 起步，再加入该 target 的 Project/Local overlay；monitor scheduler key 带
+target scope。`.lsp.yaml` 变更只发布受影响 target 的 LSP generation，不触发完整 Plugin reload。
+详见 [ADR 0022](./adr/0022-framework-prepared-plugin-generations.md)。
 
 普通 Chat 的 framework envelope 由 app-core sink 做 durable journal 与 surface 投影，
 但通用 turn summary 不在应用重复折叠。`AgentTurnDriver` 返回的 `TurnReceipt` 是 typed

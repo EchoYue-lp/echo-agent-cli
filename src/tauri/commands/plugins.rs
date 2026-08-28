@@ -4,14 +4,12 @@
 //! `AppState` (audit P0-4). Previously every command spun up its own
 //! `PluginRegistry` via `build_registry()`, completely disconnected from the
 //! running agent's `SkillRegistry`/`HookRegistry`/`McpManager`. The shared
-//! service keeps one registry and runs the framework `wire_all` on
-//! enable/disable/reload so changes actually take effect against the live
-//! agent.
+//! service keeps one registry and publishes one prepared framework generation
+//! on enable/disable/reload so changes take effect against the live agent.
 
 use crate::tauri::commands::extensions;
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent::plugin::InstallSource;
 use echo_agent_app_core::extension_commands::{
     ExtensionCommand, ExtensionCommandReceipt, ExtensionRequestScope, PluginCommand,
     PluginInstallScope,
@@ -63,17 +61,6 @@ pub async fn install_plugin(
         Some("local" | "l") => PluginInstallScope::Local,
         _ => PluginInstallScope::User,
     };
-    let parsed_source = InstallSource::parse(&source);
-
-    // This is a local personal assistant: a user-selected extension path is
-    // trusted. Keep validation to the source existing; the framework validates
-    // the plugin manifest before copying it.
-    if let InstallSource::Local(ref src_path) = parsed_source {
-        src_path
-            .canonicalize()
-            .map_err(|_| IpcError::NotFound(format!("插件源目录不存在: {}", src_path.display())))?;
-    }
-
     dispatch_plugin(
         &state,
         request_scope,

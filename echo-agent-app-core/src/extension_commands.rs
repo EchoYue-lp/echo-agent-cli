@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::extension_control::{
     ExtensionMcpServer, ExtensionSkillEntry, HookReloadReceipt, HookSourceSnapshot,
-    PluginMutationReceipt, SkillArtifactSyncReceipt, SkillInstallSettlementReceipt,
-    SkillSettlementStatus, SkillSyncReceipt, SkillUninstallSettlementReceipt,
+    PluginMutationReceipt, PluginSettlementStatus, PluginTargetSettlementStatus,
+    SkillArtifactSyncReceipt, SkillInstallSettlementReceipt, SkillSettlementStatus,
+    SkillSyncReceipt, SkillUninstallSettlementReceipt,
 };
 use crate::state::{AppState, ScopedChatRuntime};
 
@@ -1321,8 +1322,9 @@ fn render_plugin_command(receipt: Option<&PluginCommandReceipt>, lines: &mut Vec
         },
         Some(PluginCommandReceipt::Mutation { projection }) => {
             lines.push(format!(
-                "Plugin mutation plugin_id={} total={} enabled={} skills={} hooks={} mcp={} agents={} lsp={} monitors={} themes={} output_styles={}",
+                "Plugin mutation plugin_id={} status={} total={} enabled={} skills={} hooks={} mcp={} agents={} lsp={} monitors={} themes={} output_styles={}",
                 projection.plugin_id.as_deref().unwrap_or("none"),
+                projection.status.as_str(),
                 projection.summary.total,
                 projection.summary.enabled,
                 projection.summary.skills_loaded,
@@ -1334,6 +1336,20 @@ fn render_plugin_command(receipt: Option<&PluginCommandReceipt>, lines: &mut Vec
                 projection.summary.themes_loaded,
                 projection.summary.output_styles_loaded,
             ));
+            for target in &projection.target_receipts.items {
+                lines.push(format!(
+                    "  target={} workspace_generation={} previous_prepared_generation={} candidate_prepared_generation={} status={}",
+                    target.target,
+                    target.workspace_generation,
+                    target.previous_prepared_generation,
+                    target
+                        .candidate_prepared_generation
+                        .as_deref()
+                        .unwrap_or("none"),
+                    target.status.as_str(),
+                ));
+                render_bounded_errors(&target.diagnostics, lines);
+            }
             if let Some(plugin) = projection.plugin.as_ref() {
                 lines.push(render_plugin_entry(plugin));
             }
@@ -1700,6 +1716,35 @@ pub struct PluginReloadProjection {
     pub errors: BoundedItems<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PluginGenerationSettlementStatus {
+    Settled,
+    Degraded,
+}
+
+impl PluginGenerationSettlementStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Settled => "settled",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct PluginTargetGenerationProjection {
+    pub target: String,
+    pub workspace_generation: String,
+    pub previous_prepared_generation: String,
+    pub candidate_prepared_generation: Option<String>,
+    pub status: PluginGenerationSettlementStatus,
+    pub diagnostics: BoundedItems<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 #[ts(export)]
@@ -1782,6 +1827,8 @@ pub enum PluginCommandReceipt {
 pub struct PluginMutationProjection {
     pub plugin_id: Option<String>,
     pub plugin: Option<PluginEntryProjection>,
+    pub status: PluginGenerationSettlementStatus,
+    pub target_receipts: BoundedItems<PluginTargetGenerationProjection>,
     pub summary: PluginReloadProjection,
     pub active_theme: Option<String>,
     pub themes: BoundedItems<PluginThemeProjection>,
@@ -2211,6 +2258,17 @@ fn skill_receipt_status(receipt: &SkillCommandReceipt) -> ExtensionCommandStatus
     }
 }
 
+fn plugin_receipt_status(receipt: &PluginCommandReceipt) -> ExtensionCommandStatus {
+    match receipt {
+        PluginCommandReceipt::Mutation { projection }
+            if projection.status == PluginGenerationSettlementStatus::Degraded =>
+        {
+            ExtensionCommandStatus::Degraded
+        }
+        _ => ExtensionCommandStatus::Settled,
+    }
+}
+
 async fn dispatch_plugin(
     state: &Arc<AppState>,
     runtime: Option<&ScopedChatRuntime>,
@@ -2337,14 +2395,7 @@ async fn dispatch_plugin(
     };
     match result {
         Ok(receipt) => {
-            let status = match &receipt {
-                PluginCommandReceipt::Mutation { projection }
-                    if !projection.summary.errors.items.is_empty() =>
-                {
-                    ExtensionCommandStatus::Degraded
-                }
-                _ => ExtensionCommandStatus::Settled,
-            };
+            let status = plugin_receipt_status(&receipt);
             ExtensionCommandReceipt::Plugins {
                 meta: success_meta(identity, scope, status),
                 receipt: Some(receipt),
@@ -2936,10 +2987,42 @@ fn project_plugin_entry(entry: echo_agent::plugin::PluginEntry) -> PluginEntryPr
 }
 
 fn project_plugin_mutation(receipt: PluginMutationReceipt) -> PluginCommandReceipt {
+    let status = match receipt.status {
+        PluginSettlementStatus::Settled => PluginGenerationSettlementStatus::Settled,
+        PluginSettlementStatus::Degraded => PluginGenerationSettlementStatus::Degraded,
+    };
+    let target_receipts = bounded_items(
+        receipt
+            .target_receipts
+            .into_iter()
+            .map(|target| PluginTargetGenerationProjection {
+                target: bounded_text(target.target),
+                workspace_generation: bounded_text(target.workspace_generation),
+                previous_prepared_generation: bounded_text(target.previous_prepared_generation),
+                candidate_prepared_generation: target
+                    .candidate_prepared_generation
+                    .map(bounded_text),
+                status: match target.status {
+                    PluginTargetSettlementStatus::Settled => {
+                        PluginGenerationSettlementStatus::Settled
+                    }
+                    PluginTargetSettlementStatus::Degraded => {
+                        PluginGenerationSettlementStatus::Degraded
+                    }
+                },
+                diagnostics: bounded_items(
+                    target.diagnostics.into_iter().map(bounded_text),
+                    MAX_EXTENSION_ERRORS,
+                ),
+            }),
+        MAX_EXTENSION_ITEMS,
+    );
     PluginCommandReceipt::Mutation {
         projection: Box::new(PluginMutationProjection {
             plugin_id: receipt.plugin_id.map(bounded_text),
             plugin: receipt.entry.map(project_plugin_entry),
+            status,
+            target_receipts,
             summary: PluginReloadProjection {
                 total: receipt.summary.total,
                 enabled: receipt.summary.enabled,
@@ -3294,6 +3377,80 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("1")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_generation_receipt_roundtrip_is_lossless_and_bounded() -> Result<(), String> {
+        let receipt = PluginMutationReceipt {
+            authority_scope: "workspace-a".to_string(),
+            status: PluginSettlementStatus::Degraded,
+            plugin_id: Some("formatter".to_string()),
+            entry: None,
+            summary: crate::plugin_runtime::ReloadSummary {
+                total: 1,
+                enabled: 1,
+                skills_loaded: 0,
+                hooks_registered: 0,
+                mcp_connected: 0,
+                agents_loaded: 0,
+                lsp_languages_loaded: 0,
+                monitors_loaded: 0,
+                themes_loaded: 0,
+                output_styles_loaded: 0,
+                errors: vec!["target settlement failed".to_string()],
+            },
+            target_receipts: vec![crate::extension_control::PluginTargetGenerationReceipt {
+                target: "workspace-a".to_string(),
+                workspace_generation: "workspace-generation-a".to_string(),
+                previous_prepared_generation: "prepared-1".to_string(),
+                candidate_prepared_generation: Some("prepared-2".to_string()),
+                status: PluginTargetSettlementStatus::Degraded,
+                diagnostics: (0..=MAX_EXTENSION_ERRORS)
+                    .map(|index| format!("diagnostic-{index}"))
+                    .collect(),
+            }],
+            theme: crate::extension_control::PluginThemeSnapshot {
+                authority_scope: "workspace-a".to_string(),
+                active: None,
+                themes: Vec::new(),
+            },
+            output_style: crate::extension_control::PluginOutputStyleSnapshot {
+                authority_scope: "workspace-a".to_string(),
+                active: None,
+                styles: Vec::new(),
+            },
+        };
+        let projected = project_plugin_mutation(receipt);
+        assert_eq!(
+            plugin_receipt_status(&projected),
+            ExtensionCommandStatus::Degraded
+        );
+        let encoded = serde_json::to_string(&projected).map_err(|error| error.to_string())?;
+        let decoded: PluginCommandReceipt =
+            serde_json::from_str(&encoded).map_err(|error| error.to_string())?;
+        let PluginCommandReceipt::Mutation { projection } = decoded else {
+            return Err("projected receipt is not a plugin mutation".to_string());
+        };
+        assert_eq!(
+            projection.status,
+            PluginGenerationSettlementStatus::Degraded
+        );
+        let target = projection
+            .target_receipts
+            .items
+            .first()
+            .ok_or_else(|| "projected target receipt missing".to_string())?;
+        assert_eq!(target.target, "workspace-a");
+        assert_eq!(target.workspace_generation, "workspace-generation-a");
+        assert_eq!(target.previous_prepared_generation, "prepared-1");
+        assert_eq!(
+            target.candidate_prepared_generation.as_deref(),
+            Some("prepared-2")
+        );
+        assert_eq!(target.status, PluginGenerationSettlementStatus::Degraded);
+        assert_eq!(target.diagnostics.items.len(), MAX_EXTENSION_ERRORS);
+        assert_eq!(target.diagnostics.omitted, 1);
         Ok(())
     }
 

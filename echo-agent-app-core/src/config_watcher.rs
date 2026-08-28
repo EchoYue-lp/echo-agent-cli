@@ -6,7 +6,7 @@
 //!
 //! Hooks, LSP generations and webhook endpoints are reloaded here. Model and
 //! MCP generations have separate application-owned publication paths; runtime
-//! limits still require a restart. LSP rebind delegates through the shared
+//! limits still require a restart. LSP publication delegates through the shared
 //! `ExtensionControlService` admission and `PluginRuntimeService` mutation owner,
 //! so this watcher never becomes a second mutation state machine.
 //!
@@ -688,18 +688,23 @@ async fn handle_config_change(
     webhook_emitter: Option<&crate::webhook::WebhookEmitter>,
 ) {
     let path_str = changed_path.to_string_lossy().to_string();
+    let global_lsp = crate::data_root::user_data_path(".lsp.yaml");
 
     for target in registered {
         let is_lsp = changed_path
             .file_name()
             .is_some_and(|name| name == ".lsp.yaml");
         if is_lsp {
+            let target_lsp = target.root.join(".lsp.yaml");
+            if changed_path != global_lsp && changed_path != target_lsp {
+                continue;
+            }
             if let Some(runtime) = target.plugin_runtime()
                 && let Err(error) = extension_control
-                    .rebind_plugin_runtime(runtime, target.root.clone())
+                    .reload_plugin_lsp(runtime, target.root.clone())
                     .await
             {
-                warn!(workspace_root = %target.root.display(), %error, "LSP config reload rejected; keeping last known-good generation");
+                warn!(workspace_root = %target.root.display(), %error, "LSP config publication rejected; keeping last known-good generation");
             }
             continue;
         }
@@ -927,7 +932,8 @@ mod tests {
             temp.path().join("old-plugin-state.json"),
             temp.path().join("old-plugin-data"),
         )
-        .await;
+        .await
+        .map_err(|error| error.to_string())?;
         let agent_strong_before = Arc::strong_count(old_agent.inner());
         let plugin_strong_before = Arc::strong_count(&old_plugin);
         let handle = spawn_config_watcher(
@@ -952,6 +958,7 @@ mod tests {
         assert_eq!(Arc::strong_count(old_agent.inner()), agent_strong_before);
         assert_eq!(Arc::strong_count(&old_plugin), plugin_strong_before);
         assert_eq!(hook_match_count(&old_agent, "old-generation").await, 1);
+        let plugin_generation_before = old_plugin.prepared_generation_identity().await;
         handle
             .trigger_change_for_test(lsp_path.clone())
             .await
@@ -962,6 +969,10 @@ mod tests {
                 .await
                 .iter()
                 .any(|language| language == "old-language")
+        );
+        assert_eq!(
+            old_plugin.prepared_generation_identity().await,
+            plugin_generation_before
         );
 
         assert!(
@@ -981,7 +992,8 @@ mod tests {
             temp.path().join("new-plugin-state.json"),
             temp.path().join("new-plugin-data"),
         )
-        .await;
+        .await
+        .map_err(|error| error.to_string())?;
         let new_identity = ConfigWatcherWorkspaceIdentity::new("same-id", "generation-2");
         handle
             .register_workspace(
