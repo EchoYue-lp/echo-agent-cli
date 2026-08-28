@@ -1,169 +1,97 @@
-# EKO 当前项目状态
+# EKO 应用当前状态（MASTER-PLAN）
 
-Last updated: 2026-08-28
-
-本文是跨会话恢复工作的简短事实源，只记录当前权威路径、未完成工作和下一步。
-已完成里程碑不在这里保留实施日志；长期有效能力见 [功能总览](./features.md)。
+> 本文是 `echo-agent-cli` 应用层的跨会话事实源，只记录 EKO 的权威路径、当前阶段状态、未完成工作和验收入口。
+> framework 公共 API 与实现事实归 `echo-agent`；官网同步归 `echo-website`。历史实施日志保留在 Git 历史和带日期的专项文档中。
+> Last updated: 2026-08-28。
 
 ## 产品不变量
 
-- EKO 是本地个人助理，不套用线上多租户权限模型。
-- 产品模型是 `TaskRun -> PlanTask -> SubagentRun`。
-- EKO 使用普通文件、JSON/JSONL 和内存，不启用 SQLite。
-- GUI、TUI、CLI/JSONL、channel 共享核心能力，仅 transport/renderer 不同。
-- plan、script、source、evidence、report 是可检查 artifact，不是隐藏运行时状态。
+- EKO 是本机个人助理，不套用线上多租户权限模型；CLI 不启用 SQLite。
+- 产品模型是 `TaskRun -> PlanTask -> SubagentRun`。`TaskStatus` 是执行权威，Todo 只是只读 UI 投影，plan 是可编辑/可审阅 artifact。
+- GUI、TUI、CLI/JSONL、channel、cron/background 共享 app-core 能力；transport/renderer 不拥有第二套运行状态。
+- framework 提供通用 turn/event、Task DAG、Subagent、Tool、Store、MCP/LSP/channel 和 checkpoint 原语；EKO 负责 workspace、DomainProfile、文件/工件、review/worktree、pool、产品 policy 与 surface 投影。
+- 所有取消、失败、部分副作用和恢复以持久事实为准；不得重复 terminal 或把不确定写入自动重放。内部执行角色统一称 `Subagent`，不得新增 `worker` 命名。
+
+## Child 基线
+
+| 项目 | 当前 SHA | 状态 |
+| --- | --- | --- |
+| framework `echo-agent` | `302453b174086c3795dc026d16eeb668ecc66bed` | `main` 与 `origin/main` 对齐；CLI 通过相对路径 `../echo-agent` 消费。 |
+| application `echo-agent-cli` | `d09f11c7878474d0e01ba2562309d5890e369554` | `main` 与 `origin/main` 对齐；F2-F5 已合流。 |
+
+F2-F5 合流、测试卫生和适用完整门禁证据见顶层 [`plan_03`](../../docs/supreme/plans/2026-08-28T0013-项目未完成工作收敛/plan_03_F5收口完整验证主分支合并与资源清理.md)。本地 child SHA 不等于最终 release：10k/100k、长时 soak、人工 GUI、远端 CI 和 push/release 仍未执行。
+
+## 阶段状态
+
+| 阶段 | 状态 | EKO 应用侧结论 |
+| --- | --- | --- |
+| F0 characterization | Complete | 已进入 `src/main.rs`，作为各入口回归基线。 |
+| F1 receipt/admission | Complete | Persisted/Accepted/Drained/TurnSettled 已由 app-core 与 framework 合同承载。 |
+| F2 Task/Plan/Todo authority | Complete | revisioned TaskRun graph、`TaskStatus` 和 Todo projection 已切换到唯一 authority；ADR [0015](./adr/0015-task-graph-status-authority.md)。 |
+| F3 Agent control tools | Complete | `agent_list/inspect/message/followup/wait/interrupt` 是薄 adapter，复用 router、SubagentControl 和 TaskRuntime；ADR [0016](./adr/0016-agent-control-tools.md)。底层 bounded query 仍待 R1/P0。 |
+| F4 删除 InteractionMode | Complete | 生产代码、DTO、prompt、GUI/TUI/CLI/channel mode surface 已删除，不得改名恢复。 |
+| F5 Agent/Subagent lifecycle | Complete | lifecycle characterization、生产修复、panic-lint hygiene 和适用完整门禁均已完成。 |
+| F6 cursor/recovery/surface parity | **Partial** | 已有 cursor token、multi-target wait、boot reconcile、router restart 测试和静态 surface matrix；跨重启 Conversation/TaskSubagent cursor、cold address、workspace switch/delete、统一 fixture 与 stranded-resource 验收未闭环。 |
+| R0 boundary audit | Complete | 顶层审计覆盖 151 个 app-core Rust 文件，纯只读；见 [`current-framework-application-boundary-audit`](../../docs/2026-08-28-current-framework-application-boundary-audit.md)。 |
+| R1 framework-first migration | Not started | 19 个 `Migrate/converge` 与 8 个 `Conditional` 候选尚未切换；应用 adapter 必须保持无损且删除被替代主路径。 |
+| R2 examples convergence | Inventory only | 64 个 framework examples 的 disposition 已记录，CLI 只消费稳定 facade，不拥有 examples 迁移。 |
+| R3 docs/website | Not started | 等 R1/R2 API/examples 稳定后，再由各 child owner 同步文档和 website manifest。 |
+| G Final Integration/Release | Not started | 完整三仓门禁、性能/soak、人工 GUI、远端 CI、website 和 child-first 发布均后置。 |
 
 ## 当前权威路径
 
-| 语义                                               | 权威实现                                         |
-| -------------------------------------------------- | ------------------------------------------------ |
-| ReAct、tools、DAG、Subagent、store traits、MCP/LSP | `echo-agent`                                     |
-| EKO bootstrap 与共享服务                           | `echo-agent-app-core/src/runtime.rs`             |
-| workspace host 与文件资源                          | `echo-agent-app-core/src/workspace/runtime.rs`   |
-| conversation Agent 并发                            | `echo-agent-app-core/src/agent_pool.rs`          |
-| chat driver 与 terminal outcome                    | `echo-agent-app-core/src/chat_driver.rs`         |
-| foreground admission/cancel/settlement             | `echo-agent-app-core/src/foreground_turn.rs`     |
-| revisioned TaskRun graph 与文件投影                | `echo-agent-app-core/src/tasks/task_runtime/`    |
-| 跨 address 消息和 groups                           | `echo-agent-app-core/src/agent_router.rs`        |
-| 模型 Agent 协作控制面                              | `echo-agent-app-core/src/agent_control.rs`       |
-| boot recovery 与 unattended admission              | store-scoped reconciler + product owner split    |
-| Extension mutation admission                       | `extension_control.rs` + `extension_commands.rs` |
-| GUI IPC                                            | `src/tauri/commands/`                            |
-| GUI address/view projection                        | `web-frontend/src/`                              |
+| 语义 | 唯一应用入口 |
+| --- | --- |
+| bootstrap/config/pool | `echo-agent-app-core/src/runtime.rs`、`infra.rs`、`agent_pool.rs` |
+| workspace host/resource | `echo-agent-app-core/src/workspace/runtime.rs` 与 `state.rs` |
+| chat turn/event projection | `chat_driver.rs`、`foreground_turn.rs`、`chat_event_log.rs` |
+| Conversation routing/inbox | `agent_router.rs`；不在 surface 解析地址或自建 mailbox |
+| Agent control | `agent_control.rs`；只做 discriminator、revision、attempt、generation 校验和既有 service 调用 |
+| TaskRun graph/status | `tasks/task_runtime/`、`run_authority.rs`；framework `RuntimeDagExecutor` 是 DAG 内核 |
+| Task/Subagent control | `tasks/task_runtime/subagent_control.rs`；attempt-scoped guidance/interrupt/receipt |
+| boot recovery/admission | store-scoped reconciler、foreground owner、BackgroundTaskService 和 extension control split |
+| shared app services | `AppState`、`TaskRuntimeBlockingAdapter`、`ProductDataIoService`；GUI/headless 不得各建 authority |
+| GUI IPC/projection | `src/tauri/commands/` 与 `web-frontend/src/`，只传 DTO、事件和 typed receipts |
 
-## 已完成并已文档化
+## F6 实施入口与退出门
 
-- 流式对话、会话文件存储、附件与长输入 artifact。
-- revisioned TaskRun DAG、Subagent results/control、worktree、long-horizon core primitives。
-- Tool schema budget、recoverable output、canonical edit、analytics runtime、image input。
-- MCP resources、Browser/Chrome、LSP、Terminal、Plugin、Hook 与 Skill artifact sync 的
-  specialist runtime 已进入生产路径。
-- Extension Control Authority 已完成：v2 durable Skill settlement、boot/workspace repair、
-  scope-keyed MCP health、captured Hook/LSP root、AgentPool generation，以及
-  GUI/TUI/CLI/JSONL/channel 的 Skills/Plugins/MCP/Hooks/LSP/Browser 入口均收敛到 app-core。
-- 数据分析、学术/医学研究、Zotero/Europe PMC、review/export。
-- layered memory、Review Inbox、Curator、rule/Skill promotion。
-- dynamic Provider/model/protocol/thinking profile。
-- workspace-qualified session/checkpoint/task/browser/control surface，JSONL mode/policy/attachment/HITL。
-- Workflow GUI 与统一 structured extraction 的 GUI/TUI/CLI/channel 生产入口。
-- Iteration 3 Agent control plane 已接入：六个模型 `agent_*` 工具共享薄 routing adapter，
-  Conversation/TaskSubagent target 分流、exact-once message、attempt/revision/generation
-  fail-closed 与 cursor wait 均复用既有 AgentRouter/SubagentControl/TaskRuntime authority；
-  `agent_tool` 仍是唯一一次性 Subagent dispatch 入口。
-- P0 F2/F3 integration checkpoint 已完成：framework bounded `task_list` producer、CLI
-  revisioned Task graph/Todo projection 与 Agent control tools 已按 framework-first 顺序合流；
-  F2 ADR 保留 0015，Agent control ADR 为 0016，Rust 真理源已生成唯一 DTO snapshot。F4
-  已在该 clean local baseline 上完成旧 mode surface/DTO/prompt 分支删除；F2 paused-row affordance、F3 schema/truncated/interrupt metadata
-  与底层 full-vector query 仍按各 ADR 标记为后续 Minor/R1/P0 residual。
-- F5 characterization 已压缩为单一提交，runtime-state 与 H1/H2/H3 测试卫生提交保留可追溯
-  历史，原始 260 个测试 panic lint 命中已清零。framework 与 CLI 的 fmt、两套 clippy、
-  workspace tests、no-default、GUI 和 frontend 门禁均在主分支合流后真实 exit 0；generated DTO
-  由 Rust 真理源生成并纳入标准 Prettier 检查。默认 workspace test 不再执行 2k/10k 或
-  10k/100k scale case；这些性能门、长时 soak 和 Final Gate 仍按计划延期，未伪装为已完成。
-- Public framework boundary：EKO 配置已由 app-core `EkoConfig` 独立拥有，permission mode 在
-  app state/pool/framework 间全程 typed 且 DTO 八变体无损 round-trip；CLI/app-core 直接
-  `echo_core` 依赖与源码引用均为 0。产品 data root、Theme/Monitor/OutputStyle、coding
-  auto-memory policy 留在应用层，framework 只接收显式路径、tool capability 与 command policy。
+F6 owner 是 app-core；framework 只接收通用 event/cursor/checkpoint 需求。实现前先确认定义、注册和真实可达性，避免第二套 store、reducer、DAG loop 或地址解析。
 
-Task 2 二次集成检查点基于 framework `e103445`，覆盖显式 LLM 构造补修。该分支暂不合入
-CLI `main`；合并前仍须以当时最新 framework/CLI 基线完成最终复验。
+1. 使用同一 deterministic fixture，验证 Conversation 与 TaskSubagent cursor 的 append、wait、消费、restart、resume 和 terminal 去重。
+2. 覆盖 cold/unloaded address、workspace generation switch/delete、router restart、boot reconcile、orphan command cell、receipt/lease/handle 清理。
+3. 让 GUI、TUI、CLI/JSONL、channel 共用 fixture 和事件合同，比较 identity、error、artifact、HITL、cancel 和终态投影。
+4. 删除 surface-local 推断；generic terminal/retry/settlement 只能来自 framework 事件和 app 的单一 receipt owner。
 
-这些条目完成后的 design/plan/audit/soak 文档已经删除；需要理解当前行为时以代码、测试、
-[架构说明](./architecture.md) 和 [功能总览](./features.md) 为准。
+F6 只有在无重复 terminal、无 stranded receipt/handle、跨重启可恢复、删除无残留且五入口 fixture 全绿时才可标记 Complete。
 
-## 活跃工作
+## R1 应用侧迁移规则
 
-### P0 Runtime Reliability
+- framework producer 先改，CLI adapter 后切换；adapter 只做类型转换、metadata、产品 policy/hook 和 framework service 调用。
+- 优先审查 turn/event、tool/artifact、Task runtime adapter、bootstrap、plugin/memory generation 与 Tauri command composition。workspace、DomainProfile、review/worktree、文件权威和 UI/TUI/CLI/channel 投影继续留在应用层。
+- 每个切片必须有 framework 独立门禁、CLI round-trip/contract tests，并在新路径真实可达后删除旧实现；不得以“以后删除”长期保留双 authority。
+- Agent control 的 `list_events`/`list_subagent_runs` 当前仍先返回完整向量，adapter 只在截断前做 exact-target 过滤。真正下推 bounded query 属于 R1/P0，不能把当前 adapter 截断称为完成。
 
-状态：Complete（实现与开发期验收）
+## R2/R3/G 应用交付边界
 
-规格：[`design/specs/runtime-reliability.md`](../design/specs/runtime-reliability.md)
+- R2 的 examples owner 在 `echo-agent`；CLI 仅验证 public facade 与应用文档链接，不把 EKO workspace/UI/DomainProfile 带入 framework examples。
+- R3 的 EKO 正式文档维护在本目录 `architecture.md`、`features.md`、ADR 与相关 architecture 子目录；framework 双语 API 文档维护在 `echo-agent`；website manifest 等 child SHA 稳定后再更新。
+- G 统一执行三仓适用门禁、fault matrix、10k/100k release 性能、10 分钟/1 小时/最终 2 小时 soak、人工 GUI、远端 CI 和 child-first push/release。任何阻塞、中断或未执行命令必须保留真实状态。
 
-目标是完成 workspace/conversation 运行时可靠性闭环：
+## 证据索引
 
-1. 所有 Tauri 查询、控制、恢复、事件、删除使用显式 workspace/conversation identity。
-2. 同一 AgentAddress 只有一个 foreground owner；普通输入由 backend durable FIFO 接受。
-3. 历史打开、live rebind、boot recovery 不覆盖正在运行的 Agent context。
-4. AgentRouter 只在 transcript safe point 后结算 Delivered，并闭环 reply/backoff。
-5. 删除先 settle/shutdown/evict，进程级资源上限不会随 workspace 数量倍增。
-6. GUI/TUI/CLI/channel fault matrix 与 bounded smoke 全绿；长时 soak 属于项目 Final Integration Gate。
+- 应用/框架边界：[`../../docs/2026-08-28-current-framework-application-boundary-audit.md`](../../docs/2026-08-28-current-framework-application-boundary-audit.md)。
+- examples inventory：[`../../docs/2026-08-28-framework-examples-inventory.md`](../../docs/2026-08-28-framework-examples-inventory.md)。
+- 交互收敛路线：[`../../docs/2026-08-26-agent-interaction-convergence-plan.md`](../../docs/2026-08-26-agent-interaction-convergence-plan.md)。
+- 应用架构与功能：[`architecture.md`](./architecture.md)、[`features.md`](./features.md)、[`persistence.md`](./persistence.md)。
+- TaskRuntime bounded projection：[`ADR 0008`](./adr/0008-taskruntime-bounded-query-projections.md)；async/IPC boundary：[`ADR 0009`](./adr/0009-taskruntime-async-io-and-ipc-boundary.md)。
+- F6 boot/inbox authority：[`ADR 0011`](./adr/0011-boot-inbox-recovery-authority.md)；extension authority：[`ADR 0012`](./adr/0012-extension-control-authority.md)。
 
-应用提交 `5603958` 已完成 M0-M7 和 M8 自动实现：workspace-scoped IPC/event、durable input
-FIFO、restore/rebind、orphan terminal repair、delete/evict、AgentRouter settlement/backoff
-以及 process governor 均通过完整自动门禁。M8 的 3x3 smoke 和 36-turn real-provider probe
-均为零失败；10 分钟/2 小时与完整人工 GUI 场景在项目全部研发完成后统一执行。
+## 文档与提交约束
 
-当前收敛阶段进一步固定：TaskRuntime recovery 只缓存成功结果且文件 I/O 走 bounded blocking；
-AppState 恢复普通 conversation，BackgroundTaskService 独占 global background launcher；普通 Chat
-与 Paused TaskRun 的 orphan command cell 都写入 typed Interrupted terminal。Awaiter/AgentRouter
-在副作用前提交 Started，并只在 framework tracked steer 到达 Drained 后结算；Agent inbox 使用
-framework segmented journal + checkpointed FIFO frontier。删除使用 retirement guard，已开始但
-终态不确定的 attempt 禁止自动重放。见
-[ADR 0011](./adr/0011-boot-inbox-recovery-authority.md)。
+本文不复制 framework 正式 API 说明，不把历史计划当执行授权。架构变更需在所属 child 建 ADR；跨仓先提交 framework，再提交 CLI，再同步 website，最后更新 superproject gitlink。所有提交显式关闭 GPG 签名：
 
-### Long-Horizon Runtime Closure
+```text
+git -c commit.gpgsign=false commit -m "..."
+```
 
-状态：Complete；LH0-LH6 已由 framework `afdf3b1`、application
-`b125d9d`/`0782a8c`/`cd52171` 完成。P0 的 resolver、address identity、event routing、host
-recovery、fault matrix、3x3 smoke 和 real-provider probe 均已收口。
-
-规格：[`design/specs/long-horizon-runtime-closure.md`](../design/specs/long-horizon-runtime-closure.md)
-
-最新审查确认 Goal、RunTurn、provider retry、正式 PlanTask Subagent 控制、
-Requirement/Evidence、checkpoint/suffix 投影和 12 小时 deterministic ledger 真实存在；
-LH1-LH5 已关闭 CommandCell publication/retention、Started-before-side-effect、普通 Chat 精确地址、
-typed terminal/artifact projection、owned repair，以及 Awaiter direct controlled dispatch、exact
-interrupt、process Subagent permit、Ready/Acknowledged replay、完整 Provider profile、dedicated
-surface projector、global/workspace 普通 conversation boot resume，以及 checkpoint-backed hot
-state、运行边界索引、10k/100k 性能门、真实 Agent/Awaiter/surface 故障矩阵和 bounded smoke。
-长时间集成测试不再阻塞功能阶段，统一归项目 Final Integration Gate。
-
-### Channel session incarnation and product-data settlement
-
-状态：projection authority 已合入，channel focused compile/fault matrix 全绿。当前发布采用
-fix-forward：framework 修复已发布为 `echo-agent@9f8d723`，CLI 已修复 Linux `infra.rs`
-`app_config` warning，并将 CI pin 更新到该精确 framework SHA。本地 full workspace、GUI、
-TUI、CLI、channel 与 frontend 门禁按精确 child pair 执行；GitHub workflow-level 调度失败按
-当前研发节奏延后到 Final Integration Gate 统一修复和验证。
-
-- framework sender-scoped session incarnation 是 channel model context 的唯一 identity；稳定 product
-  conversation 继续拥有 ChatEventLog、TaskRun 与 UI 历史。
-- timeout/reset 通过 exact workspace generation + runtime-state key obligation 关闭 pool admission、等待
-  foreground/lease、回收 checkpoint/transcript，并只在全部成功后 rotate；产品删除最终枚举并回收该
-  stable scope 的全部 live/durable incarnation。
-- `ProductDataIoService` 按 application generation 拥有附件、压缩、删除、CommandCell、analytics 与
-  research blocking I/O。process semaphore 只限流；phase one seal 新 direct/flow admission，已接纳
-  producer 通过 nested token 完成 safe point，phase two join 全部 settlement；caller drop 不会分离写入。
-- 本阶段不建立第二套 TaskRuntime、session、conversation store 或 deletion authority。旧的 10 分钟
-  扩展并发 soak 已在 `df049e2` 完成（600.820 秒、1,557 launches、6 次重启、零
-  routing/duplicate-terminal/resource failure；ledger SHA-256 为
-  `073572eb87df3324825763d49cd31ea63b0e19b2505c96963b59e98b5be0330c`）；本轮若仅修复 cfg
-  warning、CI pin、manifest 或文档则沿用该证据，触及 runtime 语义时才重跑。
-
-## 下一步
-
-F2-F5、测试卫生与 plan_03 完整验证已经收口到本地主分支；未执行 push、release、长时 soak
-或 Final Gate。下一阶段进入 F6/R1 与剩余 lifecycle/persistence 收口；10k/100k 和长时 soak
-继续延期到整个重构完成后的统一验证阶段。
-
-TaskRuntime async surface 已统一复用进程共享的 bounded `TaskRuntimeBlockingAdapter`，并以
-ts-rs typed receipts 替代 GUI mutation 的 `serde_json::Value`/numeric interaction mode。
-下一阶段仍需独立完成两项 persistence 收口：一是 journal 已提交但 projection refresh 降级时
-返回统一 typed committed outcome；二是把 Todo/Artifact/Completion 当前视图改为 checkpoint
-增量索引，并让 10k/100k release gate 覆盖真实 GUI snapshot，而不只测 warm run state。
-
-Long-horizon 的 LH6 代码修复已完成：18 行故障矩阵、可取消 artifact finalize、Started projection
-crash window、Awaiter Provider failure durable result、EKO permission-owned shell policy、跨 workspace
-Agent execution governor、四 surface real-provider harness 与 truthful ledger 都已进入生产/测试路径。
-真实探针完成 3x3、36 Provider turns、3 Awaiter、3 HITL、2 restart，零失败；10 分钟扩展并发
-运行也完成 1,827 cells 且零失败。两小时尝试按研发节奏调整在 26.6 分钟主动停止，状态记录为
-`interrupted_by_policy`。Task 2 EKO Control Plane 与 Surface 已在
-`refactor/eko-control-surface` 完成全自动门禁；当前先完成 framework/CLI/website 的 release
-fix-forward 并冻结新的本地门禁通过 child 基线，再启动 characterization lanes。10 分钟/2 小时和完整
-人工 GUI 场景只在项目功能研发全部完成后执行一次 Final Integration Gate。
-
-## 文档生命周期
-
-- 活跃规格只放 `design/specs/`。
-- 阶段完成后先把稳定事实合并进 `docs/` 或代码，再删除规格和临时评审记录。
-- `.superpowers/` 是本地临时执行产物，不是项目文档或跨会话事实源。
+提交前按 `AGENTS.md` 执行与改动匹配的 fmt、clippy、workspace tests、no-default/feature matrix、GUI/frontend 和 Markdown/link 检查。未执行的长时、性能、人工或远端门禁不得写成通过。
