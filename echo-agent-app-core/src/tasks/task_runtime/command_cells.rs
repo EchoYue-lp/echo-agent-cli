@@ -2670,6 +2670,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn command_cells_and_task_runtime_share_the_process_execution_governor() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        let process_governor = super::super::executor::process_execution_governor();
+        assert!(Arc::ptr_eq(&service.governor, &process_governor));
+        assert!(Arc::ptr_eq(
+            &service.governor.shell_semaphore(),
+            &process_governor.shell_semaphore()
+        ));
+        assert!(Arc::ptr_eq(
+            &service.governor.subagent_semaphore(),
+            &process_governor.subagent_semaphore()
+        ));
+        Ok(())
+    }
+
     fn awaiter_result(execution_id: &str, cell_id: &str) -> AwaiterResult {
         AwaiterResult {
             receipt: AwaiterWatchReceipt {
@@ -3762,6 +3779,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_chat_rejects_missing_owner_identity_before_process_start()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "workspace")
+                .map_err(|error| error.to_string())?,
+        );
+        let service = test_service(temp.path())?;
+        let workspace_id = crate::workspace::WorkspaceId::from_name("workspace");
+        let registry = service.scoped(
+            crate::workspace::WorkspaceExecutionScope::workspace(&workspace_id, temp.path()),
+            Some(store),
+        );
+
+        for (label, owner) in [
+            (
+                "conversation",
+                CommandCellOwner {
+                    message_id: Some("root-message".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "root message",
+                CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let side_effect = temp
+                .path()
+                .join(format!("missing-{}", label.replace(' ', "-")));
+            let result = registry
+                .launch(CommandCellRequest {
+                    command: format!("touch {}", side_effect.display()),
+                    owner,
+                    ..Default::default()
+                })
+                .await;
+            assert!(matches!(
+                result,
+                Err(CommandCellError::Validation { message })
+                    if message.contains(label)
+            ));
+            assert!(!side_effect.exists());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn phase_one_cancels_long_cell_before_operation_join() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let service = test_service(temp.path())?;
@@ -4148,6 +4216,95 @@ mod tests {
                 .values()
                 .all(|cells| !cells.contains(&cell_id))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exhausted_terminal_repair_is_bounded_and_reported_as_lifecycle_debt()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "workspace")
+                .map_err(|error| error.to_string())?,
+        );
+        store
+            .create_run(
+                "terminal-debt",
+                "workspace",
+                "conversation",
+                "root-message",
+                DomainProfile::AiCoding,
+                "bound terminal repair",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("terminal-debt", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store.fail_cell_terminal_writes_for_test(MAX_PROJECTION_REPAIR_ATTEMPTS as usize + 1);
+        let service = test_service(temp.path())?;
+        let workspace_id = crate::workspace::WorkspaceId::from_name("workspace");
+        let registry = service.scoped(
+            crate::workspace::WorkspaceExecutionScope::workspace(&workspace_id, temp.path()),
+            Some(store.clone()),
+        );
+        let cell_id = registry
+            .launch(CommandCellRequest {
+                command: "printf debt".to_string(),
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    run_id: Some("terminal-debt".to_string()),
+                    message_id: Some("root-message".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .map(|receipt| receipt.cell_id)
+            .map_err(|error| error.to_string())?;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if service
+                    .projection_diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.cell_id == cell_id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "terminal debt was not exposed during repair".to_string())?;
+        assert!(
+            service
+                .run_cells
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .any(|cells| cells.contains(&cell_id))
+        );
+
+        let shutdown_error =
+            tokio::time::timeout(Duration::from_secs(8), store.shutdown_operations())
+                .await
+                .map_err(|_| "terminal repair exceeded its bounded retry window".to_string())?
+                .err()
+                .ok_or_else(|| {
+                    "exhausted terminal repair was not reported as lifecycle debt".to_string()
+                })?;
+        assert!(shutdown_error.contains("terminal persistence exhausted its repair budget"));
+        assert!(
+            service
+                .run_cells
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .all(|cells| !cells.contains(&cell_id))
+        );
+        assert_eq!(store.active_operation_count(), 0);
         Ok(())
     }
 }

@@ -7644,6 +7644,53 @@ mod tests {
     }
 
     #[test]
+    fn public_run_state_and_cell_queries_do_not_request_full_journal_replay()
+    -> Result<(), StoreError> {
+        let store = fresh()?;
+        store.create_run(
+            "checkpoint-read-run",
+            "global",
+            "conversation",
+            "message",
+            DomainProfile::General,
+            "read checkpointed state",
+            "task",
+            AttendedMode::Attended,
+        )?;
+        store.record_background_cell_started(
+            "checkpoint-read-run",
+            "cell-1",
+            "probe",
+            "sha256:probe",
+            Some("turn-1"),
+            None,
+            None,
+        )?;
+        store
+            .shadow
+            .reset_full_replay_requests_for_test("checkpoint-read-run")?;
+
+        assert!(store.get_run_state("checkpoint-read-run")?.is_some());
+        assert_eq!(store.list_background_cells("checkpoint-read-run")?.len(), 1);
+        assert_eq!(
+            store
+                .shadow
+                .full_replay_requests_for_test("checkpoint-read-run")?,
+            0
+        );
+
+        assert!(!store.list_events("checkpoint-read-run", 0)?.is_empty());
+        assert_eq!(
+            store
+                .shadow
+                .full_replay_requests_for_test("checkpoint-read-run")?,
+            1,
+            "the replay probe did not observe an explicit sequence-zero query"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn create_run_rejects_same_id_with_different_identity() -> Result<(), String> {
         let store = TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?;
         store

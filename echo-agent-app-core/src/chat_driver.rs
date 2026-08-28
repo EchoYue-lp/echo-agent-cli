@@ -1641,6 +1641,126 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::TaskRunStatus;
 
+    #[test]
+    fn product_event_wire_contract_preserves_canonical_identity_and_payloads() -> Result<(), String>
+    {
+        let identity = EventIdentity::new("stream-1", "turn-1")
+            .map_err(|error| error.to_string())?
+            .with_conversation_id("conversation-1")
+            .map_err(|error| error.to_string())?
+            .with_run_id("run-1")
+            .map_err(|error| error.to_string())?
+            .with_message_id("message-1")
+            .map_err(|error| error.to_string())?
+            .with_execution_id("execution-1")
+            .map_err(|error| error.to_string())?
+            .with_parent_event_id("parent-1")
+            .map_err(|error| error.to_string())?;
+        let events = [
+            ChatDriverEvent::Agent(Box::new(
+                EventEnvelope::new(
+                    &identity,
+                    7,
+                    identity.parent_event_id.clone(),
+                    AgentEvent::ToolResult {
+                        call_id: "call-1".to_string(),
+                        name: "shell".to_string(),
+                        result: echo_agent::tools::ToolResult::failure(
+                            echo_agent::tools::ToolFailureCategory::Timeout,
+                            "timed out",
+                        ),
+                    },
+                )
+                .map_err(|error| error.to_string())?,
+            )),
+            ChatDriverEvent::Execution(ExecEvent::subagent(
+                "workspace-1",
+                "conversation-1",
+                "run-1",
+                "task-1",
+                "execution-1",
+                RuntimeEventKind::ArtifactProduced,
+                serde_json::json!({
+                    "execution_id": "execution-1",
+                    "artifact": {
+                        "path": "/tmp/full.log",
+                        "bytes": 1234,
+                        "sha256": "abc123",
+                        "retention": "run",
+                        "available": true
+                    }
+                }),
+            )),
+            ChatDriverEvent::TurnStatus {
+                status: "completed".to_string(),
+            },
+            ChatDriverEvent::ExecutionPath {
+                observed_path: "task_runtime".to_string(),
+            },
+            ChatDriverEvent::Interrupt {
+                run_id: "run-1".to_string(),
+                goal: "revise".to_string(),
+                new_message: "use the file store".to_string(),
+            },
+        ];
+        let values = events
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let sources = values
+            .iter()
+            .filter_map(|value| value.get("source"))
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sources,
+            [
+                "agent",
+                "execution",
+                "turn_status",
+                "execution_path",
+                "interrupt"
+            ]
+        );
+
+        let agent = values
+            .first()
+            .ok_or_else(|| "agent event missing".to_string())?;
+        for (pointer, expected) in [
+            ("/event/stream_id", "stream-1"),
+            ("/event/run_id", "run-1"),
+            ("/event/turn_id", "turn-1"),
+            ("/event/execution_id", "execution-1"),
+            ("/event/parent_event_id", "parent-1"),
+            ("/event/payload/type", "tool_result"),
+            ("/event/payload/data/result/error", "timed out"),
+        ] {
+            assert_eq!(
+                agent.pointer(pointer).and_then(serde_json::Value::as_str),
+                Some(expected)
+            );
+        }
+
+        let execution = values
+            .get(1)
+            .ok_or_else(|| "execution event missing".to_string())?;
+        for (pointer, expected) in [
+            ("/event/run_id", "run-1"),
+            ("/event/task_id", "task-1"),
+            ("/event/payload/artifact/path", "/tmp/full.log"),
+            ("/event/payload/artifact/sha256", "abc123"),
+        ] {
+            assert_eq!(
+                execution
+                    .pointer(pointer)
+                    .and_then(serde_json::Value::as_str),
+                Some(expected)
+            );
+        }
+        Ok(())
+    }
+
     fn test_execution_scope() -> crate::workspace::WorkspaceExecutionScope {
         crate::workspace::WorkspaceExecutionScope::workspace(
             &crate::workspace::WorkspaceId::from_name("test"),

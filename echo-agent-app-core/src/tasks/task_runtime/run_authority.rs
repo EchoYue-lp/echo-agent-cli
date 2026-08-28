@@ -152,6 +152,8 @@ pub(crate) struct RunAuthority {
     reconcile_next_append_unconfirmed: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_next_durability_probe: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    full_replay_requests: std::sync::atomic::AtomicUsize,
 }
 
 pub(crate) struct RunBatchAppendReceipt {
@@ -340,6 +342,8 @@ impl RunAuthority {
                             ),
                             #[cfg(test)]
                             fail_next_durability_probe: std::sync::atomic::AtomicBool::new(false),
+                            #[cfg(test)]
+                            full_replay_requests: std::sync::atomic::AtomicUsize::new(0),
                         });
                         authority.validate_run_id(expected_run_id)?;
                         Ok(authority)
@@ -880,6 +884,11 @@ impl RunAuthority {
         &self,
         after_sequence: u64,
     ) -> Result<Vec<RuntimeTaskEvent>, ShadowError> {
+        #[cfg(test)]
+        if after_sequence == 0 {
+            self.full_replay_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         let guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let state = guard
             .as_ref()
@@ -1284,6 +1293,18 @@ impl RunAuthority {
             .unwrap_or_else(|error| error.into_inner())
             .as_ref()
             .map_or(0, |state| state.history.fallback_replay_count_for_test())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_full_replay_requests_for_test(&self) {
+        self.full_replay_requests
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_replay_requests_for_test(&self) -> usize {
+        self.full_replay_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) fn begin_invalidate(path: &Path) -> Result<RunInvalidationGuard, ShadowError> {

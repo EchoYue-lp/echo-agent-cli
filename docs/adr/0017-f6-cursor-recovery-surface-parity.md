@@ -25,7 +25,7 @@ OpenAI Codex Thread/Turn/Item 事件边界和 Claude Code durable identity/check
 | ordinary chat replay | `ChatEventLog` cursor | live；它是 turn event stream，不是 Agent-control wait 的重复 authority |
 | channel input lifecycle cursor | `ConversationInputService` queue revision | live；它跟踪 transport ingress receipt，不是 Conversation Agent inbox cursor |
 | GUI/TUI/CLI/JSONL/channel | canonical `ChatDriverEvent` / `ChatEventEnvelope` | runtime renderer 各异，但没有独立 terminal authority |
-| 原静态 surface matrix | `surface_contract.rs` test-only evidence | 保留并增加同一 durable fixture 的可执行 replay |
+| 原静态 surface matrix | prose-only test scaffolding，已删除 | 同一 durable fixture 的可执行 replay 归属 `f6_contracts.rs` |
 
 盘点没有发现第二套生产 Agent wait store、boot reconciler 或 surface terminal 状态机。旧 F0
 characterization 中“cursor wait 尚待后续”的注释已经过期；保留其对
@@ -71,7 +71,8 @@ characterization 中“cursor wait 尚待后续”的注释已经过期；保留
 - TaskSubagent cursor 跨 `TaskRuntimeStore` reopen、exact release 单次交付、无 active boundary/receipt；
 - cold/unloaded Conversation address、foreign workspace fail-closed、delete/recreate generation rejection；
 - disk boot reconcile 跨两次 process generation 只恢复一次；
-- `surface_contract.rs` 使用同一持久 fixture 验证 GUI/TUI/CLI/JSONL/channel typed terminal 对等。
+- `f6_contracts::interactive_surfaces_replay_one_canonical_fixture_without_terminal_inference`
+  使用同一持久 fixture 验证 GUI/TUI/CLI/JSONL/channel typed terminal 对等，并可按完整测试名直接运行。
 
 提交前运行 focused F6 tests、surface contract tests、`cargo fmt --all -- --check` 和相关 app-core
 check；最终 workspace/all-feature 门禁由本轮总集成冻结点统一执行。

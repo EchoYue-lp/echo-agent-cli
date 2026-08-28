@@ -2874,6 +2874,46 @@ mod tests {
     }
 
     #[test]
+    fn runtime_event_wire_contract_preserves_cron_terminal_facts() -> Result<(), String> {
+        let event = RuntimeTaskEvent {
+            seq: 9,
+            run_id: "cron-run-1".to_string(),
+            task_id: Some("task-1".to_string()),
+            step_id: Some("execution-1".to_string()),
+            event_type: RuntimeEventKind::TaskFailed,
+            payload: serde_json::json!({
+                "conversation_id": "cron:daily-summary",
+                "category": "provider",
+                "error": "stream setup failed",
+                "recovery": "retry",
+                "artifact": {
+                    "path": "/tmp/cron.log",
+                    "sha256": "def456",
+                    "available": true
+                }
+            }),
+            timestamp: Utc::now(),
+        };
+        let value = serde_json::to_value(event).map_err(|error| error.to_string())?;
+        for (pointer, expected) in [
+            ("/seq", "9"),
+            ("/run_id", "cron-run-1"),
+            ("/task_id", "task-1"),
+            ("/step_id", "execution-1"),
+            ("/event_type", "task_failed"),
+            ("/payload/error", "stream setup failed"),
+            ("/payload/artifact/path", "/tmp/cron.log"),
+            ("/payload/artifact/sha256", "def456"),
+        ] {
+            assert_eq!(
+                value.pointer(pointer).and_then(serde_json::Value::as_str),
+                Some(expected)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn event_sequence_accepts_string_and_lossless_integer_forms() -> Result<(), String> {
         for (encoded, expected) in [
             (r#"{"seq":42}"#, 42_i64),

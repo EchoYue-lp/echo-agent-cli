@@ -55,8 +55,6 @@ pub mod state;
 pub mod structured_extraction;
 pub mod subagent_loader;
 pub mod subagent_prompt;
-#[cfg(test)]
-mod surface_contract;
 pub mod tasks;
 pub mod terminal;
 pub mod tool_execution;

@@ -670,6 +670,25 @@ impl FileTaskShadow {
     }
 
     #[cfg(test)]
+    pub(crate) fn reset_full_replay_requests_for_test(
+        &self,
+        run_id: &str,
+    ) -> Result<(), ShadowError> {
+        let authority = self
+            .authority(run_id, false)?
+            .ok_or_else(|| ShadowError::Io(format!("TaskRuntime run not found: {run_id}")))?;
+        authority.reset_full_replay_requests_for_test();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_replay_requests_for_test(&self, run_id: &str) -> Result<usize, ShadowError> {
+        self.authority(run_id, false)?
+            .map(|authority| authority.full_replay_requests_for_test())
+            .ok_or_else(|| ShadowError::Io(format!("TaskRuntime run not found: {run_id}")))
+    }
+
+    #[cfg(test)]
     fn cached_authority_count_for_test(&self) -> usize {
         self.state
             .lock()

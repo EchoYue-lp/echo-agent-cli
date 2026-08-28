@@ -28,6 +28,16 @@
 //! The framework already re-exports a `TaskEvent` from `echo_agent::tasks`.
 //! To avoid shadowing, this module's event type is named `RuntimeTaskEvent`
 //! and its event-kind enum is `RuntimeEventKind`.
+//!
+//! Raw journal and file-store adapters are deliberately not public bypasses:
+//!
+//! ```compile_fail
+//! use echo_agent_app_core::tasks::task_runtime::file_shadow::FileTaskShadow;
+//! ```
+//!
+//! ```compile_fail
+//! use echo_agent_app_core::tasks::task_runtime::file_store::FileTaskStore;
+//! ```
 pub mod boot_reconciler;
 pub mod command_cells;
 pub mod compact_context;
@@ -36,6 +46,8 @@ pub mod continuation;
 pub mod event_rebuild;
 pub mod execution_target;
 pub mod executor;
+// External consumers must use TaskRuntimeStore so mutation receipts and
+// recovery remain authoritative.
 pub(crate) mod file_shadow;
 pub(crate) mod file_store;
 mod history_projection;
@@ -56,9 +68,6 @@ pub mod task_tools;
 pub(crate) mod turn_lifecycle;
 pub mod types;
 pub mod worktree;
-
-#[cfg(test)]
-mod long_horizon_contracts;
 
 pub use boot_reconciler::{TaskRunBootOutcome, TaskRunBootReconciler};
 pub use command_cells::{AwaiterSurfaceProjection, project_awaiter_surface_event};
