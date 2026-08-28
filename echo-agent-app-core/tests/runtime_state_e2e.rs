@@ -61,10 +61,12 @@ async fn create_runtime_state_store_creates_file_dir() -> Result<(), String> {
 }
 
 #[tokio::test]
-async fn create_agent_threads_state_store_and_conversation_id() {
-    let tmp = tempfile::tempdir().unwrap();
-    let store: Arc<dyn RuntimeStateStore> =
-        Arc::new(FileRuntimeStateStore::new(tmp.path()).unwrap());
+async fn create_agent_threads_state_store_and_conversation_id() -> Result<(), String> {
+    let tmp = tempfile::tempdir().map_err(|error| format!("create temp directory: {error}"))?;
+    let store: Arc<dyn RuntimeStateStore> = Arc::new(
+        FileRuntimeStateStore::new(tmp.path())
+            .map_err(|error| format!("create file runtime state store: {error}"))?,
+    );
 
     let params = AgentCreateParams {
         model: Some("test-model".to_string()),
@@ -85,7 +87,7 @@ async fn create_agent_threads_state_store_and_conversation_id() {
     let app_config = make_app_config();
     let agent = infra::create_agent(&params, &app_config)
         .await
-        .expect("create_agent should succeed in e2e test — check model/provider config");
+        .map_err(|error| format!("create_agent should succeed in e2e test: {error}"))?;
 
     assert!(
         agent.state_store().is_some(),
@@ -96,10 +98,11 @@ async fn create_agent_threads_state_store_and_conversation_id() {
         Some("conv-xyz"),
         "conversation_id must be threaded through create_agent into AgentConfig"
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn create_agent_without_explicit_state_store_uses_product_default() {
+async fn create_agent_without_explicit_state_store_uses_product_default() -> Result<(), String> {
     let params = AgentCreateParams {
         model: Some("test-model".to_string()),
         system_prompt: Some("base".to_string()),
@@ -119,7 +122,7 @@ async fn create_agent_without_explicit_state_store_uses_product_default() {
     let app_config = make_app_config();
     let agent = infra::create_agent(&params, &app_config)
         .await
-        .expect("create_agent should succeed in e2e test — check model/provider config");
+        .map_err(|error| format!("create_agent should succeed in e2e test: {error}"))?;
 
     assert!(
         agent.state_store().is_some(),
@@ -129,10 +132,11 @@ async fn create_agent_without_explicit_state_store_uses_product_default() {
         agent.conversation_id().is_none(),
         "conversation_id stays None when caller doesn't supply one"
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn memory_context_suffix_lands_in_system_prompt() {
+async fn memory_context_suffix_lands_in_system_prompt() -> Result<(), String> {
     let unique = "ZZZ_TEST_MEMORY_CONTEXT_MARKER_QQQ";
     let suffix = format!("\n\n## Test memory\n{unique}\n");
 
@@ -155,7 +159,7 @@ async fn memory_context_suffix_lands_in_system_prompt() {
     let app_config = make_app_config();
     let agent = infra::create_agent(&params, &app_config)
         .await
-        .expect("create_agent should succeed in e2e test — check model/provider config");
+        .map_err(|error| format!("create_agent should succeed in e2e test: {error}"))?;
 
     let prompt = agent.system_prompt();
     assert!(
@@ -163,6 +167,7 @@ async fn memory_context_suffix_lands_in_system_prompt() {
         "system prompt must contain the memory_context_suffix marker. \
          prompt was: {prompt}"
     );
+    Ok(())
 }
 
 #[tokio::test]
