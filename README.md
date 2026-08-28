@@ -55,7 +55,7 @@ echo-agent-cli/
 │       ├── workspace/      # 工作区管理
 │       ├── conversation_projection.rs  # 会话 UI 投影 DTO
 │       ├── project/        # 项目上下文、编码循环
-│       ├── output/         # 输出渲染（Markdown、主题、语法高亮）
+│       ├── output/         # REPL ANSI 输出
 │       ├── scheduler/      # 定时任务调度
 │       ├── skills_hub/     # 技能市场
 │       ├── webhook/        # Webhook 事件回调
@@ -390,8 +390,6 @@ namespace 或组件路径声明。旧 `.echo-plugin/manifest.yaml` 不再支持�
 | `/sessions [query]` | `ss`    | 从 canonical ConversationStore 列出或搜索会话 |
 | `/export`           |         | 导出会话                                      |
 | `/profile`          | `prof`  | 配置档案管理                                  |
-| `/theme`            |         | 切换主题                                      |
-| `/output`           |         | 切换输出格式                                  |
 | `/verbose`          |         | 切换详细模式                                  |
 | `/doctor`           | `doc`   | 诊断配置问题                                  |
 | `/delegate`         | `dl`    | 委托子 Agent                                  |
@@ -511,14 +509,12 @@ echo-agent (AI Agent 框架)
 - 逐事件通过 channel 发送
 - 返回基于 channel 接收端的流，避免返回时持有锁
 
-### 主题系统
+### 界面配色
 
-统一 TUI 的 `ColorTheme` 和 GUI 的主题：
-
-- `ColorTheme` 提供 6 种内置主题（dark、light、monokai、solarized、dracula、one-dark）
-- TUI 通过 `Theme::from_color_theme()` 从 `ColorTheme` 生成
-- GUI 使用 CSS 变量支持亮色/暗色主题切换
-- 支持运行时切换主题（`/theme` 命令）
+- REPL 使用稳定的 ANSI 终端配色。
+- TUI 使用自己的 ratatui 深色/浅色 palette。
+- GUI 使用 CSS 变量管理界面配色。
+- 不提供只修改显示文案、却不改变渲染状态的伪主题命令。
 
 ### 后台任务
 

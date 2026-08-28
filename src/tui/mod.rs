@@ -111,15 +111,6 @@ impl Theme {
         }
     }
 
-    /// Create a Theme from a CLI ColorTheme, unifying both theme systems.
-    pub fn from_color_theme(ct: &echo_agent_app_core::output::theme::ColorTheme) -> Self {
-        if ct.name == "light" {
-            Self::light()
-        } else {
-            Self::dark()
-        }
-    }
-
     /// Apply a plugin theme's semantic colors to the TUI palette.
     pub fn from_plugin_theme(
         definition: &echo_agent_app_core::plugin_runtime::PluginThemeDefinition,
@@ -1777,8 +1768,7 @@ mod state_tests {
     use ratatui::style::Color;
 
     fn app() -> TuiApp {
-        let theme =
-            Theme::from_color_theme(&echo_agent_app_core::output::theme::ColorTheme::dark());
+        let theme = Theme::dark();
         TuiApp::new("test-model".to_string(), "test".to_string(), theme)
     }
 
@@ -2012,9 +2002,7 @@ pub async fn run_tui(
     app_state: std::sync::Arc<echo_agent_app_core::state::AppState>,
     inline_mode: bool,
 ) -> anyhow::Result<()> {
-    // Use ColorTheme to generate Theme, unifying both theme systems.
-    let color_theme = echo_agent_app_core::output::theme::ColorTheme::dark();
-    let theme = Theme::from_color_theme(&color_theme);
+    let theme = Theme::dark();
 
     // Create the RAII guard — redirects stderr + sets up terminal.
     let _guard = TerminalGuard::new(inline_mode);

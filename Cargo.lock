@@ -1571,16 +1571,13 @@ dependencies = [
  "notify",
  "nu-ansi-term",
  "portable-pty",
- "pulldown-cmark",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
  "similar",
- "syntect",
  "tempfile",
- "terminal_size",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
@@ -1637,7 +1634,6 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-shell",
  "tempfile",
- "terminal_size",
  "textwrap",
  "tokio",
  "tokio-util",
@@ -6723,16 +6719,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "terminal_size"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21bebf2b7c9e0a515f6e0f8c51dc0f8e4696391e6f1ff30379559f8365fb0df7"
-dependencies = [
- "rustix 0.38.44",
- "windows-sys 0.48.0",
 ]
 
 [[package]]

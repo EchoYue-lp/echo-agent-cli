@@ -7289,8 +7289,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn app() -> TuiApp {
-        let theme =
-            Theme::from_color_theme(&echo_agent_app_core::output::theme::ColorTheme::dark());
+        let theme = Theme::dark();
         TuiApp::new("test-model".to_string(), "test".to_string(), theme)
     }
 

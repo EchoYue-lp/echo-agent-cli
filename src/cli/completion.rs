@@ -54,8 +54,6 @@ impl EnhancedCompleter {
                 "/save",
                 "/sessions",
                 "/ss",
-                "/theme",
-                "/output",
                 "/verbose",
                 "/inspect",
                 "/export",
@@ -122,33 +120,6 @@ impl EnhancedCompleter {
                 .collect();
         }
 
-        // /theme 后补全主题名
-        if input.starts_with("/theme ") {
-            let prefix = input.split_whitespace().last().unwrap_or("");
-            return [
-                "dark",
-                "light",
-                "monokai",
-                "solarized",
-                "dracula",
-                "one-dark",
-            ]
-            .iter()
-            .filter(|t| t.starts_with(prefix))
-            .map(|s| s.to_string())
-            .collect();
-        }
-
-        // /output 后补全输出格式
-        if input.starts_with("/output ") {
-            let prefix = input.split_whitespace().last().unwrap_or("");
-            return ["text", "json", "markdown", "table"]
-                .iter()
-                .filter(|f| f.starts_with(prefix))
-                .map(|s| s.to_string())
-                .collect();
-        }
-
         Vec::new()
     }
 }
@@ -162,7 +133,7 @@ impl Completer for EnhancedCompleter {
             return Vec::new();
         }
 
-        // Pass full prefix for context-aware completion (e.g. "/theme dar")
+        // Pass the full prefix for context-aware completion (for example, `/model qw`).
         let candidates = self.get_candidates(prefix.trim());
 
         let start = pos.saturating_sub(text.len());
@@ -230,19 +201,5 @@ mod tests {
         completer.model_names.insert("qwen3.5-plus".to_string());
         let candidates = completer.get_candidates("/model qw");
         assert_eq!(candidates, vec!["qwen3.5-plus"]);
-    }
-
-    #[test]
-    fn test_theme_completion() {
-        let completer = EnhancedCompleter::new();
-        let candidates = completer.get_candidates("/theme dar");
-        assert!(candidates.contains(&"dark".to_string()));
-    }
-
-    #[test]
-    fn test_output_completion() {
-        let completer = EnhancedCompleter::new();
-        let candidates = completer.get_candidates("/output js");
-        assert!(candidates.contains(&"json".to_string()));
     }
 }

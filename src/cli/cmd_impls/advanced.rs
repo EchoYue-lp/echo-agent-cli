@@ -1,4 +1,4 @@
-//! Advanced slash commands — export, profiles, themes, and diagnostics.
+//! Advanced slash commands — export, profiles, and diagnostics.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use std::sync::Arc;
@@ -75,42 +75,6 @@ cmd!(
     CommandCategory::Profiles,
     "Manage configuration profiles",
     cmd_profile
-);
-
-// ── ThemeCommand ──────────────────────────────────────────────────────
-
-async fn cmd_theme(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    if let Some(t) = args.first() {
-        println!("Theme set to: {t}");
-    } else {
-        println!("Available themes: dark, light, auto");
-    }
-    CommandOutcome::Continue
-}
-cmd!(
-    ThemeCommand,
-    "theme",
-    CommandCategory::Output,
-    "Switch color theme",
-    cmd_theme
-);
-
-// ── OutputCommand ─────────────────────────────────────────────────────
-
-async fn cmd_output(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    if let Some(f) = args.first() {
-        println!("Output format: {f}");
-    } else {
-        println!("Formats: text, json, markdown, table");
-    }
-    CommandOutcome::Continue
-}
-cmd!(
-    OutputCommand,
-    "output",
-    CommandCategory::Output,
-    "Set output format",
-    cmd_output
 );
 
 // ── VerboseCommand ────────────────────────────────────────────────────
@@ -318,8 +282,6 @@ cmd!(
 pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(ExportCommand));
     registry.register(Arc::new(ProfileCommand));
-    registry.register(Arc::new(ThemeCommand));
-    registry.register(Arc::new(OutputCommand));
     registry.register(Arc::new(VerboseCommand));
     registry.register(Arc::new(CronCommand));
     registry.register(Arc::new(DoctorCommand));
@@ -348,5 +310,7 @@ mod tests {
             registry.get("sessions").map(|command| command.name()),
             Some("sessions")
         );
+        assert!(registry.get("theme").is_none());
+        assert!(registry.get("output").is_none());
     }
 }
