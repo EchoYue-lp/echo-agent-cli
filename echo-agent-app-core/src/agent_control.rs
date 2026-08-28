@@ -1702,6 +1702,17 @@ impl Tool for AgentControlTool {
             },
             "additionalProperties": false
         });
+        let conversation_target_schema = json!({
+            "type": "object",
+            "description": "Conversation source target.",
+            "required": ["workspace_id", "conversation_id"],
+            "properties": {
+                "workspace_id": {"type":"string"},
+                "conversation_id": {"type":"string"},
+                "workspace_generation": {"type":"string"}
+            },
+            "additionalProperties": false
+        });
         match self.operation {
             AgentControlOperation::List => json!({
                 "type":"object",
@@ -1728,7 +1739,7 @@ impl Tool for AgentControlTool {
                     "message_id":{"type":"string","maxLength":128},
                     "correlation_id":{"type":"string","maxLength":128},
                     "delivery":{"type":"string","enum":["live","next_attempt"]},
-                    "from":target_schema
+                    "from":conversation_target_schema
                 },
                 "required":["target","text"],
                 "additionalProperties":false
@@ -2441,6 +2452,24 @@ mod tests {
                 .map_err(|error| format!("{name} schema is invalid: {error}"))?;
             assert!(!tool.description().is_empty());
         }
+        let message_schema =
+            AgentControlTool::new(Arc::clone(&service), AgentControlOperation::Message)
+                .parameters();
+        let message_validator = jsonschema::validator_for(&message_schema)
+            .map_err(|error| format!("agent_message schema is invalid: {error}"))?;
+        let valid_source = json!({
+            "target": {
+                "type": "conversation",
+                "workspace_id": "global",
+                "conversation_id": "target"
+            },
+            "text": "hello",
+            "from": {
+                "workspace_id": "global",
+                "conversation_id": "source"
+            }
+        });
+        assert!(message_validator.validate(&valid_source).is_ok());
         Ok(())
     }
 }

@@ -50,6 +50,21 @@ Last updated: 2026-08-28
   Conversation/TaskSubagent target 分流、exact-once message、attempt/revision/generation
   fail-closed 与 cursor wait 均复用既有 AgentRouter/SubagentControl/TaskRuntime authority；
   `agent_tool` 仍是唯一一次性 Subagent dispatch 入口。
+- P0 F2/F3 integration checkpoint 已完成：framework bounded `task_list` producer、CLI
+  revisioned Task graph/Todo projection 与 Agent control tools 已按 framework-first 顺序合流；
+  F2 ADR 保留 0015，Agent control ADR 为 0016，Rust 真理源已生成唯一 DTO snapshot。`InteractionMode`
+  仍保留且未改名/删除；F4 的唯一输入是本 integration checkpoint 的 clean local baseline，
+  不在本阶段实施 mode 删除。F2 paused-row affordance、F3 schema/truncated/interrupt metadata
+  与底层 full-vector query 仍按各 ADR 标记为后续 Minor/R1/P0 residual。
+- 本 checkpoint 采用大重构期间的 focused validation：Task projection/order、Agent control schema、
+  generated DTO、fmt、相关 Rust/TypeScript tests 必须通过。framework
+  `cargo test --workspace --all-targets --all-features --locked`、CLI
+  `cargo test --workspace --all-features --locked`、完整 GUI/frontend aggregate matrix，以及
+  10k/100k、长时 soak 和 Final Gate 经用户批准统一延期到整个重构完成后执行；这些命令当前
+  状态是 deferred，不是 passed。延期原因是 F4 之后工具/surface 合同仍会变化，且重复全量 Rust
+  构建曾将独立 integration target 推到 20-29 GiB 并耗尽系统盘。一次 framework
+  `--all-targets` 尝试曾误执行 10k/100k benchmark 并输出结果，整个命令随后以 exit 130
+  中断；这是执行范围偏差，结果不计作验收证据。
 - Public framework boundary：EKO 配置已由 app-core `EkoConfig` 独立拥有，permission mode 在
   app state/pool/framework 间全程 typed 且 DTO 八变体无损 round-trip；CLI/app-core 直接
   `echo_core` 依赖与源码引用均为 0。产品 data root、Theme/Monitor/OutputStyle、coding
@@ -132,10 +147,10 @@ TUI、CLI、channel 与 frontend 门禁按精确 child pair 执行；GitHub work
 
 ## 下一步
 
-Extension Control Authority 已完成。当前先完成三仓 release fix-forward：framework 已发布
-`9f8d723`，CLI 以该 SHA 完成本地集成门禁并发布新的 child commit，随后 website 同步公开文档事实
-与最终 revision。三个 child 的本地门禁和远端引用确认后更新顶层 gitlink；远端 CI 失败统一留到
-Final Integration Gate，不在此阶段阻塞功能开发，也不应提前删除 `InteractionMode`。
+F2/F3 focused integration baseline 冻结后，唯一下一阶段是 F4：以该 clean local CLI SHA 和
+framework `302453b` 为输入，单独收敛并删除 `InteractionMode`。F4 不夹带 F5/F6、release、push、
+gitlink 或 Final Gate；完整 workspace/GUI/frontend、10k/100k 与长时 soak 继续延期到整个重构
+完成后的统一验证阶段。
 
 TaskRuntime async surface 已统一复用进程共享的 bounded `TaskRuntimeBlockingAdapter`，并以
 ts-rs typed receipts 替代 GUI mutation 的 `serde_json::Value`/numeric interaction mode。

@@ -9,6 +9,11 @@ import type { SubagentControlStatus } from './SubagentControlStatus';
  */
 export type SubagentControlReceipt = {
   identity: SubagentControlIdentity;
+  /**
+   * True when the durable command already existed and this call replayed
+   * its authoritative receipt rather than appending a second command.
+   */
+  duplicate: boolean;
   status: SubagentControlStatus;
   phase: SubagentControlPhase;
   outcome: SubagentControlOutcome | null;
