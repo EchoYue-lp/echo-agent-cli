@@ -5671,15 +5671,31 @@ async fn handle_slash_command(
             });
         }
         Some(SlashCommand::Tools) => {
-            let tools = agent.read(|value| value.tool_names()).await;
-            app.tool_count = tools.len();
+            let content = match app.app_state.as_ref() {
+                Some(state) => {
+                    app.tool_count = state
+                        .get_tool_infos(agent)
+                        .await
+                        .map(|infos| infos.len())
+                        .unwrap_or_default();
+                    echo_agent_app_core::tool_control::execute_tool_control_command(
+                        state, agent, args,
+                    )
+                    .await
+                }
+                None => {
+                    let tools = agent.read(|value| value.tool_names()).await;
+                    app.tool_count = tools.len();
+                    if tools.is_empty() {
+                        "No tools registered.".to_string()
+                    } else {
+                        format!("Registered tools ({}):\n{}", tools.len(), tools.join("\n"))
+                    }
+                }
+            };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
-                content: if tools.is_empty() {
-                    "No tools registered.".to_string()
-                } else {
-                    format!("Available tools ({}):\n{}", tools.len(), tools.join("\n"))
-                },
+                content,
             });
         }
         Some(SlashCommand::Tasks) => {

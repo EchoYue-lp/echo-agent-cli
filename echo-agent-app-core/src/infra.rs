@@ -227,9 +227,46 @@ pub struct AgentModelConsumers {
     inherited_generation: Arc<tokio::sync::RwLock<SubagentRuntimeGeneration>>,
     registry: Arc<echo_agent::agent::subagent::SubagentRegistry>,
     inherited_factories: Arc<Vec<InheritedSubagentFactory>>,
+    tool_control_handles: Arc<Vec<AgentHandle>>,
+    disabled_tools_projection: Arc<tokio::sync::RwLock<Option<std::collections::HashSet<String>>>>,
 }
 
 impl AgentModelConsumers {
+    pub(crate) async fn apply_disabled_tools(
+        &self,
+        disabled_tools: Option<std::collections::HashSet<String>>,
+    ) {
+        *self.disabled_tools_projection.write().await = disabled_tools.clone();
+        for handle in self.tool_control_handles.iter() {
+            let disabled_tools = disabled_tools.clone();
+            handle
+                .read(|agent| agent.set_disabled_tools(disabled_tools))
+                .await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn tool_control_is_projected_for_test(&self, name: &str) -> bool {
+        let projection_contains = self
+            .disabled_tools_projection
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|disabled| disabled.contains(name));
+        if !projection_contains || self.tool_control_handles.is_empty() {
+            return false;
+        }
+        for handle in self.tool_control_handles.iter() {
+            if !crate::tool_control::snapshot_disabled_tools(handle)
+                .await
+                .contains(name)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     async fn publish_inherited_generation(
         &self,
         runtime: &model_config::ModelRuntimeConfig,
@@ -901,6 +938,7 @@ async fn register_default_subagents(
     }
 
     let inherited_generation = Arc::new(tokio::sync::RwLock::new(parent_generation.clone()));
+    let disabled_tools_projection = Arc::new(tokio::sync::RwLock::new(None));
     let mut built_subagents: Vec<BuiltSubagent> = Vec::with_capacity(subagents.len());
     for subagent_def in subagents {
         // Sprint 9: register BOTH readonly and writer subagents. Readonly subagents
@@ -983,6 +1021,7 @@ async fn register_default_subagents(
         };
         match build_result {
             Ok(subagent) => {
+                subagent.set_disabled_tools(disabled_tools_projection.read().await.clone());
                 subagent.set_tool_output_artifacts(tool_output_artifacts.clone());
                 crate::tasks::task_runtime::compact_context::install_task_context_protection(
                     &subagent,
@@ -1068,6 +1107,7 @@ async fn register_default_subagents(
                 let factory_system_prompt = compiled_system.system_prompt.clone();
                 let factory_prompt_compiler = prompt_compiler.clone();
                 let factory_subagent_registry = subagent_registry.clone();
+                let factory_disabled_tools = Arc::clone(&disabled_tools_projection);
                 let fork_factory = Arc::new(FnAgentFactory::new(
                     move || -> BoxFuture<'static, echo_agent::error::Result<Box<dyn Agent>>> {
                         let subagent_def = factory_def.clone();
@@ -1082,6 +1122,7 @@ async fn register_default_subagents(
                         let system_prompt = factory_system_prompt.clone();
                         let prompt_compiler = factory_prompt_compiler.clone();
                         let subagent_registry = factory_subagent_registry.clone();
+                        let disabled_tools = Arc::clone(&factory_disabled_tools);
                         Box::pin(async move {
                             let model_generation = model_binding.snapshot().await;
                             let max_iterations = subagent_def.max_turns.unwrap_or(0);
@@ -1139,6 +1180,7 @@ async fn register_default_subagents(
                                     run_code_available,
                                 )?
                             };
+                            subagent.set_disabled_tools(disabled_tools.read().await.clone());
                             subagent.set_tool_output_artifacts(tool_output_artifacts);
                             if subagent_def.can_delegate {
                                 let definitions = catalog_registry.list_available().await;
@@ -1211,10 +1253,16 @@ async fn register_default_subagents(
             factory: built.fork_factory.clone(),
         })
         .collect();
+    let tool_control_handles = built_subagents
+        .iter()
+        .map(|built| built.handle.clone())
+        .collect();
     AgentModelConsumers {
         inherited_generation,
         registry: subagent_registry,
         inherited_factories: Arc::new(inherited_factories),
+        tool_control_handles: Arc::new(tool_control_handles),
+        disabled_tools_projection,
     }
 }
 

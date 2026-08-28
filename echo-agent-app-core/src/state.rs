@@ -23,13 +23,6 @@ use crate::workspace::registry::WorkspaceRegistry;
 
 type Result<T, E = echo_agent::error::ReactError> = std::result::Result<T, E>;
 
-/// 工具状态
-#[derive(Debug, Clone)]
-pub struct ToolState {
-    pub enabled: bool,
-    pub need_approval: bool,
-}
-
 /// Web 配置（支持热更新）
 #[derive(Debug, Clone)]
 pub struct WebConfig {
@@ -479,9 +472,8 @@ struct PreparedModelMutation {
     deleted: bool,
 }
 
-/// 会话状态：工具状态、非聊天操作取消和前台 turn 控制。
+/// 会话状态：非聊天操作取消和前台 turn 控制。
 pub struct SessionState {
-    pub tool_states: RwLock<HashMap<String, ToolState>>,
     /// Cancellation registry for non-chat operations such as analysis jobs.
     pub analysis_runs: Arc<crate::product_data_io::AnalysisRunSupervisor>,
     pub product_data_io: crate::product_data_io::ProductDataIoService,
@@ -1397,6 +1389,8 @@ pub struct AppState {
     pub skills_hub: Arc<RwLock<crate::skills_hub::SkillsHub>>,
     /// Sole product authority for extension mutations across every surface.
     pub extension_control: Arc<crate::extension_control::ExtensionControlService>,
+    /// Sole EKO authority for direct-user per-tool visibility choices.
+    pub tool_control: Arc<crate::tool_control::ToolControlService>,
     /// Shared memory review integration for GUI/IPC paths that write real memory.
     pub review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
     /// Process-level shared plugin runtime (P0-4). `None` until bootstrap
@@ -1515,7 +1509,6 @@ impl AppState {
                 model_mutation_admission_open: std::sync::atomic::AtomicBool::new(true),
             },
             session: SessionState {
-                tool_states: RwLock::new(HashMap::new()),
                 analysis_runs: Arc::new(crate::product_data_io::AnalysisRunSupervisor::default()),
                 product_data_io: product_data_io.clone(),
                 foreground_turns: crate::foreground_turn::ForegroundTurnControl::default(),
@@ -1617,6 +1610,7 @@ impl AppState {
             extension_control: Arc::new(
                 crate::extension_control::ExtensionControlService::default(),
             ),
+            tool_control: Arc::new(crate::tool_control::ToolControlService::default()),
             review_integration: None,
             plugin_runtime: None,
             config_watcher: None,
@@ -2273,6 +2267,7 @@ impl AppState {
         if let Some(store) = self.tasks.runtime.as_ref() {
             self.attach_task_execution_target_resolver(store, &pool);
         }
+        self.tool_control = pool.tool_control();
         self.connection.pool = Some(pool);
     }
 
@@ -2715,32 +2710,80 @@ impl AppState {
     }
 
     /// 获取工具列表信息
-    pub async fn get_tool_infos(&self, handle: &AgentHandle) -> Vec<crate::types::ToolInfo> {
-        let tool_states = self.session.tool_states.read().await;
-
-        handle
-            .read(|agent| agent.tool_definitions())
-            .await
-            .into_iter()
-            .map(|def| {
-                let state = tool_states
-                    .get(&def.function.name)
-                    .cloned()
-                    .unwrap_or(ToolState {
-                        enabled: true,
-                        need_approval: false,
-                    });
-
-                crate::types::ToolInfo {
-                    name: def.function.name,
-                    description: def.function.description,
-                    parameters: def.function.parameters,
-                    enabled: state.enabled,
-                    need_approval: state.need_approval,
-                    source: crate::types::ToolSource::Builtin,
-                }
+    pub async fn get_tool_infos(
+        &self,
+        handle: &AgentHandle,
+    ) -> std::result::Result<Vec<crate::types::ToolInfo>, crate::tool_control::ToolControlError>
+    {
+        let policy_disabled = self.tool_control.snapshot()?.disabled_tools;
+        let (definitions, mut disabled) = handle
+            .read(|agent| {
+                let runtime = echo_agent::agent::snapshot::AgentRunSnapshot::from_agent(agent);
+                (
+                    agent.tool_definitions(),
+                    runtime.tools.disabled_tools.clone(),
+                )
             })
-            .collect()
+            .await;
+        disabled.extend(policy_disabled);
+
+        Ok(definitions
+            .into_iter()
+            .map(|def| crate::types::ToolInfo {
+                enabled: !disabled.contains(&def.function.name),
+                name: def.function.name,
+                description: def.function.description,
+                parameters: def.function.parameters,
+                source: crate::types::ToolSource::Builtin,
+            })
+            .collect())
+    }
+
+    /// Apply one direct-user tool visibility choice to every current pool.
+    /// This intentionally does not consult automated-agent permission mode.
+    pub async fn set_tool_enabled(
+        &self,
+        handle: &AgentHandle,
+        name: &str,
+        enabled: bool,
+    ) -> std::result::Result<
+        crate::tool_control::ToolControlReceipt,
+        crate::tool_control::ToolControlError,
+    > {
+        let name = name.trim();
+        let exists = handle
+            .read(|agent| agent.tool_names().iter().any(|tool| tool == name))
+            .await;
+        if !exists {
+            return Err(crate::tool_control::ToolControlError::NotRegistered {
+                name: name.to_string(),
+            });
+        }
+
+        let mutation = self.tool_control.set_enabled(name, enabled)?;
+        match self.connection.pool.as_ref() {
+            Some(pool) => pool.publish_tool_control_generation().await?,
+            None => {
+                let disabled = crate::tool_control::disabled_option(&self.tool_control.snapshot()?);
+                self.connection
+                    .primary_agent()
+                    .read(|agent| agent.set_disabled_tools(disabled))
+                    .await;
+            }
+        }
+        for (_, runtime) in self.workspace.runtimes.loaded_execution_runtimes().await {
+            runtime.pool().publish_tool_control_generation().await?;
+        }
+        let effective_enabled = self
+            .get_tool_infos(handle)
+            .await?
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .map(|tool| tool.enabled)
+            .ok_or_else(|| crate::tool_control::ToolControlError::NotRegistered {
+                name: name.to_string(),
+            })?;
+        Ok(mutation.into_receipt(effective_enabled))
     }
 
     /// 运行一次 MCP 健康检查，更新 `mcp_health` 状态
@@ -6433,6 +6476,113 @@ mod model_mutation_tests {
             assert_eq!(agent_projection(&lease.agent()).await?, expected);
         }
         assert_full_generation(&fixture, MODEL_B, "runtime-b", ENDPOINT_B, WINDOW_B).await
+    }
+
+    #[tokio::test]
+    async fn tool_control_generation_reaches_loaded_and_future_workspace_agents()
+    -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let primary = fixture.state.connection.primary_agent();
+        let tool_name = primary
+            .read(|agent| agent.tool_names().into_iter().next())
+            .await
+            .ok_or_else(|| "tool-control fixture has no registered tool".to_string())?;
+        let workspaces = tempfile::tempdir().map_err(|error| error.to_string())?;
+        for position in 0..2 {
+            let name = format!("tool-workspace-{position}");
+            let root = workspaces.path().join(&name);
+            std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+            fixture
+                .state
+                .switch_workspace(Workspace {
+                    id: crate::workspace::WorkspaceId::from_name(&name),
+                    name,
+                    root,
+                    project_root: None,
+                    kind: crate::workspace::WorkspaceKind::General,
+                    metadata: crate::workspace::WorkspaceMetadata::default(),
+                    product_data_generation: String::new(),
+                    created_at: Utc::now(),
+                    last_active: Utc::now(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+
+        let receipt = fixture
+            .state
+            .set_tool_enabled(&primary, &tool_name, false)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(receipt.changed);
+        assert_eq!(receipt.revision, 1);
+        assert!(!receipt.policy_enabled);
+        assert!(!receipt.effective_enabled);
+        let listed = fixture
+            .state
+            .get_tool_infos(&primary)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            listed
+                .iter()
+                .any(|tool| tool.name == tool_name && !tool.enabled)
+        );
+        for handle in [primary.clone(), fixture.existing.clone()] {
+            assert!(
+                crate::tool_control::snapshot_disabled_tools(&handle)
+                    .await
+                    .contains(&tool_name)
+            );
+        }
+        let future_global = fixture
+            .pool
+            .acquire("future-tool-global")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            crate::tool_control::snapshot_disabled_tools(&future_global.agent())
+                .await
+                .contains(&tool_name)
+        );
+
+        let runtimes = fixture
+            .state
+            .workspace
+            .runtimes
+            .loaded_execution_runtimes()
+            .await;
+        assert_eq!(runtimes.len(), 2);
+        for (workspace_id, runtime) in runtimes {
+            assert!(
+                crate::tool_control::snapshot_disabled_tools(&runtime.primary_agent())
+                    .await
+                    .contains(&tool_name)
+            );
+            let future = runtime
+                .pool()
+                .acquire(&format!("future-tool-{workspace_id}"))
+                .await
+                .map_err(|error| error.to_string())?;
+            assert!(
+                crate::tool_control::snapshot_disabled_tools(&future.agent())
+                    .await
+                    .contains(&tool_name)
+            );
+        }
+
+        assert!(
+            fixture
+                .state
+                .set_tool_enabled(&primary, "missing-tool", false)
+                .await
+                .is_err_and(|error| matches!(
+                    error,
+                    crate::tool_control::ToolControlError::NotRegistered { name }
+                        if name == "missing-tool"
+                ))
+        );
+        Ok(())
     }
 
     #[tokio::test]

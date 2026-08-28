@@ -2,7 +2,7 @@ import { get, post, put, del } from './client';
 import { isTauri, apiInvoke } from '../lib/tauri-bridge';
 // A-tier types that have identical generated counterparts — import from
 // generated to eliminate the same-name duplication (6-10).
-import type { SessionInfo, ContextStats, ToolInfo } from '../generated';
+import type { SessionInfo, ContextStats, ToolControlReceipt, ToolInfo } from '../generated';
 import type {
   TauriSkillInfo,
   TauriMcpServerInfo,
@@ -261,12 +261,12 @@ export const toolsApi = {
     isTauri() ? apiInvoke<ToolInfo>('get_tool', { name }) : get<ToolInfo>(`/tools/${name}`),
   enable: (name: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean }>('enable_tool', { name })
-      : post<{ success: boolean }>(`/tools/${name}/enable`),
+      ? apiInvoke<ToolControlReceipt>('enable_tool', { name })
+      : post<ToolControlReceipt>(`/tools/${name}/enable`),
   disable: (name: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean }>('disable_tool', { name })
-      : post<{ success: boolean }>(`/tools/${name}/disable`),
+      ? apiInvoke<ToolControlReceipt>('disable_tool', { name })
+      : post<ToolControlReceipt>(`/tools/${name}/disable`),
 };
 
 export const skillsApi = {

@@ -6,24 +6,21 @@ use std::sync::Arc;
 
 // ── ToolsCommand ──────────────────────────────────────────────────────
 
-async fn cmd_tools(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    ctx.agent
-        .read_async(|a| {
-            Box::pin(async move {
-                let names = a.tool_names();
-                let defs = a.tool_definitions();
-                println!("\n--- Registered Tools ({}) ---", names.len());
-                for name in &names {
-                    if let Some(def) = defs.iter().find(|d| &d.function.name == name) {
-                        let desc: String = def.function.description.chars().take(60).collect();
-                        println!("  * {} - {}", name, desc);
-                    } else {
-                        println!("  * {}", name);
-                    }
-                }
-            })
-        })
-        .await;
+async fn cmd_tools(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    if let Some(state) = ctx.app_state.as_ref() {
+        println!(
+            "{}",
+            echo_agent_app_core::tool_control::execute_tool_control_command(
+                state,
+                &ctx.agent,
+                &args.join(" "),
+            )
+            .await
+        );
+    } else {
+        let names = ctx.agent.read(|agent| agent.tool_names()).await;
+        println!("Registered tools ({}):\n{}", names.len(), names.join("\n"));
+    }
     CommandOutcome::Continue
 }
 cmd!(
@@ -31,7 +28,7 @@ cmd!(
     "tools",
     ["t"],
     CommandCategory::Info,
-    "List registered tools",
+    "List or enable/disable registered tools",
     cmd_tools
 );
 

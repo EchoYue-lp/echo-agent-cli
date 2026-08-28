@@ -57,6 +57,7 @@ pub mod subagent_loader;
 pub mod subagent_prompt;
 pub mod tasks;
 pub mod terminal;
+pub mod tool_control;
 pub mod tool_execution;
 pub mod tool_execution_projection;
 pub(crate) mod tool_exposure;

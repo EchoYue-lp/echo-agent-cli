@@ -671,6 +671,9 @@ pub struct AgentPool {
     /// Last strictly-read instruction generation. Existing and future pool
     /// agents are always projected from this same snapshot.
     instruction_projection: RwLock<Option<crate::unified_memory::InstructionProjectionSnapshot>>,
+    /// Shared EKO user policy for tool visibility. Workspace forks retain the
+    /// same service; each pool projects its generation into live/future Agents.
+    tool_control: Arc<crate::tool_control::ToolControlService>,
     /// Explicit Mock transport used only by integration tests that must fork
     /// real workspace pools without contacting an external model provider.
     #[cfg(test)]
@@ -1033,7 +1036,7 @@ impl AgentPool {
             shared,
             agents: RwLock::new(HashMap::new()),
             primary_agent: RwLock::new(Some(runtime.agent_handle.clone())),
-            primary_model_consumers: RwLock::new(None),
+            primary_model_consumers: RwLock::new(Some(runtime.model_consumers.clone())),
             mcp_config_snapshot: RwLock::new(Some(runtime.mcp_config_runtime.snapshot().await)),
             workspace_transitioning: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
@@ -1057,6 +1060,7 @@ impl AgentPool {
             tool_output_artifacts: RwLock::new(tool_output_artifacts),
             workspace_kind: RwLock::new(WorkspaceKind::General),
             instruction_projection: RwLock::new(None),
+            tool_control: Arc::new(crate::tool_control::ToolControlService::default()),
             #[cfg(test)]
             llm_client_override: RwLock::new(None),
         });
@@ -1158,6 +1162,7 @@ impl AgentPool {
             ))),
             workspace_kind: RwLock::new(kind),
             instruction_projection: RwLock::new(self.instruction_projection.read().await.clone()),
+            tool_control: crate::tool_control::shared(&self.tool_control),
             #[cfg(test)]
             llm_client_override: RwLock::new(self.llm_client_override.read().await.clone()),
         });
@@ -1318,6 +1323,7 @@ impl AgentPool {
             tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
             workspace_kind: RwLock::new(WorkspaceKind::General),
             instruction_projection: RwLock::new(None),
+            tool_control: Arc::new(crate::tool_control::ToolControlService::default()),
             #[cfg(test)]
             llm_client_override: RwLock::new(None),
         }
@@ -1817,6 +1823,58 @@ impl AgentPool {
                 })
                 .await;
         }
+    }
+
+    /// Project the current EKO tool-control generation into the primary and
+    /// every cached Agent. Runs already holding a snapshot remain unchanged;
+    /// the next run observes the new generation.
+    pub(crate) async fn publish_tool_control_generation(
+        &self,
+    ) -> Result<(), crate::tool_control::ToolControlError> {
+        let agents = self.agents.write().await;
+        // Read the authority only after publication owns the pool generation.
+        // Concurrent older publishers therefore observe the newest revision
+        // instead of overwriting a later mutation with a stale snapshot.
+        let snapshot = self.tool_control.snapshot()?;
+        let disabled = crate::tool_control::disabled_option(&snapshot);
+        let mut handles = agents
+            .values()
+            .map(|pooled| pooled.handle.clone())
+            .collect::<Vec<_>>();
+        let mut model_consumers = agents
+            .values()
+            .map(|pooled| pooled.model_consumers.clone())
+            .collect::<Vec<_>>();
+        if let Some(primary) = self.primary_agent.read().await.clone()
+            && !handles
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate.inner(), primary.inner()))
+        {
+            handles.push(primary);
+        }
+        if let Some(primary_consumers) = self.primary_model_consumers.read().await.clone() {
+            model_consumers.push(primary_consumers);
+        }
+        for handle in handles {
+            let disabled = disabled.clone();
+            handle
+                .read(|agent| agent.set_disabled_tools(disabled))
+                .await;
+        }
+        for consumers in model_consumers {
+            consumers.apply_disabled_tools(disabled.clone()).await;
+        }
+        tracing::info!(
+            revision = snapshot.revision,
+            disabled_tools = snapshot.disabled_tools.len(),
+            pooled_agents = agents.len(),
+            "AgentPool: tool-control generation published"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn tool_control(&self) -> Arc<crate::tool_control::ToolControlService> {
+        crate::tool_control::shared(&self.tool_control)
     }
 
     /// Propagate `working_dir` to all pooled agents.
@@ -2425,6 +2483,13 @@ impl AgentPool {
         }
         let permission_mode = *self.permission_mode.read().await;
         agent.set_permission_mode(permission_mode);
+        let tool_control = self
+            .tool_control
+            .snapshot()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let disabled_tools = crate::tool_control::disabled_option(&tool_control);
+        agent.set_disabled_tools(disabled_tools.clone());
+        model_consumers.apply_disabled_tools(disabled_tools).await;
 
         // 3. Install the exact plugin generation committed by PluginRuntime.
         let agent_generation = self.agent_generation.read().await.clone();
@@ -3728,6 +3793,98 @@ mod tests {
             .read(|agent| agent.get_permission_mode())
             .await;
         assert_eq!(second_mode, PermissionMode::BypassPermissions);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_control_generation_reaches_primary_existing_and_future_agents() -> TestResult {
+        let pool = create_test_pool(3, false).await?;
+        let existing = pool
+            .acquire("tool-control-existing")
+            .await
+            .map_err(|error| error.to_string())?;
+        let receipt = pool
+            .tool_control()
+            .set_enabled("shell", false)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(receipt.revision, 1);
+        pool.publish_tool_control_generation()
+            .await
+            .map_err(|error| error.to_string())?;
+
+        for handle in [
+            pool.primary_agent()
+                .await
+                .map_err(|error| error.to_string())?,
+            existing.agent(),
+        ] {
+            assert!(
+                crate::tool_control::snapshot_disabled_tools(&handle)
+                    .await
+                    .contains("shell")
+            );
+        }
+
+        let future = pool
+            .acquire("tool-control-future")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            crate::tool_control::snapshot_disabled_tools(&future.agent())
+                .await
+                .contains("shell")
+        );
+        let agents = pool.agents.read().await;
+        for pooled in agents.values() {
+            assert!(
+                pooled
+                    .model_consumers
+                    .tool_control_is_projected_for_test("shell")
+                    .await
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delayed_tool_control_publisher_cannot_overwrite_a_newer_generation() -> TestResult {
+        let pool = Arc::new(create_test_pool(3, false).await?);
+        let existing = pool
+            .acquire("tool-control-race")
+            .await
+            .map_err(|error| error.to_string())?;
+        let agents_guard = pool.agents.write().await;
+        pool.tool_control()
+            .set_enabled("shell", false)
+            .map_err(|error| error.to_string())?;
+        let delayed_pool = Arc::clone(&pool);
+        let delayed =
+            tokio::spawn(async move { delayed_pool.publish_tool_control_generation().await });
+        tokio::task::yield_now().await;
+        let latest = pool
+            .tool_control()
+            .set_enabled("read_file", false)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(latest.revision, 2);
+        drop(agents_guard);
+        delayed
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        pool.publish_tool_control_generation()
+            .await
+            .map_err(|error| error.to_string())?;
+
+        for handle in [
+            pool.primary_agent()
+                .await
+                .map_err(|error| error.to_string())?,
+            existing.agent(),
+        ] {
+            let disabled = crate::tool_control::snapshot_disabled_tools(&handle).await;
+            assert!(disabled.contains("shell"));
+            assert!(disabled.contains("read_file"));
+        }
         Ok(())
     }
 

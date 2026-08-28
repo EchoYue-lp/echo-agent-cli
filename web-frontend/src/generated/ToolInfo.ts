@@ -7,6 +7,5 @@ export type ToolInfo = {
   description: string;
   parameters: JsonValue;
   enabled: boolean;
-  need_approval: boolean;
   source: ToolSource;
 };

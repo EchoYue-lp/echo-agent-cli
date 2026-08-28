@@ -14,6 +14,7 @@ import type {
   TaskRetryReceipt,
   TaskRunControlReceipt,
   TaskRunResumeReceipt,
+  ToolControlReceipt,
   ToolInfo,
   WorkspaceTransitionReceipt,
 } from '../generated';
@@ -24,9 +25,17 @@ const serializedToolInfo = {
   description: 'Read a file',
   parameters: { type: 'object', properties: { path: { type: 'string' } } },
   enabled: true,
-  need_approval: false,
   source: 'Builtin',
 } satisfies ToolInfo;
+
+const serializedToolControlReceipt = {
+  success: true,
+  name: 'read_file',
+  policy_enabled: false,
+  effective_enabled: false,
+  changed: true,
+  revision: 1,
+} satisfies ToolControlReceipt;
 
 const serializedMcpServer = {
   name: 'local-tools',
@@ -273,8 +282,9 @@ const taskRuntimeMutationContracts = {
 describe('Rust serialization contracts', () => {
   it('consumes the generated ToolInfo wire fields', () => {
     expect(serializedToolInfo.parameters).toHaveProperty('properties.path');
-    expect(serializedToolInfo.need_approval).toBe(false);
     expectTypeOf(serializedToolInfo).toMatchTypeOf<ToolInfo>();
+    expect(serializedToolControlReceipt.revision).toBe(1);
+    expectTypeOf(serializedToolControlReceipt).toMatchTypeOf<ToolControlReceipt>();
   });
 
   it('preserves explicit nulls from Tauri projections', () => {

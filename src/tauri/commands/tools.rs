@@ -6,25 +6,30 @@ use crate::tauri::state::TauriState;
 #[tauri::command]
 pub async fn list_tools(
     state: tauri::State<'_, TauriState>,
-) -> Result<serde_json::Value, IpcError> {
-    let infos = state
+) -> Result<Vec<echo_agent_app_core::types::ToolInfo>, IpcError> {
+    let runtime = current_tool_runtime(&state).await?;
+    let agent = runtime.primary_agent();
+    state
         .app_state
-        .get_tool_infos(&state.app_state.connection.primary_agent())
-        .await;
-    serde_json::to_value(infos).map_err(|e| IpcError::Internal(e.to_string()))
+        .get_tool_infos(&agent)
+        .await
+        .map_err(tool_control_error)
 }
 
 #[tauri::command]
 pub async fn get_tool(
     state: tauri::State<'_, TauriState>,
     name: String,
-) -> Result<serde_json::Value, IpcError> {
+) -> Result<echo_agent_app_core::types::ToolInfo, IpcError> {
+    let runtime = current_tool_runtime(&state).await?;
+    let agent = runtime.primary_agent();
     let infos = state
         .app_state
-        .get_tool_infos(&state.app_state.connection.primary_agent())
-        .await;
-    match infos.iter().find(|t| t.name == name) {
-        Some(tool) => serde_json::to_value(tool).map_err(|e| IpcError::Internal(e.to_string())),
+        .get_tool_infos(&agent)
+        .await
+        .map_err(tool_control_error)?;
+    match infos.into_iter().find(|tool| tool.name == name) {
+        Some(tool) => Ok(tool),
         None => Err(IpcError::NotFound(format!("Tool '{}' not found", name))),
     }
 }
@@ -33,40 +38,45 @@ pub async fn get_tool(
 pub async fn enable_tool(
     state: tauri::State<'_, TauriState>,
     name: String,
-) -> Result<serde_json::Value, IpcError> {
-    {
-        let mut states = state.app_state.session.tool_states.write().await;
-        if let Some(s) = states.get_mut(&name) {
-            s.enabled = true;
-        }
-    }
-    let infos = state
+) -> Result<echo_agent_app_core::tool_control::ToolControlReceipt, IpcError> {
+    let runtime = current_tool_runtime(&state).await?;
+    let agent = runtime.primary_agent();
+    state
         .app_state
-        .get_tool_infos(&state.app_state.connection.primary_agent())
-        .await;
-    match infos.iter().find(|t| t.name == name) {
-        Some(tool) => serde_json::to_value(tool).map_err(|e| IpcError::Internal(e.to_string())),
-        None => Err(IpcError::NotFound(format!("Tool '{}' not found", name))),
-    }
+        .set_tool_enabled(&agent, &name, true)
+        .await
+        .map_err(tool_control_error)
 }
 
 #[tauri::command]
 pub async fn disable_tool(
     state: tauri::State<'_, TauriState>,
     name: String,
-) -> Result<serde_json::Value, IpcError> {
-    {
-        let mut states = state.app_state.session.tool_states.write().await;
-        if let Some(s) = states.get_mut(&name) {
-            s.enabled = false;
-        }
-    }
-    let infos = state
+) -> Result<echo_agent_app_core::tool_control::ToolControlReceipt, IpcError> {
+    let runtime = current_tool_runtime(&state).await?;
+    let agent = runtime.primary_agent();
+    state
         .app_state
-        .get_tool_infos(&state.app_state.connection.primary_agent())
-        .await;
-    match infos.iter().find(|t| t.name == name) {
-        Some(tool) => serde_json::to_value(tool).map_err(|e| IpcError::Internal(e.to_string())),
-        None => Err(IpcError::NotFound(format!("Tool '{}' not found", name))),
+        .set_tool_enabled(&agent, &name, false)
+        .await
+        .map_err(tool_control_error)
+}
+
+async fn current_tool_runtime(
+    state: &TauriState,
+) -> Result<echo_agent_app_core::state::ScopedChatRuntime, IpcError> {
+    state
+        .app_state
+        .current_control_runtime()
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))
+}
+
+fn tool_control_error(error: echo_agent_app_core::tool_control::ToolControlError) -> IpcError {
+    match error {
+        echo_agent_app_core::tool_control::ToolControlError::NotRegistered { name } => {
+            IpcError::NotFound(format!("Tool '{name}' not found"))
+        }
+        error => IpcError::Internal(error.to_string()),
     }
 }

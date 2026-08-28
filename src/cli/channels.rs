@@ -2622,6 +2622,22 @@ impl AppChannelMessageHandler {
         let command = parts.next()?;
         let argument = parts.next().map(str::trim).unwrap_or_default();
         match command {
+            "/tools" => {
+                let runtime = match self.app_state.current_control_runtime().await {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        return Some(format!("Workspace runtime is unavailable: {error}"));
+                    }
+                };
+                Some(
+                    echo_agent_app_core::tool_control::execute_tool_control_command(
+                        &self.app_state,
+                        &runtime.primary_agent(),
+                        argument,
+                    )
+                    .await,
+                )
+            }
             "/workflow" => Some(
                 self.app_state
                     .history

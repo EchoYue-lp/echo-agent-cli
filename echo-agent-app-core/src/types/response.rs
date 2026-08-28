@@ -86,7 +86,6 @@ pub struct ToolInfo {
     pub description: String,
     pub parameters: Value,
     pub enabled: bool,
-    pub need_approval: bool,
     pub source: ToolSource,
 }
 

@@ -25,9 +25,12 @@ export function ToolsPanel() {
 
   const toggle = async (name: string, enable: boolean) => {
     try {
-      if (enable) await toolsApi.enable(name);
-      else await toolsApi.disable(name);
-      setTools((prev) => prev.map((t) => (t.name === name ? { ...t, enabled: enable } : t)));
+      const receipt = enable ? await toolsApi.enable(name) : await toolsApi.disable(name);
+      setTools((prev) =>
+        prev.map((tool) =>
+          tool.name === receipt.name ? { ...tool, enabled: receipt.effective_enabled } : tool
+        )
+      );
     } catch (e) {
       console.error(e);
     }
@@ -72,6 +75,9 @@ export function ToolsPanel() {
               {tool.name}
             </span>
             <button
+              type="button"
+              aria-label={`${tool.enabled ? 'Disable' : 'Enable'} ${tool.name}`}
+              aria-pressed={tool.enabled}
               onClick={() => toggle(tool.name, !tool.enabled)}
               className={`relative h-5 w-9 rounded-full transition ${tool.enabled ? 'bg-[var(--accent)]' : ''}`}
               style={{ background: tool.enabled ? 'var(--accent)' : 'var(--text-tertiary)' }}
