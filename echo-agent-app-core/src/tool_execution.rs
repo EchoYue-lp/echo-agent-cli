@@ -423,8 +423,12 @@ impl ToolExecutionRepository {
         manifest.summary.finished_at = Some(finished_at);
         manifest.summary.duration_ms =
             Some(finished_at.saturating_sub(manifest.summary.started_at));
-        manifest.output_bytes =
-            stream_output_bytes(&location.stream)?.unwrap_or_else(|| result_output_bytes(result));
+        manifest.output_bytes = stream_output_bytes(&location.stream)?.unwrap_or_else(|| {
+            result.artifact.as_ref().map_or_else(
+                || u64::try_from(result_text(result).len()).unwrap_or(u64::MAX),
+                |artifact| artifact.artifact_bytes,
+            )
+        });
         manifest.result = Some(result.clone());
         write_manifest(&location.manifest, &manifest)?;
 
@@ -508,9 +512,7 @@ impl ToolExecutionRepository {
         let Some(result) = manifest.result.as_ref() else {
             return Ok(None);
         };
-        let Some(artifact) =
-            echo_agent::tools::artifact::ToolOutputArtifactRef::from_metadata(&result.metadata)
-        else {
+        let Some(artifact) = result.artifact.clone() else {
             return Ok(None);
         };
         let config = self.artifact_config_for(&artifact.path).ok_or_else(|| {
@@ -638,15 +640,13 @@ impl ToolExecutionRepository {
                 complete: false,
             });
         };
-        if let Some(artifact) =
-            echo_agent::tools::artifact::ToolOutputArtifactRef::from_metadata(&result.metadata)
-        {
+        if let Some(artifact) = result.artifact.as_ref() {
             let config = self.artifact_config_for(&artifact.path).ok_or_else(|| {
                 ToolExecutionError::ArtifactRootUnavailable(artifact.path.display().to_string())
             })?;
             let page = echo_agent::tools::files::artifact::read_artifact_page(
                 &config,
-                &artifact,
+                artifact,
                 cursor,
                 echo_agent::tools::files::artifact::ArtifactPageLimit::Bytes(
                     limit.clamp(4, DEFAULT_DETAIL_PAGE_BYTES),
@@ -996,12 +996,6 @@ fn result_text(result: &ToolResult) -> &str {
     } else {
         &result.output
     }
-}
-
-fn result_output_bytes(result: &ToolResult) -> u64 {
-    echo_agent::tools::artifact::ToolOutputArtifactRef::from_metadata(&result.metadata)
-        .map(|artifact| artifact.artifact_bytes)
-        .unwrap_or_else(|| u64::try_from(result_text(result).len()).unwrap_or(u64::MAX))
 }
 
 fn stream_path_for_manifest(manifest: &Path) -> PathBuf {

@@ -660,7 +660,7 @@ fn compact_completed_task_result(
         artifact.sha256
     );
     result.data = None;
-    artifact.extend_metadata(&mut result.metadata);
+    result.artifact = Some(artifact);
     result
         .metadata
         .insert("output_handling".to_string(), "spilled".to_string());

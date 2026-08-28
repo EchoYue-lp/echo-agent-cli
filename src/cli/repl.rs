@@ -536,21 +536,14 @@ impl ReplChatSink {
                 event: echo_agent::tools::ToolStreamEvent::Complete(result),
                 ..
             } => {
-                let Some(path) = result.metadata.get("artifact_path") else {
+                let Some(artifact) = result.artifact.as_ref() else {
                     return true;
                 };
-                let status = if std::path::Path::new(path).is_file() {
-                    "Full output artifact"
-                } else {
-                    "Full output artifact missing"
-                };
-                let size = result
-                    .metadata
-                    .get("artifact_bytes")
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .map(|bytes| format!(" ({:.1} MiB)", bytes as f64 / 1_048_576.0))
-                    .unwrap_or_default();
-                self.output.emit(format!("{status}{size}: {path}"))
+                let size = format!(" ({:.1} MiB)", artifact.artifact_bytes as f64 / 1_048_576.0);
+                self.output.emit(format!(
+                    "Full output artifact{size}: {}",
+                    artifact.path.display()
+                ))
             }
             AgentEvent::ToolStream { .. } => true,
             AgentEvent::ToolResult { name, result, .. } => {
@@ -558,7 +551,7 @@ impl ReplChatSink {
                     FILE_CHANGE_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
                 state.first_chunk = true;
-                if result.success {
+                let accepted = if result.success {
                     self.output.print_tool_result(&name, &result.output)
                 } else {
                     let error = result.error.as_deref().unwrap_or(&result.output);
@@ -574,6 +567,17 @@ impl ReplChatSink {
                     );
                     self.output
                         .emit(nu_ansi_term::Color::Red.paint(detail).to_string())
+                };
+                if !accepted {
+                    return false;
+                }
+                match result.artifact.as_ref() {
+                    Some(artifact) => self.output.emit(format!(
+                        "Full output artifact ({:.1} MiB): {}",
+                        artifact.artifact_bytes as f64 / 1_048_576.0,
+                        artifact.path.display()
+                    )),
+                    None => true,
                 }
             }
             AgentEvent::FinalAnswer(_) => {

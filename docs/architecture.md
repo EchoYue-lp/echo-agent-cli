@@ -148,6 +148,15 @@ input
    transcript。
    完整决策见 [Channel scope parity ADR](./adr/0010-channel-scope-parity.md)。
 
+### Tool result 与 artifact 投影
+
+Framework `ToolResult` 是 tool terminal 的唯一事实，完整 spill 输出通过类型化
+`ToolResult.artifact` 传递。EKO 的 `ToolExecutionRepository` 无损持久化 invocation/result，
+并在读取或向 channel 暴露 artifact 前验证 registered root、retention、文件身份、大小与摘要。
+GUI detail cursor 和 retention/cleanup 仍属于应用策略。GUI、TUI、CLI/JSONL 与 channel 不从
+metadata 重建 artifact，也不以本地路径存在性推断另一个 terminal 状态。详细取舍见
+[Typed tool artifact projection ADR](./adr/0018-typed-tool-artifact-projection.md)。
+
 ## TaskRun 数据流
 
 产品模型固定为：

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use echo_agent::agent::subagent::SubagentEvent;
-use echo_agent::tools::ToolFailure;
+use echo_agent::tools::{ToolFailure, artifact::ToolOutputArtifactRef};
 use echo_agent_app_core::chat_driver::TurnOutcome;
 use echo_agent_app_core::context_window::ContextWindowSnapshot;
 use echo_agent_app_core::conversation_input::{
@@ -323,6 +323,7 @@ enum AgentEvent {
         success: bool,
         metadata: std::collections::HashMap<String, String>,
         truncated: bool,
+        artifact: Option<ToolOutputArtifactRef>,
         failure: Option<ToolFailure>,
     },
     /// A tool execution completed.
@@ -330,6 +331,7 @@ enum AgentEvent {
         call_id: String,
         output: String,
         success: bool,
+        artifact: Option<ToolOutputArtifactRef>,
         failure: Option<ToolFailure>,
     },
     /// An error occurred.
@@ -422,6 +424,7 @@ mod tool_execution_tests {
         ToolExecutionMessage, ToolExecutionStatus, tool_command, tool_detail, tool_metadata_label,
         tool_output_tail,
     };
+    use echo_agent::tools::artifact::ToolOutputArtifactRef;
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -454,6 +457,7 @@ mod tool_execution_tests {
             log: String::new(),
             progress: None,
             truncated: false,
+            artifact: None,
             started_at: Instant::now(),
             finished_at: None,
             metadata: HashMap::new(),
@@ -504,23 +508,26 @@ mod tool_execution_tests {
     }
 
     #[test]
-    fn missing_artifact_is_visible_without_marking_tool_failed() {
+    fn typed_artifact_is_visible_without_marking_tool_failed() {
         let mut tool = execution(
             "shell",
             r#"{"command":"large-output"}"#,
             ToolExecutionStatus::Succeeded,
         );
         tool.truncated = true;
-        tool.metadata.insert(
-            "artifact_path".to_string(),
-            "/path/that/does/not/exist/tool.log".to_string(),
-        );
+        tool.artifact = Some(ToolOutputArtifactRef {
+            path: "/tool-output/tool.log".into(),
+            artifact_bytes: 1_048_576,
+            payload_bytes: 1_048_576,
+            sha256: "typed-artifact".to_string(),
+            retention: "conversation_or_30d".to_string(),
+        });
 
-        assert!(tool_metadata_label(&tool).contains("artifact missing"));
+        assert!(tool_metadata_label(&tool).contains("artifact 1.0 MiB"));
         assert!(
             tool_output_tail(&tool, 6)
                 .iter()
-                .any(|line| line.contains("full output artifact missing"))
+                .any(|line| line.contains("full output: /tool-output/tool.log"))
         );
         assert_eq!(tool.status, ToolExecutionStatus::Succeeded);
     }
@@ -730,6 +737,7 @@ pub async fn run_event_loop(
                             log: String::new(),
                             progress: None,
                             truncated: false,
+                            artifact: None,
                             started_at: Instant::now(),
                             finished_at: None,
                             metadata: std::collections::HashMap::new(),
@@ -764,6 +772,7 @@ pub async fn run_event_loop(
                     success,
                     mut metadata,
                     truncated,
+                    artifact,
                     failure,
                 } => {
                     if let Some(failure) = failure {
@@ -790,6 +799,9 @@ pub async fn run_event_loop(
                             || metadata
                                 .get("output_truncated")
                                 .is_some_and(|value| value == "true");
+                        if artifact.is_some() {
+                            tool.artifact = artifact;
+                        }
                         tool.metadata = metadata;
                     }
                     app.invalidate_messages_cache();
@@ -798,6 +810,7 @@ pub async fn run_event_loop(
                     call_id,
                     output,
                     success,
+                    artifact,
                     failure,
                 } => {
                     let mut diff_tool_name = None;
@@ -822,6 +835,9 @@ pub async fn run_event_loop(
                             ToolExecutionStatus::Failed
                         };
                         tool.finished_at = Some(Instant::now());
+                        if artifact.is_some() {
+                            tool.artifact = artifact;
+                        }
                         if tool.name == "apply_patch" {
                             diff_tool_name = Some(tool.name.clone());
                         }
@@ -3105,6 +3121,7 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                     success: result.success,
                     metadata: result.metadata,
                     truncated: result.truncated,
+                    artifact: result.artifact,
                     failure: result.failure,
                 },
                 echo_agent::agent::AgentEvent::ToolResult {
@@ -3113,6 +3130,7 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                     call_id,
                     output: result.error.unwrap_or(result.output),
                     success: result.success,
+                    artifact: result.artifact,
                     failure: result.failure,
                 },
                 echo_agent::agent::AgentEvent::ContextCompressed {
@@ -4628,18 +4646,16 @@ async fn handle_slash_command(
                     return None;
                 };
                 if requested.is_empty() || tool.call_id == requested {
-                    tool.metadata.get("artifact_path").cloned()
+                    tool.artifact.as_ref().map(|artifact| artifact.path.clone())
                 } else {
                     None
                 }
             });
-            let path = from_tool.or_else(|| {
-                (!requested.is_empty())
-                    .then(|| std::path::PathBuf::from(requested).display().to_string())
-            });
+            let path = from_tool
+                .or_else(|| (!requested.is_empty()).then(|| std::path::PathBuf::from(requested)));
             let result = match path {
-                Some(path) => open_artifact_path(std::path::Path::new(&path))
-                    .map(|()| format!("Opened tool-output artifact: {path}")),
+                Some(path) => open_artifact_path(&path)
+                    .map(|()| format!("Opened tool-output artifact: {}", path.display())),
                 None => Err("No tool-output artifact is available".to_string()),
             };
             app.messages.push(ChatMessage {
@@ -8006,6 +8022,7 @@ mod tests {
                 log: String::new(),
                 progress: None,
                 truncated: false,
+                artifact: None,
                 started_at: Instant::now(),
                 finished_at: None,
                 metadata: std::collections::HashMap::new(),

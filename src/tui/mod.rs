@@ -510,6 +510,7 @@ pub struct ToolExecutionMessage {
     pub log: String,
     pub progress: Option<String>,
     pub truncated: bool,
+    pub artifact: Option<echo_agent::tools::artifact::ToolOutputArtifactRef>,
     pub started_at: Instant,
     pub finished_at: Option<Instant>,
     pub metadata: std::collections::HashMap<String, String>,
@@ -765,13 +766,8 @@ pub(crate) fn tool_output_tail(tool: &ToolExecutionMessage, max_lines: usize) ->
         }
         None => tool.progress.clone().into_iter().collect(),
     };
-    if let Some(path) = tool.metadata.get("artifact_path") {
-        let status = if std::path::Path::new(path).is_file() {
-            "full output"
-        } else {
-            "full output artifact missing"
-        };
-        output.push(format!("{status}: {path}"));
+    if let Some(artifact) = tool.artifact.as_ref() {
+        output.push(format!("full output: {}", artifact.path.display()));
     }
     output
 }
@@ -788,16 +784,11 @@ pub(crate) fn tool_metadata_label(tool: &ToolExecutionMessage) -> String {
         .map(|value| format!("exit {value}"));
     let truncated = tool.truncated.then(|| "truncated".to_string());
     let failure = tool.metadata.get("failure_category").cloned();
-    let artifact = tool.metadata.get("artifact_path").map(|path| {
-        if std::path::Path::new(path).is_file() {
-            tool.metadata
-                .get("artifact_bytes")
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(|bytes| format!("artifact {:.1} MiB", bytes as f64 / 1_048_576.0))
-                .unwrap_or_else(|| "artifact".to_string())
-        } else {
-            "artifact missing".to_string()
-        }
+    let artifact = tool.artifact.as_ref().map(|artifact| {
+        format!(
+            "artifact {:.1} MiB",
+            artifact.artifact_bytes as f64 / 1_048_576.0
+        )
     });
     [duration, exit_code, failure, truncated, artifact]
         .into_iter()

@@ -1996,19 +1996,15 @@ impl EventSink for EkoAgentTurnSink {
                     } else {
                         state.pending_file_access.remove(&call_id);
                     }
-                    if let Some(artifact) =
-                        echo_agent::tools::artifact::ToolOutputArtifactRef::from_metadata(
-                            &result.metadata,
-                        )
-                    {
+                    if let Some(artifact) = result.artifact.as_ref() {
                         state.observed_artifacts.push(
                             echo_agent::agent::subagent::SubagentArtifact {
                                 path: artifact.path.to_string_lossy().to_string(),
                                 kind: "tool_log".to_string(),
                                 bytes: Some(artifact.artifact_bytes),
-                                sha256: Some(artifact.sha256),
+                                sha256: Some(artifact.sha256.clone()),
                                 producer_execution_id: self.context.execution_id.clone(),
-                                available: artifact.path.is_file(),
+                                available: true,
                             },
                         );
                     }

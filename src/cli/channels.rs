@@ -5233,6 +5233,7 @@ async fn aggregate_by_sentence_with_repository<'a>(
                             let artifact = channel_verified_artifact(
                                 Arc::clone(&tool_executions),
                                 entry.as_deref().map(|entry| &entry.summary),
+                                &result,
                             )
                             .await;
                             yield ChannelOutboundDraft::ordinary(channel_tool_result_message(
@@ -5382,6 +5383,7 @@ async fn aggregate_by_sentence_with_repository<'a>(
                                             let artifact = channel_verified_artifact(
                                                 Arc::clone(&tool_executions),
                                                 entry.as_deref().map(|entry| &entry.summary),
+                                                &payload.result,
                                             ).await;
                                             yield ChannelOutboundDraft::ordinary(format!(
                                                 "[subagent:{}] {}",
@@ -8201,8 +8203,13 @@ mod tests {
             let args_preview = channel_tool_args_preview(&args);
             let success = ToolResult::success("成功🙂".repeat(300))
                 .with_truncated(true)
-                .with_meta("artifact_path", "/tmp/channel-tool-full.log")
-                .with_meta("artifact_bytes", "8192");
+                .with_artifact(echo_agent::tools::artifact::ToolOutputArtifactRef {
+                    path: "/tmp/channel-tool-full.log".into(),
+                    artifact_bytes: 8_192,
+                    payload_bytes: 8_192,
+                    sha256: "unverified-artifact".to_string(),
+                    retention: "temporary_1h".to_string(),
+                });
             let complete_failure = ToolResult::failure(
                 ToolFailureCategory::Timeout,
                 "token=secretvalue123456，请重试🙂",
@@ -8461,11 +8468,7 @@ mod tests {
                 .finish()
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "artifact writer did not spill".to_string())?;
-            let result = ToolResult::success("bounded preview").with_metadata({
-                let mut metadata = std::collections::HashMap::new();
-                artifact.extend_metadata(&mut metadata);
-                metadata
-            });
+            let result = ToolResult::success("bounded preview").with_artifact(artifact.clone());
             let repository = std::sync::Arc::new(
                 echo_agent_app_core::tool_execution::ToolExecutionRepository::open(
                     temporary.path().join("tool-details"),

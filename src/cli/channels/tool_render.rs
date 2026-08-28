@@ -482,7 +482,9 @@ fn channel_tool_reference(
 pub(super) async fn channel_verified_artifact(
     repository: Arc<echo_agent_app_core::tool_execution::ToolExecutionRepository>,
     summary: Option<&echo_agent_app_core::tool_execution::ToolExecutionSummary>,
+    result: &echo_agent::tools::ToolResult,
 ) -> Option<echo_agent::tools::artifact::ToolOutputArtifactRef> {
+    let expected = result.artifact.clone()?;
     let summary = summary?;
     let workspace_id = summary.workspace_id.clone();
     let detail_ref = summary.detail_ref.clone();
@@ -491,7 +493,14 @@ pub(super) async fn channel_verified_artifact(
     })
     .await
     {
-        Ok(Ok(artifact)) => artifact,
+        Ok(Ok(Some(artifact))) if artifact == expected => Some(artifact),
+        Ok(Ok(Some(_))) => {
+            tracing::warn!(
+                "channel omitted a tool artifact that did not match the canonical result"
+            );
+            None
+        }
+        Ok(Ok(None)) => None,
         Ok(Err(error)) => {
             tracing::warn!(%error, "channel omitted an invalid tool artifact reference");
             None
