@@ -4784,29 +4784,8 @@ impl TaskRuntimeStore {
                 execution_summary,
                 review,
                 diagnostic_note,
-                typed_terminal,
+                typed_terminal: _,
             } = product;
-            if outcome != echo_agent::tasks::RuntimeTaskResolution::Superseded
-                && matches!(
-                    typed_terminal.as_ref().map(|failure| failure.terminal_kind),
-                    Some(echo_agent::error::AgentTerminalKind::TimedOut)
-                )
-                && matches!(
-                    outcome,
-                    echo_agent::tasks::RuntimeTaskResolution::Failed { .. }
-                )
-                && let Some(task) = graph
-                    .snapshot
-                    .tasks
-                    .iter_mut()
-                    .find(|task| task.spec.id == task_id)
-            {
-                let error = typed_terminal
-                    .as_ref()
-                    .map(|failure| failure.message.clone())
-                    .unwrap_or_else(|| "Subagent timed out".to_string());
-                task.execution.status = echo_agent::tasks::TaskStatus::TimedOut { error };
-            }
             let mut product_events = Vec::new();
             if outcome != echo_agent::tasks::RuntimeTaskResolution::Superseded {
                 if let Some(summary) = execution_summary {
@@ -12978,6 +12957,7 @@ mod tests {
         let request = echo_agent::tasks::RuntimeTaskResolutionRequest::Requeue {
             failure_fingerprint: Some("compile-fingerprint".to_string()),
             error: "cargo check failed".to_string(),
+            exhaustion: echo_agent::tasks::RuntimeRetryExhaustion::Failed,
         };
         let mut framework_requeued = claimed.clone();
         let framework_resolution = echo_agent::tasks::settle_runtime_resolution(

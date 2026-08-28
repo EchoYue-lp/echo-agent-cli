@@ -2779,6 +2779,13 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                             super::turn_lifecycle::agent_failure_fingerprint(failure),
                         ),
                         error: failure.message.clone(),
+                        exhaustion: if failure.terminal_kind
+                            == echo_agent::error::AgentTerminalKind::TimedOut
+                        {
+                            echo_agent::tasks::RuntimeRetryExhaustion::TimedOut
+                        } else {
+                            echo_agent::tasks::RuntimeRetryExhaustion::Failed
+                        },
                     }
                 } else {
                     match status {
@@ -2786,7 +2793,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                             echo_agent::tasks::RuntimeTaskResolutionRequest::Cancelled
                         }
                         echo_agent::agent::subagent::SubagentStatus::TimedOut => {
-                            echo_agent::tasks::RuntimeTaskResolutionRequest::Failed {
+                            echo_agent::tasks::RuntimeTaskResolutionRequest::TimedOut {
                                 error: format!("Subagent timed out: {message}"),
                             }
                         }
@@ -2860,6 +2867,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                 Ok(echo_agent::tasks::RuntimeTaskResolutionRequest::Requeue {
                     failure_fingerprint: None,
                     error: format!("execution failed: {reason}"),
+                    exhaustion: echo_agent::tasks::RuntimeRetryExhaustion::Failed,
                 })
             }
             CompletionAssessment::AcceptancePending {
@@ -3043,13 +3051,6 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&claim.claim_id)
             .unwrap_or_default();
-        let typed_timeout = matches!(
-            product
-                .typed_terminal
-                .as_ref()
-                .map(|failure| failure.terminal_kind),
-            Some(echo_agent::error::AgentTerminalKind::TimedOut)
-        );
         let committed_payload = product
             .execution_summary
             .as_ref()
@@ -3085,7 +3086,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             echo_agent::tasks::RuntimeTaskResolution::Skipped => {
                 Some(RuntimeEventKind::TaskSkipped)
             }
-            echo_agent::tasks::RuntimeTaskResolution::Failed { .. } if typed_timeout => {
+            echo_agent::tasks::RuntimeTaskResolution::TimedOut { .. } => {
                 Some(RuntimeEventKind::TaskTimedOut)
             }
             echo_agent::tasks::RuntimeTaskResolution::Failed { .. } => {
@@ -6218,7 +6219,7 @@ mod tests {
             message: "provider timed out".to_string(),
         };
 
-        for expected_outcome in ["pending", "failed"] {
+        for expected_outcome in ["pending", "timed_out"] {
             let snapshot = store
                 .load_runtime_plan_snapshot(&run_id)
                 .map_err(|error| error.to_string())?;
@@ -6255,6 +6256,7 @@ mod tests {
                             ),
                         ),
                         error: failure.message.clone(),
+                        exhaustion: echo_agent::tasks::RuntimeRetryExhaustion::TimedOut,
                     },
                     RuntimeTaskProductSettlement {
                         summary: Some(failure.message.clone()),
@@ -6276,9 +6278,9 @@ mod tests {
                     resolution,
                     echo_agent::tasks::RuntimeTaskResolution::Pending
                 ),
-                "failed" => assert!(matches!(
+                "timed_out" => assert!(matches!(
                     resolution,
-                    echo_agent::tasks::RuntimeTaskResolution::Failed { .. }
+                    echo_agent::tasks::RuntimeTaskResolution::TimedOut { .. }
                 )),
                 _ => return Err("invalid expected timeout outcome".to_string()),
             }

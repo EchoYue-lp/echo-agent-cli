@@ -53,8 +53,10 @@ policy。
 所有 RunTurn claim 的 run 必须在创建事务中显式配置 continuation。Provider-reported usage
 按 envelope event id 写入 active RunTurn；未报告的 usage 不会被记为零成本事实。Primary
 PlanTask 的 typed `AgentFailure` 作为 durable Subagent evidence 进入 exact-claim settlement；
-retryable LLM failure 使用稳定 fingerprint requeue，最终 timeout 在同一 CAS 中成为
-`TaskStatus::TimedOut`，不会先发布错误的 task terminal。
+retryable LLM failure 使用稳定 fingerprint requeue，并把 retry exhaustion 的 `Failed` /
+`TimedOut` 分类显式交给 framework；direct timeout 和最终 exhaustion 都由 framework 在同一
+CAS 中提交为 `TaskStatus::TimedOut`。EKO adapter 不再先结算 `Failed` 后改写状态，也不根据
+product metadata 推断 terminal event。
 Task-level Completed/Failed/TimedOut/Cancelled/Blocked live projection 只在 exact claim CAS
 提交后发布；physical Subagent attempt 可以先发布自己的 terminal，但不得冒充 PlanTask terminal。
 
@@ -135,8 +137,9 @@ Tauri mutation 使用 ts-rs 生成的 `TaskRunControlReceipt`、`TaskRunResumeRe
 - Async surface 不再直接执行 TaskRuntime file I/O；source inventory 固定所有 production
   surface、boot、Subagent、projector 与 lifecycle/workspace owner 都必须经过同一 adapter 和
   store operation supervisor。
-- Projection refresh 的 committed/degraded typed outcome 和 Todo/Artifact/Completion 的增量索引
-  仍是后续 persistence 迭代，不能用本次 async cutover 宣称 10k/100k 全查询面已完成。
+- Projection refresh 已返回 committed/degraded typed outcome；Todo、latest Summary 与 Completion
+  Gate 使用 checkpoint-backed projection，Artifact/Review 历史使用增量 segment。10k/100k
+  release 规模验证仍属于 Final Integration Gate，不能仅凭实现存在宣称已通过。
 
 ## 业界依据
 
