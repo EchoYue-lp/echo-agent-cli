@@ -46,7 +46,6 @@ axum = { version = "0.7" }
 nu-ansi-term = "0.50"
 syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig", "default-syntaxes", "default-themes"] }
 pulldown-cmark = "0.11"
-indicatif = "0.17"
 terminal_size = "0.3"
 tempfile = "3"  # Sprint 10: EkoDataWorkspaceFactory per-subagent tmpdir (was dev-only)
 

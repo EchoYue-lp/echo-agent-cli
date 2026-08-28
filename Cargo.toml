@@ -69,7 +69,6 @@ sha2 = "0.10"
 hex = "0.4"
 dotenvy = "0.15"
 dirs = "6"
-indicatif = "0.17"
 pulldown-cmark = { version = "0.11", optional = true }
 syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig", "default-syntaxes", "default-themes"], optional = true }
 similar = { version = "2", optional = true }

@@ -5,9 +5,6 @@
 //! `runner` provides the CLI-specific `build_fire_fn` adapter.
 
 pub mod runner;
-pub mod task;
 
 pub use echo_agent::scheduler::{CronTask, CronTaskStatus, CronTaskStore};
 pub use runner::{SchedulerRunner, build_fire_fn, new_scheduler_runner};
-// Backward-compatible alias for callers that still use `task::TaskStore`.
-pub use task::TaskStore;

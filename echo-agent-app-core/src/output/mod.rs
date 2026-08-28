@@ -10,7 +10,6 @@
 
 pub mod format;
 pub mod markdown;
-pub mod spinner;
 pub mod syntax;
 pub mod table;
 pub mod theme;
@@ -272,11 +271,6 @@ impl OutputRenderer {
         let width = self.config().max_width.min(80);
         let line = self.paint(|t| t.muted_color, "─".repeat(width).as_str());
         println!("{}", line);
-    }
-
-    /// 启动进度动画
-    pub fn start_spinner(&self, message: &str) -> spinner::SpinnerHandle {
-        spinner::SpinnerHandle::new(message)
     }
 
     /// 打印欢迎横幅
