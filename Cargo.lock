@@ -1625,7 +1625,6 @@ dependencies = [
  "sha2 0.10.9",
  "shell-words",
  "shellexpand",
- "similar",
  "strip-ansi-escapes",
  "strum 0.26.3",
  "strum_macros 0.26.4",

@@ -39,30 +39,7 @@ pub struct WorkspaceChange {
     pub status: String,
 }
 
-#[derive(Debug, Serialize)]
-pub struct DiffResult {
-    pub path: String,
-    pub old_content: String,
-    pub new_content: String,
-    pub hunks: Vec<DiffHunk>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct DiffHunk {
-    pub old_start: usize,
-    pub old_count: usize,
-    pub new_start: usize,
-    pub new_count: usize,
-    pub lines: Vec<DiffLine>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct DiffLine {
-    pub tag: String,
-    pub old_line: Option<usize>,
-    pub new_line: Option<usize>,
-    pub content: String,
-}
+pub type DiffResult = echo_agent_app_core::diff::WorkspaceFileDiff;
 
 #[derive(Debug, Serialize)]
 pub struct TreeNode {
@@ -322,11 +299,6 @@ pub async fn diff_file(
     git_ref: Option<String>,
 ) -> Result<DiffResult, IpcError> {
     let ref_str = git_ref.unwrap_or_else(|| "HEAD".to_string());
-
-    if !is_safe_git_ref(&ref_str) {
-        return Err(IpcError::Validation("Invalid git reference".to_string()));
-    }
-
     let control =
         super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
     state
@@ -334,136 +306,23 @@ pub async fn diff_file(
         .session
         .product_data_io
         .run("diff workspace file", move || {
-            let base = control.project_root();
-            diff_workspace_file(base, path, ref_str)
+            echo_agent_app_core::diff::WorkspaceDiffService::new(control.project_root())
+                .diff_file(&path, &ref_str)
+                .map_err(workspace_diff_error)
         })
         .await
         .map_err(super::product_data::blocking_error)?
 }
 
-fn diff_workspace_file(
-    base: std::path::PathBuf,
-    path: String,
-    ref_str: String,
-) -> Result<DiffResult, IpcError> {
-    let target = base.join(&path);
-    crate::tauri::path_validator::validate_within_base(&target, &base)
-        .map_err(IpcError::Validation)?;
-
-    let new_content = if target.exists() {
-        // P2-2: 此前 unwrap_or_default() 在二进制/非 UTF-8 文件上静默返空,
-        // diff 输出误导 (看起来像"全新增")。改为显式报错让前端提示。
-        std::fs::read_to_string(&target)
-            .map_err(|e| IpcError::Internal(format!("无法读取文件 (可能为二进制): {e}")))?
-    } else {
-        String::new()
-    };
-
-    let commit = std::process::Command::new("git")
-        .args(["rev-parse", "--verify", &format!("{ref_str}^{{commit}}")])
-        .current_dir(&base)
-        .output()
-        .map_err(|error| IpcError::Internal(format!("git rev-parse failed: {error}")))?;
-    if !commit.status.success() {
-        return Err(IpcError::Validation(format!(
-            "invalid git reference: {}",
-            String::from_utf8_lossy(&commit.stderr).trim()
-        )));
-    }
-    let object = format!("{ref_str}:{path}");
-    let exists = std::process::Command::new("git")
-        .args(["cat-file", "-e", &object])
-        .current_dir(&base)
-        .output()
-        .map_err(|error| IpcError::Internal(format!("git cat-file failed: {error}")))?;
-    let old_content = if exists.status.success() {
-        let output = std::process::Command::new("git")
-            .args(["show", &object])
-            .current_dir(&base)
-            .output()
-            .map_err(|error| IpcError::Internal(format!("git show failed: {error}")))?;
-        if !output.status.success() {
-            return Err(IpcError::Internal(format!(
-                "git show failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
+fn workspace_diff_error(error: echo_agent_app_core::diff::WorkspaceDiffError) -> IpcError {
+    match error {
+        echo_agent_app_core::diff::WorkspaceDiffError::Validation(message) => {
+            IpcError::Validation(message)
         }
-        String::from_utf8(output.stdout).map_err(|error| {
-            IpcError::Validation(format!("git object is not UTF-8 text: {error}"))
-        })?
-    } else {
-        String::new()
-    };
-
-    use similar::{ChangeTag, TextDiff};
-    let diff = TextDiff::from_lines(&old_content, &new_content);
-
-    let mut hunks = Vec::new();
-    let mut current_hunk_lines = Vec::new();
-    let mut old_line = 0usize;
-    let mut new_line = 0usize;
-    let mut hunk_old_start = 0usize;
-    let mut hunk_new_start = 0usize;
-    let mut hunk_old_count = 0usize;
-    let mut hunk_new_count = 0usize;
-
-    for change in diff.iter_all_changes() {
-        let tag = match change.tag() {
-            ChangeTag::Equal => {
-                old_line += 1;
-                new_line += 1;
-                "equal"
-            }
-            ChangeTag::Insert => {
-                new_line += 1;
-                hunk_new_count += 1;
-                "insert"
-            }
-            ChangeTag::Delete => {
-                old_line += 1;
-                hunk_old_count += 1;
-                "delete"
-            }
-        };
-
-        if current_hunk_lines.is_empty() {
-            hunk_old_start = old_line;
-            hunk_new_start = new_line;
-            hunk_old_count = 0;
-            hunk_new_count = 0;
+        echo_agent_app_core::diff::WorkspaceDiffError::Operation(message) => {
+            IpcError::Internal(message)
         }
-
-        current_hunk_lines.push(DiffLine {
-            tag: tag.to_string(),
-            old_line: if matches!(change.tag(), ChangeTag::Equal | ChangeTag::Delete) {
-                Some(old_line)
-            } else {
-                None
-            },
-            new_line: if matches!(change.tag(), ChangeTag::Equal | ChangeTag::Insert) {
-                Some(new_line)
-            } else {
-                None
-            },
-            content: change.value().to_string(),
-        });
     }
-
-    if !current_hunk_lines.is_empty() {
-        hunks.push(DiffHunk {
-            old_start: hunk_old_start,
-            old_count: hunk_old_count,
-            new_start: hunk_new_start,
-            new_count: hunk_new_count,
-            lines: current_hunk_lines,
-        });
-    }
-    Ok(DiffResult {
-        path,
-        old_content,
-        new_content,
-        hunks,
-    })
 }
 
 #[tauri::command]
@@ -695,32 +554,6 @@ fn preview_type(path: &str) -> Option<(&'static str, &'static str)> {
 
 fn file_revision(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
-}
-
-fn is_safe_git_ref(git_ref: &str) -> bool {
-    if git_ref.is_empty() {
-        return false;
-    }
-    // P1-5: tightened charset. `^`/`~`/`@`/`:` are valid git rev syntax
-    // (`HEAD^`, `HEAD~2`, `@`, `ref:path`) but they double as injection /
-    // treeish-traversal surfaces when the ref is interpolated into `git show
-    // <ref>:<path>`. Diff_file only needs branch / tag names, so we restrict
-    // to alphanumerics, `-`, `_`, `.`, `/` (branch names like `feat/x`).
-    for c in git_ref.chars() {
-        if !matches!(c,
-            'a'..='z' | 'A'..='Z' | '0'..='9' |
-            '-' | '_' | '.' | '/'
-        ) {
-            return false;
-        }
-    }
-    if git_ref.starts_with('-') || git_ref.starts_with('.') {
-        return false;
-    }
-    if git_ref.contains("..") {
-        return false;
-    }
-    true
 }
 
 fn dirs_home_dir() -> Option<std::path::PathBuf> {

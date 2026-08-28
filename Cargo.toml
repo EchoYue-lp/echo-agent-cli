@@ -30,7 +30,7 @@ gui = [
     "dep:tauri", "dep:tauri-plugin-shell", "dep:tauri-plugin-dialog",
     "dep:tauri-plugin-notification", "dep:tauri-plugin-fs",
     "dep:tauri-plugin-global-shortcut",
-    "dep:dashmap", "dep:similar", "channels",
+    "dep:dashmap", "channels",
 ]
 channels = ["echo-agent/channels", "dep:strip-ansi-escapes"]
 telemetry = ["echo-agent/telemetry"]
@@ -71,7 +71,6 @@ dotenvy = "0.15"
 dirs = "6"
 pulldown-cmark = { version = "0.11", optional = true }
 syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig", "default-syntaxes", "default-themes"], optional = true }
-similar = { version = "2", optional = true }
 terminal_size = "0.3"
 clap_complete = "4"
 shellexpand = "3"

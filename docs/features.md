@@ -39,6 +39,7 @@ EKO 拥有文件投影、workspace、review、worktree、资源策略和各 surf
 | 能力           | 当前实现                                                                                 | 主要依据                                               |
 | -------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------ |
 | 文件与代码修改 | canonical transactional `apply_patch`，不保留平行编辑工具                                | `echo-agent` tool registry                             |
+| Workspace diff | 显式 workspace generation、已验证 Git ref、app-core 统一结构化 hunk，Tauri 仅映射 wire DTO | `echo-agent-app-core/src/diff.rs`                      |
 | 代码执行与分析 | `run_code` 使用 EKO 锁定的 Python analytics runtime                                      | `echo-agent-app-core/src/analysis_runtime.rs`          |
 | Terminal       | 用户交互 terminal session 和 Agent shell 路径分离                                        | `echo-agent-app-core/src/terminal.rs`                  |
 | Browser/Chrome | 托管 Chromium、Chrome extension backend、tab/session/observation 与五入口控制            | Browser runtime + Extension dispatcher                 |
