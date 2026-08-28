@@ -212,9 +212,6 @@ pub fn build_tauri_app(
             commands::task_runtime::cancel_task_run,
             // TaskRuntime progress ledger (PR 4)
             commands::task_runtime::get_progress_ledger,
-            // TaskRuntime interaction mode (Chat/Task/Auto)
-            commands::task_runtime::set_interaction_mode,
-            commands::task_runtime::get_interaction_mode,
             // Memory
             commands::memory::list_memory,
             commands::memory::add_memory,

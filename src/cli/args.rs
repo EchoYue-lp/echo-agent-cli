@@ -5,23 +5,6 @@
 use clap::{Parser, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum JsonlInteractionMode {
-    Auto,
-    Chat,
-    Task,
-}
-
-impl JsonlInteractionMode {
-    pub fn runtime(self) -> echo_agent_app_core::tasks::task_runtime::InteractionMode {
-        match self {
-            Self::Auto => echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
-            Self::Chat => echo_agent_app_core::tasks::task_runtime::InteractionMode::Chat,
-            Self::Task => echo_agent_app_core::tasks::task_runtime::InteractionMode::Task,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum JsonlPermissionMode {
     Default,
     AutoEdit,
@@ -84,10 +67,6 @@ pub struct Args {
         conflicts_with_all = ["tui", "web", "cli", "channels"]
     )]
     pub jsonl: Option<String>,
-
-    /// Interaction mode used by the JSONL turn.
-    #[arg(long, value_enum, default_value = "auto", requires = "jsonl")]
-    pub jsonl_mode: JsonlInteractionMode,
 
     /// Agent tool permission mode used by the JSONL turn.
     #[arg(long, value_enum, default_value = "default", requires = "jsonl")]

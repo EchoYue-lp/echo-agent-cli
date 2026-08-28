@@ -93,7 +93,6 @@ pub enum SlashCommand {
 
     // -- Coding --
     Plan,
-    Mode,
     Tasks,
     Steer,
     TaskCancel,
@@ -190,7 +189,6 @@ impl SlashCommand {
             Self::Plugins => "Manage live plugins",
 
             Self::Plan => "Enter plan mode (read-only)",
-            Self::Mode => "Switch interaction mode (auto/chat/task)",
             Self::Tasks => "Show active tasks",
             Self::Steer => "Inject guidance into the active turn or queue it",
             Self::TaskCancel => "Cancel the current or specified task run",
@@ -279,7 +277,6 @@ impl SlashCommand {
             | Self::Hooks
             | Self::Plugins => Category::Context,
             Self::Plan
-            | Self::Mode
             | Self::Tasks
             | Self::Steer
             | Self::TaskCancel
@@ -362,7 +359,6 @@ impl SlashCommand {
             Self::Cron => "[list|create|delete|pause|resume|run|reload]",
             Self::Test => "[test-name]",
             Self::Plan => "",
-            Self::Mode => "[auto|chat|task]",
             Self::TaskCancel | Self::TaskPause | Self::TaskResume => "[run-id]",
             Self::TaskBudget => "<tokens|none> <seconds|none> [run-id]",
             Self::TaskGoal => "<expected-revision> [run-id] --reason <reason> --goal <new-goal>",

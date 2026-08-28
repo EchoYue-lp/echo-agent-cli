@@ -34,8 +34,6 @@ pub struct CommandHandler {
     scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
     plugin_runtime: Option<Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>>,
     prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
-    interaction_mode:
-        Arc<tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>>,
     staged_attachments:
         Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>>,
     app_state: Option<Arc<echo_agent_app_core::state::AppState>>,
@@ -53,9 +51,6 @@ impl CommandHandler {
             scheduler: None,
             plugin_runtime: None,
             prompt_assembly: None,
-            interaction_mode: Arc::new(tokio::sync::RwLock::new(
-                echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
-            )),
             staged_attachments: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             app_state: None,
             conversation_id: None,
@@ -146,14 +141,6 @@ impl CommandHandler {
         self
     }
 
-    pub fn with_interaction_mode(
-        mut self,
-        mode: Arc<tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>>,
-    ) -> Self {
-        self.interaction_mode = mode;
-        self
-    }
-
     pub fn with_staged_attachments(
         mut self,
         attachments: Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>>,
@@ -201,7 +188,6 @@ impl CommandHandler {
                 scheduler: self.scheduler.clone(),
                 plugin_runtime: self.plugin_runtime.clone(),
                 prompt_assembly: self.prompt_assembly.clone(),
-                interaction_mode: self.interaction_mode.clone(),
                 staged_attachments: self.staged_attachments.clone(),
                 app_state: self.app_state.clone(),
                 conversation_id: self.conversation_id.clone(),

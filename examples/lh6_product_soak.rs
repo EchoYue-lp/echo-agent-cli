@@ -21,9 +21,9 @@ use echo_agent_app_core::prepared_turn::{PreparedUserTurn, UserTurnInput};
 use echo_agent_app_core::runtime::AgentRuntime;
 use echo_agent_app_core::tasks::task_runtime::store::RunTurnClaimOutcome;
 use echo_agent_app_core::tasks::task_runtime::{
-    AttendedMode, DomainProfile, ExecutionMode, InteractionMode, PlanTask, RunTurnOrigin,
-    RunTurnStatus, SubagentControlActorSource, SubagentControlIdentity, SubagentControlService,
-    TaskPlan, TaskRunStatus, TaskRuntimeStore, TurnVisibility, commit_eko_task_plan,
+    AttendedMode, DomainProfile, ExecutionMode, PlanTask, RunTurnOrigin, RunTurnStatus,
+    SubagentControlActorSource, SubagentControlIdentity, SubagentControlService, TaskPlan,
+    TaskRunStatus, TaskRuntimeStore, TurnVisibility, commit_eko_task_plan,
     process_execution_resource_snapshot, task_goal_sha256,
 };
 use echo_agent_app_core::workspace::{WorkspaceExecutionScope, WorkspaceKind};
@@ -773,7 +773,6 @@ async fn drive_one(
         root_message_id: turn_id.clone(),
         attachments: turn.inline_attachment_refs(),
         cancel: lease.cancellation_token(),
-        interaction_mode: InteractionMode::Auto,
         review_integration: scoped.review_integration(),
         layer_manager: None,
         memory_generation: None,

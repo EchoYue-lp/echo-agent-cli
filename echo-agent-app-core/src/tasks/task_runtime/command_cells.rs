@@ -3207,7 +3207,6 @@ mod tests {
                     Some("conversation"),
                     "root-message",
                     crate::chat_driver::ChatDriverEvent::ExecutionPath {
-                        requested_mode: "chat".to_string(),
                         observed_path: format!("chat-{index}"),
                     },
                 )

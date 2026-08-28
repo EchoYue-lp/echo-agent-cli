@@ -52,8 +52,6 @@ import type {
   SubagentControlIdentity,
   SubagentControlReceipt,
   CompletionGateReport,
-  InteractionMode,
-  InteractionModeRequest,
   TaskRetryReceipt,
   TaskRunControlReceipt,
   TaskRunResumeReceipt,
@@ -968,20 +966,6 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<PlanRevision>('update_tasks', { workspaceId, runId, request })
       : post<PlanRevision>(`/task_runtime/runs/${runId}/tasks/update`, request),
-
-  // ── Interaction mode ─────────────────────────────────────────────────
-  setInteractionMode: (mode: InteractionMode) =>
-    isTauri()
-      ? apiInvoke<InteractionMode>('set_interaction_mode', {
-          request: { mode } satisfies InteractionModeRequest,
-        })
-      : post<InteractionMode>('/task_runtime/interaction_mode', {
-          mode,
-        } satisfies InteractionModeRequest),
-  getInteractionMode: () =>
-    isTauri()
-      ? apiInvoke<InteractionMode>('get_interaction_mode')
-      : get<InteractionMode>('/task_runtime/interaction_mode'),
 };
 
 // ── Durable run diagnostics API ──────────────────────────────────────

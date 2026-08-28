@@ -28,9 +28,6 @@ async fn cmd_plan(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /plan [on|off]");
             } else {
                 let task = args.join(" ");
-                *ctx.interaction_mode.write().await =
-                    echo_agent_app_core::tasks::task_runtime::InteractionMode::Task;
-                println!("Interaction mode set to Task for this request.");
                 return CommandOutcome::Chat(task);
             }
         }

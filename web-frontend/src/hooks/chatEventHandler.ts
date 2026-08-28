@@ -337,11 +337,7 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
       break;
     }
     case 'execution_path': {
-      if (event.requested_mode !== event.observed_path) {
-        store.appendLocalAssistantNote(
-          `[Info] Execution path: ${event.requested_mode} -> ${event.observed_path}`
-        );
-      }
+      store.appendLocalAssistantNote(`[Info] Execution path: ${event.observed_path}`);
       break;
     }
     case 'interrupt_prompt': {

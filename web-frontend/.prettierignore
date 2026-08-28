@@ -1,3 +1,5 @@
 dist
 node_modules
 *.local
+# ts-rs owns formatting for machine-generated DTOs; do not rewrite them with Prettier.
+src/generated

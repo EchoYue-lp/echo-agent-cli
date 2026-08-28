@@ -490,37 +490,6 @@ fn internal<E: std::fmt::Display>(e: E) -> IpcError {
     IpcError::Internal(e.to_string())
 }
 
-// ── Router toggle ────────────────────────────────────────────────────────
-
-/// Set the manual interaction mode: 0=Auto, 1=Chat, 2=Task.
-#[tauri::command]
-pub async fn set_interaction_mode(
-    state: tauri::State<'_, TauriState>,
-    request: InteractionModeRequest,
-) -> Result<InteractionMode, IpcError> {
-    state
-        .app_state
-        .tasks
-        .interaction_mode
-        .store(request.mode.as_u8(), std::sync::atomic::Ordering::Relaxed);
-    tracing::info!(mode = request.mode.as_str(), "interaction mode set");
-    Ok(request.mode)
-}
-
-/// Get the current interaction mode.
-#[tauri::command]
-pub async fn get_interaction_mode(
-    state: tauri::State<'_, TauriState>,
-) -> Result<InteractionMode, IpcError> {
-    Ok(InteractionMode::from_u8(
-        state
-            .app_state
-            .tasks
-            .interaction_mode
-            .load(std::sync::atomic::Ordering::Relaxed),
-    ))
-}
-
 /// Resume a paused run. Transitions `Paused → Running` and re-launches the
 /// executor, which re-reads the plan from the store and skips already-completed
 /// tasks.
@@ -773,7 +742,6 @@ async fn resume_continuation_run(
         root_message_id: turn_id.clone(),
         attachments: snapshot.run.attachments,
         cancel: lease.cancellation_token(),
-        interaction_mode: InteractionMode::Task,
         review_integration: runtime.review_integration(),
         layer_manager: None,
         memory_generation: None,

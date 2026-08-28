@@ -35,14 +35,14 @@ struct CapabilityRow {
 
 const CAPABILITY_MATRIX: &[CapabilityRow] = &[
     CapabilityRow {
-        capability: "chat_task_auto",
+        capability: "unified_invocation_capabilities",
         evidence: [
-            "ChatInput mode selector",
-            "/mode chat|task|auto",
-            "/mode chat|task|auto",
-            "--jsonl-mode chat|task|auto",
-            "/mode chat|task|auto",
-            "N/A: scheduled Task trigger has no interactive selector",
+            "registered tools and workspace facts",
+            "registered tools and workspace facts",
+            "registered tools and workspace facts",
+            "registered tools and workspace facts",
+            "registered tools and workspace facts",
+            "scheduled TaskRun binding",
         ],
     },
     CapabilityRow {
@@ -51,7 +51,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "TaskRuntime plan controls",
             "plan and task slash commands",
             "task runtime slash commands",
-            "Task mode shared task tools and canonical events",
+            "TaskRun shared task tools and canonical events",
             "shared plan/task tools",
             "scheduled TaskRuntime plan",
         ],
@@ -183,7 +183,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "Agent group editor and frozen PlanTask target",
             "/agent-group and shared TaskRuntime target adapter",
             "/agent-group and shared TaskRuntime target adapter",
-            "Task mode honors frozen Agent-group targets",
+            "TaskRun honors frozen Agent-group targets",
             "/agent-group and shared TaskRuntime target adapter",
             "scheduled TaskRuntime honors frozen Agent-group targets",
         ],
@@ -298,7 +298,6 @@ fn shared_driver_wire_contract_preserves_product_facts() -> Result<(), String> {
             status: "completed".to_string(),
         },
         ChatDriverEvent::ExecutionPath {
-            requested_mode: "auto".to_string(),
             observed_path: "task_runtime".to_string(),
         },
         ChatDriverEvent::Interrupt {

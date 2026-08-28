@@ -419,7 +419,6 @@ async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> a
         root_message_id: "active-target-turn".to_string(),
         attachments: Vec::new(),
         cancel: lease.cancellation_token(),
-        interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
         review_integration: runtime.review_integration(),
         layer_manager: None,
         memory_generation: None,

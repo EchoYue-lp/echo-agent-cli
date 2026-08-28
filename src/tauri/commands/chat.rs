@@ -735,13 +735,6 @@ pub async fn send_chat_message(
         )
         .await;
 
-    use echo_agent_app_core::tasks::task_runtime::InteractionMode;
-    let raw = state
-        .app_state
-        .tasks
-        .interaction_mode
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let interaction_mode = InteractionMode::from_u8(raw);
     // Build the GUI sink + per-turn resources, then drive the whole turn
     // (normal reply AND any complex runs the agent autonomously spins up via
     // create_complex_task) through the single shared `drive_chat` entry. The
@@ -794,7 +787,6 @@ pub async fn send_chat_message(
         root_message_id: message_key.clone(),
         attachments: prepared_turn.inline_attachment_refs(),
         cancel: cancel_token.clone(),
-        interaction_mode,
         review_integration: scoped_runtime.review_integration(),
         layer_manager: None,
         memory_generation: None,

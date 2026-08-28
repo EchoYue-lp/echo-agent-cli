@@ -108,9 +108,9 @@ Subagent control、GUI/TUI/CLI/channel TaskRuntime surface 和 unattended worktr
 该边界。已接受的复合文件 mutation 把 driver registration 随 closure 一起持有，因此 caller
 drop 不会提前释放 workspace generation。
 
-Tauri mutation 使用 ts-rs 生成的 `TaskRunControlReceipt`、`TaskRunResumeReceipt`、
-`TaskRetryReceipt` 和 `InteractionModeRequest`。Continuation resume 的 `turn_id` 是正式 wire
-字段；interaction mode 使用字符串 enum，不再由前端手写数字协议。
+Tauri mutation 使用 ts-rs 生成的 `TaskRunControlReceipt`、`TaskRunResumeReceipt` 和
+`TaskRetryReceipt`。Continuation resume 的 `turn_id` 是正式 wire 字段；surface capability
+来自已注册工具与 workspace facts，不再由前端传递 mode DTO。
 
 ## 取舍与影响
 

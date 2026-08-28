@@ -50,8 +50,8 @@ Tauri commands 仍有同步调用。
 - revision store 与 EKO task policy 继续保持薄 adapter：framework 仍拥有 patch、DAG、CAS
   和 revision 语义；blocking boundary 不引入第二套 validator 或 executor。
 - Tauri mutation 返回 `TaskRunControlReceipt`、`TaskRunResumeReceipt` 和 `TaskRetryReceipt`。
-  continuation resume 的 `turn_id` 是显式可选字段。Interaction mode 使用
-  `InteractionModeRequest` 和 `InteractionMode` 字符串枚举，不再暴露数字 wire contract。
+  continuation resume 的 `turn_id` 是显式可选字段。Surface capability 来自注册工具与
+  workspace facts，不再暴露 interaction-mode wire contract。
 - 排队 resume 的 identity 同时冻结 continuation route。GUI/TUI/CLI 只校验 workspace 与
   conversation scope，不读取或预判当前 journal sequence；ABA、status 和 sequence 的唯一判定在
   store 原子 resume transaction。capture 后仅追加 `kind=execution_path` diagnostic Note 时允许

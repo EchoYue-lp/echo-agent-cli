@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::tasks::task_runtime::{DomainProfile, InteractionMode};
+use crate::tasks::task_runtime::DomainProfile;
 
 pub(crate) const MAX_MODEL_VISIBLE_TOOL_RESULT_TOKENS: usize = 4_000;
 #[cfg(test)]
@@ -14,7 +14,7 @@ pub(crate) struct ToolOptimizationRollout {
     pub content_free_telemetry: bool,
 }
 
-pub(crate) fn rollout_for_mode(_interaction_mode: InteractionMode) -> ToolOptimizationRollout {
+pub(crate) fn invocation_rollout() -> ToolOptimizationRollout {
     ToolOptimizationRollout {
         deferred_schemas: true,
         cursor_pagination: true,
@@ -23,12 +23,11 @@ pub(crate) fn rollout_for_mode(_interaction_mode: InteractionMode) -> ToolOptimi
     }
 }
 
-pub(crate) fn record_mode_schema_budget(
-    interaction_mode: InteractionMode,
+pub(crate) fn record_schema_budget(
     definitions: &[echo_agent::llm::types::ToolDefinition],
     visible: &HashSet<String>,
 ) {
-    let rollout = rollout_for_mode(interaction_mode);
+    let rollout = invocation_rollout();
     let selected = definitions
         .iter()
         .filter(|definition| visible.contains(&definition.function.name))
@@ -37,7 +36,6 @@ pub(crate) fn record_mode_schema_budget(
     match echo_agent::tools::ToolManager::schema_stats_for(&selected) {
         Ok(stats) => tracing::info!(
             target: "eko::tool_budget",
-            mode = interaction_mode.as_str(),
             tool_count = stats.tool_count,
             schema_bytes = stats.schema_bytes,
             schema_estimated_tokens = stats.estimated_tokens,
@@ -49,7 +47,6 @@ pub(crate) fn record_mode_schema_budget(
         ),
         Err(error) => tracing::warn!(
             target: "eko::tool_budget",
-            mode = interaction_mode.as_str(),
             %error,
             "failed to measure interaction tool budget"
         ),
@@ -72,7 +69,6 @@ const CELL_TOOLS: &[&str] = &[
     "watch_cell",
     "interrupt_awaiter",
 ];
-const SKILL_RESOURCE_TOOLS: &[&str] = &["read_skill_resource"];
 const WEB_SEARCH_TOOLS: &[&str] = &["web_search"];
 const WEB_FETCH_TOOLS: &[&str] = &["web_fetch"];
 const REPOSITORY_INSPECTION_TOOLS: &[&str] = &["diff"];
@@ -84,29 +80,8 @@ const ACADEMIC_RESEARCH_TOOLS: &[&str] = &[
     "clinical_trials_search",
 ];
 
-fn groups_for_mode(interaction_mode: InteractionMode) -> &'static [&'static [&'static str]] {
-    const CHAT: &[&[&str]] = &[
-        CONTROL_TOOLS,
-        FILE_TOOLS,
-        DIRECTORY_TOOLS,
-        EXECUTION_TOOLS,
-        CODE_EXECUTION_TOOLS,
-        CELL_TOOLS,
-        TASK_TOOLS,
-        WEB_SEARCH_TOOLS,
-    ];
-    const TASK: &[&[&str]] = &[
-        CONTROL_TOOLS,
-        FILE_TOOLS,
-        EXECUTION_TOOLS,
-        CODE_EXECUTION_TOOLS,
-        CELL_TOOLS,
-        TASK_TOOLS,
-        SKILL_RESOURCE_TOOLS,
-        WEB_SEARCH_TOOLS,
-        REPOSITORY_INSPECTION_TOOLS,
-    ];
-    const AUTO: &[&[&str]] = &[
+fn initial_groups() -> &'static [&'static [&'static str]] {
+    const INITIAL: &[&[&str]] = &[
         CONTROL_TOOLS,
         FILE_TOOLS,
         DIRECTORY_TOOLS,
@@ -118,34 +93,54 @@ fn groups_for_mode(interaction_mode: InteractionMode) -> &'static [&'static [&'s
         REPOSITORY_INSPECTION_TOOLS,
         MEMORY_TOOLS,
     ];
-
-    match interaction_mode {
-        InteractionMode::Chat => CHAT,
-        InteractionMode::Task => TASK,
-        InteractionMode::Auto => AUTO,
-    }
+    INITIAL
 }
 
-/// EKO selects an invocation-scoped first-turn surface from the framework's
-/// single registry. Browser, MCP, extended memory, and domain tools remain in
-/// the catalog and are activated through `tool_search` when needed.
-pub(crate) fn initial_visible_tools(
-    interaction_mode: InteractionMode,
-    registered: &[String],
-) -> HashSet<String> {
-    if !rollout_for_mode(interaction_mode).deferred_schemas {
-        return registered.iter().cloned().collect();
-    }
+fn task_run_groups() -> &'static [&'static [&'static str]] {
+    const TASK_RUN: &[&[&str]] = &[
+        CONTROL_TOOLS,
+        FILE_TOOLS,
+        EXECUTION_TOOLS,
+        CODE_EXECUTION_TOOLS,
+        CELL_TOOLS,
+        TASK_TOOLS,
+        WEB_SEARCH_TOOLS,
+        REPOSITORY_INSPECTION_TOOLS,
+    ];
+    TASK_RUN
+}
+
+fn visible_from_groups(groups: &[&[&str]], registered: &[String]) -> HashSet<String> {
     let registered = registered
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    groups_for_mode(interaction_mode)
+    groups
         .iter()
         .flat_map(|group| group.iter())
         .filter(|name| registered.contains(**name))
         .map(|name| (*name).to_string())
         .collect()
+}
+
+/// EKO selects an invocation-scoped first-turn surface from the framework's
+/// single registry. Browser, MCP, extended memory, and domain tools remain in
+/// the catalog and are activated through `tool_search` when needed.
+pub(crate) fn initial_visible_tools(registered: &[String]) -> HashSet<String> {
+    if !invocation_rollout().deferred_schemas {
+        return registered.iter().cloned().collect();
+    }
+    visible_from_groups(initial_groups(), registered)
+}
+
+/// Select the first-turn surface for an explicit TaskRun or Subagent attempt.
+/// TaskRun work receives the code-execution schema immediately; ordinary chat
+/// can still activate the registered capability explicitly through tool_search.
+pub(crate) fn initial_visible_tools_for_task_run(registered: &[String]) -> HashSet<String> {
+    if !invocation_rollout().deferred_schemas {
+        return registered.iter().cloned().collect();
+    }
+    visible_from_groups(task_run_groups(), registered)
 }
 
 /// Select the first-turn surface for one canonical TaskRun.
@@ -155,11 +150,10 @@ pub(crate) fn initial_visible_tools(
 /// without a separate foreground `tool_search` turn. Other domain tools remain
 /// deferred and all non-research profiles keep the normal mode budget.
 pub(crate) fn initial_visible_tools_for_profile(
-    interaction_mode: InteractionMode,
     domain_profile: DomainProfile,
     registered: &[String],
 ) -> HashSet<String> {
-    let mut visible = initial_visible_tools(interaction_mode, registered);
+    let mut visible = initial_visible_tools_for_task_run(registered);
     if domain_profile == DomainProfile::AcademicResearch {
         let registered = registered
             .iter()
@@ -175,31 +169,8 @@ pub(crate) fn initial_visible_tools_for_profile(
     visible
 }
 
-pub(crate) fn disabled_tools_for_mode(interaction_mode: InteractionMode) -> HashSet<String> {
-    let mut disabled = HashSet::new();
-
-    match interaction_mode {
-        InteractionMode::Chat => disabled.extend(
-            ["create_complex_task", "check_run_status", "cancel_run"]
-                .into_iter()
-                .map(str::to_string),
-        ),
-        InteractionMode::Task => disabled.extend(
-            [
-                "agent_tool",
-                "create_complex_task",
-                "check_run_status",
-                "cancel_run",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        ),
-        InteractionMode::Auto => {
-            disabled.insert("agent_tool".to_string());
-        }
-    }
-
-    disabled
+pub(crate) fn disabled_tools() -> HashSet<String> {
+    HashSet::new()
 }
 
 #[cfg(test)]
@@ -214,10 +185,8 @@ mod tests {
             FILE_TOOLS,
             DIRECTORY_TOOLS,
             EXECUTION_TOOLS,
-            CODE_EXECUTION_TOOLS,
             CELL_TOOLS,
             TASK_TOOLS,
-            SKILL_RESOURCE_TOOLS,
             WEB_SEARCH_TOOLS,
             WEB_FETCH_TOOLS,
             REPOSITORY_INSPECTION_TOOLS,
@@ -229,8 +198,8 @@ mod tests {
         .collect()
     }
 
-    fn sorted_visible(mode: InteractionMode) -> Vec<String> {
-        let mut names = initial_visible_tools(mode, &policy_tool_names())
+    fn sorted_visible() -> Vec<String> {
+        let mut names = initial_visible_tools(&policy_tool_names())
             .into_iter()
             .collect::<Vec<_>>();
         names.sort();
@@ -238,60 +207,9 @@ mod tests {
     }
 
     #[test]
-    fn mode_exposure_snapshots_are_stable() {
+    fn invocation_capability_snapshot_is_stable() {
         assert_eq!(
-            sorted_visible(InteractionMode::Chat),
-            vec![
-                "apply_patch",
-                "final_answer",
-                "glob",
-                "grep",
-                "interrupt_awaiter",
-                "list_cells",
-                "list_dir",
-                "read_artifact",
-                "read_file",
-                "run_code",
-                "shell",
-                "stop_cell",
-                "task_create",
-                "task_execute",
-                "task_list",
-                "task_update",
-                "tool_search",
-                "wait",
-                "watch_cell",
-                "web_search",
-            ]
-        );
-        assert_eq!(
-            sorted_visible(InteractionMode::Task),
-            vec![
-                "apply_patch",
-                "diff",
-                "final_answer",
-                "glob",
-                "grep",
-                "interrupt_awaiter",
-                "list_cells",
-                "read_artifact",
-                "read_file",
-                "read_skill_resource",
-                "run_code",
-                "shell",
-                "stop_cell",
-                "task_create",
-                "task_execute",
-                "task_list",
-                "task_update",
-                "tool_search",
-                "wait",
-                "watch_cell",
-                "web_search",
-            ]
-        );
-        assert_eq!(
-            sorted_visible(InteractionMode::Auto),
+            sorted_visible(),
             vec![
                 "apply_patch",
                 "diff",
@@ -321,22 +239,24 @@ mod tests {
     }
 
     #[test]
+    fn explicit_task_run_surface_keeps_code_execution_bounded() {
+        let mut registered = policy_tool_names();
+        registered.push("run_code".to_string());
+        let visible = initial_visible_tools_for_task_run(&registered);
+        assert!(visible.contains("run_code"));
+        assert!(!initial_visible_tools(&registered).contains("run_code"));
+    }
+
+    #[test]
     fn academic_background_profile_exposes_only_registered_research_providers() {
         let mut registered = policy_tool_names();
         registered.extend([
             "semantic_scholar_search".to_string(),
             "pubmed_search".to_string(),
         ]);
-        let academic = initial_visible_tools_for_profile(
-            InteractionMode::Auto,
-            DomainProfile::AcademicResearch,
-            &registered,
-        );
-        let general = initial_visible_tools_for_profile(
-            InteractionMode::Auto,
-            DomainProfile::General,
-            &registered,
-        );
+        let academic =
+            initial_visible_tools_for_profile(DomainProfile::AcademicResearch, &registered);
+        let general = initial_visible_tools_for_profile(DomainProfile::General, &registered);
 
         assert!(academic.contains("semantic_scholar_search"));
         assert!(academic.contains("pubmed_search"));
@@ -345,22 +265,16 @@ mod tests {
     }
 
     #[test]
-    fn optimizations_are_enabled_after_chat_task_auto_rollout() {
-        for mode in [
-            InteractionMode::Chat,
-            InteractionMode::Task,
-            InteractionMode::Auto,
-        ] {
-            let rollout = rollout_for_mode(mode);
-            assert!(rollout.deferred_schemas);
-            assert!(rollout.cursor_pagination);
-            assert!(rollout.bounded_results);
-            assert!(rollout.content_free_telemetry);
-        }
+    fn invocation_optimizations_are_enabled() {
+        let rollout = invocation_rollout();
+        assert!(rollout.deferred_schemas);
+        assert!(rollout.cursor_pagination);
+        assert!(rollout.bounded_results);
+        assert!(rollout.content_free_telemetry);
     }
 
     #[tokio::test]
-    async fn mode_schema_budgets_do_not_regress() -> anyhow::Result<()> {
+    async fn invocation_schema_budget_does_not_regress() -> anyhow::Result<()> {
         let mut agent = ReactAgentBuilder::new()
             .model("test-model")
             .name("audit")
@@ -431,60 +345,39 @@ mod tests {
             );
         }
 
-        for mode in [
-            InteractionMode::Chat,
-            InteractionMode::Task,
-            InteractionMode::Auto,
-        ] {
-            let visible = initial_visible_tools(mode, &registered);
-            let selected = definitions
-                .iter()
-                .filter(|definition| visible.contains(&definition.function.name))
-                .cloned()
-                .collect::<Vec<_>>();
-            let stats = ToolManager::schema_stats_for(&selected)?;
-            eprintln!("{} tool schema baseline: {stats:?}", mode.as_str());
-            let (minimum_tools, maximum_tools) = match mode {
-                InteractionMode::Chat => (13, 20),
-                InteractionMode::Task => (14, 24),
-                // `final_answer` is internal and intentionally omitted from
-                // Agent::tool_definitions; the public Auto baseline is 15.
-                InteractionMode::Auto => (15, 27),
-            };
-            assert!(
-                stats.tool_count >= minimum_tools && stats.tool_count <= maximum_tools,
-                "{} initial tool count exceeded its range: {stats:?}",
-                mode.as_str()
-            );
-            assert!(
-                stats.schema_bytes <= 16_000,
-                "{} initial schema byte budget exceeded: {stats:?}",
-                mode.as_str()
-            );
-            assert!(
-                stats.estimated_tokens <= 4_000,
-                "{} initial schema budget exceeded: {stats:?}",
-                mode.as_str()
-            );
-            assert_eq!(MAX_MODEL_VISIBLE_TOOL_RESULT_TOKENS, 4_000);
-        }
+        let visible = initial_visible_tools(&registered);
+        let selected = definitions
+            .iter()
+            .filter(|definition| visible.contains(&definition.function.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let stats = ToolManager::schema_stats_for(&selected)?;
+        eprintln!("invocation tool schema baseline: {stats:?}");
+        assert!((15..=27).contains(&stats.tool_count));
+        assert!(stats.schema_bytes <= 16_000);
+        assert!(stats.estimated_tokens <= 4_000);
+        let task_visible = initial_visible_tools_for_task_run(&registered);
+        let task_selected = definitions
+            .iter()
+            .filter(|definition| task_visible.contains(&definition.function.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let task_stats = ToolManager::schema_stats_for(&task_selected)?;
+        eprintln!("task-run tool schema baseline: {task_stats:?}");
+        assert!(task_stats.schema_bytes <= 16_000);
+        assert!(task_stats.estimated_tokens <= 4_000);
+        assert_eq!(MAX_MODEL_VISIBLE_TOOL_RESULT_TOKENS, 4_000);
         Ok(())
     }
 
     #[test]
-    fn modes_keep_the_authoritative_task_graph_tools_visible() {
+    fn invocation_keeps_the_authoritative_task_graph_tools_visible() {
         let registered = policy_tool_names();
-        for mode in [
-            InteractionMode::Chat,
-            InteractionMode::Task,
-            InteractionMode::Auto,
-        ] {
-            let visible = initial_visible_tools(mode, &registered);
-            let disabled = disabled_tools_for_mode(mode);
-            for tool in ["task_create", "task_update", "task_list", "task_execute"] {
-                assert!(visible.contains(tool));
-                assert!(!disabled.contains(tool));
-            }
+        let visible = initial_visible_tools(&registered);
+        let disabled = disabled_tools();
+        for tool in ["task_create", "task_update", "task_list", "task_execute"] {
+            assert!(visible.contains(tool));
+            assert!(!disabled.contains(tool));
         }
     }
 
@@ -496,15 +389,9 @@ mod tests {
                 .into_iter()
                 .map(str::to_string),
         );
-        for mode in [
-            InteractionMode::Chat,
-            InteractionMode::Task,
-            InteractionMode::Auto,
-        ] {
-            let visible = initial_visible_tools(mode, &registered);
-            for tool in echo_agent::mcp::MCP_RESOURCE_TOOL_NAMES {
-                assert!(!visible.contains(tool));
-            }
+        let visible = initial_visible_tools(&registered);
+        for tool in echo_agent::mcp::MCP_RESOURCE_TOOL_NAMES {
+            assert!(!visible.contains(tool));
         }
     }
 }

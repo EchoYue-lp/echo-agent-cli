@@ -548,11 +548,6 @@ pub struct TaskState {
     /// Backs TaskRuntime query commands. Bootstrap propagates authority errors;
     /// `None` is retained only for explicit embedding/test construction.
     pub runtime: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
-    /// Manual interaction mode override (Chat/Task/Auto). `Auto` chooses
-    /// between direct work and a formal run; `Chat` disables formal task tools
-    /// for the turn; `Task` requires a formal run and plan lifecycle.
-    /// Toggleable at runtime via Tauri command.
-    pub interaction_mode: std::sync::atomic::AtomicU8,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1580,7 +1575,6 @@ impl AppState {
                 runtime: Some(Arc::new(
                     crate::tasks::task_runtime::TaskRuntimeStore::new()?,
                 )),
-                interaction_mode: std::sync::atomic::AtomicU8::new(0), // 0 = Auto
             },
             webhook: WebhookState {
                 emitter: webhook_emitter,
@@ -2609,7 +2603,6 @@ impl AppState {
                 root_message_id: run.root_message_id.clone(),
                 attachments: Vec::new(),
                 cancel: CancellationToken::new(),
-                interaction_mode: crate::tasks::task_runtime::InteractionMode::Task,
                 review_integration: runtime.review_integration(),
                 layer_manager: None,
                 memory_generation: None,
@@ -4316,7 +4309,6 @@ impl AppState {
             root_message_id: root_turn_id.clone(),
             attachments: turn.inline_attachment_refs(),
             cancel: lease.cancellation_token(),
-            interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
             review_integration: runtime.review_integration(),
             layer_manager: None,
             memory_generation: None,
@@ -8042,7 +8034,6 @@ mod workspace_transition_tests {
             root_message_id: "active-target-turn".to_string(),
             attachments: Vec::new(),
             cancel: lease.cancellation_token(),
-            interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
             review_integration: runtime.review_integration(),
             layer_manager: None,
             memory_generation: None,

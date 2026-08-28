@@ -4,7 +4,7 @@
 //!
 //! `drive_chat` scopes an `Arc<ChatResources>` per turn; tools read it via
 //! [`current_chat_resources`]. `pool`/`store` are `Option` because some
-//! contexts (tests, a mode without a pool) lack them — `create_complex_task`
+//! contexts (tests or a surface without a pool) lack them — `create_complex_task`
 //! requires `Some(pool)` and `Some(store)` and errors otherwise.
 use std::sync::Arc;
 
@@ -43,10 +43,6 @@ pub struct ChatResources {
     /// The chat turn's cancel token. Foreground runs may share it; background
     /// runs MUST use an independent token (spec §5.5) — never this one.
     pub cancel: CancellationToken,
-    /// The interaction mode for this turn (Chat/Task/Auto). All modes retain
-    /// the canonical task graph API; mode-specific policy controls other
-    /// delegation tools and prompt guidance. Default is `Auto`.
-    pub interaction_mode: crate::tasks::task_runtime::InteractionMode,
     /// Canonical source for workspace-bound memory admission. Product
     /// surfaces pass this Arc through unchanged; `drive_chat` acquires the
     /// generation only after foreground admission succeeds.

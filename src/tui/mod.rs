@@ -36,8 +36,6 @@ use std::time::Instant;
 use textwrap::WordSplitter;
 use unicode_width::UnicodeWidthChar;
 
-use echo_agent_app_core::tasks::task_runtime::types::InteractionMode;
-
 // ── Theme ───────────────────────────────────────────────────────────────────
 
 /// Color theme that adapts to terminal background.
@@ -339,10 +337,6 @@ pub struct TuiApp {
     pub model: String,
     /// Agent mode label.
     pub mode: String,
-    /// Manual routing override (Auto/Chat/Task) for the next message. Set by
-    /// `/mode`. TUI/GUI parity (AGENTS.md): mirrors the GUI's
-    /// `app_state.tasks.interaction_mode` and feeds `drive_chat` the same way.
-    pub interaction_mode: InteractionMode,
     /// Token usage 累计 (prompt, completion, request_count)。
     /// 注意：prompt/completion 是累计历史值；request_count 用于统计调用次数。
     /// "当前上下文占用"由 context_snapshot 单独维持，见下。
@@ -883,7 +877,6 @@ impl TuiApp {
             chat_scroll: 0,
             model,
             mode,
-            interaction_mode: InteractionMode::default(),
             tokens: (0, 0, 0),
             context_window_size: 0,
             context_snapshot: ContextWindowSnapshot::default(),

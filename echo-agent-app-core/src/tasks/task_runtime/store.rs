@@ -6807,7 +6807,6 @@ impl TaskRuntimeStore {
     pub fn record_execution_path(
         &self,
         run_id: &str,
-        requested_mode: &str,
         observed_path: &str,
     ) -> Result<(), StoreError> {
         let _operation = self.shadow_operation()?;
@@ -6818,7 +6817,6 @@ impl TaskRuntimeStore {
             RuntimeEventKind::Note,
             serde_json::json!({
                 "kind": "execution_path",
-                "requested_mode": requested_mode,
                 "observed_path": observed_path,
             }),
         ))
@@ -11104,7 +11102,7 @@ mod tests {
                 .get_run_state("r1")?
                 .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?,
         );
-        store.record_execution_path("r1", "task", "formal_plan")?;
+        store.record_execution_path("r1", "formal_plan")?;
 
         assert!(matches!(
             store.resume_and_claim_run_turn_expected(

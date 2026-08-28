@@ -97,83 +97,6 @@ impl ExecutionMode {
     }
 }
 
-/// Manual override of how a user message should be handled.
-/// `Auto` lets the agent choose an execution path; the other two enforce the
-/// available tool surface and formal-run contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export, rename = "InteractionMode")]
-pub enum InteractionMode {
-    /// Prefer direct chat while retaining the explicit TaskRuntime graph tools.
-    Chat,
-    /// Create a formal TaskRuntime run and require a reviewable plan lifecycle.
-    Task,
-    /// Agent-selected direct or formal TaskRuntime execution (default).
-    #[default]
-    Auto,
-}
-
-/// Typed IPC request for changing the application-wide interaction mode.
-///
-/// Keeping the request beside [`InteractionMode`] makes the Rust and generated
-/// TypeScript wire contract evolve together instead of translating through a
-/// numeric UI-only representation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, rename = "InteractionModeRequest")]
-pub struct InteractionModeRequest {
-    pub mode: InteractionMode,
-}
-
-impl InteractionMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            InteractionMode::Chat => "chat",
-            InteractionMode::Task => "task",
-            InteractionMode::Auto => "auto",
-        }
-    }
-
-    pub fn as_u8(&self) -> u8 {
-        match self {
-            InteractionMode::Chat => 1,
-            InteractionMode::Task => 2,
-            InteractionMode::Auto => 0,
-        }
-    }
-
-    pub fn from_u8(value: u8) -> Self {
-        match value {
-            1 => InteractionMode::Chat,
-            2 => InteractionMode::Task,
-            _ => InteractionMode::Auto,
-        }
-    }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            InteractionMode::Chat => "Chat",
-            InteractionMode::Task => "Task",
-            InteractionMode::Auto => "Auto",
-        }
-    }
-
-    /// Per-turn behavior contract injected into the user message. Keeping this
-    /// here ensures GUI, TUI, and channel entry points stay behaviorally equal.
-    pub fn prompt_hint(&self) -> &'static str {
-        match self {
-            InteractionMode::Chat => {
-                "Chat mode. Resolve simple requests directly. When a visible task list or delegated execution is useful, use the same task_create/task_update/task_list/task_execute API as every other mode; a single task does not require an artificial wrapper or DAG."
-            }
-            InteractionMode::Task => {
-                "Task mode. Materialize a formal, reviewable task graph. The TaskRun already represents the overall goal, so never create a wrapper or placeholder task for it. Submit the complete initial graph in one task_create call using its tasks array, including when the graph has only one task. Inspect the returned revision with task_list, and pass it as revision to task_execute. Use task_update with the current base_revision for later changes. Keep task status and verification current. Do not claim dispatch before task_execute starts."
-            }
-            InteractionMode::Auto => {
-                "Auto mode. Choose between direct work and formal TaskRuntime execution. Answer or act directly for simple work. When a visible task list, Subagent delegation, multi-step work, dependencies, or parallelism is useful, submit the complete graph in one task_create call using its tasks array, including for a single task. Inspect the revision with task_list, and pass it as revision to task_execute. Use task_update for later changes. Do not dispatch ad-hoc Subagents in Auto mode."
-            }
-        }
-    }
-}
-
 /// Result of a run-level pause or cancellation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, rename = "TaskRunControlReceipt")]
@@ -2976,32 +2899,7 @@ mod tests {
     }
 
     #[test]
-    fn interaction_mode_prompt_contracts_are_distinct_and_actionable() {
-        let chat = InteractionMode::Chat.prompt_hint();
-        let task = InteractionMode::Task.prompt_hint();
-        let auto = InteractionMode::Auto.prompt_hint();
-
-        assert!(chat.contains("same task_create/task_update/task_list/task_execute API"));
-        assert!(task.contains("task_create"));
-        assert!(task.contains("pass it as revision"));
-        assert!(task.contains("task_update"));
-        assert!(task.contains("never create a wrapper"));
-        assert!(auto.contains("Choose between direct work"));
-        assert!(auto.contains("formal TaskRuntime execution"));
-        assert!(auto.contains("Do not dispatch ad-hoc Subagents"));
-        assert!(auto.contains("task_list"));
-        assert_ne!(chat, task);
-        assert_ne!(task, auto);
-    }
-
-    #[test]
     fn task_runtime_ipc_receipts_preserve_typed_wire_fields() -> Result<(), String> {
-        let request = InteractionModeRequest {
-            mode: InteractionMode::Task,
-        };
-        let request_json = serde_json::to_value(request).map_err(|error| error.to_string())?;
-        assert_eq!(request_json, serde_json::json!({ "mode": "task" }));
-
         let planned = TaskRunResumeReceipt {
             kind: TaskRunResumeKind::Resumed,
             run_id: "run-planned".to_string(),

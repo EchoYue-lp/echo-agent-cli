@@ -234,8 +234,6 @@ async fn cmd_task_run(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     snapshot.run.status.as_str()
                 );
             } else {
-                *ctx.interaction_mode.write().await =
-                    echo_agent_app_core::tasks::task_runtime::InteractionMode::Task;
                 return CommandOutcome::ResumeTaskRun {
                     message: format!(
                         "Resume the existing TaskRun {} toward its unchanged Goal. Reload the authoritative TaskRuntime projection and continue the next useful work.",

@@ -11,7 +11,6 @@ import type {
   SkillSyncReceipt,
   SkillUninstallSettlementReceipt,
   StreamingEvent,
-  InteractionModeRequest,
   TaskRetryReceipt,
   TaskRunControlReceipt,
   TaskRunResumeReceipt,
@@ -249,7 +248,6 @@ const serializedWorkspaceTransition = {
 } satisfies WorkspaceTransitionReceipt;
 
 const taskRuntimeMutationContracts = {
-  mode: { mode: 'task' } satisfies InteractionModeRequest,
   control: {
     success: false,
     run_id: 'already-terminal',
@@ -327,8 +325,7 @@ describe('Rust serialization contracts', () => {
     expectTypeOf(serializedWorkspaceTransition).toMatchTypeOf<WorkspaceTransitionReceipt>();
   });
 
-  it('keeps TaskRuntime mutation receipts and interaction mode generated', () => {
-    expect(taskRuntimeMutationContracts.mode.mode).toBe('task');
+  it('keeps TaskRuntime mutation receipts generated', () => {
     expect(taskRuntimeMutationContracts.control.success).toBe(false);
     expect(taskRuntimeMutationContracts.plannedResume.turn_id).toBeNull();
     expect(taskRuntimeMutationContracts.continuationResume.turn_id).toBe('turn-1');

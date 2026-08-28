@@ -407,38 +407,6 @@ cmd!(
     cmd_attach
 );
 
-async fn cmd_interaction_mode(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    use echo_agent_app_core::tasks::task_runtime::InteractionMode;
-
-    let Some(value) = args.first() else {
-        let current = ctx.interaction_mode.read().await;
-        println!(
-            "Current interaction mode: {}. Usage: /mode chat|task|auto",
-            current.as_str()
-        );
-        return CommandOutcome::Continue;
-    };
-    let next = match value.to_ascii_lowercase().as_str() {
-        "chat" => InteractionMode::Chat,
-        "task" => InteractionMode::Task,
-        "auto" => InteractionMode::Auto,
-        _ => {
-            println!("Usage: /mode chat|task|auto");
-            return CommandOutcome::Continue;
-        }
-    };
-    *ctx.interaction_mode.write().await = next;
-    println!("Interaction mode set to {}.", next.as_str());
-    CommandOutcome::Continue
-}
-cmd!(
-    InteractionModeCommand,
-    "mode",
-    CommandCategory::Context,
-    "Set Chat, Task, or Auto interaction mode",
-    cmd_interaction_mode
-);
-
 cmd!(
     MemoryCommand,
     "memory",
@@ -662,7 +630,6 @@ pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(ForgetCommand));
     registry.register(Arc::new(MemoryCommand));
     registry.register(Arc::new(AttachCommand));
-    registry.register(Arc::new(InteractionModeCommand));
     registry.register(Arc::new(ReflectCommand));
     registry.register(Arc::new(AutoMemoryCommand));
 }

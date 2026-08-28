@@ -102,9 +102,6 @@ pub struct CommandContext {
     pub plugin_runtime: Option<Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>>,
     /// Static prompt-module report captured during runtime bootstrap.
     pub prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
-    /// Mutable Chat / Task / Auto interaction mode for subsequent turns.
-    pub interaction_mode:
-        Arc<tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>>,
     /// Attachments staged for the next CLI chat turn.
     pub staged_attachments:
         Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>>,
@@ -124,9 +121,6 @@ impl CommandContext {
             scheduler: None,
             plugin_runtime: None,
             prompt_assembly: None,
-            interaction_mode: Arc::new(tokio::sync::RwLock::new(
-                echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
-            )),
             staged_attachments: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             app_state: None,
             conversation_id: None,

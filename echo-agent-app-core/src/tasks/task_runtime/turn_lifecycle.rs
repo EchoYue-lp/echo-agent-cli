@@ -151,7 +151,7 @@ fn decide_after_persisted_run_turn_sync(
                     run.conversation_id.clone(),
                     run_id.to_string(),
                     RuntimeEventKind::RunCancelled,
-                    serde_json::json!({ "status": "cancelled", "mode": "task" }),
+                    serde_json::json!({ "status": "cancelled" }),
                 ));
             }
             return Ok(RunTurnDecision::Stop);
@@ -234,8 +234,8 @@ fn decide_after_persisted_run_turn_sync(
     }
 
     let reason = match store.get_plan(run_id) {
-        Ok(Some(_)) => "Task mode turn ended before task_execute reached a terminal result",
-        _ => "Task mode turn ended without creating a formal plan",
+        Ok(Some(_)) => "TaskRun turn ended before task_execute reached a terminal result",
+        _ => "TaskRun turn ended without creating a formal plan",
     };
     store
         .note(run_id, None, reason)
@@ -249,7 +249,7 @@ fn decide_after_persisted_run_turn_sync(
             run.conversation_id,
             run_id.to_string(),
             RuntimeEventKind::RunFailed,
-            serde_json::json!({ "error": reason, "mode": "task" }),
+            serde_json::json!({ "error": reason }),
         ));
     }
     Ok(RunTurnDecision::Stop)

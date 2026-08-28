@@ -84,9 +84,9 @@ different content is an identity collision. Queue reorder uses a compare-and-
 set queue revision.
 
 Surface source (`Gui`, `Tui`, `Cli`, or `Channel`) participates only in the
-stable scoped input-id derivation. `InteractionMode` is deliberately absent
-from ingress: dispatch reads the current capability/policy, and F4 will delete
-the old mode enum. TaskRun resume is also not a ConversationInput payload; it
+stable scoped input-id derivation. Surface mode is deliberately absent from
+ingress: dispatch reads the current capability/policy, and F4 removed the old
+mode enum. TaskRun resume is also not a ConversationInput payload; it
 continues through the existing revisioned TaskRuntime continuation/wakeup
 authority. Durable cursor/watch delivery is deferred to Iteration 6 and is not
 smuggled into P1 metadata.

@@ -74,8 +74,8 @@ The event fold reconstructs `TaskStatus` first and builds Todos afterward.
 
 The task tools remain `task_create`, `task_update`, `task_list`, and
 `task_execute`. No TaskGet, TodoWrite, workflow store, second reducer, or
-surface-local state mutation is introduced. `InteractionMode` is unchanged;
-its removal belongs to F4.
+surface-local state mutation is introduced. The former interaction-mode surface
+was removed by F4; task graph execution remains explicit through `task_execute`.
 
 ## Consequences
 

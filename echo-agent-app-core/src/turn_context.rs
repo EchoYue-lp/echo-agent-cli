@@ -1,8 +1,8 @@
 //! Per-turn EKO policy projected at every model boundary.
 //!
 //! User-authored text stays untouched in conversation history. Dynamic product
-//! policy, including the active interaction mode, is carried in a replaceable
-//! projection so it cannot become part of the user request or TaskRun goal.
+//! policy is carried in a replaceable projection so it cannot become part of
+//! the user request or TaskRun goal.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
@@ -13,10 +13,10 @@ use echo_agent::llm::types::Message;
 use futures::future::BoxFuture;
 
 use crate::prepared_turn::InstructionAuthorship;
+use crate::tasks::task_runtime::RunTurnOrigin;
 use crate::tasks::task_runtime::compact_context::{
     TaskRuntimeContextProjector, TaskRuntimeProjectionRegistry,
 };
-use crate::tasks::task_runtime::{InteractionMode, RunTurnOrigin};
 
 /// Stable projection owner for the current turn's product contract.
 pub const TURN_CONTRACT_MARKER: &str = "eko:turn-contract";
@@ -29,7 +29,6 @@ Do not infer response language from system instructions, mode contracts, tool sc
 
 #[derive(Clone, Copy)]
 struct TurnContract {
-    interaction_mode: InteractionMode,
     origin: RunTurnOrigin,
     authorship: InstructionAuthorship,
 }
@@ -54,7 +53,6 @@ impl TurnPromptContextRegistry {
     pub fn register(
         self: &Arc<Self>,
         turn_id: impl Into<String>,
-        interaction_mode: InteractionMode,
         origin: RunTurnOrigin,
         authorship: InstructionAuthorship,
     ) -> TurnPromptContextRegistration {
@@ -67,11 +65,7 @@ impl TurnPromptContextRegistry {
                 turn_id.clone(),
                 TurnRegistration {
                     id,
-                    contract: TurnContract {
-                        interaction_mode,
-                        origin,
-                        authorship,
-                    },
+                    contract: TurnContract { origin, authorship },
                 },
             );
         TurnPromptContextRegistration {
@@ -209,11 +203,9 @@ fn render_turn_contract(contract: TurnContract) -> String {
         }
     };
     format!(
-        "[eko_turn_contract]\nInteraction mode: {}\nTurn origin: {}\nInstruction author: {}\nMode behavior:\n{}\n\nResponse language:\n{language_anchor}\n{LANGUAGE_PRIORITY_RULES}\n[/eko_turn_contract]",
-        contract.interaction_mode.label(),
+        "[eko_turn_contract]\nTurn origin: {}\nInstruction author: {}\n\nResponse language:\n{language_anchor}\n{LANGUAGE_PRIORITY_RULES}\n[/eko_turn_contract]",
         contract.origin.as_str(),
         contract.authorship.as_str(),
-        contract.interaction_mode.prompt_hint(),
     )
 }
 
@@ -237,12 +229,8 @@ mod tests {
         let task_registry = Arc::new(TaskRuntimeProjectionRegistry::new());
         let turn_registry = Arc::new(TurnPromptContextRegistry::new());
         let projector = EkoContextProjector::new(task_registry, Arc::clone(&turn_registry));
-        let registration = turn_registry.register(
-            "turn-a",
-            InteractionMode::Auto,
-            RunTurnOrigin::User,
-            InstructionAuthorship::User,
-        );
+        let registration =
+            turn_registry.register("turn-a", RunTurnOrigin::User, InstructionAuthorship::User);
 
         let active = projector
             .project(&projection_context(Some("turn-a")))
@@ -254,8 +242,7 @@ mod tests {
             .and_then(|projection| projection.message.as_ref())
             .and_then(|message| message.content.as_text())
             .ok_or_else(|| "active turn contract missing".to_string())?;
-        if !contract.contains("Interaction mode: Auto")
-            || !contract.contains("Turn origin: user")
+        if !contract.contains("Turn origin: user")
             || !contract.contains("non-projection user message")
         {
             return Err(format!("turn contract is incomplete: {contract}"));
@@ -283,7 +270,6 @@ mod tests {
         let projector = EkoContextProjector::new(task_registry, Arc::clone(&turn_registry));
         let _registration = turn_registry.register(
             "turn-c",
-            InteractionMode::Task,
             RunTurnOrigin::Continuation,
             InstructionAuthorship::Runtime,
         );
@@ -312,15 +298,9 @@ mod tests {
     #[test]
     fn latest_registration_owns_cleanup_for_the_same_turn() -> Result<(), String> {
         let registry = Arc::new(TurnPromptContextRegistry::new());
-        let old = registry.register(
-            "turn",
-            InteractionMode::Chat,
-            RunTurnOrigin::User,
-            InstructionAuthorship::User,
-        );
+        let old = registry.register("turn", RunTurnOrigin::User, InstructionAuthorship::User);
         let current = registry.register(
             "turn",
-            InteractionMode::Task,
             RunTurnOrigin::Resume,
             InstructionAuthorship::Runtime,
         );
@@ -328,8 +308,7 @@ mod tests {
         let contract = registry
             .contract("turn")
             .ok_or_else(|| "current registration missing".to_string())?;
-        if contract.interaction_mode != InteractionMode::Task
-            || contract.origin != RunTurnOrigin::Resume
+        if contract.origin != RunTurnOrigin::Resume
             || contract.authorship != InstructionAuthorship::Runtime
         {
             return Err("old registration removed the current turn".to_string());

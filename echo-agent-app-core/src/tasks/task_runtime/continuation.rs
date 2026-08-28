@@ -15,7 +15,7 @@ use crate::chat_resources::ChatResources;
 use crate::prepared_turn::PreparedUserTurn;
 
 use super::store::TaskRuntimeStore;
-use super::types::{InteractionMode, RunTurnBinding, RunTurnOrigin, TaskRunStatus, TurnVisibility};
+use super::types::{RunTurnBinding, RunTurnOrigin, TaskRunStatus, TurnVisibility};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContinueRequestDisposition {
@@ -93,7 +93,6 @@ impl ContinuationLauncher {
                 root_message_id: String::new(),
                 attachments: self.resources.attachments.clone(),
                 cancel: CancellationToken::new(),
-                interaction_mode: InteractionMode::Task,
                 review_integration: self.resources.review_integration.clone(),
                 layer_manager: None,
                 memory_generation: None,
@@ -203,7 +202,6 @@ impl TaskContinuationRuntime {
             root_message_id: String::new(),
             attachments: resources.attachments.clone(),
             cancel: CancellationToken::new(),
-            interaction_mode: InteractionMode::Task,
             review_integration: resources.review_integration.clone(),
             layer_manager: None,
             memory_generation: None,
@@ -866,7 +864,6 @@ async fn drive_continuation_turn(
         root_message_id: turn_id,
         attachments: launcher.resources.attachments.clone(),
         cancel,
-        interaction_mode: InteractionMode::Task,
         review_integration: launcher.resources.review_integration.clone(),
         layer_manager: None,
         memory_generation: None,
@@ -1196,20 +1193,6 @@ pub(crate) fn request_continue(
 }
 
 #[cfg(test)]
-pub(crate) fn launcher_generation_for_test(
-    store: &Arc<TaskRuntimeStore>,
-    run_id: &str,
-) -> Option<u64> {
-    runtime_for(store)
-        .state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .launchers
-        .get(run_id)
-        .map(|registered| registered.generation)
-}
-
-#[cfg(test)]
 pub(crate) fn runtime_state_for_test(
     store: &TaskRuntimeStore,
     run_id: &str,
@@ -1393,7 +1376,6 @@ mod tests {
             root_message_id: format!("{run_id}-root"),
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
-            interaction_mode: InteractionMode::Task,
             review_integration: None,
             layer_manager: None,
             memory_generation: None,
@@ -1732,7 +1714,6 @@ mod tests {
             root_message_id: "join-root".to_string(),
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
-            interaction_mode: InteractionMode::Task,
             review_integration: None,
             layer_manager: None,
             memory_generation: None,
@@ -1819,7 +1800,6 @@ mod tests {
             root_message_id: "deferred-root".to_string(),
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
-            interaction_mode: InteractionMode::Task,
             review_integration: None,
             layer_manager: None,
             memory_generation: None,
@@ -2010,7 +1990,6 @@ mod tests {
             root_message_id: "drop-order-root".to_string(),
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
-            interaction_mode: InteractionMode::Task,
             review_integration: None,
             layer_manager: None,
             memory_generation: None,

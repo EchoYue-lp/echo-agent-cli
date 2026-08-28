@@ -31,7 +31,6 @@ static FILE_CHANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 struct QueuedReplTurn {
     message: String,
-    interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode,
     attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
     staged_attachment_batch: Option<echo_agent_app_core::attachments::StagedAttachmentBatch>,
     task_run_resume: Option<echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity>,
@@ -759,19 +758,15 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
             echo_agent_app_core::chat_driver::ChatDriverEvent::ExtensionReceipt(receipt) => {
                 self.output.emit(receipt.display_message())
             }
-            echo_agent_app_core::chat_driver::ChatDriverEvent::ExecutionPath {
-                requested_mode,
-                observed_path,
-            } => self.output.emit(format!(
-                "Execution path: {requested_mode} -> {observed_path}"
-            )),
+            echo_agent_app_core::chat_driver::ChatDriverEvent::ExecutionPath { observed_path } => {
+                self.output.emit(format!("Execution path: {observed_path}"))
+            }
             echo_agent_app_core::chat_driver::ChatDriverEvent::TurnConfiguration {
-                interaction_mode,
                 permission_mode,
                 approval_policy,
                 attachments,
             } => self.output.emit(format!(
-                "Turn configuration: mode={interaction_mode}, permission={permission_mode}, \
+                "Turn configuration: permission={permission_mode}, \
                  approval={approval_policy}, attachments={}",
                 attachments.len()
             )),
@@ -1251,9 +1246,6 @@ async fn run_repl_inner(
         crate::project::coding_loop::CodingLoop::new(&project_root),
     ));
 
-    let interaction_mode = Arc::new(tokio::sync::RwLock::new(
-        echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
-    ));
     let staged_attachments = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let cmd_handler = CommandHandler::new(agent.clone())
         .with_registry(Arc::new(registry))
@@ -1264,7 +1256,6 @@ async fn run_repl_inner(
         .with_prompt_assembly(config.prompt_assembly.clone())
         .with_app_state_opt(config.app_state.clone())
         .with_conversation_id(config.conversation_id.clone())
-        .with_interaction_mode(interaction_mode.clone())
         .with_staged_attachments(staged_attachments.clone());
 
     let editor_config = EditorConfig {
@@ -1294,7 +1285,6 @@ async fn run_repl_inner(
                 live_output.clone(),
                 &config,
                 &mut active_turn,
-                *interaction_mode.read().await,
             )
             .await;
         }
@@ -1318,7 +1308,6 @@ async fn run_repl_inner(
                 live_output.clone(),
                 &config,
                 &mut active_turn,
-                *interaction_mode.read().await,
             )
             .await;
         }
@@ -1348,7 +1337,6 @@ async fn run_repl_inner(
                 live_output.clone(),
                 &config,
                 &mut active_turn,
-                *interaction_mode.read().await,
             )
             .await;
         }
@@ -1378,14 +1366,12 @@ async fn run_repl_inner(
                         let _ = resolve_front_hitl(&mut pending_hitl, line, output.as_ref());
                     }
                     ReplLineTarget::ActiveTurn => {
-                        let mode = *interaction_mode.read().await;
                         let attachments = {
                             let mut staged = staged_attachments.lock().await;
                             std::mem::take(&mut *staged)
                         };
                         let mut queued = QueuedReplTurn {
                             message: line.to_string(),
-                            interaction_mode: mode,
                             attachments,
                             staged_attachment_batch: None,
                             task_run_resume: None,
@@ -1436,7 +1422,6 @@ async fn run_repl_inner(
                                             live_output.clone(),
                                             &config,
                                             &mut active_turn,
-                                            *interaction_mode.read().await,
                                         )
                                         .await;
                                     }
@@ -1481,7 +1466,6 @@ async fn run_repl_inner(
                                             live_output.clone(),
                                             &config,
                                             &mut active_turn,
-                                            *interaction_mode.read().await,
                                         )
                                         .await;
                                     }
@@ -1557,14 +1541,12 @@ async fn run_repl_inner(
                             CommandResult::Continue => {}
                             CommandResult::Exit => break Ok(()),
                             CommandResult::Chat(message) => {
-                                let mode = *interaction_mode.read().await;
                                 let attachments = {
                                     let mut staged = staged_attachments.lock().await;
                                     std::mem::take(&mut *staged)
                                 };
                                 let mut input = QueuedReplTurn {
                                     message,
-                                    interaction_mode: mode,
                                     attachments,
                                     staged_attachment_batch: None,
                                     task_run_resume: None,
@@ -1588,7 +1570,6 @@ async fn run_repl_inner(
                                             live_output.clone(),
                                             &config,
                                             &mut active_turn,
-                                            mode,
                                         )
                                         .await;
                                     }
@@ -1611,7 +1592,6 @@ async fn run_repl_inner(
                                     message,
                                     attachments: Vec::new(),
                                     staged_attachment_batch: None,
-                                    interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Task,
                                     task_run_resume: Some(identity),
                                 };
                                 let turn_id = uuid::Uuid::new_v4().to_string();
@@ -1658,7 +1638,6 @@ async fn run_repl_inner(
                         live_output.clone(),
                         &config,
                         &mut active_turn,
-                        *interaction_mode.read().await,
                     )
                     .await;
                 } else {
@@ -2060,7 +2039,6 @@ async fn repl_turn_from_projection(
     config: &ReplConfig,
     runtime: &echo_agent_app_core::state::ScopedChatRuntime,
     projection: &echo_agent_app_core::conversation_input::ConversationInputProjection,
-    interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode,
 ) -> Result<QueuedReplTurn, String> {
     let app_state = config
         .app_state
@@ -2078,7 +2056,6 @@ async fn repl_turn_from_projection(
         .map_err(|error| error.to_string())??;
     Ok(QueuedReplTurn {
         message: projection.payload.text.clone(),
-        interaction_mode,
         attachments: staged.refs,
         staged_attachment_batch: staged.batch,
         task_run_resume: None,
@@ -2116,7 +2093,6 @@ async fn start_next_durable_turn(
     live_output: ReplExternalOutput,
     config: &ReplConfig,
     active: &mut Option<ActiveReplTurn>,
-    interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode,
 ) {
     if active.is_some() {
         return;
@@ -2151,20 +2127,19 @@ async fn start_next_durable_turn(
             return;
         }
     };
-    let mut next =
-        match repl_turn_from_projection(config, &runtime, &projection, interaction_mode).await {
-            Ok(next) => next,
-            Err(error) => {
-                if let Some(state) = config.app_state.as_ref() {
-                    let _ = state
-                        .conversation_inputs()
-                        .deferred(attempt, error.clone())
-                        .await;
-                }
-                output.print_warning(&format!("Queued follow-up remains pending: {error}"));
-                return;
+    let mut next = match repl_turn_from_projection(config, &runtime, &projection).await {
+        Ok(next) => next,
+        Err(error) => {
+            if let Some(state) = config.app_state.as_ref() {
+                let _ = state
+                    .conversation_inputs()
+                    .deferred(attempt, error.clone())
+                    .await;
             }
-        };
+            output.print_warning(&format!("Queued follow-up remains pending: {error}"));
+            return;
+        }
+    };
     match prepare_repl_turn_start(agent, &mut next, config, turn_id, Some(attempt.clone())).await {
         Ok(prepared) => {
             *active = Some(spawn_prepared_repl_turn(
@@ -2283,14 +2258,7 @@ async fn route_active_input(
             return ActiveInputDisposition::Queued;
         }
     };
-    let mut durable_input = match repl_turn_from_projection(
-        config,
-        &runtime,
-        &projection,
-        input.interaction_mode,
-    )
-    .await
-    {
+    let mut durable_input = match repl_turn_from_projection(config, &runtime, &projection).await {
         Ok(input) => input,
         Err(error) => {
             let _ = app_state
@@ -2695,7 +2663,6 @@ fn spawn_prepared_repl_turn(
         root_message_id: turn_id.clone(),
         attachments: turn.inline_attachment_refs(),
         cancel,
-        interaction_mode: input.interaction_mode,
         review_integration: scoped_runtime.review_integration(),
         layer_manager: None,
         memory_generation: None,
@@ -4192,7 +4159,6 @@ mod tests {
             root_message_id: "closed-printer-turn".to_string(),
             attachments: Vec::new(),
             cancel: cancel.clone(),
-            interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
             review_integration: None,
             layer_manager: None,
             memory_generation: None,

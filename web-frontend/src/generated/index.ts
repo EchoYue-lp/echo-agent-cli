@@ -67,8 +67,6 @@ export * from './HookCommand';
 export * from './HookCommandReceipt';
 export * from './HookSourceProjection';
 export * from './HookTestMatchProjection';
-export * from './InteractionMode';
-export * from './InteractionModeRequest';
 export * from './IssueSeverity';
 export * from './LoggingConfigResponse';
 export * from './LoggingUpdate';

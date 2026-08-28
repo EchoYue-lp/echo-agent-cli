@@ -214,7 +214,7 @@ export type ChatEvent = {
   | { type: 'error'; message: string }
   | { type: 'run_status'; status: ChatRunStatus }
   | { type: 'notice'; level: 'info' | 'warning' | 'error' | string; code: string; message: string }
-  | { type: 'execution_path'; requested_mode: string; observed_path: string }
+  | { type: 'execution_path'; observed_path: string }
   | {
       type: 'approval_request';
       request_id: string;
@@ -330,7 +330,7 @@ export type ChatDriverEvent =
   | { source: 'agent'; event: AgentEventEnvelope }
   | { source: 'execution'; event: Record<string, unknown> }
   | { source: 'turn_status'; event: { status: ChatRunStatus } }
-  | { source: 'execution_path'; event: { requested_mode: string; observed_path: string } }
+  | { source: 'execution_path'; event: { observed_path: string } }
   | { source: 'interrupt'; event: { run_id: string; goal: string; new_message: string } }
   | { source: 'input_lifecycle'; event: ConversationInputFact }
   | {

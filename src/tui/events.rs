@@ -360,7 +360,6 @@ enum AgentEvent {
         outcome: TurnOutcome,
     },
     ExecutionPath {
-        requested_mode: String,
         observed_path: String,
     },
     Interrupt {
@@ -899,11 +898,8 @@ pub async fn run_event_loop(
                             .await;
                     }
                 }
-                AgentEvent::ExecutionPath {
-                    requested_mode,
-                    observed_path,
-                } => {
-                    app.status_msg = format!("{requested_mode} -> {observed_path}");
+                AgentEvent::ExecutionPath { observed_path } => {
+                    app.status_msg = observed_path;
                 }
                 AgentEvent::Interrupt {
                     run_id,
@@ -2134,7 +2130,6 @@ async fn dispatch_turn(
         // Bind staged refs so subagents in an autonomous run see them too.
         attachments: task_attachments,
         cancel: lease.cancellation_token(),
-        interaction_mode: app.interaction_mode,
         review_integration: scoped_runtime.review_integration(),
         layer_manager: None,
         memory_generation: None,
@@ -2985,21 +2980,16 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
             ChatDriverEvent::InputLifecycle(fact) => {
                 AgentEvent::Notice(format_conversation_input_fact(&fact))
             }
-            ChatDriverEvent::ExecutionPath {
-                requested_mode,
-                observed_path,
-            } => AgentEvent::ExecutionPath {
-                requested_mode,
-                observed_path,
-            },
+            ChatDriverEvent::ExecutionPath { observed_path } => {
+                AgentEvent::ExecutionPath { observed_path }
+            }
             ChatDriverEvent::TurnConfiguration {
-                interaction_mode,
                 permission_mode,
                 approval_policy,
                 attachments,
             } => AgentEvent::Notice(format!(
-                "Turn configuration: mode={interaction_mode}, permission={permission_mode}, \
-                 approval={approval_policy}, attachments={}",
+                "Turn configuration: permission={permission_mode}, approval={approval_policy}, \
+                 attachments={}",
                 attachments.len()
             )),
             ChatDriverEvent::Interrupt {
@@ -4779,37 +4769,6 @@ async fn handle_slash_command(
                     "Exited plan mode.".to_string()
                 },
             });
-        }
-        Some(SlashCommand::Mode) => {
-            // Manual routing override for the next message (TUI/GUI parity with
-            // `set_interaction_mode`). Auto = router decides; Chat = force normal
-            // chat; Task = force TaskRuntime. Updates the status-bar label too.
-            if args.is_empty() {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: format!(
-                        "Interaction mode: {} (auto/chat/task)",
-                        app.interaction_mode.label()
-                    ),
-                });
-            } else {
-                match parse_interaction_mode(args) {
-                    Some(m) => {
-                        app.interaction_mode = m;
-                        app.mode = m.label().to_string();
-                        app.messages.push(ChatMessage {
-                            role: MessageRole::System,
-                            content: format!("Interaction mode set to: {}", m.label()),
-                        });
-                    }
-                    None => {
-                        app.messages.push(ChatMessage {
-                            role: MessageRole::System,
-                            content: format!("Unknown mode '{}'; use auto, chat, or task", args),
-                        });
-                    }
-                }
-            }
         }
         Some(SlashCommand::Attach) => {
             // B5.3: stage a file (image/document) for the next message. Reads
@@ -7269,22 +7228,6 @@ fn find_subagent_run_mut<'a>(
 
 // ── Parallel task progress strip ────────────────────────────────────────
 
-/// Parse a user-supplied interaction-mode argument (`auto` / `chat` / `task`,
-/// case-insensitive) for the `/mode` command. Returns `None` for unknown or
-/// empty input so the caller can surface an error instead of silently
-/// falling back to `Auto`.
-fn parse_interaction_mode(
-    arg: &str,
-) -> Option<echo_agent_app_core::tasks::task_runtime::types::InteractionMode> {
-    use echo_agent_app_core::tasks::task_runtime::types::InteractionMode;
-    match arg.trim().to_lowercase().as_str() {
-        "auto" => Some(InteractionMode::Auto),
-        "chat" => Some(InteractionMode::Chat),
-        "task" => Some(InteractionMode::Task),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -7294,10 +7237,9 @@ mod tests {
         delete_previous_word, exact_active_turn_for_address, exact_conversation_input_attempt,
         execute_registered_tui_steer, format_conversation_input_fact, format_task_runtime_view,
         format_unattended_worktrees, handle_approval_key, handle_esc, move_cursor_vertical,
-        parse_interaction_mode, project_tui_task_views, render_cancelled_event,
-        render_conversation_input_receipt, render_error_event, request_from_prepared,
-        resolve_tui_workspace_file, retry_tui_task, reverse_history_search,
-        run_turn_binding_for_request, settle_planned_resume_foreground,
+        project_tui_task_views, render_cancelled_event, render_conversation_input_receipt,
+        render_error_event, request_from_prepared, resolve_tui_workspace_file, retry_tui_task,
+        reverse_history_search, run_turn_binding_for_request, settle_planned_resume_foreground,
         slash_command_allowed_while_busy, update_subagent_runs, validate_tui_task_run_scope,
     };
     use crate::tui::{
@@ -7307,8 +7249,8 @@ mod tests {
     };
     use echo_agent_app_core::chat_driver::TurnOutcome;
     use echo_agent_app_core::tasks::task_runtime::{
-        AttendedMode, DomainProfile, ExecutionMode, InteractionMode, PlanRevision, PlanTask,
-        TaskPlan, TaskRunStatus, TaskRuntimeStore, TodoItem, TodoStatus, commit_eko_task_plan,
+        AttendedMode, DomainProfile, ExecutionMode, PlanRevision, PlanTask, TaskPlan,
+        TaskRunStatus, TaskRuntimeStore, TodoItem, TodoStatus, commit_eko_task_plan,
     };
     use std::sync::Arc;
     use std::time::Instant;
@@ -7454,28 +7396,6 @@ mod tests {
             .map_err(|error| error.to_string())?
         );
         Ok(())
-    }
-
-    #[test]
-    fn parses_auto_chat_task_case_insensitively() {
-        assert_eq!(parse_interaction_mode("auto"), Some(InteractionMode::Auto));
-        assert_eq!(parse_interaction_mode("chat"), Some(InteractionMode::Chat));
-        assert_eq!(parse_interaction_mode("task"), Some(InteractionMode::Task));
-        // Case-insensitive.
-        assert_eq!(parse_interaction_mode("Chat"), Some(InteractionMode::Chat));
-        assert_eq!(parse_interaction_mode("TASK"), Some(InteractionMode::Task));
-        // Surrounding whitespace is tolerated (e.g. `/mode  chat`).
-        assert_eq!(
-            parse_interaction_mode(" chat "),
-            Some(InteractionMode::Chat)
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_and_empty() {
-        assert_eq!(parse_interaction_mode("plan"), None);
-        assert_eq!(parse_interaction_mode("xyz"), None);
-        assert_eq!(parse_interaction_mode(""), None);
     }
 
     #[test]

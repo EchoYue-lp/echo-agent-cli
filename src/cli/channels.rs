@@ -966,8 +966,6 @@ pub struct AppChannelMessageHandler {
     webhook_emitter: Arc<echo_agent_app_core::webhook::WebhookEmitter>,
     hitl: Arc<ChannelHumanLoopProvider>,
     foreground_turns: ForegroundTurnControl,
-    interaction_mode:
-        Arc<tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>>,
     session_instance: echo_agent::channels::ChannelSessionInstance,
     session_coordinator: Arc<ChannelSessionCoordinator>,
     initialization_error: Option<String>,
@@ -997,7 +995,6 @@ struct ChannelInputPumpAdapter {
     agent_conversation_id: String,
     cache_id: String,
     hitl: Arc<ChannelHumanLoopProvider>,
-    interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode,
 }
 
 #[cfg(feature = "channels")]
@@ -1279,7 +1276,6 @@ impl input_pump::ChannelInputPumpAdapter for ChannelInputPumpAdapter {
                 root_message_id: item.attempt.turn_id.clone(),
                 attachments: turn.inline_attachment_refs(),
                 cancel,
-                interaction_mode: self.interaction_mode,
                 review_integration: item.runtime.review_integration(),
                 layer_manager: None,
                 memory_generation: None,
@@ -1421,7 +1417,6 @@ impl AppChannelMessageHandler {
                     agent_conversation_id,
                     cache_id,
                     hitl: Arc::clone(&self.hitl),
-                    interaction_mode: *self.interaction_mode.read().await,
                 });
                 self.session_coordinator.start_input_pump_task(
                     Arc::clone(&self.input_pump),
@@ -1450,9 +1445,6 @@ impl AppChannelMessageHandler {
             webhook_emitter,
             hitl: Arc::new(ChannelHumanLoopProvider::new()),
             foreground_turns,
-            interaction_mode: Arc::new(tokio::sync::RwLock::new(
-                echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
-            )),
             session_instance,
             active_turns: Arc::clone(&session_coordinator.active_turns),
             input_pump: session_coordinator.input_pump(&surface_id),
@@ -1684,7 +1676,6 @@ impl AppChannelMessageHandler {
             agent_conversation_id: agent_conv.to_string(),
             cache_id: Self::cache_user_id(conv, &self.session_instance.incarnation_id()),
             hitl: Arc::clone(&self.hitl),
-            interaction_mode: *self.interaction_mode.read().await,
         });
         let terminal_projector = channel_live_terminal_projector(
             service.clone(),
@@ -3004,7 +2995,6 @@ impl AppChannelMessageHandler {
                 let session_instance = self.session_instance.clone();
                 let session_coordinator = Arc::clone(&self.session_coordinator);
                 let incarnation_fault = Arc::clone(&self.incarnation_fault);
-                let interaction_mode = Arc::clone(&self.interaction_mode);
                 let pending_retirement = Arc::clone(&self.pending_retirement);
                 let active_turns = Arc::clone(&self.active_turns);
                 let reset_turn_id_for_owner = reset_turn_id.clone();
@@ -3092,7 +3082,6 @@ impl AppChannelMessageHandler {
                                                 }
                                             }
                                             drop(retirement_holds);
-                                            reset_channel_interaction_mode(&interaction_mode).await;
                                             (
                                                 echo_agent_app_core::chat_driver::TurnOutcome::Completed,
                                                 "Conversation reset with a clean model context; product history remains available."
@@ -3923,50 +3912,6 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 ChannelHumanLoopResolution::NoPending => {}
             }
         }
-        if msg.text.split_whitespace().next() == Some("/mode") {
-            let command_id = uuid::Uuid::new_v4().to_string();
-            let (_runtime, lease) = match self
-                .app_state
-                .begin_scoped_chat_turn_owned(
-                    ForegroundTurnSurface::Channel,
-                    &conv,
-                    command_id.clone(),
-                )
-                .await
-            {
-                Ok(lease) => lease,
-                Err(echo_agent_app_core::state::ScopedChatTurnError::Conversation(
-                    echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
-                        ForegroundTurnError::Busy { active_turn_id, .. },
-                    ),
-                )) => {
-                    return Ok(immediate_channel_response(
-                        &msg,
-                        format!("Turn {active_turn_id} is still running; mode was not changed."),
-                    ));
-                }
-                Err(error) => {
-                    return Ok(immediate_channel_response(
-                        &msg,
-                        format!("Unable to admit the mode command: {error}"),
-                    ));
-                }
-            };
-            let message = parse_channel_mode_command(&msg.text, &self.interaction_mode)
-                .await
-                .unwrap_or_else(|| "Usage: /mode chat|task|auto".to_string());
-            let message = match settle_channel_turn_after_input_observers(
-                lease,
-                echo_agent_app_core::chat_driver::TurnOutcome::Completed,
-            )
-            .await
-            {
-                Ok(_) => message,
-                Err(error) => format!("{message}; foreground settlement failed: {error}"),
-            };
-            return Ok(immediate_channel_response(&msg, message));
-        }
-
         // Management commands use the same exact foreground admission and
         // TaskRuntime -> pool order as chat. They do not mutate the agent when
         // any admission step fails.
@@ -4446,11 +4391,6 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         // GUI/TUI under the exact immutable execution scope captured at turn
         // admission. PreparedUserTurn then promotes these staging files into
         // conversation/turn-scoped resources shared by main and Subagents.
-        let interaction_mode = if resume_task_run.is_some() {
-            echo_agent_app_core::tasks::task_runtime::InteractionMode::Task
-        } else {
-            *self.interaction_mode.read().await
-        };
         let runtime_authored = resume_task_run.is_some();
         let prepared_attachments = Vec::new();
         let prepared_conversation_id = conv.clone();
@@ -4583,7 +4523,6 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                             root_message_id: driver_turn_id,
                             attachments: turn.inline_attachment_refs(),
                             cancel: foreground_lease.cancellation_token(),
-                            interaction_mode,
                             review_integration,
                             layer_manager: None,
                             memory_generation: None,
@@ -4803,41 +4742,6 @@ async fn configure_channel_agent(
             })
         })
         .await;
-}
-
-#[cfg(feature = "channels")]
-async fn parse_channel_mode_command(
-    message: &str,
-    mode: &tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>,
-) -> Option<String> {
-    use echo_agent_app_core::tasks::task_runtime::InteractionMode;
-
-    let mut parts = message.split_whitespace();
-    if parts.next()? != "/mode" {
-        return None;
-    }
-    let Some(value) = parts.next() else {
-        let current = mode.read().await;
-        return Some(format!(
-            "Current mode: {}. Usage: /mode chat|task|auto",
-            current.as_str()
-        ));
-    };
-    let next = match value.to_ascii_lowercase().as_str() {
-        "chat" => InteractionMode::Chat,
-        "task" => InteractionMode::Task,
-        "auto" => InteractionMode::Auto,
-        _ => return Some("Usage: /mode chat|task|auto".to_string()),
-    };
-    *mode.write().await = next;
-    Some(format!("Interaction mode set to {}.", next.as_str()))
-}
-
-#[cfg(feature = "channels")]
-async fn reset_channel_interaction_mode(
-    mode: &tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>,
-) {
-    *mode.write().await = echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto;
 }
 
 #[cfg(feature = "channels")]
@@ -5818,21 +5722,6 @@ mod tests {
 
     #[cfg(feature = "channels")]
     #[tokio::test]
-    async fn successful_reset_restores_only_the_sender_mode_to_auto() {
-        use echo_agent_app_core::tasks::task_runtime::InteractionMode;
-
-        let alice = tokio::sync::RwLock::new(InteractionMode::Task);
-        let bob = tokio::sync::RwLock::new(InteractionMode::Chat);
-        let failed_reset = tokio::sync::RwLock::new(InteractionMode::Task);
-        super::reset_channel_interaction_mode(&alice).await;
-
-        assert_eq!(*alice.read().await, InteractionMode::Auto);
-        assert_eq!(*bob.read().await, InteractionMode::Chat);
-        assert_eq!(*failed_reset.read().await, InteractionMode::Task);
-    }
-
-    #[cfg(feature = "channels")]
-    #[tokio::test]
     async fn reset_gc_removes_only_the_exact_sender_incarnation() -> Result<(), String> {
         use echo_agent::memory::{ConversationStore, FileConversationStore, NewConversation};
         use echo_agent::state::{AgentCheckpoint, FileRuntimeStateStore, RuntimeStateStore};
@@ -6669,7 +6558,7 @@ mod tests {
         use echo_agent_app_core::chat_driver::TurnOutcome;
         use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
         use echo_agent_app_core::tasks::task_runtime::{
-            InteractionMode, RunTurnBinding, RunTurnOrigin, TaskRuntimeStore, TurnVisibility,
+            RunTurnBinding, RunTurnOrigin, TaskRuntimeStore, TurnVisibility,
         };
 
         let temporary =
@@ -6721,7 +6610,6 @@ mod tests {
             root_message_id: "root-turn".to_string(),
             attachments: Vec::new(),
             cancel,
-            interaction_mode: InteractionMode::Chat,
             review_integration: None,
             layer_manager: None,
             memory_generation: None,

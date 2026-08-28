@@ -9,17 +9,16 @@ import {
   ShieldCheck,
   Cpu,
   Brain,
-  Workflow,
   ChevronDown,
   Check,
 } from 'lucide-react';
 import { Card } from '../common/Card';
-import { permissionsApi, providerApi, taskRuntimeApi } from '../../api/endpoints';
+import { permissionsApi, providerApi } from '../../api/endpoints';
 import { useUiStore } from '../../stores/uiStore';
 import { useToastStore } from '../../stores/toastStore';
 import { useChatStore, cacheHitRate } from '../../stores/chatStore';
 import type { Attachment } from '../../types/api';
-import type { ConfiguredModel, InteractionMode } from '../../generated';
+import type { ConfiguredModel } from '../../generated';
 import { CONTEXT_RING_CIRCUMFERENCE, ringDashOffset } from './contextRing';
 import { computeContextUsage, estimateDraftTokens, type ContextUsageSource } from './contextUsage';
 import { isKnownThinkingLevel, thinkingLevelOptions } from './thinkingLevels';
@@ -32,11 +31,6 @@ import {
 } from '../../lib/permissionModes';
 
 const THINKING_STORAGE_KEY = 'echo_thinking_level';
-const INTERACTION_MODES = [
-  { id: 'chat', label: 'Chat', description: '直接对话' },
-  { id: 'task', label: 'Task', description: '计划并执行复杂任务' },
-  { id: 'auto', label: 'Auto', description: '由 Agent 选择执行路径' },
-] as const;
 function loadThinkingLevel(): string {
   try {
     const v = localStorage.getItem(THINKING_STORAGE_KEY);
@@ -333,10 +327,6 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   const [thinkingLevel, setThinkingLevel] = useState<string>(loadThinkingLevel);
   const [thinkingMenuOpen, setThinkingMenuOpen] = useState(false);
   const [switchingThinking, setSwitchingThinking] = useState(false);
-  const [interactionMode, setInteractionMode] = useState<InteractionMode>('auto');
-  const [switchingInteractionMode, setSwitchingInteractionMode] = useState<InteractionMode | null>(
-    null
-  );
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
@@ -351,8 +341,6 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   const contextWindowSize = displayModel?.context_window ?? null;
   const activePermissionMode =
     PERMISSION_MODES.find((mode) => mode.id === permissionMode) ?? PERMISSION_MODES[0];
-  const activeInteractionMode =
-    INTERACTION_MODES.find((mode) => mode.id === interactionMode) ?? INTERACTION_MODES[2];
 
   const loadConfiguredModels = useCallback(async () => {
     try {
@@ -379,19 +367,6 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   useEffect(() => {
     loadPermissionMode();
   }, [loadPermissionMode]);
-
-  const loadInteractionMode = useCallback(async () => {
-    try {
-      const mode = await taskRuntimeApi.getInteractionMode();
-      setInteractionMode(INTERACTION_MODES.some((m) => m.id === mode) ? mode : 'auto');
-    } catch (e) {
-      console.error('[ChatInput] Failed to load interaction mode:', e);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadInteractionMode();
-  }, [loadInteractionMode]);
 
   useEffect(() => {
     const refreshPermissionMode = () => {
@@ -458,22 +433,6 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
       }
     },
     [permissionMode, switchingPermissionMode]
-  );
-
-  const switchInteractionMode = useCallback(
-    async (mode: InteractionMode) => {
-      if (mode === interactionMode || switchingInteractionMode !== null) return;
-      setSwitchingInteractionMode(mode);
-      try {
-        const next = await taskRuntimeApi.setInteractionMode(mode);
-        setInteractionMode(INTERACTION_MODES.some((m) => m.id === next) ? next : mode);
-      } catch (e) {
-        console.error('[ChatInput] Failed to switch interaction mode:', e);
-      } finally {
-        setSwitchingInteractionMode(null);
-      }
-    },
-    [interactionMode, switchingInteractionMode]
   );
 
   useEffect(() => {
@@ -986,28 +945,6 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
                     </button>
                   </MenuOverlay>
                 )}
-              </div>
-              <div
-                className="flex shrink-0 items-center rounded-full border border-[var(--border-secondary)] bg-[var(--bg-secondary)] p-0.5"
-                title={`运行模式: ${activeInteractionMode.description}`}
-              >
-                <Workflow size={12} className="mx-1 text-[var(--text-tertiary)]" />
-                {INTERACTION_MODES.map((mode) => (
-                  <button
-                    key={mode.id}
-                    type="button"
-                    onClick={() => switchInteractionMode(mode.id)}
-                    disabled={switchingInteractionMode !== null}
-                    title={mode.description}
-                    className={`h-6 rounded-full px-2 text-[10px] transition-colors disabled:cursor-wait ${
-                      interactionMode === mode.id
-                        ? 'bg-[var(--accent)] text-[var(--text-on-accent)]'
-                        : 'text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
-                    }`}
-                  >
-                    {switchingInteractionMode === mode.id ? '...' : mode.label}
-                  </button>
-                ))}
               </div>
               <div className="relative">
                 <button

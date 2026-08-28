@@ -4929,12 +4929,9 @@ async fn run_main_agent_task(
                 .map(crate::state::WorkspaceIoInvocation::resource_guards)
                 .unwrap_or_default();
             Box::pin(async move {
-                let visible_tools = crate::tool_exposure::initial_visible_tools(
-                    InteractionMode::Task,
-                    &agent.tool_names(),
-                );
-                crate::tool_exposure::record_mode_schema_budget(
-                    InteractionMode::Task,
+                let visible_tools =
+                    crate::tool_exposure::initial_visible_tools_for_task_run(&agent.tool_names());
+                crate::tool_exposure::record_schema_budget(
                     &agent.tool_definitions(),
                     &visible_tools,
                 );
@@ -4964,9 +4961,7 @@ async fn run_main_agent_task(
                     }),
                     working_dir,
                     cancel: None,
-                    disabled_tools: Some(crate::tool_exposure::disabled_tools_for_mode(
-                        InteractionMode::Task,
-                    )),
+                    disabled_tools: Some(crate::tool_exposure::disabled_tools()),
                     visible_tools: Some(visible_tools),
                     run_budget: None,
                     resource_guards,
@@ -5256,15 +5251,10 @@ async fn drive_owned_agent_turn(
             let agent_inner = primary_agent.inner().clone();
             let agent = agent_inner.read().await;
             let visible_tools = crate::tool_exposure::initial_visible_tools_for_profile(
-                InteractionMode::Auto,
                 run.domain_profile,
                 &agent.tool_names(),
             );
-            crate::tool_exposure::record_mode_schema_budget(
-                InteractionMode::Auto,
-                &agent.tool_definitions(),
-                &visible_tools,
-            );
+            crate::tool_exposure::record_schema_budget(&agent.tool_definitions(), &visible_tools);
             let mutating_tools: HashSet<String> = agent
                 .tool_names()
                 .into_iter()
@@ -5365,9 +5355,7 @@ pub async fn drive_agent_run(
     let prompt = unattended_run_prompt(prompt, attended_mode, write_mode);
     let mut disabled_tools =
         direct_mutation_disabled_tools(attended_mode, write_mode).unwrap_or_default();
-    disabled_tools.extend(crate::tool_exposure::disabled_tools_for_mode(
-        InteractionMode::Auto,
-    ));
+    disabled_tools.extend(crate::tool_exposure::disabled_tools());
     let continuation_configured = blocking
         .run("validate agent-driven continuation", {
             let run_id = run_id.to_string();

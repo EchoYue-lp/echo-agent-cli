@@ -46,7 +46,6 @@ impl EnhancedCompleter {
                 "/stats",
                 "/st",
                 "/model",
-                "/mode",
                 "/attach",
                 "/remember",
                 "/forget",

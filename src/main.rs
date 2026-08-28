@@ -508,7 +508,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             conversation_id.clone(),
             &headless_services,
             cli::JsonlRunOptions {
-                interaction_mode: args.jsonl_mode,
                 permission_mode: args.jsonl_permission,
                 approval_policy: args.jsonl_approval,
                 attachment_paths: args.jsonl_attachment.clone(),
@@ -657,7 +656,6 @@ mod tests {
             tui: false,
             no_alt_screen: false,
             jsonl: None,
-            jsonl_mode: cli::args::JsonlInteractionMode::Auto,
             jsonl_permission: cli::args::JsonlPermissionMode::Default,
             jsonl_approval: cli::args::JsonlApprovalPolicy::Reject,
             jsonl_attachment: Vec::new(),
@@ -744,8 +742,6 @@ mod tests {
             "echo-agent-cli",
             "--jsonl",
             "inspect the project",
-            "--jsonl-mode",
-            "task",
             "--jsonl-permission",
             "full-auto",
             "--jsonl-approval",
@@ -754,7 +750,6 @@ mod tests {
             "/tmp/context.txt",
         ]);
         assert_eq!(args.jsonl.as_deref(), Some("inspect the project"));
-        assert_eq!(args.jsonl_mode, cli::args::JsonlInteractionMode::Task);
         assert_eq!(
             args.jsonl_permission,
             cli::args::JsonlPermissionMode::FullAuto

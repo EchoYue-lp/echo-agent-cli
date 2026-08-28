@@ -7,7 +7,7 @@ use anyhow::Result;
 use futures::FutureExt;
 
 use crate::agent_handle::AgentHandle;
-use crate::cli::args::{Args, JsonlApprovalPolicy, JsonlInteractionMode, JsonlPermissionMode};
+use crate::cli::args::{Args, JsonlApprovalPolicy, JsonlPermissionMode};
 use echo_agent_app_core::config::EkoConfig;
 
 /// Owned settlement for a concurrently running product surface that must stop
@@ -222,7 +222,6 @@ where
 
 #[derive(Debug, Clone)]
 pub struct JsonlRunOptions {
-    pub interaction_mode: JsonlInteractionMode,
     pub permission_mode: JsonlPermissionMode,
     pub approval_policy: JsonlApprovalPolicy,
     pub attachment_paths: Vec<std::path::PathBuf>,
@@ -397,7 +396,6 @@ pub async fn run_jsonl_mode(
     {
         if !sink.on_event(
             echo_agent_app_core::chat_driver::ChatDriverEvent::TurnConfiguration {
-                interaction_mode: options.interaction_mode.runtime().as_str().to_string(),
                 permission_mode: options.permission_mode.as_str().to_string(),
                 approval_policy: options.approval_policy.as_str().to_string(),
                 attachments: Vec::new(),
@@ -506,7 +504,6 @@ pub async fn run_jsonl_mode(
     }
     if !sink.on_event(
         echo_agent_app_core::chat_driver::ChatDriverEvent::TurnConfiguration {
-            interaction_mode: options.interaction_mode.runtime().as_str().to_string(),
             permission_mode: options.permission_mode.as_str().to_string(),
             approval_policy: options.approval_policy.as_str().to_string(),
             attachments: attachments
@@ -622,7 +619,6 @@ pub async fn run_jsonl_mode(
         root_message_id: turn_id,
         attachments: turn.inline_attachment_refs(),
         cancel: lease.cancellation_token(),
-        interaction_mode: options.interaction_mode.runtime(),
         review_integration: scoped_runtime.review_integration(),
         layer_manager: None,
         memory_generation: None,
