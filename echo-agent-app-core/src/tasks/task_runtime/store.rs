@@ -7342,6 +7342,7 @@ mod tests {
 
     fn fresh() -> Result<TaskRuntimeStore, StoreError> {
         TaskRuntimeStore::new_in_memory()
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))
     }
 
     #[test]

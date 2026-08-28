@@ -191,7 +191,10 @@ mod tests {
     use super::*;
 
     fn seeded_store() -> Result<Arc<TaskRuntimeStore>, StoreError> {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory()
+                .map_err(|error| StoreError::InvalidPlan(error.to_string()))?,
+        );
         store.create_run(
             "r1",
             "ws",
@@ -266,7 +269,8 @@ mod tests {
 
     #[test]
     fn render_progress_errors_on_unknown_run() -> Result<(), StoreError> {
-        let store = TaskRuntimeStore::new_in_memory()?;
+        let store = TaskRuntimeStore::new_in_memory()
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
         assert!(matches!(
             render_progress(&store, "nope"),
             Err(StoreError::RunNotFound(_))

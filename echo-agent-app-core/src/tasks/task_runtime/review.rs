@@ -26,7 +26,7 @@ use echo_agent::prelude::Message;
 
 use super::profiles::ProfileTemplate;
 #[cfg(test)]
-use super::store::TaskRuntimeStore;
+use super::store::{StoreError, TaskRuntimeStore};
 use super::types::*;
 
 /// Error returned by review operations.
@@ -459,7 +459,10 @@ mod tests {
 
     #[tokio::test]
     async fn circuit_breaker_suspends_on_exhausted_retries() -> Result<(), StoreError> {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory()
+                .map_err(|error| StoreError::InvalidPlan(error.to_string()))?,
+        );
         let task = PlanTask {
             id: "t1".into(),
             retry_count: 3,
@@ -486,7 +489,10 @@ mod tests {
 
     #[tokio::test]
     async fn circuit_breaker_suspends_on_repeated_fingerprint() -> Result<(), StoreError> {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory()
+                .map_err(|error| StoreError::InvalidPlan(error.to_string()))?,
+        );
         // Seed: one prior review with fp-X (mimics what review_task would
         // have persisted on the first failed attempt).
         store.add_review(&ReviewResult {
@@ -529,7 +535,10 @@ mod tests {
 
     #[tokio::test]
     async fn circuit_breaker_creates_fix_on_first_failure() -> Result<(), StoreError> {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory()
+                .map_err(|error| StoreError::InvalidPlan(error.to_string()))?,
+        );
         let task = PlanTask {
             id: "t1".into(),
             retry_count: 0,
