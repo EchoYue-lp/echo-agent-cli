@@ -27,6 +27,11 @@ durable inbox、`SubagentControlService` 的 exact-attempt guidance/interrupt、
   workspace incarnation；不匹配时返回 typed fail-closed error；
 - `agent_wait` 只读取现有 router/task event cursor，返回 bounded event summaries，不能
   代替 TaskRun/Subagent terminal authority；取消和超时是 wait 结果，不是任务终态；
+- TaskRuntime 提供 `RuntimeEventQuery { after_sequence, limit, execution_id, event_types }`
+  和 bounded `SubagentRunSnapshot` 查询。journal 在单次 replay 边界执行 limit，过滤时以
+  固定大小 page 前进；`execution_id` 与 event kind 在 store 内过滤，不会让大量无关事件
+  占满 adapter 的 limit。Subagent list 仅保留有界 attempt map，exact-attempt inspect/control
+  只重建目标 execution，不先构造完整 `Vec<SubagentRun>`；
 - Conversation `agent_message`/`agent_followup` 先通过绑定 workspace 的
   `ConversationStore` 验证持久化会话，再以 `message_id` 复用 router exact-once 语义；router
   的 `target.json` 单独不能制造会话。`agent_message` 只持久化信息、不自动启动 turn，
@@ -55,13 +60,15 @@ list/message/wait。Conversation 的存在性由绑定 workspace `ConversationSt
 只负责 inbox/journal；list 会过滤 router-only phantom target，并为每个列出的 target
 写入当前 workspace generation（global 使用固定 `global`）。WorkspaceRegistry generation
 读取通过 blocking boundary 完成。TaskRuntime 的所有读操作经
-`TaskRuntimeBlockingAdapter` 离开 async executor；当前底层 `list_events`/
-`list_subagent_runs` API 仍返回完整向量，adapter 保证 exact-target 过滤发生在
-`MAX_EVENTS` 截断之前，避免 false timeout；新增真正的 bounded query API 留作 R1/P0
-integration，不能在本 ADR 中伪称已解决。
+`TaskRuntimeBlockingAdapter` 离开 async executor。通用诊断/恢复调用仍可显式使用完整历史
+`list_events`/`list_subagent_runs`；Agent control 的 list/inspect/wait/exact-attempt 路径全部
+使用底层 bounded query。长历史扫描的内存上界由 journal page、query limit 和 retained
+attempt limit 决定，返回字段仍由同一事件 fold 无损投影（包括 revision、attempt、usage、
+terminal result 与 latest sequence）。
 
 ## 验证
 
 覆盖 target discriminator、ConversationStore-first phantom rejection、exact-once message、
-cursor target binding、settled attempt inspect/wait、cancel/timeout wait，以及六工具
+cursor target binding、settled attempt inspect/wait、cancel/timeout wait、增长历史中跨越大量
+无关事件的 exact target 查询、bounded attempt retention 与字段 round-trip，以及六工具
 schema/注册；提交前按 `AGENTS.md` 执行 Rust workspace 门禁。

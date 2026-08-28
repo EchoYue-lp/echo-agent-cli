@@ -322,6 +322,18 @@ impl FileTaskStore {
             .map_err(FileReadError::Shadow)
     }
 
+    pub(crate) fn list_events_bounded(
+        &self,
+        run_id: &str,
+        since_seq: i64,
+        limit: usize,
+    ) -> Result<Vec<RuntimeTaskEvent>, FileReadError> {
+        let after_sequence = u64::try_from(since_seq).unwrap_or_default();
+        self.shadow
+            .read_events_after_bounded(run_id, after_sequence, limit)
+            .map_err(FileReadError::Shadow)
+    }
+
     /// Artifacts come from the journal-derived incremental history segment.
     /// Query cost is proportional to returned artifacts plus an uncheckpointed
     /// journal suffix, not the full journal length.

@@ -20,9 +20,10 @@ use ts_rs::TS;
 
 use crate::agent_router::{AgentAddress, AgentDeliveryReceipt, AgentRouter};
 use crate::tasks::task_runtime::{
-    RuntimeEventKind, StoreError, SubagentControlActorSource, SubagentControlIdentity,
-    SubagentControlPhase, SubagentControlReceipt, SubagentControlService, SubagentGuidanceKind,
-    SubagentRun, TaskPlan, TaskRun, TaskRunStatus, TaskRuntimeBlockingAdapter, TaskRuntimeStore,
+    RuntimeEventKind, RuntimeEventQuery, StoreError, SubagentControlActorSource,
+    SubagentControlIdentity, SubagentControlPhase, SubagentControlReceipt, SubagentControlService,
+    SubagentGuidanceKind, SubagentRun, SubagentRunSnapshot, TaskPlan, TaskRun, TaskRunStatus,
+    TaskRuntimeBlockingAdapter, TaskRuntimeStore,
 };
 use crate::workspace::WorkspaceId;
 use crate::workspace::registry::WorkspaceRegistry;
@@ -428,28 +429,44 @@ impl AgentControlService {
             .map_err(|error| AgentControlError::Runtime(error.to_string()))
     }
 
-    async fn list_events(
+    async fn query_events(
         &self,
         run_id: &str,
-        since_seq: i64,
+        query: RuntimeEventQuery,
     ) -> Result<Vec<crate::tasks::task_runtime::RuntimeTaskEvent>, AgentControlError> {
         let run_id = run_id.to_string();
         self.task_runtime_blocking
             .run_store("read Agent control events", move |store| {
-                store.list_events(&run_id, since_seq)
+                store.query_events_bounded(&run_id, query)
             })
             .await
             .map_err(|error| AgentControlError::Runtime(error.to_string()))
     }
 
-    async fn list_subagent_runs(
+    async fn list_subagent_run_snapshots(
         &self,
         run_id: &str,
-    ) -> Result<Vec<SubagentRun>, AgentControlError> {
+        limit: usize,
+    ) -> Result<Vec<SubagentRunSnapshot>, AgentControlError> {
         let run_id = run_id.to_string();
         self.task_runtime_blocking
             .run_store("read Agent control Subagent runs", move |store| {
-                store.list_subagent_runs(&run_id)
+                store.list_subagent_run_snapshots(&run_id, limit)
+            })
+            .await
+            .map_err(|error| AgentControlError::Runtime(error.to_string()))
+    }
+
+    async fn get_subagent_run_snapshot(
+        &self,
+        run_id: &str,
+        execution_id: &str,
+    ) -> Result<Option<SubagentRunSnapshot>, AgentControlError> {
+        let run_id = run_id.to_string();
+        let execution_id = execution_id.to_string();
+        self.task_runtime_blocking
+            .run_store("read exact Agent control Subagent run", move |store| {
+                store.get_subagent_run_snapshot(&run_id, &execution_id)
             })
             .await
             .map_err(|error| AgentControlError::Runtime(error.to_string()))
@@ -589,23 +606,16 @@ impl AgentControlService {
                 {
                     continue;
                 }
-                for subagent in self.list_subagent_runs(&run.run_id).await? {
-                    // A retry can outlive a later plan revision. Recover the
-                    // revision recorded on this exact Assigned boundary rather
-                    // than binding historical attempts to today's plan.
-                    let events = self.list_events(&subagent.run_id, 0).await?;
-                    let Some(plan_revision) = events
-                        .iter()
-                        .rev()
-                        .find(|event| {
-                            event.event_type == RuntimeEventKind::SubagentAssigned
-                                && event.step_id.as_deref()
-                                    == Some(subagent.subagent_run_id.as_str())
-                        })
-                        .and_then(|event| {
-                            event.payload.get("plan_revision").and_then(Value::as_u64)
-                        })
-                    else {
+                let remaining = limit.saturating_sub(entries.len());
+                for snapshot in self
+                    .list_subagent_run_snapshots(&run.run_id, remaining)
+                    .await?
+                {
+                    let subagent = snapshot.run;
+                    // A retry can outlive a later plan revision. The bounded
+                    // snapshot keeps the revision recorded on this exact
+                    // Assigned boundary.
+                    let Some(plan_revision) = snapshot.plan_revision else {
                         continue;
                     };
                     let target = AgentTarget::TaskSubagent {
@@ -634,14 +644,7 @@ impl AgentControlService {
                     {
                         continue;
                     }
-                    let sequence = events
-                        .iter()
-                        .rev()
-                        .find(|event| {
-                            event.step_id.as_deref() == Some(subagent.subagent_run_id.as_str())
-                        })
-                        .map(|event| event.seq)
-                        .unwrap_or(0);
+                    let sequence = snapshot.latest_event.seq;
                     let cursor = self.cursor_token(&target, sequence);
                     entries.push(AgentListEntry {
                         target,
@@ -697,16 +700,13 @@ impl AgentControlService {
                 // one; exact_subagent below enforces identity without
                 // requiring Running status.
                 self.validate_observable_task_target(task).await?;
-                let subagent = self.exact_subagent(task).await?;
-                let events = self.list_events(&task.run_id, 0).await?;
-                let latest = events
-                    .iter()
-                    .rev()
-                    .find(|event| event.step_id.as_deref() == Some(task.execution_id.as_str()));
+                let snapshot = self.exact_subagent_snapshot(task).await?;
+                let subagent = snapshot.run;
+                let latest = snapshot.latest_event;
                 Ok(AgentInspectResponse {
                     target: target.clone(),
                     status: subagent.status.as_str().to_string(),
-                    phase: latest.map(|event| event.event_type.as_str().to_string()),
+                    phase: Some(latest.event_type.as_str().to_string()),
                     outcome: subagent
                         .result
                         .as_ref()
@@ -720,10 +720,9 @@ impl AgentControlService {
                         &AgentTarget::TaskSubagent {
                             target: task.clone(),
                         },
-                        latest.map(|event| event.seq).unwrap_or(0),
+                        latest.seq,
                     ),
-                    needs_attention: latest
-                        .is_some_and(|event| event.event_type.is_attention_event()),
+                    needs_attention: latest.event_type.is_attention_event(),
                 })
             }
         }
@@ -1026,21 +1025,15 @@ impl AgentControlService {
                 }))
             }
             AgentTarget::TaskSubagent { target: task } => {
-                let events = self.list_events(&task.run_id, after).await?;
-                let event = events
+                let event = self
+                    .query_events(
+                        &task.run_id,
+                        RuntimeEventQuery::new(after, 1)
+                            .for_execution(task.execution_id.clone())
+                            .with_event_types(subagent_wait_event_types()),
+                    )
+                    .await?
                     .into_iter()
-                    .filter(|event| {
-                        event.step_id.as_deref() == Some(task.execution_id.as_str())
-                            && (matches!(event.event_type, RuntimeEventKind::SubagentReleased)
-                                || matches!(
-                                    event.event_type,
-                                    RuntimeEventKind::SubagentGuidanceMailboxAccepted
-                                        | RuntimeEventKind::SubagentGuidanceDrained
-                                        | RuntimeEventKind::SubagentGuidanceSettled
-                                )
-                                || event.event_type.is_attention_event())
-                    })
-                    .take(MAX_EVENTS)
                     .next();
                 Ok(event.map(|event| AgentWaitEvent {
                     target: target.clone(),
@@ -1228,23 +1221,32 @@ impl AgentControlService {
         &self,
         target: &TaskSubagentTarget,
     ) -> Result<SubagentRun, AgentControlError> {
-        let runs = self.list_subagent_runs(&target.run_id).await?;
-        let Some(run) = runs
-            .into_iter()
-            .find(|run| run.subagent_run_id == target.execution_id)
+        self.exact_subagent_snapshot(target)
+            .await
+            .map(|snapshot| snapshot.run)
+    }
+
+    async fn exact_subagent_snapshot(
+        &self,
+        target: &TaskSubagentTarget,
+    ) -> Result<SubagentRunSnapshot, AgentControlError> {
+        let Some(snapshot) = self
+            .get_subagent_run_snapshot(&target.run_id, &target.execution_id)
+            .await?
         else {
             return Err(AgentControlError::StaleAttempt {
                 execution_id: target.execution_id.clone(),
                 attempt: target.attempt,
             });
         };
+        let run = &snapshot.run;
         if run.task_id != target.task_id || run.attempt != target.attempt {
             return Err(AgentControlError::StaleAttempt {
                 execution_id: target.execution_id.clone(),
                 attempt: target.attempt,
             });
         }
-        Ok(run)
+        Ok(snapshot)
     }
 
     fn conversation_address(
@@ -1594,6 +1596,33 @@ fn control_phase_name(phase: SubagentControlPhase) -> &'static str {
     }
 }
 
+fn subagent_wait_event_types() -> Vec<RuntimeEventKind> {
+    vec![
+        RuntimeEventKind::SubagentReleased,
+        RuntimeEventKind::SubagentGuidanceMailboxAccepted,
+        RuntimeEventKind::SubagentGuidanceDrained,
+        RuntimeEventKind::SubagentGuidanceSettled,
+        RuntimeEventKind::RunGoalUpdated,
+        RuntimeEventKind::RequirementEvidenceInvalidated,
+        RuntimeEventKind::RequirementSkipped,
+        RuntimeEventKind::RunFailed,
+        RuntimeEventKind::RunCancelled,
+        RuntimeEventKind::TaskFailed,
+        RuntimeEventKind::TaskCancelled,
+        RuntimeEventKind::TaskTimedOut,
+        RuntimeEventKind::SubagentGuidanceRejected,
+        RuntimeEventKind::SubagentInterruptSettled,
+        RuntimeEventKind::Failed,
+        RuntimeEventKind::Cancelled,
+        RuntimeEventKind::TimedOut,
+        RuntimeEventKind::ArtifactProduced,
+        RuntimeEventKind::BackgroundCellFinished,
+        RuntimeEventKind::MergeStarted,
+        RuntimeEventKind::MergeCompleted,
+        RuntimeEventKind::MergeFailed,
+    ]
+}
+
 fn bounded_text(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
 }
@@ -1896,8 +1925,10 @@ pub async fn register_agent_control_tools_on_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks::task_runtime::store::SubagentReleaseRecord;
     use crate::tasks::task_runtime::{
-        AttendedMode, DomainProfile, ExecutionMode, PlanTask, TaskPlan, task_goal_sha256,
+        AttendedMode, DomainProfile, ExecutionMode, PlanTask, SubagentRunStatus, SubagentRunUsage,
+        SubagentTaskResult, TaskPlan, task_goal_sha256,
     };
     use echo_agent::memory::{ConversationStore, FileConversationStore, NewConversation};
 
@@ -2186,6 +2217,117 @@ mod tests {
             ])
             .map(|runs| runs.len())
             .map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn task_agent_queries_remain_exact_after_long_unrelated_history() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = service(root.path())?;
+        seed_task_plan(service.task_runtime.as_ref(), "run-bounded")
+            .map_err(|error| format!("failed to seed bounded Agent-control plan: {error}"))?;
+        service
+            .task_runtime
+            .record_subagent_assigned(
+                "run-bounded",
+                "task-a",
+                "execution-a",
+                "implementer",
+                "Task A",
+                1,
+                1,
+                false,
+                false,
+            )
+            .map_err(|error| error.to_string())?;
+        let assigned = service
+            .task_runtime
+            .query_events_bounded(
+                "run-bounded",
+                RuntimeEventQuery::new(0, 1)
+                    .for_execution("execution-a")
+                    .with_event_types(vec![RuntimeEventKind::SubagentAssigned]),
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "assigned event missing".to_string())?;
+        for index in 0..300 {
+            service
+                .task_runtime
+                .note("run-bounded", None, &format!("unrelated event {index}"))
+                .map_err(|error| error.to_string())?;
+        }
+        let result = SubagentTaskResult::terminal(
+            SubagentRunStatus::Completed,
+            "完成 ✅ adapter result",
+            Vec::new(),
+        );
+        let usage = SubagentRunUsage {
+            duration_ms: Some(17),
+            tokens_used: Some(23),
+            iterations: Some(2),
+        };
+        service
+            .task_runtime
+            .record_subagent_released(SubagentReleaseRecord {
+                run_id: "run-bounded",
+                task_id: "task-a",
+                execution_id: "execution-a",
+                agent_name: "implementer",
+                task_subject: "Task A",
+                plan_revision: 1,
+                attempt: 1,
+                status: "completed",
+                result: Some(&result),
+                full_output: None,
+                usage: Some(&usage),
+                dispatch_hook: false,
+            })
+            .map_err(|error| error.to_string())?;
+
+        let listed = service
+            .list(AgentListRequest {
+                scope: AgentListScope::TaskSubagent,
+                workspace_id: Some("global".to_string()),
+                status: None,
+                limit: 1,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let entry = listed
+            .entries
+            .first()
+            .ok_or_else(|| "bounded Agent list entry missing".to_string())?;
+        assert_eq!(entry.attempt, Some(1));
+        assert_eq!(entry.status, "completed");
+        assert_eq!(entry.summary.as_deref(), Some("完成 ✅ adapter result"));
+
+        let target = task_subagent_target("run-bounded");
+        let inspected = service
+            .inspect(target.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(inspected.phase.as_deref(), Some("subagent_released"));
+        assert_eq!(inspected.outcome.as_deref(), Some("completed"));
+        assert_eq!(inspected.summary.as_deref(), Some("完成 ✅ adapter result"));
+        let waited = service
+            .wait(
+                AgentWaitRequest {
+                    targets: vec![target.clone()],
+                    after_cursor: Some(service.cursor_token(&target, assigned.seq)),
+                    timeout_ms: 0,
+                },
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(waited.status, AgentWaitStatus::Changed);
+        assert_eq!(waited.events.len(), 1);
+        assert_eq!(
+            waited.events.first().map(|event| event.kind.as_str()),
+            Some("subagent_released")
+        );
+        Ok(())
     }
 
     async fn settle_claim(

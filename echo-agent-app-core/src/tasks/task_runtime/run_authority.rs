@@ -887,6 +887,36 @@ impl RunAuthority {
         replay_journal(state.journal.as_ref(), after_sequence)
     }
 
+    /// Replay at most `limit` records directly from the journal. Unlike
+    /// [`Self::replay_after`], this is a single bounded journal read and does
+    /// not materialize the complete suffix before returning.
+    pub(crate) fn replay_after_bounded(
+        &self,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<RuntimeTaskEvent>, ShadowError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| ShadowError::AuthorityClosed(self.event_path.display().to_string()))?;
+        let records = state
+            .journal
+            .replay_after(after_sequence, limit)
+            .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
+        records
+            .into_iter()
+            .map(|record| {
+                record
+                    .event
+                    .project(record.sequence)
+                    .map_err(|sequence| ShadowError::SequenceOutOfRange { sequence })
+            })
+            .collect()
+    }
+
     pub(crate) fn read_plan_projection(&self) -> Result<Option<PlanRevision>, ShadowError> {
         self.read_projection("plan.json")
     }

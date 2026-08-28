@@ -86,6 +86,48 @@ pub enum StoreError {
     },
 }
 
+/// Bounded journal query used by application adapters that must not
+/// materialize a TaskRun's complete event history. Empty `event_types` means
+/// all event kinds; `execution_id` binds the query to one Subagent attempt.
+#[derive(Debug, Clone)]
+pub struct RuntimeEventQuery {
+    pub after_sequence: i64,
+    pub limit: usize,
+    pub execution_id: Option<String>,
+    pub event_types: Vec<RuntimeEventKind>,
+}
+
+impl RuntimeEventQuery {
+    pub fn new(after_sequence: i64, limit: usize) -> Self {
+        Self {
+            after_sequence,
+            limit,
+            execution_id: None,
+            event_types: Vec::new(),
+        }
+    }
+
+    pub fn for_execution(mut self, execution_id: impl Into<String>) -> Self {
+        self.execution_id = Some(execution_id.into());
+        self
+    }
+
+    pub fn with_event_types(mut self, event_types: Vec<RuntimeEventKind>) -> Self {
+        self.event_types = event_types;
+        self
+    }
+}
+
+/// One exact Subagent attempt plus the event metadata required by bounded
+/// Agent-control projections. The `run` fields are reconstructed without
+/// dropping usage or terminal result data.
+#[derive(Debug, Clone)]
+pub struct SubagentRunSnapshot {
+    pub run: SubagentRun,
+    pub plan_revision: Option<u64>,
+    pub latest_event: RuntimeTaskEvent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectionCommitReceipt {
     Durable { seq: i64 },
@@ -5109,112 +5151,70 @@ impl TaskRuntimeStore {
     /// usage events. `SubagentReleased.usage` is the terminal aggregate when
     /// available; usage events provide the live projection while it is running.
     pub fn list_subagent_runs(&self, run_id: &str) -> Result<Vec<SubagentRun>, StoreError> {
-        let mut runs = std::collections::BTreeMap::<String, SubagentRun>::new();
-        // Audit allowlist: this public history API reconstructs every Subagent
-        // attempt, live usage, and terminal result, not just current boundaries.
-        for event in self.list_events(run_id, 0)? {
-            if let Some(recovery) = boot_recovery_payload(&event)
-                && let Some(subagents) = recovery
-                    .get("subagents")
-                    .and_then(serde_json::Value::as_array)
-            {
-                for recovered in subagents {
-                    let Some(execution_id) = json_string(recovered, "execution_id") else {
-                        continue;
-                    };
-                    let Some(run) = runs.get_mut(&execution_id) else {
-                        continue;
-                    };
-                    run.status = json_string(recovered, "status")
-                        .as_deref()
-                        .and_then(SubagentRunStatus::from_str)
-                        .unwrap_or(SubagentRunStatus::Failed);
-                }
+        self.list_subagent_run_snapshots(run_id, usize::MAX)
+            .map(|snapshots| snapshots.into_iter().map(|snapshot| snapshot.run).collect())
+    }
+
+    /// Rebuild at most `limit` Subagent attempts while scanning the journal in
+    /// fixed-size pages. The retained map is bounded even when the TaskRun has
+    /// a long history; ordering matches [`Self::list_subagent_runs`].
+    pub fn list_subagent_run_snapshots(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SubagentRunSnapshot>, StoreError> {
+        self.project_subagent_runs(run_id, limit, None)
+            .map(|runs| runs.into_values().collect())
+    }
+
+    /// Rebuild one exact Subagent attempt without first constructing the full
+    /// run history vector.
+    pub fn get_subagent_run_snapshot(
+        &self,
+        run_id: &str,
+        execution_id: &str,
+    ) -> Result<Option<SubagentRunSnapshot>, StoreError> {
+        self.project_subagent_runs(run_id, 1, Some(execution_id))
+            .map(|mut runs| runs.remove(execution_id))
+    }
+
+    fn project_subagent_runs(
+        &self,
+        run_id: &str,
+        limit: usize,
+        exact_execution_id: Option<&str>,
+    ) -> Result<std::collections::BTreeMap<String, SubagentRunSnapshot>, StoreError> {
+        const SCAN_PAGE_SIZE: usize = 256;
+
+        if limit == 0 {
+            return Ok(std::collections::BTreeMap::new());
+        }
+        let mut runs = std::collections::BTreeMap::new();
+        let mut after_sequence = 0_i64;
+        loop {
+            let events = self.query_events_bounded(
+                run_id,
+                RuntimeEventQuery::new(after_sequence, SCAN_PAGE_SIZE),
+            )?;
+            let event_count = events.len();
+            if event_count == 0 {
+                break;
             }
-            let Some(execution_id) = event.step_id.clone() else {
-                continue;
-            };
-            match event.event_type {
-                RuntimeEventKind::SubagentAssigned => {
-                    let Some(task_id) = event.task_id.clone() else {
-                        continue;
-                    };
-                    let Some(subagent_name) = json_string(&event.payload, "agent_name") else {
-                        continue;
-                    };
-                    let attempt = event
-                        .payload
-                        .get("attempt")
-                        .and_then(serde_json::Value::as_u64)
-                        .and_then(|value| u32::try_from(value).ok())
-                        .unwrap_or(1);
-                    runs.insert(
-                        execution_id.clone(),
-                        SubagentRun::new(execution_id, run_id, task_id, subagent_name, attempt),
-                    );
-                }
-                RuntimeEventKind::RunTurnUsageAccounted
-                    if json_string(&event.payload, "source_scope").as_deref()
-                        == Some("subagent") =>
-                {
-                    let Some(run) = runs.get_mut(&execution_id) else {
-                        continue;
-                    };
-                    let tokens = event
-                        .payload
-                        .get("input_tokens")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0)
-                        .saturating_add(
-                            event
-                                .payload
-                                .get("output_tokens")
-                                .and_then(serde_json::Value::as_u64)
-                                .unwrap_or(0),
-                        );
-                    run.usage.tokens_used =
-                        Some(run.usage.tokens_used.unwrap_or(0).saturating_add(tokens));
-                    let duration_ms = event
-                        .payload
-                        .get("duration_ms")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                    run.usage.duration_ms = Some(
-                        run.usage
-                            .duration_ms
-                            .unwrap_or(0)
-                            .saturating_add(duration_ms),
-                    );
-                }
-                RuntimeEventKind::SubagentReleased => {
-                    let Some(run) = runs.get_mut(&execution_id) else {
-                        continue;
-                    };
-                    if let Some(status) = json_string(&event.payload, "status")
-                        .as_deref()
-                        .and_then(SubagentRunStatus::from_str)
-                    {
-                        run.status = status;
-                    }
-                    if let Some(result) =
-                        event.payload.get("result").cloned().and_then(|value| {
-                            serde_json::from_value::<SubagentTaskResult>(value).ok()
-                        })
-                    {
-                        run.result = Some(result);
-                    }
-                    if let Some(usage) =
-                        event.payload.get("usage").cloned().and_then(|value| {
-                            serde_json::from_value::<SubagentRunUsage>(value).ok()
-                        })
-                    {
-                        run.usage = usage;
-                    }
-                }
-                _ => {}
+            for event in events {
+                after_sequence = event.seq;
+                apply_subagent_projection_event(
+                    &mut runs,
+                    run_id,
+                    limit,
+                    exact_execution_id,
+                    event,
+                );
+            }
+            if event_count < SCAN_PAGE_SIZE {
+                break;
             }
         }
-        Ok(runs.into_values().collect())
+        Ok(runs)
     }
 
     pub fn list_runs_for_conversation(
@@ -5641,6 +5641,53 @@ impl TaskRuntimeStore {
         self.file_store()?
             .list_events(run_id, since_seq)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
+    }
+
+    /// Execute a bounded event query at the journal boundary. Filtering is
+    /// applied while scanning fixed-size pages, so unrelated events cannot
+    /// consume the caller's result limit and the complete suffix is never
+    /// materialized as an intermediate vector.
+    pub fn query_events_bounded(
+        &self,
+        run_id: &str,
+        query: RuntimeEventQuery,
+    ) -> Result<Vec<RuntimeTaskEvent>, StoreError> {
+        const SCAN_PAGE_SIZE: usize = 256;
+
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let store = self.file_store()?;
+        let mut after_sequence = query.after_sequence;
+        let mut matched = Vec::with_capacity(query.limit.min(SCAN_PAGE_SIZE));
+        loop {
+            let events = store
+                .list_events_bounded(run_id, after_sequence, SCAN_PAGE_SIZE)
+                .map_err(|error| StoreError::InvalidPlan(format!("file read: {error}")))?;
+            let event_count = events.len();
+            if event_count == 0 {
+                break;
+            }
+            for event in events {
+                after_sequence = event.seq;
+                let execution_matches = query
+                    .execution_id
+                    .as_deref()
+                    .is_none_or(|execution_id| event.step_id.as_deref() == Some(execution_id));
+                let type_matches =
+                    query.event_types.is_empty() || query.event_types.contains(&event.event_type);
+                if execution_matches && type_matches {
+                    matched.push(event);
+                    if matched.len() >= query.limit {
+                        return Ok(matched);
+                    }
+                }
+            }
+            if event_count < SCAN_PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(matched)
     }
 
     /// Read the deterministic checkpoint-backed run-state projection.
@@ -7267,6 +7314,144 @@ fn task_status_runtime_event(event: TaskStatusEvent<'_>) -> RuntimeJournalEvent 
     )
 }
 
+fn apply_subagent_projection_event(
+    runs: &mut std::collections::BTreeMap<String, SubagentRunSnapshot>,
+    run_id: &str,
+    limit: usize,
+    exact_execution_id: Option<&str>,
+    event: RuntimeTaskEvent,
+) {
+    if let Some(recovery) = boot_recovery_payload(&event)
+        && let Some(subagents) = recovery
+            .get("subagents")
+            .and_then(serde_json::Value::as_array)
+    {
+        for recovered in subagents {
+            let Some(execution_id) = json_string(recovered, "execution_id") else {
+                continue;
+            };
+            let Some(snapshot) = runs.get_mut(&execution_id) else {
+                continue;
+            };
+            snapshot.run.status = json_string(recovered, "status")
+                .as_deref()
+                .and_then(SubagentRunStatus::from_str)
+                .unwrap_or(SubagentRunStatus::Failed);
+        }
+    }
+    let Some(execution_id) = event.step_id.clone() else {
+        return;
+    };
+    if exact_execution_id.is_some_and(|wanted| wanted != execution_id) {
+        return;
+    }
+    if event.event_type == RuntimeEventKind::SubagentAssigned {
+        let Some(task_id) = event.task_id.clone() else {
+            return;
+        };
+        let Some(subagent_name) = json_string(&event.payload, "agent_name") else {
+            return;
+        };
+        if exact_execution_id.is_none() && !runs.contains_key(&execution_id) && runs.len() >= limit
+        {
+            let Some(last_key) = runs.last_key_value().map(|(key, _)| key.clone()) else {
+                return;
+            };
+            if execution_id >= last_key {
+                return;
+            }
+            runs.remove(&last_key);
+        }
+        let attempt = event
+            .payload
+            .get("attempt")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(1);
+        let plan_revision = event
+            .payload
+            .get("plan_revision")
+            .and_then(serde_json::Value::as_u64);
+        runs.insert(
+            execution_id.clone(),
+            SubagentRunSnapshot {
+                run: SubagentRun::new(execution_id, run_id, task_id, subagent_name, attempt),
+                plan_revision,
+                latest_event: event,
+            },
+        );
+        return;
+    }
+    let Some(snapshot) = runs.get_mut(&execution_id) else {
+        return;
+    };
+    snapshot.latest_event = event.clone();
+    match event.event_type {
+        RuntimeEventKind::RunTurnUsageAccounted
+            if json_string(&event.payload, "source_scope").as_deref() == Some("subagent") =>
+        {
+            let tokens = event
+                .payload
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(
+                    event
+                        .payload
+                        .get("output_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                );
+            snapshot.run.usage.tokens_used = Some(
+                snapshot
+                    .run
+                    .usage
+                    .tokens_used
+                    .unwrap_or(0)
+                    .saturating_add(tokens),
+            );
+            let duration_ms = event
+                .payload
+                .get("duration_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            snapshot.run.usage.duration_ms = Some(
+                snapshot
+                    .run
+                    .usage
+                    .duration_ms
+                    .unwrap_or(0)
+                    .saturating_add(duration_ms),
+            );
+        }
+        RuntimeEventKind::SubagentReleased => {
+            if let Some(status) = json_string(&event.payload, "status")
+                .as_deref()
+                .and_then(SubagentRunStatus::from_str)
+            {
+                snapshot.run.status = status;
+            }
+            if let Some(result) = event
+                .payload
+                .get("result")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<SubagentTaskResult>(value).ok())
+            {
+                snapshot.run.result = Some(result);
+            }
+            if let Some(usage) = event
+                .payload
+                .get("usage")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<SubagentRunUsage>(value).ok())
+            {
+                snapshot.run.usage = usage;
+            }
+        }
+        _ => {}
+    }
+}
+
 fn boot_recovery_payload(event: &RuntimeTaskEvent) -> Option<&serde_json::Value> {
     event.payload.get("recovery").filter(|recovery| {
         recovery.get("kind").and_then(serde_json::Value::as_str) == Some("boot_recovery")
@@ -7343,6 +7528,140 @@ mod tests {
     fn fresh() -> Result<TaskRuntimeStore, StoreError> {
         TaskRuntimeStore::new_in_memory()
             .map_err(|error| StoreError::InvalidPlan(error.to_string()))
+    }
+
+    #[test]
+    fn bounded_agent_queries_scan_growth_without_unbounded_results() -> Result<(), StoreError> {
+        let store = fresh()?;
+        store.create_run(
+            "bounded-run",
+            "global",
+            "conversation",
+            "message",
+            DomainProfile::General,
+            "goal",
+            "task",
+            AttendedMode::Attended,
+        )?;
+        let mut events = (0..600)
+            .map(|index| {
+                RuntimeJournalEvent::for_append(
+                    "bounded-run",
+                    None,
+                    None,
+                    RuntimeEventKind::Note,
+                    serde_json::json!({ "message": format!("before-{index}") }),
+                )
+            })
+            .collect::<Vec<_>>();
+        events.push(RuntimeJournalEvent::for_append(
+            "bounded-run",
+            Some("task-z"),
+            Some("execution-z"),
+            RuntimeEventKind::SubagentAssigned,
+            serde_json::json!({
+                "execution_id": "execution-z",
+                "agent_name": "reviewer",
+                "plan_revision": 7,
+                "attempt": 2,
+            }),
+        ));
+        events.extend((0..400).map(|index| {
+            RuntimeJournalEvent::for_append(
+                "bounded-run",
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({ "message": format!("middle-{index}") }),
+            )
+        }));
+        events.push(RuntimeJournalEvent::for_append(
+            "bounded-run",
+            Some("task-a"),
+            Some("execution-a"),
+            RuntimeEventKind::SubagentAssigned,
+            serde_json::json!({
+                "execution_id": "execution-a",
+                "agent_name": "implementer",
+                "plan_revision": 9,
+                "attempt": 3,
+            }),
+        ));
+        events.extend((0..300).map(|index| {
+            RuntimeJournalEvent::for_append(
+                "bounded-run",
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({ "message": format!("after-{index}") }),
+            )
+        }));
+        let result = SubagentTaskResult::terminal(
+            SubagentRunStatus::Completed,
+            "完成 ✅ bounded result",
+            Vec::new(),
+        );
+        let usage = SubagentRunUsage {
+            duration_ms: Some(41),
+            tokens_used: Some(73),
+            iterations: Some(5),
+        };
+        events.push(RuntimeJournalEvent::for_append(
+            "bounded-run",
+            Some("task-a"),
+            Some("execution-a"),
+            RuntimeEventKind::SubagentReleased,
+            serde_json::json!({
+                "status": "completed",
+                "result": result,
+                "usage": usage,
+            }),
+        ));
+        store.commit_runtime_events("bounded-run", events)?;
+
+        let released = store.query_events_bounded(
+            "bounded-run",
+            RuntimeEventQuery::new(0, 1)
+                .for_execution("execution-a")
+                .with_event_types(vec![RuntimeEventKind::SubagentReleased]),
+        )?;
+        assert_eq!(released.len(), 1);
+        assert_eq!(
+            released.first().map(|event| event.event_type),
+            Some(RuntimeEventKind::SubagentReleased)
+        );
+
+        let snapshots = store.list_subagent_run_snapshots("bounded-run", 1)?;
+        let snapshot = snapshots
+            .first()
+            .ok_or_else(|| StoreError::InvalidPlan("bounded snapshot missing".to_string()))?;
+        assert_eq!(snapshot.run.subagent_run_id, "execution-a");
+        assert_eq!(snapshot.plan_revision, Some(9));
+        assert_eq!(snapshot.run.attempt, 3);
+        assert_eq!(snapshot.run.usage.tokens_used, Some(73));
+        assert_eq!(snapshot.run.usage.iterations, Some(5));
+        assert_eq!(
+            snapshot
+                .run
+                .result
+                .as_ref()
+                .map(|value| value.summary.as_str()),
+            Some("完成 ✅ bounded result")
+        );
+        assert_eq!(
+            snapshot.latest_event.event_type,
+            RuntimeEventKind::SubagentReleased
+        );
+
+        let exact = store
+            .get_subagent_run_snapshot("bounded-run", "execution-z")?
+            .ok_or_else(|| StoreError::InvalidPlan("exact snapshot missing".to_string()))?;
+        assert_eq!(exact.run.task_id, "task-z");
+        assert_eq!(exact.plan_revision, Some(7));
+        let encoded = serde_json::to_value(&exact.run)?;
+        let decoded = serde_json::from_value::<SubagentRun>(encoded.clone())?;
+        assert_eq!(serde_json::to_value(decoded)?, encoded);
+        Ok(())
     }
 
     #[test]

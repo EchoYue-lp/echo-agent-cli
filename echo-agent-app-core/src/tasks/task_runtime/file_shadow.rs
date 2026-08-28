@@ -1016,6 +1016,21 @@ impl FileTaskShadow {
             .map(Option::unwrap_or_default)
     }
 
+    pub(crate) fn read_events_after_bounded(
+        &self,
+        run_id: &str,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<RuntimeTaskEvent>, ShadowError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.authority(run_id, false)?
+            .map(|authority| authority.replay_after_bounded(after_sequence, limit))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
     pub(crate) fn diagnostic_full_replay(
         &self,
         run_id: &str,

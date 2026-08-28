@@ -88,8 +88,8 @@ pub use revisioned_adapter::{
 };
 pub use store::{
     AbandonedRunSettlement, BootAutoResumeBlocker, BootAutoResumeDecision, BootAutoResumeOutcome,
-    ProviderRetryDisposition, RunDriverReceiptOwner, StoreError, TaskRetryPreparation,
-    TaskRunDriverShutdownError, TaskRuntimeStore,
+    ProviderRetryDisposition, RunDriverReceiptOwner, RuntimeEventQuery, StoreError,
+    SubagentRunSnapshot, TaskRetryPreparation, TaskRunDriverShutdownError, TaskRuntimeStore,
 };
 pub use subagent_control::SubagentControlService;
 pub use task_execute_tool::ExecuteTaskTool;
