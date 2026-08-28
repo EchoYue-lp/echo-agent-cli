@@ -7,7 +7,6 @@ use echo_agent_app_core::workspace::Workspace;
 #[cfg(test)]
 use echo_agent_app_core::workspace::WorkspaceId;
 use echo_agent_app_core::workspace::WorkspaceKind;
-use echo_agent_app_core::workspace::migration::LegacyMigrator;
 #[cfg(test)]
 use echo_agent_app_core::workspace::registry::WorkspaceRegistry;
 use std::sync::Arc;
@@ -382,63 +381,5 @@ pub async fn link_project(
             }))
         }
         Err(e) => Err(IpcError::Internal(format!("Failed to link project: {e}"))),
-    }
-}
-
-#[tauri::command]
-pub async fn audit_migration() -> Result<serde_json::Value, IpcError> {
-    let migrator = LegacyMigrator::new();
-
-    if !migrator.has_legacy_data() {
-        return Ok(serde_json::json!({
-            "has_legacy_data": false,
-            "message": "No legacy data found to migrate.",
-        }));
-    }
-
-    match migrator.audit() {
-        Ok(plan) => Ok(serde_json::json!({
-            "has_legacy_data": true,
-            "plan": plan,
-        })),
-        Err(e) => Err(IpcError::Internal(format!(
-            "Failed to audit legacy data: {e}"
-        ))),
-    }
-}
-
-#[tauri::command]
-pub async fn execute_migration(
-    state: tauri::State<'_, TauriState>,
-) -> Result<serde_json::Value, IpcError> {
-    let migrator = LegacyMigrator::new();
-
-    if !migrator.has_legacy_data() {
-        return Err(IpcError::Validation(
-            "No legacy data found to migrate.".to_string(),
-        ));
-    }
-
-    let plan = migrator
-        .audit()
-        .map_err(|e| IpcError::Internal(format!("Failed to audit: {e}")))?;
-
-    match state
-        .app_state
-        .execute_legacy_migration_owned(migrator, plan)
-        .await
-    {
-        Ok(report) => {
-            tracing::info!(
-                workspaces = report.workspaces_created.len(),
-                sessions = report.sessions_migrated,
-                "Migration completed via IPC"
-            );
-            Ok(serde_json::json!({
-                "success": true,
-                "report": report,
-            }))
-        }
-        Err(e) => Err(IpcError::Internal(format!("Migration failed: {e}"))),
     }
 }

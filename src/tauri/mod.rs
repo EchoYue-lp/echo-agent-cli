@@ -160,8 +160,6 @@ pub fn build_tauri_app(
             commands::workspace::switch_workspace,
             commands::workspace::exit_workspace,
             commands::workspace::link_project,
-            commands::workspace::audit_migration,
-            commands::workspace::execute_migration,
             // Session
             commands::session::get_session,
             commands::session::reset_session,

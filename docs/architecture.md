@@ -234,8 +234,8 @@ EKO 启动时把 framework 用户数据根设置为 `~/.eko`，也可用 `EKO_DA
         logs/
 ```
 
-所有 path 都应通过 `echo_agent::paths` 或 `WorkspaceLayout` 解析。不得在应用代码新增
-硬编码 `~/.echo-agent`，也不得给 EKO 引入 `SqliteStore`/`SqliteConversationStore`。
+所有 path 都应通过 `echo_agent::paths` 或 `WorkspaceLayout` 解析。EKO 不扫描或导入
+`~/.echo-agent`，也不得给应用引入 `SqliteStore`/`SqliteConversationStore`。
 
 ## 扩展与专业能力
 

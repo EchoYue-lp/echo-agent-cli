@@ -21,7 +21,6 @@
 //! ```
 
 pub mod layout;
-pub mod migration;
 pub mod registry;
 pub(crate) mod runtime;
 pub mod templates;

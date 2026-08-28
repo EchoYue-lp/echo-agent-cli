@@ -1,14 +1,15 @@
-//! Workspace slash commands — new, list, switch, link, migrate, info.
+//! Workspace slash commands — new, list, switch, link, and info.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use echo_agent_app_core::state::AppState;
 use echo_agent_app_core::workspace::WorkspaceKind;
-use echo_agent_app_core::workspace::migration::LegacyMigrator;
 
 pub struct WorkspaceCommandResult {
     pub output: String,
     pub generation_changed: bool,
 }
+
+pub const WORKSPACE_SUBCOMMAND_USAGE: &str = "[new|list|switch|exit|link|info] [args]";
 
 // ── WorkspaceCommand ────────────────────────────────────────────────
 
@@ -45,10 +46,9 @@ pub async fn execute_workspace_command(
         Some("switch") | Some("sw") => ws_switch(state, args.get(1).copied()).await,
         Some("exit") => ws_exit(state).await,
         Some("link") => unchanged(ws_link(state, args.get(1).copied()).await),
-        Some("migrate") => unchanged(ws_migrate(state, args.get(1).copied().unwrap_or("")).await),
         Some("info") | None => unchanged(ws_info(state).await),
         Some(other) => unchanged(format!(
-            "Unknown workspace subcommand: {other}\nUsage: /workspace [new|list|switch|exit|link|migrate|info]"
+            "Unknown workspace subcommand: {other}\nUsage: /workspace {WORKSPACE_SUBCOMMAND_USAGE}"
         )),
     }
 }
@@ -222,59 +222,6 @@ async fn ws_link(state: &std::sync::Arc<AppState>, path: Option<&str>) -> String
     }
 }
 
-/// `/workspace migrate [--dry-run]`
-async fn ws_migrate(state: &std::sync::Arc<AppState>, sub: &str) -> String {
-    let migrator = LegacyMigrator::new();
-
-    if !migrator.has_legacy_data() {
-        return "No legacy data found to migrate.".to_string();
-    }
-
-    match migrator.audit() {
-        Ok(plan) => {
-            let mut output = format!(
-                "Migration plan:\n  Workspaces to create: {}\n  Sessions to migrate: {}\n  Conversations: {}\n  Estimated size: {} KB",
-                plan.workspaces_to_create.len(),
-                plan.ungrouped_sessions.len(),
-                plan.conversation_count,
-                plan.estimated_size_bytes / 1024
-            );
-            for ws_plan in &plan.workspaces_to_create {
-                output.push_str(&format!(
-                    "\n  - '{}' ({} sessions, {} conversations)",
-                    ws_plan.name,
-                    ws_plan.session_files.len(),
-                    ws_plan.conversation_files.len()
-                ));
-            }
-
-            if sub == "--dry-run" || sub == "-n" {
-                output.push_str("\nDry run; no changes made. Run /workspace migrate to execute.");
-                return output;
-            }
-            match state.execute_legacy_migration_owned(migrator, plan).await {
-                Ok(report) => {
-                    output.push_str(&format!(
-                        "\nMigration complete:\n  Workspaces created: {}\n  Sessions migrated: {}\n  Conversations: {}",
-                        report.workspaces_created.len(),
-                        report.sessions_migrated,
-                        report.conversations_migrated
-                    ));
-                    if !report.errors.is_empty() {
-                        output.push_str(&format!("\n  Errors ({}):", report.errors.len()));
-                        for err in &report.errors {
-                            output.push_str(&format!("\n    - {err}"));
-                        }
-                    }
-                    output
-                }
-                Err(error) => format!("Migration failed: {error}"),
-            }
-        }
-        Err(error) => format!("Failed to audit legacy data: {error}"),
-    }
-}
-
 /// `/workspace` or `/workspace info` — show current workspace info
 async fn ws_info(state: &AppState) -> String {
     match state.current_workspace().await {
@@ -300,7 +247,7 @@ cmd!(
     "workspace",
     ["ws"],
     CommandCategory::Session,
-    "Manage workspaces (new/list/switch/exit/link/migrate)",
+    "Manage workspaces (new/list/switch/exit/link/info)",
     cmd_workspace
 );
 
@@ -308,4 +255,18 @@ cmd!(
 
 pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(std::sync::Arc::new(WorkspaceCommand));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WORKSPACE_SUBCOMMAND_USAGE;
+
+    #[test]
+    fn workspace_usage_has_no_legacy_migration_surface() {
+        assert_eq!(
+            WORKSPACE_SUBCOMMAND_USAGE,
+            "[new|list|switch|exit|link|info] [args]"
+        );
+        assert!(!WORKSPACE_SUBCOMMAND_USAGE.contains("migrate"));
+    }
 }

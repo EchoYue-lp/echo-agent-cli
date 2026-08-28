@@ -627,10 +627,6 @@ enum WorkspaceTransitionRequest {
         workspace_id: Option<crate::workspace::WorkspaceId>,
         project_root: std::path::PathBuf,
     },
-    Migrate {
-        migrator: crate::workspace::migration::LegacyMigrator,
-        plan: crate::workspace::migration::MigrationPlan,
-    },
 }
 
 enum WorkspaceSettlementOutcome {
@@ -638,7 +634,6 @@ enum WorkspaceSettlementOutcome {
     Transition(WorkspaceTransitionReceipt),
     Deleted,
     Linked(Workspace),
-    Migrated(crate::workspace::migration::MigrationReport),
 }
 
 struct WorkspaceTransitionMarker {
@@ -2990,32 +2985,6 @@ impl AppState {
         Ok(workspace)
     }
 
-    pub async fn execute_legacy_migration_owned(
-        self: &Arc<Self>,
-        migrator: crate::workspace::migration::LegacyMigrator,
-        plan: crate::workspace::migration::MigrationPlan,
-    ) -> anyhow::Result<crate::workspace::migration::MigrationReport> {
-        match self
-            .run_owned_workspace_transition(WorkspaceTransitionRequest::Migrate { migrator, plan })
-            .await?
-        {
-            WorkspaceSettlementOutcome::Migrated(report) => Ok(report),
-            _ => anyhow::bail!("workspace migration settlement returned an unexpected outcome"),
-        }
-    }
-
-    async fn execute_legacy_migration_inner(
-        &self,
-        migrator: crate::workspace::migration::LegacyMigrator,
-        plan: crate::workspace::migration::MigrationPlan,
-    ) -> anyhow::Result<crate::workspace::migration::MigrationReport> {
-        let _lifecycle = self.workspace.transition.write().await;
-        let registry = Arc::clone(&self.workspace.registry);
-        tokio::task::spawn_blocking(move || migrator.execute(&plan, registry.as_ref()))
-            .await
-            .map_err(|error| anyhow::anyhow!("workspace migration task failed: {error}"))?
-    }
-
     /// 获取当前活跃工作区（None 表示使用全局默认路径）。
     pub async fn current_workspace(&self) -> Option<Workspace> {
         let current = self.workspace.current.read().await.clone();
@@ -5333,10 +5302,6 @@ impl AppState {
                     .link_workspace_project_inner(workspace_id, project_root)
                     .await
                     .map(WorkspaceSettlementOutcome::Linked),
-                WorkspaceTransitionRequest::Migrate { migrator, plan } => state
-                    .execute_legacy_migration_inner(migrator, plan)
-                    .await
-                    .map(WorkspaceSettlementOutcome::Migrated),
             }
         }));
         let result = match settlement.as_mut() {

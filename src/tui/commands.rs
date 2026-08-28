@@ -384,7 +384,7 @@ impl SlashCommand {
             Self::Rename => "<title>",
             Self::DeleteSession => "<conversation-id>",
             Self::OpenArtifact => "[call-id|path]",
-            Self::Workspace => "[new|list|switch|exit|link|migrate|info] [args]",
+            Self::Workspace => crate::cli::cmd_impls::workspace::WORKSPACE_SUBCOMMAND_USAGE,
             Self::AgentList => "",
             Self::AgentSend => "<workspace-id> <conversation-id> <message>",
             Self::AgentStatus => "<workspace-id> <conversation-id> [message-id]",
