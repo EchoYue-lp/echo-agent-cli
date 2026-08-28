@@ -357,14 +357,15 @@ mod tests {
         use super::*;
 
         #[test]
-        fn record_accumulates_when_reported() {
+        fn record_accumulates_when_reported() -> anyhow::Result<()> {
             let mut a = ContextUsageAccumulator::default();
             a.record(1000, 800, true);
             a.record(500, 400, true);
             assert_eq!(a.total_input, 1500);
             assert_eq!(a.total_cached, 1200);
-            let rate = a.cache_hit_rate().expect("rate");
+            let rate = a.cache_hit_rate().ok_or_else(|| anyhow::anyhow!("rate"))?;
             assert!((rate - 0.8).abs() < 1e-9);
+            Ok(())
         }
 
         #[test]
@@ -414,7 +415,7 @@ mod tests {
         }
 
         #[test]
-        fn compress_boundary_keeps_accumulator() {
+        fn compress_boundary_keeps_accumulator() -> anyhow::Result<()> {
             // 压缩只清 Snapshot，不清 Accumulator（设计契约）。
             let mut snap = ContextWindowSnapshot {
                 input_tokens: 80_000,
@@ -427,7 +428,11 @@ mod tests {
             snap.clear_usage();
             assert!(!snap.is_available());
             assert_eq!(acc.total_input, 80_000);
-            assert!((acc.cache_hit_rate().expect("rate") - 0.875).abs() < 1e-9);
+            let rate = acc
+                .cache_hit_rate()
+                .ok_or_else(|| anyhow::anyhow!("rate"))?;
+            assert!((rate - 0.875).abs() < 1e-9);
+            Ok(())
         }
     }
 

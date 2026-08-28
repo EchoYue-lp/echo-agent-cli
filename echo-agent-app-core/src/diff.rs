@@ -503,15 +503,17 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_hunk_header() {
-        let h = parse_hunk_header("@@ -10,5 +20,7 @@").unwrap();
+    fn test_parse_hunk_header() -> anyhow::Result<()> {
+        let h = parse_hunk_header("@@ -10,5 +20,7 @@")?;
         assert_eq!(h, (10, 5, 20, 7));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_hunk_header_single_line() {
-        let h = parse_hunk_header("@@ -1 +1 @@").unwrap();
+    fn test_parse_hunk_header_single_line() -> anyhow::Result<()> {
+        let h = parse_hunk_header("@@ -1 +1 @@")?;
         assert_eq!(h, (1, 1, 1, 1));
+        Ok(())
     }
 
     #[test]

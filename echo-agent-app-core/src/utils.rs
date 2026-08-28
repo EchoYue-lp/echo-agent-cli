@@ -99,26 +99,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn git_root_outranks_nested_package_marker() {
-        let temp = tempfile::tempdir().unwrap();
+    fn git_root_outranks_nested_package_marker() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path().join("repo");
         let nested = root.join("crates/member/src");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(root.join("crates/member/Cargo.toml"), "[package]").unwrap();
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(&nested)?;
+        std::fs::write(root.join("crates/member/Cargo.toml"), "[package]")?;
 
         assert_eq!(find_project_root(&nested).as_deref(), Some(root.as_path()));
+        Ok(())
     }
 
     #[test]
-    fn package_marker_is_used_without_repository_metadata() {
-        let temp = tempfile::tempdir().unwrap();
+    fn package_marker_is_used_without_repository_metadata() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path().join("project");
         let nested = root.join("src");
-        std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(root.join("package.json"), "{}").unwrap();
+        std::fs::create_dir_all(&nested)?;
+        std::fs::write(root.join("package.json"), "{}")?;
 
         assert_eq!(find_project_root(&nested).as_deref(), Some(root.as_path()));
+        Ok(())
     }
 
     #[test]

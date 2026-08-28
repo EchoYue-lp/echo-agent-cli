@@ -244,67 +244,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_audit_empty_directory() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn test_audit_empty_directory() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         let migrator = LegacyMigrator::with_base_dir(tmp.path().to_path_buf());
 
-        let plan = migrator.audit().unwrap();
+        let plan = migrator.audit()?;
         assert!(plan.workspaces_to_create.is_empty());
         assert_eq!(plan.estimated_size_bytes, 0);
+        Ok(())
     }
 
     #[test]
-    fn test_audit_with_sessions() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn test_audit_with_sessions() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         let sessions_dir = tmp.path().join("sessions");
-        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&sessions_dir)?;
         fs::write(
             sessions_dir.join("test.json"),
             r#"{"name":"test","messages":[]}"#,
-        )
-        .unwrap();
+        )?;
 
         let migrator = LegacyMigrator::with_base_dir(tmp.path().to_path_buf());
-        let plan = migrator.audit().unwrap();
+        let plan = migrator.audit()?;
         assert_eq!(plan.workspaces_to_create.len(), 1);
         assert_eq!(plan.workspaces_to_create[0].session_files.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_has_legacy_data() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn test_has_legacy_data() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         let migrator = LegacyMigrator::with_base_dir(tmp.path().to_path_buf());
         assert!(!migrator.has_legacy_data());
 
         let sessions_dir = tmp.path().join("sessions");
-        fs::create_dir_all(&sessions_dir).unwrap();
-        fs::write(sessions_dir.join("test.json"), "{}").unwrap();
+        fs::create_dir_all(&sessions_dir)?;
+        fs::write(sessions_dir.join("test.json"), "{}")?;
         assert!(migrator.has_legacy_data());
+        Ok(())
     }
 
     #[test]
-    fn test_execute_migration() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn test_execute_migration() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         let legacy_dir = tmp.path().join("legacy");
         let workspace_dir = tmp.path().join("workspaces");
 
         // 设置旧数据
         let sessions_dir = legacy_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&sessions_dir)?;
         fs::write(
             sessions_dir.join("session1.json"),
             r#"{"name":"s1","messages":[]}"#,
-        )
-        .unwrap();
+        )?;
 
         // 执行迁移
         let migrator = LegacyMigrator::with_base_dir(legacy_dir);
-        let registry = WorkspaceRegistry::with_base_dir(workspace_dir).unwrap();
-        let plan = migrator.audit().unwrap();
-        let report = migrator.execute(&plan, &registry).unwrap();
+        let registry = WorkspaceRegistry::with_base_dir(workspace_dir)?;
+        let plan = migrator.audit()?;
+        let report = migrator.execute(&plan, &registry)?;
 
         assert_eq!(report.workspaces_created.len(), 1);
         assert_eq!(report.sessions_migrated, 1);
         assert!(report.errors.is_empty());
+        Ok(())
     }
 }

@@ -492,124 +492,115 @@ mod tests {
     }
 
     #[test]
-    fn test_create_and_open_workspace() {
-        let tmp = tempfile::tempdir().unwrap();
-        let registry = WorkspaceRegistry::with_base_dir(tmp.path().to_path_buf()).unwrap();
+    fn test_create_and_open_workspace() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(tmp.path().to_path_buf())?;
 
-        let ws = registry
-            .create("test-project", WorkspaceKind::Code { repo_url: None })
-            .unwrap();
+        let ws = registry.create("test-project", WorkspaceKind::Code { repo_url: None })?;
 
         assert_eq!(ws.name, "test-project");
         assert!(ws.root.exists());
         assert!(WorkspaceLayout::sessions(&ws.root).exists());
 
-        let opened = registry.open(&ws.id).unwrap();
+        let opened = registry.open(&ws.id)?;
         assert_eq!(opened.name, "test-project");
+        Ok(())
     }
 
     #[test]
-    fn test_create_at_custom_path() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn test_create_at_custom_path() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         let base = tmp.path().join("base");
         let custom = tmp.path().join("my-project");
-        let registry = WorkspaceRegistry::with_base_dir(base).unwrap();
+        let registry = WorkspaceRegistry::with_base_dir(base)?;
 
-        let ws = registry
-            .create_at("my-project", WorkspaceKind::General, custom.clone())
-            .unwrap();
+        let ws = registry.create_at("my-project", WorkspaceKind::General, custom.clone())?;
 
         assert_eq!(ws.root, custom);
         assert!(WorkspaceLayout::sessions(&custom).exists());
 
         // Should be findable via open
-        let opened = registry.open(&ws.id).unwrap();
+        let opened = registry.open(&ws.id)?;
         assert_eq!(opened.root, custom);
 
         // Should appear in list
-        let list = registry.list().unwrap();
+        let list = registry.list()?;
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "my-project");
+        Ok(())
     }
 
     #[test]
-    fn test_list_workspaces() {
-        let tmp = tempfile::tempdir().unwrap();
-        let registry = WorkspaceRegistry::with_base_dir(tmp.path().to_path_buf()).unwrap();
+    fn test_list_workspaces() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(tmp.path().to_path_buf())?;
 
-        registry
-            .create("project-a", WorkspaceKind::General)
-            .unwrap();
-        registry
-            .create("project-b", WorkspaceKind::Research { topics: vec![] })
-            .unwrap();
+        registry.create("project-a", WorkspaceKind::General)?;
+        registry.create("project-b", WorkspaceKind::Research { topics: vec![] })?;
 
-        let list = registry.list().unwrap();
+        let list = registry.list()?;
         assert_eq!(list.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_delete_workspace() {
-        let tmp = tempfile::tempdir().unwrap();
-        let registry = WorkspaceRegistry::with_base_dir(tmp.path().to_path_buf()).unwrap();
+    fn test_delete_workspace() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(tmp.path().to_path_buf())?;
 
-        let ws = registry
-            .create("to-delete", WorkspaceKind::General)
-            .unwrap();
+        let ws = registry.create("to-delete", WorkspaceKind::General)?;
         assert!(ws.root.exists());
 
-        registry.delete(&ws.id).unwrap();
+        registry.delete(&ws.id)?;
         assert!(!ws.root.exists());
+        Ok(())
     }
 
     #[test]
-    fn test_delete_custom_path_workspace() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn test_delete_custom_path_workspace() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         let base = tmp.path().join("base");
         let custom = tmp.path().join("my-project");
         // Pre-create a user file in the custom dir
-        fs::create_dir_all(&custom).unwrap();
-        fs::write(custom.join("README.md"), "# My Project").unwrap();
+        fs::create_dir_all(&custom)?;
+        fs::write(custom.join("README.md"), "# My Project")?;
 
-        let registry = WorkspaceRegistry::with_base_dir(base).unwrap();
-        let ws = registry
-            .create_at("my-project", WorkspaceKind::General, custom.clone())
-            .unwrap();
+        let registry = WorkspaceRegistry::with_base_dir(base)?;
+        let ws = registry.create_at("my-project", WorkspaceKind::General, custom.clone())?;
 
-        registry.delete(&ws.id).unwrap();
+        registry.delete(&ws.id)?;
 
         // Custom path: user's original file should be preserved
         assert!(custom.join("README.md").exists());
         // But EKO system data should be cleaned up
         assert!(!WorkspaceLayout::state_dir(&custom).exists());
         assert!(!WorkspaceLayout::manifest(&custom).exists());
+        Ok(())
     }
 
     #[test]
-    fn test_duplicate_creation_fails() {
-        let tmp = tempfile::tempdir().unwrap();
-        let registry = WorkspaceRegistry::with_base_dir(tmp.path().to_path_buf()).unwrap();
+    fn test_duplicate_creation_fails() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(tmp.path().to_path_buf())?;
 
-        registry.create("dup", WorkspaceKind::General).unwrap();
+        registry.create("dup", WorkspaceKind::General)?;
         let result = registry.create("dup", WorkspaceKind::General);
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_mixed_default_and_custom_workspaces() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn test_mixed_default_and_custom_workspaces() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         let base = tmp.path().join("base");
         let custom = tmp.path().join("external-project");
-        let registry = WorkspaceRegistry::with_base_dir(base).unwrap();
+        let registry = WorkspaceRegistry::with_base_dir(base)?;
 
-        registry
-            .create("default-ws", WorkspaceKind::General)
-            .unwrap();
-        registry
-            .create_at("custom-ws", WorkspaceKind::Code { repo_url: None }, custom)
-            .unwrap();
+        registry.create("default-ws", WorkspaceKind::General)?;
+        registry.create_at("custom-ws", WorkspaceKind::Code { repo_url: None }, custom)?;
 
-        let list = registry.list().unwrap();
+        let list = registry.list()?;
         assert_eq!(list.len(), 2);
+        Ok(())
     }
 }

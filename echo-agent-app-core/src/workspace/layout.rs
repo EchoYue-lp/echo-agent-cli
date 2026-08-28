@@ -198,11 +198,11 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_dirs() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn test_ensure_dirs() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         let root = tmp.path();
 
-        WorkspaceLayout::ensure_dirs(root).unwrap();
+        WorkspaceLayout::ensure_dirs(root)?;
 
         assert!(WorkspaceLayout::state_dir(root).exists());
         assert!(WorkspaceLayout::sessions(root).exists());
@@ -215,5 +215,6 @@ mod tests {
         assert!(WorkspaceLayout::traces(root).exists());
         assert!(WorkspaceLayout::uploads(root).exists());
         assert!(WorkspaceLayout::logs(root).exists());
+        Ok(())
     }
 }

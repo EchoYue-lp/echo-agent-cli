@@ -400,16 +400,17 @@ mod tests {
     }
 
     #[test]
-    fn test_workspace_kind_serialization() {
+    fn test_workspace_kind_serialization() -> anyhow::Result<()> {
         let kind = WorkspaceKind::Code {
             repo_url: Some("https://github.com/test".into()),
         };
-        let json = serde_json::to_string(&kind).unwrap();
+        let json = serde_json::to_string(&kind)?;
         assert!(json.contains("\"type\":\"code\""));
+        Ok(())
     }
 
     #[test]
-    fn test_workspace_serialization() {
+    fn test_workspace_serialization() -> anyhow::Result<()> {
         let ws = Workspace {
             id: WorkspaceId::from_name("test"),
             name: "Test Workspace".into(),
@@ -421,10 +422,11 @@ mod tests {
             created_at: Utc::now(),
             last_active: Utc::now(),
         };
-        let json = serde_json::to_string_pretty(&ws).unwrap();
-        let parsed: Workspace = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string_pretty(&ws)?;
+        let parsed: Workspace = serde_json::from_str(&json)?;
         assert_eq!(parsed.id, ws.id);
         assert_eq!(parsed.name, ws.name);
+        Ok(())
     }
 
     #[test]
