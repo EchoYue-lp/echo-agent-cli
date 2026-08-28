@@ -6661,19 +6661,18 @@ mod tests {
     }
 
     #[test]
-    fn preflight_disabled_rejects_write_kinds() {
+    fn preflight_disabled_rejects_write_kinds() -> Result<(), String> {
         // B1: stage-1 regression — under Disabled, write kinds are rejected.
         let task = preflight_task("t1", PlanTaskKind::Implementation, &[], &[]);
-        let result = preflight_unattended_plan(&[task], UnattendedWriteMode::Disabled);
-        assert!(
-            result.is_err(),
-            "write kind should be rejected under Disabled"
-        );
-        let reason = result.unwrap_err().reason;
+        let reason = match preflight_unattended_plan(&[task], UnattendedWriteMode::Disabled) {
+            Err(error) => error.reason,
+            Ok(_) => return Err("write kind was accepted under Disabled".to_string()),
+        };
         assert!(
             reason.contains("implementation"),
             "reason should mention 'implementation', got {reason:?}"
         );
+        Ok(())
     }
 
     #[test]
@@ -6710,35 +6709,37 @@ Read the runtime path and found one missing branch.
     }
 
     #[test]
-    fn preflight_disabled_rejects_write_tools() {
+    fn preflight_disabled_rejects_write_tools() -> Result<(), String> {
         // B1: under Disabled, tools outside the readonly allowlist are rejected.
         let task = preflight_task("t1", PlanTaskKind::Investigation, &["apply_patch"], &[]);
-        let result = preflight_unattended_plan(&[task], UnattendedWriteMode::Disabled);
-        assert!(
-            result.is_err(),
-            "write tool should be rejected under Disabled"
-        );
-        let reason = result.unwrap_err().reason;
+        let reason = match preflight_unattended_plan(&[task], UnattendedWriteMode::Disabled) {
+            Err(error) => error.reason,
+            Ok(_) => return Err("write tool was accepted under Disabled".to_string()),
+        };
         assert!(
             reason.contains("apply_patch"),
             "reason should mention 'apply_patch', got {reason:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn preflight_disabled_rejects_verification_shell() {
+    fn preflight_disabled_rejects_verification_shell() -> Result<(), String> {
         // B1: under Disabled, any verification (shell) entry is rejected.
         let task = preflight_task("t1", PlanTaskKind::Investigation, &[], &["cargo test"]);
-        let result = preflight_unattended_plan(&[task], UnattendedWriteMode::Disabled);
-        assert!(
-            result.is_err(),
-            "execution_checks (shell commands) should be rejected under Disabled"
-        );
-        let reason = result.unwrap_err().reason;
+        let reason = match preflight_unattended_plan(&[task], UnattendedWriteMode::Disabled) {
+            Err(error) => error.reason,
+            Ok(_) => {
+                return Err(
+                    "execution_checks shell command was accepted under Disabled".to_string()
+                );
+            }
+        };
         assert!(
             reason.contains("execution_checks") || reason.contains("shell"),
             "reason should mention execution_checks/shell, got {reason:?}"
         );
+        Ok(())
     }
 
     #[test]

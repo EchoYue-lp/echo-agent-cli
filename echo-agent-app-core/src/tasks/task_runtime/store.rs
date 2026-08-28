@@ -7340,8 +7340,8 @@ mod tests {
         }
     }
 
-    fn fresh() -> TaskRuntimeStore {
-        TaskRuntimeStore::new_in_memory().expect("in-memory store")
+    fn fresh() -> Result<TaskRuntimeStore, StoreError> {
+        TaskRuntimeStore::new_in_memory()
     }
 
     #[test]
@@ -9105,24 +9105,23 @@ mod tests {
     }
 
     #[test]
-    fn create_run_emits_run_created_event() {
-        let s = fresh();
-        let run = s
-            .create_run(
-                "r1",
-                "ws",
-                "c1",
-                "m1",
-                DomainProfile::AiCoding,
-                "review runtime",
-                "",
-                AttendedMode::Attended,
-            )
-            .unwrap();
+    fn create_run_emits_run_created_event() -> Result<(), StoreError> {
+        let s = fresh()?;
+        let run = s.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::AiCoding,
+            "review runtime",
+            "",
+            AttendedMode::Attended,
+        )?;
         assert_eq!(run.status, TaskRunStatus::Pending);
-        let evs = s.list_events("r1", 0).unwrap();
+        let evs = s.list_events("r1", 0)?;
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].event_type, RuntimeEventKind::RunCreated);
+        Ok(())
     }
 
     #[test]
@@ -9168,8 +9167,8 @@ mod tests {
     }
 
     #[test]
-    fn transition_run_appends_status_event_atomically() {
-        let s = fresh();
+    fn transition_run_appends_status_event_atomically() -> Result<(), StoreError> {
+        let s = fresh()?;
         s.create_run(
             "r1",
             "ws",
@@ -9179,14 +9178,14 @@ mod tests {
             "g",
             "",
             AttendedMode::Attended,
-        )
-        .unwrap();
-        let run = s.transition_run("r1", TaskRunStatus::Running).unwrap();
+        )?;
+        let run = s.transition_run("r1", TaskRunStatus::Running)?;
         assert_eq!(run.status, TaskRunStatus::Running);
-        let evs = s.list_events("r1", 0).unwrap();
+        let evs = s.list_events("r1", 0)?;
         // RunCreated + RunStatusChanged
         assert_eq!(evs.len(), 2);
         assert_eq!(evs[1].event_type, RuntimeEventKind::RunStatusChanged);
+        Ok(())
     }
 
     #[test]
@@ -9419,8 +9418,8 @@ mod tests {
 
     #[test]
     fn task_update_rebinds_plan_before_goal_updated_run_can_resume() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.transition_run("r1", TaskRunStatus::Paused)?;
         store.update_run_goal(
             "r1",
@@ -9480,8 +9479,8 @@ mod tests {
     }
 
     #[test]
-    fn illegal_transition_is_rejected_and_leaves_no_event() {
-        let s = fresh();
+    fn illegal_transition_is_rejected_and_leaves_no_event() -> Result<(), StoreError> {
+        let s = fresh()?;
         s.create_run(
             "r1",
             "ws",
@@ -9491,24 +9490,29 @@ mod tests {
             "g",
             "",
             AttendedMode::Attended,
-        )
-        .unwrap();
+        )?;
         // First transition to Running (was Pending → now legal).
-        s.transition_run("r1", TaskRunStatus::Running).unwrap();
+        s.transition_run("r1", TaskRunStatus::Running)?;
         // Running → Completed is legal. Now test that Completed → Running is
         // illegal (terminal state → non-terminal is always rejected).
-        let _before = s.list_events("r1", 0).unwrap().len();
-        s.transition_run("r1", TaskRunStatus::Completed).unwrap();
-        let before_terminal = s.list_events("r1", 0).unwrap().len();
-        let err = s.transition_run("r1", TaskRunStatus::Running).unwrap_err();
+        let _before = s.list_events("r1", 0)?.len();
+        s.transition_run("r1", TaskRunStatus::Completed)?;
+        let before_terminal = s.list_events("r1", 0)?.len();
+        let err = s
+            .transition_run("r1", TaskRunStatus::Running)
+            .err()
+            .ok_or_else(|| {
+                StoreError::InvalidPlan("illegal transition unexpectedly succeeded".to_string())
+            })?;
         assert!(matches!(err, StoreError::IllegalTransition { .. }));
         // No new event was appended — the tx rolled back.
-        assert_eq!(s.list_events("r1", 0).unwrap().len(), before_terminal);
+        assert_eq!(s.list_events("r1", 0)?.len(), before_terminal);
+        Ok(())
     }
 
     #[test]
-    fn attach_plan_creates_tasks_and_todos() {
-        let s = fresh();
+    fn attach_plan_creates_tasks_and_todos() -> Result<(), StoreError> {
+        let s = fresh()?;
         s.create_run(
             "r1",
             "ws",
@@ -9518,8 +9522,7 @@ mod tests {
             "g",
             "",
             AttendedMode::Attended,
-        )
-        .unwrap();
+        )?;
         // attach_plan no longer changes the run status; caller decides.
         let plan = TaskPlan {
             plan_id: "p1".into(),
@@ -9539,51 +9542,56 @@ mod tests {
                 ..Default::default()
             }],
         };
-        s.attach_plan_for_test(&plan).unwrap();
+        s.attach_plan_for_test(&plan)?;
 
-        let loaded = s.get_plan("r1").unwrap().expect("plan");
+        let loaded = s
+            .get_plan("r1")?
+            .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?;
         assert_eq!(loaded.tasks.len(), 1);
         assert_eq!(loaded.tasks[0].id, "t1");
 
-        let todos = s.list_todos("r1").unwrap();
+        let todos = s.list_todos("r1")?;
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].task_id, "t1");
         assert_eq!(todos[0].status, TodoStatus::Pending);
 
-        let run = s.get_run("r1").unwrap().unwrap();
+        let run = s
+            .get_run("r1")?
+            .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?;
         // attach_plan no longer transitions status; run stays Pending.
         assert_eq!(run.status, TaskRunStatus::Pending);
         assert_eq!(run.plan_id.as_deref(), Some("p1"));
+        Ok(())
     }
 
     #[test]
-    fn set_task_status_updates_task_todo_and_event_together() {
-        let s = fresh();
-        seed_plan(&s);
+    fn set_task_status_updates_task_todo_and_event_together() -> Result<(), StoreError> {
+        let s = fresh()?;
+        seed_plan(&s)?;
         s.set_task_status(
             "r1",
             "t1",
             echo_agent::tasks::TaskStatus::Running,
             Some("code_reviewer"),
             None,
-        )
-        .unwrap();
-        let todos = s.list_todos("r1").unwrap();
+        )?;
+        let todos = s.list_todos("r1")?;
         assert_eq!(todos[0].status, TodoStatus::Running);
         assert_eq!(todos[0].owner_agent.as_deref(), Some("code_reviewer"));
         assert!(todos[0].started_at.is_some());
 
-        let evs = s.list_events("r1", 0).unwrap();
+        let evs = s.list_events("r1", 0)?;
         assert!(
             evs.iter()
                 .any(|e| e.event_type == RuntimeEventKind::TaskStarted)
         );
+        Ok(())
     }
 
     #[test]
     fn task_terminal_events_follow_typed_status_not_detail_text() -> Result<(), StoreError> {
-        let failed = fresh();
-        seed_plan(&failed);
+        let failed = fresh()?;
+        seed_plan(&failed)?;
         failed.set_task_status(
             "r1",
             "t1",
@@ -9604,8 +9612,8 @@ mod tests {
             )
         }));
 
-        let timed_out = fresh();
-        seed_plan(&timed_out);
+        let timed_out = fresh()?;
+        seed_plan(&timed_out)?;
         timed_out.set_task_status(
             "r1",
             "t1",
@@ -9622,8 +9630,8 @@ mod tests {
                 .any(|event| event.event_type == RuntimeEventKind::TaskTimedOut)
         );
 
-        let cancelled = fresh();
-        seed_plan(&cancelled);
+        let cancelled = fresh()?;
+        seed_plan(&cancelled)?;
         cancelled.set_task_status(
             "r1",
             "t1",
@@ -9990,8 +9998,8 @@ mod tests {
 
     #[test]
     fn list_todos_is_read_only_and_does_not_append_journal() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         let events_path = store.active_shadow_root().join("r1").join("events.jsonl");
         let before_events = std::fs::read(&events_path)
             .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
@@ -10011,9 +10019,9 @@ mod tests {
     }
 
     #[test]
-    fn put_summary_upserts_and_get_summary_reads() {
-        let s = fresh();
-        seed_plan(&s);
+    fn put_summary_upserts_and_get_summary_reads() -> Result<(), StoreError> {
+        let s = fresh()?;
+        seed_plan(&s)?;
         let sum = TaskExecutionSummary {
             run_id: "r1".into(),
             task_id: "t1".into(),
@@ -10041,15 +10049,18 @@ mod tests {
             suggested_tasks: vec![],
             created_at: Utc::now(),
         };
-        s.put_summary(&sum).unwrap();
-        let got = s.get_summary("r1", "t1").unwrap().unwrap();
+        s.put_summary(&sum)?;
+        let got = s
+            .get_summary("r1", "t1")?
+            .ok_or_else(|| StoreError::TaskNotFound("t1 summary".to_string()))?;
         assert_eq!(got.result.summary, "read chat.rs");
         assert_eq!(got.next_implications.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn latest_run_for_conversation_orders_by_created_desc() {
-        let s = fresh();
+    fn latest_run_for_conversation_orders_by_created_desc() -> Result<(), StoreError> {
+        let s = fresh()?;
         s.create_run(
             "r1",
             "ws",
@@ -10059,8 +10070,7 @@ mod tests {
             "g1",
             "",
             AttendedMode::Attended,
-        )
-        .unwrap();
+        )?;
         std::thread::sleep(std::time::Duration::from_millis(10));
         s.create_run(
             "r2",
@@ -10071,13 +10081,15 @@ mod tests {
             "g2",
             "",
             AttendedMode::Attended,
-        )
-        .unwrap();
-        let latest = s.latest_run_for_conversation("c1").unwrap().unwrap();
+        )?;
+        let latest = s
+            .latest_run_for_conversation("c1")?
+            .ok_or_else(|| StoreError::RunNotFound("latest run for c1".to_string()))?;
         assert_eq!(latest.run_id, "r2");
+        Ok(())
     }
 
-    fn seed_plan(s: &TaskRuntimeStore) {
+    fn seed_plan(s: &TaskRuntimeStore) -> Result<(), StoreError> {
         s.create_run(
             "r1",
             "ws",
@@ -10087,8 +10099,7 @@ mod tests {
             "g",
             "",
             AttendedMode::Attended,
-        )
-        .unwrap();
+        )?;
         let plan = TaskPlan {
             plan_id: "p1".into(),
             run_id: "r1".into(),
@@ -10107,15 +10118,16 @@ mod tests {
                 ..Default::default()
             }],
         };
-        s.attach_plan_for_test(&plan).unwrap();
-        s.transition_run("r1", TaskRunStatus::Running).unwrap();
+        s.attach_plan_for_test(&plan)?;
+        s.transition_run("r1", TaskRunStatus::Running)?;
+        Ok(())
     }
 
     #[test]
     fn budget_update_requires_existing_continuation_and_preserves_policy() -> Result<(), StoreError>
     {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         assert!(
             store
                 .update_run_continuation_budgets("r1", Some(100), Some(60))
@@ -10136,8 +10148,8 @@ mod tests {
 
     #[test]
     fn lowering_budget_atomically_pauses_and_cancels_active_driver() -> Result<(), StoreError> {
-        let store = std::sync::Arc::new(fresh());
-        seed_plan(&store);
+        let store = std::sync::Arc::new(fresh()?);
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, true, None, None)?;
         assert!(matches!(
             store.claim_run_turn("r1", "turn-1", RunTurnOrigin::User, TurnVisibility::Visible)?,
@@ -10181,8 +10193,8 @@ mod tests {
 
     #[test]
     fn subagent_usage_is_idempotent_and_parent_turn_owns_wall_clock() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, false, Some(100), Some(20))?;
         assert!(matches!(
             store.claim_run_turn("r1", "turn-1", RunTurnOrigin::User, TurnVisibility::Visible)?,
@@ -10293,8 +10305,8 @@ mod tests {
 
     #[test]
     fn cell_terminal_and_defer_race_cannot_leave_lost_wakeup() -> Result<(), String> {
-        let store = std::sync::Arc::new(fresh());
-        seed_plan(&store);
+        let store = std::sync::Arc::new(fresh().map_err(|error| error.to_string())?);
+        seed_plan(&store).map_err(|error| error.to_string())?;
         store
             .configure_run_continuation("r1", true, false, None, None)
             .map_err(|error| error.to_string())?;
@@ -10360,8 +10372,8 @@ mod tests {
 
     #[test]
     fn cell_terminal_retry_uses_the_exact_checkpointed_terminal_fact() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.record_background_cell_started(
             "r1",
             "cell-retry",
@@ -10420,8 +10432,8 @@ mod tests {
 
     #[test]
     fn concurrent_run_turn_claim_has_one_authoritative_winner() -> Result<(), String> {
-        let store = std::sync::Arc::new(fresh());
-        seed_plan(&store);
+        let store = std::sync::Arc::new(fresh().map_err(|error| error.to_string())?);
+        seed_plan(&store).map_err(|error| error.to_string())?;
         store
             .configure_run_continuation("r1", true, false, None, None)
             .map_err(|error| error.to_string())?;
@@ -10472,8 +10484,8 @@ mod tests {
 
     #[test]
     fn run_turn_accounting_is_idempotent_and_rejects_cross_turn_events() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, false, Some(100), None)?;
         assert!(matches!(
             store.claim_run_turn("r1", "turn-1", RunTurnOrigin::User, TurnVisibility::Visible,)?,
@@ -10554,8 +10566,8 @@ mod tests {
     #[test]
     fn time_budget_stops_at_exact_boundary_and_cannot_be_bypassed_by_resume()
     -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, false, None, Some(7))?;
         assert!(matches!(
             store.claim_run_turn("r1", "turn-1", RunTurnOrigin::User, TurnVisibility::Visible)?,
@@ -10599,8 +10611,8 @@ mod tests {
     #[test]
     fn one_hundred_turns_and_compactions_replay_without_double_accounting() -> Result<(), StoreError>
     {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         let initial_goal_sha256 = store
             .get_run("r1")?
             .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?
@@ -10662,8 +10674,8 @@ mod tests {
 
     #[test]
     fn provider_retry_schedule_rebuilds_and_counts_across_fingerprints() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, false, None, None)?;
         let base = Utc::now() - chrono::Duration::hours(1);
 
@@ -10723,8 +10735,8 @@ mod tests {
 
     #[test]
     fn provider_retry_claim_waits_then_success_clears_schedule() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, false, None, None)?;
         assert!(matches!(
             store.claim_run_turn(
@@ -10784,8 +10796,8 @@ mod tests {
     #[test]
     fn fifth_provider_failure_atomically_pauses_and_explicit_resume_resets_retry()
     -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, true, None, None)?;
         let base = Utc::now() - chrono::Duration::hours(1);
         for attempt in 1..=MAX_PROVIDER_RETRY_ATTEMPTS {
@@ -10889,7 +10901,7 @@ mod tests {
     #[test]
     fn boot_auto_resume_admission_rejects_missing_owner_workspace_and_unsafe_boundary()
     -> Result<(), StoreError> {
-        let store = fresh();
+        let store = fresh()?;
         prepare_boot_auto_resume_run(&store, "attended", AttendedMode::Attended)?;
         let attended = store.boot_auto_resume_decision("attended", true, false)?;
         assert!(matches!(
@@ -10929,7 +10941,7 @@ mod tests {
                 if blockers.contains(&BootAutoResumeBlocker::RecoveryBlocker)
         ));
 
-        let mismatched = fresh();
+        let mismatched = fresh()?;
         mismatched.create_run(
             "mismatch",
             "different-workspace",
@@ -11006,8 +11018,8 @@ mod tests {
 
     #[test]
     fn resume_task_run_transitions_paused_to_running() -> Result<(), String> {
-        let s = fresh();
-        seed_plan(&s);
+        let s = fresh().map_err(|error| error.to_string())?;
+        seed_plan(&s).map_err(|error| error.to_string())?;
         // Simulate user interrupt: Running -> Paused.
         s.transition_run("r1", TaskRunStatus::Paused)
             .map_err(|error| error.to_string())?;
@@ -11041,8 +11053,8 @@ mod tests {
 
     #[test]
     fn expected_resume_and_run_turn_claim_commit_in_one_frame() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, false, None, None)?;
         store.request_pause("r1")?;
         let expected = TaskRunResumeIdentity::capture(
@@ -11093,8 +11105,8 @@ mod tests {
 
     #[test]
     fn expected_resume_allows_only_execution_path_diagnostic_suffix() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, false, None, None)?;
         store.request_pause("r1")?;
         let expected = TaskRunResumeIdentity::capture(
@@ -11120,8 +11132,8 @@ mod tests {
     #[test]
     fn expected_resume_sequence_rejects_status_attachment_and_continuation_aba()
     -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, false, None, None)?;
         store.request_pause("r1")?;
         let first = store
@@ -11166,8 +11178,8 @@ mod tests {
 
     #[test]
     fn stale_expected_resume_cannot_mutate_recreated_run() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, false, None, None)?;
         store.request_pause("r1")?;
         let stale = TaskRunResumeIdentity::capture(
@@ -11177,7 +11189,7 @@ mod tests {
         );
 
         store.shadow.remove_runs(&["r1".to_string()])?;
-        seed_plan(&store);
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, false, None, None)?;
         store.request_pause("r1")?;
         let before_events = store.list_events("r1", 0)?.len();
@@ -11214,8 +11226,8 @@ mod tests {
 
     #[test]
     fn inactive_cancel_terminalizes_todos_and_run_in_one_frame() -> Result<(), String> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh().map_err(|error| error.to_string())?;
+        seed_plan(&store).map_err(|error| error.to_string())?;
         store
             .set_task_status(
                 "r1",
@@ -11255,8 +11267,8 @@ mod tests {
 
     #[test]
     fn idle_long_horizon_run_accepts_pause_resume_and_cancel() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, false, None, None)?;
         for ordinal in 1..=3 {
             let turn_id = format!("turn-{ordinal}");
@@ -11325,8 +11337,8 @@ mod tests {
     #[test]
     fn blocker_audit_resets_on_progress_and_distinguishes_error_fingerprints()
     -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, false, None, None)?;
 
         assert!(matches!(
@@ -11420,7 +11432,7 @@ mod tests {
 
     #[test]
     fn canonical_runtime_store_retry_keeps_dependency_blockers_derived() -> Result<(), StoreError> {
-        let store = fresh();
+        let store = fresh()?;
         store.create_run(
             "retry-run",
             "ws",
@@ -11537,8 +11549,8 @@ mod tests {
 
     #[test]
     fn boot_recovery_pauses_run_and_preserves_completed_tasks() -> Result<(), StoreError> {
-        let s = fresh();
-        seed_plan(&s);
+        let s = fresh()?;
+        seed_plan(&s)?;
         s.set_task_status(
             "r1",
             "t1",
@@ -11564,8 +11576,8 @@ mod tests {
 
     #[test]
     fn boot_recovery_failure_keeps_running_marker_and_is_retryable() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.set_task_status(
             "r1",
             "t1",
@@ -11611,8 +11623,8 @@ mod tests {
 
     #[test]
     fn boot_recovery_repairs_projection_after_atomic_event_commit() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.set_task_status(
             "r1",
             "t1",
@@ -11671,8 +11683,8 @@ mod tests {
 
     #[test]
     fn boot_recovery_closes_orphan_turn_and_records_pause_reason() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.configure_run_continuation("r1", true, false, None, None)?;
         assert!(matches!(
             store.claim_run_turn(
@@ -11719,8 +11731,8 @@ mod tests {
 
     #[test]
     fn boot_recovery_closes_orphan_cell_without_replaying_it() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.record_background_cell_started(
             "r1",
             "orphan-cell",
@@ -11765,8 +11777,8 @@ mod tests {
     #[test]
     fn boot_recovery_closes_active_cell_owned_by_already_paused_run_once() -> Result<(), StoreError>
     {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.record_background_cell_started(
             "r1",
             "paused-orphan-cell",
@@ -11807,8 +11819,8 @@ mod tests {
 
     #[test]
     fn pause_request_stops_driver_and_keeps_run_resumable() -> Result<(), StoreError> {
-        let store = std::sync::Arc::new(fresh());
-        seed_plan(&store);
+        let store = std::sync::Arc::new(fresh()?);
+        seed_plan(&store)?;
         store.set_task_status(
             "r1",
             "t1",
@@ -11831,8 +11843,8 @@ mod tests {
 
     #[test]
     fn active_cancel_durably_overrides_a_prior_pause_intent() -> Result<(), StoreError> {
-        let store = std::sync::Arc::new(fresh());
-        seed_plan(&store);
+        let store = std::sync::Arc::new(fresh()?);
+        seed_plan(&store)?;
         let snapshot = store.load_runtime_plan_snapshot("r1")?;
         let task = snapshot
             .tasks
@@ -11879,7 +11891,7 @@ mod tests {
 
     #[test]
     fn cancelled_registration_drop_only_releases_in_memory_ownership() -> Result<(), StoreError> {
-        let store = std::sync::Arc::new(fresh());
+        let store = std::sync::Arc::new(fresh()?);
         store.create_run(
             "cancelled-driver",
             "ws",
@@ -11907,7 +11919,7 @@ mod tests {
 
     #[test]
     fn cancel_request_retains_driver_ownership_until_registration_drop() -> Result<(), StoreError> {
-        let store = std::sync::Arc::new(fresh());
+        let store = std::sync::Arc::new(fresh()?);
         store.create_run(
             "cancel-request-driver",
             "ws",
@@ -11948,7 +11960,7 @@ mod tests {
 
     #[test]
     fn cancelled_nested_registration_restores_outer_driver() -> Result<(), StoreError> {
-        let store = std::sync::Arc::new(fresh());
+        let store = std::sync::Arc::new(fresh()?);
         store.create_run(
             "nested-cancelled-driver",
             "ws",
@@ -11984,8 +11996,8 @@ mod tests {
 
     #[test]
     fn boot_recovery_requeues_orphaned_running_task() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.set_task_status(
             "r1",
             "t1",
@@ -12008,8 +12020,8 @@ mod tests {
     #[test]
     fn boot_recovery_terminalizes_replay_safe_orphan_subagent_without_blocker()
     -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         let task = store
             .get_plan("r1")?
             .and_then(|plan| plan.tasks.into_iter().next())
@@ -12069,8 +12081,8 @@ mod tests {
 
     #[test]
     fn boot_recovery_reuses_completed_subagent_without_redispatch() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         let task = store
             .get_plan("r1")?
             .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?
@@ -12149,8 +12161,8 @@ mod tests {
 
     #[test]
     fn mutating_in_doubt_subagent_blocks_resume_until_user_decides() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.apply_task_patch_for_test(
             "r1",
             &TaskUpdateRequest {
@@ -12209,8 +12221,8 @@ mod tests {
     #[test]
     fn canonical_recovery_skip_commits_revision_and_resolution_in_one_batch()
     -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.apply_task_patch_for_test(
             "r1",
             &TaskUpdateRequest {
@@ -12271,8 +12283,8 @@ mod tests {
 
     #[test]
     fn tool_failure_boundary_persists_recovery_contract() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         let failure = echo_agent::tools::ToolFailure::new(
             echo_agent::tools::ToolFailureCategory::PartialSideEffect,
         )
@@ -12315,37 +12327,42 @@ mod tests {
     }
 
     #[test]
-    fn find_in_progress_run_by_conversation_returns_running() {
-        let s = fresh();
-        seed_plan(&s); // run "r1" in conversation "c1" is now Running.
-        let found = s.find_in_progress_run_by_conversation("c1").unwrap();
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().run_id, "r1");
+    fn find_in_progress_run_by_conversation_returns_running() -> Result<(), StoreError> {
+        let s = fresh()?;
+        seed_plan(&s)?; // run "r1" in conversation "c1" is now Running.
+        let found = s
+            .find_in_progress_run_by_conversation("c1")?
+            .ok_or_else(|| StoreError::RunNotFound("in-progress run for c1".to_string()))?;
+        assert_eq!(found.run_id, "r1");
+        Ok(())
     }
 
     #[test]
-    fn find_in_progress_run_by_conversation_returns_paused() {
-        let s = fresh();
-        seed_plan(&s);
-        s.transition_run("r1", TaskRunStatus::Paused).unwrap();
-        let found = s.find_in_progress_run_by_conversation("c1").unwrap();
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().run_id, "r1");
+    fn find_in_progress_run_by_conversation_returns_paused() -> Result<(), StoreError> {
+        let s = fresh()?;
+        seed_plan(&s)?;
+        s.transition_run("r1", TaskRunStatus::Paused)?;
+        let found = s
+            .find_in_progress_run_by_conversation("c1")?
+            .ok_or_else(|| StoreError::RunNotFound("paused run for c1".to_string()))?;
+        assert_eq!(found.run_id, "r1");
+        Ok(())
     }
 
     #[test]
-    fn find_in_progress_run_by_conversation_returns_none_for_completed() {
-        let s = fresh();
-        seed_plan(&s);
-        s.transition_run("r1", TaskRunStatus::Completed).unwrap();
-        let found = s.find_in_progress_run_by_conversation("c1").unwrap();
+    fn find_in_progress_run_by_conversation_returns_none_for_completed() -> Result<(), StoreError> {
+        let s = fresh()?;
+        seed_plan(&s)?;
+        s.transition_run("r1", TaskRunStatus::Completed)?;
+        let found = s.find_in_progress_run_by_conversation("c1")?;
         assert!(found.is_none());
+        Ok(())
     }
 
     #[test]
-    fn task_update_inserts_task_and_commits_one_revision() {
-        let s = fresh();
-        seed_plan(&s);
+    fn task_update_inserts_task_and_commits_one_revision() -> Result<(), StoreError> {
+        let s = fresh()?;
+        seed_plan(&s)?;
         let t2 = PlanTask {
             id: "t2".into(),
             title: "Second task".into(),
@@ -12355,31 +12372,30 @@ mod tests {
             depends_on: vec!["t1".into()],
             ..Default::default()
         };
-        let before = s.list_events("r1", 0).unwrap().len();
-        let plan = s
-            .apply_task_patch_for_test(
-                "r1",
-                &TaskUpdateRequest {
-                    base_revision: 1,
-                    reason: "new implementation dependency".to_string(),
-                    operations: vec![TaskUpdateOperation::Insert {
-                        after_task_id: Some("t1".to_string()),
-                        task: t2.spec(),
-                    }],
-                },
-            )
-            .unwrap();
+        let before = s.list_events("r1", 0)?.len();
+        let plan = s.apply_task_patch_for_test(
+            "r1",
+            &TaskUpdateRequest {
+                base_revision: 1,
+                reason: "new implementation dependency".to_string(),
+                operations: vec![TaskUpdateOperation::Insert {
+                    after_task_id: Some("t1".to_string()),
+                    task: t2.spec(),
+                }],
+            },
+        )?;
 
         assert_eq!(plan.revision, 2);
         assert_eq!(plan.tasks.len(), 2);
         assert_eq!(plan.tasks[0].id, "t1");
         assert_eq!(plan.tasks[1].id, "t2");
-        let evs = s.list_events("r1", 0).unwrap();
+        let evs = s.list_events("r1", 0)?;
         assert_eq!(evs.len(), before + 1);
         assert_eq!(
             evs.last().map(|event| event.event_type),
             Some(RuntimeEventKind::PlanRevisionCommitted)
         );
+        Ok(())
     }
 
     #[test]
@@ -12495,10 +12511,10 @@ mod tests {
     }
 
     #[test]
-    fn task_update_rejects_stale_revision_without_appending_event() {
-        let s = fresh();
-        seed_plan(&s);
-        let before = s.list_events("r1", 0).unwrap().len();
+    fn task_update_rejects_stale_revision_without_appending_event() -> Result<(), StoreError> {
+        let s = fresh()?;
+        seed_plan(&s)?;
+        let before = s.list_events("r1", 0)?.len();
         let error = s
             .apply_task_patch_for_test(
                 "r1",
@@ -12510,16 +12526,20 @@ mod tests {
                     }],
                 },
             )
-            .unwrap_err();
+            .err()
+            .ok_or_else(|| {
+                StoreError::InvalidPlan("stale update unexpectedly succeeded".to_string())
+            })?;
         assert!(matches!(error, StoreError::PlanConflict { .. }));
-        assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
+        assert_eq!(s.list_events("r1", 0)?.len(), before);
+        Ok(())
     }
 
     #[test]
     fn canonical_runtime_store_claim_and_settlement_match_framework_fields()
     -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         let before = store.load_runtime_plan_snapshot("r1")?;
         let expected_task = before
             .tasks
@@ -12618,8 +12638,8 @@ mod tests {
     #[test]
     fn canonical_runtime_store_requeue_matches_framework_and_rejects_aba_claim()
     -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         let initial = store.load_runtime_plan_snapshot("r1")?;
         let expected_task = initial
             .tasks
@@ -12798,8 +12818,8 @@ mod tests {
 
     #[test]
     fn canonical_runtime_store_pause_interruption_is_lossless() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         let initial = store.load_runtime_plan_snapshot("r1")?;
         let expected_task = initial
             .tasks
@@ -12873,8 +12893,8 @@ mod tests {
     #[test]
     fn recovered_result_requires_exact_physical_claim_after_pause_resume() -> Result<(), StoreError>
     {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         let initial = store.load_runtime_plan_snapshot("r1")?;
         let expected = initial
             .tasks
@@ -12984,8 +13004,8 @@ mod tests {
 
     #[test]
     fn canonical_runtime_store_revision_reload_wins_task_update_race() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         let expected = store
             .get_plan("r1")?
             .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?
@@ -13025,8 +13045,8 @@ mod tests {
 
     #[test]
     fn stale_claim_cannot_overwrite_cancelled_task() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         let expected = store
             .get_plan("r1")?
             .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?
@@ -13076,8 +13096,8 @@ mod tests {
 
     #[test]
     fn patched_spec_uses_new_execution_identity_without_retry_bump() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         let original = store
             .get_plan("r1")?
             .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?
@@ -13191,66 +13211,63 @@ mod tests {
     }
 
     #[test]
-    fn task_update_skip_preserves_spec_and_updates_execution() {
-        let s = fresh();
-        seed_plan(&s);
-        let plan = s
-            .apply_task_patch_for_test(
-                "r1",
-                &TaskUpdateRequest {
-                    base_revision: 1,
-                    reason: "task no longer required".to_string(),
-                    operations: vec![TaskUpdateOperation::Skip {
-                        task_id: "t1".to_string(),
-                    }],
-                },
-            )
-            .unwrap();
+    fn task_update_skip_preserves_spec_and_updates_execution() -> Result<(), StoreError> {
+        let s = fresh()?;
+        seed_plan(&s)?;
+        let plan = s.apply_task_patch_for_test(
+            "r1",
+            &TaskUpdateRequest {
+                base_revision: 1,
+                reason: "task no longer required".to_string(),
+                operations: vec![TaskUpdateOperation::Skip {
+                    task_id: "t1".to_string(),
+                }],
+            },
+        )?;
         assert_eq!(plan.revision, 2);
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].status, echo_agent::tasks::TaskStatus::Skipped);
+        Ok(())
     }
 
     #[test]
-    fn task_update_update_requeues_blocked_task() {
-        let s = fresh();
-        seed_plan(&s);
+    fn task_update_update_requeues_blocked_task() -> Result<(), StoreError> {
+        let s = fresh()?;
+        seed_plan(&s)?;
         s.set_task_status(
             "r1",
             "t1",
             echo_agent::tasks::TaskStatus::Blocked(String::new()),
             Some("reviewer"),
             Some("needs a clearer brief"),
-        )
-        .unwrap();
-        let plan = s
-            .apply_task_patch_for_test(
-                "r1",
-                &TaskUpdateRequest {
-                    base_revision: 1,
-                    reason: "clarify the blocked task".to_string(),
-                    operations: vec![TaskUpdateOperation::Update {
-                        task_id: "t1".to_string(),
-                        patch: TaskPatch {
-                            description: Some("Review the clarified runtime boundary".to_string()),
-                            ..Default::default()
-                        },
-                    }],
-                },
-            )
-            .unwrap();
+        )?;
+        let plan = s.apply_task_patch_for_test(
+            "r1",
+            &TaskUpdateRequest {
+                base_revision: 1,
+                reason: "clarify the blocked task".to_string(),
+                operations: vec![TaskUpdateOperation::Update {
+                    task_id: "t1".to_string(),
+                    patch: TaskPatch {
+                        description: Some("Review the clarified runtime boundary".to_string()),
+                        ..Default::default()
+                    },
+                }],
+            },
+        )?;
         assert_eq!(plan.revision, 2);
         assert_eq!(plan.tasks[0].status, echo_agent::tasks::TaskStatus::Pending);
         assert_eq!(
             plan.tasks[0].description,
             "Review the clarified runtime boundary"
         );
+        Ok(())
     }
 
     #[test]
     fn completion_gate_rechecks_latest_plan_revision() -> Result<(), StoreError> {
-        let s = fresh();
-        seed_plan(&s);
+        let s = fresh()?;
+        seed_plan(&s)?;
         let persist_summary = |task_id: &str| {
             s.put_summary(&TaskExecutionSummary {
                 run_id: "r1".to_string(),
@@ -13316,8 +13333,8 @@ mod tests {
 
     #[test]
     fn task_update_rejects_running_task_contract_change() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
+        let store = fresh()?;
+        seed_plan(&store)?;
         store.set_task_status(
             "r1",
             "t1",
@@ -13351,8 +13368,8 @@ mod tests {
     /// `transition_run` rejects an illegal transition on the file path and
     /// appends no event. (Completed → Running is always illegal.)
     #[test]
-    fn file_path_rejects_illegal_transition_and_appends_no_event() {
-        let s = fresh();
+    fn file_path_rejects_illegal_transition_and_appends_no_event() -> Result<(), StoreError> {
+        let s = fresh()?;
         s.create_run(
             "r1",
             "ws",
@@ -13362,21 +13379,28 @@ mod tests {
             "g",
             "",
             AttendedMode::Attended,
-        )
-        .unwrap();
-        s.transition_run("r1", TaskRunStatus::Running).unwrap();
-        s.transition_run("r1", TaskRunStatus::Completed).unwrap();
-        let before = s.list_events("r1", 0).unwrap().len();
-        let err = s.transition_run("r1", TaskRunStatus::Running).unwrap_err();
+        )?;
+        s.transition_run("r1", TaskRunStatus::Running)?;
+        s.transition_run("r1", TaskRunStatus::Completed)?;
+        let before = s.list_events("r1", 0)?.len();
+        let err = s
+            .transition_run("r1", TaskRunStatus::Running)
+            .err()
+            .ok_or_else(|| {
+                StoreError::InvalidPlan(
+                    "illegal file transition unexpectedly succeeded".to_string(),
+                )
+            })?;
         assert!(matches!(err, StoreError::IllegalTransition { .. }));
         // No new event appended — the file-path validation rejected before writing.
-        assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
+        assert_eq!(s.list_events("r1", 0)?.len(), before);
+        Ok(())
     }
 
     /// `task_update` rejects a dependency cycle and appends no revision event.
     #[test]
-    fn file_path_rejects_dependency_cycle_and_appends_no_event() {
-        let s = fresh();
+    fn file_path_rejects_dependency_cycle_and_appends_no_event() -> Result<(), StoreError> {
+        let s = fresh()?;
         s.create_run(
             "r1",
             "ws",
@@ -13386,8 +13410,7 @@ mod tests {
             "g",
             "",
             AttendedMode::Attended,
-        )
-        .unwrap();
+        )?;
         s.attach_plan_for_test(&TaskPlan {
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
@@ -13410,9 +13433,8 @@ mod tests {
                     ..sample_task_body("t2")
                 },
             ],
-        })
-        .unwrap();
-        let before = s.list_events("r1", 0).unwrap().len();
+        })?;
+        let before = s.list_events("r1", 0)?.len();
         // Now make t1 depend on t2 → cycle.
         let err = s
             .apply_task_patch_for_test(
@@ -13429,18 +13451,22 @@ mod tests {
                     }],
                 },
             )
-            .unwrap_err();
+            .err()
+            .ok_or_else(|| {
+                StoreError::InvalidPlan("dependency cycle unexpectedly succeeded".to_string())
+            })?;
         assert!(matches!(err, StoreError::InvalidPlan(_)));
-        assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
+        assert_eq!(s.list_events("r1", 0)?.len(), before);
+        Ok(())
     }
 
     /// `set_task_status` rejects an unknown task on the file path and appends
     /// no event.
     #[test]
-    fn file_path_rejects_unknown_task_and_appends_no_event() {
-        let s = fresh();
-        seed_plan(&s);
-        let before = s.list_events("r1", 0).unwrap().len();
+    fn file_path_rejects_unknown_task_and_appends_no_event() -> Result<(), StoreError> {
+        let s = fresh()?;
+        seed_plan(&s)?;
+        let before = s.list_events("r1", 0)?.len();
         let err = s
             .set_task_status(
                 "r1",
@@ -13449,9 +13475,13 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap_err();
+            .err()
+            .ok_or_else(|| {
+                StoreError::InvalidPlan("unknown task unexpectedly succeeded".to_string())
+            })?;
         assert!(matches!(err, StoreError::TaskNotFound(_)));
-        assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
+        assert_eq!(s.list_events("r1", 0)?.len(), before);
+        Ok(())
     }
 
     #[tokio::test]
@@ -14642,7 +14672,7 @@ mod tests {
     #[test]
     fn projection_receipt_distinguishes_uncommitted_and_committed_degradation() -> Result<(), String>
     {
-        let store = fresh();
+        let store = fresh().map_err(|error| error.to_string())?;
         store
             .create_run(
                 "receipt-run",
@@ -14707,7 +14737,7 @@ mod tests {
 
     #[test]
     fn durability_receipt_preserves_batch_cell_and_reconciled_degradation() -> Result<(), String> {
-        let store = fresh();
+        let store = fresh().map_err(|error| error.to_string())?;
         store
             .create_run(
                 "durability-run",
@@ -15140,7 +15170,7 @@ mod tests {
 
     #[test]
     fn committed_projection_degradation_preserves_all_mutation_outcomes() -> Result<(), String> {
-        let store = fresh();
+        let store = fresh().map_err(|error| error.to_string())?;
         store
             .create_run(
                 "transition-run",
@@ -15290,7 +15320,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_completion_survives_committed_projection_degradation() -> Result<(), String> {
-        let store = std::sync::Arc::new(fresh());
+        let store = std::sync::Arc::new(fresh().map_err(|error| error.to_string())?);
         let run_id = "direct-degraded";
         store
             .create_run(

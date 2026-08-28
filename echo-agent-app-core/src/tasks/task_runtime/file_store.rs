@@ -469,22 +469,20 @@ mod tests {
     /// including the TodoItem runtime fields derived from events.
     #[test]
     fn file_store_reads_match_sql() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir()?;
         let shadow = Arc::new(FileTaskShadow::new(tmp.path())?);
-        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path())?;
 
-        store
-            .create_run(
-                "r1",
-                "ws",
-                "c1",
-                "m1",
-                DomainProfile::AiCoding,
-                "review",
-                "complex",
-                AttendedMode::Attended,
-            )
-            .unwrap();
+        store.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::AiCoding,
+            "review",
+            "complex",
+            AttendedMode::Attended,
+        )?;
         let plan = TaskPlan {
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
@@ -497,45 +495,49 @@ mod tests {
             execution_mode: ExecutionMode::Parallel,
             tasks: vec![task("t1", PlanTaskKind::ReadOnlyReview)],
         };
-        store.attach_plan_for_test(&plan).unwrap();
-        store
-            .set_task_status(
-                "r1",
-                "t1",
-                echo_agent::tasks::TaskStatus::Running,
-                Some("explorer"),
-                Some("starting"),
-            )
-            .unwrap();
-        store
-            .set_task_status(
-                "r1",
-                "t1",
-                echo_agent::tasks::TaskStatus::Completed,
-                Some("explorer"),
-                Some("done"),
-            )
-            .unwrap();
+        store.attach_plan_for_test(&plan)?;
+        store.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Running,
+            Some("explorer"),
+            Some("starting"),
+        )?;
+        store.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Completed,
+            Some("explorer"),
+            Some("done"),
+        )?;
 
         let file = FileTaskStore::new((*shadow).clone());
 
         // get_run
-        let sql_run = store.get_run("r1").unwrap().unwrap();
-        let file_run = file.get_run("r1").unwrap().unwrap();
+        let sql_run = store
+            .get_run("r1")?
+            .ok_or_else(|| std::io::Error::other("SQL run r1 missing"))?;
+        let file_run = file
+            .get_run("r1")?
+            .ok_or_else(|| std::io::Error::other("file run r1 missing"))?;
         assert_eq!(file_run.run_id, sql_run.run_id);
         assert_eq!(file_run.goal, sql_run.goal);
         assert_eq!(file_run.route, sql_run.route);
 
         // get_plan
-        let sql_plan = store.get_plan("r1").unwrap().unwrap();
-        let file_plan = file.get_plan("r1").unwrap().unwrap();
+        let sql_plan = store
+            .get_plan("r1")?
+            .ok_or_else(|| std::io::Error::other("SQL plan r1 missing"))?;
+        let file_plan = file
+            .get_plan("r1")?
+            .ok_or_else(|| std::io::Error::other("file plan r1 missing"))?;
         assert_eq!(file_plan.plan_id, sql_plan.plan_id);
         assert_eq!(file_plan.tasks.len(), sql_plan.tasks.len());
         assert_eq!(file_plan.tasks[0].id, sql_plan.tasks[0].id);
 
         // list_todos — the 4 runtime fields must be derived correctly.
-        let sql_todos = store.list_todos("r1").unwrap();
-        let file_todos = file.list_todos("r1").unwrap();
+        let sql_todos = store.list_todos("r1")?;
+        let file_todos = file.list_todos("r1")?;
         assert_eq!(sql_todos.len(), file_todos.len());
         let st = &sql_todos[0];
         let ft = &file_todos[0];
@@ -550,8 +552,8 @@ mod tests {
         assert!(ft.completed_at.is_some());
 
         // list_events
-        let sql_ev = store.list_events("r1", 0).unwrap();
-        let file_ev = file.list_events("r1", 0).unwrap();
+        let sql_ev = store.list_events("r1", 0)?;
+        let file_ev = file.list_events("r1", 0)?;
         assert_eq!(sql_ev.len(), file_ev.len());
         Ok(())
     }
@@ -618,36 +620,32 @@ mod tests {
     /// ordering). Drives a store with two runs and asserts both surface.
     #[test]
     fn list_runs_enumerates_all_runs_desc_by_created() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir()?;
         let shadow = Arc::new(FileTaskShadow::new(tmp.path())?);
-        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
-        store
-            .create_run(
-                "r1",
-                "ws",
-                "c1",
-                "m1",
-                DomainProfile::General,
-                "g1",
-                "",
-                AttendedMode::Attended,
-            )
-            .unwrap();
-        store
-            .create_run(
-                "r2",
-                "ws",
-                "c2",
-                "m2",
-                DomainProfile::General,
-                "g2",
-                "",
-                AttendedMode::Attended,
-            )
-            .unwrap();
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path())?;
+        store.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::General,
+            "g1",
+            "",
+            AttendedMode::Attended,
+        )?;
+        store.create_run(
+            "r2",
+            "ws",
+            "c2",
+            "m2",
+            DomainProfile::General,
+            "g2",
+            "",
+            AttendedMode::Attended,
+        )?;
 
         let file = FileTaskStore::new((*shadow).clone());
-        let runs = file.list_runs().unwrap();
+        let runs = file.list_runs()?;
         assert_eq!(runs.len(), 2);
         let ids: Vec<_> = runs.iter().map(|r| r.run_id.as_str()).collect();
         assert!(ids.contains(&"r1"));
@@ -660,87 +658,77 @@ mod tests {
     /// if it is Running/Paused.
     #[test]
     fn conversation_queries_filter_and_order() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir()?;
         let shadow = Arc::new(FileTaskShadow::new(tmp.path())?);
-        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
-        store
-            .create_run(
-                "r1",
-                "ws",
-                "cX",
-                "m1",
-                DomainProfile::General,
-                "g1",
-                "",
-                AttendedMode::Attended,
-            )
-            .unwrap();
-        store
-            .create_run(
-                "r2",
-                "ws",
-                "cX",
-                "m2",
-                DomainProfile::General,
-                "g2",
-                "",
-                AttendedMode::Attended,
-            )
-            .unwrap();
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path())?;
+        store.create_run(
+            "r1",
+            "ws",
+            "cX",
+            "m1",
+            DomainProfile::General,
+            "g1",
+            "",
+            AttendedMode::Attended,
+        )?;
+        store.create_run(
+            "r2",
+            "ws",
+            "cX",
+            "m2",
+            DomainProfile::General,
+            "g2",
+            "",
+            AttendedMode::Attended,
+        )?;
         // r1 Running, r2 Pending — latest is r2 (newer), in-progress is r1.
-        store.transition_run("r1", TaskRunStatus::Running).unwrap();
+        store.transition_run("r1", TaskRunStatus::Running)?;
 
         let file = FileTaskStore::new((*shadow).clone());
-        let latest = file.latest_run_for_conversation("cX").unwrap();
+        let latest = file.latest_run_for_conversation("cX")?;
         assert_eq!(latest.as_ref().map(|r| r.run_id.as_str()), Some("r2"));
-        let in_prog = file.find_in_progress_run_by_conversation("cX").unwrap();
+        let in_prog = file.find_in_progress_run_by_conversation("cX")?;
         assert_eq!(in_prog.as_ref().map(|r| r.run_id.as_str()), Some("r1"));
         // Different conversation → none.
-        assert!(file.latest_run_for_conversation("other").unwrap().is_none());
+        assert!(file.latest_run_for_conversation("other")?.is_none());
         Ok(())
     }
 
     /// `list_runs_in` filters by status set.
     #[test]
     fn list_runs_in_filters_by_status() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir()?;
         let shadow = Arc::new(FileTaskShadow::new(tmp.path())?);
-        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
-        store
-            .create_run(
-                "r1",
-                "ws",
-                "c1",
-                "m1",
-                DomainProfile::General,
-                "g1",
-                "",
-                AttendedMode::Attended,
-            )
-            .unwrap();
-        store
-            .create_run(
-                "r2",
-                "ws",
-                "c2",
-                "m2",
-                DomainProfile::General,
-                "g2",
-                "",
-                AttendedMode::Attended,
-            )
-            .unwrap();
-        store.transition_run("r1", TaskRunStatus::Running).unwrap();
-        store
-            .transition_run("r1", TaskRunStatus::Completed)
-            .unwrap();
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path())?;
+        store.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::General,
+            "g1",
+            "",
+            AttendedMode::Attended,
+        )?;
+        store.create_run(
+            "r2",
+            "ws",
+            "c2",
+            "m2",
+            DomainProfile::General,
+            "g2",
+            "",
+            AttendedMode::Attended,
+        )?;
+        store.transition_run("r1", TaskRunStatus::Running)?;
+        store.transition_run("r1", TaskRunStatus::Completed)?;
         // r1 Completed, r2 Pending.
 
         let file = FileTaskStore::new((*shadow).clone());
-        let completed = file.list_runs_in(&[TaskRunStatus::Completed]).unwrap();
+        let completed = file.list_runs_in(&[TaskRunStatus::Completed])?;
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].run_id, "r1");
-        let pending = file.list_runs_in(&[TaskRunStatus::Pending]).unwrap();
+        let pending = file.list_runs_in(&[TaskRunStatus::Pending])?;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].run_id, "r2");
         Ok(())

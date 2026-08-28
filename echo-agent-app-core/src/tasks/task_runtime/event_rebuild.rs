@@ -1605,15 +1605,15 @@ pub(crate) fn fold_fixture_for_test(
 mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::{
-        RunTurnClaimOutcome, RunTurnCompletion, TaskRuntimeStore,
+        RunTurnClaimOutcome, RunTurnCompletion, StoreError, TaskRuntimeStore,
     };
     use crate::tasks::task_runtime::types::{
         DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, RunTurnOrigin, RunTurnStatus,
         TaskPatch, TaskPlan, TaskRunStatus, TaskUpdateOperation, TaskUpdateRequest, TurnVisibility,
     };
 
-    fn fresh() -> TaskRuntimeStore {
-        TaskRuntimeStore::new_in_memory().expect("in-memory store")
+    fn fresh() -> Result<TaskRuntimeStore, StoreError> {
+        TaskRuntimeStore::new_in_memory()
     }
 
     fn sample_task(id: &str, kind: PlanTaskKind) -> PlanTask {
@@ -1646,22 +1646,20 @@ mod tests {
     /// event-rebuilt plan matches the SQL-read plan on run header, plan envelope,
     /// and every task's defining fields.
     #[test]
-    fn rebuild_matches_sql_after_full_lifecycle() {
-        let s = fresh();
+    fn rebuild_matches_sql_after_full_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+        let s = fresh()?;
 
         // 1. create_run
-        let _run = s
-            .create_run(
-                "r1",
-                "ws",
-                "c1",
-                "m1",
-                DomainProfile::AiCoding,
-                "review runtime",
-                "complex_runtime",
-                AttendedMode::Attended,
-            )
-            .unwrap();
+        let _run = s.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::AiCoding,
+            "review runtime",
+            "complex_runtime",
+            AttendedMode::Attended,
+        )?;
 
         // 2. attach a structured plan (the authoritative plan-creation path).
         let plan = TaskPlan {
@@ -1679,7 +1677,7 @@ mod tests {
                 sample_task("t2", PlanTaskKind::Investigation),
             ],
         };
-        s.attach_plan_for_test(&plan).unwrap();
+        s.attach_plan_for_test(&plan)?;
 
         // 4. mutate a task status
         s.set_task_status(
@@ -1688,16 +1686,19 @@ mod tests {
             echo_agent::tasks::TaskStatus::Running,
             Some("code_reviewer"),
             None,
-        )
-        .unwrap();
+        )?;
 
         // 5. Read SQL ground truth.
-        let sql_run = s.get_run("r1").unwrap().unwrap();
-        let sql_plan = s.get_plan("r1").unwrap().unwrap();
-        let events = s.list_events("r1", 0).unwrap();
+        let sql_run = s
+            .get_run("r1")?
+            .ok_or_else(|| std::io::Error::other("run r1 missing"))?;
+        let sql_plan = s
+            .get_plan("r1")?
+            .ok_or_else(|| std::io::Error::other("plan r1 missing"))?;
+        let events = s.list_events("r1", 0)?;
 
         // 6. Rebuild from events.
-        let rebuilt = fold_fixture_for_test(&events).unwrap();
+        let rebuilt = fold_fixture_for_test(&events)?;
 
         // 7. Assert run header parity.
         assert_eq!(rebuilt.run.run_id, sql_run.run_id);
@@ -1721,16 +1722,12 @@ mod tests {
 
         // 9. Assert task parity. The revision commit replaced tasks, so the
         // projection has 1 task (t1) and rebuild must converge to that state.
-        let rebuilt_t1 = rebuilt
-            .tasks
-            .iter()
-            .find(|t| t.id == "t1")
-            .unwrap_or_else(|| {
-                panic!(
-                    "rebuilt tasks: {:?}",
-                    rebuilt.tasks.iter().map(|t| &t.id).collect::<Vec<_>>()
-                )
-            });
+        let rebuilt_t1 = rebuilt.tasks.iter().find(|t| t.id == "t1").ok_or_else(|| {
+            std::io::Error::other(format!(
+                "task t1 missing from rebuilt tasks: {:?}",
+                rebuilt.tasks.iter().map(|t| &t.id).collect::<Vec<_>>()
+            ))
+        })?;
         assert_eq!(rebuilt_t1.title, "task t1");
         assert_eq!(rebuilt_t1.description, "do t1");
         assert_eq!(rebuilt_t1.kind, PlanTaskKind::ReadOnlyReview);
@@ -1739,12 +1736,13 @@ mod tests {
         assert_eq!(rebuilt_t1.allowed_tools, vec!["read_file".to_string()]);
         // status was set to Running after attach.
         assert_eq!(rebuilt_t1.status, echo_agent::tasks::TaskStatus::Running);
+        Ok(())
     }
 
     /// A committed revision patch must be visible in the rebuilt specification.
     #[test]
-    fn rebuild_reflects_task_patch() {
-        let s = fresh();
+    fn rebuild_reflects_task_patch() -> Result<(), Box<dyn std::error::Error>> {
+        let s = fresh()?;
         s.create_run(
             "r1",
             "ws",
@@ -1754,8 +1752,7 @@ mod tests {
             "g",
             "",
             AttendedMode::Attended,
-        )
-        .unwrap();
+        )?;
         s.attach_plan_for_test(&TaskPlan {
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
@@ -1767,8 +1764,7 @@ mod tests {
             risks: Vec::new(),
             execution_mode: ExecutionMode::Parallel,
             tasks: vec![sample_task("t1", PlanTaskKind::Investigation)],
-        })
-        .unwrap();
+        })?;
         s.apply_task_patch_for_test(
             "r1",
             &TaskUpdateRequest {
@@ -1791,22 +1787,26 @@ mod tests {
                     },
                 }],
             },
-        )
-        .unwrap();
+        )?;
 
-        let events = s.list_events("r1", 0).unwrap();
-        let rebuilt = fold_fixture_for_test(&events).unwrap();
-        let t = rebuilt.tasks.iter().find(|t| t.id == "t1").unwrap();
+        let events = s.list_events("r1", 0)?;
+        let rebuilt = fold_fixture_for_test(&events)?;
+        let t = rebuilt
+            .tasks
+            .iter()
+            .find(|t| t.id == "t1")
+            .ok_or_else(|| std::io::Error::other("rebuilt task t1 missing"))?;
         assert_eq!(t.title, "renamed");
         assert_eq!(t.description, "new desc");
         assert_eq!(t.kind, PlanTaskKind::ReadOnlyReview);
         assert_eq!(t.agent_role, "explorer");
         assert_eq!(t.files, vec!["b.rs".to_string()]);
+        Ok(())
     }
 
     #[test]
     fn continuation_fold_is_idempotent_under_duplicate_event_delivery() -> Result<(), String> {
-        let store = fresh();
+        let store = fresh().map_err(|error| error.to_string())?;
         store
             .create_run(
                 "continuation-run",

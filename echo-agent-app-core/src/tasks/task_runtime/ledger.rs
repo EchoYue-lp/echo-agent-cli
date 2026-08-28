@@ -190,20 +190,18 @@ mod tests {
 
     use super::*;
 
-    fn seeded_store() -> Arc<TaskRuntimeStore> {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
-        store
-            .create_run(
-                "r1",
-                "ws",
-                "c1",
-                "m1",
-                DomainProfile::AiCoding,
-                "Build real runtime",
-                "",
-                AttendedMode::Attended,
-            )
-            .unwrap();
+    fn seeded_store() -> Result<Arc<TaskRuntimeStore>, StoreError> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        store.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::AiCoding,
+            "Build real runtime",
+            "",
+            AttendedMode::Attended,
+        )?;
         let plan = TaskPlan {
             plan_id: "p1".into(),
             run_id: "r1".into(),
@@ -232,33 +230,29 @@ mod tests {
                 },
             ],
         };
-        store.attach_plan_for_test(&plan).unwrap();
-        store.transition_run("r1", TaskRunStatus::Running).unwrap();
-        store
-            .set_task_status(
-                "r1",
-                "t1",
-                echo_agent::tasks::TaskStatus::Running,
-                Some("code_reviewer"),
-                None,
-            )
-            .unwrap();
-        store
-            .set_task_status(
-                "r1",
-                "t1",
-                echo_agent::tasks::TaskStatus::Completed,
-                Some("code_reviewer"),
-                Some("found router gap"),
-            )
-            .unwrap();
-        store
+        store.attach_plan_for_test(&plan)?;
+        store.transition_run("r1", TaskRunStatus::Running)?;
+        store.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Running,
+            Some("code_reviewer"),
+            None,
+        )?;
+        store.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Completed,
+            Some("code_reviewer"),
+            Some("found router gap"),
+        )?;
+        Ok(store)
     }
 
     #[test]
-    fn render_progress_groups_by_status() {
-        let store = seeded_store();
-        let md = render_progress(&store, "r1").unwrap();
+    fn render_progress_groups_by_status() -> Result<(), StoreError> {
+        let store = seeded_store()?;
+        let md = render_progress(&store, "r1")?;
         assert!(md.contains("## Goal\nBuild real runtime"));
         assert!(md.contains("## Completed"));
         assert!(md.contains("`t1` — Review runtime: found router gap"));
@@ -267,32 +261,36 @@ mod tests {
         assert!(md.contains("## Assumptions"));
         assert!(md.contains("## Risks"));
         assert!(md.contains("1/2 tasks completed"));
+        Ok(())
     }
 
     #[test]
-    fn render_progress_errors_on_unknown_run() {
-        let store = TaskRuntimeStore::new_in_memory().unwrap();
+    fn render_progress_errors_on_unknown_run() -> Result<(), StoreError> {
+        let store = TaskRuntimeStore::new_in_memory()?;
         assert!(matches!(
             render_progress(&store, "nope"),
             Err(StoreError::RunNotFound(_))
         ));
+        Ok(())
     }
 
     #[test]
-    fn write_progress_creates_file_and_returns_markdown() {
+    fn write_progress_creates_file_and_returns_markdown() -> Result<(), Box<dyn std::error::Error>>
+    {
         // Use a temp CWD so the test doesn't litter the repo.
         let tmp = std::env::temp_dir().join(format!("eko-progress-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
+        std::fs::create_dir_all(&tmp)?;
+        let prev = std::env::current_dir()?;
+        std::env::set_current_dir(&tmp)?;
 
-        let store = seeded_store();
-        let md = write_progress(&store, "r1", Some(&tmp)).unwrap();
-        let written = std::fs::read_to_string(export_path("r1", Some(&tmp))).unwrap();
+        let store = seeded_store()?;
+        let md = write_progress(&store, "r1", Some(&tmp))?;
+        let written = std::fs::read_to_string(export_path("r1", Some(&tmp)))?;
         assert_eq!(md, written);
         assert!(written.contains("## Goal"));
 
-        std::env::set_current_dir(prev).unwrap();
+        std::env::set_current_dir(prev)?;
         let _ = std::fs::remove_dir_all(&tmp);
+        Ok(())
     }
 }

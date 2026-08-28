@@ -458,8 +458,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn circuit_breaker_suspends_on_exhausted_retries() {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
+    async fn circuit_breaker_suspends_on_exhausted_retries() -> Result<(), StoreError> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
         let task = PlanTask {
             id: "t1".into(),
             retry_count: 3,
@@ -477,30 +477,29 @@ mod tests {
             created_fix_task_id: None,
             created_at: chrono::Utc::now(),
         };
-        match circuit_breaker_action(&store, &task, &review, 2) {
-            BreakerAction::Suspend { reason } => assert!(reason.contains("retry budget")),
-            BreakerAction::CreateFix => panic!("should suspend"),
-        }
+        assert!(matches!(
+            circuit_breaker_action(&store, &task, &review, 2),
+            BreakerAction::Suspend { reason } if reason.contains("retry budget")
+        ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn circuit_breaker_suspends_on_repeated_fingerprint() {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
+    async fn circuit_breaker_suspends_on_repeated_fingerprint() -> Result<(), StoreError> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
         // Seed: one prior review with fp-X (mimics what review_task would
         // have persisted on the first failed attempt).
-        store
-            .add_review(&ReviewResult {
-                id: "a".into(),
-                run_id: "run".into(),
-                task_id: "t1".into(),
-                reviewer_agent: "reviewer".into(),
-                outcome: ReviewOutcome::NeedsFix,
-                issues: vec![],
-                failure_fingerprint: Some("fp-X".into()),
-                created_fix_task_id: None,
-                created_at: chrono::Utc::now(),
-            })
-            .unwrap();
+        store.add_review(&ReviewResult {
+            id: "a".into(),
+            run_id: "run".into(),
+            task_id: "t1".into(),
+            reviewer_agent: "reviewer".into(),
+            outcome: ReviewOutcome::NeedsFix,
+            issues: vec![],
+            failure_fingerprint: Some("fp-X".into()),
+            created_fix_task_id: None,
+            created_at: chrono::Utc::now(),
+        })?;
         let task = PlanTask {
             id: "t1".into(),
             retry_count: 1,
@@ -520,16 +519,17 @@ mod tests {
             created_fix_task_id: None,
             created_at: chrono::Utc::now(),
         };
-        store.add_review(&review).unwrap();
-        match circuit_breaker_action(&store, &task, &review, 2) {
-            BreakerAction::Suspend { reason } => assert!(reason.contains("fp-X"), "{reason}"),
-            BreakerAction::CreateFix => panic!("should suspend on repeated fingerprint"),
-        }
+        store.add_review(&review)?;
+        assert!(matches!(
+            circuit_breaker_action(&store, &task, &review, 2),
+            BreakerAction::Suspend { reason } if reason.contains("fp-X")
+        ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn circuit_breaker_creates_fix_on_first_failure() {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
+    async fn circuit_breaker_creates_fix_on_first_failure() -> Result<(), StoreError> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
         let task = PlanTask {
             id: "t1".into(),
             retry_count: 0,
@@ -551,5 +551,6 @@ mod tests {
             circuit_breaker_action(&store, &task, &review, 2),
             BreakerAction::CreateFix
         ));
+        Ok(())
     }
 }

@@ -279,8 +279,8 @@ mod tests {
         AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan, TaskRunStatus,
     };
 
-    fn seeded_store() -> Arc<TaskRuntimeStore> {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
+    fn seeded_store() -> Result<Arc<TaskRuntimeStore>, String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         store
             .create_run(
                 "r1",
@@ -292,7 +292,7 @@ mod tests {
                 "",
                 AttendedMode::Attended,
             )
-            .unwrap();
+            .map_err(|error| error.to_string())?;
         let plan = TaskPlan {
             plan_id: "p1".into(),
             run_id: "r1".into(),
@@ -311,8 +311,12 @@ mod tests {
                 ..Default::default()
             }],
         };
-        store.attach_plan_for_test(&plan).unwrap();
-        store.transition_run("r1", TaskRunStatus::Running).unwrap();
+        store
+            .attach_plan_for_test(&plan)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("r1", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
         store
             .set_task_status(
                 "r1",
@@ -321,13 +325,13 @@ mod tests {
                 Some("code_reviewer"),
                 Some("found gap"),
             )
-            .unwrap();
-        store
+            .map_err(|error| error.to_string())?;
+        Ok(store)
     }
 
     #[tokio::test]
     async fn build_candidates_for_completed_run_summarizes_todos() -> Result<(), String> {
-        let store = seeded_store();
+        let store = seeded_store()?;
         let cands = build_candidates(
             &store,
             &MemoryEvent::RunCompleted {
@@ -349,7 +353,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_candidates_for_repeated_failure_carries_fingerprint() -> Result<(), String> {
-        let store = seeded_store();
+        let store = seeded_store()?;
         let cands = build_candidates(
             &store,
             &MemoryEvent::RepeatedTaskFailure {
@@ -371,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_candidates_for_cancelled_run_is_a_preference() -> Result<(), String> {
-        let store = seeded_store();
+        let store = seeded_store()?;
         let cands = build_candidates(
             &store,
             &MemoryEvent::RunCancelledByUser {
@@ -390,8 +394,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_memory_candidate_is_a_noop_without_layer_manager() {
-        let store = seeded_store();
+    async fn write_memory_candidate_is_a_noop_without_layer_manager() -> Result<(), String> {
+        let store = seeded_store()?;
         // None for layer_manager → no panic, no error.
         write_memory_candidate_settled(
             None,
@@ -403,6 +407,7 @@ mod tests {
             },
         )
         .await;
+        Ok(())
     }
 
     #[tokio::test]
@@ -414,10 +419,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_none_policy_is_a_noop_even_with_no_layer_manager() {
+    async fn dispatch_none_policy_is_a_noop_even_with_no_layer_manager() -> Result<(), String> {
         // B5.1: MemoryPolicy::None short-circuits before touching the layer
         // manager, so a None layer_manager is fine (no panic, returns fast).
-        let store = seeded_store();
+        let store = seeded_store()?;
         write_memory_candidate_dispatch(
             MemoryPolicy::None,
             None,
@@ -429,14 +434,15 @@ mod tests {
             },
         )
         .await;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn dispatch_settled_with_no_layer_manager_returns_without_panic() {
+    async fn dispatch_settled_with_no_layer_manager_returns_without_panic() -> Result<(), String> {
         // BestEffortSettled + None layer manager → no-op (a caller without a memory
         // subsystem can't write). Must NOT block forever or panic — this is the
         // autonomous path's fallback when no layer manager is wired (TUI/channel).
-        let store = seeded_store();
+        let store = seeded_store()?;
         write_memory_candidate_dispatch(
             MemoryPolicy::BestEffortSettled,
             None,
@@ -448,6 +454,7 @@ mod tests {
             },
         )
         .await;
+        Ok(())
     }
 
     /// B5.5 recall-closure e2e: a Completed run's memory (written via the
@@ -482,7 +489,7 @@ mod tests {
 
         // Seeded TaskRuntimeStore: run "r1", goal "Review runtime", one
         // Completed todo ("Review chat.rs" / "found gap").
-        let rt_store = seeded_store();
+        let rt_store = seeded_store()?;
 
         // The write the settled policy performs on Completion (the path
         // drive_run_async → execute_run → write_memory_candidate_dispatch uses).
