@@ -3207,7 +3207,7 @@ mod resolve_subagent_model_tests {
     }
 
     #[test]
-    fn loader_thinking_specs_parse_through_binding_path() {
+    fn loader_thinking_specs_parse_through_binding_path() -> Result<(), String> {
         // The builtin awaiter declares `thinking: low`; the same parse_spec the
         // binding uses must accept it, and the loader spec string must flow
         // unchanged from the .md frontmatter.
@@ -3215,16 +3215,17 @@ mod resolve_subagent_model_tests {
         let awaiter = defs
             .iter()
             .find(|d| d.name == "awaiter")
-            .expect("builtin awaiter.md must load");
+            .ok_or_else(|| "builtin awaiter.md must load".to_string())?;
         let parsed = echo_agent::llm::ThinkingConfig::parse_spec(
             awaiter.thinking.as_deref().unwrap_or_default(),
         )
-        .expect("awaiter thinking spec must parse");
+        .map_err(|error| format!("awaiter thinking spec must parse: {error}"))?;
         assert_eq!(
             parsed,
             Some(echo_agent::llm::ThinkingConfig::Level(
                 echo_agent::llm::ThinkingLevel::Low
             ))
         );
+        Ok(())
     }
 }

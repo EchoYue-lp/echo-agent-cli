@@ -162,7 +162,7 @@ async fn isolated_app_state() -> anyhow::Result<Fixture> {
 /// surface, so a TUI turn can run concurrently with the same conversation's
 /// GUI turn and both write the same transcript.
 #[test]
-fn f03_one_user_turn_per_address_across_surfaces() {
+fn f03_one_user_turn_per_address_across_surfaces() -> Result<(), String> {
     use crate::foreground_turn::{
         ForegroundTurnControl, ForegroundTurnError, ForegroundTurnSurface,
     };
@@ -175,7 +175,7 @@ fn f03_one_user_turn_per_address_across_surfaces() {
             "conversation-shared",
             "gui-root",
         )
-        .expect("the first GUI turn must be admitted");
+        .map_err(|error| format!("the first GUI turn must be admitted: {error}"))?;
 
     let second = control.begin_scoped(
         "workspace-a",
@@ -189,13 +189,14 @@ fn f03_one_user_turn_per_address_across_surfaces() {
         "a TUI turn for the same workspace conversation must conflict with the live GUI turn"
     );
     gui_lease.settle(crate::chat_driver::TurnOutcome::Completed);
+    Ok(())
 }
 
 /// Positive baseline (spec invariant 3): the same conversation id in two
 /// different workspaces is two independent addresses and must run
 /// concurrently. This already works and must keep working.
 #[test]
-fn same_conversation_id_in_different_workspaces_admits_concurrently() {
+fn same_conversation_id_in_different_workspaces_admits_concurrently() -> Result<(), String> {
     use crate::foreground_turn::ForegroundTurnSurface;
 
     let control = crate::foreground_turn::ForegroundTurnControl::default();
@@ -206,7 +207,7 @@ fn same_conversation_id_in_different_workspaces_admits_concurrently() {
             "conversation-shared",
             "turn-a",
         )
-        .expect("workspace A must admit its own turn");
+        .map_err(|error| format!("workspace A must admit its own turn: {error}"))?;
     let lease_b = control
         .begin_scoped(
             "workspace-b",
@@ -214,9 +215,12 @@ fn same_conversation_id_in_different_workspaces_admits_concurrently() {
             "conversation-shared",
             "turn-b",
         )
-        .expect("workspace B must admit the same conversation id concurrently");
+        .map_err(|error| {
+            format!("workspace B must admit the same conversation id concurrently: {error}")
+        })?;
     lease_a.settle(crate::chat_driver::TurnOutcome::Completed);
     lease_b.settle(crate::chat_driver::TurnOutcome::Completed);
+    Ok(())
 }
 
 /// M6: conversation deletion suspension must be workspace-qualified. Today
@@ -224,13 +228,15 @@ fn same_conversation_id_in_different_workspaces_admits_concurrently() {
 /// conversation in one workspace blocks foreground admission for every other
 /// workspace that happens to reuse the same conversation id.
 #[test]
-fn m6_conversation_suspension_is_workspace_qualified() {
+fn m6_conversation_suspension_is_workspace_qualified() -> Result<(), String> {
     use crate::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
 
     let control = ForegroundTurnControl::default();
     let _suspension = control
         .suspend_conversation_admission_if_idle_scoped("workspace-a", "conversation-shared")
-        .expect("suspending the workspace A conversation must succeed while idle");
+        .map_err(|error| {
+            format!("suspending the workspace A conversation must succeed while idle: {error}")
+        })?;
 
     let other_workspace_turn = control.begin_scoped(
         "workspace-b",
@@ -243,10 +249,13 @@ fn m6_conversation_suspension_is_workspace_qualified() {
         Ok(lease) => {
             lease.settle(crate::chat_driver::TurnOutcome::Completed);
         }
-        Err(error) => panic!(
-            "workspace B admission must survive a same-id suspension in workspace A: {error}"
-        ),
+        Err(error) => {
+            return Err(format!(
+                "workspace B admission must survive a same-id suspension in workspace A: {error}"
+            ));
+        }
     }
+    Ok(())
 }
 
 /// F09/M6: deleting a workspace conversation must retire the workspace-owned

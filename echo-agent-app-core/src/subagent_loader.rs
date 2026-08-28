@@ -582,20 +582,23 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    type TestResult = Result<(), String>;
+
     #[test]
-    fn parse_minimal_md_with_fallback_name() {
+    fn parse_minimal_md_with_fallback_name() -> TestResult {
         let md = "---\ndescription: \"a subagent\"\n---\nDo the thing.";
-        let def = parse_subagent_md(md, Some("subagent1")).unwrap();
+        let def = parse_subagent_md(md, Some("subagent1"))?;
         assert_eq!(def.name, "subagent1");
         assert_eq!(def.description, "a subagent");
         assert_eq!(def.system_prompt, "Do the thing.");
         assert!(!def.readonly);
+        Ok(())
     }
 
     #[test]
-    fn parse_full_frontmatter() {
+    fn parse_full_frontmatter() -> TestResult {
         let md = "---\nname: explorer\ndescription: \"探索\"\nreadonly: true\ntags: [\"custom\"]\n---\n你是 explorer。";
-        let def = parse_subagent_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None)?;
         assert_eq!(def.name, "explorer");
         assert_eq!(def.description, "探索");
         assert!(def.readonly);
@@ -604,48 +607,50 @@ mod tests {
         assert!(def.tags.contains(&"readonly".to_string()));
         assert!(def.tags.contains(&"parallel".to_string()));
         assert_eq!(def.system_prompt, "你是 explorer。");
+        Ok(())
     }
 
     #[test]
-    fn parse_model_max_turns_is_background() {
+    fn parse_model_max_turns_is_background() -> TestResult {
         let md = "---\nname: explorer\ndescription: \"x\"\nreadonly: true\nmodel: fast\nmax_turns: 30\nis_background: true\n---\nbody";
-        let def = parse_subagent_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None)?;
         assert_eq!(def.model.as_deref(), Some("fast"));
         assert_eq!(def.max_turns, Some(30));
         assert!(def.is_background);
+        Ok(())
     }
 
     #[test]
-    fn parse_timeout_secs_and_thinking() {
+    fn parse_timeout_secs_and_thinking() -> TestResult {
         // Per-subagent thinking/timeout frontmatter: explicit values pass
         // through as specs (parsed by infra at registration); empty/whitespace
         // thinking normalizes to None (inherit parent generation).
         let md = "---\nname: awaiter\ndescription: \"x\"\nreadonly: true\nmodel: fast\nmax_turns: 64\ntimeout_secs: 90000\nthinking: low\nis_background: true\n---\nbody";
-        let def = parse_subagent_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None)?;
         assert_eq!(def.timeout_secs, Some(90000));
         assert_eq!(def.thinking.as_deref(), Some("low"));
 
-        let unset = parse_subagent_md("---\nname: w\ndescription: \"d\"\n---\nbody", None).unwrap();
+        let unset = parse_subagent_md("---\nname: w\ndescription: \"d\"\n---\nbody", None)?;
         assert_eq!(unset.timeout_secs, None);
         assert_eq!(unset.thinking, None);
 
         let blank = parse_subagent_md(
             "---\nname: w\ndescription: \"d\"\nthinking: \"  \"\n---\nbody",
             None,
-        )
-        .unwrap();
+        )?;
         assert_eq!(blank.thinking, None, "whitespace-only thinking → None");
+        Ok(())
     }
 
     #[test]
-    fn builtin_awaiter_frontmatter_declares_waiting_role() {
+    fn builtin_awaiter_frontmatter_declares_waiting_role() -> TestResult {
         // The builtin awaiter role must parse with the per-subagent
         // thinking/timeout/model/background wiring the infra path expects.
         let defs = discover_subagents(None, None);
         let awaiter = defs
             .iter()
             .find(|d| d.name == "awaiter")
-            .expect("builtin awaiter.md must load");
+            .ok_or_else(|| "builtin awaiter.md must load".to_string())?;
         assert!(awaiter.readonly);
         assert!(awaiter.is_background);
         assert_eq!(awaiter.model.as_deref(), Some("fast"));
@@ -654,6 +659,7 @@ mod tests {
         assert_eq!(awaiter.thinking.as_deref(), Some("low"));
         assert!(awaiter.tags.contains(&"readonly".to_string()));
         assert!(awaiter.tags.contains(&"background".to_string()));
+        Ok(())
     }
 
     #[test]
@@ -667,10 +673,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_missing_name_without_fallback_errors() {
+    fn parse_missing_name_without_fallback_errors() -> TestResult {
         let md = "---\ndescription: \"x\"\n---\nbody";
-        let err = parse_subagent_md(md, None).unwrap_err();
+        let err = parse_subagent_md(md, None)
+            .err()
+            .ok_or_else(|| "expected missing-name parse error".to_string())?;
         assert!(err.contains("name"));
+        Ok(())
     }
 
     #[test]
@@ -686,36 +695,39 @@ mod tests {
     }
 
     #[test]
-    fn parse_worktree_flag_for_writer_only() {
+    fn parse_worktree_flag_for_writer_only() -> TestResult {
         // Sprint 8: `worktree: true` sets isolate_worktree on a writer.
         let md = "---\nname: refactorer\ndescription: \"writes code\"\nreadonly: false\nworktree: true\n---\nYou refactor code.";
-        let def = parse_subagent_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None)?;
         assert!(!def.readonly);
         assert!(def.isolate_worktree, "writer with worktree:true → isolate");
+        Ok(())
     }
 
     #[test]
-    fn parse_worktree_flag_ignored_for_readonly() {
+    fn parse_worktree_flag_ignored_for_readonly() -> TestResult {
         // Sprint 8: a readonly subagent declaring worktree:true is ignored —
         // readonly subagents don't mutate files, so isolation is meaningless.
         let md = "---\nname: explorer\ndescription: \"reads\"\nreadonly: true\nworktree: true\n---\nYou explore.";
-        let def = parse_subagent_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None)?;
         assert!(def.readonly);
         assert!(
             !def.isolate_worktree,
             "readonly subagent must not request worktree isolation"
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_worktree_defaults_false() {
+    fn parse_worktree_defaults_false() -> TestResult {
         let md = "---\nname: w\ndescription: \"d\"\nreadonly: false\n---\nbody";
-        let def = parse_subagent_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None)?;
         assert!(!def.isolate_worktree);
+        Ok(())
     }
 
     #[test]
-    fn builtin_defaults_parse_cleanly() {
+    fn builtin_defaults_parse_cleanly() -> TestResult {
         // The compiled-in defaults must all parse without error — guards
         // against a corrupt source .md slipping through. Sprint 9 added a
         // writer subagent (implementer); Sprint 10 added data subagents
@@ -741,11 +753,17 @@ mod tests {
             assert!(!d.system_prompt.is_empty());
             assert!(!d.description.is_empty());
         }
-        let explorer = defs.iter().find(|d| d.name == "explorer").unwrap();
+        let explorer = defs
+            .iter()
+            .find(|d| d.name == "explorer")
+            .ok_or_else(|| "builtin explorer must load".to_string())?;
         assert_eq!(explorer.model.as_deref(), Some("fast"));
         // The 4 readonly roles are readonly + carry the readonly tag.
         for name in ["explorer", "reviewer", "planner", "summarizer"] {
-            let d = defs.iter().find(|d| d.name == name).unwrap();
+            let d = defs
+                .iter()
+                .find(|d| d.name == name)
+                .ok_or_else(|| format!("builtin {name} must load"))?;
             assert!(d.readonly, "{name} should be readonly");
             assert!(d.tags.contains(&"readonly".to_string()));
             assert!(!d.isolate_worktree, "{name} must not request worktree");
@@ -758,18 +776,24 @@ mod tests {
             .iter()
             .find(|(name, _)| *name == "implementer")
             .map(|(_, content)| *content)
-            .expect("builtin implementer.md");
+            .ok_or_else(|| "builtin implementer.md".to_string())?;
         assert!(
             implementer_md.contains("worktree: true"),
             "builtin implementer.md must declare worktree: true"
         );
-        let implementer = defs.iter().find(|d| d.name == "implementer").unwrap();
+        let implementer = defs
+            .iter()
+            .find(|d| d.name == "implementer")
+            .ok_or_else(|| "builtin implementer must load".to_string())?;
         assert!(!implementer.readonly);
         assert!(
             implementer.isolate_worktree,
             "implementer must request worktree isolation (worktree:true && !readonly)"
         );
-        let gp = defs.iter().find(|d| d.name == "general-purpose").unwrap();
+        let gp = defs
+            .iter()
+            .find(|d| d.name == "general-purpose")
+            .ok_or_else(|| "builtin general-purpose must load".to_string())?;
         assert!(!gp.readonly);
         assert!(
             !gp.isolate_worktree,
@@ -777,7 +801,10 @@ mod tests {
         );
         // Sprint 10: data subagents request a per-subagent workspace (tmpdir).
         for name in ["data-shaper", "analyst"] {
-            let d = defs.iter().find(|d| d.name == name).unwrap();
+            let d = defs
+                .iter()
+                .find(|d| d.name == name)
+                .ok_or_else(|| format!("builtin {name} must load"))?;
             assert!(
                 d.isolate_workspace,
                 "{name} must request a data workspace (workspace:true)"
@@ -785,33 +812,36 @@ mod tests {
             // Worktree NOT requested (mutually exclusive; worktree is for writers).
             assert!(!d.isolate_worktree, "{name} must not request worktree");
         }
+        Ok(())
     }
 
     #[test]
-    fn parse_workspace_flag() {
+    fn parse_workspace_flag() -> TestResult {
         // Sprint 10: `workspace: true` sets isolate_workspace.
         let md = "---\nname: data-shaper\ndescription: \"d\"\nworkspace: true\n---\nbody";
-        let def = parse_subagent_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None)?;
         assert!(def.isolate_workspace);
         assert!(!def.isolate_worktree);
+        Ok(())
     }
 
     #[test]
-    fn parse_workspace_cleared_when_worktree_active() {
+    fn parse_workspace_cleared_when_worktree_active() -> TestResult {
         // Sprint 10: if BOTH worktree and workspace are set, worktree wins and
         // workspace is cleared (mutually exclusive — worktree also provides
         // disjoint FS, avoid double-isolation).
         let md = "---\nname: w\ndescription: \"d\"\nreadonly: false\nworktree: true\nworkspace: true\n---\nbody";
-        let def = parse_subagent_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None)?;
         assert!(def.isolate_worktree);
         assert!(
             !def.isolate_workspace,
             "workspace must be cleared when worktree is active"
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_team_frontmatter_builds_team_spec() {
+    fn parse_team_frontmatter_builds_team_spec() -> TestResult {
         // Sprint 11: team_strategy + team_manager + team_subagents → TeamSpec.
         let md = "---\n\
 name: team-research\n\
@@ -820,8 +850,10 @@ team_strategy: manager-subagent\n\
 team_manager: planner\n\
 team_subagents: [\"explorer\", \"summarizer\"]\n\
 ---\nbody";
-        let def = parse_subagent_md(md, None).unwrap();
-        let spec = def.team.expect("team spec should be built");
+        let def = parse_subagent_md(md, None)?;
+        let spec = def
+            .team
+            .ok_or_else(|| "team spec should be built".to_string())?;
         assert_eq!(spec.manager, "planner");
         assert_eq!(
             spec.subagents,
@@ -831,113 +863,138 @@ team_subagents: [\"explorer\", \"summarizer\"]\n\
             spec.strategy,
             echo_agent::agent::subagent::TeamStrategy::ManagerSubagent
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_team_frontmatter_rejects_missing_manager() {
+    fn parse_team_frontmatter_rejects_missing_manager() -> TestResult {
         let md = "---\nname: t\ndescription: \"d\"\nteam_strategy: manager-subagent\nteam_subagents: [\"w\"]\n---\nbody";
-        let err = parse_subagent_md(md, None).unwrap_err();
+        let err = parse_subagent_md(md, None)
+            .err()
+            .ok_or_else(|| "expected missing-manager parse error".to_string())?;
         assert!(err.contains("team_manager missing"), "got: {err}");
+        Ok(())
     }
 
     #[test]
-    fn parse_team_frontmatter_rejects_empty_subagents() {
+    fn parse_team_frontmatter_rejects_empty_subagents() -> TestResult {
         let md = "---\nname: t\ndescription: \"d\"\nteam_strategy: manager-subagent\nteam_manager: m\n---\nbody";
-        let err = parse_subagent_md(md, None).unwrap_err();
+        let err = parse_subagent_md(md, None)
+            .err()
+            .ok_or_else(|| "expected empty-subagents parse error".to_string())?;
         assert!(err.contains("team_subagents empty"), "got: {err}");
+        Ok(())
     }
 
     #[test]
-    fn parse_team_frontmatter_rejects_unsupported_strategy() {
+    fn parse_team_frontmatter_rejects_unsupported_strategy() -> TestResult {
         let md = "---\nname: t\ndescription: \"d\"\nteam_strategy: swarm\nteam_manager: m\nteam_subagents: [\"w\"]\n---\nbody";
-        let err = parse_subagent_md(md, None).unwrap_err();
+        let err = parse_subagent_md(md, None)
+            .err()
+            .ok_or_else(|| "expected unsupported-strategy parse error".to_string())?;
         assert!(err.contains("only 'manager-subagent'"), "got: {err}");
+        Ok(())
     }
 
     #[test]
-    fn parse_team_frontmatter_absent_yields_no_team() {
+    fn parse_team_frontmatter_absent_yields_no_team() -> TestResult {
         // Normal subagent without team_strategy → team is None.
         let md = "---\nname: w\ndescription: \"d\"\nreadonly: true\n---\nbody";
-        let def = parse_subagent_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None)?;
         assert!(def.team.is_none());
+        Ok(())
     }
 
     #[test]
-    fn parse_can_delegate_defaults_false() {
+    fn parse_can_delegate_defaults_false() -> TestResult {
         let md = "---\nname: w\ndescription: \"d\"\nreadonly: true\n---\nbody";
-        let def = parse_subagent_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None)?;
         assert!(!def.can_delegate);
+        Ok(())
     }
 
     #[test]
-    fn parse_can_delegate_frontmatter() {
+    fn parse_can_delegate_frontmatter() -> TestResult {
         let md = "---\nname: manager\ndescription: \"d\"\ncan_delegate: true\n---\nbody";
-        let def = parse_subagent_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None)?;
         assert!(def.can_delegate);
+        Ok(())
     }
 
     #[test]
-    fn project_scope_overrides_builtin() {
+    fn project_scope_overrides_builtin() -> TestResult {
         // A project-scoped .md with the same name as a builtin overrides it.
-        let dir = tempdir().unwrap();
+        let dir = tempdir().map_err(|e| e.to_string())?;
         let sub = dir.path().join(".eko").join("subagents");
-        fs::create_dir_all(&sub).unwrap();
+        fs::create_dir_all(&sub).map_err(|e| e.to_string())?;
         fs::write(
             sub.join("explorer.md"),
             "---\nname: explorer\ndescription: \"override\"\nreadonly: true\n---\nOVERRIDDEN PROMPT",
         )
-        .unwrap();
+        .map_err(|e| e.to_string())?;
 
         let defs = discover_subagents(Some(dir.path()), None);
-        let explorer = defs.iter().find(|d| d.name == "explorer").unwrap();
+        let explorer = defs
+            .iter()
+            .find(|d| d.name == "explorer")
+            .ok_or_else(|| "project explorer must load".to_string())?;
         assert_eq!(explorer.description, "override");
         assert_eq!(explorer.system_prompt, "OVERRIDDEN PROMPT");
         // Other builtins still present.
         assert!(defs.iter().any(|d| d.name == "reviewer"));
+        Ok(())
     }
 
     #[test]
-    fn user_scope_adds_new_subagent() {
-        let home = tempdir().unwrap();
+    fn user_scope_adds_new_subagent() -> TestResult {
+        let home = tempdir().map_err(|e| e.to_string())?;
         let sub = home.path().join(".eko").join("subagents");
-        fs::create_dir_all(&sub).unwrap();
+        fs::create_dir_all(&sub).map_err(|e| e.to_string())?;
         fs::write(
             sub.join("custom-subagent.md"),
             "---\nname: custom-subagent\ndescription: \"extra\"\nreadonly: false\n---\nCustom body",
         )
-        .unwrap();
+        .map_err(|e| e.to_string())?;
 
         let defs = discover_subagents(None, Some(home.path()));
-        let custom = defs.iter().find(|d| d.name == "custom-subagent").unwrap();
+        let custom = defs
+            .iter()
+            .find(|d| d.name == "custom-subagent")
+            .ok_or_else(|| "custom subagent must load".to_string())?;
         assert_eq!(custom.system_prompt, "Custom body");
         assert!(!custom.readonly);
         // Builtins still there.
         assert_eq!(defs.iter().filter(|d| d.name == "explorer").count(), 1);
+        Ok(())
     }
 
     #[test]
-    fn project_scope_beats_user_scope() {
-        let home = tempdir().unwrap();
+    fn project_scope_beats_user_scope() -> TestResult {
+        let home = tempdir().map_err(|e| e.to_string())?;
         let home_sub = home.path().join(".eko").join("subagents");
-        fs::create_dir_all(&home_sub).unwrap();
+        fs::create_dir_all(&home_sub).map_err(|e| e.to_string())?;
         fs::write(
             home_sub.join("explorer.md"),
             "---\nname: explorer\ndescription: \"user\"\nreadonly: true\n---\nUSER",
         )
-        .unwrap();
+        .map_err(|e| e.to_string())?;
 
-        let proj = tempdir().unwrap();
+        let proj = tempdir().map_err(|e| e.to_string())?;
         let proj_sub = proj.path().join(".eko").join("subagents");
-        fs::create_dir_all(&proj_sub).unwrap();
+        fs::create_dir_all(&proj_sub).map_err(|e| e.to_string())?;
         fs::write(
             proj_sub.join("explorer.md"),
             "---\nname: explorer\ndescription: \"project\"\nreadonly: true\n---\nPROJECT",
         )
-        .unwrap();
+        .map_err(|e| e.to_string())?;
 
         let defs = discover_subagents(Some(proj.path()), Some(home.path()));
-        let explorer = defs.iter().find(|d| d.name == "explorer").unwrap();
+        let explorer = defs
+            .iter()
+            .find(|d| d.name == "explorer")
+            .ok_or_else(|| "project explorer must load".to_string())?;
         assert_eq!(explorer.system_prompt, "PROJECT");
+        Ok(())
     }
 
     #[test]
