@@ -404,8 +404,8 @@ workspace_id
 conversation_id
 text
 attachment refs            # 已按 exact workspace staged
-interaction_mode
 submitted_at
+payload_sha256              # text + attachments canonical digest
 position/revision
 ```
 

@@ -504,14 +504,16 @@ mod tests {
 
     #[test]
     fn test_parse_hunk_header() -> anyhow::Result<()> {
-        let h = parse_hunk_header("@@ -10,5 +20,7 @@")?;
+        let h = parse_hunk_header("@@ -10,5 +20,7 @@")
+            .ok_or_else(|| anyhow::anyhow!("valid hunk header did not parse"))?;
         assert_eq!(h, (10, 5, 20, 7));
         Ok(())
     }
 
     #[test]
     fn test_parse_hunk_header_single_line() -> anyhow::Result<()> {
-        let h = parse_hunk_header("@@ -1 +1 @@")?;
+        let h = parse_hunk_header("@@ -1 +1 @@")
+            .ok_or_else(|| anyhow::anyhow!("valid single-line hunk header did not parse"))?;
         assert_eq!(h, (1, 1, 1, 1));
         Ok(())
     }

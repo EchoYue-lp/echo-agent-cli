@@ -3555,6 +3555,7 @@ mod tests {
             crate::tasks::task_runtime::store::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let turn_id = "stream-agent-events-contract-turn";
         let res = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
             workspace_io_receipt: None,
@@ -3563,7 +3564,7 @@ mod tests {
             sink,
             webhook_emitter: None,
             conv_id: Some("c1".to_string()),
-            root_message_id: "m1".to_string(),
+            root_message_id: turn_id.to_string(),
             attachments: vec![],
             cancel,
             review_integration: None,
@@ -3580,12 +3581,12 @@ mod tests {
             chat_sink.event_count()
         );
         assert!(
-            chat_sink.has_valid_contract("c1", "m1"),
+            chat_sink.has_valid_contract("c1", turn_id),
             "drive_chat should preserve version, identity, sequence, and exactly one terminal"
         );
         assert!(
             store
-                .get_run(&crate::tasks::task_runtime::task_tools::formal_run_id_for_turn("m1"))
+                .get_run(&crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(turn_id),)
                 .map_err(|error| error.to_string())?
                 .is_none(),
             "ordinary chat must not create a TaskRun"
@@ -3883,6 +3884,7 @@ mod tests {
             crate::tasks::task_runtime::store::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let turn_id = "raw-user-text-contract-turn";
         let res = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
             workspace_io_receipt: None,
@@ -3891,7 +3893,7 @@ mod tests {
             sink,
             webhook_emitter: None,
             conv_id: None,
-            root_message_id: "m1".to_string(),
+            root_message_id: turn_id.to_string(),
             attachments: vec![],
             cancel,
             review_integration: None,
@@ -3923,7 +3925,7 @@ mod tests {
         if !contract.contains("Instruction author: user") {
             return Err(format!("turn contract is incomplete: {contract}"));
         }
-        if crate::turn_context::turn_prompt_context_registry().contains("m1") {
+        if crate::turn_context::turn_prompt_context_registry().contains(turn_id) {
             return Err("turn contract registration leaked after the turn".to_string());
         }
         Ok(())

@@ -13944,6 +13944,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "final 10k/100k scale gate; run explicitly after the refactor"]
     fn production_todo_artifact_review_summary_completion_queries_are_bounded_at_10k_and_100k()
     -> Result<(), String> {
         let (_ten_temp, ten_store, ten_run) = seed_public_query_fixture(10_000)?;
@@ -14158,6 +14159,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "final 2k/10k scale characterization; run explicitly after the refactor"]
     fn artifact_and_per_task_review_history_characterization_at_2k_and_10k() -> Result<(), String> {
         let (small_temp, small_store, small_run, _, _) = seed_history_scale_fixture(2_000)?;
         let (large_temp, large_store, large_run, _, _) = seed_history_scale_fixture(10_000)?;

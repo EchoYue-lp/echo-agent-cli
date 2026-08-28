@@ -4100,30 +4100,11 @@ impl AppState {
                     state = receipt.wait_for_drained() => state,
                 };
                 if !drained.was_drained() {
-                    let outcome = match drained {
-                        echo_agent::agent::AgentSteerState::TurnSettled { outcome, .. } => {
-                            match outcome {
-                                echo_agent::agent::AgentSteerTurnOutcome::Completed => {
-                                    crate::agent_router::AgentDeliveryOutcome::Completed
-                                }
-                                echo_agent::agent::AgentSteerTurnOutcome::Cancelled => {
-                                    crate::agent_router::AgentDeliveryOutcome::Cancelled
-                                }
-                                echo_agent::agent::AgentSteerTurnOutcome::Failed => {
-                                    crate::agent_router::AgentDeliveryOutcome::Failed
-                                }
-                                echo_agent::agent::AgentSteerTurnOutcome::Dropped => {
-                                    crate::agent_router::AgentDeliveryOutcome::Dropped
-                                }
-                            }
-                        }
-                        _ => crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
-                    };
                     self.agent_router
                         .turn_settled(
                             &claim,
                             Some(turn_id.clone()),
-                            outcome,
+                            crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
                             false,
                             agent_delivery_unknown_reason(
                                 "live Agent delivery mailbox did not confirm consumption before the target turn settled",

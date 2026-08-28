@@ -469,9 +469,21 @@ async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> a
                 break;
             }
             if record.phase == crate::agent_router::AgentDeliveryPhase::TurnSettled {
-                anyhow::bail!(
-                    "live steer reached a terminal before the test observed framework drain; record={record:?}"
+                assert!(
+                    !record.drained
+                        && record.outcome
+                            == Some(crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown)
+                        && record.turn_id.as_deref() == Some("active-target-turn")
+                        && record.reason.as_deref().is_some_and(|reason| {
+                            reason.contains("outcome unknown")
+                                && reason.contains("did not confirm consumption")
+                        })
+                        && record.next_attempt_at.is_none(),
+                    "terminal-before-drain must remain an explicit non-replayable unknown delivery; record={record:?}"
                 );
+                let _ = active_task.await?;
+                state.shutdown_agent_deliveries().await?;
+                return Ok(());
             }
         }
         if active_task.is_finished() {

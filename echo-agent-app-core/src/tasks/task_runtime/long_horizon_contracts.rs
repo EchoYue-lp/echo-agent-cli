@@ -460,7 +460,7 @@ fn task_runtime_async_boundaries_keep_file_io_behind_the_bounded_adapter() -> Re
         (APP_CHANNELS, "load channel TaskRun"),
         (APP_CHANNELS, "update channel TaskRun Goal"),
         (APP_CHAT_DRIVER, "observe chat execution path"),
-        (APP_CHAT_DRIVER, "resolve previous continuation driver"),
+        (APP_CHAT_DRIVER, "wait_for_previous_continuation_driver"),
         (APP_CHAT_DRIVER, "project EKO turn TaskRuntime event"),
         (APP_SUBAGENT_CONTROL, "deliver live Subagent guidance"),
         (APP_SUBAGENT_CONTROL, "interrupt exact Subagent attempt"),

@@ -55,15 +55,11 @@ Last updated: 2026-08-28
   F2 ADR 保留 0015，Agent control ADR 为 0016，Rust 真理源已生成唯一 DTO snapshot。F4
   已在该 clean local baseline 上完成旧 mode surface/DTO/prompt 分支删除；F2 paused-row affordance、F3 schema/truncated/interrupt metadata
   与底层 full-vector query 仍按各 ADR 标记为后续 Minor/R1/P0 residual。
-- 本 checkpoint 采用大重构期间的 focused validation：Task projection/order、Agent control schema、
-  generated DTO、fmt、相关 Rust/TypeScript tests 必须通过。framework
-  `cargo test --workspace --all-targets --all-features --locked`、CLI
-  `cargo test --workspace --all-features --locked`、完整 GUI/frontend aggregate matrix，以及
-  10k/100k、长时 soak 和 Final Gate 经用户批准统一延期到整个重构完成后执行；这些命令当前
-  状态是 deferred，不是 passed。延期原因是 F4 之后工具/surface 合同仍会变化，且重复全量 Rust
-  构建曾将独立 integration target 推到 20-29 GiB 并耗尽系统盘。一次 framework
-  `--all-targets` 尝试曾误执行 10k/100k benchmark 并输出结果，整个命令随后以 exit 130
-  中断；这是执行范围偏差，结果不计作验收证据。
+- F5 characterization 已压缩为单一提交，runtime-state 与 H1/H2/H3 测试卫生提交保留可追溯
+  历史，原始 260 个测试 panic lint 命中已清零。framework 与 CLI 的 fmt、两套 clippy、
+  workspace tests、no-default、GUI 和 frontend 门禁均在主分支合流后真实 exit 0；generated DTO
+  由 Rust 真理源生成并纳入标准 Prettier 检查。默认 workspace test 不再执行 2k/10k 或
+  10k/100k scale case；这些性能门、长时 soak 和 Final Gate 仍按计划延期，未伪装为已完成。
 - Public framework boundary：EKO 配置已由 app-core `EkoConfig` 独立拥有，permission mode 在
   app state/pool/framework 间全程 typed 且 DTO 八变体无损 round-trip；CLI/app-core 直接
   `echo_core` 依赖与源码引用均为 0。产品 data root、Theme/Monitor/OutputStyle、coding
@@ -146,9 +142,9 @@ TUI、CLI、channel 与 frontend 门禁按精确 child pair 执行；GitHub work
 
 ## 下一步
 
-F4 mode surface 收敛已在当前 integration worktree 完成，且未夹带 F5/F6、release、push、
-gitlink 或 Final Gate。下一阶段仍是 F4 之后的 lifecycle/persistence 收口；完整 workspace/GUI/frontend、
-10k/100k 与长时 soak 继续延期到整个重构完成后的统一验证阶段。
+F2-F5、测试卫生与 plan_03 完整验证已经收口到本地主分支；未执行 push、release、长时 soak
+或 Final Gate。下一阶段进入 F6/R1 与剩余 lifecycle/persistence 收口；10k/100k 和长时 soak
+继续延期到整个重构完成后的统一验证阶段。
 
 TaskRuntime async surface 已统一复用进程共享的 bounded `TaskRuntimeBlockingAdapter`，并以
 ts-rs typed receipts 替代 GUI mutation 的 `serde_json::Value`/numeric interaction mode。
