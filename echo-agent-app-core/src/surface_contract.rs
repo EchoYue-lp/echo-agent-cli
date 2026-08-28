@@ -4,6 +4,7 @@ use chrono::Utc;
 use echo_agent::agent::{AgentEvent, EventEnvelope, EventIdentity};
 
 use crate::chat_driver::ChatDriverEvent;
+use crate::chat_event_log::{ChatEventLog, ChatEventRetention};
 use crate::tasks::task_runtime::executor::ExecEvent;
 use crate::tasks::task_runtime::{RuntimeEventKind, RuntimeTaskEvent};
 
@@ -243,6 +244,64 @@ fn capability_matrix_has_evidence_for_every_surface() {
         assert_eq!(row.evidence.len(), ProductSurface::ALL.len());
         assert!(row.evidence.iter().all(|value| !value.trim().is_empty()));
     }
+}
+
+#[test]
+fn interactive_surfaces_replay_one_canonical_fixture_without_terminal_inference()
+-> Result<(), String> {
+    const INTERACTIVE_SURFACES: [&str; 5] = ["gui", "tui", "cli", "jsonl", "channel"];
+    let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let log_root = root.path().join("chat-events");
+    let log = ChatEventLog::open(&log_root, ChatEventRetention::default())
+        .map_err(|error| error.to_string())?;
+    for status in ["running", "completed"] {
+        log.append(
+            "global",
+            Some("surface-fixture"),
+            "turn-fixture",
+            ChatDriverEvent::TurnStatus {
+                status: status.to_string(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    drop(log);
+
+    let reopened = ChatEventLog::open(log_root, ChatEventRetention::default())
+        .map_err(|error| error.to_string())?;
+    let replay = reopened
+        .replay("global", Some("surface-fixture"), "turn-fixture", 0)
+        .map_err(|error| error.to_string())?;
+    assert!(!replay.truncated);
+    assert_eq!(replay.latest_cursor, 2);
+
+    let canonical = replay
+        .events
+        .iter()
+        .map(|envelope| {
+            let ChatDriverEvent::TurnStatus { status } = &envelope.payload else {
+                return Err("surface fixture contained a non-status event".to_string());
+            };
+            Ok((envelope.sequence, status.clone()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for surface in INTERACTIVE_SURFACES {
+        let consumed = canonical.clone();
+        assert_eq!(
+            consumed,
+            vec![(1, "running".to_string()), (2, "completed".to_string())],
+            "{surface} diverged from the canonical fixture"
+        );
+        assert_eq!(
+            consumed
+                .iter()
+                .filter(|(_, status)| status == "completed")
+                .count(),
+            1,
+            "{surface} inferred or duplicated a terminal"
+        );
+    }
+    Ok(())
 }
 
 #[test]

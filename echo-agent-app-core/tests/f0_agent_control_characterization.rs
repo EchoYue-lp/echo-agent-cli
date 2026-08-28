@@ -227,8 +227,9 @@ fn cold_start_and_active_message_boundaries_are_currently_observable() {
 
     assert!(SUBAGENT_CONTROL.contains("RuntimeEventKind::SubagentGuidanceQueued"));
     assert!(SUBAGENT_CONTROL.contains("framework_turn_id"));
-    // The typed phase/outcome receipt is the current boundary; cursor wait and
-    // model follow-up commands remain later convergence iterations.
+    // The low-level exact-attempt owner deliberately has no cursor/wait API.
+    // F6 cursor wait belongs to the AgentControlService adapter over the
+    // TaskRuntime journal, so adding it here would create a second authority.
     assert!(!SUBAGENT_CONTROL.contains("cursor"));
     assert!(!SUBAGENT_CONTROL.contains("pub async fn wait"));
     assert!(!SUBAGENT_CONTROL.contains("pub async fn followup"));

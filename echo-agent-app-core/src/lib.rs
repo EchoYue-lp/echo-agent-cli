@@ -25,6 +25,8 @@ pub mod evolution;
 pub mod export;
 pub mod extension_commands;
 pub mod extension_control;
+#[cfg(test)]
+mod f6_contracts;
 pub mod foreground_turn;
 pub mod hitl;
 pub mod hook_config_loader;
