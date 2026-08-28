@@ -14,7 +14,9 @@
 
 use echo_agent::agent::{Agent, AgentEvent, AgentHandle, EventEnvelope, EventIdentity};
 use echo_agent::prelude::Message;
-use echo_agent::runtime::{AgentTurnDriver, EventSink, SinkControl, TurnMode, TurnRequest};
+use echo_agent::runtime::{
+    AgentTurnDriver, EventSink, SinkControl, TurnMode, TurnReceipt, TurnRequest,
+};
 use echo_agent::tools::TraceSinkFn;
 use futures::future::BoxFuture;
 
@@ -215,13 +217,6 @@ pub fn framework_trace_sink_for(sink: &std::sync::Arc<dyn ChatSink>) -> TraceSin
 struct WebhookTurnObserver {
     emitter: Option<std::sync::Arc<crate::webhook::WebhookEmitter>>,
     model: String,
-    started: std::time::Instant,
-    input_tokens: usize,
-    output_tokens: usize,
-    completed: bool,
-    compaction_count: u32,
-    final_answer: Option<String>,
-    final_message_id: Option<String>,
     tools: std::collections::HashMap<String, (String, String, std::time::Instant)>,
 }
 
@@ -230,39 +225,12 @@ impl WebhookTurnObserver {
         Self {
             emitter,
             model,
-            started: std::time::Instant::now(),
-            input_tokens: 0,
-            output_tokens: 0,
-            completed: false,
-            compaction_count: 0,
-            final_answer: None,
-            final_message_id: None,
             tools: std::collections::HashMap::new(),
         }
     }
 
     fn observe(&mut self, event: &EventEnvelope) {
         let payload = &event.payload;
-        match payload {
-            AgentEvent::LlmUsage {
-                prompt_tokens,
-                completion_tokens,
-                usage_reported: true,
-                ..
-            } => {
-                self.input_tokens = self.input_tokens.saturating_add(*prompt_tokens);
-                self.output_tokens = self.output_tokens.saturating_add(*completion_tokens);
-            }
-            AgentEvent::ContextCompressed { .. } => {
-                self.compaction_count = self.compaction_count.saturating_add(1);
-            }
-            AgentEvent::FinalAnswer(answer) => {
-                self.completed = true;
-                self.final_answer = Some(answer.chars().take(4_000).collect());
-                self.final_message_id = event.message_id.as_ref().map(ToString::to_string);
-            }
-            _ => {}
-        }
         let Some(emitter) = self.emitter.as_ref() else {
             return;
         };
@@ -322,32 +290,34 @@ impl WebhookTurnObserver {
         }
     }
 
-    fn finish(self, turn_id: String, terminal: TurnOutcome) -> ChatTurnOutcome {
-        let elapsed = self.started.elapsed();
-        if self.should_emit_chat_completed(&terminal)
+    fn finish(self, receipt: &TurnReceipt, terminal: TurnOutcome) -> ChatTurnOutcome {
+        if self.should_emit_chat_completed(receipt, &terminal)
             && let Some(emitter) = self.emitter
         {
             emitter.emit(crate::webhook::WebhookEvent::ChatCompleted {
                 model: self.model,
-                input_tokens: self.input_tokens,
-                output_tokens: self.output_tokens,
-                elapsed_ms: duration_millis(elapsed),
+                input_tokens: usize::try_from(receipt.prompt_tokens).unwrap_or(usize::MAX),
+                output_tokens: usize::try_from(receipt.completion_tokens).unwrap_or(usize::MAX),
+                elapsed_ms: duration_millis(receipt.elapsed),
             });
         }
         ChatTurnOutcome {
-            turn_id,
+            turn_id: receipt.turn_id.to_string(),
             terminal,
-            input_tokens: u64::try_from(self.input_tokens).unwrap_or(u64::MAX),
-            output_tokens: u64::try_from(self.output_tokens).unwrap_or(u64::MAX),
-            compaction_count: self.compaction_count,
-            elapsed_seconds: duration_seconds_rounded_up(elapsed),
-            final_answer: self.final_answer,
-            final_message_id: self.final_message_id,
+            input_tokens: receipt.prompt_tokens,
+            output_tokens: receipt.completion_tokens,
+            compaction_count: u32::try_from(receipt.compaction_count).unwrap_or(u32::MAX),
+            elapsed_seconds: duration_seconds_rounded_up(receipt.elapsed),
+            final_answer: receipt
+                .final_answer
+                .as_deref()
+                .map(|answer| answer.chars().take(4_000).collect()),
+            final_message_id: receipt.final_message_id.as_ref().map(ToString::to_string),
         }
     }
 
-    fn should_emit_chat_completed(&self, terminal: &TurnOutcome) -> bool {
-        self.completed && matches!(terminal, TurnOutcome::Completed)
+    fn should_emit_chat_completed(&self, receipt: &TurnReceipt, terminal: &TurnOutcome) -> bool {
+        receipt.final_answer.is_some() && matches!(terminal, TurnOutcome::Completed)
     }
 }
 
@@ -1317,7 +1287,7 @@ impl EkoTurnEventSink {
 
     fn finish(
         &self,
-        turn_id: String,
+        receipt: TurnReceipt,
         framework_terminal: TurnOutcome,
     ) -> Result<ChatTurnOutcome, String> {
         let mut state = self
@@ -1333,7 +1303,7 @@ impl EkoTurnEventSink {
             .webhook_observer
             .take()
             .ok_or_else(|| "EKO turn sink was finalized more than once".to_string())?;
-        Ok(observer.finish(turn_id, terminal))
+        Ok(observer.finish(&receipt, terminal))
     }
 
     fn record_projector_failure(
@@ -1638,8 +1608,8 @@ async fn drive_chat_inner(
             )
         };
         let effective_terminal =
-            effective_terminal_after_input_observer(receipt.outcome, observer_result);
-        eko_sink.finish(turn_id, effective_terminal)
+            effective_terminal_after_input_observer(receipt.outcome.clone(), observer_result);
+        eko_sink.finish(receipt, effective_terminal)
     })
     .await
 }
@@ -1686,6 +1656,23 @@ mod tests {
             resources: vec![],
             authorship: crate::prepared_turn::InstructionAuthorship::User,
         }
+    }
+
+    fn test_turn_receipt(turn_id: &str, outcome: TurnOutcome) -> Result<TurnReceipt, String> {
+        let identity = EventIdentity::new(format!("test-stream-{turn_id}"), turn_id)
+            .map_err(|error| error.to_string())?;
+        Ok(TurnReceipt {
+            turn_id: identity.turn_id,
+            outcome,
+            final_answer: None,
+            final_message_id: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            llm_calls: 0,
+            compaction_count: 0,
+            last_event_sequence: 0,
+            elapsed: std::time::Duration::ZERO,
+        })
     }
 
     async fn drive_successful_model_with_observer(
@@ -2186,7 +2173,21 @@ mod tests {
             );
         }
 
-        let outcome = adapter.finish("receipt-turn".to_string(), TurnOutcome::Completed)?;
+        let mut receipt = test_turn_receipt("receipt-turn", TurnOutcome::Completed)?;
+        receipt.final_answer = Some("finished".to_string());
+        receipt.final_message_id = EventIdentity::for_chat(
+            Some("receipt-conversation".to_string()),
+            "receipt-turn",
+            "receipt-turn",
+            Some("receipt-run".to_string()),
+        )
+        .map_err(|error| error.to_string())?
+        .message_id;
+        receipt.prompt_tokens = 11;
+        receipt.completion_tokens = 7;
+        receipt.llm_calls = 1;
+        receipt.compaction_count = 1;
+        let outcome = adapter.finish(receipt, TurnOutcome::Completed)?;
         assert_eq!(outcome.terminal, TurnOutcome::Completed);
         assert_eq!(outcome.input_tokens, 11);
         assert_eq!(outcome.output_tokens, 7);
@@ -2238,7 +2239,8 @@ mod tests {
         };
         assert!(error.to_string().contains("downstream_disconnect"));
 
-        let outcome = adapter.finish("rejected-turn".to_string(), TurnOutcome::Cancelled)?;
+        let receipt = test_turn_receipt("rejected-turn", TurnOutcome::Cancelled)?;
+        let outcome = adapter.finish(receipt, TurnOutcome::Cancelled)?;
         assert!(matches!(
             outcome.terminal,
             TurnOutcome::Failed(ref failure) if failure.code == "downstream_disconnect"
@@ -2335,8 +2337,8 @@ mod tests {
             }
         };
         assert!(error.to_string().contains("sink_projector_closed"));
-        let outcome =
-            adapter.finish("closed-projector-turn".to_string(), TurnOutcome::Cancelled)?;
+        let receipt = test_turn_receipt("closed-projector-turn", TurnOutcome::Cancelled)?;
+        let outcome = adapter.finish(receipt, TurnOutcome::Cancelled)?;
         assert!(matches!(
             outcome.terminal,
             TurnOutcome::Failed(ref failure) if failure.code == "sink_projector_closed"
@@ -3625,9 +3627,10 @@ mod tests {
             other => return Err(format!("observer failure finished as {other:?}")),
         }
         assert!(outcome.final_answer.is_some());
-        let mut webhook = WebhookTurnObserver::new(None, "observer-terminal".to_string());
-        webhook.completed = true;
-        assert!(!webhook.should_emit_chat_completed(&outcome.terminal));
+        let webhook = WebhookTurnObserver::new(None, "observer-terminal".to_string());
+        let mut receipt = test_turn_receipt("observer-failed-turn", TurnOutcome::Completed)?;
+        receipt.final_answer = Some("model completed".to_string());
+        assert!(!webhook.should_emit_chat_completed(&receipt, &outcome.terminal));
         Ok(())
     }
 
@@ -3639,9 +3642,10 @@ mod tests {
         assert!(sink.has_final_answer());
         assert_eq!(outcome.terminal, TurnOutcome::Completed);
         assert_eq!(outcome.final_answer.as_deref(), Some("model completed"));
-        let mut webhook = WebhookTurnObserver::new(None, "observer-terminal".to_string());
-        webhook.completed = true;
-        assert!(webhook.should_emit_chat_completed(&outcome.terminal));
+        let webhook = WebhookTurnObserver::new(None, "observer-terminal".to_string());
+        let mut receipt = test_turn_receipt("observer-success-turn", TurnOutcome::Completed)?;
+        receipt.final_answer = Some("model completed".to_string());
+        assert!(webhook.should_emit_chat_completed(&receipt, &outcome.terminal));
         Ok(())
     }
 

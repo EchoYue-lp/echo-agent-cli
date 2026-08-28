@@ -282,11 +282,19 @@ journal/event stream且不进入模型；CLI、TUI、channel 通过同一 app-co
 terminal settlement。MCP health 按 authority scope 保存，Hook/LSP 使用 captured project root，
 Browser 和 LSP 在五类产品入口功能对等。
 
+普通 Chat 的 framework envelope 由 app-core sink 做 durable journal 与 surface 投影，
+但通用 turn summary 不在应用重复折叠。`AgentTurnDriver` 返回的 `TurnReceipt` 是 typed
+terminal、provider usage、context compaction 次数、final answer/message identity、sequence
+和 elapsed time 的唯一权威；`ChatTurnOutcome` 只做 EKO Task/Webhook 字段投影。
+`ChatEventLog` 继续只拥有 workspace stream identity、语义 retention pin 与产品恢复事实，
+底层 sequence、segment、integrity、durability 和 pruning 复用 framework journal。
+
 ## 不变量
 
 - GUI、TUI、CLI/JSONL、channel 功能对等，差异只在 transport 和 renderer。
 - plan approval 不进入 TaskRun 状态机；plan 是 artifact，批准由 prompt/permission 驱动。
 - current workspace 只表示 UI focus，不是已接受 operation 的路由依据。
 - Task DAG、重试、取消、revision 语义只能有一个权威实现。
+- 通用 turn terminal 与 accounting 只能来自 framework `TurnReceipt`，surface/event sink 不重复推断。
 - EKO 使用文件/内存持久化，不启用 SQLite。
 - 只有 Subagent 术语，不建立第二种执行角色概念。
