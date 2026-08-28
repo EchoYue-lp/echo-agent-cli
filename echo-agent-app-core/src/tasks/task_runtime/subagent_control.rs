@@ -3039,6 +3039,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_old_attempt_settlement_does_not_affect_next_attempt() -> Result<(), String> {
+        let store = store_with_plan("run-attempt-isolation", &["task-1"])?;
+        let first_execution = "run-attempt-isolation:task-1:1:1:claim-1";
+        store
+            .record_subagent_assigned(
+                "run-attempt-isolation",
+                "task-1",
+                first_execution,
+                "reviewer",
+                "Review",
+                1,
+                1,
+                true,
+                false,
+            )
+            .map_err(|error| error.to_string())?;
+        let old_guidance = SubagentControlIdentity {
+            run_id: "run-attempt-isolation".to_string(),
+            task_id: "task-1".to_string(),
+            execution_id: first_execution.to_string(),
+            plan_revision: 1,
+            attempt: 1,
+            command_id: "old-command".to_string(),
+        };
+        store
+            .commit_runtime_events(
+                "run-attempt-isolation",
+                vec![
+                    guidance_event(
+                        &old_guidance,
+                        RuntimeEventKind::SubagentGuidanceQueued,
+                        SubagentGuidanceKind::LiveMessage,
+                        SubagentControlActorSource::Cli,
+                        Some("finish the first attempt"),
+                        serde_json::json!({}),
+                    ),
+                    guidance_event(
+                        &old_guidance,
+                        RuntimeEventKind::SubagentGuidanceMailboxAccepted,
+                        SubagentGuidanceKind::LiveMessage,
+                        SubagentControlActorSource::Cli,
+                        None,
+                        serde_json::json!({ "framework_turn_id": "turn-old" }),
+                    ),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .record_subagent_released(crate::tasks::task_runtime::store::SubagentReleaseRecord {
+                run_id: "run-attempt-isolation",
+                task_id: "task-1",
+                execution_id: first_execution,
+                agent_name: "reviewer",
+                task_subject: "Review",
+                plan_revision: 1,
+                attempt: 1,
+                status: "completed",
+                result: None,
+                full_output: None,
+                usage: None,
+                dispatch_hook: false,
+            })
+            .map_err(|error| error.to_string())?;
+
+        let service = SubagentControlService::new(store.clone());
+        let events_before_late_observer = store
+            .list_events("run-attempt-isolation", 0)
+            .map_err(|error| error.to_string())?
+            .len();
+        persist_guidance_transition(
+            &service.blocking,
+            old_guidance.clone(),
+            RuntimeEventKind::SubagentGuidanceDrained,
+            SubagentGuidanceKind::LiveMessage,
+            SubagentControlActorSource::Cli,
+            serde_json::json!({ "framework_turn_id": "turn-old", "drained": true }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            store
+                .list_events("run-attempt-isolation", 0)
+                .map_err(|error| error.to_string())?
+                .len(),
+            events_before_late_observer,
+            "late drain must replay the settled old command without appending"
+        );
+
+        let next_guidance = SubagentControlIdentity {
+            run_id: "run-attempt-isolation".to_string(),
+            task_id: "task-1".to_string(),
+            execution_id: "pending:run-attempt-isolation:task-1:1:2".to_string(),
+            plan_revision: 1,
+            attempt: 2,
+            command_id: "next-command".to_string(),
+        };
+        let next_receipt = service
+            .queue_guidance(
+                next_guidance.clone(),
+                "guide the next attempt",
+                SubagentControlActorSource::Cli,
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(next_receipt.status, SubagentControlStatus::Pending);
+        assert!(!next_receipt.duplicate);
+
+        let rebound = SubagentControlIdentity {
+            command_id: old_guidance.command_id.clone(),
+            ..next_guidance.clone()
+        };
+        let error = service
+            .queue_guidance(
+                rebound,
+                "must not reuse the old command",
+                SubagentControlActorSource::Cli,
+            )
+            .err()
+            .ok_or_else(|| "old command id was rebound to the next attempt".to_string())?;
+        assert!(error.to_string().contains("another identity"));
+        let settled_old = existing_receipt(&store, &old_guidance)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "old guidance settlement disappeared".to_string())?;
+        assert_eq!(settled_old.status, SubagentControlStatus::Settled);
+        assert_eq!(settled_old.outcome, Some(SubagentControlOutcome::Completed));
+        let pending_next = existing_receipt(&store, &next_guidance)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "next-attempt guidance was not retained".to_string())?;
+        assert_eq!(pending_next.status, SubagentControlStatus::Pending);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn exact_interrupt_routes_once_and_settles_durably() -> Result<(), String> {
         use echo_agent::agent::CancellationToken;
         use echo_agent::agent::subagent::{

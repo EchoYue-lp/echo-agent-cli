@@ -2171,6 +2171,406 @@ mod tests {
         Ok(())
     }
 
+    fn task_run_count(service: &AgentControlService) -> Result<usize, String> {
+        use crate::tasks::task_runtime::TaskRunStatus;
+
+        service
+            .task_runtime
+            .list_runs_in(&[
+                TaskRunStatus::Pending,
+                TaskRunStatus::Running,
+                TaskRunStatus::Paused,
+                TaskRunStatus::Cancelled,
+                TaskRunStatus::Failed,
+                TaskRunStatus::Completed,
+            ])
+            .map(|runs| runs.len())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn settle_claim(
+        router: &AgentRouter,
+        claim: &crate::agent_router::AgentDeliveryClaim,
+        turn_id: &str,
+    ) -> Result<AgentDeliveryReceipt, String> {
+        router
+            .begin_injection(claim, turn_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        router
+            .mailbox_accepted(claim, turn_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        router
+            .drained(claim, turn_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        router
+            .turn_settled(
+                claim,
+                Some(turn_id.to_string()),
+                crate::agent_router::AgentDeliveryOutcome::Completed,
+                true,
+                None,
+                false,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn f5_conversation_multi_turns_preserve_fifo_turn_identity_without_task_run()
+    -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = service(root.path())?;
+        seed_conversations(&service, &["conversation-multi"]).await?;
+        let target = conversation("global", "conversation-multi");
+        let address = AgentAddress::new(
+            WorkspaceId::from_raw("global".to_string()),
+            "conversation-multi",
+        );
+
+        let first_request = AgentMessageRequest {
+            target: target.clone(),
+            text: "first turn".to_string(),
+            command_id: None,
+            message_id: Some("f5-first-turn".to_string()),
+            correlation_id: None,
+            delivery: AgentMessageDelivery::Live,
+            from: None,
+        };
+        let second_request = AgentMessageRequest {
+            target,
+            text: "second turn".to_string(),
+            command_id: None,
+            message_id: Some("f5-second-turn".to_string()),
+            correlation_id: None,
+            delivery: AgentMessageDelivery::Live,
+            from: None,
+        };
+        let first_receipt = service
+            .message(first_request)
+            .await
+            .map_err(|error| error.to_string())?;
+        let second_receipt = service
+            .message(second_request)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(first_receipt.phase, "persisted");
+        assert_eq!(second_receipt.phase, "persisted");
+
+        let pending = service
+            .router
+            .pending(&address)
+            .await
+            .map_err(|error| error.to_string())?;
+        let first = pending
+            .first()
+            .ok_or_else(|| "first Conversation turn was not queued".to_string())?;
+        let second = pending
+            .get(1)
+            .ok_or_else(|| "second Conversation turn was not queued".to_string())?;
+        assert_eq!(first.message_id, "f5-first-turn");
+        assert_eq!(second.message_id, "f5-second-turn");
+        let first_turn_id = first.delivery_turn_id();
+        let second_turn_id = second.delivery_turn_id();
+        assert_ne!(first_turn_id, second_turn_id);
+
+        let first_claim = service
+            .router
+            .claim_next(&address)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "first Conversation claim was not admitted".to_string())?;
+        assert_eq!(first_claim.message.message_id, "f5-first-turn");
+        settle_claim(&service.router, &first_claim, &first_turn_id).await?;
+
+        let second_claim = service
+            .router
+            .claim_next(&address)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "second Conversation claim was not admitted".to_string())?;
+        assert_eq!(second_claim.message.message_id, "f5-second-turn");
+        settle_claim(&service.router, &second_claim, &second_turn_id).await?;
+
+        let records = service
+            .router
+            .records(&address)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(records.len(), 2);
+        let first_record = records
+            .iter()
+            .find(|record| record.message_id == "f5-first-turn")
+            .ok_or_else(|| "first Conversation terminal receipt is missing".to_string())?;
+        let second_record = records
+            .iter()
+            .find(|record| record.message_id == "f5-second-turn")
+            .ok_or_else(|| "second Conversation terminal receipt is missing".to_string())?;
+        assert_eq!(
+            first_record.phase,
+            crate::agent_router::AgentDeliveryPhase::TurnSettled
+        );
+        assert_eq!(
+            second_record.phase,
+            crate::agent_router::AgentDeliveryPhase::TurnSettled
+        );
+        assert_eq!(
+            first_record.turn_id.as_deref(),
+            Some(first_turn_id.as_str())
+        );
+        assert_eq!(
+            second_record.turn_id.as_deref(),
+            Some(second_turn_id.as_str())
+        );
+        assert_eq!(task_run_count(&service)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn f5_followup_distinguishes_idle_information_from_running_delivery() -> Result<(), String>
+    {
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let service = service(root.path())?.with_delivery_wake(Arc::new(move |_target| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }));
+        seed_conversations(&service, &["conversation-followup"]).await?;
+        let target = conversation("global", "conversation-followup");
+        let address = AgentAddress::new(
+            WorkspaceId::from_raw("global".to_string()),
+            "conversation-followup",
+        );
+
+        service
+            .message(AgentMessageRequest {
+                target: target.clone(),
+                text: "idle information".to_string(),
+                command_id: None,
+                message_id: Some("f5-idle-message".to_string()),
+                correlation_id: None,
+                delivery: AgentMessageDelivery::Live,
+                from: None,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            wakes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "plain Conversation message is informational and does not wake an idle target"
+        );
+
+        let claim = service
+            .router
+            .claim_next(&address)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "running Conversation claim is missing".to_string())?;
+        let running_turn_id = claim.message.delivery_turn_id();
+        service
+            .router
+            .begin_injection(&claim, running_turn_id.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        service
+            .router
+            .mailbox_accepted(&claim, running_turn_id.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let followup = service
+            .followup(AgentMessageRequest {
+                target,
+                text: "running follow-up".to_string(),
+                command_id: None,
+                message_id: Some("f5-running-followup".to_string()),
+                correlation_id: None,
+                delivery: AgentMessageDelivery::Live,
+                from: None,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(followup.operation, "followup");
+        assert_eq!(
+            wakes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "follow-up wakes the existing running target exactly once"
+        );
+        let in_flight = service
+            .router
+            .in_flight_claim(&address)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "follow-up replaced the running Conversation claim".to_string())?;
+        assert_eq!(in_flight.claim.message.message_id, "f5-idle-message");
+        assert_eq!(in_flight.turn_id, running_turn_id);
+        let pending = service
+            .router
+            .pending(&address)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|message| message.message_id == "f5-running-followup")
+                .count(),
+            1
+        );
+        assert_eq!(
+            pending
+                .iter()
+                .position(|message| message.message_id == "f5-idle-message"),
+            Some(0)
+        );
+        assert_eq!(task_run_count(&service)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn f5_terminal_receipt_keeps_exact_turn_and_rejects_stale_claim() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let router = AgentRouter::new(root.path().join("router"));
+        let target = AgentAddress::new(
+            WorkspaceId::from_raw("global".to_string()),
+            "conversation-terminal",
+        );
+        let mut message =
+            crate::agent_router::AgentMessage::agent_text(None, target.clone(), "terminal receipt");
+        message.message_id = "f5-terminal-message".to_string();
+        let turn_id = message.delivery_turn_id();
+        router
+            .enqueue(message.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let claim = router
+            .claim_next(&target)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "terminal claim is missing".to_string())?;
+        router
+            .begin_injection(&claim, turn_id.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            router.mailbox_accepted(&claim, "f5-wrong-turn").await,
+            Err(crate::agent_router::AgentRouterError::StaleClaim { .. })
+        ));
+        router
+            .mailbox_accepted(&claim, turn_id.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        router
+            .drained(&claim, turn_id.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let terminal = router
+            .turn_settled(
+                &claim,
+                Some(turn_id.clone()),
+                crate::agent_router::AgentDeliveryOutcome::Completed,
+                true,
+                None,
+                false,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            terminal.phase,
+            crate::agent_router::AgentDeliveryPhase::TurnSettled
+        );
+        assert_eq!(
+            terminal.outcome,
+            Some(crate::agent_router::AgentDeliveryOutcome::Completed)
+        );
+        assert!(terminal.drained);
+
+        let duplicate = router
+            .enqueue(message)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.phase, terminal.phase);
+        assert_eq!(duplicate.outcome, terminal.outcome);
+        assert_eq!(duplicate.drained, terminal.drained);
+        assert!(matches!(
+            router.begin_injection(&claim, turn_id).await,
+            Err(crate::agent_router::AgentRouterError::StaleClaim { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn f5_late_or_unknown_conversation_message_does_not_create_task_run() -> Result<(), String>
+    {
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = service(root.path())?;
+        seed_conversations(&service, &["conversation-late"]).await?;
+        let target = conversation("global", "conversation-late");
+        let address = AgentAddress::new(
+            WorkspaceId::from_raw("global".to_string()),
+            "conversation-late",
+        );
+        let request = AgentMessageRequest {
+            target: target.clone(),
+            text: "late message".to_string(),
+            command_id: None,
+            message_id: Some("f5-late-message".to_string()),
+            correlation_id: None,
+            delivery: AgentMessageDelivery::Live,
+            from: None,
+        };
+        service
+            .message(request.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let claim = service
+            .router
+            .claim_next(&address)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "late Conversation claim is missing".to_string())?;
+        let turn_id = claim.message.delivery_turn_id();
+        settle_claim(&service.router, &claim, &turn_id).await?;
+
+        let late = service
+            .message(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(late.duplicate);
+        assert_eq!(late.phase, "turn_settled");
+        let unknown = conversation("global", "conversation-stale");
+        let error = match service
+            .message(AgentMessageRequest {
+                target: unknown,
+                text: "stale target".to_string(),
+                command_id: None,
+                message_id: Some("f5-stale-target".to_string()),
+                correlation_id: None,
+                delivery: AgentMessageDelivery::Live,
+                from: None,
+            })
+            .await
+        {
+            Ok(_) => return Err("unknown Conversation message was accepted".to_string()),
+            Err(error) => error,
+        };
+        assert!(matches!(error, AgentControlError::TargetUnavailable(_)));
+        let targets = service
+            .router
+            .list_targets()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(targets, vec![address]);
+        assert_eq!(task_run_count(&service)?, 0);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn inspect_unknown_conversation_is_read_only_and_does_not_create_target()
     -> Result<(), String> {
