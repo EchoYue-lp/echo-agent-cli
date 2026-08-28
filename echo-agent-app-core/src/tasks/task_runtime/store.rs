@@ -236,7 +236,6 @@ pub(crate) struct InitialRunTriggerMetadata {
     pub kind: String,
     pub prompt: String,
     pub priority: u8,
-    pub dependencies: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4444,7 +4443,6 @@ impl TaskRuntimeStore {
                     "task_kind": trigger.kind,
                     "prompt": trigger.prompt,
                     "priority": trigger.priority.min(10),
-                    "dependencies": trigger.dependencies,
                 }),
                 timestamp,
             ));
@@ -6811,7 +6809,6 @@ impl TaskRuntimeStore {
         kind: &str,
         prompt: &str,
         priority: u8,
-        dependencies: &[String],
     ) -> Result<(), StoreError> {
         let _operation = self.shadow_operation()?;
         self.commit_runtime_event(RuntimeJournalEvent::for_append(
@@ -6825,7 +6822,6 @@ impl TaskRuntimeStore {
                 "task_kind": kind,
                 "prompt": prompt,
                 "priority": priority.min(10),
-                "dependencies": dependencies,
             }),
         ))
     }

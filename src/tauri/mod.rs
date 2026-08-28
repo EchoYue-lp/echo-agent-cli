@@ -180,7 +180,6 @@ pub fn build_tauri_app(
             commands::tasks::submit_task,
             commands::tasks::get_task,
             commands::tasks::cancel_task,
-            commands::tasks::get_task_dag,
             // TaskRuntime (complex-task runs, plans, todos, events, artifacts, reviews)
             commands::task_runtime::get_task_run,
             commands::task_runtime::get_task_completion_gate,

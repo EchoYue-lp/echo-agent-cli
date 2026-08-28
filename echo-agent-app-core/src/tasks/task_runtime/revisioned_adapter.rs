@@ -380,7 +380,6 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
                     kind: "agent_task_plan".to_string(),
                     prompt: goal,
                     priority: 5,
-                    dependencies: Vec::new(),
                 },
                 continuation: None,
             });

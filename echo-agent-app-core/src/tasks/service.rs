@@ -13,10 +13,10 @@ use echo_agent::tasks::progress::TaskProgress;
 
 use super::background::BackgroundTaskKind;
 use super::task_runtime::{
-    AttendedMode, DomainProfile, ExecuteTaskTool, ExecutionMode, MemoryPolicy, PlanTask,
-    RecoveryBlocker, RecoveryDecision, TaskPlan, TaskRetryPreparation, TaskRun, TaskRunBootOutcome,
-    TaskRunBootReconciler, TaskRunStatus, TaskRuntimeBlockingAdapter, TaskRuntimeStore, TodoItem,
-    TodoStatus, UnattendedWriteMode,
+    AttendedMode, DomainProfile, ExecuteTaskTool, ExecutionMode, MemoryPolicy, PlanRevision,
+    PlanTask, RecoveryBlocker, RecoveryDecision, TaskPlan, TaskRetryPreparation, TaskRun,
+    TaskRunBootOutcome, TaskRunBootReconciler, TaskRunStatus, TaskRuntimeBlockingAdapter,
+    TaskRuntimeStore, TodoItem, TodoStatus, UnattendedWriteMode,
 };
 use crate::agent_handle::AgentHandle;
 #[cfg(test)]
@@ -45,7 +45,6 @@ struct PromptRunRequest<'a> {
     source: &'a str,
     task_kind: &'a str,
     priority: u8,
-    dependencies: Vec<String>,
     domain_profile: DomainProfile,
 }
 
@@ -60,7 +59,6 @@ pub struct UnifiedTaskInfo {
     pub error: Option<String>,
     pub kind: Option<String>,
     pub source: &'static str,
-    pub dependencies: Vec<String>,
     pub priority: u8,
 }
 
@@ -210,7 +208,7 @@ impl BackgroundTaskService {
         description: &str,
         submitted_via: Option<String>,
     ) -> anyhow::Result<String> {
-        self.submit_with_options(kind, description, submitted_via, None, Vec::new())
+        self.submit_with_options(kind, description, submitted_via, None)
             .await
     }
 
@@ -220,7 +218,6 @@ impl BackgroundTaskService {
         description: &str,
         submitted_via: Option<String>,
         priority: Option<u8>,
-        depends_on: Vec<String>,
     ) -> anyhow::Result<String> {
         let domain_profile = kind.domain_profile();
         let prompt = kind.to_prompt();
@@ -232,7 +229,6 @@ impl BackgroundTaskService {
             source: &source,
             task_kind: &task_kind,
             priority: priority.unwrap_or(5),
-            dependencies: depends_on,
             domain_profile,
         })
         .await
@@ -252,7 +248,6 @@ impl BackgroundTaskService {
             source: source_id,
             task_kind: &task_kind,
             priority: 5,
-            dependencies: Vec::new(),
             domain_profile: DomainProfile::General,
         })
         .await
@@ -282,7 +277,6 @@ impl BackgroundTaskService {
         let preparation_kind = request.task_kind.to_string();
         let preparation_source = request.source.to_string();
         let preparation_prompt = request.prompt.to_string();
-        let preparation_dependencies = request.dependencies.clone();
         let preparation_domain_profile = request.domain_profile;
         let preparation_priority = request.priority;
         let preparation_store = self.task_runtime_store.clone();
@@ -318,7 +312,6 @@ impl BackgroundTaskService {
                     &preparation_kind,
                     &preparation_prompt,
                     preparation_priority,
-                    &preparation_dependencies,
                 ) {
                     registration.fail_preparation(error.to_string());
                     return Err(error);
@@ -329,7 +322,6 @@ impl BackgroundTaskService {
         self.start_run_driver(
             run_id.clone(),
             request.prompt.to_string(),
-            request.dependencies,
             registration,
             cancel,
         )?;
@@ -395,7 +387,6 @@ impl BackgroundTaskService {
                 kind: task_kind.clone(),
                 prompt: goal.to_string(),
                 priority: 5,
-                dependencies: Vec::new(),
             },
             Some((true, true, None, None)),
             TaskPlan {
@@ -416,13 +407,7 @@ impl BackgroundTaskService {
             registration.reject(error.to_string());
             return Err(error.into());
         }
-        self.start_run_driver(
-            run_id.clone(),
-            goal.to_string(),
-            Vec::new(),
-            registration,
-            cancel,
-        )?;
+        self.start_run_driver(run_id.clone(), goal.to_string(), registration, cancel)?;
         Ok(run_id)
     }
 
@@ -430,7 +415,6 @@ impl BackgroundTaskService {
         &self,
         run_id: String,
         prompt: String,
-        dependencies: Vec<String>,
         registration: super::task_runtime::store::RegisteredRunDriver<()>,
         cancel: echo_agent::agent::CancellationToken,
     ) -> anyhow::Result<()> {
@@ -446,7 +430,6 @@ impl BackgroundTaskService {
                 run_semaphore,
                 run_id,
                 prompt,
-                dependencies,
                 cancel,
                 receipt_owner,
             )
@@ -521,7 +504,6 @@ impl BackgroundTaskService {
                     return Err(error);
                 }
                 registration.mark_preparation_started();
-                let dependencies = metadata.dependencies;
                 let result_waiter = registration.start(move |receipt_owner| {
                     drive_background_run(
                         store,
@@ -530,7 +512,6 @@ impl BackgroundTaskService {
                         run_semaphore,
                         run_id,
                         prompt,
-                        dependencies,
                         cancel,
                         receipt_owner,
                     )
@@ -601,9 +582,9 @@ impl BackgroundTaskService {
                         )));
                     }
                     let metadata = trigger_metadata(&preflight_store, &preflight_run_id);
-                    Ok((metadata.prompt.unwrap_or(run.goal), metadata.dependencies))
+                    Ok(metadata.prompt.unwrap_or(run.goal))
                 },
-                move |(prompt, dependencies), receipt_owner| {
+                move |prompt, receipt_owner| {
                     drive_background_run(
                         driver_store,
                         agent_provider,
@@ -611,7 +592,6 @@ impl BackgroundTaskService {
                         run_semaphore,
                         driver_run_id,
                         prompt,
-                        dependencies,
                         driver_cancel,
                         receipt_owner,
                     )
@@ -654,6 +634,30 @@ impl BackgroundTaskService {
             .await
             .ok()
             .flatten()
+    }
+
+    pub fn workspace_id(&self) -> String {
+        self.task_runtime_store.active_workspace_id()
+    }
+
+    pub async fn get_task_plan(&self, run_id: &str) -> anyhow::Result<Option<PlanRevision>> {
+        let run_id = run_id.to_string();
+        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+            .run_store("load background TaskRun plan", move |store| {
+                store.get_plan_revision(&run_id)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn list_task_todos(&self, run_id: &str) -> anyhow::Result<Vec<TodoItem>> {
+        let run_id = run_id.to_string();
+        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+            .run_store("list background TaskRun todos", move |store| {
+                store.list_todos(&run_id)
+            })
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn resume_pending(&self) -> anyhow::Result<usize> {
@@ -718,13 +722,7 @@ impl BackgroundTaskService {
                     }
                 }
             }
-            self.start_run_driver(
-                run.run_id,
-                prompt,
-                metadata.dependencies,
-                registration,
-                cancel,
-            )?;
+            self.start_run_driver(run.run_id, prompt, registration, cancel)?;
             resumed = resumed.saturating_add(1);
         }
         Ok(resumed)
@@ -805,28 +803,10 @@ async fn drive_background_run(
     run_semaphore: Arc<tokio::sync::Semaphore>,
     run_id: String,
     prompt: String,
-    dependencies: Vec<String>,
     cancel: CancellationToken,
     mut receipt_owner: super::task_runtime::store::RunDriverReceiptOwner,
 ) -> Result<(), String> {
     let blocking = TaskRuntimeBlockingAdapter::new(store.clone());
-    if let Err(error) = wait_for_dependencies(&blocking, &dependencies, &cancel).await {
-        let failure_run_id = run_id.clone();
-        let failure_store = store.clone();
-        let failure = error.clone();
-        let cancelled = cancel.is_cancelled();
-        blocking
-            .run_owned("settle background dependency failure", move || {
-                finish_pre_execution_failure(&failure_store, &failure_run_id, &failure, cancelled)
-                    .map_err(super::task_runtime::StoreError::InvalidPlan)
-            })
-            .await
-            .map_err(|settlement| settlement.to_string())?;
-        if cancel.is_cancelled() {
-            return Ok(());
-        }
-        return Err(error);
-    }
     if cancel.is_cancelled() {
         let failure_run_id = run_id.clone();
         let failure_store = store.clone();
@@ -990,7 +970,6 @@ struct TriggerMetadata {
     kind: Option<String>,
     prompt: Option<String>,
     priority: u8,
-    dependencies: Vec<String>,
 }
 
 fn trigger_metadata(store: &TaskRuntimeStore, run_id: &str) -> TriggerMetadata {
@@ -1021,17 +1000,6 @@ fn trigger_metadata(store: &TaskRuntimeStore, run_id: &str) -> TriggerMetadata {
                 .and_then(|value| u8::try_from(value).ok())
                 .unwrap_or(5)
                 .min(10),
-            dependencies: event
-                .payload
-                .get("dependencies")
-                .and_then(|value| value.as_array())
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(|value| value.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
         })
         .unwrap_or_default()
 }
@@ -1059,7 +1027,6 @@ fn run_to_unified(store: &TaskRuntimeStore, run: &TaskRun) -> UnifiedTaskInfo {
         error,
         kind: metadata.kind.or_else(|| Some(run.route.clone())),
         source: "run",
-        dependencies: metadata.dependencies,
         priority: if metadata.priority == 0 {
             5
         } else {
@@ -1088,50 +1055,6 @@ fn all_run_statuses() -> [TaskRunStatus; 6] {
         TaskRunStatus::Failed,
         TaskRunStatus::Completed,
     ]
-}
-
-async fn wait_for_dependencies(
-    blocking: &TaskRuntimeBlockingAdapter,
-    dependencies: &[String],
-    cancel: &CancellationToken,
-) -> Result<(), String> {
-    loop {
-        if cancel.is_cancelled() {
-            return Err("run cancelled while waiting for dependencies".to_string());
-        }
-        let dependencies = dependencies.to_vec();
-        let waiting = blocking
-            .run_store("poll background dependencies", move |store| {
-                let mut waiting = false;
-                for dependency in dependencies {
-                    let run = store.get_run(&dependency)?.ok_or_else(|| {
-                        super::task_runtime::StoreError::RunNotFound(dependency.clone())
-                    })?;
-                    match run.status {
-                        TaskRunStatus::Completed => {}
-                        TaskRunStatus::Failed | TaskRunStatus::Cancelled => {
-                            return Err(super::task_runtime::StoreError::InvalidPlan(format!(
-                                "dependency {dependency} ended {}",
-                                run.status.as_str()
-                            )));
-                        }
-                        TaskRunStatus::Pending | TaskRunStatus::Running | TaskRunStatus::Paused => {
-                            waiting = true;
-                        }
-                    }
-                }
-                Ok(waiting)
-            })
-            .await
-            .map_err(|error| format!("read background dependencies: {error}"))?;
-        if !waiting {
-            return Ok(());
-        }
-        tokio::select! {
-            _ = cancel.cancelled() => return Err("run cancelled while waiting for dependencies".to_string()),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
-        }
-    }
 }
 
 fn transition_to_running(store: &TaskRuntimeStore, run_id: &str) -> Result<(), String> {
@@ -1283,7 +1206,7 @@ mod tests {
             .transition_run(run_id, run_status)
             .map_err(|error| error.to_string())?;
         store
-            .record_trigger_metadata(run_id, "test", "research", "retry run", 5, &[])
+            .record_trigger_metadata(run_id, "test", "research", "retry run", 5)
             .map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -1429,20 +1352,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dependency_wait_can_be_cancelled_through_runtime_store() -> Result<(), String> {
+    async fn same_run_dependency_graph_is_the_only_background_dag() -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        store
-            .create_run(
-                "dependency",
-                "default",
-                "background:test:dependency",
-                "",
-                DomainProfile::General,
-                "dependency",
-                "bg:kind:test",
-                AttendedMode::Unattended,
-            )
-            .map_err(|error| error.to_string())?;
         let service = BackgroundTaskService::new(
             test_agent()?,
             CancellationToken::new(),
@@ -1451,32 +1362,64 @@ mod tests {
         .await
         .map_err(|error| error.to_string())?;
         let run_id = service
-            .submit_with_options(
-                BackgroundTaskKind::WritingPipeline {
-                    topic: "runtime".to_string(),
-                    audience: "engineers".to_string(),
-                    format: "report".to_string(),
-                    max_revisions: 1,
-                    quality_threshold: 70,
-                },
-                "write runtime report",
-                Some("test".to_string()),
-                Some(7),
-                vec!["dependency".to_string()],
+            .submit_dag(
+                vec![
+                    PlanTask {
+                        id: "inspect".to_string(),
+                        title: "Inspect".to_string(),
+                        kind: PlanTaskKind::Investigation,
+                        ..PlanTask::default()
+                    },
+                    PlanTask {
+                        id: "report".to_string(),
+                        title: "Report".to_string(),
+                        kind: PlanTaskKind::Investigation,
+                        depends_on: vec!["inspect".to_string()],
+                        ..PlanTask::default()
+                    },
+                ],
+                "same run graph",
+                "test",
+                "same-run-dag",
             )
             .await
             .map_err(|error| error.to_string())?;
-        assert!(
-            store
-                .request_cancel(&run_id)
-                .map_err(|error| error.to_string())?
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let run = store
-            .get_run(&run_id)
+        let plan = service
+            .get_task_plan(&run_id)
+            .await
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "run missing".to_string())?;
-        assert_eq!(run.status, TaskRunStatus::Cancelled);
+            .ok_or_else(|| "same-run plan missing".to_string())?;
+        let report = plan
+            .tasks
+            .iter()
+            .find(|task| task.id == "report")
+            .ok_or_else(|| "dependent task missing".to_string())?;
+        assert_eq!(report.depends_on, vec!["inspect".to_string()]);
+        let trigger = store
+            .list_events(&run_id, 0)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|event| {
+                event
+                    .payload
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("trigger_metadata")
+            })
+            .ok_or_else(|| "trigger metadata missing".to_string())?;
+        assert!(trigger.payload.get("dependencies").is_none());
+        assert_eq!(
+            service
+                .list_task_todos(&run_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .len(),
+            2
+        );
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -1484,18 +1427,6 @@ mod tests {
     async fn retry_registers_driver_immediately_instead_of_leaving_fake_running()
     -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        store
-            .create_run(
-                "dependency",
-                "default",
-                "background:test:dependency",
-                "",
-                DomainProfile::General,
-                "dependency",
-                "bg:kind:test",
-                AttendedMode::Unattended,
-            )
-            .map_err(|error| error.to_string())?;
         store
             .create_run(
                 "retry-run",
@@ -1546,14 +1477,7 @@ mod tests {
             .transition_run("retry-run", TaskRunStatus::Failed)
             .map_err(|error| error.to_string())?;
         store
-            .record_trigger_metadata(
-                "retry-run",
-                "test",
-                "research",
-                "retry run",
-                5,
-                &["dependency".to_string()],
-            )
+            .record_trigger_metadata("retry-run", "test", "research", "retry run", 5)
             .map_err(|error| error.to_string())?;
 
         let service = BackgroundTaskService::new(

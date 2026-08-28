@@ -749,6 +749,12 @@ export interface SubmitTaskRequest {
   params: Record<string, unknown>;
 }
 
+export interface BackgroundRunLaunchReceipt {
+  success: boolean;
+  workspace_id: string;
+  run_id: string;
+}
+
 export const tasksApi = {
   list: () =>
     isTauri() ? apiInvoke<BackgroundTask[]>('list_tasks') : get<BackgroundTask[]>('/tasks'),
@@ -756,12 +762,12 @@ export const tasksApi = {
     isTauri() ? apiInvoke<BackgroundTask>('get_task', { id }) : get<BackgroundTask>(`/tasks/${id}`),
   submit: (req: SubmitTaskRequest) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; task_id: string }>('submit_task', {
+      ? apiInvoke<BackgroundRunLaunchReceipt>('submit_task', {
           kind: req.kind,
           description: req.description,
           params: req.params,
         })
-      : post<{ success: boolean; task_id: string }>('/tasks', req),
+      : post<BackgroundRunLaunchReceipt>('/tasks', req),
   cancel: (id: string) =>
     isTauri()
       ? apiInvoke<{ success: boolean; task_id: string }>('cancel_task', { id })

@@ -66,14 +66,9 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("\nBackground Tasks:");
                 println!("{:-<90}", "");
                 for t in &tasks {
-                    let deps = if t.dependencies.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" deps:[{}]", t.dependencies.join(","))
-                    };
                     println!(
-                        "  [{:>12}] P{:<2} {} (id: {}{})",
-                        t.status, t.priority, t.description, t.id, deps
+                        "  [{:>12}] P{:<2} {} (run: {})",
+                        t.status, t.priority, t.description, t.id
                     );
                 }
             }
@@ -90,9 +85,6 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     println!("  Description: {}", task.description);
                     println!("  Status: {}", task.status);
                     println!("  Priority: {}", task.priority);
-                    if !task.dependencies.is_empty() {
-                        println!("  Dependencies: {}", task.dependencies.join(", "));
-                    }
                     println!("  Created At: {}", task.created_at);
                     if let Some(ref result) = task.result {
                         println!("  Result: {}", result);
@@ -234,43 +226,102 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }
         }
         "dag" => {
-            let tasks = service.list_unified(None).await;
-            if tasks.is_empty() {
-                println!("No tasks to visualize.");
-            } else {
-                println!("\nTask Dependency Graph (Mermaid format):");
-                println!("graph TD");
-                for task in &tasks {
-                    println!(
-                        "    {}[\"{}\"]",
-                        task.id,
-                        task.description.replace('"', "'")
-                    );
-                    for dependency in &task.dependencies {
-                        println!("    {} --> {}", dependency, task.id);
-                    }
-                }
-                println!("\nTask Details:");
-                for task in &tasks {
-                    let deps = if task.dependencies.is_empty() {
-                        "none".to_string()
-                    } else {
-                        task.dependencies.join(", ")
-                    };
-                    println!(
-                        "  {} [P{}] - {} (deps: {})",
-                        task.id, task.priority, task.description, deps
-                    );
-                }
+            let run_id = args.get(1).copied().unwrap_or("");
+            if run_id.is_empty() {
+                println!("Usage: /tasks dag <run-id>");
+                return CommandOutcome::Continue;
+            }
+            match service.get_task_plan(run_id).await {
+                Ok(Some(plan)) => match service.list_task_todos(run_id).await {
+                    Ok(todos) => print!("{}", render_task_dag(&plan, &todos)),
+                    Err(error) => println!("Failed to load TaskRun todos: {error}"),
+                },
+                Ok(None) => println!("TaskRun has no plan: {run_id}"),
+                Err(error) => println!("Failed to load TaskRun plan: {error}"),
             }
         }
         _ => {
             println!(
-                "Usage: /tasks [list|status <id>|pause <id>|resume <id>|cancel <id>|recovery <id>|retry <id> <task-id>|skip <id> <task-id>|research <topic>|dag]"
+                "Usage: /tasks [list|status <run-id>|pause <run-id>|resume <run-id>|cancel <run-id>|recovery <run-id>|retry <run-id> <task-id>|skip <run-id> <task-id>|research <topic>|dag <run-id>]"
             );
         }
     }
     CommandOutcome::Continue
+}
+
+fn render_task_dag(
+    plan: &echo_agent_app_core::tasks::task_runtime::PlanRevision,
+    todos: &[echo_agent_app_core::tasks::task_runtime::TodoItem],
+) -> String {
+    let statuses = todos
+        .iter()
+        .map(|todo| (todo.task_id.as_str(), todo.status.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut output = String::from("\nTask Dependency Graph (Mermaid format):\ngraph TD\n");
+    for task in &plan.tasks {
+        output.push_str(&format!(
+            "    {}[\"{}\"]\n",
+            task.id,
+            task.title.replace('"', "'")
+        ));
+        for dependency in &task.depends_on {
+            output.push_str(&format!("    {dependency} --> {}\n", task.id));
+        }
+    }
+    output.push_str("\nTask Details:\n");
+    for task in &plan.tasks {
+        let dependencies = if task.depends_on.is_empty() {
+            "none".to_string()
+        } else {
+            task.depends_on.join(", ")
+        };
+        let status = statuses.get(task.id.as_str()).copied().unwrap_or("pending");
+        output.push_str(&format!(
+            "  {} [{}] - {} (deps: {})\n",
+            task.id, status, task.title, dependencies
+        ));
+    }
+    output
+}
+
+#[cfg(test)]
+mod task_dag_tests {
+    use super::render_task_dag;
+    use echo_agent_app_core::tasks::task_runtime::{
+        DomainProfile, ExecutionMode, PlanRevision, PlanTask,
+    };
+
+    #[test]
+    fn cli_dag_renders_edges_from_one_plan_revision() {
+        let inspect = PlanTask {
+            id: "inspect".to_string(),
+            title: "Inspect".to_string(),
+            ..PlanTask::default()
+        };
+        let report = PlanTask {
+            id: "report".to_string(),
+            title: "Report".to_string(),
+            depends_on: vec!["inspect".to_string()],
+            ..PlanTask::default()
+        };
+        let plan = PlanRevision {
+            plan_id: "plan".to_string(),
+            run_id: "run".to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: "goal".to_string(),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![inspect.spec(), report.spec()],
+        };
+
+        let rendered = render_task_dag(&plan, &[]);
+
+        assert!(rendered.contains("inspect --> report"));
+        assert!(rendered.contains("report [pending] - Report (deps: inspect)"));
+    }
 }
 
 cmd!(

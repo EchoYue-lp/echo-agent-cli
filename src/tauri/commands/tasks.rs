@@ -21,8 +21,6 @@ pub struct TaskInfo {
     pub progress: Option<u8>,
     /// Task priority (0-10, higher = more urgent).
     pub priority: u8,
-    /// Task IDs this task depends on.
-    pub dependencies: Vec<String>,
     /// Real-time progress percentage (0.0–100.0) from ProgressBridge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_pct: Option<f64>,
@@ -35,6 +33,13 @@ pub struct TaskInfo {
     /// Estimated seconds remaining.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eta_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackgroundRunLaunchReceipt {
+    pub success: bool,
+    pub workspace_id: String,
+    pub run_id: String,
 }
 
 #[tauri::command]
@@ -63,8 +68,7 @@ pub async fn submit_task(
     description: String,
     params: Option<serde_json::Value>,
     priority: Option<u8>,
-    depends_on: Option<Vec<String>>,
-) -> Result<serde_json::Value, IpcError> {
+) -> Result<BackgroundRunLaunchReceipt, IpcError> {
     let service = state
         .app_state
         .tasks
@@ -76,18 +80,17 @@ pub async fn submit_task(
     let params = params.unwrap_or_default();
 
     // Every accepted kind creates a TaskRun; the kind only changes the prompt.
-    let (task_id, source) = match kind.as_str() {
+    let run_id = match kind.as_str() {
         "agent_chat" | "chat" => {
             let prompt = params
                 .get("prompt")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&description)
                 .to_string();
-            let id = service
+            service
                 .submit_run(&prompt, &description, "background", "ipc")
                 .await
-                .map_err(|e| IpcError::Internal(format!("Failed to submit task: {e}")))?;
-            (id, "run")
+                .map_err(|e| IpcError::Internal(format!("Failed to submit task: {e}")))?
         }
         "cron" | "workflow" => {
             return Err(IpcError::Validation(format!(
@@ -107,17 +110,10 @@ pub async fn submit_task(
                     .unwrap_or(20) as usize,
                 output_format: Default::default(),
             };
-            let id = service
-                .submit_with_options(
-                    task_kind,
-                    &description,
-                    Some("ipc".to_string()),
-                    priority,
-                    depends_on.unwrap_or_default(),
-                )
+            service
+                .submit_with_options(task_kind, &description, Some("ipc".to_string()), priority)
                 .await
-                .map_err(|e| IpcError::Internal(format!("Failed to submit task: {e}")))?;
-            (id, "run")
+                .map_err(|e| IpcError::Internal(format!("Failed to submit task: {e}")))?
         }
         other => {
             return Err(IpcError::Validation(format!(
@@ -126,11 +122,11 @@ pub async fn submit_task(
         }
     };
 
-    Ok(serde_json::json!({
-        "success": true,
-        "task_id": task_id,
-        "source": source,
-    }))
+    Ok(BackgroundRunLaunchReceipt {
+        success: true,
+        workspace_id: service.workspace_id(),
+        run_id,
+    })
 }
 
 #[tauri::command]
@@ -198,7 +194,6 @@ fn task_to_info(
         kind: task.kind,
         progress: None,
         priority: task.priority,
-        dependencies: task.dependencies,
         progress_pct,
         progress_phase,
         progress_message,
@@ -206,60 +201,29 @@ fn task_to_info(
     }
 }
 
-/// Response for get_task_dag command
-#[derive(Debug, Serialize)]
-pub struct TaskDagInfo {
-    /// Mermaid format DAG visualization
-    pub mermaid: String,
-    /// Task details with dependencies
-    pub tasks: Vec<TaskDagNode>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[derive(Debug, Serialize)]
-pub struct TaskDagNode {
-    pub id: String,
-    pub description: String,
-    pub status: String,
-    pub priority: u8,
-    pub dependencies: Vec<String>,
-}
-
-#[tauri::command]
-pub async fn get_task_dag(state: tauri::State<'_, TauriState>) -> Result<TaskDagInfo, IpcError> {
-    let service = state
-        .app_state
-        .tasks
-        .service
-        .as_ref()
-        .ok_or_else(|| IpcError::Internal("Task service not initialized".to_string()))?;
-
-    let tasks = service.list_unified(None).await;
-    let mut mermaid_lines = vec!["graph TD".to_string()];
-    for task in &tasks {
-        mermaid_lines.push(format!(
-            "    {}[\"{}\"]",
-            task.id,
-            task.description.replace('"', "'")
-        ));
-        for dependency in &task.dependencies {
-            mermaid_lines.push(format!("    {} --> {}", dependency, task.id));
-        }
+    #[test]
+    fn background_launch_receipt_uses_workspace_and_run_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let value = serde_json::to_value(BackgroundRunLaunchReceipt {
+            success: true,
+            workspace_id: "workspace-a".to_string(),
+            run_id: "run-a".to_string(),
+        })?;
+        assert_eq!(
+            value
+                .get("workspace_id")
+                .and_then(serde_json::Value::as_str),
+            Some("workspace-a")
+        );
+        assert_eq!(
+            value.get("run_id").and_then(serde_json::Value::as_str),
+            Some("run-a")
+        );
+        assert!(value.get("task_id").is_none());
+        Ok(())
     }
-    let mermaid = mermaid_lines.join("\n");
-
-    let task_nodes: Vec<TaskDagNode> = tasks
-        .into_iter()
-        .map(|task| TaskDagNode {
-            id: task.id,
-            description: task.description,
-            status: task.status,
-            priority: task.priority,
-            dependencies: task.dependencies,
-        })
-        .collect();
-
-    Ok(TaskDagInfo {
-        mermaid,
-        tasks: task_nodes,
-    })
 }

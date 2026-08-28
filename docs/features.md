@@ -33,6 +33,8 @@ TaskRuntime 的框架/应用边界是稳定的：框架拥有 DAG、状态迁移
 EKO 拥有文件投影、workspace、review、worktree、资源策略和各 surface 的呈现。
 具体 authority、原子 settlement 和 blocking I/O 约束见
 [RuntimeTaskService 适配决策](./architecture/runtime-task-service.md)。
+Task 依赖只存在于单个 revisioned TaskRun 的 `PlanRevision.tasks[].depends_on`；background
+launcher 不再维护跨 TaskRun metadata DAG 或轮询器。CLI 使用 `/tasks dag <run-id>` 查看该权威图。
 
 ## 工具与扩展
 
