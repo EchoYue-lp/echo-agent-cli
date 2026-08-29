@@ -88,8 +88,8 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
         Some(review_lease.memory_store()),
         Some(run_store),
     );
-    let layer_manager = match review_lease.create_layer_manager() {
-        Ok(manager) => Arc::new(manager),
+    let layer_manager = match review_lease.layer_manager() {
+        Ok(manager) => manager,
         Err(error) => {
             println!("Review memory initialization failed: {error}");
             return CommandOutcome::Continue;
@@ -104,12 +104,17 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
             return CommandOutcome::Continue;
         }
     };
-    let settled = match review_lease.track_background_review(handle).await {
+    let settled = match review_lease.clone().track_background_review(handle).await {
         Ok(mut pass) => pass.settle().await,
         Err(error) => Err(error),
     };
     match settled {
         Ok(settlement) => {
+            let projection = if settlement.evidence_candidate.is_some() {
+                Some(review_lease.settle_hot_memory_projection().await)
+            } else {
+                None
+            };
             let outcome = settlement.outcome;
             if outcome.nothing_to_save {
                 println!("Nothing to save.");
@@ -131,6 +136,9 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
             }
             if let Some(ref err) = outcome.error {
                 println!("Warning: {err}");
+            }
+            if let Some(error) = projection.and_then(|receipt| receipt.error) {
+                println!("Memory projection remains pending: {error}");
             }
         }
         Err(error) => println!("Review task failed: {error}"),
@@ -1472,10 +1480,14 @@ async fn cmd_rule_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
             match proposal {
                 Some(proposal) => match integration.promote_rule(proposal).await {
                     Ok(receipt) => {
+                        let projection = control.generation.settle_hot_memory_projection().await;
                         println!(
                             "Successfully promoted memory '{}' as {}",
                             memory_key, receipt.promotion_id
                         );
+                        if let Some(error) = projection.error {
+                            println!("Memory projection remains pending: {error}");
+                        }
                     }
                     Err(error) => println!("Failed to promote rule: {error}"),
                 },
@@ -1789,7 +1801,11 @@ async fn cmd_evidence_inbox(ctx: &CommandContext, args: &[&str]) -> CommandOutco
                 .unwrap_or_default();
             match store.edit(candidate_id, &content) {
                 Ok(candidate) => {
-                    println!("Updated {}: {}", candidate.candidate_id, candidate.content)
+                    let projection = control.generation.settle_hot_memory_projection().await;
+                    println!("Updated {}: {}", candidate.candidate_id, candidate.content);
+                    if let Some(error) = projection.error {
+                        println!("Memory projection remains pending: {error}");
+                    }
                 }
                 Err(error) => println!("Failed to edit candidate: {error}"),
             }
@@ -1800,7 +1816,13 @@ async fn cmd_evidence_inbox(ctx: &CommandContext, args: &[&str]) -> CommandOutco
                 return CommandOutcome::Continue;
             };
             match store.reject(candidate_id) {
-                Ok(candidate) => println!("Rejected {}.", candidate.candidate_id),
+                Ok(candidate) => {
+                    let projection = control.generation.settle_hot_memory_projection().await;
+                    println!("Rejected {}.", candidate.candidate_id);
+                    if let Some(error) = projection.error {
+                        println!("Memory projection remains pending: {error}");
+                    }
+                }
                 Err(error) => println!("Failed to reject candidate: {error}"),
             }
         }
@@ -1809,8 +1831,8 @@ async fn cmd_evidence_inbox(ctx: &CommandContext, args: &[&str]) -> CommandOutco
                 println!("Usage: /evidence-inbox {sub} <candidate-id>");
                 return CommandOutcome::Continue;
             };
-            let layer_manager = match control.generation.create_layer_manager() {
-                Ok(manager) => Arc::new(manager),
+            let layer_manager = match control.generation.layer_manager() {
+                Ok(manager) => manager,
                 Err(error) => {
                     println!("Failed to initialize layered memory: {error}");
                     return CommandOutcome::Continue;
@@ -1829,7 +1851,11 @@ async fn cmd_evidence_inbox(ctx: &CommandContext, args: &[&str]) -> CommandOutco
             };
             match result {
                 Ok(candidate) => {
-                    println!("{} is now {:?}.", candidate.candidate_id, candidate.status)
+                    let projection = control.generation.settle_hot_memory_projection().await;
+                    println!("{} is now {:?}.", candidate.candidate_id, candidate.status);
+                    if let Some(error) = projection.error {
+                        println!("Memory projection remains pending: {error}");
+                    }
                 }
                 Err(error) => println!("Review Inbox action failed: {error}"),
             }

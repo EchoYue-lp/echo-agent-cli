@@ -8,6 +8,7 @@ import type {
   TauriMcpServerInfo,
   McpConfig,
   MemoryEntry,
+  ReflectionReceipt,
   NamespacesResponse,
   SnapshotInfo,
   ConfigInfo,
@@ -438,6 +439,13 @@ export const memoryApi = {
     isTauri()
       ? apiInvoke<NamespacesResponse>('list_namespaces')
       : get<NamespacesResponse>('/memory/namespaces'),
+  reflect: (workspaceId: string, conversationId?: string) =>
+    isTauri()
+      ? apiInvoke<ReflectionReceipt>('reflect_session', { workspaceId, conversationId })
+      : post<ReflectionReceipt>('/memory/reflect', {
+          workspace_id: workspaceId,
+          conversation_id: conversationId,
+        }),
 };
 
 export const autoMemoryApi = {

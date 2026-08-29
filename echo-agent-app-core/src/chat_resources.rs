@@ -9,7 +9,6 @@
 use std::sync::Arc;
 
 use echo_agent::agent::CancellationToken;
-use echo_agent::evolution::MemoryLayerManager;
 use echo_agent::human_loop::HumanLoopProvider;
 
 use crate::agent_pool::AgentPool;
@@ -47,15 +46,8 @@ pub struct ChatResources {
     /// surfaces pass this Arc through unchanged; `drive_chat` acquires the
     /// generation only after foreground admission succeeds.
     pub review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
-    /// Memory layer manager for durable write-back of completed runs
-    /// (B5.1): `create_complex_task` forwards this into the background Run's
-    /// payload so `execute_run` (settled best-effort policy) lands the
-    /// `taskrun:completed:{run_id}` memory before returning. `None` when the
-    /// caller has no review/memory subsystem wired (minimal tests/embedders) — the
-    /// write becomes a no-op.
-    pub layer_manager: Option<Arc<MemoryLayerManager>>,
-    /// Pins every memory/evidence write initiated by this turn to the same
-    /// workspace generation as `layer_manager`.
+    /// Pins every memory/evidence write initiated by this turn to one shared
+    /// generation-bound manager and projection source.
     pub memory_generation: Option<crate::evolution::ReviewGenerationLease>,
     /// Surface-owned approval/input transport. Long-horizon continuation
     /// replays this onto its run-scoped pooled agent for every finite turn.

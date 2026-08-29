@@ -881,7 +881,7 @@ async fn drive_background_run(
     }
     let layer_manager = memory_generation
         .as_ref()
-        .map(|generation| generation.create_layer_manager().map(Arc::new))
+        .map(crate::evolution::ReviewGenerationLease::layer_manager)
         .transpose()
         .map_err(|error| format!("memory layer unavailable: {error}"))?;
     let lease = match agent_provider.acquire_for_task(&run_id).await {
@@ -922,7 +922,6 @@ async fn drive_background_run(
             store.clone(),
             Some(agent),
             reviewer_llm,
-            layer_manager,
             memory_generation,
             None,
             None,

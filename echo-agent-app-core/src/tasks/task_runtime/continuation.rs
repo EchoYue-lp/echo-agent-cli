@@ -94,7 +94,6 @@ impl ContinuationLauncher {
                 attachments: self.resources.attachments.clone(),
                 cancel: CancellationToken::new(),
                 review_integration: self.resources.review_integration.clone(),
-                layer_manager: None,
                 memory_generation: None,
                 human_loop_provider: self.resources.human_loop_provider.clone(),
             }),
@@ -203,7 +202,6 @@ impl TaskContinuationRuntime {
             attachments: resources.attachments.clone(),
             cancel: CancellationToken::new(),
             review_integration: resources.review_integration.clone(),
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: resources.human_loop_provider.clone(),
         });
@@ -865,7 +863,6 @@ async fn drive_continuation_turn(
         attachments: launcher.resources.attachments.clone(),
         cancel,
         review_integration: launcher.resources.review_integration.clone(),
-        layer_manager: None,
         memory_generation: None,
         human_loop_provider: launcher.resources.human_loop_provider.clone(),
     });
@@ -1377,7 +1374,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -1715,7 +1711,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -1801,7 +1796,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -1991,7 +1985,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });

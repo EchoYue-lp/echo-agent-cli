@@ -429,7 +429,6 @@ async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> a
         attachments: Vec::new(),
         cancel: lease.cancellation_token(),
         review_integration: runtime.review_integration(),
-        layer_manager: None,
         memory_generation: None,
         human_loop_provider: Some(Arc::new(crate::hitl::HitlDispatcher::new())),
     });

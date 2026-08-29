@@ -788,7 +788,6 @@ pub async fn send_chat_message(
         attachments: prepared_turn.inline_attachment_refs(),
         cancel: cancel_token.clone(),
         review_integration: scoped_runtime.review_integration(),
-        layer_manager: None,
         memory_generation: None,
         human_loop_provider: Some(hitl_handler),
     });

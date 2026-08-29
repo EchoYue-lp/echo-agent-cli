@@ -45,6 +45,7 @@ pub mod product_data_io;
 pub mod profiles;
 pub mod project;
 pub mod prompt_contract;
+pub mod reflection;
 pub mod research;
 pub mod research_connectors;
 pub mod research_tool;

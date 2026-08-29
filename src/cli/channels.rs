@@ -1277,7 +1277,6 @@ impl input_pump::ChannelInputPumpAdapter for ChannelInputPumpAdapter {
                 attachments: turn.inline_attachment_refs(),
                 cancel,
                 review_integration: item.runtime.review_integration(),
-                layer_manager: None,
                 memory_generation: None,
                 human_loop_provider: Some(self.hitl.clone()),
             });
@@ -3376,6 +3375,28 @@ fn parse_developer_command(message: &str) -> Result<Option<(String, Vec<String>)
 }
 
 #[cfg(feature = "channels")]
+fn render_channel_reflection_receipt(
+    receipt: &echo_agent_app_core::reflection::ReflectionReceipt,
+) -> String {
+    receipt.display_message()
+}
+
+#[cfg(all(feature = "channels", test))]
+mod reflection_adapter_tests {
+    #[test]
+    fn channel_parser_and_projection_use_the_shared_contract() -> Result<(), String> {
+        let parsed = echo_agent_app_core::reflection::ReflectionCommand::parse("/reflect")
+            .map_err(|error| error.to_string())?;
+        assert!(parsed.is_some());
+        let receipt = echo_agent_app_core::reflection::reflection_receipt_fixture();
+        let rendered = super::render_channel_reflection_receipt(&receipt);
+        assert!(rendered.contains(&receipt.key));
+        assert!(rendered.contains(&receipt.content_summary));
+        Ok(())
+    }
+}
+
+#[cfg(feature = "channels")]
 #[async_trait::async_trait]
 impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
     async fn handle(
@@ -3624,6 +3645,49 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             let message = match settle_channel_turn_after_input_observers(lease, outcome).await {
                 Ok(_) => message,
                 Err(error) => format!("{message}; foreground settlement failed: {error}"),
+            };
+            return Ok(immediate_channel_response(&msg, message));
+        }
+        let reflection_command =
+            match echo_agent_app_core::reflection::ReflectionCommand::parse(&msg.text) {
+                Ok(command) => command,
+                Err(error) => return Ok(immediate_channel_response(&msg, error.to_string())),
+            };
+        if reflection_command.is_some() {
+            if !msg.attachments.is_empty() {
+                return Ok(immediate_channel_response(
+                    &msg,
+                    "/reflect does not accept attachments",
+                ));
+            }
+            let runtime = match self.app_state.current_control_runtime().await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Reflection unavailable: {error}"),
+                    ));
+                }
+            };
+            let execution = match runtime.agent_for(&agent_conv).await {
+                Ok(execution) => execution,
+                Err(error) => {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Reflection unavailable: {error}"),
+                    ));
+                }
+            };
+            let agent = execution.agent();
+            let message = match echo_agent_app_core::reflection::reflect_session(
+                &runtime,
+                &agent,
+                Some(&conv),
+            )
+            .await
+            {
+                Ok(receipt) => render_channel_reflection_receipt(&receipt),
+                Err(error) => format!("Reflection failed: {error}"),
             };
             return Ok(immediate_channel_response(&msg, message));
         }
@@ -4540,7 +4604,6 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                             attachments: turn.inline_attachment_refs(),
                             cancel: foreground_lease.cancellation_token(),
                             review_integration,
-                            layer_manager: None,
                             memory_generation: None,
                             human_loop_provider: Some(hitl.clone()),
                         });
@@ -6629,7 +6692,6 @@ mod tests {
             attachments: Vec::new(),
             cancel,
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });

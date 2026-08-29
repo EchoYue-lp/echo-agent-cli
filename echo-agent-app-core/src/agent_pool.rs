@@ -674,11 +674,6 @@ pub struct AgentPool {
     /// Sole owned cleanup monitor settlement handle. The monitor holds only a
     /// weak pool reference so a failed bootstrap cannot keep the pool alive.
     cleanup_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Workspace-scoped memory store override. Set by `apply_memory_store`
-    /// on workspace switch so newly-created pool agents also bind to the
-    /// current workspace's memory store (not the stale shared.store captured
-    /// at bootstrap). `None` means "use shared.store" (pre-switch behavior).
-    memory_store_override: RwLock<Option<Arc<dyn echo_agent::memory::Store>>>,
     /// Workspace-scoped conversation store used by existing and future agents.
     conversation_store_override: RwLock<Option<Arc<dyn echo_agent::memory::ConversationStore>>>,
     /// Workspace-scoped runtime-state store used by existing and future agents.
@@ -1074,7 +1069,6 @@ impl AgentPool {
             )),
             cleanup_cancel: CancellationToken::new(),
             cleanup_handle: Mutex::new(None),
-            memory_store_override: RwLock::new(None),
             conversation_store_override: RwLock::new(None),
             state_store_override: RwLock::new(None),
             tool_output_artifacts: RwLock::new(tool_output_artifacts),
@@ -1180,7 +1174,6 @@ impl AgentPool {
             agent_generation: RwLock::new(authority_plugin_generation.clone()),
             cleanup_cancel: CancellationToken::new(),
             cleanup_handle: Mutex::new(None),
-            memory_store_override: RwLock::new(None),
             conversation_store_override: RwLock::new(None),
             state_store_override: RwLock::new(None),
             tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(Some(
@@ -1345,7 +1338,6 @@ impl AgentPool {
             agent_generation: RwLock::new(AgentPluginGeneration::default()),
             cleanup_cancel: CancellationToken::new(),
             cleanup_handle: Mutex::new(None),
-            memory_store_override: RwLock::new(None),
             conversation_store_override: RwLock::new(None),
             state_store_override: RwLock::new(None),
             tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
@@ -1998,138 +1990,6 @@ impl AgentPool {
         }
     }
 
-    /// Rebind all pooled agents to a workspace-scoped memory store.
-    ///
-    /// Called after `switch_workspace` so that pooled agents (background +
-    /// multi-session) read/write memories from the new workspace's store
-    /// (`{root}/.eko/memory/store.json`), not the stale bootstrap store.
-    /// Also sets the `memory_store_override` so *future* pool agents created
-    /// post-switch bind to the same store.
-    ///
-    /// Mirrors the primary-agent store swap done in `AppState::switch_workspace`.
-    /// `ReviewIntegration` is expected to have been `rebind`-ed by the caller
-    /// already — `create_layer_manager` reads the rebound dir/store.
-    pub async fn apply_memory_store(&self, workspace_root: &std::path::Path) {
-        let store = match crate::infra::create_memory_store_for_workspace(workspace_root) {
-            Some(s) => s,
-            None => {
-                tracing::warn!(
-                    root = %workspace_root.display(),
-                    "AgentPool: failed to create workspace memory store; pool unchanged"
-                );
-                return;
-            }
-        };
-        let echo_agent_dir = crate::workspace::layout::WorkspaceLayout::state_dir(workspace_root);
-        self.apply_memory_store_inner(store, echo_agent_dir).await;
-    }
-
-    /// Rebind all pooled agents to the global memory store (post-`exit_workspace`).
-    pub async fn apply_memory_store_global(&self) {
-        let store = match crate::infra::create_global_memory_store() {
-            Some(s) => s,
-            None => {
-                tracing::warn!("AgentPool: failed to create global memory store; pool unchanged");
-                return;
-            }
-        };
-        let (_, echo_agent_dir) = crate::infra::global_memory_paths();
-        self.apply_memory_store_inner(store, echo_agent_dir).await;
-    }
-
-    /// Shared implementation: swap store + rebuild layer manager on every
-    /// pooled agent, and record the override for future pool agents.
-    async fn apply_memory_store_inner(
-        &self,
-        store: Arc<dyn echo_agent::memory::Store>,
-        echo_agent_dir: std::path::PathBuf,
-    ) {
-        // (1) Record override so future create_agent calls in the pool bind
-        //     to this store instead of the stale `shared.store`.
-        {
-            let mut ovr = self.memory_store_override.write().await;
-            *ovr = Some(store.clone());
-        }
-        // (2) Hot-swap every existing pooled agent's store + layer manager.
-        let agents: Vec<AgentHandle> = self
-            .agents
-            .read()
-            .await
-            .values()
-            .map(|pa| pa.handle.clone())
-            .collect();
-        for handle in agents {
-            let store_clone = store.clone();
-            let evolution_observer = crate::evolution::evolution_hook_observer(&handle).await;
-            let skill_curator = self
-                .shared
-                .review_integration
-                .as_ref()
-                .map(|integration| integration.curator());
-            let layer_manager = match self
-                .shared
-                .review_integration
-                .as_ref()
-                .map(|integration| {
-                    integration.create_layer_manager_with_observer(evolution_observer)
-                })
-                .unwrap_or_else(|| {
-                    echo_agent::evolution::MemoryRuntimeIntegrationBuilder::new(
-                        echo_agent_dir.clone(),
-                        store_clone.clone(),
-                    )
-                    .build_layer_manager()
-                }) {
-                Ok(manager) => manager,
-                Err(error) => {
-                    tracing::error!(%error, "failed to rebuild pooled agent memory layer");
-                    continue;
-                }
-            };
-            handle
-                .write_async(|agent| {
-                    Box::pin(async move {
-                        agent.install_memory_store(store_clone.clone()).await;
-                        agent.install_memory_layer_manager(Arc::new(layer_manager));
-                        agent.set_skill_curator(skill_curator);
-                    })
-                })
-                .await;
-        }
-        let pooled_agents = self.agents.read().await.len();
-        tracing::info!(
-            dir = %echo_agent_dir.display(),
-            pooled_agents,
-            "AgentPool: memory store applied"
-        );
-    }
-
-    /// Refresh the independently-owned MEMORY.md projection for every pooled agent.
-    pub async fn refresh_hot_memory_context(&self) {
-        let root = self.working_dir.read().await.clone();
-        let agents: Vec<AgentHandle> = self
-            .agents
-            .read()
-            .await
-            .values()
-            .map(|pooled| pooled.handle.clone())
-            .collect();
-        for handle in agents {
-            let root = root.clone();
-            handle
-                .write_async(|agent| {
-                    Box::pin(async move {
-                        crate::unified_memory::refresh_hot_memory_projection(
-                            agent,
-                            root.as_deref(),
-                        )
-                        .await;
-                    })
-                })
-                .await;
-        }
-    }
-
     /// Current number of agents in the pool (including background).
     pub async fn pool_size(&self) -> usize {
         self.agents.read().await.len()
@@ -2481,30 +2341,30 @@ impl AgentPool {
         if let Some(ref cs) = conversation_store {
             agent.set_conversation_store(cs.clone());
         }
-        // Prefer the workspace-scoped override (set by apply_memory_store after
-        // a workspace switch) over the stale shared.store captured at bootstrap.
-        let effective_store = self
-            .memory_store_override
-            .read()
-            .await
-            .clone()
-            .or_else(|| self.shared.store.clone());
-        if let Some(ref st) = effective_store {
+        if let Some(ref st) = self.shared.store {
             agent.install_store(st.clone()).await;
         }
         if let Some(ref review_integration) = self.shared.review_integration {
-            let evolution_observer = Arc::new(echo_agent::evolution::HookEvolutionObserver::new(
-                agent.hook_registry().clone(),
-                agent.config().get_session_id().unwrap_or(""),
-                agent.config().get_agent_name(),
-            ));
-            let layer_manager = Arc::new(
-                review_integration.create_layer_manager_with_observer(evolution_observer)?,
-            );
+            let memory_generation = review_integration
+                .lease_generation()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let layer_manager = memory_generation.layer_manager()?;
             agent.install_memory_layer_manager(layer_manager);
             agent.set_memory_trigger_sink(Some(review_integration.clone()));
             agent.set_skill_load_policy(Some(review_integration.clone()));
             agent.set_skill_curator(Some(review_integration.curator()));
+            let mut projector = crate::turn_context::EkoContextProjector::new(
+                crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
+                crate::turn_context::turn_prompt_context_registry(),
+            )
+            .with_hot_memory_source(review_integration.hot_memory_projection_source());
+            if let (Some(command_cells), Some(execution_scope)) = (
+                self.shared.command_cell_runtime.clone(),
+                self.shared.execution_scope.clone(),
+            ) {
+                projector = projector.with_awaiter_results(command_cells, execution_scope);
+            }
+            agent.set_pre_model_context_projector(Some(Arc::new(projector)));
         }
         if let Some(ref ps) = self.shared.permission_service {
             agent.set_permission_service(ps.clone());
@@ -3735,6 +3595,85 @@ mod tests {
             has_layer_manager,
             "pooled agents must install MemoryLayerManager so TriggerDetector writes real memory"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn primary_existing_and_future_agents_share_exact_scoped_memory_arc() -> TestResult {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store_a = Arc::new(echo_agent::memory::InMemoryStore::new())
+            as Arc<dyn echo_agent::memory::Store>;
+        let integration_a = Arc::new(crate::evolution::ReviewIntegration::new_scoped(
+            echo_agent::evolution::ReviewConfig::default(),
+            temp.path().join("workspace-a/.eko"),
+            store_a.clone(),
+            "workspace-a".to_string(),
+            "generation-a".to_string(),
+        ));
+        let manager_a = integration_a
+            .lease_generation()
+            .map_err(|error| error.to_string())?
+            .layer_manager()
+            .map_err(|error| error.to_string())?;
+        let primary = create_test_agent_handle()?;
+        let primary_manager = manager_a.clone();
+        primary
+            .write(|agent| agent.install_memory_layer_manager(primary_manager))
+            .await;
+        let pool = AgentPool::new_for_test(
+            primary.clone(),
+            Some(integration_a.clone()),
+            Some(store_a),
+            3,
+            false,
+        )
+        .await;
+
+        let existing = pool
+            .acquire("existing-memory-generation")
+            .await
+            .map_err(|error| error.to_string())?;
+        let existing_manager = existing
+            .agent()
+            .read(|agent| agent.memory_layer_manager().cloned())
+            .await
+            .ok_or_else(|| "existing pooled Agent has no memory manager".to_string())?;
+        drop(existing);
+        let future = pool
+            .acquire("future-memory-generation")
+            .await
+            .map_err(|error| error.to_string())?;
+        let future_manager = future
+            .agent()
+            .read(|agent| agent.memory_layer_manager().cloned())
+            .await
+            .ok_or_else(|| "future pooled Agent has no memory manager".to_string())?;
+        let installed_primary = primary
+            .read(|agent| agent.memory_layer_manager().cloned())
+            .await
+            .ok_or_else(|| "primary Agent has no memory manager".to_string())?;
+
+        assert!(Arc::ptr_eq(&manager_a, &installed_primary));
+        assert!(Arc::ptr_eq(&manager_a, &existing_manager));
+        assert!(Arc::ptr_eq(&manager_a, &future_manager));
+
+        let integration_b = crate::evolution::ReviewIntegration::new_scoped(
+            echo_agent::evolution::ReviewConfig::default(),
+            temp.path().join("workspace-b/.eko"),
+            Arc::new(echo_agent::memory::InMemoryStore::new()),
+            "workspace-b".to_string(),
+            "generation-b".to_string(),
+        );
+        let manager_b = integration_b
+            .lease_generation()
+            .map_err(|error| error.to_string())?
+            .layer_manager()
+            .map_err(|error| error.to_string())?;
+        assert!(!Arc::ptr_eq(&manager_a, &manager_b));
+        assert!(!Arc::ptr_eq(
+            &integration_a.hot_memory_projection_source(),
+            &integration_b.hot_memory_projection_source(),
+        ));
         Ok(())
     }
 

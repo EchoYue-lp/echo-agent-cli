@@ -2147,7 +2147,6 @@ async fn dispatch_turn(
         attachments: task_attachments,
         cancel: lease.cancellation_token(),
         review_integration: scoped_runtime.review_integration(),
-        layer_manager: None,
         memory_generation: None,
         human_loop_provider: app.human_loop_provider.clone().map(|provider| {
             provider as std::sync::Arc<dyn echo_agent::human_loop::HumanLoopProvider>
@@ -3893,32 +3892,26 @@ async fn current_tui_memory_control(
     let generation = integration
         .lease_generation()
         .map_err(|error| error.to_string())?;
-    let layer_manager = Arc::new(
-        generation
-            .create_layer_manager()
-            .map_err(|error| error.to_string())?,
-    );
+    let layer_manager = generation
+        .layer_manager()
+        .map_err(|error| error.to_string())?;
     Ok((runtime, generation, layer_manager))
 }
 
-async fn refresh_tui_hot_memory_projection(
-    runtime: &echo_agent_app_core::state::ScopedChatRuntime,
-) {
-    let agent = runtime.primary_agent();
-    let root = agent.read(|value| value.working_dir()).await;
-    agent
-        .write_async(|value| {
-            Box::pin(async move {
-                echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
-                    value,
-                    root.as_deref(),
-                )
-                .await;
-            })
-        })
-        .await;
-    if let Some(pool) = runtime.pool() {
-        pool.refresh_hot_memory_context().await;
+fn render_tui_reflection_receipt(
+    receipt: &echo_agent_app_core::reflection::ReflectionReceipt,
+) -> String {
+    receipt.display_message()
+}
+
+#[cfg(test)]
+mod reflection_adapter_tests {
+    #[test]
+    fn tui_projects_the_shared_reflection_receipt() {
+        let receipt = echo_agent_app_core::reflection::reflection_receipt_fixture();
+        let rendered = super::render_tui_reflection_receipt(&receipt);
+        assert!(rendered.contains(&receipt.key));
+        assert!(rendered.contains(&receipt.content_summary));
     }
 }
 
@@ -4406,11 +4399,41 @@ async fn handle_slash_command(
                 content,
             });
         }
+        Some(SlashCommand::Reflect) => {
+            let reflection_input = if args.trim().is_empty() {
+                "/reflect".to_string()
+            } else {
+                format!("/reflect {}", args.trim())
+            };
+            if let Err(error) =
+                echo_agent_app_core::reflection::ReflectionCommand::parse(&reflection_input)
+            {
+                return push_system_message(app, error.to_string());
+            }
+            let runtime = match current_tui_control_runtime(app).await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return push_system_message(app, format!("Reflection unavailable: {error}"));
+                }
+            };
+            let conversation_id = app.conversation_id.clone();
+            let content = match echo_agent_app_core::reflection::reflect_session(
+                &runtime,
+                agent,
+                conversation_id.as_deref(),
+            )
+            .await
+            {
+                Ok(receipt) => render_tui_reflection_receipt(&receipt),
+                Err(error) => format!("Reflection failed: {error}"),
+            };
+            push_system_message(app, content);
+        }
         Some(SlashCommand::Remember) => {
             if args.trim().is_empty() {
                 return push_system_message(app, "Usage: /remember <fact>".to_string());
             }
-            let (runtime, _memory_generation, layer_manager) =
+            let (_runtime, memory_generation, layer_manager) =
                 match current_tui_memory_control(app).await {
                     Ok(control) => control,
                     Err(error) => {
@@ -4424,11 +4447,14 @@ async fn handle_slash_command(
                 "explicit",
             );
             let content = match layer_manager.write_memory(&key, args.trim(), meta).await {
-                Ok(promotion) => {
-                    if promotion.is_some() {
-                        refresh_tui_hot_memory_projection(&runtime).await;
+                Ok(_) => {
+                    let projection = memory_generation.settle_hot_memory_projection().await;
+                    match projection.error {
+                        Some(error) => format!(
+                            "Memory saved with key: {key}\nProjection remains pending: {error}"
+                        ),
+                        None => format!("Memory saved with key: {key}"),
                     }
-                    format!("Memory saved with key: {key}")
                 }
                 Err(error) => format!("Failed to save memory: {error}"),
             };
@@ -4441,7 +4467,7 @@ async fn handle_slash_command(
             if args.trim().is_empty() {
                 return push_system_message(app, "Usage: /forget <key-or-query>".to_string());
             }
-            let (runtime, _memory_generation, layer_manager) =
+            let (_runtime, memory_generation, layer_manager) =
                 match current_tui_memory_control(app).await {
                     Ok(control) => control,
                     Err(error) => {
@@ -4477,19 +4503,19 @@ async fn handle_slash_command(
                 }
             };
             let content = match key {
-                Some(key) => {
-                    let layer = layer_manager.locate(&key).await.map(|(layer, _)| layer);
-                    match layer_manager.delete_memory(&key).await {
-                        Ok(true) => {
-                            if layer == Some(echo_agent::evolution::MemoryLayer::Hot) {
-                                refresh_tui_hot_memory_projection(&runtime).await;
-                            }
-                            format!("Removed memory: {key}")
+                Some(key) => match layer_manager.delete_memory(&key).await {
+                    Ok(true) => {
+                        let projection = memory_generation.settle_hot_memory_projection().await;
+                        match projection.error {
+                            Some(error) => format!(
+                                "Removed memory: {key}\nProjection remains pending: {error}"
+                            ),
+                            None => format!("Removed memory: {key}"),
                         }
-                        Ok(false) => "No matching memory found.".to_string(),
-                        Err(error) => format!("Failed to remove memory: {error}"),
                     }
-                }
+                    Ok(false) => "No matching memory found.".to_string(),
+                    Err(error) => format!("Failed to remove memory: {error}"),
+                },
                 None => "No unambiguous matching memory found.".to_string(),
             };
             app.messages.push(ChatMessage {
@@ -4953,10 +4979,23 @@ async fn handle_slash_command(
                     } else {
                         let store = evidence_generation.evidence_store();
                         match queue_observations(&store, &observations, &messages) {
-                            Ok(candidates) => format!(
-                                "Queued {} auto-memory candidate(s) in Review Inbox.",
-                                candidates.len()
-                            ),
+                            Ok(candidates) => {
+                                let projection = if candidates.is_empty() {
+                                    None
+                                } else {
+                                    Some(evidence_generation.settle_hot_memory_projection().await)
+                                };
+                                let mut message = format!(
+                                    "Queued {} auto-memory candidate(s) in Review Inbox.",
+                                    candidates.len()
+                                );
+                                if let Some(error) = projection.and_then(|receipt| receipt.error) {
+                                    message.push_str(&format!(
+                                        "\nProjection remains pending: {error}"
+                                    ));
+                                }
+                                message
+                            }
                             Err(error) => format!("Auto-memory extraction failed: {error}"),
                         }
                     }
@@ -5054,7 +5093,7 @@ async fn handle_slash_command(
                     return;
                 }
             };
-            let settled = match review_lease.track_background_review(handle).await {
+            let settled = match review_lease.clone().track_background_review(handle).await {
                 Ok(mut pass) => pass.settle().await,
                 Err(error) => Err(error),
             };
@@ -5071,8 +5110,13 @@ async fn handle_slash_command(
                     });
                 }
                 Ok(settlement) => {
+                    let projection = if settlement.evidence_candidate.is_some() {
+                        Some(review_lease.settle_hot_memory_projection().await)
+                    } else {
+                        None
+                    };
                     let outcome = settlement.outcome;
-                    let content = match outcome.candidate {
+                    let mut content = match outcome.candidate {
                         Some(candidate) => format!(
                             "Candidate ({:?}, confidence {:.2}): {}\nEvidence: {}\n{}",
                             candidate.kind,
@@ -5088,6 +5132,9 @@ async fn handle_slash_command(
                         ),
                         None => outcome.actions.join("\n"),
                     };
+                    if let Some(error) = projection.and_then(|receipt| receipt.error) {
+                        content.push_str(&format!("\nProjection remains pending: {error}"));
+                    }
                     app.messages.push(ChatMessage {
                         role: MessageRole::System,
                         content,
@@ -5198,7 +5245,17 @@ async fn handle_slash_command(
                 },
                 "edit" => match (candidate_id, content) {
                     (Some(id), Some(new_content)) => match store.edit(id, new_content) {
-                        Ok(candidate) => format!("Updated {}.", candidate.candidate_id),
+                        Ok(candidate) => {
+                            let projection =
+                                memory_generation.settle_hot_memory_projection().await;
+                            match projection.error {
+                                Some(error) => format!(
+                                    "Updated {}.\nProjection remains pending: {error}",
+                                    candidate.candidate_id
+                                ),
+                                None => format!("Updated {}.", candidate.candidate_id),
+                            }
+                        }
                         Err(error) => format!("Failed to edit candidate: {error}"),
                     },
                     _ => {
@@ -5207,7 +5264,17 @@ async fn handle_slash_command(
                 },
                 "reject" => match candidate_id {
                     Some(id) => match store.reject(id) {
-                        Ok(candidate) => format!("Rejected {}.", candidate.candidate_id),
+                        Ok(candidate) => {
+                            let projection =
+                                memory_generation.settle_hot_memory_projection().await;
+                            match projection.error {
+                                Some(error) => format!(
+                                    "Rejected {}.\nProjection remains pending: {error}",
+                                    candidate.candidate_id
+                                ),
+                                None => format!("Rejected {}.", candidate.candidate_id),
+                            }
+                        }
                         Err(error) => format!("Failed to reject candidate: {error}"),
                     },
                     None => "Usage: /evidence-inbox reject <candidate-id>".to_string(),
@@ -5221,7 +5288,18 @@ async fn handle_slash_command(
                         };
                         match action {
                             Ok(candidate) => {
-                                format!("{} is now {:?}.", candidate.candidate_id, candidate.status)
+                                let projection =
+                                    memory_generation.settle_hot_memory_projection().await;
+                                match projection.error {
+                                    Some(error) => format!(
+                                        "{} is now {:?}.\nProjection remains pending: {error}",
+                                        candidate.candidate_id, candidate.status
+                                    ),
+                                    None => format!(
+                                        "{} is now {:?}.",
+                                        candidate.candidate_id, candidate.status
+                                    ),
+                                }
                             }
                             Err(error) => format!("Review Inbox action failed: {error}"),
                         }
@@ -6491,52 +6569,41 @@ async fn start_tui_task_retry_driver(
             task_id,
             cancel.clone(),
             move || {
-            let memory_generation = review_integration
-                .as_ref()
-                .map(|integration| integration.lease_generation())
-                .transpose()
-                .map_err(|error| {
-                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
-                        "memory generation unavailable: {error}"
-                    ))
-                })?;
-            let layer_manager = memory_generation
-                .as_ref()
-                .map(|generation| generation.create_layer_manager().map(Arc::new))
-                .transpose()
-                .map_err(|error| {
-                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
-                        "layered memory unavailable: {error}"
-                    ))
-                })?;
-            Ok((memory_generation, layer_manager))
+                review_integration
+                    .as_ref()
+                    .map(|integration| integration.lease_generation())
+                    .transpose()
+                    .map_err(|error| {
+                        echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                            "memory generation unavailable: {error}"
+                        ))
+                    })
             },
-            move |(memory_generation, layer_manager), mut receipt_owner| async move {
-            let _pool_execution = pool_execution;
-            if let Some(generation) = memory_generation.as_ref() {
-                receipt_owner.retain(generation.clone());
-            }
-            let reviewer_llm = agent.read(|value| value.llm_client().cloned()).await;
-            let run_store = agent.read(|value| value.run_store().cloned()).await;
-            let result = echo_agent_app_core::tasks::task_runtime::execute_run(
-                preparation_store,
-                Some(agent),
-                reviewer_llm,
-                layer_manager,
-                memory_generation,
-                run_store,
-                None,
-                &preparation_run_id,
-                cancel,
-                echo_agent_app_core::tasks::task_runtime::MemoryPolicy::BestEffortSettled,
-                workspace_io,
-            )
-            .await;
-            if let Err(error) = result {
-                tracing::error!(run_id = %preparation_run_id, %error, "TUI task retry driver failed");
-                return Err(error.to_string());
-            }
-            Ok(())
+            move |memory_generation, mut receipt_owner| async move {
+                let _pool_execution = pool_execution;
+                if let Some(generation) = memory_generation.as_ref() {
+                    receipt_owner.retain(generation.clone());
+                }
+                let reviewer_llm = agent.read(|value| value.llm_client().cloned()).await;
+                let run_store = agent.read(|value| value.run_store().cloned()).await;
+                let result = echo_agent_app_core::tasks::task_runtime::execute_run(
+                    preparation_store,
+                    Some(agent),
+                    reviewer_llm,
+                    memory_generation,
+                    run_store,
+                    None,
+                    &preparation_run_id,
+                    cancel,
+                    echo_agent_app_core::tasks::task_runtime::MemoryPolicy::BestEffortSettled,
+                    workspace_io,
+                )
+                .await;
+                if let Err(error) = result {
+                    tracing::error!(run_id = %preparation_run_id, %error, "TUI task retry driver failed");
+                    return Err(error.to_string());
+                }
+                Ok(())
             },
         )
         .await?;

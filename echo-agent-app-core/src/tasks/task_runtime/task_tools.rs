@@ -1011,19 +1011,6 @@ impl CreateComplexTaskTool {
                 )));
             }
         };
-        let layer_manager = match memory_generation
-            .as_ref()
-            .map(|generation| generation.create_layer_manager().map(Arc::new))
-            .transpose()
-        {
-            Ok(manager) => manager.or_else(|| res.layer_manager.clone()),
-            Err(error) => {
-                registration.reject(error.to_string());
-                return Ok(ToolResult::error(format!(
-                    "Memory layer unavailable: {error}"
-                )));
-            }
-        };
         registration.mark_preparation_started();
         if let Err(e) = store.create_run_for_active_workspace(
             &run_id,
@@ -1069,11 +1056,6 @@ impl CreateComplexTaskTool {
                 pool,
                 store: payload_store,
                 cancel: run_cancel,
-                // B5.1: forward the chat turn's memory layer so the run's settled
-                // memory write (drive_run_async → execute_run) actually lands the
-                // taskrun:completed:{run_id} memory. None when no memory subsystem
-                // best-effort write is wired (otherwise the write is a no-op).
-                layer_manager,
                 memory_generation,
                 trace_sink,
                 prompt: run_prompt,

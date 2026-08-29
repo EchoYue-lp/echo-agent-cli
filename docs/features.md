@@ -86,7 +86,7 @@ store。
 | 医学研究     | PICO/PECO、screening、RoB、GRADE、PRISMA、适用性风险                       | `web-frontend/src/components/papers/ReviewWorkbench.tsx` |
 | Sandbox      | GUI 已挂载配置、可用性检查和真实本地 sandbox execution                     | `src/tauri/commands/panels.rs`                           |
 | 定时任务     | file-backed cron scheduler 与 GUI/TUI/CLI 控制                             | `echo-agent-app-core/src/scheduler/`                     |
-| 记忆与自进化 | layered memory、Review Inbox、Curator、rule/Skill promotion、dashboard     | `echo-agent-app-core/src/evolution/`                     |
+| 记忆与自进化 | generation-bound layered memory、safe-point hot projection、`/reflect`、Review Inbox、Curator、rule/Skill promotion、dashboard | `echo-agent-app-core/src/evolution/`、`echo-agent-app-core/src/reflection.rs` |
 
 ## 配置与可观测性
 

@@ -92,6 +92,22 @@ retirement guard 清理对应 inbox。完整取舍见
 `AgentPool`、TaskRuntime、ReviewIntegration、Plugin/MCP receipts。切换 GUI focus 不会重绑
 已经接受的运行。
 
+### Memory generation 与模型 safe point
+
+每个 global/workspace `ReviewIntegration` 拥有一个 generation-bound
+`Arc<MemoryLayerManager>` 和一个共享 `HotMemoryProjectionSource`。primary、已有 pool Agent 与
+未来创建的 pool Agent 都在每次 pre-model safe point 从同一个 source 读取不可变 snapshot；
+memory mutation settlement 只读一次磁盘并原子发布，不逐 Agent 加锁或执行 I/O。
+
+公开 receipt 同时携带 authority scope、workspace generation、SHA-256 content revision、
+changed、settled/degraded、当前 primary/pool/future binding 以及 pending repair debt。durable
+write 成功但 projection 失败时不回滚事实；下一次 settlement 修复同一 debt。bootstrap 在首次
+turn admission 前完成初始发布，workspace retirement 会清空 targets 并 fence 旧 lease。
+
+`/reflect`、remember/forget、evidence、TaskRuntime、Dreaming 与模型工具写入都复用同一个
+manager/service；CLI、TUI、GUI、JSONL 和 channel 只是输入与 typed receipt 适配层。完整取舍见
+[ADR 0024](./adr/0024-generation-bound-hot-memory-projection.md)。
+
 当前 runtime reliability 工作正在把剩余 Tauri 查询、控制、事件、恢复和删除路径都
 收敛到显式 workspace/conversation identity；详见
 [`design/specs/runtime-reliability.md`](../design/specs/runtime-reliability.md)。
@@ -249,8 +265,8 @@ EKO 启动时把 framework 用户数据根设置为 `~/.eko`，也可用 `EKO_DA
 - Skill：内置和用户 Skill 都通过 framework loader；SkillsHub 负责 artifact
   discovery/install/sync，不拥有第二份 live registry。
 - 分析/研究：计划、脚本、数据、source/evidence/review/report 都保存为可检查 artifact。
-- Memory/evolution：workspace-bound layered memory 和 Review Inbox 是应用策略，写入需要
-  可追溯证据。
+- Memory/evolution：workspace-bound layered memory、Review Inbox、shared hot projection 与
+  `/reflect` 是应用策略；写入需要可追溯证据，并返回 generation-bound settlement receipt。
 
 完整的已实现能力与代码入口见 [功能总览](./features.md)。
 

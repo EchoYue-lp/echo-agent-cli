@@ -150,7 +150,7 @@ fn build_fire_fn_with_cancel(
                 }
                 let layer_manager = memory_generation
                     .as_ref()
-                    .map(|generation| generation.create_layer_manager().map(Arc::new))
+                    .map(crate::evolution::ReviewGenerationLease::layer_manager)
                     .transpose()
                     .map_err(|error| format!("cron memory layer unavailable: {error}"))?;
 

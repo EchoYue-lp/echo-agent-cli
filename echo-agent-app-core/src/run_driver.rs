@@ -21,7 +21,6 @@
 use std::sync::Arc;
 
 use echo_agent::agent::CancellationToken;
-use echo_agent::evolution::MemoryLayerManager;
 use echo_agent::human_loop::HumanLoopProvider;
 
 use crate::agent_pool::AgentPool;
@@ -44,7 +43,6 @@ pub struct RunPayload {
     /// background runs — see spec §5.5). Foreground runs may share the turn
     /// token, but using an independent one keeps the logic uniform.
     pub cancel: CancellationToken,
-    pub layer_manager: Option<Arc<MemoryLayerManager>>,
     pub memory_generation: Option<crate::evolution::ReviewGenerationLease>,
     /// Execution-flow sink forwarded into the independent Agent so its
     /// thinking/tool/token events reach the frontend's `execution://event`
@@ -70,7 +68,6 @@ struct RunExecutionPayload {
     run_id: String,
     store: Arc<TaskRuntimeStore>,
     cancel: CancellationToken,
-    layer_manager: Option<Arc<MemoryLayerManager>>,
     memory_generation: Option<crate::evolution::ReviewGenerationLease>,
     trace_sink: Option<ExecSink>,
     prompt: String,
@@ -98,7 +95,6 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
         pool,
         store,
         cancel,
-        layer_manager,
         memory_generation,
         trace_sink,
         prompt,
@@ -157,7 +153,6 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
             run_id,
             store,
             cancel,
-            layer_manager,
             memory_generation,
             trace_sink,
             prompt,
@@ -250,7 +245,6 @@ async fn drive_run_async_inner(
     if let Some(event) = memory_event {
         crate::tasks::task_runtime::memory_bridge::write_memory_candidate_dispatch(
             MemoryPolicy::BestEffortSettled,
-            payload.layer_manager.as_ref(),
             payload.memory_generation.as_ref(),
             &payload.store,
             event,
@@ -388,7 +382,6 @@ mod tests {
                 run_id: run_id.to_string(),
                 store,
                 cancel: CancellationToken::new(),
-                layer_manager: None,
                 memory_generation: None,
                 trace_sink: None,
                 prompt: "Search for durable Agent research runtimes.".to_string(),

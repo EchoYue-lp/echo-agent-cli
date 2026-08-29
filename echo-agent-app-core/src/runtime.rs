@@ -815,12 +815,7 @@ impl ApplicationServices {
         let health_task = infra::spawn_mcp_health_check(app_state.clone(), root_cancel.clone());
         lifecycle.track_background_task("MCP health check", health_task);
         if let Some(review_integration) = app_state.review_integration.clone() {
-            let dreaming_task = infra::spawn_dreaming_task(
-                review_integration,
-                runtime.agent_handle.clone(),
-                Some(pool.clone()),
-                root_cancel,
-            );
+            let dreaming_task = infra::spawn_dreaming_task(review_integration, root_cancel);
             lifecycle.track_background_task("Dreaming", dreaming_task);
         }
 
@@ -1205,6 +1200,23 @@ impl AgentRuntime {
         if let Some(review_integration) = &review_integration {
             bootstrap_lifecycle.bind_review_integration(review_integration.clone());
             review_integration.bind_rule_projection_primary(agent_handle.clone());
+            let execution_scope = params.execution_scope.clone().unwrap_or_else(|| {
+                crate::workspace::WorkspaceExecutionScope::global(
+                    params
+                        .working_dir
+                        .clone()
+                        .unwrap_or_else(|| std::path::PathBuf::from(".")),
+                )
+            });
+            let projector = crate::turn_context::EkoContextProjector::new(
+                crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
+                crate::turn_context::turn_prompt_context_registry(),
+            )
+            .with_awaiter_results(command_cell_runtime.clone(), execution_scope)
+            .with_hot_memory_source(review_integration.hot_memory_projection_source());
+            agent_handle
+                .read(|agent| agent.set_pre_model_context_projector(Some(Arc::new(projector))))
+                .await;
             if let Err(error) = review_integration.initialize_rule_promotions().await {
                 let receipt = bootstrap_lifecycle
                     .settle(
@@ -1216,8 +1228,22 @@ impl AgentRuntime {
             }
             let evolution_observer = crate::evolution::evolution_hook_observer(&agent_handle).await;
             review_integration.set_evolution_observer(evolution_observer);
-            let layer_manager = match review_integration.create_layer_manager() {
-                Ok(layer_manager) => Arc::new(layer_manager),
+            let memory_generation = match review_integration.lease_generation() {
+                Ok(generation) => generation,
+                Err(error) => {
+                    let receipt = bootstrap_lifecycle
+                        .settle(
+                            ApplicationLifecycleReason::BootstrapRollback,
+                            Some(anyhow::anyhow!(
+                                "Failed to reserve memory generation: {error}"
+                            )),
+                        )
+                        .await;
+                    return Err(anyhow::Error::new(receipt.into_error()));
+                }
+            };
+            let layer_manager = match memory_generation.layer_manager() {
+                Ok(layer_manager) => layer_manager,
                 Err(error) => {
                     let receipt = bootstrap_lifecycle
                         .settle(
@@ -1249,6 +1275,19 @@ impl AgentRuntime {
                     })
                 })
                 .await;
+            let projection = memory_generation.settle_hot_memory_projection().await;
+            if projection.status == crate::evolution::MemoryProjectionSettlementStatus::Degraded {
+                let error = projection
+                    .error
+                    .unwrap_or_else(|| "initial hot-memory projection did not settle".to_string());
+                let receipt = bootstrap_lifecycle
+                    .settle(
+                        ApplicationLifecycleReason::BootstrapRollback,
+                        Some(anyhow::anyhow!(error)),
+                    )
+                    .await;
+                return Err(anyhow::Error::new(receipt.into_error()));
+            }
             tracing::info!("Layered memory, evidence sink, and skill policy installed");
         }
 
@@ -1346,107 +1385,6 @@ impl AgentRuntime {
         task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
     ) -> anyhow::Result<Arc<crate::agent_pool::AgentPool>> {
         crate::agent_pool::AgentPool::from_runtime(self, config, task_runtime_store).await
-    }
-
-    /// Trigger reflection on a completed task or session.
-    ///
-    /// Convenience wrapper around [`checkpoint_reflection`](Self::checkpoint_reflection)
-    /// that can be called from slash commands (`/reflect`) or session exit hooks.
-    pub async fn reflect_on_session(&self) {
-        self.checkpoint_reflection("session", "Interactive session completed", "Session ended")
-            .await;
-    }
-
-    /// Checkpoint Reflection: reflect on a completed skill execution and write
-    /// learnings back to project memory.
-    ///
-    /// This is a lightweight, non-blocking reflection that runs after a skill
-    /// successfully completes. It uses ~200 tokens to summarize key learnings.
-    pub async fn checkpoint_reflection(&self, skill_name: &str, task_summary: &str, result: &str) {
-        let Some(review_integration) = self.review_integration.as_ref() else {
-            tracing::warn!("Review integration unavailable; skipping checkpoint reflection");
-            return;
-        };
-        let memory_generation = match review_integration.lease_generation() {
-            Ok(generation) => generation,
-            Err(error) => {
-                tracing::warn!(%error, "Checkpoint reflection unavailable during workspace transition");
-                return;
-            }
-        };
-
-        // Build a concise prompt for the LLM
-        let prompt = format!(
-            "Reflect on the following completed task and summarize key learnings \
-             in 1-2 sentences.\n\n\
-             Skill: {skill_name}\n\
-             Task: {task_summary}\n\
-             Result: {result}\n\n\
-             Rules:\n\
-             - Focus on reusable insights (data quirks, tool behavior, user preferences)\n\
-             - Be specific\n\
-             - Do not include sensitive information\n\
-             - Max 200 tokens\n\n\
-             Reflection:"
-        );
-
-        // Clone the LLM client Arc so we can use it outside the read lock
-        let llm_client = self
-            .agent_handle
-            .read(|agent| agent.llm_client().cloned())
-            .await;
-
-        let Some(llm) = llm_client else {
-            tracing::debug!("No LLM client available, skipping checkpoint reflection");
-            return;
-        };
-
-        // Call LLM to generate reflection (lightweight, max 300 tokens, 2s timeout)
-        let reflection = {
-            let messages = vec![echo_agent::prelude::Message::user(prompt)];
-            let options = echo_agent::prelude::SimpleChatOptions::default().with_max_tokens(300);
-            let llm_call = llm.chat_simple_with_options(messages, options);
-
-            // Enforce 2-second wall-clock timeout
-            match tokio::time::timeout(std::time::Duration::from_secs(2), llm_call).await {
-                Ok(Ok(text)) => text,
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "LLM reflection failed, using fallback");
-                    format!("Completed {skill_name}: {task_summary}")
-                }
-                Err(_) => {
-                    tracing::warn!("LLM reflection timed out (>2s), using fallback");
-                    format!("Completed {skill_name}: {task_summary}")
-                }
-            }
-        };
-
-        // Write to the workspace root pinned before the LLM call.
-        let memory_dir = memory_generation.echo_agent_dir().join("memory");
-        if let Err(error) = std::fs::create_dir_all(&memory_dir) {
-            tracing::warn!(path = %memory_dir.display(), %error, "Failed to create project memory directory");
-            return;
-        }
-        let memory_file = memory_dir.join("PROJECT.md");
-
-        let entry = format!("\n## [{skill_name}] {task_summary}\n{reflection}\n");
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&memory_file)
-        {
-            Ok(mut file) => {
-                use std::io::Write;
-                if let Err(e) = file.write_all(entry.as_bytes()) {
-                    tracing::warn!(path = %memory_file.display(), error = %e, "Failed to write checkpoint reflection");
-                } else {
-                    tracing::info!(path = %memory_file.display(), skill = skill_name, "Checkpoint reflection written");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(path = %memory_file.display(), error = %e, "Failed to open project memory for writing");
-            }
-        }
     }
 }
 

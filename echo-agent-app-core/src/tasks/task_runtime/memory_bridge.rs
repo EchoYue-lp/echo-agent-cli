@@ -3,9 +3,9 @@
 //! Per the plan (§984-1017): all long-term memory writes must go through the
 //! single chokepoint `MemoryLayerManager::write_memory`. This module turns
 //! run/task lifecycle events into memory candidates and writes them through
-//! that API, reusing the `MemoryLayerManager` that `ReviewIntegration`
-//! already constructs for the primary agent (so there is exactly one write
-//! path, not a parallel one).
+//! that API. The retained `ReviewGenerationLease` returns the generation's
+//! shared manager and settles its hot-memory projection after each successful
+//! mutation batch, so no caller can pair a manager with the wrong generation.
 //!
 //! What gets written:
 //! - run completed (success) → a verified-fix / decision memory
@@ -17,7 +17,6 @@
 
 use std::sync::Arc;
 
-use echo_agent::evolution::MemoryLayerManager;
 use echo_agent::prelude::{MemoryMeta, MemorySource, MemoryType};
 
 use super::executor::TaskRuntimeBlockingAdapter;
@@ -78,16 +77,22 @@ pub enum MemoryEvent {
 /// failures are logged and swallowed, so memory cannot replace the TaskRun's
 /// business terminal outcome.
 pub async fn write_memory_candidate_settled(
-    layer_manager: Option<&Arc<MemoryLayerManager>>,
     memory_generation: Option<&crate::evolution::ReviewGenerationLease>,
     store: &Arc<TaskRuntimeStore>,
     event: MemoryEvent,
 ) {
-    let (Some(lm), Some(_memory_generation)) = (layer_manager, memory_generation) else {
-        tracing::debug!(event = ?event, "generation-bound memory manager unavailable; skipping settled memory write");
+    let Some(memory_generation) = memory_generation else {
+        tracing::debug!(event = ?event, "memory generation unavailable; skipping settled memory write");
         return;
     };
-    write_memory_candidate_inner(lm, store, event).await;
+    let layer_manager = match memory_generation.layer_manager() {
+        Ok(manager) => manager,
+        Err(error) => {
+            tracing::warn!(%error, "generation-bound memory manager unavailable");
+            return;
+        }
+    };
+    write_memory_candidate_inner(&layer_manager, memory_generation, store, event).await;
 }
 
 /// Dispatch a memory candidate write according to [`MemoryPolicy`] (B5.1).
@@ -96,11 +101,10 @@ pub async fn write_memory_candidate_settled(
 /// - `None` → no write (return immediately).
 /// - `BestEffortSettled` → await IO, while swallowing/logging memory errors.
 ///
-/// A missing manager or generation lease short-circuits to a no-op regardless
-/// of policy. The pair is one controlled resource and must never be split.
+/// A missing generation lease short-circuits to a no-op regardless of policy.
+/// The manager is always resolved from that lease.
 pub async fn write_memory_candidate_dispatch(
     policy: MemoryPolicy,
-    layer_manager: Option<&Arc<MemoryLayerManager>>,
     memory_generation: Option<&crate::evolution::ReviewGenerationLease>,
     store: &Arc<TaskRuntimeStore>,
     event: MemoryEvent,
@@ -108,13 +112,14 @@ pub async fn write_memory_candidate_dispatch(
     match policy {
         MemoryPolicy::None => {}
         MemoryPolicy::BestEffortSettled => {
-            write_memory_candidate_settled(layer_manager, memory_generation, store, event).await;
+            write_memory_candidate_settled(memory_generation, store, event).await;
         }
     }
 }
 
 async fn write_memory_candidate_inner(
-    lm: &Arc<MemoryLayerManager>,
+    layer_manager: &echo_agent::evolution::MemoryLayerManager,
+    memory_generation: &crate::evolution::ReviewGenerationLease,
     store: &Arc<TaskRuntimeStore>,
     event: MemoryEvent,
 ) {
@@ -125,16 +130,18 @@ async fn write_memory_candidate_inner(
             return;
         }
     };
+    let mut mutated = false;
     for candidate in candidates {
         let category = candidate.category.clone();
         let meta = MemoryMeta::new(candidate.memory_type, candidate.source, candidate.category)
             .with_confidence(candidate.confidence);
 
-        match lm
+        match layer_manager
             .write_memory(&candidate.key, &candidate.content, meta)
             .await
         {
             Ok(_) => {
+                mutated = true;
                 tracing::info!(
                     key = %candidate.key,
                     category = %category,
@@ -148,6 +155,23 @@ async fn write_memory_candidate_inner(
                     "memory write failed (non-fatal); skipping"
                 );
             }
+        }
+    }
+    if mutated {
+        let receipt = memory_generation.settle_hot_memory_projection().await;
+        if matches!(
+            receipt.status,
+            crate::evolution::review_integration::MemoryProjectionSettlementStatus::Degraded
+        ) {
+            tracing::warn!(
+                authority_scope = %receipt.authority_scope,
+                workspace_generation = %receipt.workspace_generation,
+                revision = receipt.revision,
+                status = ?receipt.status,
+                pending_revision = ?receipt.pending_revision,
+                error = ?receipt.error,
+                "hot-memory projection settlement degraded"
+            );
         }
     }
 }
@@ -394,11 +418,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_memory_candidate_is_a_noop_without_layer_manager() -> Result<(), String> {
+    async fn write_memory_candidate_is_a_noop_without_generation() -> Result<(), String> {
         let store = seeded_store()?;
-        // None for layer_manager → no panic, no error.
         write_memory_candidate_settled(
-            None,
             None,
             &store,
             MemoryEvent::RunCompleted {
@@ -419,13 +441,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_none_policy_is_a_noop_even_with_no_layer_manager() -> Result<(), String> {
-        // B5.1: MemoryPolicy::None short-circuits before touching the layer
-        // manager, so a None layer_manager is fine (no panic, returns fast).
+    async fn dispatch_none_policy_is_a_noop_even_with_no_generation() -> Result<(), String> {
+        // B5.1: MemoryPolicy::None short-circuits before touching the lease.
         let store = seeded_store()?;
         write_memory_candidate_dispatch(
             MemoryPolicy::None,
-            None,
             None,
             &store,
             MemoryEvent::RunCompleted {
@@ -438,14 +458,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_settled_with_no_layer_manager_returns_without_panic() -> Result<(), String> {
-        // BestEffortSettled + None layer manager → no-op (a caller without a memory
-        // subsystem can't write). Must NOT block forever or panic — this is the
-        // autonomous path's fallback when no layer manager is wired (TUI/channel).
+    async fn dispatch_settled_with_no_generation_returns_without_panic() -> Result<(), String> {
         let store = seeded_store()?;
         write_memory_candidate_dispatch(
             MemoryPolicy::BestEffortSettled,
-            None,
             None,
             &store,
             MemoryEvent::RunCompleted {
@@ -481,11 +497,9 @@ mod tests {
         let memory_generation = integration
             .lease_generation()
             .map_err(|error| error.to_string())?;
-        let lm = Arc::new(
-            memory_generation
-                .create_layer_manager()
-                .map_err(|error| error.to_string())?,
-        );
+        let lm = memory_generation
+            .layer_manager()
+            .map_err(|error| error.to_string())?;
 
         // Seeded TaskRuntimeStore: run "r1", goal "Review runtime", one
         // Completed todo ("Review chat.rs" / "found gap").
@@ -494,7 +508,6 @@ mod tests {
         // The write the settled policy performs on Completion (the path
         // drive_run_async → execute_run → write_memory_candidate_dispatch uses).
         write_memory_candidate_settled(
-            Some(&lm),
             Some(&memory_generation),
             &rt_store,
             MemoryEvent::RunCompleted {

@@ -694,7 +694,6 @@ async fn drive_one(
         attachments: turn.inline_attachment_refs(),
         cancel: lease.cancellation_token(),
         review_integration: scoped.review_integration(),
-        layer_manager: None,
         memory_generation: None,
         human_loop_provider: Some(context.runtime.hitl_dispatcher.clone()),
     });

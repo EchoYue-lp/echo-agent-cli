@@ -287,13 +287,21 @@ impl ForegroundTurnProgress {
             attachments: resources.attachments.clone(),
             cancel,
             review_integration: resources.review_integration.clone(),
-            layer_manager: resources.layer_manager.clone(),
             memory_generation: resources.memory_generation.clone(),
             human_loop_provider: resources.human_loop_provider.clone(),
         });
+        let memory_generation = resources.memory_generation.clone();
         let result = CURRENT_FOREGROUND_TURN
             .scope(Arc::clone(&self.0), execute(controlled_resources))
             .await;
+        if let Some(generation) = memory_generation {
+            let receipt = generation.settle_hot_memory_projection().await;
+            if receipt.status
+                == crate::evolution::review_integration::MemoryProjectionSettlementStatus::Degraded
+            {
+                tracing::warn!(error = ?receipt.error, "foreground hot-memory projection remains pending");
+            }
+        }
         if !delivery.terminal_delivery_failed() {
             return result;
         }
@@ -1838,16 +1846,24 @@ where
         attachments: resources.attachments.clone(),
         cancel,
         review_integration: resources.review_integration.clone(),
-        layer_manager: resources.layer_manager.clone(),
         memory_generation: resources.memory_generation.clone(),
         human_loop_provider: resources.human_loop_provider.clone(),
     });
+    let memory_generation = resources.memory_generation.clone();
     let result = normalize_downstream_outcome(
         CURRENT_FOREGROUND_TURN
             .scope(Arc::clone(&lease.entry), execute(controlled_resources))
             .await,
         delivery.as_ref(),
     );
+    if let Some(generation) = memory_generation {
+        let receipt = generation.settle_hot_memory_projection().await;
+        if receipt.status
+            == crate::evolution::review_integration::MemoryProjectionSettlementStatus::Degraded
+        {
+            tracing::warn!(error = ?receipt.error, "foreground hot-memory projection remains pending");
+        }
+    }
     let settlement_outcome = result.clone().unwrap_or_else(|error| {
         TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
             "foreground_turn",

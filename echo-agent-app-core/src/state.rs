@@ -2612,7 +2612,6 @@ impl AppState {
                 attachments: Vec::new(),
                 cancel: CancellationToken::new(),
                 review_integration: runtime.review_integration(),
-                layer_manager: None,
                 memory_generation: None,
                 human_loop_provider: None,
             });
@@ -4321,7 +4320,6 @@ impl AppState {
             attachments: turn.inline_attachment_refs(),
             cancel: lease.cancellation_token(),
             review_integration: runtime.review_integration(),
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: Some(Arc::new(crate::hitl::HitlDispatcher::new())),
         });
@@ -8089,7 +8087,6 @@ mod workspace_transition_tests {
             attachments: Vec::new(),
             cancel: lease.cancellation_token(),
             review_integration: runtime.review_integration(),
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: Some(Arc::new(crate::hitl::HitlDispatcher::new())),
         });
@@ -8741,7 +8738,7 @@ mod workspace_transition_tests {
             .lease_generation()
             .map_err(|error| error.to_string())?;
         let memory_manager_a = memory_a
-            .create_layer_manager()
+            .layer_manager()
             .map_err(|error| error.to_string())?;
         memory_manager_a
             .write_memory(
@@ -8755,6 +8752,10 @@ mod workspace_transition_tests {
             )
             .await
             .map_err(|error| error.to_string())?;
+        let projection_a = memory_a.settle_hot_memory_projection().await;
+        if let Some(error) = projection_a.error {
+            return Err(format!("workspace A projection did not settle: {error}"));
+        }
 
         let receipt_b = state
             .switch_workspace(workspace("workspace-b", root_b))
@@ -8839,7 +8840,7 @@ mod workspace_transition_tests {
             .lease_generation()
             .map_err(|error| error.to_string())?;
         let memory_manager_b = memory_b
-            .create_layer_manager()
+            .layer_manager()
             .map_err(|error| error.to_string())?;
         memory_manager_b
             .write_memory(
@@ -8853,6 +8854,10 @@ mod workspace_transition_tests {
             )
             .await
             .map_err(|error| error.to_string())?;
+        let projection_b = memory_b.settle_hot_memory_projection().await;
+        if let Some(error) = projection_b.error {
+            return Err(format!("workspace B projection did not settle: {error}"));
+        }
         let profile_store_a =
             echo_agent::workspace::state::profiles::ProfileStore::new(memory_a.memory_store());
         let profile_store_b =
@@ -8888,6 +8893,12 @@ mod workspace_transition_tests {
                 confidence: 0.9,
             })
             .map_err(|error| error.to_string())?;
+        let evidence_projection_a = memory_a.settle_hot_memory_projection().await;
+        if let Some(error) = evidence_projection_a.error {
+            return Err(format!(
+                "workspace A evidence projection did not settle: {error}"
+            ));
+        }
         evidence_b
             .upsert(crate::evolution::EvidenceCandidateDraft {
                 kind: crate::evolution::EvidenceKind::ProjectFact,
@@ -8905,6 +8916,12 @@ mod workspace_transition_tests {
                 confidence: 0.9,
             })
             .map_err(|error| error.to_string())?;
+        let evidence_projection_b = memory_b.settle_hot_memory_projection().await;
+        if let Some(error) = evidence_projection_b.error {
+            return Err(format!(
+                "workspace B evidence projection did not settle: {error}"
+            ));
+        }
         assert_eq!(
             task_store_a
                 .get_run("shared-run")
@@ -8994,6 +9011,12 @@ mod workspace_transition_tests {
                 .await
                 .map_err(|error| error.to_string())?
         );
+        let projection_b = memory_b.settle_hot_memory_projection().await;
+        if let Some(error) = projection_b.error {
+            return Err(format!(
+                "workspace B deletion projection did not settle: {error}"
+            ));
+        }
         assert!(memory_manager_b.locate("shared-memory").await.is_none());
         assert!(memory_manager_a.locate("shared-memory").await.is_some());
         let pool_a = runtime_a

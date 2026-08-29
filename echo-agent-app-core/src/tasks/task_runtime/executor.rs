@@ -361,19 +361,6 @@ pub async fn launch_planned_run_resume(
                     return Err(error);
                 }
             };
-            let layer_manager = match memory_generation
-                .as_ref()
-                .map(|generation| generation.create_layer_manager().map(Arc::new))
-                .transpose()
-            {
-                Ok(manager) => manager,
-                Err(error) => {
-                    let error =
-                        StoreError::InvalidPlan(format!("layered memory unavailable: {error}"));
-                    registration.reject(error.to_string());
-                    return Err(error);
-                }
-            };
             if store.get_plan(&run_id)?.is_none() {
                 let error = StoreError::InvalidPlan(format!(
                     "run {run_id} has no persisted plan to resume"
@@ -409,7 +396,6 @@ pub async fn launch_planned_run_resume(
                         preparation_store,
                         Some(primary_agent),
                         reviewer_llm,
-                        layer_manager,
                         memory_generation,
                         run_store,
                         trace_sink,
@@ -527,7 +513,6 @@ pub async fn execute_run(
     store: Arc<TaskRuntimeStore>,
     primary_agent: Option<crate::agent_handle::AgentHandle>,
     reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
-    layer_manager: Option<Arc<echo_agent::evolution::MemoryLayerManager>>,
     memory_generation: Option<crate::evolution::ReviewGenerationLease>,
     run_store: Option<Arc<dyn echo_agent::trace::RunStore>>,
     trace_sink: Option<ExecSink>,
@@ -721,7 +706,6 @@ pub async fn execute_run(
             );
             super::memory_bridge::write_memory_candidate_dispatch(
                 memory_policy,
-                layer_manager.as_ref(),
                 memory_generation.as_ref(),
                 &store,
                 super::memory_bridge::MemoryEvent::RunCompleted {
@@ -801,7 +785,6 @@ pub async fn execute_run(
             );
             super::memory_bridge::write_memory_candidate_dispatch(
                 memory_policy,
-                layer_manager.as_ref(),
                 memory_generation.as_ref(),
                 &store,
                 super::memory_bridge::MemoryEvent::RunCancelledByUser {

@@ -871,7 +871,14 @@ pub async fn create_agent_with_diagnostics(
 
 /// Refresh every workspace-dependent context projection on an agent.
 pub async fn refresh_dynamic_context(agent: &mut ReactAgent, root: Option<&std::path::Path>) {
-    crate::unified_memory::refresh_memory_projections(agent, root).await;
+    match crate::unified_memory::load_instruction_projection_strict(root) {
+        Ok(snapshot) => {
+            crate::unified_memory::apply_instruction_projection_snapshot(agent, &snapshot).await;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to refresh instruction context projection");
+        }
+    }
     crate::project::prompt::refresh_project_context_projection(agent, root).await;
 }
 
@@ -1549,13 +1556,10 @@ pub fn spawn_mcp_health_check(
 /// and batch-demote stale low-recall ones to Archived. Uses the shared
 /// `ReviewIntegration`'s layer manager (same store the agent recalls from, so
 /// revives/demotes land in the unified `["agent","memories"]` namespace).
-/// When a pass changes the hot layer, the primary and pooled agents refresh
-/// their replaceable instruction projection immediately. Best-effort: errors
-/// are logged and the next pass still runs.
+/// Each completed pass settles the generation's shared hot-memory projection.
+/// Best-effort errors are logged and the next pass still runs.
 pub fn spawn_dreaming_task(
     review_integration: Arc<crate::evolution::ReviewIntegration>,
-    primary_agent: crate::agent_handle::AgentHandle,
-    pool: Option<Arc<crate::agent_pool::AgentPool>>,
     cancel: echo_agent::agent::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1575,11 +1579,7 @@ pub fn spawn_dreaming_task(
                     break;
                 }
                 _ = interval.tick() => {
-                    let pass = run_dreaming_pass(
-                        &review_integration,
-                        &primary_agent,
-                        pool.as_ref(),
-                    );
+                    let pass = run_dreaming_pass(&review_integration);
                     tokio::pin!(pass);
                     let result = tokio::select! {
                         _ = cancel.cancelled() => {
@@ -1608,34 +1608,22 @@ pub fn spawn_dreaming_task(
 
 async fn run_dreaming_pass(
     review_integration: &crate::evolution::ReviewIntegration,
-    primary_agent: &crate::agent_handle::AgentHandle,
-    pool: Option<&Arc<crate::agent_pool::AgentPool>>,
 ) -> anyhow::Result<echo_agent::evolution::DreamingReport> {
-    // The lease covers both framework writes and EKO's replaceable projection
-    // refresh. A workspace transition therefore either observes the complete
+    // The lease covers both framework writes and canonical projection
+    // settlement. A workspace transition therefore either observes the complete
     // old generation or returns Busy before publishing the new generation.
     let generation_lease = review_integration
         .lease_generation()
         .map_err(anyhow::Error::from)?;
-    let layer_manager = std::sync::Arc::new(generation_lease.create_layer_manager()?);
+    let layer_manager = generation_lease.layer_manager()?;
     let dreaming = echo_agent::evolution::Dreaming::new(
         layer_manager,
         echo_agent::evolution::DreamingConfig::default(),
     );
     let report = dreaming.run().await.map_err(anyhow::Error::from)?;
-    if report.promoted > 0 {
-        let root = primary_agent.read(|agent| agent.working_dir()).await;
-        primary_agent
-            .write_async(|agent| {
-                Box::pin(async move {
-                    crate::unified_memory::refresh_hot_memory_projection(agent, root.as_deref())
-                        .await;
-                })
-            })
-            .await;
-        if let Some(agent_pool) = pool {
-            agent_pool.refresh_hot_memory_context().await;
-        }
+    let projection = generation_lease.settle_hot_memory_projection().await;
+    if let Some(error) = projection.error {
+        tracing::warn!(%error, "Dreaming hot-memory projection remains pending");
     }
     Ok(report)
 }

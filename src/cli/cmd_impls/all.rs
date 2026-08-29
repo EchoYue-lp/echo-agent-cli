@@ -13,12 +13,10 @@ async fn current_memory_control(
     String,
 > {
     let control = ctx.current_review_control().await?;
-    let manager = Arc::new(
-        control
-            .generation
-            .create_layer_manager()
-            .map_err(|error| error.to_string())?,
-    );
+    let manager = control
+        .generation
+        .layer_manager()
+        .map_err(|error| error.to_string())?;
     Ok((control, manager))
 }
 
@@ -166,23 +164,12 @@ async fn cmd_remember(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         "explicit",
     );
     match layer_manager.write_memory(&key, content.trim(), meta).await {
-        Ok(promotion) => {
-            if promotion.is_some() {
-                let agent = control.runtime.primary_agent();
-                let root = agent.read(|agent| agent.working_dir()).await;
-                agent
-                    .write_async(|agent| {
-                        Box::pin(async move {
-                            echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
-                                agent,
-                                root.as_deref(),
-                            )
-                            .await;
-                        })
-                    })
-                    .await;
-            }
+        Ok(_) => {
+            let projection = control.generation.settle_hot_memory_projection().await;
             println!("Memory saved with key: {key}");
+            if let Some(error) = projection.error {
+                println!("Memory projection remains pending: {error}");
+            }
         }
         Err(error) => println!("Failed to save memory: {error}"),
     }
@@ -235,25 +222,13 @@ async fn cmd_forget(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
     };
     if let Some(key) = key {
-        let layer = layer_manager.locate(&key).await.map(|(layer, _)| layer);
         match layer_manager.delete_memory(&key).await {
             Ok(true) => {
-                if layer == Some(echo_agent::evolution::MemoryLayer::Hot) {
-                    let agent = control.runtime.primary_agent();
-                    let root = agent.read(|agent| agent.working_dir()).await;
-                    agent
-                        .write_async(|agent| {
-                            Box::pin(async move {
-                                echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
-                                    agent,
-                                    root.as_deref(),
-                                )
-                                .await;
-                            })
-                        })
-                        .await;
-                }
+                let projection = control.generation.settle_hot_memory_projection().await;
                 println!("Removed memory: {key}");
+                if let Some(error) = projection.error {
+                    println!("Memory projection remains pending: {error}");
+                }
             }
             Ok(false) => println!("No matching memory found."),
             Err(error) => println!("Failed to remove memory: {error}"),
@@ -292,16 +267,10 @@ async fn cmd_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 .root()
                 .join(".eko")
                 .join("project.md");
-            let reflection_path = control
-                .generation
-                .echo_agent_dir()
-                .join("memory")
-                .join("PROJECT.md");
             if let Err(error) = tokio::task::spawn_blocking(move || {
                 println!("\n📝 Project Memory\n");
                 print_memory_tier("User", &user_path);
                 print_memory_tier("Project", &project_path);
-                print_memory_tier("Reflection", &reflection_path);
             })
             .await
             {
@@ -417,81 +386,48 @@ cmd!(
 
 // ── ReflectCommand ─────────────────────────────────────────────────────
 
-async fn cmd_reflect(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    println!("🪞 Generating reflection...");
+fn render_reflection_receipt(
+    receipt: &echo_agent_app_core::reflection::ReflectionReceipt,
+) -> String {
+    receipt.display_message()
+}
 
-    let control = match ctx.current_review_control().await {
-        Ok(control) => control,
+fn validate_reflection_args(
+    args: &[&str],
+) -> Result<(), echo_agent_app_core::reflection::ReflectionCommandParseError> {
+    let input = if args.is_empty() {
+        "/reflect".to_string()
+    } else {
+        format!("/reflect {}", args.join(" "))
+    };
+    echo_agent_app_core::reflection::ReflectionCommand::parse(&input).map(|_| ())
+}
+
+async fn cmd_reflect(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    if let Err(error) = validate_reflection_args(args) {
+        println!("{error}");
+        return CommandOutcome::Continue;
+    }
+    let Some(state) = ctx.app_state.as_ref() else {
+        println!("Reflection unavailable: application state is unavailable");
+        return CommandOutcome::Continue;
+    };
+    let runtime = match state.current_control_runtime().await {
+        Ok(runtime) => runtime,
         Err(error) => {
-            println!("⚠️  Reflection unavailable: {error}");
+            println!("Reflection unavailable: {error}");
             return CommandOutcome::Continue;
         }
     };
-
-    // Get LLM client from agent
-    let llm_client = control
-        .runtime
-        .primary_agent()
-        .read(|agent| agent.llm_client().cloned())
-        .await;
-
-    let Some(llm) = llm_client else {
-        println!("⚠️  No LLM client available for reflection.");
-        return CommandOutcome::Continue;
-    };
-
-    let prompt = "Reflect on the current session and summarize key learnings in 1-2 sentences.\n\
-                  Focus on reusable insights. Be specific. Max 200 tokens.\n\nReflection:";
-
-    let messages = vec![echo_agent::prelude::Message::user(prompt.to_string())];
-    let options = echo_agent::prelude::SimpleChatOptions::default().with_max_tokens(300);
-
-    let reflection = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        llm.chat_simple_with_options(messages, options),
+    match echo_agent_app_core::reflection::reflect_session(
+        &runtime,
+        &ctx.agent,
+        ctx.conversation_id.as_deref(),
     )
     .await
     {
-        Ok(Ok(text)) => text,
-        Ok(Err(e)) => {
-            println!("⚠️  LLM reflection failed: {e}");
-            return CommandOutcome::Continue;
-        }
-        Err(_) => {
-            println!("⚠️  LLM reflection timed out (>2s).");
-            return CommandOutcome::Continue;
-        }
-    };
-
-    // Write to the `.eko` root pinned before the LLM call.
-    let memory_dir = control.generation.echo_agent_dir().join("memory");
-    if let Err(error) = std::fs::create_dir_all(&memory_dir) {
-        println!("⚠️  Failed to create reflection memory directory: {error}");
-        return CommandOutcome::Continue;
-    }
-    let memory_file = memory_dir.join("PROJECT.md");
-
-    let entry = format!(
-        "\n## [session] Reflection ({})\n{}\n",
-        chrono::Local::now().format("%Y-%m-%d %H:%M"),
-        reflection.trim()
-    );
-
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&memory_file)
-    {
-        Ok(mut file) => {
-            use std::io::Write;
-            match file.write_all(entry.as_bytes()) {
-                Ok(()) => println!("✅ Reflection saved to {}", memory_file.display()),
-                Err(error) => println!("⚠️  Failed to write reflection: {error}"),
-            }
-        }
-        Err(e) => {
-            println!("⚠️  Failed to write reflection: {e}");
-        }
+        Ok(receipt) => println!("{}", render_reflection_receipt(&receipt)),
+        Err(error) => println!("Reflection failed: {error}"),
     }
 
     CommandOutcome::Continue
@@ -546,11 +482,21 @@ async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
 
             let store = control.generation.evidence_store();
             match queue_observations(&store, &observations, &messages) {
-                Ok(candidates) => println!(
-                    "Extracted {} observation(s); {} candidate(s) are in Review Inbox.",
-                    count,
-                    candidates.len()
-                ),
+                Ok(candidates) => {
+                    let projection = if candidates.is_empty() {
+                        None
+                    } else {
+                        Some(control.generation.settle_hot_memory_projection().await)
+                    };
+                    println!(
+                        "Extracted {} observation(s); {} candidate(s) are in Review Inbox.",
+                        count,
+                        candidates.len()
+                    );
+                    if let Some(error) = projection.and_then(|receipt| receipt.error) {
+                        println!("Memory projection remains pending: {error}");
+                    }
+                }
                 Err(e) => println!("Auto-memory candidate creation failed: {e}"),
             }
         }
@@ -632,4 +578,19 @@ pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(AttachCommand));
     registry.register(Arc::new(ReflectCommand));
     registry.register(Arc::new(AutoMemoryCommand));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_reflection_adapter_projects_shared_receipt() {
+        assert!(validate_reflection_args(&[]).is_ok());
+        assert!(validate_reflection_args(&["extra"]).is_err());
+        let receipt = echo_agent_app_core::reflection::reflection_receipt_fixture();
+        let rendered = render_reflection_receipt(&receipt);
+        assert!(rendered.contains(&receipt.key));
+        assert!(rendered.contains(&receipt.content_summary));
+    }
 }

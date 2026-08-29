@@ -9,14 +9,13 @@ use echo_agent::evolution::MemoryLayer;
 use echo_agent::evolution::MemoryLayerManager;
 use echo_agent::memory::{MemoryFilter, MemoryMeta, MemorySource, MemoryType, TypedMemoryEntry};
 use echo_agent_app_core::evolution::ReviewGenerationLease;
-use echo_agent_app_core::state::ScopedChatRuntime;
+use echo_agent_app_core::reflection::ReflectionReceipt;
 use std::sync::Arc;
 
 const AGENT_MEMORY_NAMESPACE: &str = "agent/memories";
 
 struct ScopedMemoryControl {
-    runtime: ScopedChatRuntime,
-    _generation: ReviewGenerationLease,
+    generation: ReviewGenerationLease,
     layer_manager: Arc<MemoryLayerManager>,
 }
 
@@ -42,35 +41,13 @@ async fn memory_control_for_workspace(
     let generation = integration
         .lease_generation()
         .map_err(|error| IpcError::Validation(error.to_string()))?;
-    let layer_manager = Arc::new(
-        generation
-            .create_layer_manager()
-            .map_err(|error| IpcError::Internal(error.to_string()))?,
-    );
+    let layer_manager = generation
+        .layer_manager()
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
     Ok(ScopedMemoryControl {
-        runtime,
-        _generation: generation,
+        generation,
         layer_manager,
     })
-}
-
-async fn refresh_hot_projection(control: &ScopedMemoryControl) {
-    let agent = control.runtime.primary_agent();
-    let root = agent.read(|value| value.working_dir()).await;
-    agent
-        .write_async(|value| {
-            Box::pin(async move {
-                echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
-                    value,
-                    root.as_deref(),
-                )
-                .await;
-            })
-        })
-        .await;
-    if let Some(pool) = control.runtime.pool() {
-        pool.refresh_hot_memory_context().await;
-    }
 }
 
 fn namespace_supported(namespace: Option<&str>) -> bool {
@@ -186,14 +163,13 @@ pub async fn add_memory(
         "explicit",
     );
     match layer_manager.write_memory(&key, content.trim(), meta).await {
-        Ok(promotion) => {
-            if promotion.is_some() {
-                refresh_hot_projection(&control).await;
-            }
+        Ok(_) => {
+            let projection_settlement = control.generation.settle_hot_memory_projection().await;
             Ok(serde_json::json!({
                 "success": true,
                 "key": key,
                 "message": "Memory added successfully",
+                "projection_settlement": projection_settlement,
             }))
         }
         Err(error) => Ok(serde_json::json!({
@@ -250,18 +226,17 @@ pub async fn delete_memory(
         }));
     }
     let layer_manager = &control.layer_manager;
-    let layer = layer_manager
-        .locate(key.trim())
-        .await
-        .map(|(layer, _)| layer);
     match layer_manager.delete_memory(key.trim()).await {
         Ok(deleted) => {
-            if deleted && layer == Some(MemoryLayer::Hot) {
-                refresh_hot_projection(&control).await;
-            }
+            let projection_settlement = if deleted {
+                Some(control.generation.settle_hot_memory_projection().await)
+            } else {
+                None
+            };
             Ok(serde_json::json!({
                 "success": deleted,
                 "message": if deleted { "Memory deleted successfully" } else { "Memory not found" },
+                "projection_settlement": projection_settlement,
             }))
         }
         Err(error) => Ok(serde_json::json!({
@@ -276,6 +251,48 @@ pub async fn list_namespaces(
     _state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
     Ok(serde_json::json!({ "namespaces": [["agent", "memories"]] }))
+}
+
+#[tauri::command]
+pub async fn reflect_session(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    conversation_id: Option<String>,
+) -> Result<ReflectionReceipt, IpcError> {
+    if workspace_id.trim().is_empty() {
+        return Err(IpcError::Validation(
+            "workspace_id must not be empty".to_string(),
+        ));
+    }
+    if conversation_id
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(IpcError::Validation(
+            "conversation_id must not be empty when supplied".to_string(),
+        ));
+    }
+    let runtime = state
+        .app_state
+        .chat_runtime_for_scope(&workspace_id)
+        .await
+        .map_err(IpcError::from)?;
+    let execution = match conversation_id.as_deref() {
+        Some(conversation_id) => Some(
+            runtime
+                .agent_for(conversation_id)
+                .await
+                .map_err(|error| IpcError::Internal(error.to_string()))?,
+        ),
+        None => None,
+    };
+    let agent = execution
+        .as_ref()
+        .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+        .unwrap_or_else(|| runtime.primary_agent());
+    echo_agent_app_core::reflection::reflect_session(&runtime, &agent, conversation_id.as_deref())
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))
 }
 
 #[cfg(test)]
@@ -308,5 +325,13 @@ mod tests {
             validate_namespace_after_scope(validation, Some("unsupported")),
             Err(IpcError::Validation(message)) if message == "workspace is deleted"
         ));
+    }
+
+    #[test]
+    fn reflection_receipt_keeps_typed_gui_wire_fields() -> Result<(), String> {
+        let value =
+            serde_json::to_value(echo_agent_app_core::reflection::reflection_receipt_fixture())
+                .map_err(|error| error.to_string())?;
+        echo_agent_app_core::reflection::validate_reflection_receipt_wire(&value)
     }
 }

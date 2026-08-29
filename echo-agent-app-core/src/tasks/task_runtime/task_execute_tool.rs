@@ -488,7 +488,6 @@ impl Tool for ExecuteTaskTool {
                         self.store.clone(),
                         Some(execution_agent.agent.clone()),
                         reviewer_llm,
-                        None, // layer_manager — 暂时 None
                         None, // memory generation — outer run owns settlement
                         run_store,
                         trace_sink,

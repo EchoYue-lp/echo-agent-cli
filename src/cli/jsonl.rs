@@ -1,4 +1,8 @@
 //! Non-interactive JSONL transport over the shared chat driver.
+//!
+//! Ordinary chat events are accepted only after journaling. Finite app-core
+//! control commands may additionally emit their typed receipt as one JSONL
+//! record before the journaled terminal status.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -23,19 +27,23 @@ impl JsonlChatSink {
             output: Mutex::new(output),
         }
     }
-}
 
-impl ChatSink for JsonlChatSink {
-    fn on_event(&self, _event: ChatDriverEvent) -> bool {
-        tracing::error!("JSONL transport rejected an event that bypassed the chat journal");
-        false
+    /// Emit the typed result of the finite reflection control command.
+    pub fn write_reflection_receipt(
+        &self,
+        receipt: &echo_agent_app_core::reflection::ReflectionReceipt,
+    ) -> bool {
+        self.write_json_line(&serde_json::json!({
+            "source": "reflection_receipt",
+            "event": receipt,
+        }))
     }
 
-    fn on_journaled_event(&self, envelope: ChatEventEnvelope) -> bool {
-        let mut encoded = match serde_json::to_vec(&envelope) {
+    fn write_json_line(&self, value: &impl serde::Serialize) -> bool {
+        let mut encoded = match serde_json::to_vec(value) {
             Ok(encoded) => encoded,
             Err(error) => {
-                tracing::error!(%error, "failed to serialize canonical JSONL chat envelope");
+                tracing::error!(%error, "failed to serialize JSONL output");
                 return false;
             }
         };
@@ -48,10 +56,21 @@ impl ChatSink for JsonlChatSink {
             }
         };
         if let Err(error) = output.write_all(&encoded).and_then(|()| output.flush()) {
-            tracing::error!(%error, "failed to write canonical JSONL chat envelope");
+            tracing::error!(%error, "failed to write JSONL output");
             return false;
         }
         true
+    }
+}
+
+impl ChatSink for JsonlChatSink {
+    fn on_event(&self, _event: ChatDriverEvent) -> bool {
+        tracing::error!("JSONL transport rejected an event that bypassed the chat journal");
+        false
+    }
+
+    fn on_journaled_event(&self, envelope: ChatEventEnvelope) -> bool {
+        self.write_json_line(&envelope)
     }
 }
 
@@ -301,6 +320,28 @@ mod tests {
                     == echo_agent_app_core::extension_commands::ExtensionCommandStatus::Failed
         ));
         Ok(())
+    }
+
+    #[test]
+    fn reflection_receipt_keeps_its_typed_jsonl_fields() -> Result<(), String> {
+        let shared = SharedOutput::default();
+        let captured = shared.0.clone();
+        let sink = JsonlChatSink::new(Box::new(shared));
+        let receipt = echo_agent_app_core::reflection::reflection_receipt_fixture();
+        assert!(sink.write_reflection_receipt(&receipt));
+
+        let bytes = lock_output(&captured).clone();
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        assert_eq!(
+            value.get("source").and_then(serde_json::Value::as_str),
+            Some("reflection_receipt")
+        );
+        echo_agent_app_core::reflection::validate_reflection_receipt_wire(
+            value
+                .get("event")
+                .ok_or_else(|| "JSONL reflection event is missing".to_string())?,
+        )
     }
 
     #[test]

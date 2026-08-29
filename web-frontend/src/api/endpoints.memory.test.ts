@@ -28,6 +28,7 @@ describe('workspace-scoped memory API', () => {
       namespace: 'agent/memories',
       key: 'fact',
     });
+    await memoryApi.reflect('workspace-a', 'conversation-a');
 
     expect(bridge.apiInvoke).toHaveBeenNthCalledWith(1, 'list_memory', {
       workspaceId: 'workspace-a',
@@ -48,6 +49,10 @@ describe('workspace-scoped memory API', () => {
       workspaceId: 'workspace-a',
       namespace: 'agent/memories',
       key: 'fact',
+    });
+    expect(bridge.apiInvoke).toHaveBeenNthCalledWith(5, 'reflect_session', {
+      workspaceId: 'workspace-a',
+      conversationId: 'conversation-a',
     });
   });
 

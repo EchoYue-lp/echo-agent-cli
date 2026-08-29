@@ -82,6 +82,7 @@ pub enum SlashCommand {
     Think,
     System,
     Memory,
+    Reflect,
     Remember,
     Forget,
     /// Attach a file (image/document) to the next message (B5.3 multimodal).
@@ -180,6 +181,7 @@ impl SlashCommand {
             Self::Think => "Show or set the active model's thinking level",
             Self::System => "Show or set system prompt",
             Self::Memory => "Show memory contents",
+            Self::Reflect => "Reflect on session learnings",
             Self::Remember => "Save a fact to memory",
             Self::Forget => "Remove a fact from memory",
             Self::Attach => "Attach a file to the next message (/attach <path>)",
@@ -269,6 +271,7 @@ impl SlashCommand {
             | Self::Think
             | Self::System
             | Self::Memory
+            | Self::Reflect
             | Self::Remember
             | Self::Forget
             | Self::Attach
@@ -557,6 +560,17 @@ mod tests {
         assert_eq!(workflow.category(), Category::Pipeline);
         assert!(workflow.usage().contains("create <name>"));
         assert!(workflow.usage().contains("run <id>"));
+        Ok(())
+    }
+
+    #[test]
+    fn reflect_is_a_first_class_context_command() -> Result<(), String> {
+        let reflect = "reflect"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(reflect, SlashCommand::Reflect);
+        assert_eq!(reflect.category(), Category::Context);
+        assert!(SlashCommand::complete("/refl").contains(&reflect));
         Ok(())
     }
 }

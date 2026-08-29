@@ -8,6 +8,7 @@ import {
 import type { MemoryEntry } from '../../types/api';
 import { Brain, Loader2, Plus, Search, Sparkles, Trash2 } from 'lucide-react';
 import { workspaceIdForView } from '../../lib/viewAddress';
+import { useConversationStore } from '../../stores/conversationStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 
 const AGENT_MEMORY_NAMESPACE = 'agent/memories';
@@ -18,6 +19,7 @@ function isCurrentWorkspace(workspaceId: string): boolean {
 
 export function MemoryPanel() {
   const workspaceId = useWorkspaceStore((state) => workspaceIdForView(state.current?.id));
+  const conversationId = useConversationStore((state) => state.activeId);
   const scopeRef = useRef({ workspaceId, generation: 0 });
   if (scopeRef.current.workspaceId !== workspaceId) {
     scopeRef.current = {
@@ -30,6 +32,7 @@ export function MemoryPanel() {
   const autoStatusRequestRef = useRef(0);
   const autoActionRequestRef = useRef(0);
   const memoryMutationRequestRef = useRef(0);
+  const reflectionRequestRef = useRef(0);
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
   const [entriesWorkspaceId, setEntriesWorkspaceId] = useState('');
   const [entriesScopeGeneration, setEntriesScopeGeneration] = useState(-1);
@@ -50,6 +53,8 @@ export function MemoryPanel() {
   const [autoBusy, setAutoBusy] = useState(false);
   const [autoBusyScopeGeneration, setAutoBusyScopeGeneration] = useState(-1);
   const [autoMessage, setAutoMessage] = useState<string | null>(null);
+  const [reflectionBusy, setReflectionBusy] = useState(false);
+  const [reflectionMessage, setReflectionMessage] = useState<string | null>(null);
   const visibleEntries =
     entriesWorkspaceId === workspaceId && entriesScopeGeneration === scopeGeneration ? entries : [];
   const visibleAutoStatus =
@@ -347,6 +352,41 @@ export function MemoryPanel() {
     }
   };
 
+  const reflectSession = async () => {
+    if (!conversationId || reflectionBusy) return;
+    const requestGeneration = scopeRef.current.generation;
+    const requestToken = reflectionRequestRef.current + 1;
+    reflectionRequestRef.current = requestToken;
+    setReflectionBusy(true);
+    setReflectionMessage(null);
+    try {
+      const receipt = await memoryApi.reflect(workspaceId, conversationId);
+      if (
+        !requestIsCurrent(workspaceId, requestGeneration) ||
+        reflectionRequestRef.current !== requestToken ||
+        useConversationStore.getState().activeId !== conversationId
+      )
+        return;
+      setReflectionMessage(`已保存反思 ${receipt.key}: ${receipt.content_summary}`);
+      void loadEntries(selectedNs || undefined);
+    } catch (e) {
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        reflectionRequestRef.current === requestToken &&
+        useConversationStore.getState().activeId === conversationId
+      ) {
+        setReflectionMessage(e instanceof Error ? e.message : '会话反思失败');
+      }
+    } finally {
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        reflectionRequestRef.current === requestToken
+      ) {
+        setReflectionBusy(false);
+      }
+    }
+  };
+
   const s = {
     text: 'var(--text-primary)',
     textSec: 'var(--text-secondary)',
@@ -428,7 +468,22 @@ export function MemoryPanel() {
             )}
             送审
           </button>
+          <button
+            onClick={reflectSession}
+            disabled={reflectionBusy || !conversationId}
+            className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs transition-colors disabled:opacity-50"
+            style={{ background: s.bgHover, color: s.textSec }}
+          >
+            {reflectionBusy ? <Loader2 size={12} className="animate-spin" /> : <Brain size={12} />}
+            反思
+          </button>
         </div>
+
+        {reflectionMessage && (
+          <div className="mt-2 text-[11px]" style={{ color: s.textTer }}>
+            {reflectionMessage}
+          </div>
+        )}
 
         {visibleAutoMessage && (
           <div className="mt-2 text-[11px]" style={{ color: s.textTer }}>

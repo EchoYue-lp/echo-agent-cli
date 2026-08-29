@@ -23,11 +23,12 @@
 use std::path::PathBuf;
 
 use crate::instruction_provider::InstructionProvider;
+use echo_agent::compression::ContextProjection;
 use echo_agent::llm::types::Message;
 use sha2::{Digest, Sha256};
 
 const INSTRUCTION_CONTEXT_PROJECTION: &str = "eko:instruction-context";
-const HOT_MEMORY_CONTEXT_PROJECTION: &str = "eko:hot-memory-context";
+pub(crate) const HOT_MEMORY_CONTEXT_PROJECTION: &str = "eko:hot-memory-context";
 
 /// One strictly-read instruction generation shared by the primary agent and
 /// every existing or future pooled agent.
@@ -40,6 +41,65 @@ pub(crate) struct InstructionProjectionSnapshot {
 impl InstructionProjectionSnapshot {
     pub(crate) fn revision(&self) -> &str {
         &self.revision
+    }
+}
+
+/// One immutable layered hot-memory generation. The revision is a deterministic
+/// content hash; the generation-bound observer is used only to coalesce reads.
+#[derive(Debug, Clone)]
+pub(crate) struct HotMemoryProjectionSnapshot {
+    revision: String,
+    message: Option<Message>,
+}
+
+impl HotMemoryProjectionSnapshot {
+    pub(crate) fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    pub(crate) fn same_content(&self, other: &Self) -> bool {
+        self.revision == other.revision
+    }
+}
+
+/// Shared source consumed at every pre-model safe point. Publication is one
+/// synchronous pointer/value replacement and never waits for a live Agent.
+pub(crate) struct HotMemoryProjectionSource {
+    snapshot: std::sync::RwLock<Option<HotMemoryProjectionSnapshot>>,
+}
+
+impl HotMemoryProjectionSource {
+    pub(crate) fn new() -> Self {
+        Self {
+            snapshot: std::sync::RwLock::new(None),
+        }
+    }
+
+    pub(crate) fn publish(&self, snapshot: HotMemoryProjectionSnapshot) {
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot);
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<HotMemoryProjectionSnapshot> {
+        self.snapshot
+            .read()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    pub(crate) fn projection(&self) -> ContextProjection {
+        ContextProjection {
+            marker: HOT_MEMORY_CONTEXT_PROJECTION.to_string(),
+            message: self.snapshot().and_then(|snapshot| snapshot.message),
+        }
+    }
+}
+
+impl Default for HotMemoryProjectionSource {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -181,39 +241,30 @@ pub(crate) async fn apply_instruction_projection_snapshot(
         .replace_projection(INSTRUCTION_CONTEXT_PROJECTION, snapshot.message.clone());
 }
 
-/// Replace the independently-owned hot-memory projection for one agent.
-pub async fn refresh_hot_memory_projection(
-    agent: &mut echo_agent::agent::ReactAgent,
-    root: Option<&std::path::Path>,
-) {
-    let suffix = UnifiedMemory::load_for(root).memory_prompt_suffix();
-    let message = suffix
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| Message::system(value.trim().to_string()));
-    agent
-        .context()
-        .lock()
-        .await
-        .replace_projection(HOT_MEMORY_CONTEXT_PROJECTION, message);
-}
-
-/// Refresh both file-backed context domains from one filesystem snapshot.
-pub async fn refresh_memory_projections(
-    agent: &mut echo_agent::agent::ReactAgent,
-    root: Option<&std::path::Path>,
-) {
-    let memory = UnifiedMemory::load_for(root);
-    let instruction = memory
-        .instruction_prompt_suffix()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| Message::system(value.trim().to_string()));
-    let hot_memory = memory
-        .memory_prompt_suffix()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| Message::system(value.trim().to_string()));
-    let mut context = agent.context().lock().await;
-    context.replace_projection(INSTRUCTION_CONTEXT_PROJECTION, instruction);
-    context.replace_projection(HOT_MEMORY_CONTEXT_PROJECTION, hot_memory);
+/// Read one immutable hot-memory generation outside the async executor.
+pub(crate) async fn load_hot_memory_projection_snapshot(
+    echo_agent_dir: PathBuf,
+) -> Result<HotMemoryProjectionSnapshot, String> {
+    let content = tokio::task::spawn_blocking(move || {
+        crate::instruction_provider::strict_optional_text(Some(&echo_agent_dir.join("MEMORY.md")))
+            .map(|content| {
+                content
+                    .map(|raw| crate::utils::strip_yaml_frontmatter(&raw))
+                    .unwrap_or_default()
+            })
+    })
+    .await
+    .map_err(|error| format!("hot-memory projection read task failed: {error}"))?
+    .map_err(|error| format!("hot-memory projection read failed: {error}"))?;
+    let rendered = content.trim();
+    let mut hasher = Sha256::new();
+    hasher.update(b"eko-hot-memory-projection-v1\0");
+    hasher.update(rendered.as_bytes());
+    let message = (!rendered.is_empty()).then(|| Message::system(rendered.to_string()));
+    Ok(HotMemoryProjectionSnapshot {
+        revision: format!("{:x}", hasher.finalize()),
+        message,
+    })
 }
 
 #[cfg(test)]
@@ -292,11 +343,18 @@ mod tests {
             .build()?;
         let snapshot = load_instruction_projection_strict(Some(root))?;
         apply_instruction_projection_snapshot(&mut agent, &snapshot).await;
-        refresh_hot_memory_projection(&mut agent, Some(root)).await;
+        let hot = load_hot_memory_projection_snapshot(root.join(".eko"))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let source = HotMemoryProjectionSource::new();
+        source.publish(hot);
 
         let context = agent.context().lock().await;
         assert!(context.has_projection(INSTRUCTION_CONTEXT_PROJECTION));
-        assert!(context.has_projection(HOT_MEMORY_CONTEXT_PROJECTION));
+        drop(context);
+        let projection = source.projection();
+        assert_eq!(projection.marker, HOT_MEMORY_CONTEXT_PROJECTION);
+        assert!(projection.message.is_some());
         Ok(())
     }
 }

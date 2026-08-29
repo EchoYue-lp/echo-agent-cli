@@ -21,6 +21,7 @@ use echo_agent::memory::Store;
 use echo_agent::memory::TypedMemoryStore;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use super::evidence::{
@@ -37,6 +38,23 @@ struct RuleProjectionTargets {
     pool: Option<Weak<crate::agent_pool::AgentPool>>,
 }
 
+struct HotMemoryProjectionControl {
+    gate: Arc<tokio::sync::Mutex<()>>,
+    repair: tokio::sync::Mutex<HotMemoryProjectionRepair>,
+    snapshot: RwLock<Option<crate::unified_memory::HotMemoryProjectionSnapshot>>,
+    targets: Arc<RwLock<RuleProjectionTargets>>,
+    source: Arc<crate::unified_memory::HotMemoryProjectionSource>,
+    active_generation: AtomicU64,
+    settled_dirty_epoch: AtomicU64,
+    #[cfg(test)]
+    projection_reads: AtomicU64,
+}
+
+struct HotMemoryProjectionRepair {
+    accepting: bool,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuleProjectionFault {
@@ -46,17 +64,111 @@ enum RuleProjectionFault {
 
 #[derive(Clone)]
 struct ReviewBinding {
+    authority_scope: String,
+    workspace_generation: String,
     echo_agent_dir: PathBuf,
     store: Arc<dyn Store>,
     generation: u64,
+    layer_manager: Arc<Mutex<Option<Arc<MemoryLayerManager>>>>,
+    projection_observer: Arc<MemoryProjectionObserver>,
+}
+
+struct MemoryProjectionObserver {
+    revision: AtomicU64,
+    downstream: Arc<RwLock<Option<Arc<dyn EvolutionObserver>>>>,
+    projection_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl MemoryProjectionObserver {
+    fn new(
+        downstream: Arc<RwLock<Option<Arc<dyn EvolutionObserver>>>>,
+        projection_gate: Arc<tokio::sync::Mutex<()>>,
+    ) -> Self {
+        Self {
+            revision: AtomicU64::new(0),
+            downstream,
+            projection_gate,
+        }
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    fn mark_dirty(&self) {
+        let _ = self
+            .revision
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
+                revision.checked_add(1)
+            });
+    }
+
+    fn downstream(&self) -> Option<Arc<dyn EvolutionObserver>> {
+        self.downstream
+            .read()
+            .map(|observer| observer.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+}
+
+impl EvolutionObserver for MemoryProjectionObserver {
+    fn on_memory_write<'a>(
+        &'a self,
+        key: &'a str,
+        source: &'a str,
+    ) -> futures::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(observer) = self.downstream() {
+                observer.on_memory_write(key, source).await;
+            }
+        })
+    }
+
+    fn on_memory_layer_change<'a>(
+        &'a self,
+        key: &'a str,
+        from_layer: &'a str,
+        to_layer: &'a str,
+    ) -> futures::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if from_layer == "hot" || to_layer == "hot" {
+                let _gate = self.projection_gate.lock().await;
+                self.mark_dirty();
+            }
+            if let Some(observer) = self.downstream() {
+                observer
+                    .on_memory_layer_change(key, from_layer, to_layer)
+                    .await;
+            }
+        })
+    }
+
+    fn on_skill_candidate_detected<'a>(
+        &'a self,
+        skill_name: &'a str,
+    ) -> futures::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(observer) = self.downstream() {
+                observer.on_skill_candidate_detected(skill_name).await;
+            }
+        })
+    }
+
+    fn on_skill_health_check<'a>(
+        &'a self,
+        skill_name: &'a str,
+    ) -> futures::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(observer) = self.downstream() {
+                observer.on_skill_health_check(skill_name).await;
+            }
+        })
+    }
 }
 
 struct ReviewBindingState {
     current: ReviewBinding,
-    pending_rule_projection: Option<crate::unified_memory::InstructionProjectionSnapshot>,
-    pending_rule_receipts: Vec<RulePromotionReceipt>,
     active_passes: usize,
-    rebind_in_progress: bool,
     pending_triggers: VecDeque<QueuedTrigger>,
     trigger_delivery_failures: u64,
     rejected_triggers: u64,
@@ -95,51 +207,36 @@ pub struct TriggerDeliveryStatus {
     pub last_error: Option<String>,
 }
 
-/// Result of publishing a prepared memory generation. Binding publication is
-/// infallible after the workspace transition crosses its commit boundary;
-/// trigger settlement can still make the owning transition degraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryProjectionSettlementStatus {
+    Settled,
+    Degraded,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct MemoryRebindReceipt {
-    pub generation: u64,
-    pub pending_old: usize,
-    pub pending_roots: Vec<PathBuf>,
-    pub delivery_error: Option<String>,
+pub struct MemoryProjectionSettlementReceipt {
+    pub authority_scope: String,
+    pub workspace_generation: String,
+    pub revision: String,
+    pub changed: bool,
+    pub status: MemoryProjectionSettlementStatus,
+    pub primary_bound: bool,
+    pub pool_bound: bool,
+    pub future_bound: bool,
+    pub pending_revision: Option<String>,
+    pub error: Option<String>,
 }
 
-impl MemoryRebindReceipt {
-    pub fn is_degraded(&self) -> bool {
-        self.pending_old != 0 || !self.pending_roots.is_empty() || self.delivery_error.is_some()
-    }
-}
-
-/// A workspace memory generation is busy running a review/evolution pass or
-/// is already being rebound by the canonical workspace transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewGenerationError {
-    Busy {
-        active_passes: usize,
-        rebind_in_progress: bool,
-    },
     CounterExhausted(&'static str),
-    TriggerSettlement {
-        pending: usize,
-        last_error: String,
-    },
-    ProjectionSettlement {
-        pending_receipts: usize,
-    },
+    TriggerSettlement { pending: usize, last_error: String },
 }
 
 impl std::fmt::Display for ReviewGenerationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Busy {
-                active_passes,
-                rebind_in_progress,
-            } => write!(
-                formatter,
-                "memory evolution generation is busy (active passes: {active_passes}, rebind in progress: {rebind_in_progress})"
-            ),
             Self::CounterExhausted(counter) => {
                 write!(formatter, "memory evolution {counter} counter exhausted")
             }
@@ -149,10 +246,6 @@ impl std::fmt::Display for ReviewGenerationError {
             } => write!(
                 formatter,
                 "memory trigger settlement failed with {pending} candidate(s) still pending: {last_error}"
-            ),
-            Self::ProjectionSettlement { pending_receipts } => write!(
-                formatter,
-                "memory rule projection settlement must retry before rebind ({pending_receipts} receipt(s) pending)"
             ),
         }
     }
@@ -172,19 +265,13 @@ pub struct ReviewGenerationLease {
 struct ReviewGenerationReceipt {
     control: Arc<ReviewBindingControl>,
     binding: ReviewBinding,
-    evolution_observer: Option<Arc<dyn EvolutionObserver>>,
+    projection_observer: Arc<MemoryProjectionObserver>,
+    hot_memory_projection: Arc<HotMemoryProjectionControl>,
 }
 
 impl ReviewGenerationLease {
-    pub fn create_layer_manager(&self) -> echo_agent::error::Result<MemoryLayerManager> {
-        let mut builder = MemoryRuntimeIntegrationBuilder::new(
-            self.receipt.binding.echo_agent_dir.clone(),
-            self.receipt.binding.store.clone(),
-        );
-        if let Some(observer) = self.receipt.evolution_observer.clone() {
-            builder = builder.evolution_observer(observer);
-        }
-        builder.build_layer_manager()
+    pub fn layer_manager(&self) -> echo_agent::error::Result<Arc<MemoryLayerManager>> {
+        layer_manager_for_binding(&self.receipt.binding, &self.receipt.projection_observer)
     }
 
     /// Evidence inbox pinned to the same workspace as this pass.
@@ -195,6 +282,60 @@ impl ReviewGenerationLease {
     /// Framework memory store pinned to the same workspace generation.
     pub fn memory_store(&self) -> Arc<dyn Store> {
         self.receipt.binding.store.clone()
+    }
+
+    pub async fn settle_hot_memory_projection(&self) -> MemoryProjectionSettlementReceipt {
+        let receipt = settle_hot_memory_projection_for_binding(
+            &self.receipt.binding,
+            &self.receipt.hot_memory_projection,
+        )
+        .await;
+        if receipt.status == MemoryProjectionSettlementStatus::Degraded {
+            self.schedule_hot_memory_projection_repair().await;
+        }
+        receipt
+    }
+
+    async fn schedule_hot_memory_projection_repair(&self) {
+        let mut repair = self.receipt.hot_memory_projection.repair.lock().await;
+        if !repair.accepting {
+            return;
+        }
+        if let Some(existing) = repair.task.take() {
+            if !existing.is_finished() {
+                repair.task = Some(existing);
+                return;
+            }
+            if let Err(error) = existing.await {
+                tracing::error!(%error, "hot-memory projection repair task failed to join");
+            }
+        }
+        let binding = self.receipt.binding.clone();
+        let control = self.receipt.hot_memory_projection.clone();
+        repair.task = Some(tokio::spawn(async move {
+            let mut last_receipt = None;
+            for delay_ms in [25_u64, 50, 100] {
+                if control.active_generation.load(Ordering::Acquire) != binding.generation {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let receipt = settle_hot_memory_projection_for_binding(&binding, &control).await;
+                if receipt.status == MemoryProjectionSettlementStatus::Settled {
+                    return;
+                }
+                last_receipt = Some(receipt);
+            }
+            if let Some(receipt) = last_receipt {
+                tracing::warn!(
+                    authority_scope = %receipt.authority_scope,
+                    workspace_generation = %receipt.workspace_generation,
+                    revision = %receipt.revision,
+                    pending_revision = ?receipt.pending_revision,
+                    error = ?receipt.error,
+                    "bounded hot-memory projection repair remains degraded"
+                );
+            }
+        }));
     }
 
     /// Transfer a spawned framework review into the integration's owned
@@ -281,20 +422,192 @@ impl ReviewGenerationLease {
         })
     }
 
-    #[cfg(test)]
-    fn generation(&self) -> u64 {
-        self.receipt.binding.generation
-    }
-
     /// Workspace-local `.eko` root pinned by this generation.
     pub fn echo_agent_dir(&self) -> &std::path::Path {
         &self.receipt.binding.echo_agent_dir
     }
 }
 
+fn layer_manager_for_binding(
+    binding: &ReviewBinding,
+    observer: &Arc<MemoryProjectionObserver>,
+) -> echo_agent::error::Result<Arc<MemoryLayerManager>> {
+    let mut manager = binding
+        .layer_manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(manager) = manager.as_ref() {
+        return Ok(Arc::clone(manager));
+    }
+    let created = Arc::new(
+        MemoryRuntimeIntegrationBuilder::new(binding.echo_agent_dir.clone(), binding.store.clone())
+            .evolution_observer(observer.clone())
+            .build_layer_manager()?,
+    );
+    *manager = Some(Arc::clone(&created));
+    Ok(created)
+}
+
+fn projection_target_bindings(control: &HotMemoryProjectionControl) -> (bool, bool, bool) {
+    let targets = control
+        .targets
+        .read()
+        .map(|targets| (targets.primary.is_some(), targets.pool.clone()))
+        .unwrap_or_else(|poisoned| {
+            let targets = poisoned.into_inner();
+            (targets.primary.is_some(), targets.pool.clone())
+        });
+    let pool_bound = targets.1.and_then(|pool| pool.upgrade()).is_some();
+    (targets.0, pool_bound, pool_bound)
+}
+
+async fn settle_hot_memory_projection_for_binding(
+    binding: &ReviewBinding,
+    control: &HotMemoryProjectionControl,
+) -> MemoryProjectionSettlementReceipt {
+    let _gate = control.gate.lock().await;
+    let dirty_epoch = binding.projection_observer.revision();
+    let previous = control
+        .snapshot
+        .read()
+        .map(|snapshot| snapshot.clone())
+        .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+    let previous_revision = previous
+        .as_ref()
+        .map(|snapshot| snapshot.revision().to_string())
+        .unwrap_or_else(|| "unpublished".to_string());
+    let degraded = |error: String,
+                    pending_revision: Option<String>,
+                    changed: bool|
+     -> MemoryProjectionSettlementReceipt {
+        let (primary_bound, pool_bound, future_bound) = projection_target_bindings(control);
+        MemoryProjectionSettlementReceipt {
+            authority_scope: binding.authority_scope.clone(),
+            workspace_generation: binding.workspace_generation.clone(),
+            revision: previous_revision.clone(),
+            changed,
+            status: MemoryProjectionSettlementStatus::Degraded,
+            primary_bound,
+            pool_bound,
+            future_bound,
+            pending_revision,
+            error: Some(error),
+        }
+    };
+    if control.active_generation.load(Ordering::Acquire) != binding.generation {
+        return degraded(
+            "stale memory generation cannot publish projection".to_string(),
+            Some(format!("dirty:{dirty_epoch}")),
+            false,
+        );
+    }
+    if previous.is_some() && control.settled_dirty_epoch.load(Ordering::Acquire) == dirty_epoch {
+        let (primary_bound, pool_bound, future_bound) = projection_target_bindings(control);
+        return MemoryProjectionSettlementReceipt {
+            authority_scope: binding.authority_scope.clone(),
+            workspace_generation: binding.workspace_generation.clone(),
+            revision: previous_revision,
+            changed: false,
+            status: MemoryProjectionSettlementStatus::Settled,
+            primary_bound,
+            pool_bound,
+            future_bound,
+            pending_revision: None,
+            error: None,
+        };
+    }
+    if let Err(error) = layer_manager_for_binding(binding, &binding.projection_observer) {
+        return degraded(
+            format!("memory layer manager unavailable: {error}"),
+            Some(format!("dirty:{dirty_epoch}")),
+            false,
+        );
+    }
+    #[cfg(test)]
+    control.projection_reads.fetch_add(1, Ordering::AcqRel);
+    let snapshot = match crate::unified_memory::load_hot_memory_projection_snapshot(
+        binding.echo_agent_dir.clone(),
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return degraded(error, Some(format!("dirty:{dirty_epoch}")), false);
+        }
+    };
+    let changed = previous
+        .as_ref()
+        .is_none_or(|previous| !previous.same_content(&snapshot));
+    if control.active_generation.load(Ordering::Acquire) != binding.generation {
+        return degraded(
+            "memory generation retired during projection read".to_string(),
+            Some(snapshot.revision().to_string()),
+            changed,
+        );
+    }
+    let latest_dirty_epoch = binding.projection_observer.revision();
+    if latest_dirty_epoch != dirty_epoch {
+        return degraded(
+            "hot memory changed during projection read".to_string(),
+            Some(format!("dirty:{latest_dirty_epoch}")),
+            false,
+        );
+    }
+    let (primary_bound, pool_bound, future_bound) = projection_target_bindings(control);
+    if !primary_bound {
+        return degraded(
+            "primary hot-memory projection target is not bound".to_string(),
+            Some(snapshot.revision().to_string()),
+            changed,
+        );
+    }
+    let revision = snapshot.revision().to_string();
+    control.source.publish(snapshot.clone());
+    let final_dirty_epoch = binding.projection_observer.revision();
+    if control.active_generation.load(Ordering::Acquire) != binding.generation
+        || final_dirty_epoch != dirty_epoch
+    {
+        return degraded(
+            "hot-memory projection changed before settlement commit".to_string(),
+            Some(format!("dirty:{final_dirty_epoch}")),
+            false,
+        );
+    }
+    *control
+        .snapshot
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot);
+    control
+        .settled_dirty_epoch
+        .store(dirty_epoch, Ordering::Release);
+    MemoryProjectionSettlementReceipt {
+        authority_scope: binding.authority_scope.clone(),
+        workspace_generation: binding.workspace_generation.clone(),
+        revision,
+        changed,
+        status: MemoryProjectionSettlementStatus::Settled,
+        primary_bound: true,
+        pool_bound,
+        future_bound,
+        pending_revision: None,
+        error: None,
+    }
+}
+
 impl crate::tasks::task_runtime::store::RunDriverExecutionReceipt for ReviewGenerationLease {
     fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
         Box::pin(async move {
+            let receipt = self.settle_hot_memory_projection().await;
+            if receipt.status == MemoryProjectionSettlementStatus::Degraded {
+                tracing::warn!(
+                    authority_scope = %receipt.authority_scope,
+                    workspace_generation = %receipt.workspace_generation,
+                    revision = %receipt.revision,
+                    pending_revision = ?receipt.pending_revision,
+                    error = ?receipt.error,
+                    "run release retained committed hot-memory projection debt"
+                );
+            }
             drop(self);
         })
     }
@@ -371,104 +684,6 @@ async fn await_owned_background_reviews(tasks: Vec<OwnedBackgroundReview>) -> Op
     first_error
 }
 
-/// Exclusive workspace-rebind admission owned by the existing workspace
-/// transition. Preparing it is fallible and happens before the transition's
-/// commit boundary; committing the already-prepared binding is infallible.
-#[must_use]
-pub struct ReviewRebindPermit {
-    control: Arc<ReviewBindingControl>,
-    next: Option<ReviewBinding>,
-}
-
-/// A prepared workspace memory generation whose pending rule promotions were
-/// reconciled before the process crosses its workspace commit boundary.
-#[must_use]
-pub struct ReconciledReviewRebindPermit {
-    permit: ReviewRebindPermit,
-    projection: Option<crate::unified_memory::InstructionProjectionSnapshot>,
-    receipts: Vec<RulePromotionReceipt>,
-}
-
-impl ReviewRebindPermit {
-    pub async fn reconcile_rule_promotions(
-        self,
-    ) -> Result<ReconciledReviewRebindPermit, RulePromotionError> {
-        let next = self.next.as_ref().ok_or_else(|| {
-            RulePromotionError::Projection(
-                "workspace rebind permit has no prepared binding".to_string(),
-            )
-        })?;
-        let promoter = RulePromoter::new(next.store.clone())
-            .with_rules_path(next.echo_agent_dir.join("learned-rules.md"));
-        let change_log = echo_agent::evolution::JsonlChangeLog::new(
-            next.echo_agent_dir
-                .join("evolution")
-                .join("change-log.jsonl"),
-        )
-        .map_err(|error| RulePromotionError::Audit(error.to_string()))?;
-        let receipts = promoter.reconcile_pending(&change_log).await?;
-        let root = next
-            .echo_agent_dir
-            .parent()
-            .map(std::path::Path::to_path_buf);
-        let projection = crate::unified_memory::load_instruction_projection_strict(root.as_deref())
-            .map_err(|error| RulePromotionError::Projection(error.to_string()))?;
-        Ok(ReconciledReviewRebindPermit {
-            permit: self,
-            projection: Some(projection),
-            receipts,
-        })
-    }
-}
-
-impl ReconciledReviewRebindPermit {
-    /// Publish the prepared binding while retaining the exact projection read
-    /// before the workspace commit boundary for later runtime settlement.
-    pub fn commit(&mut self) -> MemoryRebindReceipt {
-        let mut state = self
-            .permit
-            .control
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        flush_queued_triggers_locked(&mut state);
-        let pending_old = state.pending_triggers.len();
-        let mut pending_roots = Vec::new();
-        for queued in &state.pending_triggers {
-            if !pending_roots.contains(&queued.echo_agent_dir) {
-                pending_roots.push(queued.echo_agent_dir.clone());
-            }
-        }
-        let delivery_error = if pending_old == 0 {
-            None
-        } else {
-            state.last_trigger_delivery_error.clone()
-        };
-        if let Some(next) = self.permit.next.take() {
-            state.current = next;
-            state.pending_rule_projection = self.projection.take();
-            state.pending_rule_receipts = std::mem::take(&mut self.receipts);
-        }
-        MemoryRebindReceipt {
-            generation: state.current.generation,
-            pending_old,
-            pending_roots,
-            delivery_error,
-        }
-    }
-}
-
-impl Drop for ReviewRebindPermit {
-    fn drop(&mut self) {
-        let mut state = self
-            .control
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.rebind_in_progress = false;
-    }
-}
-
 fn flush_queued_triggers_locked(state: &mut ReviewBindingState) {
     while let Some(queued) = state.pending_triggers.front().cloned() {
         match EvidenceStore::new(queued.echo_agent_dir).upsert(queued.draft) {
@@ -497,16 +712,18 @@ pub struct ReviewIntegration {
     /// Single authority for workspace directory, Store and generation. The
     /// pair must never be read or published through independent locks.
     binding: Arc<ReviewBindingControl>,
-    /// Framework observer wired to the shared agent HookRegistry.
-    evolution_observer: RwLock<Option<Arc<dyn EvolutionObserver>>>,
+    /// One observer shared by the generation-bound layer manager. It marks the
+    /// latest hot-memory revision dirty and forwards framework hook events.
+    forwarding_evolution_observer: Arc<RwLock<Option<Arc<dyn EvolutionObserver>>>>,
     /// Serializes promotion recovery, publication, and projection settlement.
     promotion_gate: tokio::sync::Mutex<()>,
     /// Primary plus current pool are the one projection target set used by all
     /// surfaces. A successful promotion refreshes both before returning.
-    rule_projection_targets: RwLock<RuleProjectionTargets>,
+    rule_projection_targets: Arc<RwLock<RuleProjectionTargets>>,
     /// Last generation confirmed on primary and pool. Instruction files remain
     /// the content authority; this is only a runtime publication receipt.
     rule_projection_snapshot: RwLock<Option<crate::unified_memory::InstructionProjectionSnapshot>>,
+    hot_memory_projection: Arc<HotMemoryProjectionControl>,
     #[cfg(test)]
     rule_projection_fault: Mutex<Option<RuleProjectionFault>>,
 }
@@ -514,19 +731,57 @@ pub struct ReviewIntegration {
 impl ReviewIntegration {
     /// Create a new review integration with the given config.
     pub fn new(config: ReviewConfig, echo_agent_dir: PathBuf, store: Arc<dyn Store>) -> Self {
+        Self::new_scoped(
+            config,
+            echo_agent_dir,
+            store,
+            "global".to_string(),
+            "global".to_string(),
+        )
+    }
+
+    pub fn new_scoped(
+        config: ReviewConfig,
+        echo_agent_dir: PathBuf,
+        store: Arc<dyn Store>,
+        authority_scope: String,
+        workspace_generation: String,
+    ) -> Self {
+        let forwarding_evolution_observer = Arc::new(RwLock::new(None));
+        let projection_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let memory_projection_observer = Arc::new(MemoryProjectionObserver::new(
+            forwarding_evolution_observer.clone(),
+            projection_gate.clone(),
+        ));
+        let rule_projection_targets = Arc::new(RwLock::new(RuleProjectionTargets::default()));
+        let hot_memory_projection = Arc::new(HotMemoryProjectionControl {
+            gate: projection_gate,
+            repair: tokio::sync::Mutex::new(HotMemoryProjectionRepair {
+                accepting: true,
+                task: None,
+            }),
+            snapshot: RwLock::new(None),
+            targets: rule_projection_targets.clone(),
+            source: Arc::new(crate::unified_memory::HotMemoryProjectionSource::new()),
+            active_generation: AtomicU64::new(0),
+            settled_dirty_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            projection_reads: AtomicU64::new(0),
+        });
         Self {
             config,
             binding: Arc::new(ReviewBindingControl {
                 state: Mutex::new(ReviewBindingState {
                     current: ReviewBinding {
+                        authority_scope,
+                        workspace_generation,
                         echo_agent_dir,
                         store,
                         generation: 0,
+                        layer_manager: Arc::new(Mutex::new(None)),
+                        projection_observer: memory_projection_observer,
                     },
-                    pending_rule_projection: None,
-                    pending_rule_receipts: Vec::new(),
                     active_passes: 0,
-                    rebind_in_progress: false,
                     pending_triggers: VecDeque::new(),
                     trigger_delivery_failures: 0,
                     rejected_triggers: 0,
@@ -537,10 +792,11 @@ impl ReviewIntegration {
                     tasks: Vec::new(),
                 }),
             }),
-            evolution_observer: RwLock::new(None),
+            forwarding_evolution_observer,
             promotion_gate: tokio::sync::Mutex::new(()),
-            rule_projection_targets: RwLock::new(RuleProjectionTargets::default()),
+            rule_projection_targets,
             rule_projection_snapshot: RwLock::new(None),
+            hot_memory_projection,
             #[cfg(test)]
             rule_projection_fault: Mutex::new(None),
         }
@@ -582,48 +838,7 @@ impl ReviewIntegration {
             self.publish_rule_projection(snapshot).await?;
             self.commit_rule_projection_receipts(&lease, &pending)
                 .await?;
-            self.clear_pending_rule_projection();
         }
-        Ok(())
-    }
-
-    /// Test-only coverage for the retired process-wide workspace rebind path.
-    #[cfg(test)]
-    pub(crate) async fn settle_rebind_rule_promotions(
-        &self,
-        pool_transition: Option<&crate::agent_pool::AgentPoolWorkspaceTransition<'_>>,
-    ) -> Result<(), RulePromotionError> {
-        let _gate = self.promotion_gate.lock().await;
-        let (binding, snapshot, receipts) = {
-            let state = self
-                .binding
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !state.rebind_in_progress {
-                return Err(RulePromotionError::Projection(
-                    "workspace rule projection settlement has no active rebind".to_string(),
-                ));
-            }
-            let snapshot = state.pending_rule_projection.clone().ok_or_else(|| {
-                RulePromotionError::Projection(
-                    "workspace rule projection settlement has no prepared snapshot".to_string(),
-                )
-            })?;
-            (
-                state.current.clone(),
-                snapshot,
-                state.pending_rule_receipts.clone(),
-            )
-        };
-        let promoter = RulePromoter::new(binding.store)
-            .with_rules_path(binding.echo_agent_dir.join("learned-rules.md"));
-        self.publish_rule_projection_with_transition(snapshot, pool_transition)
-            .await?;
-        for receipt in &receipts {
-            promoter.commit_projection(receipt).await?;
-        }
-        self.clear_pending_rule_projection();
         Ok(())
     }
 
@@ -637,7 +852,6 @@ impl ReviewIntegration {
         self.publish_rule_projection(snapshot).await?;
         self.commit_rule_projection_receipts(&lease, &pending)
             .await?;
-        self.clear_pending_rule_projection();
         Ok(RulePromoter::new(lease.memory_store())
             .with_rules_path(lease.echo_agent_dir().join("learned-rules.md"))
             .scan_for_proposals()
@@ -669,7 +883,6 @@ impl ReviewIntegration {
         .map_err(|error| RulePromotionError::Projection(error.to_string()))?;
         self.publish_rule_projection(snapshot).await?;
         let receipt = promoter.commit_projection(&effects).await?;
-        self.clear_pending_rule_projection();
         let primary = self
             .rule_projection_targets
             .read()
@@ -733,30 +946,8 @@ impl ReviewIntegration {
         &self,
         lease: &ReviewGenerationLease,
     ) -> Result<crate::unified_memory::InstructionProjectionSnapshot, RulePromotionError> {
-        let pending = self
-            .binding
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .pending_rule_projection
-            .clone();
-        match pending {
-            Some(snapshot) => Ok(snapshot),
-            None => crate::unified_memory::load_instruction_projection_strict(
-                lease.echo_agent_dir().parent(),
-            )
-            .map_err(|error| RulePromotionError::Projection(error.to_string())),
-        }
-    }
-
-    fn clear_pending_rule_projection(&self) {
-        let mut state = self
-            .binding
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.pending_rule_projection = None;
-        state.pending_rule_receipts.clear();
+        crate::unified_memory::load_instruction_projection_strict(lease.echo_agent_dir().parent())
+            .map_err(|error| RulePromotionError::Projection(error.to_string()))
     }
 
     fn has_rule_projection_primary(&self) -> bool {
@@ -863,62 +1054,80 @@ impl ReviewIntegration {
 
     /// Attach the runtime observer used by memory, candidate and health paths.
     pub fn set_evolution_observer(&self, observer: Arc<dyn EvolutionObserver>) {
-        let mut current = self
-            .evolution_observer
+        *self
+            .forwarding_evolution_observer
             .write()
-            .unwrap_or_else(|error| error.into_inner());
-        *current = Some(observer);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
     }
 
-    /// Reserve the memory/evolution generation for the canonical workspace
-    /// transition. EKO deliberately returns Busy instead of synchronously
-    /// waiting inside async code when a review or Dreaming pass is active.
-    pub fn prepare_rebind(
+    fn current_evolution_observer(&self) -> Option<Arc<dyn EvolutionObserver>> {
+        self.forwarding_evolution_observer
+            .read()
+            .map(|observer| observer.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    pub(crate) fn hot_memory_projection_source(
         &self,
-        echo_agent_dir: PathBuf,
-        store: Arc<dyn Store>,
-    ) -> Result<ReviewRebindPermit, ReviewGenerationError> {
-        let mut state = self
-            .binding
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.active_passes != 0 || state.rebind_in_progress {
-            return Err(ReviewGenerationError::Busy {
-                active_passes: state.active_passes,
-                rebind_in_progress: state.rebind_in_progress,
-            });
+    ) -> Arc<crate::unified_memory::HotMemoryProjectionSource> {
+        self.hot_memory_projection.source.clone()
+    }
+
+    #[cfg(test)]
+    fn hot_memory_projection_read_count(&self) -> u64 {
+        self.hot_memory_projection
+            .projection_reads
+            .load(Ordering::Acquire)
+    }
+
+    pub async fn settle_hot_memory_projection(&self) -> MemoryProjectionSettlementReceipt {
+        match self.lease_generation() {
+            Ok(lease) => lease.settle_hot_memory_projection().await,
+            Err(error) => {
+                let binding = self.binding_snapshot();
+                let targets = self
+                    .rule_projection_targets
+                    .read()
+                    .map(|targets| (targets.primary.is_some(), targets.pool.clone()))
+                    .unwrap_or_else(|poisoned| {
+                        let targets = poisoned.into_inner();
+                        (targets.primary.is_some(), targets.pool.clone())
+                    });
+                let pool_bound = targets.1.and_then(|pool| pool.upgrade()).is_some();
+                let revision = self
+                    .hot_memory_projection
+                    .snapshot
+                    .read()
+                    .map(|snapshot| {
+                        snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.revision().to_string())
+                            .unwrap_or_else(|| "unpublished".to_string())
+                    })
+                    .unwrap_or_else(|poisoned| {
+                        poisoned
+                            .into_inner()
+                            .as_ref()
+                            .map(|snapshot| snapshot.revision().to_string())
+                            .unwrap_or_else(|| "unpublished".to_string())
+                    });
+                MemoryProjectionSettlementReceipt {
+                    authority_scope: binding.authority_scope,
+                    workspace_generation: binding.workspace_generation,
+                    revision,
+                    changed: false,
+                    status: MemoryProjectionSettlementStatus::Degraded,
+                    primary_bound: targets.0,
+                    pool_bound,
+                    future_bound: pool_bound,
+                    pending_revision: Some(format!(
+                        "dirty:{}",
+                        binding.projection_observer.revision()
+                    )),
+                    error: Some(error.to_string()),
+                }
+            }
         }
-        flush_queued_triggers_locked(&mut state);
-        if !state.pending_triggers.is_empty() {
-            return Err(ReviewGenerationError::TriggerSettlement {
-                pending: state.pending_triggers.len(),
-                last_error: state
-                    .last_trigger_delivery_error
-                    .clone()
-                    .unwrap_or_else(|| "unknown trigger delivery failure".to_string()),
-            });
-        }
-        if state.pending_rule_projection.is_some() {
-            return Err(ReviewGenerationError::ProjectionSettlement {
-                pending_receipts: state.pending_rule_receipts.len(),
-            });
-        }
-        let generation = state
-            .current
-            .generation
-            .checked_add(1)
-            .ok_or(ReviewGenerationError::CounterExhausted("generation"))?;
-        state.rebind_in_progress = true;
-        drop(state);
-        Ok(ReviewRebindPermit {
-            control: self.binding.clone(),
-            next: Some(ReviewBinding {
-                echo_agent_dir,
-                store,
-                generation,
-            }),
-        })
     }
 
     /// Get the current review config.
@@ -936,8 +1145,7 @@ impl ReviewIntegration {
         self.current_echo_agent_dir()
     }
 
-    /// Observable delivery state for triggers that arrived during the short
-    /// workspace rebind settlement window.
+    /// Observable delivery state for queued trigger persistence.
     pub fn trigger_delivery_status(&self) -> TriggerDeliveryStatus {
         let state = self
             .binding
@@ -970,6 +1178,20 @@ impl ReviewIntegration {
 
     pub async fn shutdown_background_reviews(&self) -> Result<(), String> {
         self.begin_background_review_shutdown();
+        {
+            let _projection_gate = self.hot_memory_projection.gate.lock().await;
+            let mut targets = self
+                .rule_projection_targets
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            targets.primary = None;
+            targets.pool = None;
+            let _advanced = self.hot_memory_projection.active_generation.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |generation| generation.checked_add(1),
+            );
+        }
         let tasks = {
             let mut registry = self
                 .binding
@@ -982,9 +1204,26 @@ impl ReviewIntegration {
             task.abort_handle.abort();
             task.release.cancel();
         }
-        match await_owned_background_reviews(tasks).await {
-            Some(error) => Err(error),
-            None => Ok(()),
+        let projection_repair = {
+            let mut repair = self.hot_memory_projection.repair.lock().await;
+            repair.accepting = false;
+            repair.task.take()
+        };
+        let mut errors = Vec::new();
+        if let Some(error) = await_owned_background_reviews(tasks).await {
+            errors.push(error);
+        }
+        if let Some(repair) = projection_repair
+            && let Err(error) = repair.await
+        {
+            errors.push(format!(
+                "hot-memory projection repair failed to join: {error}"
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
         }
     }
 
@@ -1045,7 +1284,6 @@ impl ReviewIntegration {
             self.commit_rule_projection_receipts(&lease, &pending)
                 .await
                 .map_err(|error| error.to_string())?;
-            self.clear_pending_rule_projection();
         }
         let echo_agent_dir = lease.receipt.binding.echo_agent_dir.clone();
         let store = lease.receipt.binding.store.clone();
@@ -1120,43 +1358,6 @@ impl ReviewIntegration {
         Ok(report)
     }
 
-    /// Create a `MemoryLayerManager` for the current workspace's memory store.
-    ///
-    /// Reads one atomic `(echo_agent_dir, store, generation)` binding, so after
-    /// a workspace `rebind` this manager uses the new workspace.
-    pub fn create_layer_manager(&self) -> echo_agent::error::Result<MemoryLayerManager> {
-        self.runtime_builder().build_layer_manager()
-    }
-
-    /// Create a manager with caller-specific event correlation metadata.
-    /// Pool agents use this so shared storage does not imply a shared session ID.
-    pub fn create_layer_manager_with_observer(
-        &self,
-        observer: Arc<dyn EvolutionObserver>,
-    ) -> echo_agent::error::Result<MemoryLayerManager> {
-        self.runtime_builder()
-            .evolution_observer(observer)
-            .build_layer_manager()
-    }
-
-    /// Create framework runtime wiring without owning product lifecycle policy.
-    fn runtime_builder(&self) -> MemoryRuntimeIntegrationBuilder {
-        let binding = self.binding_snapshot();
-        let mut builder =
-            MemoryRuntimeIntegrationBuilder::new(binding.echo_agent_dir, binding.store);
-        if let Some(observer) = self.current_evolution_observer() {
-            builder = builder.evolution_observer(observer);
-        }
-        builder
-    }
-
-    fn current_evolution_observer(&self) -> Option<Arc<dyn EvolutionObserver>> {
-        self.evolution_observer
-            .read()
-            .map(|observer| observer.clone())
-            .unwrap_or_else(|error| error.into_inner().clone())
-    }
-
     fn current_echo_agent_dir(&self) -> PathBuf {
         self.binding_snapshot().echo_agent_dir
     }
@@ -1177,12 +1378,6 @@ impl ReviewIntegration {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.rebind_in_progress {
-                return Err(ReviewGenerationError::Busy {
-                    active_passes: state.active_passes,
-                    rebind_in_progress: true,
-                });
-            }
             flush_queued_triggers_locked(&mut state);
             state.active_passes = state
                 .active_passes
@@ -1190,11 +1385,13 @@ impl ReviewIntegration {
                 .ok_or(ReviewGenerationError::CounterExhausted("active pass"))?;
             state.current.clone()
         };
+        let projection_observer = binding.projection_observer.clone();
         let lease = ReviewGenerationLease {
             receipt: Arc::new(ReviewGenerationReceipt {
                 control: self.binding.clone(),
                 binding,
-                evolution_observer: self.current_evolution_observer(),
+                projection_observer,
+                hot_memory_projection: self.hot_memory_projection.clone(),
             }),
         };
         Ok(lease)
@@ -1288,10 +1485,6 @@ impl echo_agent::evolution::MemoryTriggerSink for ReviewIntegration {
             };
             let lease = match self.lease_generation() {
                 Ok(lease) => lease,
-                Err(ReviewGenerationError::Busy { .. }) => {
-                    self.queue_trigger(draft, None);
-                    return Ok(echo_agent::evolution::MemoryTriggerDisposition::Captured);
-                }
                 Err(error) => {
                     self.queue_trigger(draft, Some(error.to_string()));
                     tracing::error!(%error, "memory trigger could not acquire generation lease");
@@ -1640,7 +1833,9 @@ mod tests {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let ri = ReviewIntegration::new(ReviewConfig::default(), temp.path().join(".eko"), store);
         let layer_manager = ri
-            .create_layer_manager()
+            .lease_generation()
+            .map_err(|error| error.to_string())?
+            .layer_manager()
             .map_err(|error| error.to_string())?;
         let high = MemoryMeta::new(MemoryType::ProjectFact, MemorySource::ExplicitSave, "build")
             .with_confidence(0.9);
@@ -1766,83 +1961,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_rebind_hands_instruction_generation_off_without_reopening_pool_admission()
-    -> Result<(), String> {
-        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let root_a = temp.path().join("workspace-a");
-        let root_b = temp.path().join("workspace-b");
-        for root in [&root_a, &root_b] {
-            std::fs::create_dir_all(root.join(".git")).map_err(|error| error.to_string())?;
-            std::fs::create_dir_all(root.join(".eko")).map_err(|error| error.to_string())?;
-        }
-        std::fs::write(root_a.join(".eko/learned-rules.md"), "GENERATION_A")
-            .map_err(|error| error.to_string())?;
-        std::fs::write(root_b.join(".eko/learned-rules.md"), "GENERATION_B")
-            .map_err(|error| error.to_string())?;
-        let store_a = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
-        let store_b = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
-        let integration = Arc::new(ReviewIntegration::new(
-            ReviewConfig::default(),
-            root_a.join(".eko"),
-            store_a,
-        ));
-        let primary = projection_test_agent()?;
-        integration.bind_rule_projection_primary(primary.clone());
-        integration
-            .initialize_rule_promotions()
-            .await
-            .map_err(|error| error.to_string())?;
-        let pool = Arc::new(
-            crate::agent_pool::AgentPool::new_for_test(primary.clone(), None, None, 4, false).await,
-        );
-        integration
-            .bind_rule_projection_pool(&pool)
-            .await
-            .map_err(|error| error.to_string())?;
-        let existing = pool
-            .acquire("existing")
-            .await
-            .map_err(|error| error.to_string())?;
-        drop(existing);
-
-        let mut memory_permit = integration
-            .prepare_rebind(root_b.join(".eko"), store_b)
-            .map_err(|error| error.to_string())?
-            .reconcile_rule_promotions()
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut pool_transition = pool
-            .preflight_workspace_transition()
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(memory_permit.commit().generation, 1);
-        pool_transition.commit().await;
-        integration
-            .settle_rebind_rule_promotions(Some(&pool_transition))
-            .await
-            .map_err(|error| error.to_string())?;
-        assert!(pool.transition_admission_closed_for_test());
-        assert!(
-            projected_instruction_text(&primary)
-                .await
-                .contains("GENERATION_B")
-        );
-        drop(pool_transition);
-        drop(memory_permit);
-
-        let future = pool
-            .acquire("future")
-            .await
-            .map_err(|error| error.to_string())?;
-        assert!(
-            projected_instruction_text(&future.agent())
-                .await
-                .contains("GENERATION_B")
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn promotion_receipt_commits_only_after_projection_retry() -> Result<(), String> {
         use echo_agent::memory::{MemoryMeta, MemorySource, MemoryType};
 
@@ -1937,7 +2055,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evolution_observer_survives_rebind_and_manager_rebuild() -> Result<(), String> {
+    async fn generation_manager_is_shared_and_forwards_observer_events() -> Result<(), String> {
         use echo_agent::memory::{InMemoryStore, MemoryMeta, MemorySource, MemoryType};
 
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
@@ -1960,28 +2078,434 @@ mod tests {
             )
             .with_confidence(0.6)
         };
-        ri.create_layer_manager()
-            .map_err(|error| error.to_string())?
+        let first_lease = ri.lease_generation().map_err(|error| error.to_string())?;
+        let first_manager = first_lease
+            .layer_manager()
+            .map_err(|error| error.to_string())?;
+        first_manager
             .write_memory("first", "first write", meta())
             .await
             .map_err(|error| error.to_string())?;
-
-        let second_store = Arc::new(InMemoryStore::new()) as Arc<dyn Store>;
-        let mut permit = ri
-            .prepare_rebind(temp.path().join("second/.eko"), second_store)
-            .map_err(|error| error.to_string())?
-            .reconcile_rule_promotions()
-            .await
+        let second_lease = ri.lease_generation().map_err(|error| error.to_string())?;
+        let second_manager = second_lease
+            .layer_manager()
             .map_err(|error| error.to_string())?;
-        assert_eq!(permit.commit().generation, 1);
-        drop(permit);
-        ri.create_layer_manager()
-            .map_err(|error| error.to_string())?
+        assert!(Arc::ptr_eq(&first_manager, &second_manager));
+        second_manager
             .write_memory("second", "second write", meta())
             .await
             .map_err(|error| error.to_string())?;
 
         assert_eq!(writes.load(Ordering::Relaxed), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_release_publishes_dirty_snapshot_and_unchanged_turn_is_noop() -> Result<(), String>
+    {
+        use echo_agent::memory::{InMemoryStore, MemoryMeta, MemorySource, MemoryType};
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let echo_dir = temp.path().join("workspace/.eko");
+        std::fs::create_dir_all(&echo_dir).map_err(|error| error.to_string())?;
+        let integration = Arc::new(ReviewIntegration::new_scoped(
+            ReviewConfig::default(),
+            echo_dir,
+            Arc::new(InMemoryStore::new()),
+            "workspace:alpha".to_string(),
+            "generation-alpha".to_string(),
+        ));
+        integration.bind_rule_projection_primary(projection_test_agent()?);
+        let lease = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        lease
+            .layer_manager()
+            .map_err(|error| error.to_string())?
+            .write_memory(
+                "release-fact",
+                "the release path publishes this fact",
+                MemoryMeta::new(
+                    MemoryType::ProjectFact,
+                    MemorySource::ExplicitSave,
+                    "release-test",
+                )
+                .with_confidence(0.99)
+                .with_stability(0.90),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            integration
+                .hot_memory_projection_source()
+                .snapshot()
+                .is_none()
+        );
+
+        crate::tasks::task_runtime::store::RunDriverExecutionReceipt::release(Box::new(lease))
+            .await;
+        let published = integration
+            .hot_memory_projection_source()
+            .snapshot()
+            .ok_or_else(|| "run release did not publish hot memory".to_string())?;
+        assert!(!published.revision().is_empty());
+        assert_eq!(integration.hot_memory_projection_read_count(), 1);
+
+        let unchanged = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?
+            .settle_hot_memory_projection()
+            .await;
+        assert_eq!(unchanged.status, MemoryProjectionSettlementStatus::Settled);
+        assert!(!unchanged.changed);
+        assert_eq!(unchanged.authority_scope, "workspace:alpha");
+        assert_eq!(unchanged.workspace_generation, "generation-alpha");
+        assert_eq!(unchanged.revision, published.revision());
+        assert_eq!(integration.hot_memory_projection_read_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cloned_review_owner_preserves_generation_and_original_settles_once()
+    -> Result<(), String> {
+        use echo_agent::memory::{InMemoryStore, MemoryMeta, MemorySource, MemoryType};
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let integration = ReviewIntegration::new_scoped(
+            ReviewConfig::default(),
+            temp.path().join("workspace/.eko"),
+            Arc::new(InMemoryStore::new()),
+            "workspace:review".to_string(),
+            "generation-review".to_string(),
+        );
+        integration.bind_rule_projection_primary(projection_test_agent()?);
+        let initial = integration.settle_hot_memory_projection().await;
+        assert_eq!(initial.status, MemoryProjectionSettlementStatus::Settled);
+        let review_lease = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        review_lease
+            .layer_manager()
+            .map_err(|error| error.to_string())?
+            .write_memory(
+                "review-hot-fact",
+                "review completion settles this hot-memory generation once",
+                MemoryMeta::new(
+                    MemoryType::ArchitectureDecision,
+                    MemorySource::ExplicitSave,
+                    "review-clone-test",
+                )
+                .with_confidence(0.99)
+                .with_stability(0.90),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let child = tokio::spawn(async {
+            echo_agent::evolution::ReviewOutcome {
+                run_id: "review-clone-run".to_string(),
+                actions: vec!["capture reusable decision".to_string()],
+                nothing_to_save: false,
+                candidate: Some(echo_agent::evolution::ReviewCandidate {
+                    kind: echo_agent::evolution::ReviewCandidateKind::ProjectFact,
+                    content: "review generation remains stable".to_string(),
+                    evidence: "the background owner captured this candidate".to_string(),
+                    confidence: 0.95,
+                    persisted: false,
+                }),
+                error: None,
+            }
+        });
+        let mut pass = review_lease.clone().track_background_review(child).await?;
+        let settlement = pass.settle().await?;
+        assert!(settlement.evidence_candidate.is_some());
+        drop(pass);
+        assert_eq!(review_lease.evidence_store().list()?.len(), 1);
+
+        let receipt = review_lease.settle_hot_memory_projection().await;
+        assert_eq!(receipt.status, MemoryProjectionSettlementStatus::Settled);
+        assert_eq!(receipt.authority_scope, "workspace:review");
+        assert_eq!(receipt.workspace_generation, "generation-review");
+        assert!(receipt.changed);
+        assert_eq!(integration.hot_memory_projection_read_count(), 2);
+        let unchanged = review_lease.settle_hot_memory_projection().await;
+        assert!(!unchanged.changed);
+        assert_eq!(integration.hot_memory_projection_read_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn warm_only_write_settles_without_hot_projection_read() -> Result<(), String> {
+        use echo_agent::memory::{InMemoryStore, MemoryMeta, MemorySource, MemoryType};
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let integration = ReviewIntegration::new(
+            ReviewConfig::default(),
+            temp.path().join("workspace/.eko"),
+            Arc::new(InMemoryStore::new()),
+        );
+        integration.bind_rule_projection_primary(projection_test_agent()?);
+        let initial = integration.settle_hot_memory_projection().await;
+        assert_eq!(initial.status, MemoryProjectionSettlementStatus::Settled);
+        assert_eq!(integration.hot_memory_projection_read_count(), 1);
+
+        let generation = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        generation
+            .layer_manager()
+            .map_err(|error| error.to_string())?
+            .write_memory(
+                "warm-only",
+                "this memory intentionally remains in the warm layer",
+                MemoryMeta::new(
+                    MemoryType::ProjectFact,
+                    MemorySource::ExplicitSave,
+                    "warm-only-test",
+                )
+                .with_confidence(0.99),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let settled = generation.settle_hot_memory_projection().await;
+        assert_eq!(settled.status, MemoryProjectionSettlementStatus::Settled);
+        assert!(!settled.changed);
+        assert_eq!(settled.revision, initial.revision);
+        assert_eq!(integration.hot_memory_projection_read_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_write_degrades_without_primary_and_repairs_on_retry() -> Result<(), String> {
+        use echo_agent::memory::{InMemoryStore, MemoryMeta, MemorySource, MemoryType};
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let integration = ReviewIntegration::new(
+            ReviewConfig::default(),
+            temp.path().join("workspace/.eko"),
+            Arc::new(InMemoryStore::new()),
+        );
+        let lease = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        lease
+            .layer_manager()
+            .map_err(|error| error.to_string())?
+            .write_memory(
+                "durable-before-projection",
+                "durable write remains committed while projection is degraded",
+                MemoryMeta::new(
+                    MemoryType::ProjectFact,
+                    MemorySource::ExplicitSave,
+                    "degraded-repair-test",
+                )
+                .with_confidence(0.99)
+                .with_stability(0.90),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let degraded = lease.settle_hot_memory_projection().await;
+        assert_eq!(degraded.status, MemoryProjectionSettlementStatus::Degraded);
+        assert!(
+            degraded
+                .pending_revision
+                .as_deref()
+                .is_some_and(|revision| !revision.starts_with("dirty:"))
+        );
+        assert!(
+            integration
+                .hot_memory_projection_source()
+                .snapshot()
+                .is_none()
+        );
+
+        integration.bind_rule_projection_primary(projection_test_agent()?);
+        let repaired = lease.settle_hot_memory_projection().await;
+        assert_eq!(repaired.status, MemoryProjectionSettlementStatus::Settled);
+        assert!(repaired.changed);
+        assert!(repaired.pending_revision.is_none());
+        assert!(
+            integration
+                .hot_memory_projection_source()
+                .snapshot()
+                .is_some()
+        );
+        assert_eq!(integration.hot_memory_projection_read_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_read_failure_preserves_last_good_and_owned_repair_publishes_next()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let echo_dir = temp.path().join("workspace/.eko");
+        std::fs::create_dir_all(&echo_dir).map_err(|error| error.to_string())?;
+        let memory_path = echo_dir.join("MEMORY.md");
+        std::fs::write(&memory_path, "last known good").map_err(|error| error.to_string())?;
+        let integration = ReviewIntegration::new(
+            ReviewConfig::default(),
+            echo_dir,
+            Arc::new(echo_agent::memory::InMemoryStore::new()),
+        );
+        integration.bind_rule_projection_primary(projection_test_agent()?);
+        let initial = integration.settle_hot_memory_projection().await;
+        assert_eq!(initial.status, MemoryProjectionSettlementStatus::Settled);
+        let initial_revision = initial.revision.clone();
+
+        std::fs::remove_file(&memory_path).map_err(|error| error.to_string())?;
+        std::fs::create_dir(&memory_path).map_err(|error| error.to_string())?;
+        let binding = integration.binding_snapshot();
+        {
+            let _gate = binding.projection_observer.projection_gate.lock().await;
+            binding.projection_observer.mark_dirty();
+        }
+        let degraded = integration.settle_hot_memory_projection().await;
+        assert_eq!(degraded.status, MemoryProjectionSettlementStatus::Degraded);
+        assert_eq!(degraded.revision, initial_revision);
+        assert!(
+            degraded
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("read failed"))
+        );
+        assert_eq!(
+            integration
+                .hot_memory_projection_source()
+                .snapshot()
+                .map(|snapshot| snapshot.revision().to_string())
+                .as_deref(),
+            Some(initial_revision.as_str())
+        );
+
+        std::fs::remove_dir(&memory_path).map_err(|error| error.to_string())?;
+        std::fs::write(&memory_path, "repaired projection").map_err(|error| error.to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let repaired = integration
+                    .hot_memory_projection_source()
+                    .snapshot()
+                    .is_some_and(|snapshot| snapshot.revision() != initial_revision);
+                if repaired {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "owned hot-memory projection repair did not publish".to_string())?;
+        integration.shutdown_background_reviews().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settlement_does_not_wait_for_live_primary_agent_lock() -> Result<(), String> {
+        use echo_agent::memory::{InMemoryStore, MemoryMeta, MemorySource, MemoryType};
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let integration = ReviewIntegration::new(
+            ReviewConfig::default(),
+            temp.path().join("workspace/.eko"),
+            Arc::new(InMemoryStore::new()),
+        );
+        let primary = projection_test_agent()?;
+        integration.bind_rule_projection_primary(primary.clone());
+        let lease = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        lease
+            .layer_manager()
+            .map_err(|error| error.to_string())?
+            .write_memory(
+                "live-agent-write",
+                "publication cannot wait for the agent that initiated this write",
+                MemoryMeta::new(
+                    MemoryType::ProjectFact,
+                    MemorySource::ExplicitSave,
+                    "active-agent-test",
+                )
+                .with_confidence(0.99)
+                .with_stability(0.90),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let primary_owner = Arc::clone(primary.inner());
+        let _primary_guard = primary_owner.write_owned().await;
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            lease.settle_hot_memory_projection(),
+        )
+        .await
+        .map_err(|_| "hot-memory settlement waited for live primary agent".to_string())?;
+        assert_eq!(receipt.status, MemoryProjectionSettlementStatus::Settled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receipt_reports_current_pool_lifetime_without_stale_bound_flags() -> Result<(), String>
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let integration = ReviewIntegration::new(
+            ReviewConfig::default(),
+            temp.path().join("workspace/.eko"),
+            Arc::new(echo_agent::memory::InMemoryStore::new()),
+        );
+        let primary = projection_test_agent()?;
+        integration.bind_rule_projection_primary(primary.clone());
+        let pool = Arc::new(
+            crate::agent_pool::AgentPool::new_for_test(primary, None, None, 2, false).await,
+        );
+        integration
+            .rule_projection_targets
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pool = Some(Arc::downgrade(&pool));
+
+        let bound = integration.settle_hot_memory_projection().await;
+        assert!(bound.primary_bound);
+        assert!(bound.pool_bound);
+        assert!(bound.future_bound);
+        drop(pool);
+
+        let retired = integration.settle_hot_memory_projection().await;
+        assert!(retired.primary_bound);
+        assert!(!retired.pool_bound);
+        assert!(!retired.future_bound);
+        assert_eq!(integration.hot_memory_projection_read_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retired_generation_cannot_publish_or_report_stale_targets() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let integration = ReviewIntegration::new(
+            ReviewConfig::default(),
+            temp.path().join("workspace/.eko"),
+            Arc::new(echo_agent::memory::InMemoryStore::new()),
+        );
+        integration.bind_rule_projection_primary(projection_test_agent()?);
+        let stale = integration.binding_snapshot();
+        stale.projection_observer.mark_dirty();
+        integration.shutdown_background_reviews().await?;
+
+        let rejected =
+            settle_hot_memory_projection_for_binding(&stale, &integration.hot_memory_projection)
+                .await;
+        assert_eq!(rejected.status, MemoryProjectionSettlementStatus::Degraded);
+        assert!(
+            rejected
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("stale memory generation"))
+        );
+        assert!(!rejected.primary_bound);
+        assert!(!rejected.pool_bound);
+        assert!(!rejected.future_bound);
+        assert!(
+            integration
+                .hot_memory_projection_source()
+                .snapshot()
+                .is_none()
+        );
+        assert_eq!(integration.hot_memory_projection_read_count(), 0);
         Ok(())
     }
 
@@ -2001,65 +2525,6 @@ mod tests {
         let ri = ReviewIntegration::new(config, dir, store);
         let result = ri.on_session_end().await;
         assert!(result.is_none(), "should not review when disabled");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn binding_snapshot_is_atomic_and_rebind_is_busy_until_settlement() -> Result<(), String>
-    {
-        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let dir_a = temp.path().join("workspace-a/.eko");
-        let dir_b = temp.path().join("workspace-b/.eko");
-        let store_a = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
-        let store_b = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
-        let integration =
-            ReviewIntegration::new(ReviewConfig::default(), dir_a.clone(), store_a.clone());
-
-        let pass_a = integration
-            .lease_generation()
-            .map_err(|error| error.to_string())?;
-        assert_eq!(pass_a.generation(), 0);
-        assert_eq!(pass_a.echo_agent_dir(), dir_a);
-        assert!(Arc::ptr_eq(&pass_a.memory_store(), &store_a));
-        assert!(matches!(
-            integration.prepare_rebind(dir_b.clone(), store_b.clone()),
-            Err(ReviewGenerationError::Busy {
-                active_passes: 1,
-                rebind_in_progress: false,
-            })
-        ));
-
-        drop(pass_a);
-        let mut permit = integration
-            .prepare_rebind(dir_b.clone(), store_b.clone())
-            .map_err(|error| error.to_string())?
-            .reconcile_rule_promotions()
-            .await
-            .map_err(|error| error.to_string())?;
-        assert!(matches!(
-            integration.lease_generation(),
-            Err(ReviewGenerationError::Busy {
-                active_passes: 0,
-                rebind_in_progress: true,
-            })
-        ));
-        assert_eq!(permit.commit().generation, 1);
-        // Projection settlement still owns the permit after binding publish.
-        assert!(matches!(
-            integration.lease_generation(),
-            Err(ReviewGenerationError::Busy {
-                active_passes: 0,
-                rebind_in_progress: true,
-            })
-        ));
-        drop(permit);
-
-        let pass_b = integration
-            .lease_generation()
-            .map_err(|error| error.to_string())?;
-        assert_eq!(pass_b.generation(), 1);
-        assert_eq!(pass_b.echo_agent_dir(), dir_b);
-        assert!(Arc::ptr_eq(&pass_b.memory_store(), &store_b));
         Ok(())
     }
 
@@ -2094,14 +2559,10 @@ mod tests {
             "parked pass should be cancelled"
         );
 
-        let store_b = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
-        let mut permit = integration
-            .prepare_rebind(temp.path().join("workspace-b/.eko"), store_b)
-            .map_err(|error| error.to_string())?
-            .reconcile_rule_promotions()
-            .await
+        let next = integration
+            .lease_generation()
             .map_err(|error| error.to_string())?;
-        assert_eq!(permit.commit().generation, 1);
+        assert_eq!(next.echo_agent_dir(), temp.path().join("workspace-a/.eko"));
         Ok(())
     }
 
@@ -2163,36 +2624,10 @@ mod tests {
             .await
             .map_err(|error| format!("background review child did not begin abort: {error}"))?;
 
-        let blocked_store = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
-        assert!(matches!(
-            integration.prepare_rebind(temp.path().join("workspace-b/.eko"), blocked_store),
-            Err(ReviewGenerationError::Busy {
-                active_passes: 1,
-                ..
-            })
-        ));
-
         drop_release_sender
             .send(())
             .map_err(|error| format!("failed to release background review child: {error}"))?;
-        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let next_store =
-                    Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
-                match integration.prepare_rebind(temp.path().join("workspace-b/.eko"), next_store) {
-                    Ok(permit) => return Ok(permit),
-                    Err(ReviewGenerationError::Busy { .. }) => tokio::task::yield_now().await,
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
-        })
-        .await
-        .map_err(|_| "background review lease did not settle after child exit".to_string())??;
-        let mut permit = permit
-            .reconcile_rule_promotions()
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(permit.commit().generation, 1);
+        integration.shutdown_background_reviews().await?;
         Ok(())
     }
 
@@ -2431,79 +2866,6 @@ mod tests {
                 .last_error
                 .is_some_and(|error| error.contains("capacity"))
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn degraded_commit_publishes_next_binding_and_retries_old_root_only() -> Result<(), String>
-    {
-        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let dir_a = temp.path().join("workspace-a/.eko");
-        let dir_b = temp.path().join("workspace-b/.eko");
-        std::fs::create_dir_all(&dir_a).map_err(|error| error.to_string())?;
-        let store_a = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
-        let store_b = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
-        let integration = ReviewIntegration::new(ReviewConfig::default(), dir_a.clone(), store_a);
-        let permit = integration
-            .prepare_rebind(dir_b.clone(), store_b.clone())
-            .map_err(|error| error.to_string())?;
-
-        let blocked_parent = dir_a.join("evolution");
-        std::fs::write(&blocked_parent, b"blocks directory creation")
-            .map_err(|error| error.to_string())?;
-        integration.queue_trigger(
-            EvidenceCandidateDraft {
-                kind: EvidenceKind::ProjectFact,
-                scope: None,
-                content: "old workspace fact".to_string(),
-                evidence: vec![EvidenceRef {
-                    source: EvidenceSource::TriggerDetector,
-                    source_run_id: None,
-                    source_role: Some("user".to_string()),
-                    source_turn: None,
-                    source_memory_key: None,
-                    quote: "old workspace fact".to_string(),
-                }],
-                action: None,
-                confidence: 0.9,
-            },
-            None,
-        );
-
-        let mut permit = permit
-            .reconcile_rule_promotions()
-            .await
-            .map_err(|error| error.to_string())?;
-        let receipt = permit.commit();
-        assert_eq!(receipt.generation, 1);
-        assert_eq!(receipt.pending_old, 1);
-        assert_eq!(receipt.pending_roots, vec![dir_a.clone()]);
-        assert!(receipt.is_degraded());
-        drop(permit);
-
-        std::fs::remove_file(&blocked_parent).map_err(|error| error.to_string())?;
-        let lease_b = integration
-            .lease_generation()
-            .map_err(|error| error.to_string())?;
-        assert_eq!(lease_b.generation(), 1);
-        assert_eq!(lease_b.echo_agent_dir(), dir_b);
-        assert!(Arc::ptr_eq(&lease_b.memory_store(), &store_b));
-        assert_eq!(lease_b.evidence_store().list()?.len(), 0);
-        assert_eq!(EvidenceStore::new(dir_a.clone()).list()?.len(), 1);
-        assert_eq!(integration.trigger_delivery_status().pending, 0);
-        drop(lease_b);
-
-        let final_lease = integration
-            .lease_generation()
-            .map_err(|error| error.to_string())?;
-        assert_eq!(
-            EvidenceStore::new(final_lease.echo_agent_dir().to_path_buf())
-                .list()?
-                .len(),
-            0
-        );
-        assert_eq!(EvidenceStore::new(dir_a).list()?.len(), 1);
-        assert_eq!(integration.trigger_delivery_status().pending, 0);
         Ok(())
     }
 }

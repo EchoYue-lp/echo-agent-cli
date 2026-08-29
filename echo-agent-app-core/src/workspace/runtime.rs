@@ -452,12 +452,14 @@ impl WorkspaceRuntimeHost {
             .execution
             .get_or_try_init(|| async {
                 let task_runtime = self.task_runtime().await?;
-                let review_integration = Arc::new(ReviewIntegration::new(
+                let workspace = self.workspace().await;
+                let review_integration = Arc::new(ReviewIntegration::new_scoped(
                     echo_agent::evolution::ReviewConfig::default(),
                     self.resources.state_dir().to_path_buf(),
                     self.resources.memory_store(),
+                    workspace.id.to_string(),
+                    workspace.opaque_product_data_generation(),
                 ));
-                let workspace = self.workspace().await;
                 let workspace_io_identity = self.workspace_io_identity();
                 let (pool, plugin_runtime, _mcp_ownership) = seed_pool
                     .fork_for_workspace(WorkspaceAgentPoolResources {
@@ -474,7 +476,22 @@ impl WorkspaceRuntimeHost {
                     .await?;
                 let primary_agent = pool.primary_agent().await?;
                 review_integration.bind_rule_projection_primary(primary_agent.clone());
+                review_integration.initialize_rule_promotions().await?;
+                let evolution_observer =
+                    crate::evolution::evolution_hook_observer(&primary_agent).await;
+                review_integration.set_evolution_observer(evolution_observer);
                 review_integration.bind_rule_projection_pool(&pool).await?;
+                let memory_projection = review_integration.settle_hot_memory_projection().await;
+                if memory_projection.status
+                    == crate::evolution::review_integration::MemoryProjectionSettlementStatus::Degraded
+                {
+                    anyhow::bail!(
+                        "workspace hot-memory projection failed: {}",
+                        memory_projection
+                            .error
+                            .unwrap_or_else(|| "unknown projection error".to_string())
+                    );
+                }
                 Ok::<Arc<WorkspaceExecutionRuntime>, anyhow::Error>(Arc::new(
                     WorkspaceExecutionRuntime {
                         primary_agent,
@@ -1295,6 +1312,20 @@ mod tests {
         .map_err(|error| error.to_string())?;
         assert!(!Arc::ptr_eq(&runtime_a, &runtime_b));
         assert!(!Arc::ptr_eq(&runtime_a.pool(), &runtime_b.pool()));
+        let review_a = runtime_a.review_integration();
+        let review_b = runtime_b.review_integration();
+        assert!(
+            review_a.hot_memory_projection_source().snapshot().is_some(),
+            "workspace A must publish hot memory before execution admission"
+        );
+        assert!(
+            review_b.hot_memory_projection_source().snapshot().is_some(),
+            "workspace B must publish hot memory before execution admission"
+        );
+        assert!(!Arc::ptr_eq(
+            &review_a.hot_memory_projection_source(),
+            &review_b.hot_memory_projection_source(),
+        ));
         assert_eq!(runtime_a.task_runtime().active_workspace_id(), "a");
         assert_eq!(runtime_b.task_runtime().active_workspace_id(), "b");
         assert_eq!(

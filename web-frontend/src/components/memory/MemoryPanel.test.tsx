@@ -8,6 +8,7 @@ const api = vi.hoisted(() => ({
   namespaces: vi.fn(),
   add: vi.fn(),
   delete: vi.fn(),
+  reflect: vi.fn(),
   status: vi.fn(),
   preview: vi.fn(),
 }));
@@ -19,6 +20,7 @@ vi.mock('../../api/endpoints', () => ({
     search: api.search,
     add: api.add,
     delete: api.delete,
+    reflect: api.reflect,
   },
   autoMemoryApi: {
     status: api.status,
@@ -36,6 +38,7 @@ vi.mock('../../stores/workspaceStore', async () => {
 });
 
 import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { useConversationStore } from '../../stores/conversationStore';
 import type { Workspace } from '../../api/endpoints';
 import { MemoryPanel } from './MemoryPanel';
 
@@ -71,6 +74,7 @@ describe('MemoryPanel workspace projection', () => {
     api.namespaces.mockReset();
     api.add.mockReset();
     api.delete.mockReset();
+    api.reflect.mockReset();
     api.status.mockReset();
     api.preview.mockReset();
     api.namespaces.mockResolvedValue({ namespaces: [['agent', 'memories']] });
@@ -79,7 +83,40 @@ describe('MemoryPanel workspace projection', () => {
       observation_count: 0,
       config: { min_confidence: 0.7, max_per_session: 10 },
     });
+    api.reflect.mockResolvedValue({
+      authority_scope: 'workspace-a',
+      workspace_generation: 'generation-a',
+      workspace_id: 'workspace-a',
+      conversation_id: 'conversation-a',
+      key: 'session-reflection:fixture',
+      content_summary: 'fixture insight',
+      content_chars: 15,
+      projection: {
+        authority_scope: 'workspace-a',
+        workspace_generation: 'generation-a',
+        revision: 'revision-a',
+        changed: true,
+        status: 'settled',
+        primary_bound: true,
+        pool_bound: true,
+        future_bound: true,
+        pending_revision: null,
+        error: null,
+      },
+    });
     useWorkspaceStore.setState({ current: workspace('workspace-a') });
+    useConversationStore.setState({ activeId: 'conversation-a' });
+  });
+
+  it('invokes the scoped reflection endpoint and renders its typed receipt', async () => {
+    api.list.mockResolvedValue([]);
+    render(<MemoryPanel />);
+
+    fireEvent.click(screen.getByRole('button', { name: '反思' }));
+
+    await waitFor(() => expect(api.reflect).toHaveBeenCalledWith('workspace-a', 'conversation-a'));
+    expect(await screen.findByText(/session-reflection:fixture/)).toBeTruthy();
+    expect(screen.getByText(/fixture insight/)).toBeTruthy();
   });
 
   it('does not let an A1 add response close or refresh the A2 form', async () => {

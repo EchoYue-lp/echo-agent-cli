@@ -84,7 +84,7 @@ impl InstructionProvider {
     /// Load the complete instruction projection without silently dropping an
     /// existing but unreadable source.
     ///
-    /// Promotion and workspace-rebind transactions use this path before
+    /// Promotion and workspace bootstrap transactions use this path before
     /// publishing a runtime generation. Missing optional files are valid;
     /// symlinks, non-regular entries, invalid UTF-8, and read failures are not.
     pub(crate) fn load_for_strict(working_dir: Option<&Path>) -> std::io::Result<Self> {
@@ -355,7 +355,7 @@ impl InstructionProvider {
     }
 }
 
-fn strict_optional_text(path: Option<&Path>) -> std::io::Result<Option<String>> {
+pub(crate) fn strict_optional_text(path: Option<&Path>) -> std::io::Result<Option<String>> {
     let Some(path) = path else {
         return Ok(None);
     };

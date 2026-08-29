@@ -22,25 +22,32 @@ use std::process::Command;
 use std::sync::Arc;
 use tauri::Emitter;
 
-fn current_echo_agent_dir(state: &TauriState) -> PathBuf {
-    state
-        .app_state
-        .review_integration
-        .as_ref()
-        .map(|integration| integration.echo_agent_dir())
-        .unwrap_or_else(echo_agent_app_core::evolution::discover_echo_agent_dir)
+struct ScopedEvolutionControl {
+    runtime: echo_agent_app_core::state::ScopedChatRuntime,
+    integration: Arc<echo_agent_app_core::evolution::ReviewIntegration>,
+    generation: echo_agent_app_core::evolution::ReviewGenerationLease,
 }
 
-fn evolution_write_lease(
-    state: &TauriState,
-) -> Result<echo_agent_app_core::evolution::ReviewGenerationLease, IpcError> {
-    state
+async fn current_evolution_control(state: &TauriState) -> Result<ScopedEvolutionControl, IpcError> {
+    let runtime = state
         .app_state
-        .review_integration
-        .as_ref()
-        .ok_or_else(|| IpcError::Internal("Review integration is not configured".into()))?
+        .current_control_runtime()
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let integration = runtime.review_integration().ok_or_else(|| {
+        IpcError::Internal(format!(
+            "Review integration is not configured for workspace '{}'",
+            runtime.execution_scope().workspace_id()
+        ))
+    })?;
+    let generation = integration
         .lease_generation()
-        .map_err(|error| IpcError::Validation(error.to_string()))
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    Ok(ScopedEvolutionControl {
+        runtime,
+        integration,
+        generation,
+    })
 }
 
 fn map_workflow_error(error: WorkflowServiceError) -> IpcError {
@@ -424,6 +431,11 @@ pub async fn extract_auto_memory(
     let candidates =
         echo_agent_app_core::auto_memory::queue_observations(&store, &observations, &messages)
             .map_err(IpcError::Internal)?;
+    let projection_settlement = if candidates.is_empty() {
+        None
+    } else {
+        Some(control.generation.settle_hot_memory_projection().await)
+    };
     let count = observations.len();
     let formatted = echo_agent_app_core::auto_memory::format_observations_for_memory(&observations);
 
@@ -435,6 +447,7 @@ pub async fn extract_auto_memory(
         "observations": observations,
         "formatted": formatted,
         "memory_path": store.path().display().to_string(),
+        "projection_settlement": projection_settlement,
     }))
 }
 
@@ -937,17 +950,9 @@ pub async fn review_run(
     state: tauri::State<'_, TauriState>,
     run_id: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let review_integration = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .ok_or_else(|| IpcError::Validation("Review integration is not configured".into()))?;
-    let review_lease = review_integration.lease_generation().map_err(|error| {
-        IpcError::Validation(format!(
-            "Review unavailable during workspace transition: {error}"
-        ))
-    })?;
-    let agent = state.app_state.connection.primary_agent();
+    let control = current_evolution_control(&state).await?;
+    let review_lease = control.generation;
+    let agent = control.runtime.primary_agent();
     let (llm_client, run_store) = agent
         .read(|a| (a.llm_client().cloned(), a.run_store().cloned()))
         .await;
@@ -976,19 +981,25 @@ pub async fn review_run(
         Some(review_lease.memory_store()),
         Some(run_store),
     );
-    let reviewer = reviewer.with_layer_manager(std::sync::Arc::new(
+    let reviewer = reviewer.with_layer_manager(
         review_lease
-            .create_layer_manager()
+            .layer_manager()
             .map_err(|error| IpcError::Internal(error.to_string()))?,
-    ));
+    );
     let handle = reviewer
         .review_by_run_id(&run_id)
         .map_err(|e| IpcError::Internal(e.to_string()))?;
     let mut pass = review_lease
+        .clone()
         .track_background_review(handle)
         .await
         .map_err(IpcError::Internal)?;
     let settlement = pass.settle().await.map_err(IpcError::Internal)?;
+    let projection_settlement = if settlement.evidence_candidate.is_some() {
+        Some(review_lease.settle_hot_memory_projection().await)
+    } else {
+        None
+    };
     let outcome = settlement.outcome;
     let evidence_candidate = settlement.evidence_candidate;
     Ok(json!({
@@ -999,19 +1010,8 @@ pub async fn review_run(
         "candidate": outcome.candidate,
         "evidence_candidate": evidence_candidate,
         "error": outcome.error,
+        "projection_settlement": projection_settlement,
     }))
-}
-
-async fn evidence_store_for_state(
-    state: &TauriState,
-) -> Result<echo_agent_app_core::evolution::EvidenceStore, IpcError> {
-    if let Some(integration) = state.app_state.review_integration.as_ref() {
-        return Ok(integration.evidence_store());
-    }
-    let root = workspace_project_root(state).await?;
-    Ok(echo_agent_app_core::evolution::EvidenceStore::new(
-        root.join(".eko"),
-    ))
 }
 
 #[tauri::command]
@@ -1031,7 +1031,8 @@ pub async fn list_evidence_candidates(
             )));
         }
     };
-    let store = evidence_store_for_state(&state).await?;
+    let control = current_evolution_control(&state).await?;
+    let store = control.generation.evidence_store();
     let candidates: Vec<_> = store
         .review_items()
         .map_err(IpcError::Internal)?
@@ -1052,14 +1053,8 @@ pub async fn evidence_candidate_action(
     candidate_id: String,
     content: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let integration = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .ok_or_else(|| IpcError::Internal("Review integration is not configured".into()))?;
-    let evidence_lease = integration
-        .lease_generation()
-        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let control = current_evolution_control(&state).await?;
+    let evidence_lease = control.generation;
     let store = evidence_lease.evidence_store();
     let candidate = match action.as_str() {
         "edit" => store
@@ -1067,11 +1062,9 @@ pub async fn evidence_candidate_action(
             .map_err(IpcError::Internal)?,
         "reject" => store.reject(&candidate_id).map_err(IpcError::Internal)?,
         "accept" | "undo" => {
-            let layer_manager = std::sync::Arc::new(
-                evidence_lease
-                    .create_layer_manager()
-                    .map_err(|error| IpcError::Internal(error.to_string()))?,
-            );
+            let layer_manager = evidence_lease
+                .layer_manager()
+                .map_err(|error| IpcError::Internal(error.to_string()))?;
             if action == "accept" {
                 store
                     .accept(&candidate_id, content.as_deref(), &layer_manager)
@@ -1090,7 +1083,12 @@ pub async fn evidence_candidate_action(
             )));
         }
     };
-    Ok(json!({ "success": true, "candidate": candidate }))
+    let projection_settlement = evidence_lease.settle_hot_memory_projection().await;
+    Ok(json!({
+        "success": true,
+        "candidate": candidate,
+        "projection_settlement": projection_settlement,
+    }))
 }
 
 #[tauri::command]
@@ -1099,33 +1097,19 @@ pub async fn curator_action(
     action: String,
     skill_name: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
+    let control = current_evolution_control(&state).await?;
+    let curator = control.integration.curator();
     match action.as_str() {
-        "status" => {
-            let curator = state
-                .app_state
-                .review_integration
-                .as_ref()
-                .map(|integration| integration.curator())
-                .unwrap_or_else(|| {
-                    echo_agent_app_core::evolution::workspace_curator(&current_echo_agent_dir(
-                        state.inner(),
-                    ))
-                });
-            Ok(json!({
-                "success": true,
-                "status": curator_status_json(curator.status().map_err(|e| IpcError::Internal(e.to_string()))?),
-            }))
-        }
+        "status" => Ok(json!({
+            "success": true,
+            "status": curator_status_json(curator.status().map_err(|e| IpcError::Internal(e.to_string()))?),
+        })),
         "run" => {
-            let generation = evolution_write_lease(state.inner())?;
-            let curator =
-                echo_agent_app_core::evolution::workspace_curator(generation.echo_agent_dir());
             let transitions = curator
                 .apply_transitions()
                 .map_err(|e| IpcError::Internal(e.to_string()))?;
-            state
-                .app_state
-                .connection
+            control
+                .runtime
                 .primary_agent()
                 .write_async(|agent| {
                     Box::pin(async move {
@@ -1151,9 +1135,6 @@ pub async fn curator_action(
             }))
         }
         "pin" => {
-            let generation = evolution_write_lease(state.inner())?;
-            let curator =
-                echo_agent_app_core::evolution::workspace_curator(generation.echo_agent_dir());
             let name = skill_name
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| IpcError::Validation("skill_name is required for pin".into()))?;
@@ -1165,9 +1146,6 @@ pub async fn curator_action(
             )
         }
         "unpin" => {
-            let generation = evolution_write_lease(state.inner())?;
-            let curator =
-                echo_agent_app_core::evolution::workspace_curator(generation.echo_agent_dir());
             let name = skill_name
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| IpcError::Validation("skill_name is required for unpin".into()))?;
@@ -1198,17 +1176,14 @@ pub async fn curator_action(
 pub async fn get_evolution_dashboard(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let agent = state.app_state.connection.primary_agent();
-    let (store, run_store) = agent
-        .read(|a| (a.store().cloned(), a.run_store().cloned()))
+    let control = current_evolution_control(&state).await?;
+    let run_store = control
+        .runtime
+        .primary_agent()
+        .read(|agent| agent.run_store().cloned())
         .await;
-    let store = store.ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
-    let echo_agent_dir = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .map(|integration| integration.echo_agent_dir())
-        .unwrap_or_else(echo_agent_app_core::evolution::discover_echo_agent_dir);
+    let store = control.generation.memory_store();
+    let echo_agent_dir = control.generation.echo_agent_dir();
     let change_log = echo_agent::evolution::JsonlChangeLog::new(
         echo_agent_dir.join("evolution").join("change-log.jsonl"),
     )
@@ -1217,11 +1192,7 @@ pub async fn get_evolution_dashboard(
     let dashboard =
         echo_agent_app_core::evolution::Dashboard::new(store, change_log).with_run_store(run_store);
     let metrics = dashboard.generate_metrics().await;
-    let trigger_delivery = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .map(|integration| integration.trigger_delivery_status());
+    let trigger_delivery = Some(control.integration.trigger_delivery_status());
 
     Ok(json!({
         "metrics": metrics,
@@ -1239,12 +1210,9 @@ pub async fn get_evolution_dashboard(
 pub async fn scan_rule_proposals(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let integration = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .ok_or_else(|| IpcError::Internal("Review integration is not configured".into()))?;
-    let proposals = integration
+    let control = current_evolution_control(&state).await?;
+    let proposals = control
+        .integration
         .scan_rule_proposals()
         .await
         .map_err(|error| IpcError::Internal(error.to_string()))?;
@@ -1262,13 +1230,10 @@ pub async fn promote_rule(
     state: tauri::State<'_, TauriState>,
     memory_key: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let integration = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .ok_or_else(|| IpcError::Internal("Review integration is not configured".into()))?;
+    let control = current_evolution_control(&state).await?;
     // 找到对应候选(scan 已过置信度/age/type 门槛)
-    let proposal = integration
+    let proposal = control
+        .integration
         .scan_rule_proposals()
         .await
         .map_err(|error| IpcError::Internal(error.to_string()))?
@@ -1280,16 +1245,19 @@ pub async fn promote_rule(
             ))
         })?;
 
-    let receipt = integration
+    let receipt = control
+        .integration
         .promote_rule(&proposal)
         .await
         .map_err(|error| IpcError::Internal(format!("Failed to promote rule: {error}")))?;
+    let projection_settlement = control.generation.settle_hot_memory_projection().await;
 
     Ok(json!({
         "success": true,
         "memory_key": memory_key,
         "rule_text": proposal.rule_text,
         "promotion_id": receipt.promotion_id,
+        "projection_settlement": projection_settlement,
     }))
 }
 
@@ -1306,11 +1274,8 @@ pub async fn promote_rule(
 pub async fn scan_skill_candidates(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let agent = state.app_state.connection.primary_agent();
-    let store = agent
-        .read(|a| a.store().cloned())
-        .await
-        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
+    let control = current_evolution_control(&state).await?;
+    let store = control.generation.memory_store();
 
     let typed = echo_agent::memory::TypedMemoryStore::new(store);
     let entries = typed
@@ -1321,7 +1286,7 @@ pub async fn scan_skill_candidates(
         .await
         .map_err(|e| IpcError::Internal(format!("Failed to list candidates: {e}")))?;
 
-    let echo_agent_dir = current_echo_agent_dir(state.inner());
+    let echo_agent_dir = control.generation.echo_agent_dir();
     let candidates: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|e| {
@@ -1381,8 +1346,9 @@ pub async fn generate_skill_draft(
     state: tauri::State<'_, TauriState>,
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let generation = evolution_write_lease(state.inner())?;
-    let agent = state.app_state.connection.primary_agent();
+    let control = current_evolution_control(&state).await?;
+    let generation = control.generation;
+    let agent = control.runtime.primary_agent();
     let store = generation.memory_store();
     let echo_agent_dir = generation.echo_agent_dir().to_path_buf();
     let change_log = echo_agent::evolution::JsonlChangeLog::new(
@@ -1469,30 +1435,6 @@ struct WorktreeInfo {
     head: String,
 }
 
-async fn workspace_project_root_for(
-    state: &TauriState,
-    workspace_id: &str,
-) -> Result<PathBuf, IpcError> {
-    if workspace_id == "global" {
-        return state
-            .app_state
-            .chat_runtime_for_scope(workspace_id)
-            .await
-            .map(|runtime| runtime.execution_scope().root().to_path_buf())
-            .map_err(|error| IpcError::Validation(error.to_string()));
-    }
-    state
-        .app_state
-        .workspace
-        .registry
-        .list()
-        .map_err(|error| IpcError::Internal(error.to_string()))?
-        .into_iter()
-        .find(|workspace| workspace.id.as_str() == workspace_id)
-        .map(|workspace| workspace.project_root.unwrap_or(workspace.root))
-        .ok_or_else(|| IpcError::NotFound(format!("Workspace '{workspace_id}' not found")))
-}
-
 struct ScopedWorktreeControl {
     _control: echo_agent_app_core::state::ScopedWorkspaceControl,
     repo_root: PathBuf,
@@ -1548,14 +1490,6 @@ async fn worktree_control_for_workspace(
         repo_root,
         store,
     })
-}
-
-async fn workspace_project_root(state: &TauriState) -> Result<PathBuf, IpcError> {
-    if let Some(workspace) = state.app_state.current_workspace().await {
-        Ok(workspace.project_root.unwrap_or(workspace.root))
-    } else {
-        workspace_project_root_for(state, "global").await
-    }
 }
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<String, IpcError> {

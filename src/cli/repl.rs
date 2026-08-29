@@ -2668,7 +2668,6 @@ fn spawn_prepared_repl_turn(
         attachments: turn.inline_attachment_refs(),
         cancel,
         review_integration: scoped_runtime.review_integration(),
-        layer_manager: None,
         memory_generation: None,
         human_loop_provider: config.app_state.as_ref().map(|state| {
             state.connection.hitl_dispatcher.clone()
@@ -4164,7 +4163,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: cancel.clone(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });

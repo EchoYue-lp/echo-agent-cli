@@ -268,6 +268,8 @@ pub async fn run_jsonl_mode(
     if prompt.trim().is_empty() {
         return Err(anyhow::anyhow!("--jsonl requires a non-empty prompt"));
     }
+    let reflection_command = echo_agent_app_core::reflection::ReflectionCommand::parse(prompt)
+        .map_err(anyhow::Error::new)?;
 
     let turn_id = uuid::Uuid::new_v4().to_string();
     let (scoped_runtime, lease) = services
@@ -279,8 +281,9 @@ pub async fn run_jsonl_mode(
         )
         .await
         .map_err(anyhow::Error::from)?;
+    let jsonl_renderer = std::sync::Arc::new(crate::cli::jsonl::JsonlChatSink::stdout());
     let renderer: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
-        std::sync::Arc::new(crate::cli::jsonl::JsonlChatSink::stdout());
+        jsonl_renderer.clone();
     let sink = echo_agent_app_core::chat_event_log::bind_surface_chat_sink(
         echo_agent_app_core::chat_event_log::ChatSurface::Cli,
         renderer,
@@ -290,6 +293,127 @@ pub async fn run_jsonl_mode(
         Some(conversation_id.clone()),
         turn_id.clone(),
     );
+    if reflection_command.is_some() {
+        if !options.attachment_paths.is_empty() {
+            settle_jsonl_foreground(
+                lease,
+                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(
+                        "reflection_attachments",
+                        "/reflect does not accept attachments",
+                    ),
+                ),
+            )
+            .await?;
+            return Err(anyhow::anyhow!("/reflect does not accept attachments"));
+        }
+        if !sink.on_event(
+            echo_agent_app_core::chat_driver::ChatDriverEvent::TurnConfiguration {
+                permission_mode: options.permission_mode.as_str().to_string(),
+                approval_policy: options.approval_policy.as_str().to_string(),
+                attachments: Vec::new(),
+            },
+        ) || !sink.on_event(
+            echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
+                status: "running".to_string(),
+            },
+        ) {
+            settle_jsonl_foreground(
+                lease,
+                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(
+                        "jsonl_output",
+                        "JSONL output closed before reflection started",
+                    ),
+                ),
+            )
+            .await?;
+            return Err(anyhow::anyhow!(
+                "JSONL output closed before reflection started"
+            ));
+        }
+        let execution = match scoped_runtime.agent_for(&conversation_id).await {
+            Ok(execution) => execution,
+            Err(error) => {
+                let detail = format!("Reflection Agent is unavailable: {error}");
+                settle_jsonl_foreground(
+                    lease,
+                    echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                        echo_agent::error::AgentFailure::message(
+                            "reflection_agent",
+                            detail.clone(),
+                        ),
+                    ),
+                )
+                .await?;
+                return Err(anyhow::Error::msg(detail));
+            }
+        };
+        let agent = execution.agent();
+        let receipt = match echo_agent_app_core::reflection::reflect_session(
+            &scoped_runtime,
+            &agent,
+            Some(&conversation_id),
+        )
+        .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let detail = error.to_string();
+                settle_jsonl_foreground(
+                    lease,
+                    echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                        echo_agent::error::AgentFailure::message(
+                            "reflection_failed",
+                            detail.clone(),
+                        ),
+                    ),
+                )
+                .await?;
+                return Err(anyhow::Error::msg(detail));
+            }
+        };
+        if !jsonl_renderer.write_reflection_receipt(&receipt) {
+            settle_jsonl_foreground(
+                lease,
+                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(
+                        "jsonl_output",
+                        "JSONL output closed before the reflection receipt was delivered",
+                    ),
+                ),
+            )
+            .await?;
+            return Err(anyhow::anyhow!(
+                "JSONL output closed before the reflection receipt was delivered"
+            ));
+        }
+        if !sink.on_event(
+            echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
+                status: "completed".to_string(),
+            },
+        ) {
+            settle_jsonl_foreground(
+                lease,
+                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(
+                        "jsonl_output",
+                        "JSONL output closed before the reflection terminal was delivered",
+                    ),
+                ),
+            )
+            .await?;
+            return Err(anyhow::anyhow!(
+                "JSONL output closed before the reflection terminal was delivered"
+            ));
+        }
+        settle_jsonl_foreground(
+            lease,
+            echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+        )
+        .await?;
+        return Ok(());
+    }
     let identity = echo_agent_app_core::extension_commands::ExtensionCommandIdentity {
         request_id: turn_id.clone(),
         operation_id: uuid::Uuid::new_v4().to_string(),
@@ -527,7 +651,6 @@ pub async fn run_jsonl_mode(
         attachments: turn.inline_attachment_refs(),
         cancel: lease.cancellation_token(),
         review_integration: scoped_runtime.review_integration(),
-        layer_manager: None,
         memory_generation: None,
         human_loop_provider: Some(std::sync::Arc::new(
             crate::cli::jsonl::JsonlHumanLoopProvider::new(sink.clone(), options.approval_policy),
@@ -863,6 +986,18 @@ mod tests {
     use std::sync::Arc;
     #[cfg(feature = "channels")]
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn jsonl_intercepts_only_the_shared_reflection_command() -> Result<()> {
+        assert!(echo_agent_app_core::reflection::ReflectionCommand::parse("/reflect")?.is_some());
+        assert!(
+            echo_agent_app_core::reflection::ReflectionCommand::parse("normal prompt")?.is_none()
+        );
+        assert!(
+            echo_agent_app_core::reflection::ReflectionCommand::parse("/reflect extra").is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn committed_extension_receipt_is_pending_not_completed() -> Result<()> {

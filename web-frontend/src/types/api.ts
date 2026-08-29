@@ -476,6 +476,30 @@ export interface MemoryEntry {
   score?: number; // optional relevance score for search results
 }
 
+export interface MemoryProjectionSettlementReceipt {
+  authority_scope: string;
+  workspace_generation: string;
+  revision: string;
+  changed: boolean;
+  status: 'settled' | 'degraded';
+  primary_bound: boolean;
+  pool_bound: boolean;
+  future_bound: boolean;
+  pending_revision: string | null;
+  error: string | null;
+}
+
+export interface ReflectionReceipt {
+  authority_scope: string;
+  workspace_generation: string;
+  workspace_id: string;
+  conversation_id: string | null;
+  key: string;
+  content_summary: string;
+  content_chars: number;
+  projection: MemoryProjectionSettlementReceipt;
+}
+
 export interface NamespacesResponse {
   namespaces: string[][]; // Vec<Vec<String>> in Rust
 }

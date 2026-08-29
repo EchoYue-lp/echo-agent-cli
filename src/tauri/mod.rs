@@ -215,6 +215,7 @@ pub fn build_tauri_app(
             commands::memory::search_memory,
             commands::memory::delete_memory,
             commands::memory::list_namespaces,
+            commands::memory::reflect_session,
             // Tools
             commands::tools::list_tools,
             commands::tools::get_tool,

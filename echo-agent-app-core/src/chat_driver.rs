@@ -682,12 +682,6 @@ async fn prepare_chat_execution(
             )));
         }
     };
-    let layer_manager = memory_generation
-        .as_ref()
-        .map(|lease| lease.create_layer_manager().map(std::sync::Arc::new))
-        .transpose()
-        .map_err(|error| format!("Memory layer unavailable: {error}"))?
-        .or_else(|| res.layer_manager.clone());
     let res = std::sync::Arc::new(crate::chat_resources::ChatResources {
         execution_scope: res.execution_scope.clone(),
         workspace_io_receipt: res.workspace_io_receipt.clone(),
@@ -700,7 +694,6 @@ async fn prepare_chat_execution(
         attachments: res.attachments.clone(),
         cancel: res.cancel.clone(),
         review_integration: res.review_integration.clone(),
-        layer_manager,
         memory_generation,
         human_loop_provider: res.human_loop_provider.clone(),
     });
@@ -1825,7 +1818,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: echo_agent::agent::CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -1982,7 +1974,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: echo_agent::agent::CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -2531,7 +2522,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_memory_generation_precedes_live_rebind_admission() -> Result<(), String> {
+    fn pinned_memory_generation_precedes_live_integration_lookup() -> Result<(), String> {
         use echo_agent::evolution::ReviewConfig;
         use echo_agent::memory::{InMemoryStore, Store};
 
@@ -2551,12 +2542,6 @@ mod tests {
             temp.path().join("live/.eko"),
             std::sync::Arc::new(InMemoryStore::new()) as std::sync::Arc<dyn Store>,
         ));
-        let _rebind = live_integration
-            .prepare_rebind(
-                temp.path().join("next/.eko"),
-                std::sync::Arc::new(InMemoryStore::new()) as std::sync::Arc<dyn Store>,
-            )
-            .map_err(|error| error.to_string())?;
         let resources = crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
             workspace_io_receipt: None,
@@ -2569,7 +2554,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: echo_agent::agent::CancellationToken::new(),
             review_integration: Some(live_integration),
-            layer_manager: None,
             memory_generation: Some(pinned),
             human_loop_provider: None,
         };
@@ -2621,7 +2605,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: echo_agent::agent::CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -2703,7 +2686,6 @@ mod tests {
             attachments: Vec::new(),
             cancel,
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -2821,7 +2803,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -2940,7 +2921,6 @@ mod tests {
                 attachments: Vec::new(),
                 cancel: CancellationToken::new(),
                 review_integration: None,
-                layer_manager: None,
                 memory_generation: None,
                 human_loop_provider: None,
             })
@@ -3134,7 +3114,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -3218,7 +3197,6 @@ mod tests {
                 attachments: Vec::new(),
                 cancel: CancellationToken::new(),
                 review_integration: None,
-                layer_manager: None,
                 memory_generation: None,
                 human_loop_provider: None,
             }),
@@ -3319,7 +3297,6 @@ mod tests {
             }],
             cancel: echo_agent::agent::CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -3436,7 +3413,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -3598,7 +3574,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -3690,7 +3665,6 @@ mod tests {
             attachments: vec![],
             cancel,
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -3810,7 +3784,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -3921,7 +3894,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -4021,7 +3993,6 @@ mod tests {
             attachments: vec![],
             cancel,
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -4094,7 +4065,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: echo_agent::agent::CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });
@@ -4142,7 +4112,6 @@ mod tests {
             attachments: Vec::new(),
             cancel: echo_agent::agent::CancellationToken::new(),
             review_integration: None,
-            layer_manager: None,
             memory_generation: None,
             human_loop_provider: None,
         });

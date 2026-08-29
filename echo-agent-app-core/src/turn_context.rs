@@ -134,6 +134,7 @@ pub struct EkoContextProjector {
         Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>,
         crate::workspace::WorkspaceExecutionScope,
     )>,
+    hot_memory: Arc<crate::unified_memory::HotMemoryProjectionSource>,
 }
 
 impl EkoContextProjector {
@@ -145,7 +146,16 @@ impl EkoContextProjector {
             task_runtime: TaskRuntimeContextProjector::new(task_runtime_registry),
             turns,
             awaiter: None,
+            hot_memory: Arc::new(crate::unified_memory::HotMemoryProjectionSource::new()),
         }
+    }
+
+    pub(crate) fn with_hot_memory_source(
+        mut self,
+        source: Arc<crate::unified_memory::HotMemoryProjectionSource>,
+    ) -> Self {
+        self.hot_memory = source;
+        self
     }
 
     pub fn with_awaiter_results(
@@ -173,6 +183,7 @@ impl PreModelContextProjector for EkoContextProjector {
                 marker: TURN_CONTRACT_MARKER.to_string(),
                 message: contract.map(render_turn_contract).map(Message::user),
             });
+            projections.push(self.hot_memory.projection());
             let pending_awaiter = match (
                 self.awaiter.as_ref(),
                 context.conversation_id.as_deref(),

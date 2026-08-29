@@ -743,7 +743,6 @@ async fn resume_continuation_run(
         attachments: snapshot.run.attachments,
         cancel: lease.cancellation_token(),
         review_integration: runtime.review_integration(),
-        layer_manager: None,
         memory_generation: None,
         human_loop_provider: Some(Arc::new(
             crate::tauri::commands::chat::TauriHumanLoopHandler::new(sink.clone(), turn_id.clone()),
@@ -900,18 +899,9 @@ async fn spawn_tauri_task_retry(
                         "memory generation unavailable: {error}"
                     ))
                 })?;
-            let layer_manager = memory_generation
-                .as_ref()
-                .map(|generation| generation.create_layer_manager().map(Arc::new))
-                .transpose()
-                .map_err(|error| {
-                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
-                        "layered memory unavailable: {error}"
-                    ))
-                })?;
-            Ok((memory_generation, layer_manager))
+            Ok(memory_generation)
         },
-        move |(memory_generation, layer_manager), mut receipt_owner| async move {
+        move |memory_generation, mut receipt_owner| async move {
             let _pool_execution = pool_execution;
             if let Some(generation) = memory_generation.as_ref() {
                 receipt_owner.retain(generation.clone());
@@ -924,7 +914,6 @@ async fn spawn_tauri_task_retry(
                 driver_store.clone(),
                 Some(primary_agent),
                 reviewer_llm,
-                layer_manager,
                 memory_generation,
                 run_store,
                 Some(trace_sink),
