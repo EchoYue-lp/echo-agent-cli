@@ -17,7 +17,7 @@
 | 项目 | 当前 SHA | 状态 |
 | --- | --- | --- |
 | framework `echo-agent` | `125ea5f` | learning/examples/docs 重组已完成；CLI 通过相对路径 `../echo-agent` 消费。 |
-| application `echo-agent-cli` | `cae9e7f` + R4 working tree | F0-F6、R1、R2 与 R3 已完成；R4 app-core 模块化已通过直接代码门禁，当前工作树包含未提交的模块/facade/docs 改动。 |
+| application `echo-agent-cli` | R4 child handoff | F0-F6、R1、R2、R3 与 R4 app-core 模块化实现已提交；Rust、examples、GUI、frontend 与 website checks 已通过。website manifest 在 child handoff 后复核；Final Integration/Release 仍未执行。 |
 
 F2-F5 合流、测试卫生和适用完整门禁证据见顶层 [`plan_03`](../../docs/supreme/plans/2026-08-28T0013-项目未完成工作收敛/plan_03_F5收口完整验证主分支合并与资源清理.md)。本地 child SHA 不等于最终 release：10k/100k、长时 soak、人工 GUI、远端 CI 和 push/release 仍未执行。
 
@@ -35,8 +35,8 @@ F2-F5 合流、测试卫生和适用完整门禁证据见顶层 [`plan_03`](../.
 | R0 boundary audit | Complete | 顶层审计覆盖 151 个 app-core Rust 文件，纯只读；见 [`current-framework-application-boundary-audit`](../../docs/2026-08-28-current-framework-application-boundary-audit.md)。 |
 | R1 framework-first migration | Complete | turn、TaskRuntime、artifact、bootstrap、diff、plugin、memory、tool-control、background 与测试/legacy/dead-shim 收敛已完成；无第二 authority。顶层 boundary audit 记录逐项 SHA。 |
 | R2 examples convergence | Complete | `echo-agent-learning` 统一承载 43 个教学/组合 demos、13 个 Rust 学习章节和 21 个 executable contracts；panic/UTF-8/facade contracts 全绿。 |
-| R3 docs/website | Complete | framework 正式双语文档、learning 文档、website manifest/discovery/build 已同步；EKO projection 已按 `cae9e7f` 完成应用文档复核。 |
-| R4 app-core global modularization | In progress | `state`、TaskRuntime store/executor、router/chat log/pool、extension/plugin/infra 已按 authority 物理拆分；`api` facade 已建立并迁移五 surface、examples 和 integration tests，相关 Rust gates 已通过。website source/manifest 不需产品事实改动，待 child SHA 稳定后执行 docs/discovery/site checks；本 child commit 尚未完成。ADR [0025](./adr/0025-app-core-global-modularization.md)。 |
+| R3 docs/website | Complete | framework 正式双语文档、learning 文档、website manifest/discovery/build 已同步；EKO projection 已按 R4 child handoff 完成应用文档复核。 |
+| R4 app-core global modularization | Complete | `state`、TaskRuntime store/executor、router/chat log/pool、extension/plugin/infra 已按 authority 物理拆分；`api` facade 已建立并迁移五 surface、examples 和 integration tests。Rust、frontend 与 website docs/discovery/site gates 已通过；Final Integration/Release 仍后置。ADR [0025](./adr/0025-app-core-global-modularization.md)。 |
 | G Final Integration/Release | Not started | 完整三仓门禁、性能/soak、人工 GUI、远端 CI、website 和 child-first 发布均后置。 |
 
 ## 当前权威路径
