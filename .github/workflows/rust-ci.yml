@@ -16,7 +16,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: EchoYue-lp/echo-agent
-          ref: 9f8d723ecb8e27a67754afe86fd7d285307866d7
+          ref: f6d81fe809a9661b58e7a9aaa71b753696defbc2
           path: echo-agent
       - name: Prepare sibling path dependency
         run: ln -s "$GITHUB_WORKSPACE/echo-agent" "$GITHUB_WORKSPACE/../echo-agent"
@@ -44,3 +44,31 @@ jobs:
             -D clippy::unreachable
           cargo test --workspace --all-features --locked
           cargo check -p echo-agent-app-core --no-default-features --locked
+      - name: Verify GUI feature matrix
+        run: |
+          cargo check --no-default-features --features gui --bin echo-agent-tauri
+          cargo test --no-default-features --features gui
+      - name: Verify generated frontend contracts are current
+        run: git diff --exit-code -- web-frontend/src/generated
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: web-frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: web-frontend
+        run: npm ci
+      - name: Verify frontend formatting
+        working-directory: web-frontend
+        run: npx prettier --check "src/**/*.{ts,tsx}"
+      - name: Test frontend
+        working-directory: web-frontend
+        run: npm test
+      - name: Build frontend
+        working-directory: web-frontend
+        run: npm run build
