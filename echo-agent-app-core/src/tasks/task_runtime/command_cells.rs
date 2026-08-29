@@ -56,6 +56,7 @@ struct AwaiterWatchKey {
     conversation_id: String,
     run_id: Option<String>,
     root_turn_id: String,
+    current_turn_id: Option<String>,
     cell_id: String,
 }
 
@@ -221,6 +222,18 @@ struct AwaiterStartedTestBarrier {
     release: tokio::sync::oneshot::Receiver<()>,
 }
 
+#[cfg(test)]
+struct AwaiterWatchSnapshotTestBarrier {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+struct AwaiterWatchLeaseTestBarrier {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AwaiterAgentKey {
     workspace_id: String,
@@ -261,6 +274,10 @@ pub struct CommandCellRuntimeService {
     awaiter_recovery_failures: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     awaiter_started_barrier: Mutex<Option<AwaiterStartedTestBarrier>>,
+    #[cfg(test)]
+    awaiter_watch_snapshot_barrier: Mutex<Option<AwaiterWatchSnapshotTestBarrier>>,
+    #[cfg(test)]
+    awaiter_watch_lease_barrier: Mutex<Option<AwaiterWatchLeaseTestBarrier>>,
 }
 
 impl CommandCellRuntimeService {
@@ -299,6 +316,10 @@ impl CommandCellRuntimeService {
             awaiter_recovery_failures: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             awaiter_started_barrier: Mutex::new(None),
+            #[cfg(test)]
+            awaiter_watch_snapshot_barrier: Mutex::new(None),
+            #[cfg(test)]
+            awaiter_watch_lease_barrier: Mutex::new(None),
         });
         service.spawn_started_awaiter_recovery();
         Ok(service)
@@ -421,6 +442,32 @@ impl CommandCellRuntimeService {
     async fn wait_after_awaiter_started_for_test(&self) {
         let barrier = self
             .awaiter_started_barrier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(barrier) = barrier {
+            let _ = barrier.entered.send(());
+            let _ = barrier.release.await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_after_awaiter_watch_snapshot_for_test(&self) {
+        let barrier = self
+            .awaiter_watch_snapshot_barrier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(barrier) = barrier {
+            let _ = barrier.entered.send(());
+            let _ = barrier.release.await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_after_awaiter_watch_lease_for_test(&self) {
+        let barrier = self
+            .awaiter_watch_lease_barrier
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
@@ -713,6 +760,13 @@ impl CommandCellRuntimeService {
         key: &AwaiterWatchKey,
     ) -> Result<BackgroundCellState, CommandCellError> {
         if let Some(run_id) = key.run_id.as_deref() {
+            let current_turn_id = key
+                .current_turn_id
+                .as_deref()
+                .filter(|turn_id| !turn_id.trim().is_empty())
+                .ok_or_else(|| CommandCellError::Validation {
+                    message: "watch_cell requires current TaskRun turn identity".to_string(),
+                })?;
             let store = self.store_for_workspace(&key.workspace_id).ok_or_else(|| {
                 CommandCellError::Validation {
                     message: "Awaiter requires the exact TaskRuntimeStore".to_string(),
@@ -720,18 +774,29 @@ impl CommandCellRuntimeService {
             })?;
             let run_id = run_id.to_string();
             let cell_id = key.cell_id.clone();
+            let workspace_id = key.workspace_id.clone();
+            let conversation_id = key.conversation_id.clone();
+            let current_turn_id = current_turn_id.to_string();
             return super::executor::TaskRuntimeBlockingAdapter::new(store)
                 .run_store("load Awaiter TaskRun cell", move |store| {
-                    store
+                    let exact_owner = store.get_run(&run_id)?.is_some_and(|run| {
+                        run.workspace_id == workspace_id && run.conversation_id == conversation_id
+                    });
+                    if !exact_owner {
+                        return Ok(None);
+                    }
+                    let cell = store
                         .list_background_cells(&run_id)
-                        .map(|cells| cells.into_iter().find(|cell| cell.cell_id == cell_id))
+                        .map(|cells| cells.into_iter().find(|cell| cell.cell_id == cell_id))?;
+                    Ok(cell
+                        .filter(|cell| cell.turn_id.as_deref() == Some(current_turn_id.as_str())))
                 })
                 .await
                 .map_err(|error| CommandCellError::Runtime {
                     message: error.to_string(),
                 })?
                 .ok_or_else(|| CommandCellError::Validation {
-                    message: "cell does not belong to the exact TaskRun scope".to_string(),
+                    message: "watch_cell cannot cross its exact cell owner scope".to_string(),
                 });
         }
         let chat_events = self.chat_events.clone();
@@ -745,8 +810,8 @@ impl CommandCellRuntimeService {
                     0,
                 )?;
                 Ok::<Option<BackgroundCellState>, crate::chat_event_log::ChatEventLogError>(
-                    find_chat_cell_fact(&replay.events, &key.cell_id, false)
-                        .or_else(|| find_chat_cell_fact(&replay.events, &key.cell_id, true))
+                    find_chat_cell_fact(&replay.events, &key.cell_id, true)
+                        .or_else(|| find_chat_cell_fact(&replay.events, &key.cell_id, false))
                         .cloned(),
                 )
             })
@@ -758,7 +823,7 @@ impl CommandCellRuntimeService {
                 message: error.to_string(),
             })?
             .ok_or_else(|| CommandCellError::Validation {
-                message: "cell does not belong to the exact ordinary Chat scope".to_string(),
+                message: "watch_cell cannot cross its exact cell owner scope".to_string(),
             })
     }
 
@@ -809,29 +874,59 @@ impl CommandCellRuntimeService {
                 .ok_or_else(|| CommandCellError::Validation {
                     message: "watch_cell requires root message identity".to_string(),
                 })?;
+        let current_turn_id = context.run_id.as_ref().and_then(|_| {
+            context
+                .turn_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|turn_id| !turn_id.is_empty())
+                .map(str::to_string)
+        });
         let key = AwaiterWatchKey {
             workspace_id: execution_scope.workspace_id().to_string(),
             conversation_id,
             run_id: context.run_id.clone(),
             root_turn_id,
+            current_turn_id,
             cell_id: cell_id.to_string(),
         };
-        if !self.owns_active_cell(&key) {
+        {
+            let state = self
+                .awaiters
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(active) = state.active.get(&key) {
+                return Ok(active.receipt.clone());
+            }
+            if !new_generation && let Some(latest) = state.latest.get(&key) {
+                return Ok(latest.clone());
+            }
+        }
+
+        // The lease reveals no cell data, but pins any retained framework
+        // terminal before disk-backed exact-owner validation begins. A failed
+        // durable owner check drops it without creating a receipt or dispatch.
+        let observation = registry.observe(cell_id)?;
+        #[cfg(test)]
+        self.wait_after_awaiter_watch_lease_for_test().await;
+        // Durable state owns identity and terminal truth. The live active set
+        // only proves that a non-terminal process resource still belongs to
+        // this process. Re-read after a failed live check to close the window
+        // where terminal persistence and active-owner retirement race watch.
+        let mut base_cell = self.cell_state_for_watch(&key).await?;
+        #[cfg(test)]
+        self.wait_after_awaiter_watch_snapshot_for_test().await;
+        if base_cell.is_active() && !self.owns_active_cell(&key) {
+            base_cell = self.cell_state_for_watch(&key).await?;
+        }
+        if base_cell.is_active() && !self.owns_active_cell(&key) {
             return Err(CommandCellError::Validation {
                 message: "watch_cell cannot cross its exact cell owner scope".to_string(),
             });
         }
-        let snapshot = registry.wait(cell_id, 0, 0).await?;
-        if snapshot.snapshot.phase.is_terminal() {
-            return Err(CommandCellError::Validation {
-                message: format!(
-                    "cell {cell_id} is already {}",
-                    snapshot.snapshot.phase.as_str()
-                ),
-            });
-        }
-        let base_cell = self.cell_state_for_watch(&key).await?;
-        let observation = registry.observe(cell_id)?;
+        // The framework lease bridges this durable snapshot to controlled
+        // dispatch. A retained terminal is retry-readable and reaches the same
+        // genuine Awaiter summary path without re-executing the command cell.
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|error| CommandCellError::Runtime {
                 message: format!("Tokio runtime is unavailable: {error}"),
@@ -2150,6 +2245,9 @@ async fn observe_awaiter_cell_truth(
     wait_for_terminal: bool,
     shutdown: &CancellationToken,
 ) -> Result<Option<BackgroundCellState>, String> {
+    if cell.phase.is_terminal() {
+        return Ok(Some(cell));
+    }
     let mut cursor = 0_u64;
     let mut excerpt = String::new();
     let mut shutdown_seen = false;
@@ -2617,6 +2715,28 @@ mod tests {
         root: &std::path::Path,
         retention: crate::chat_event_log::ChatEventRetention,
     ) -> Result<Arc<CommandCellRuntimeService>, String> {
+        test_service_with_config(root, retention, BackgroundCommandManagerConfig::default())
+    }
+
+    fn test_service_with_command_history(
+        root: &std::path::Path,
+        max_terminal_history: usize,
+    ) -> Result<Arc<CommandCellRuntimeService>, String> {
+        test_service_with_config(
+            root,
+            crate::chat_event_log::ChatEventRetention::default(),
+            BackgroundCommandManagerConfig {
+                max_terminal_history,
+                ..BackgroundCommandManagerConfig::default()
+            },
+        )
+    }
+
+    fn test_service_with_config(
+        root: &std::path::Path,
+        retention: crate::chat_event_log::ChatEventRetention,
+        manager_config: BackgroundCommandManagerConfig,
+    ) -> Result<Arc<CommandCellRuntimeService>, String> {
         let chat_events =
             crate::chat_event_log::ChatEventLog::open(root.join("chat-events"), retention)
                 .map_err(|error| error.to_string())?;
@@ -2624,7 +2744,7 @@ mod tests {
             .begin_owned_flow("command-cell test projection")
             .map_err(|error| error.to_string())?;
         Ok(Arc::new(CommandCellRuntimeService {
-            inner: Arc::new(BackgroundCommandManager::default()),
+            inner: Arc::new(BackgroundCommandManager::new(manager_config)?),
             run_cells: RwLock::new(HashMap::new()),
             chat_cells: RwLock::new(HashMap::new()),
             cell_deadlines: RwLock::new(HashMap::new()),
@@ -2643,6 +2763,8 @@ mod tests {
             awaiter_recovery_barrier: Mutex::new(None),
             awaiter_recovery_failures: std::sync::atomic::AtomicUsize::new(0),
             awaiter_started_barrier: Mutex::new(None),
+            awaiter_watch_snapshot_barrier: Mutex::new(None),
+            awaiter_watch_lease_barrier: Mutex::new(None),
         }))
     }
 
@@ -2709,6 +2831,91 @@ mod tests {
         }
     }
 
+    fn test_awaiter_executor(
+        response: &str,
+    ) -> Result<
+        (
+            Arc<echo_agent::agent::subagent::SubagentExecutor>,
+            echo_agent::testing::MockAgent,
+        ),
+        String,
+    > {
+        let mut parent = echo_agent::agent::ReactAgentBuilder::new()
+            .model("test-model")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let mock = echo_agent::testing::MockAgent::new("awaiter").with_response(response);
+        parent.register_subagent_with_definition(
+            echo_agent::agent::subagent::SubagentBuilder::new("awaiter")
+                .description("test Awaiter")
+                .background()
+                .build(),
+            Box::new(mock.clone()),
+        );
+        Ok((parent.subagent_executor().clone(), mock))
+    }
+
+    async fn wait_for_chat_cell_terminal(
+        service: &CommandCellRuntimeService,
+        conversation_id: &str,
+        root_turn_id: &str,
+        cell_id: &str,
+    ) -> Result<BackgroundCellState, String> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let replay = service
+                    .chat_events
+                    .replay("global", Some(conversation_id), root_turn_id, 0)
+                    .map_err(|error| error.to_string())?;
+                if let Some(cell) = find_chat_cell_fact(&replay.events, cell_id, true) {
+                    return Ok::<BackgroundCellState, String>(cell.clone());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| format!("cell {cell_id} did not reach durable terminal"))?
+    }
+
+    async fn wait_for_awaiter_ready(
+        service: &CommandCellRuntimeService,
+        workspace_id: &str,
+        conversation_id: &str,
+        root_turn_id: &str,
+        cell_id: &str,
+    ) -> Result<AwaiterResult, String> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let pending = service
+                    .chat_events
+                    .pending_awaiter_results(workspace_id, conversation_id, root_turn_id)
+                    .map_err(|error| error.to_string())?;
+                if let Some(result) = pending
+                    .into_iter()
+                    .find(|result| result.cell.cell_id == cell_id)
+                {
+                    return Ok::<AwaiterResult, String>(result);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| format!("cell {cell_id} did not publish Awaiter Ready"))?
+    }
+
+    async fn wait_for_live_cell_owner_retired(
+        service: &CommandCellRuntimeService,
+        key: &AwaiterWatchKey,
+    ) -> Result<(), String> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while service.owns_active_cell(key) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| format!("live owner for cell {} was not retired", key.cell_id))
+    }
+
     fn recovery_barrier() -> (
         AwaiterRecoveryTestBarrier,
         tokio::sync::oneshot::Receiver<()>,
@@ -2735,6 +2942,40 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         (
             AwaiterStartedTestBarrier {
+                entered: entered_tx,
+                release: release_rx,
+            },
+            entered_rx,
+            release_tx,
+        )
+    }
+
+    fn watch_snapshot_barrier() -> (
+        AwaiterWatchSnapshotTestBarrier,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            AwaiterWatchSnapshotTestBarrier {
+                entered: entered_tx,
+                release: release_rx,
+            },
+            entered_rx,
+            release_tx,
+        )
+    }
+
+    fn watch_lease_barrier() -> (
+        AwaiterWatchLeaseTestBarrier,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            AwaiterWatchLeaseTestBarrier {
                 entered: entered_tx,
                 release: release_rx,
             },
@@ -3318,6 +3559,7 @@ mod tests {
             conversation_id: "conversation".to_string(),
             run_id: None,
             root_turn_id: "root-message".to_string(),
+            current_turn_id: None,
             cell_id: cell_id.clone(),
         };
         let receipt = AwaiterWatchReceipt {
@@ -3369,6 +3611,500 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert!(!cell.snapshot.phase.is_terminal());
         registry.stop(&cell_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_before_watch_dispatches_once_and_reuses_stable_receipt() -> Result<(), String>
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        let scope = crate::workspace::WorkspaceExecutionScope::global(temp.path());
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "global")
+                .map_err(|error| error.to_string())?,
+        );
+        let registry = service.scoped(scope.clone(), Some(store.clone()));
+        let cell_id = registry
+            .launch(CommandCellRequest {
+                command: "printf completed-before-watch".to_string(),
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    message_id: Some("root-message".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .map(|receipt| receipt.cell_id)
+            .map_err(|error| error.to_string())?;
+        let terminal =
+            wait_for_chat_cell_terminal(&service, "conversation", "root-message", &cell_id).await?;
+        assert_eq!(terminal.phase, BackgroundCellPhase::Succeeded);
+        let key = AwaiterWatchKey {
+            workspace_id: "global".to_string(),
+            conversation_id: "conversation".to_string(),
+            run_id: None,
+            root_turn_id: "root-message".to_string(),
+            current_turn_id: Some("turn".to_string()),
+            cell_id: cell_id.clone(),
+        };
+        wait_for_live_cell_owner_retired(&service, &key).await?;
+        assert!(!service.owns_active_cell(&key));
+
+        let (executor, mock) = test_awaiter_executor("retained terminal observed")?;
+        let context = ToolContext {
+            conversation_id: Some("conversation".to_string()),
+            message_id: Some("root-message".to_string()),
+            turn_id: Some("turn".to_string()),
+            ..ToolContext::default()
+        };
+        let receipt = service
+            .watch_cell(
+                registry.clone(),
+                executor.clone(),
+                &scope,
+                &context,
+                &cell_id,
+                false,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let ready =
+            wait_for_awaiter_ready(&service, "global", "conversation", "root-message", &cell_id)
+                .await?;
+        assert_eq!(ready.receipt.execution_id, receipt.execution_id);
+        assert_eq!(ready.cell, terminal);
+        assert_eq!(ready.awaiter_status, AwaiterSummaryStatus::Completed);
+        assert_eq!(mock.call_count(), 1);
+
+        let repeated = service
+            .watch_cell(registry, executor, &scope, &context, &cell_id, false)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(repeated.execution_id, receipt.execution_id);
+        assert_eq!(repeated.watch_generation, receipt.watch_generation);
+        assert_eq!(mock.call_count(), 1);
+        let replay = service
+            .chat_events
+            .replay("global", Some("conversation"), "root-message", 0)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.payload,
+                    crate::chat_driver::ChatDriverEvent::AwaiterResultReady { result }
+                        if result.cell.cell_id == cell_id
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.payload,
+                    crate::chat_driver::ChatDriverEvent::CommandCellSettled { cell }
+                        if cell.cell_id == cell_id
+                ))
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_cell_cross_owner_rejects_without_dispatch_or_ready() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        let scope = crate::workspace::WorkspaceExecutionScope::global(temp.path());
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "global")
+                .map_err(|error| error.to_string())?,
+        );
+        let registry = service.scoped(scope.clone(), Some(store.clone()));
+        let cell_id = registry
+            .launch(CommandCellRequest {
+                command: "printf exact-owner".to_string(),
+                owner: CommandCellOwner {
+                    conversation_id: Some("owner-conversation".to_string()),
+                    message_id: Some("owner-root".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .map(|receipt| receipt.cell_id)
+            .map_err(|error| error.to_string())?;
+        wait_for_chat_cell_terminal(&service, "owner-conversation", "owner-root", &cell_id).await?;
+        wait_for_live_cell_owner_retired(
+            &service,
+            &AwaiterWatchKey {
+                workspace_id: "global".to_string(),
+                conversation_id: "owner-conversation".to_string(),
+                run_id: None,
+                root_turn_id: "owner-root".to_string(),
+                current_turn_id: None,
+                cell_id: cell_id.clone(),
+            },
+        )
+        .await?;
+        let (executor, mock) = test_awaiter_executor("must not run")?;
+        let error = service
+            .watch_cell(
+                registry,
+                executor,
+                &scope,
+                &ToolContext {
+                    conversation_id: Some("other-conversation".to_string()),
+                    message_id: Some("other-root".to_string()),
+                    turn_id: Some("other-turn".to_string()),
+                    ..ToolContext::default()
+                },
+                &cell_id,
+                false,
+            )
+            .await
+            .err()
+            .ok_or_else(|| "cross-owner watch unexpectedly succeeded".to_string())?;
+        assert!(error.to_string().contains("exact cell owner scope"));
+        assert_eq!(mock.call_count(), 0);
+        let replay = service
+            .chat_events
+            .replay("global", Some("other-conversation"), "other-root", 0)
+            .map_err(|error| error.to_string())?;
+        assert!(!replay.events.iter().any(|event| matches!(
+            event.payload,
+            crate::chat_driver::ChatDriverEvent::AwaiterResultReady { .. }
+        )));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_run_watch_owner_uses_full_durable_identity() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "workspace")
+                .map_err(|error| error.to_string())?,
+        );
+        store
+            .create_run(
+                "run",
+                "workspace",
+                "conversation",
+                "original-root",
+                DomainProfile::AiCoding,
+                "goal",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        let workspace_id = crate::workspace::WorkspaceId::from_name("workspace");
+        let scope =
+            crate::workspace::WorkspaceExecutionScope::workspace(&workspace_id, temp.path());
+        let registry = service.scoped(scope.clone(), Some(store.clone()));
+        let cell_id = registry
+            .launch(CommandCellRequest {
+                command: "printf resumed-run-cell".to_string(),
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    run_id: Some("run".to_string()),
+                    turn_id: Some("owned-turn".to_string()),
+                    message_id: Some("original-root".to_string()),
+                    execution_id: Some("execution".to_string()),
+                    call_id: Some("call".to_string()),
+                },
+                ..Default::default()
+            })
+            .await
+            .map(|receipt| receipt.cell_id)
+            .map_err(|error| error.to_string())?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let cells = store
+                    .list_background_cells("run")
+                    .map_err(|error| error.to_string())?;
+                if cells
+                    .iter()
+                    .any(|cell| cell.cell_id == cell_id && !cell.is_active())
+                {
+                    return Ok::<(), String>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "TaskRun cell did not reach durable terminal".to_string())??;
+
+        let (executor, mock) = test_awaiter_executor("resume turn observed")?;
+        let context = ToolContext {
+            conversation_id: Some("conversation".to_string()),
+            run_id: Some("run".to_string()),
+            message_id: Some("original-root".to_string()),
+            turn_id: Some("owned-turn".to_string()),
+            ..ToolContext::default()
+        };
+        let wrong_turn = ToolContext {
+            turn_id: Some("other-current-turn".to_string()),
+            ..context.clone()
+        };
+        let error = service
+            .watch_cell(
+                registry.clone(),
+                executor.clone(),
+                &scope,
+                &wrong_turn,
+                &cell_id,
+                false,
+            )
+            .await
+            .err()
+            .ok_or_else(|| "mismatched TaskRun turn unexpectedly resolved".to_string())?;
+        assert!(error.to_string().contains("exact cell owner scope"));
+        assert_eq!(mock.call_count(), 0);
+        let receipt = service
+            .watch_cell(
+                registry.clone(),
+                executor.clone(),
+                &scope,
+                &context,
+                &cell_id,
+                false,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let error = service
+            .watch_cell(
+                registry.clone(),
+                executor.clone(),
+                &scope,
+                &wrong_turn,
+                &cell_id,
+                false,
+            )
+            .await
+            .err()
+            .ok_or_else(|| "mismatched turn reused the active receipt".to_string())?;
+        assert!(error.to_string().contains("exact cell owner scope"));
+        let duplicate = service
+            .watch_cell(registry, executor, &scope, &context, &cell_id, false)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(duplicate.execution_id, receipt.execution_id);
+        assert_eq!(duplicate.watch_generation, receipt.watch_generation);
+        let ready = wait_for_awaiter_ready(
+            &service,
+            scope.workspace_id(),
+            "conversation",
+            "original-root",
+            &cell_id,
+        )
+        .await?;
+        assert_eq!(ready.receipt.execution_id, receipt.execution_id);
+        assert_eq!(ready.cell.turn_id.as_deref(), Some("owned-turn"));
+        assert_eq!(mock.call_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watch_rechecks_durable_terminal_after_live_owner_retires() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        let scope = crate::workspace::WorkspaceExecutionScope::global(temp.path());
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "global")
+                .map_err(|error| error.to_string())?,
+        );
+        let registry = service.scoped(scope.clone(), Some(store.clone()));
+        let cell_id = registry
+            .launch(CommandCellRequest {
+                command: "sleep 0.2; printf snapshot-watch-race".to_string(),
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    message_id: Some("root-message".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .map(|receipt| receipt.cell_id)
+            .map_err(|error| error.to_string())?;
+        let key = AwaiterWatchKey {
+            workspace_id: "global".to_string(),
+            conversation_id: "conversation".to_string(),
+            run_id: None,
+            root_turn_id: "root-message".to_string(),
+            current_turn_id: None,
+            cell_id: cell_id.clone(),
+        };
+        assert!(service.owns_active_cell(&key));
+        let (barrier, entered, release) = watch_snapshot_barrier();
+        *service
+            .awaiter_watch_snapshot_barrier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(barrier);
+        let (executor, mock) = test_awaiter_executor("race terminal observed")?;
+        let watching_service = service.clone();
+        let watching_registry = registry.clone();
+        let watching_scope = scope.clone();
+        let watching_cell_id = cell_id.clone();
+        let watching = tokio::spawn(async move {
+            watching_service
+                .watch_cell(
+                    watching_registry,
+                    executor,
+                    &watching_scope,
+                    &ToolContext {
+                        conversation_id: Some("conversation".to_string()),
+                        message_id: Some("root-message".to_string()),
+                        turn_id: Some("turn".to_string()),
+                        ..ToolContext::default()
+                    },
+                    &watching_cell_id,
+                    false,
+                )
+                .await
+        });
+        entered
+            .await
+            .map_err(|_| "watch did not reach its durable snapshot barrier".to_string())?;
+        wait_for_chat_cell_terminal(&service, "conversation", "root-message", &cell_id).await?;
+        wait_for_live_cell_owner_retired(&service, &key).await?;
+        release
+            .send(())
+            .map_err(|_| "watch snapshot barrier receiver was dropped".to_string())?;
+        let receipt = watching
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let ready =
+            wait_for_awaiter_ready(&service, "global", "conversation", "root-message", &cell_id)
+                .await?;
+        assert_eq!(ready.receipt.execution_id, receipt.execution_id);
+        assert_eq!(ready.cell.phase, BackgroundCellPhase::Succeeded);
+        assert_eq!(mock.call_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watch_observation_pins_terminal_across_history_churn() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service_with_command_history(temp.path(), 1)?;
+        let scope = crate::workspace::WorkspaceExecutionScope::global(temp.path());
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "global")
+                .map_err(|error| error.to_string())?,
+        );
+        let registry = service.scoped(scope.clone(), Some(store.clone()));
+        let cell_id = registry
+            .launch(CommandCellRequest {
+                command: "printf retained-before-churn".to_string(),
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    message_id: Some("root-message".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .map(|receipt| receipt.cell_id)
+            .map_err(|error| error.to_string())?;
+        wait_for_chat_cell_terminal(&service, "conversation", "root-message", &cell_id).await?;
+        let key = AwaiterWatchKey {
+            workspace_id: "global".to_string(),
+            conversation_id: "conversation".to_string(),
+            run_id: None,
+            root_turn_id: "root-message".to_string(),
+            current_turn_id: None,
+            cell_id: cell_id.clone(),
+        };
+        wait_for_live_cell_owner_retired(&service, &key).await?;
+
+        let (barrier, entered, release) = watch_lease_barrier();
+        *service
+            .awaiter_watch_lease_barrier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(barrier);
+        let (executor, mock) = test_awaiter_executor("retained terminal survived churn")?;
+        let watching_service = service.clone();
+        let watching_registry = registry.clone();
+        let watching_scope = scope.clone();
+        let watching_cell_id = cell_id.clone();
+        let watching = tokio::spawn(async move {
+            watching_service
+                .watch_cell(
+                    watching_registry,
+                    executor,
+                    &watching_scope,
+                    &ToolContext {
+                        conversation_id: Some("conversation".to_string()),
+                        message_id: Some("root-message".to_string()),
+                        turn_id: Some("turn".to_string()),
+                        ..ToolContext::default()
+                    },
+                    &watching_cell_id,
+                    false,
+                )
+                .await
+        });
+        entered
+            .await
+            .map_err(|_| "watch did not acquire its observation before the barrier".to_string())?;
+
+        for index in 0..4 {
+            let root_turn_id = format!("churn-root-{index}");
+            let churn_cell = registry
+                .launch(CommandCellRequest {
+                    command: format!("printf churn-{index}"),
+                    owner: CommandCellOwner {
+                        conversation_id: Some("conversation".to_string()),
+                        message_id: Some(root_turn_id.clone()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .await
+                .map(|receipt| receipt.cell_id)
+                .map_err(|error| error.to_string())?;
+            wait_for_chat_cell_terminal(&service, "conversation", &root_turn_id, &churn_cell)
+                .await?;
+            wait_for_live_cell_owner_retired(
+                &service,
+                &AwaiterWatchKey {
+                    workspace_id: "global".to_string(),
+                    conversation_id: "conversation".to_string(),
+                    run_id: None,
+                    root_turn_id,
+                    current_turn_id: None,
+                    cell_id: churn_cell,
+                },
+            )
+            .await?;
+        }
+        let retained = registry
+            .wait(&cell_id, 0, 0)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(retained.snapshot.phase.is_terminal());
+        release
+            .send(())
+            .map_err(|_| "watch snapshot barrier receiver was dropped".to_string())?;
+        let receipt = watching
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let ready =
+            wait_for_awaiter_ready(&service, "global", "conversation", "root-message", &cell_id)
+                .await?;
+        assert_eq!(ready.receipt.execution_id, receipt.execution_id);
+        assert_eq!(mock.call_count(), 1);
         Ok(())
     }
 

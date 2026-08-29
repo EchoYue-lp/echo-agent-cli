@@ -77,6 +77,13 @@ FIFO frontier、typed durability 与 prepared-batch reconciliation。Conversatio
 retirement guard 清理对应 inbox。完整取舍见
 [ADR 0011](./adr/0011-boot-inbox-recovery-authority.md)。
 
+`watch_cell` 的 exact owner 与 terminal truth 来自 durable TaskRuntime/Chat cell projection；live active
+set 只表示本进程仍持有资源。已在 watch 前完成的 retained cell 继续走 framework controlled Awaiter
+dispatch，立即读取 retry-safe terminal 并发布真实 typed Ready。TaskRun 用 durable run identity 加 cell
+`turn_id` 校验 resume/continuation current turn；普通 Chat 使用 conversation/root。durable read 前先取得
+不暴露内容的 observation lease，live owner 失配时再二读 durable state，从而同时闭合 terminal-history prune 与
+snapshot/live owner 窗口，不重跑 cell，也不从 active set 反推 terminal。
+
 ### Workspace runtime
 
 `WorkspaceRuntimeRegistry` 是已加载 workspace host 的唯一进程级 owner。每个

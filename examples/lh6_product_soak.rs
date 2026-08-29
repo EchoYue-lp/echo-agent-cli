@@ -19,6 +19,7 @@ use echo_agent_app_core::config;
 use echo_agent_app_core::foreground_turn::ForegroundTurnSurface;
 use echo_agent_app_core::prepared_turn::{PreparedUserTurn, UserTurnInput};
 use echo_agent_app_core::runtime::{AgentRuntime, ApplicationServices};
+use echo_agent_app_core::tasks::task_runtime::command_cells::AwaiterWatchReceipt;
 use echo_agent_app_core::tasks::task_runtime::store::RunTurnClaimOutcome;
 use echo_agent_app_core::tasks::task_runtime::{
     AttendedMode, DomainProfile, ExecutionMode, PlanTask, RunTurnOrigin, RunTurnStatus,
@@ -35,6 +36,8 @@ const WORKSPACE_COUNT: usize = 3;
 const CONVERSATIONS_PER_WORKSPACE: usize = 3;
 const CELL_WAVE_SECONDS: u64 = 60;
 const RESTART_COUNT: u64 = 2;
+const AWAITER_COMMAND_SECONDS: u64 = 60;
+const AWAITER_READY_WAIT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Parser)]
 #[command(name = "lh6-product-soak")]
@@ -313,7 +316,7 @@ impl HumanLoopProvider for AutoHitlProvider {
 #[derive(Default)]
 struct SinkMetrics {
     terminal_events: u64,
-    awaiter_ready: u64,
+    typed_watch_receipts: u64,
 }
 
 struct MetricsSink {
@@ -330,19 +333,20 @@ impl ChatSink for MetricsSink {
             .metrics
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        match envelope.payload {
-            ChatDriverEvent::Agent(event)
-                if matches!(
-                    event.payload,
-                    AgentEvent::FinalAnswer(_) | AgentEvent::Cancelled | AgentEvent::Error { .. }
-                ) =>
-            {
-                metrics.terminal_events = metrics.terminal_events.saturating_add(1);
+        if let ChatDriverEvent::Agent(event) = envelope.payload {
+            match event.payload {
+                AgentEvent::ToolResult { name, result, .. }
+                    if name == "watch_cell"
+                        && result.success
+                        && serde_json::from_str::<AwaiterWatchReceipt>(&result.output).is_ok() =>
+                {
+                    metrics.typed_watch_receipts = metrics.typed_watch_receipts.saturating_add(1);
+                }
+                AgentEvent::FinalAnswer(_) | AgentEvent::Cancelled | AgentEvent::Error { .. } => {
+                    metrics.terminal_events = metrics.terminal_events.saturating_add(1);
+                }
+                _ => {}
             }
-            ChatDriverEvent::AwaiterResultReady { .. } => {
-                metrics.awaiter_ready = metrics.awaiter_ready.saturating_add(1);
-            }
-            _ => {}
         }
         true
     }
@@ -743,7 +747,7 @@ async fn drive_one(
     );
     let prompt = if require_awaiter {
         format!(
-            "LH6 acceptance wave {wave}. Use shell with background=true to run exactly `sleep 5; printf LH6_CELL_{wave}`. Immediately call watch_cell for that cell. While it runs, compute 17*19, then report the typed cell terminal phase and exit code after the Awaiter result."
+            "LH6 acceptance wave {wave}. Use shell with background=true to run exactly `sleep {AWAITER_COMMAND_SECONDS}; printf LH6_CELL_{wave}`. Immediately call watch_cell for that cell. While it runs, compute 17*19, then report the typed cell terminal phase and exit code after the Awaiter result."
         )
     } else {
         format!(
@@ -784,7 +788,15 @@ async fn drive_one(
     drop(pool_execution);
 
     if require_awaiter {
-        tokio::time::timeout(Duration::from_secs(120), async {
+        let typed_watch_receipts = metrics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .typed_watch_receipts;
+        ensure!(
+            typed_watch_receipts == 1,
+            "watch_cell did not return exactly one successful typed receipt"
+        );
+        tokio::time::timeout(AWAITER_READY_WAIT, async {
             loop {
                 let replay = context
                     .services
@@ -807,7 +819,12 @@ async fn drive_one(
             }
         })
         .await
-        .map_err(|_| anyhow!("Awaiter result did not reach the durable journal"))??;
+        .map_err(|_| {
+            anyhow!(
+                "successful watch_cell receipt did not publish Awaiter Ready within {} seconds",
+                AWAITER_READY_WAIT.as_secs()
+            )
+        })??;
     }
     let snapshot = metrics.lock().unwrap_or_else(|error| error.into_inner());
     ensure!(
@@ -831,6 +848,16 @@ async fn drive_one(
         .iter()
         .filter(|event| event.root_turn_id == turn_id)
         .collect::<Vec<_>>();
+    let durable_awaiter_ready = current_turn_events
+        .iter()
+        .filter(|event| matches!(event.payload, ChatDriverEvent::AwaiterResultReady { .. }))
+        .count();
+    if require_awaiter {
+        ensure!(
+            durable_awaiter_ready == 1,
+            "watch_cell did not publish exactly one durable Awaiter Ready fact"
+        );
+    }
     ensure!(
         !current_turn_events.is_empty(),
         "foreground journal has no events for the current root turn"
@@ -845,7 +872,7 @@ async fn drive_one(
     Ok(TurnEvidence {
         surface: foreground_surface,
         terminal_events: snapshot.terminal_events,
-        awaiter_ready: snapshot.awaiter_ready.max(u64::from(require_awaiter)),
+        awaiter_ready: u64::try_from(durable_awaiter_ready).unwrap_or(u64::MAX),
     })
 }
 
