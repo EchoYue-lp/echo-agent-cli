@@ -71,7 +71,7 @@ fixture 在 GUI、TUI、CLI、JSONL、channel 不产生 surface-local terminal �
 ## R3/G 应用交付边界
 
 - R3 的 EKO 正式文档维护在本目录 `architecture.md`、`features.md`、ADR 与相关 architecture 子目录；framework 双语 API 文档维护在 `echo-agent`；website manifest 等 child SHA 稳定后再更新。
-- G 统一执行三仓适用门禁、fault matrix、10k/100k release 性能、10 分钟/1 小时/最终 2 小时 soak、人工 GUI、远端 CI 和 child-first push/release。任何阻塞、中断或未执行命令必须保留真实状态。
+- G 统一执行三仓适用门禁、fault matrix、10k/100k release 性能、10 分钟 deterministic soak、1 小时 real-product acceptance、最终 2 小时 real-product acceptance、人工 GUI、远端 CI 和 child-first push/release。`lh6_product_soak` 的一小时门必须显式使用 `--acceptance-tier one-hour` 且不少于 3600 秒；未指定 tier 的非 probe 仍是 `final-two-hour` 且不少于 7200 秒。`--probe` 只产生 `probe_passed`，不得作为 acceptance。任何阻塞、中断或未执行命令必须保留真实状态。
 
 ## 证据索引
 

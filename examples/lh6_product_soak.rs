@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use echo_agent::agent::AgentEvent;
 use echo_agent::human_loop::{
     HumanLoopKind, HumanLoopProvider, HumanLoopRequest, HumanLoopResponse,
@@ -47,9 +47,61 @@ struct Args {
     config: PathBuf,
     #[arg(long)]
     project: PathBuf,
+    /// Acceptance evidence tier. Omitted non-probe runs remain the final two-hour gate.
+    #[arg(long, value_enum)]
+    acceptance_tier: Option<AcceptanceTier>,
     /// Exercise the complete path without producing acceptance evidence.
     #[arg(long, default_value_t = false)]
     probe: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AcceptanceTier {
+    OneHour,
+    FinalTwoHour,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum EvidenceTier {
+    Probe,
+    OneHour,
+    FinalTwoHour,
+}
+
+impl EvidenceTier {
+    fn from_args(args: &Args) -> Result<Self> {
+        match (args.probe, args.acceptance_tier) {
+            (true, Some(_)) => Err(anyhow!("--probe cannot be combined with --acceptance-tier")),
+            (true, None) => Ok(Self::Probe),
+            (false, Some(AcceptanceTier::OneHour)) => Ok(Self::OneHour),
+            (false, Some(AcceptanceTier::FinalTwoHour) | None) => Ok(Self::FinalTwoHour),
+        }
+    }
+
+    fn minimum_duration_seconds(self) -> u64 {
+        match self {
+            Self::Probe => 60,
+            Self::OneHour => 3_600,
+            Self::FinalTwoHour => 7_200,
+        }
+    }
+
+    fn validate_duration(self, duration_seconds: u64) -> Result<()> {
+        let minimum_seconds = self.minimum_duration_seconds();
+        ensure!(
+            duration_seconds >= minimum_seconds,
+            "LH6 {self:?} duration must be at least {minimum_seconds} seconds"
+        );
+        Ok(())
+    }
+
+    fn completion_status(self) -> &'static str {
+        match self {
+            Self::Probe => "probe_passed",
+            Self::OneHour | Self::FinalTwoHour => "passed",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -110,13 +162,15 @@ impl PeakResources {
 struct Ledger {
     schema_version: u32,
     status: String,
-    commit: String,
+    tier: EvidenceTier,
+    cli_commit: String,
+    framework_commit: String,
     provider_id: String,
     model_id: String,
     started_at: String,
     completed_at: Option<String>,
-    required_active_millis: u64,
-    active_elapsed_millis: u64,
+    required_duration_seconds: u64,
+    actual_duration_millis: u64,
     workspaces: usize,
     conversations: usize,
     provider_turns: u64,
@@ -136,6 +190,54 @@ struct Ledger {
     peak_resources: PeakResources,
     journal_sha256: Option<String>,
     task_events_sha256: Option<String>,
+}
+
+impl Ledger {
+    fn new(
+        tier: EvidenceTier,
+        cli_commit: String,
+        framework_commit: String,
+        provider_id: String,
+        model_id: String,
+        required_duration_seconds: u64,
+    ) -> Self {
+        Self {
+            schema_version: 2,
+            status: "running".to_string(),
+            tier,
+            cli_commit,
+            framework_commit,
+            provider_id,
+            model_id,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: None,
+            required_duration_seconds,
+            actual_duration_millis: 0,
+            workspaces: WORKSPACE_COUNT,
+            conversations: WORKSPACE_COUNT.saturating_mul(CONVERSATIONS_PER_WORKSPACE),
+            provider_turns: 0,
+            provider_failures: 0,
+            command_cells: 0,
+            awaiter_ready: 0,
+            hitl_responses: 0,
+            controlled_restarts: 0,
+            provider_retry_injections: 0,
+            compactions: 0,
+            subagent_controls: 0,
+            terminal_events: 0,
+            identity_failures: 0,
+            duplicate_terminal_failures: 0,
+            resource_failures: 0,
+            surface_counts: SurfaceCounts::default(),
+            peak_resources: PeakResources::default(),
+            journal_sha256: None,
+            task_events_sha256: None,
+        }
+    }
+
+    fn required_duration_millis(&self) -> u64 {
+        self.required_duration_seconds.saturating_mul(1_000)
+    }
 }
 
 struct LedgerFailureGuard {
@@ -255,19 +357,19 @@ struct ProductContext {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let minimum_seconds = if args.probe { 60 } else { 7_200 };
-    ensure!(
-        args.duration_seconds >= minimum_seconds,
-        "LH6 duration is below its gate"
-    );
+    let tier = EvidenceTier::from_args(&args)?;
+    tier.validate_duration(args.duration_seconds)?;
     ensure!(args.config.is_file(), "provider config does not exist");
     ensure!(args.project.is_dir(), "project root does not exist");
     echo_agent_cli::configure_data_root()?;
     let repo_root = git_repo_root()?;
+    let framework_root = sibling_framework_root(&repo_root)?;
     if !args.probe {
         ensure_clean_worktree(&repo_root)?;
+        ensure_clean_worktree(&framework_root)?;
     }
-    let commit = git_head(&repo_root)?;
+    let cli_commit = git_head(&repo_root)?;
+    let framework_commit = git_head(&framework_root)?;
     std::fs::create_dir_all(&args.output_dir)?;
     let ledger_path = args.output_dir.join("ledger.json");
     ensure!(
@@ -279,36 +381,14 @@ async fn main() -> Result<()> {
     let mut app_config = config::load_config(Some(&config_path));
     config::apply_env_overrides(&mut app_config);
     let runtime_model = echo_agent_app_core::model_config::resolve_runtime_model(&app_config, None);
-    let mut ledger = Ledger {
-        schema_version: 1,
-        status: "running".to_string(),
-        commit,
-        provider_id: runtime_model.provider.clone(),
-        model_id: runtime_model.id.clone(),
-        started_at: chrono::Utc::now().to_rfc3339(),
-        completed_at: None,
-        required_active_millis: args.duration_seconds.saturating_mul(1_000),
-        active_elapsed_millis: 0,
-        workspaces: WORKSPACE_COUNT,
-        conversations: WORKSPACE_COUNT.saturating_mul(CONVERSATIONS_PER_WORKSPACE),
-        provider_turns: 0,
-        provider_failures: 0,
-        command_cells: 0,
-        awaiter_ready: 0,
-        hitl_responses: 0,
-        controlled_restarts: 0,
-        provider_retry_injections: 0,
-        compactions: 0,
-        subagent_controls: 0,
-        terminal_events: 0,
-        identity_failures: 0,
-        duplicate_terminal_failures: 0,
-        resource_failures: 0,
-        surface_counts: SurfaceCounts::default(),
-        peak_resources: PeakResources::default(),
-        journal_sha256: None,
-        task_events_sha256: None,
-    };
+    let mut ledger = Ledger::new(
+        tier,
+        cli_commit,
+        framework_commit,
+        runtime_model.provider.clone(),
+        runtime_model.id.clone(),
+        args.duration_seconds,
+    );
     write_ledger(&ledger_path, &ledger)?;
     let mut failure_guard = LedgerFailureGuard::new(ledger_path.clone());
 
@@ -347,7 +427,8 @@ async fn main() -> Result<()> {
         &mut ledger,
     )
     .await?;
-    ledger.active_elapsed_millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    ledger.actual_duration_millis =
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     write_ledger(&ledger_path, &ledger)?;
 
     let restart_at = [
@@ -358,7 +439,7 @@ async fn main() -> Result<()> {
     let mut next_cell_wave = 0_u64;
     loop {
         let elapsed_seconds = started.elapsed().as_secs();
-        ledger.active_elapsed_millis =
+        ledger.actual_duration_millis =
             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if elapsed_seconds >= next_cell_wave {
             run_cell_wave(
@@ -402,7 +483,7 @@ async fn main() -> Result<()> {
             .await?;
             write_ledger(&ledger_path, &ledger)?;
         }
-        if ledger.active_elapsed_millis >= ledger.required_active_millis
+        if ledger.actual_duration_millis >= ledger.required_duration_millis()
             && next_restart >= restart_at.len()
         {
             break;
@@ -444,15 +525,12 @@ async fn main() -> Result<()> {
     ensure!(ledger.provider_retry_injections >= 1);
     ensure!(ledger.subagent_controls >= 1);
     ensure!(ledger.peak_resources.agent_active > 0);
-    ledger.active_elapsed_millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    ledger.actual_duration_millis =
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let data_root = echo_agent_app_core::data_root::user_data_path("");
     ledger.journal_sha256 = Some(hash_tree(&data_root.join("chat-events"))?);
     ledger.task_events_sha256 = Some(hash_matching_files(&args.output_dir, "events.jsonl")?);
-    ledger.status = if args.probe {
-        "probe_passed".to_string()
-    } else {
-        "passed".to_string()
-    };
+    ledger.status = tier.completion_status().to_string();
     ledger.completed_at = Some(chrono::Utc::now().to_rfc3339());
     write_ledger(&ledger_path, &ledger)?;
     failure_guard.disarm();
@@ -1025,6 +1103,19 @@ fn git_head(root: &Path) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
+fn sibling_framework_root(cli_root: &Path) -> Result<PathBuf> {
+    let parent = cli_root
+        .parent()
+        .ok_or_else(|| anyhow!("CLI repository has no parent directory"))?;
+    let framework_root = parent.join("echo-agent");
+    ensure!(
+        framework_root.is_dir(),
+        "framework sibling does not exist at {}",
+        framework_root.display()
+    );
+    Ok(framework_root)
+}
+
 fn ensure_clean_worktree(root: &Path) -> Result<()> {
     let output = std::process::Command::new("git")
         .args(["status", "--porcelain"])
@@ -1036,4 +1127,144 @@ fn ensure_clean_worktree(root: &Path) -> Result<()> {
         "soak requires a clean committed worktree"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_args(extra: &[&str]) -> Result<Args, clap::Error> {
+        let mut args = vec![
+            "lh6-product-soak",
+            "--output-dir",
+            "/tmp/lh6-output",
+            "--config",
+            "/tmp/lh6-config.yaml",
+            "--project",
+            "/tmp/lh6-project",
+        ];
+        args.extend_from_slice(extra);
+        Args::try_parse_from(args)
+    }
+
+    #[test]
+    fn one_hour_tier_rejects_3599_and_accepts_3600_seconds() -> Result<()> {
+        let args = parse_args(&[
+            "--acceptance-tier",
+            "one-hour",
+            "--duration-seconds",
+            "3600",
+        ])?;
+        let tier = EvidenceTier::from_args(&args)?;
+        assert_eq!(tier, EvidenceTier::OneHour);
+        assert!(tier.validate_duration(3_599).is_err());
+        tier.validate_duration(3_600)?;
+        assert_eq!(tier.completion_status(), "passed");
+        Ok(())
+    }
+
+    #[test]
+    fn default_final_tier_rejects_7199_and_accepts_7200_seconds() -> Result<()> {
+        let args = parse_args(&["--duration-seconds", "7200"])?;
+        let tier = EvidenceTier::from_args(&args)?;
+        assert_eq!(tier, EvidenceTier::FinalTwoHour);
+        assert!(tier.validate_duration(7_199).is_err());
+        tier.validate_duration(7_200)?;
+        assert_eq!(tier.completion_status(), "passed");
+
+        let explicit = parse_args(&[
+            "--acceptance-tier",
+            "final-two-hour",
+            "--duration-seconds",
+            "7200",
+        ])?;
+        assert_eq!(
+            EvidenceTier::from_args(&explicit)?,
+            EvidenceTier::FinalTwoHour
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn probe_is_separate_and_never_emits_passed_acceptance() -> Result<()> {
+        let args = parse_args(&["--probe", "--duration-seconds", "60"])?;
+        let tier = EvidenceTier::from_args(&args)?;
+        assert_eq!(tier, EvidenceTier::Probe);
+        tier.validate_duration(60)?;
+        assert_eq!(tier.completion_status(), "probe_passed");
+        assert_ne!(tier.completion_status(), "passed");
+
+        let conflicting = parse_args(&[
+            "--probe",
+            "--acceptance-tier",
+            "one-hour",
+            "--duration-seconds",
+            "3600",
+        ])?;
+        assert!(EvidenceTier::from_args(&conflicting).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn ledger_serializes_tier_durations_shas_and_existing_counters() -> Result<()> {
+        let mut ledger = Ledger::new(
+            EvidenceTier::OneHour,
+            "cli-sha".to_string(),
+            "framework-sha".to_string(),
+            "provider".to_string(),
+            "provider:model".to_string(),
+            3_600,
+        );
+        ledger.actual_duration_millis = 3_600_001;
+        let value = serde_json::to_value(ledger)?;
+
+        assert_eq!(value.get("tier"), Some(&serde_json::json!("one-hour")));
+        assert_eq!(
+            value.get("required_duration_seconds"),
+            Some(&serde_json::json!(3_600))
+        );
+        assert_eq!(
+            value.get("actual_duration_millis"),
+            Some(&serde_json::json!(3_600_001))
+        );
+        assert_eq!(value.get("cli_commit"), Some(&serde_json::json!("cli-sha")));
+        assert_eq!(
+            value.get("framework_commit"),
+            Some(&serde_json::json!("framework-sha"))
+        );
+        for counter in [
+            "workspaces",
+            "conversations",
+            "provider_turns",
+            "provider_failures",
+            "command_cells",
+            "awaiter_ready",
+            "hitl_responses",
+            "controlled_restarts",
+            "provider_retry_injections",
+            "compactions",
+            "subagent_controls",
+            "terminal_events",
+            "identity_failures",
+            "duplicate_terminal_failures",
+            "resource_failures",
+        ] {
+            assert!(
+                value.get(counter).is_some(),
+                "missing ledger counter {counter}"
+            );
+        }
+        for evidence in [
+            "surface_counts",
+            "peak_resources",
+            "journal_sha256",
+            "task_events_sha256",
+        ] {
+            assert!(
+                value.get(evidence).is_some(),
+                "missing ledger evidence {evidence}"
+            );
+        }
+        Ok(())
+    }
 }
