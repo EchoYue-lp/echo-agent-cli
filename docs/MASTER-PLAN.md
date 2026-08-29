@@ -16,8 +16,8 @@
 
 | 项目 | 当前 SHA | 状态 |
 | --- | --- | --- |
-| framework `echo-agent` | `302453b174086c3795dc026d16eeb668ecc66bed` | `main` 与 `origin/main` 对齐；CLI 通过相对路径 `../echo-agent` 消费。 |
-| application `echo-agent-cli` | `d09f11c7878474d0e01ba2562309d5890e369554` | `main` 与 `origin/main` 对齐；F2-F5 已合流。 |
+| framework `echo-agent` | `1446cae` | R1/R2 producer 已完成；CLI 通过相对路径 `../echo-agent` 消费。 |
+| application `echo-agent-cli` | `df88546` | F0-F6、R1、R2 已完成；R3 文档/website 同步进行中。 |
 
 F2-F5 合流、测试卫生和适用完整门禁证据见顶层 [`plan_03`](../../docs/supreme/plans/2026-08-28T0013-项目未完成工作收敛/plan_03_F5收口完整验证主分支合并与资源清理.md)。本地 child SHA 不等于最终 release：10k/100k、长时 soak、人工 GUI、远端 CI 和 push/release 仍未执行。
 
@@ -28,14 +28,14 @@ F2-F5 合流、测试卫生和适用完整门禁证据见顶层 [`plan_03`](../.
 | F0 characterization | Complete | 已进入 `src/main.rs`，作为各入口回归基线。 |
 | F1 receipt/admission | Complete | Persisted/Accepted/Drained/TurnSettled 已由 app-core 与 framework 合同承载。 |
 | F2 Task/Plan/Todo authority | Complete | revisioned TaskRun graph、`TaskStatus` 和 Todo projection 已切换到唯一 authority；ADR [0015](./adr/0015-task-graph-status-authority.md)。 |
-| F3 Agent control tools | Complete | `agent_list/inspect/message/followup/wait/interrupt` 是薄 adapter，复用 router、SubagentControl 和 TaskRuntime；ADR [0016](./adr/0016-agent-control-tools.md)。底层 bounded query 仍待 R1/P0。 |
+| F3 Agent control tools | Complete | `agent_list/inspect/message/followup/wait/interrupt` 是薄 adapter，复用 router、SubagentControl 和 TaskRuntime；bounded query 已下推。ADR [0016](./adr/0016-agent-control-tools.md)。 |
 | F4 删除 InteractionMode | Complete | 生产代码、DTO、prompt、GUI/TUI/CLI/channel mode surface 已删除，不得改名恢复。 |
 | F5 Agent/Subagent lifecycle | Complete | lifecycle characterization、生产修复、panic-lint hygiene 和适用完整门禁均已完成。 |
-| F6 cursor/recovery/surface parity | **Partial** | 已有 cursor token、multi-target wait、boot reconcile、router restart 测试和静态 surface matrix；跨重启 Conversation/TaskSubagent cursor、cold address、workspace switch/delete、统一 fixture 与 stranded-resource 验收未闭环。 |
+| F6 cursor/recovery/surface parity | Complete | Conversation/TaskSubagent cursor restart、cold address、workspace switch/delete、boot reconcile、terminal exactly-once 与五入口共享 fixture 已闭环；ADR [0017](./adr/0017-f6-cursor-recovery-surface-parity.md)。 |
 | R0 boundary audit | Complete | 顶层审计覆盖 151 个 app-core Rust 文件，纯只读；见 [`current-framework-application-boundary-audit`](../../docs/2026-08-28-current-framework-application-boundary-audit.md)。 |
-| R1 framework-first migration | Not started | 19 个 `Migrate/converge` 与 8 个 `Conditional` 候选尚未切换；应用 adapter 必须保持无损且删除被替代主路径。 |
-| R2 examples convergence | Inventory only | 64 个 framework examples 的 disposition 已记录，CLI 只消费稳定 facade，不拥有 examples 迁移。 |
-| R3 docs/website | Not started | 等 R1/R2 API/examples 稳定后，再由各 child owner 同步文档和 website manifest。 |
+| R1 framework-first migration | Complete | turn、TaskRuntime、artifact、bootstrap、diff、plugin、memory、tool-control、background 与测试/legacy/dead-shim 收敛已完成；无第二 authority。顶层 boundary audit 记录逐项 SHA。 |
+| R2 examples convergence | Complete | framework 43 个 root examples + 21 个 executable contracts 覆盖 64 个唯一场景；panic/UTF-8/facade contracts 全绿。 |
+| R3 docs/website | In progress | child 正式文档按最终 API/examples 收敛中；website manifest 与最终双语同步尚未完成。 |
 | G Final Integration/Release | Not started | 完整三仓门禁、性能/soak、人工 GUI、远端 CI、website 和 child-first 发布均后置。 |
 
 ## 当前权威路径
@@ -53,27 +53,23 @@ F2-F5 合流、测试卫生和适用完整门禁证据见顶层 [`plan_03`](../.
 | shared app services | `AppState`、`TaskRuntimeBlockingAdapter`、`ProductDataIoService`；GUI/headless 不得各建 authority |
 | GUI IPC/projection | `src/tauri/commands/` 与 `web-frontend/src/`，只传 DTO、事件和 typed receipts |
 
-## F6 实施入口与退出门
+## F6 验收结论
 
-F6 owner 是 app-core；framework 只接收通用 event/cursor/checkpoint 需求。实现前先确认定义、注册和真实可达性，避免第二套 store、reducer、DAG loop 或地址解析。
+F6 已由 app-core 的 executable fixtures 证明：跨重启 cursor 可恢复，cold/unloaded address 与
+workspace generation/delete fail closed，boot reconciliation 不遗留 receipt/handle，同一 canonical
+fixture 在 GUI、TUI、CLI、JSONL、channel 不产生 surface-local terminal 推断。
 
-1. 使用同一 deterministic fixture，验证 Conversation 与 TaskSubagent cursor 的 append、wait、消费、restart、resume 和 terminal 去重。
-2. 覆盖 cold/unloaded address、workspace generation switch/delete、router restart、boot reconcile、orphan command cell、receipt/lease/handle 清理。
-3. 让 GUI、TUI、CLI/JSONL、channel 共用 fixture 和事件合同，比较 identity、error、artifact、HITL、cancel 和终态投影。
-4. 删除 surface-local 推断；generic terminal/retry/settlement 只能来自 framework 事件和 app 的单一 receipt owner。
+## R1 收敛结论
 
-F6 只有在无重复 terminal、无 stranded receipt/handle、跨重启可恢复、删除无残留且五入口 fixture 全绿时才可标记 Complete。
+- Framework 持有 canonical turn receipt、typed artifact、immutable prepared plugin generation、Task
+  timeout/dependency 原语；EKO 只保留 workspace、pool、review/worktree、文件权威和 surface policy。
+- `ApplicationServices` 是 GUI/headless/soak 的统一 composition owner；Tauri diff/workflow/tool commands
+  均为薄 adapter。
+- Plugin 与 hot-memory 都按 generation 一次 prepare、一次 publication，并覆盖 primary、existing pool
+  与 future pool；旧 additive refresh、legacy importer、dead shims 与字符串扫描合同已删除。
 
-## R1 应用侧迁移规则
+## R3/G 应用交付边界
 
-- framework producer 先改，CLI adapter 后切换；adapter 只做类型转换、metadata、产品 policy/hook 和 framework service 调用。
-- 优先审查 turn/event、tool/artifact、Task runtime adapter、bootstrap、plugin/memory generation 与 Tauri command composition。workspace、DomainProfile、review/worktree、文件权威和 UI/TUI/CLI/channel 投影继续留在应用层。
-- 每个切片必须有 framework 独立门禁、CLI round-trip/contract tests，并在新路径真实可达后删除旧实现；不得以“以后删除”长期保留双 authority。
-- Agent control 的 `list_events`/`list_subagent_runs` 当前仍先返回完整向量，adapter 只在截断前做 exact-target 过滤。真正下推 bounded query 属于 R1/P0，不能把当前 adapter 截断称为完成。
-
-## R2/R3/G 应用交付边界
-
-- R2 的 examples owner 在 `echo-agent`；CLI 仅验证 public facade 与应用文档链接，不把 EKO workspace/UI/DomainProfile 带入 framework examples。
 - R3 的 EKO 正式文档维护在本目录 `architecture.md`、`features.md`、ADR 与相关 architecture 子目录；framework 双语 API 文档维护在 `echo-agent`；website manifest 等 child SHA 稳定后再更新。
 - G 统一执行三仓适用门禁、fault matrix、10k/100k release 性能、10 分钟/1 小时/最终 2 小时 soak、人工 GUI、远端 CI 和 child-first push/release。任何阻塞、中断或未执行命令必须保留真实状态。
 

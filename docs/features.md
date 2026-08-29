@@ -94,7 +94,7 @@ store。
   以及 text/image/audio/video 输入能力。详见 [Provider 架构](./architecture/providers.md)。
 - GUI、TUI、CLI/JSONL 和 channel 共享模型、thinking profile、permission mode、
   TaskRuntime 与 Extension authority。
-- JSONL one-shot 可显式选择 interaction mode、permission/approval policy 和附件；HITL 请求
+- JSONL one-shot 可显式选择 permission/approval policy 和附件；HITL 请求
   进入 canonical event stream，不能回传的 input/selection 会明确拒绝而不静默挂起。
 - Browser session、approval receipt、普通 Subagent event 和 workspace 删除投影均使用
   `(workspace, conversation)` 地址；同名 conversation 不会跨 workspace 混写或误删。
