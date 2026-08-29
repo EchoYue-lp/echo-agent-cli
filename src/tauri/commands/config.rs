@@ -79,13 +79,19 @@ fn build_agent_config_response(
     AgentConfigResponse {
         model: agent.model_name().to_string(),
         system_prompt: agent.system_prompt().to_string(),
-        max_iterations: agent.config().get_max_iterations(),
+        max_iterations: display_max_iterations(agent.config().get_max_iterations()),
         token_limit: agent.config().get_token_limit(),
         enable_memory: agent.config().is_memory_enabled(),
         enable_human_loop: agent.config().is_human_in_loop_enabled(),
         session_id: agent.config().get_session_id().map(|s| s.to_string()),
         available_models,
     }
+}
+
+/// Keep the EKO wire sentinel stable while the framework receives a positive
+/// value for its validated iteration ceiling.
+fn display_max_iterations(value: usize) -> usize {
+    if value == usize::MAX { 0 } else { value }
 }
 
 #[tauri::command]
@@ -306,4 +312,15 @@ pub async fn discover_config() -> Result<serde_json::Value, IpcError> {
         "total": inventory.total_count(),
         "files": files,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_max_iterations;
+
+    #[test]
+    fn unbounded_iteration_sentinel_round_trips_as_eko_zero() {
+        assert_eq!(display_max_iterations(usize::MAX), 0);
+        assert_eq!(display_max_iterations(10), 10);
+    }
 }

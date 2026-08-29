@@ -66,6 +66,18 @@ fn resolved_max_tool_output_tokens(configured: usize) -> usize {
     }
 }
 
+/// Convert EKO's `0` iteration sentinel into the positive framework value that
+/// represents an effectively unlimited ReAct loop. The framework builder
+/// rejects zero, while EKO configuration intentionally documents zero as
+/// "until completion or cancellation".
+fn resolved_max_iterations(configured: usize) -> usize {
+    if configured == 0 {
+        usize::MAX
+    } else {
+        configured
+    }
+}
+
 /// Resolve the one context budget used by prompt assembly, the parent agent,
 /// and every subagent that inherits the selected runtime model.
 ///
@@ -609,7 +621,7 @@ pub async fn create_agent_with_diagnostics(
         .subagent_prompt_compiler(subagent_prompt_compiler.clone())
         .register_agent_dispatch_tool() // Phase 0: ad-hoc agent_tool alongside task_execute
         .enable_human_in_loop()
-        .max_iterations(app_config.agent.max_iterations)
+        .max_iterations(resolved_max_iterations(app_config.agent.max_iterations))
         .token_limit(token_limit)
         .visibility_horizon(eko_visibility_horizon(token_limit))
         .max_tool_output_tokens(max_tool_output_tokens)

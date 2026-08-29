@@ -227,6 +227,22 @@ mod llm_config_tests {
     }
 }
 
+#[test]
+fn zero_primary_iteration_config_uses_framework_unlimited_sentinel() {
+    assert_eq!(resolved_max_iterations(0), usize::MAX);
+    assert_eq!(resolved_max_iterations(1), 1);
+    assert_eq!(resolved_max_iterations(100), 100);
+}
+
+#[tokio::test]
+async fn zero_primary_iteration_config_builds_a_framework_valid_agent() -> Result<(), String> {
+    let mut config = EkoConfig::default();
+    config.agent.max_iterations = 0;
+    let created = create_agent_with_diagnostics(&AgentCreateParams::default(), &config).await?;
+    assert_eq!(created.agent.config().get_max_iterations(), usize::MAX);
+    Ok(())
+}
+
 #[cfg(test)]
 mod resolve_subagent_model_tests {
     use super::{
