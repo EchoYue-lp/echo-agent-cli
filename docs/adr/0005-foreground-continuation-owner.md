@@ -109,5 +109,5 @@ RunDriver release。Drop 不能 abort 这个唯一 owner，防御性 Drop 只请
 
 ## 文档与示例影响
 
-这是 EKO 应用运行时所有权，不修改 `echo-agent` public facade 或 `echo-agent-examples`。
+这是 EKO 应用运行时所有权，不修改 `echo-agent` public facade 或 `echo-agent-learning`。
 `echo-website` 不描述内部 RunTurn lifecycle，因此无需同步修改。

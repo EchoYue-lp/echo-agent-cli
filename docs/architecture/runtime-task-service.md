@@ -157,6 +157,6 @@ Tauri mutation 使用 ts-rs 生成的 `TaskRunControlReceipt`、`TaskRunResumeRe
 
 ## 不适用范围
 
-`echo-agent-examples` 用于验证 framework public facade，不应引入 EKO 文件 journal、review
+`echo-agent-learning` 用于验证 framework public facade，不应引入 EKO 文件 journal、review
 或 worktree policy。`echo-website` 是静态展示站，不依赖 agent runtime。因此本决策不修改
 framework examples 或 website。
