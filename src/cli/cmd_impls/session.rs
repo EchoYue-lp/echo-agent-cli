@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 async fn active_execution(
     ctx: &CommandContext,
-) -> Option<echo_agent_app_core::agent_pool::AgentPoolExecutionLease> {
+) -> Option<echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease> {
     let state = ctx.app_state.as_ref()?;
     let conversation_id = ctx.conversation_id.as_deref()?;
     let runtime = state.current_chat_runtime().await.ok()?;
@@ -14,11 +14,11 @@ async fn active_execution(
 }
 
 fn active_agent(
-    execution: Option<&echo_agent_app_core::agent_pool::AgentPoolExecutionLease>,
+    execution: Option<&echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease>,
     fallback: &crate::agent_handle::AgentHandle,
 ) -> crate::agent_handle::AgentHandle {
     execution
-        .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+        .map(echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease::agent)
         .unwrap_or_else(|| fallback.clone())
 }
 

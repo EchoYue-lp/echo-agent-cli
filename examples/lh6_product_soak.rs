@@ -11,23 +11,25 @@ use echo_agent::human_loop::{
 };
 use echo_agent::memory::NewConversation;
 use echo_agent::tools::cell::{CommandCellOwner, CommandCellRequest};
-use echo_agent_app_core::agent_pool::agent_execution_resource_snapshot;
-use echo_agent_app_core::chat_driver::{ChatDriverEvent, ChatSink, TurnOutcome};
-use echo_agent_app_core::chat_event_log::{ChatEventEnvelope, ChatSurface, bind_surface_chat_sink};
-use echo_agent_app_core::chat_resources::ChatResources;
-use echo_agent_app_core::config;
-use echo_agent_app_core::foreground_turn::ForegroundTurnSurface;
-use echo_agent_app_core::prepared_turn::{PreparedUserTurn, UserTurnInput};
-use echo_agent_app_core::runtime::{AgentRuntime, ApplicationServices};
-use echo_agent_app_core::tasks::task_runtime::command_cells::AwaiterWatchReceipt;
-use echo_agent_app_core::tasks::task_runtime::store::RunTurnClaimOutcome;
-use echo_agent_app_core::tasks::task_runtime::{
+use echo_agent_app_core::api::agent_pool::agent_execution_resource_snapshot;
+use echo_agent_app_core::api::chat_driver::{ChatDriverEvent, ChatSink, TurnOutcome};
+use echo_agent_app_core::api::chat_event_log::{
+    ChatEventEnvelope, ChatSurface, bind_surface_chat_sink,
+};
+use echo_agent_app_core::api::chat_resources::ChatResources;
+use echo_agent_app_core::api::config;
+use echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface;
+use echo_agent_app_core::api::prepared_turn::{PreparedUserTurn, UserTurnInput};
+use echo_agent_app_core::api::runtime::{AgentRuntime, ApplicationServices};
+use echo_agent_app_core::api::tasks::task_runtime::command_cells::AwaiterWatchReceipt;
+use echo_agent_app_core::api::tasks::task_runtime::store::RunTurnClaimOutcome;
+use echo_agent_app_core::api::tasks::task_runtime::{
     AttendedMode, DomainProfile, ExecutionMode, PlanTask, RunTurnOrigin, RunTurnStatus,
     SubagentControlActorSource, SubagentControlIdentity, SubagentControlService, TaskPlan,
     TaskRunStatus, TurnVisibility, commit_eko_task_plan, process_execution_resource_snapshot,
     task_goal_sha256,
 };
-use echo_agent_app_core::workspace::{WorkspaceExecutionScope, WorkspaceKind};
+use echo_agent_app_core::api::workspace::{WorkspaceExecutionScope, WorkspaceKind};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -355,7 +357,7 @@ impl ChatSink for MetricsSink {
 struct ProductContext {
     runtime: AgentRuntime,
     services: ApplicationServices,
-    hitl_registration: Option<echo_agent_app_core::hitl::HitlProviderRegistration>,
+    hitl_registration: Option<echo_agent_app_core::api::hitl::HitlProviderRegistration>,
 }
 
 #[tokio::main]
@@ -384,7 +386,8 @@ async fn main() -> Result<()> {
     let config_path = args.config.to_string_lossy().to_string();
     let mut app_config = config::load_config(Some(&config_path));
     config::apply_env_overrides(&mut app_config);
-    let runtime_model = echo_agent_app_core::model_config::resolve_runtime_model(&app_config, None);
+    let runtime_model =
+        echo_agent_app_core::api::model_config::resolve_runtime_model(&app_config, None);
     let mut ledger = Ledger::new(
         tier,
         cli_commit,
@@ -531,7 +534,7 @@ async fn main() -> Result<()> {
     ensure!(ledger.peak_resources.agent_active > 0);
     ledger.actual_duration_millis =
         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let data_root = echo_agent_app_core::data_root::user_data_path("");
+    let data_root = echo_agent_app_core::api::data_root::user_data_path("");
     ledger.journal_sha256 = Some(hash_tree(&data_root.join("chat-events"))?);
     ledger.task_events_sha256 = Some(hash_matching_files(&args.output_dir, "events.jsonl")?);
     ledger.status = tier.completion_status().to_string();
@@ -544,11 +547,11 @@ async fn main() -> Result<()> {
 
 async fn bootstrap(
     args: &Args,
-    app_config: &echo_agent_app_core::config::EkoConfig,
+    app_config: &echo_agent_app_core::api::config::EkoConfig,
     hitl: Arc<AutoHitlProvider>,
 ) -> Result<ProductContext> {
-    let conversation_store = echo_agent_app_core::infra::create_conversation_store();
-    let params = echo_agent_app_core::infra::AgentCreateParams {
+    let conversation_store = echo_agent_app_core::api::infra::create_conversation_store();
+    let params = echo_agent_app_core::api::infra::AgentCreateParams {
         model: None,
         system_prompt: None,
         project: Some(args.project.to_string_lossy().to_string()),
@@ -565,7 +568,7 @@ async fn bootstrap(
         execution_scope: None,
     };
     let mcp_path =
-        echo_agent_app_core::mcp_config_runtime::resolve_mcp_config_path(None, app_config);
+        echo_agent_app_core::api::mcp_config_runtime::resolve_mcp_config_path(None, app_config);
     let runtime = AgentRuntime::bootstrap(app_config, params, mcp_path).await?;
     let hitl_registration = runtime
         .hitl_dispatcher
@@ -592,7 +595,7 @@ impl ProductContext {
         self.hitl_registration.take();
         self.services
             .settle(
-                echo_agent_app_core::runtime::ApplicationLifecycleReason::Shutdown,
+                echo_agent_app_core::api::runtime::ApplicationLifecycleReason::Shutdown,
                 None,
             )
             .await
@@ -754,7 +757,7 @@ async fn drive_one(
             "Reply exactly `LH6_OK_{wave}_{index}` and do not call tools. This is a real-provider reliability probe."
         )
     };
-    let spill = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(
+    let spill = echo_agent_app_core::api::prepared_turn::resolve_user_input_spill_dir(Some(
         scoped.execution_scope().root(),
     ));
     let turn = PreparedUserTurn::build(UserTurnInput {
@@ -779,7 +782,7 @@ async fn drive_one(
         memory_generation: None,
         human_loop_provider: Some(context.runtime.hitl_dispatcher.clone()),
     });
-    let outcome = echo_agent_app_core::foreground_turn::drive_foreground_chat(
+    let outcome = echo_agent_app_core::api::foreground_turn::drive_foreground_chat(
         lease, &agent, &turn, resources,
     )
     .await
@@ -883,15 +886,17 @@ async fn run_cell_wave(
 ) -> Result<()> {
     for (index, address) in addresses.iter().enumerate() {
         let scope = WorkspaceExecutionScope::workspace(
-            &echo_agent_app_core::workspace::WorkspaceId::from_name(&address.workspace_id),
+            &echo_agent_app_core::api::workspace::WorkspaceId::from_name(&address.workspace_id),
             context
                 .services
                 .app_state
                 .workspace
                 .registry
-                .open(&echo_agent_app_core::workspace::WorkspaceId::from_name(
-                    &address.workspace_id,
-                ))?
+                .open(
+                    &echo_agent_app_core::api::workspace::WorkspaceId::from_name(
+                        &address.workspace_id,
+                    ),
+                )?
                 .root,
         );
         let scoped_runtime = context
@@ -1022,7 +1027,7 @@ async fn inject_control_events(
         store.record_run_turn_compaction(run_id, "lh6-control-turn", "lh6-compaction")?;
         store.finish_run_turn(
             run_id,
-            echo_agent_app_core::tasks::task_runtime::store::RunTurnCompletion {
+            echo_agent_app_core::api::tasks::task_runtime::store::RunTurnCompletion {
                 turn_id: "lh6-control-turn",
                 status: RunTurnStatus::Ended,
                 elapsed_seconds: 1,

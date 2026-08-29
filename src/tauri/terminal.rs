@@ -3,7 +3,7 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use base64::Engine;
-use echo_agent_app_core::terminal::{TerminalEvent, TerminalExitReason, TerminalService};
+use echo_agent_app_core::api::terminal::{TerminalEvent, TerminalExitReason, TerminalService};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;

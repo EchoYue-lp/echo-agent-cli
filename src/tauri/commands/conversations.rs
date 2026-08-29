@@ -5,8 +5,8 @@ use crate::tauri::state::TauriState;
 use echo_agent::agent::Agent;
 use echo_agent::llm::types::{Message, Role};
 use echo_agent::memory::{NewConversation, StoredMessage};
-use echo_agent_app_core::conversation_projection::{AttachmentsPayload, SavedMessage};
-use echo_agent_app_core::state::ScopedChatRuntime;
+use echo_agent_app_core::api::conversation_projection::{AttachmentsPayload, SavedMessage};
+use echo_agent_app_core::api::state::ScopedChatRuntime;
 use std::collections::BTreeMap;
 
 async fn scoped_runtime(

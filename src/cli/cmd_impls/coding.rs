@@ -4,8 +4,8 @@
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use crate::project::test_runner;
-use echo_agent_app_core::tasks::task_runtime::{RecoveryDecision, TaskRetryPreparation};
-use echo_agent_app_core::tasks::{BackgroundTaskKind, ResearchOutputFormat};
+use echo_agent_app_core::api::tasks::task_runtime::{RecoveryDecision, TaskRetryPreparation};
+use echo_agent_app_core::api::tasks::{BackgroundTaskKind, ResearchOutputFormat};
 use std::sync::Arc;
 
 // ── PlanCommand ──────────────────────────────────────────────────────
@@ -250,8 +250,8 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
 }
 
 fn render_task_dag(
-    plan: &echo_agent_app_core::tasks::task_runtime::PlanRevision,
-    todos: &[echo_agent_app_core::tasks::task_runtime::TodoItem],
+    plan: &echo_agent_app_core::api::tasks::task_runtime::PlanRevision,
+    todos: &[echo_agent_app_core::api::tasks::task_runtime::TodoItem],
 ) -> String {
     let statuses = todos
         .iter()
@@ -287,7 +287,7 @@ fn render_task_dag(
 #[cfg(test)]
 mod task_dag_tests {
     use super::render_task_dag;
-    use echo_agent_app_core::tasks::task_runtime::{
+    use echo_agent_app_core::api::tasks::task_runtime::{
         DomainProfile, ExecutionMode, PlanRevision, PlanTask,
     };
 
@@ -686,13 +686,13 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     if mode.is_empty() {
         // Show current permission mode
         let current = match ctx.app_state.as_ref() {
-            Some(state) => echo_agent_app_core::permission::permission_mode_id(
+            Some(state) => echo_agent_app_core::api::permission::permission_mode_id(
                 *state.config.permission_mode.read().await,
             ),
             None => {
                 ctx.agent
                     .read(|agent| {
-                        echo_agent_app_core::permission::permission_mode_id(
+                        echo_agent_app_core::api::permission::permission_mode_id(
                             agent.get_permission_mode(),
                         )
                     })
@@ -713,14 +713,14 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         return CommandOutcome::Continue;
     }
 
-    let framework_mode = match echo_agent_app_core::permission::parse_permission_mode(mode) {
+    let framework_mode = match echo_agent_app_core::api::permission::parse_permission_mode(mode) {
         Ok(mode) => mode,
         Err(error) => {
             println!("{error}");
             return CommandOutcome::Continue;
         }
     };
-    let normalized = echo_agent_app_core::permission::permission_mode_id(framework_mode);
+    let normalized = echo_agent_app_core::api::permission::permission_mode_id(framework_mode);
 
     match ctx.app_state.as_ref() {
         Some(state) => {

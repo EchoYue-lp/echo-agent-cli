@@ -146,12 +146,12 @@ Trace 写入失败当前不会回滚 TaskRuntime 已提交事件，因此 Trace 
 
 ## 代码入口
 
-- Workspace runtime 绑定：`echo-agent-app-core/src/infra.rs`
-- TaskRuntime facade：`echo-agent-app-core/src/tasks/task_runtime/store.rs`
+- Workspace runtime 绑定：`echo-agent-app-core/src/infra/factory.rs`
+- TaskRuntime facade：`echo-agent-app-core/src/tasks/task_runtime/store/mod.rs`
 - Task Journal/checkpoint authority：`echo-agent-app-core/src/tasks/task_runtime/run_authority.rs`
 - Task projection/read side：`echo-agent-app-core/src/tasks/task_runtime/file_store.rs`
 - 有界查询投影决策：`docs/adr/0008-taskruntime-bounded-query-projections.md`
 - Task recovery/shadow path：`echo-agent-app-core/src/tasks/task_runtime/file_shadow.rs`
-- 普通 Chat Journal：`echo-agent-app-core/src/chat_event_log.rs`
+- 普通 Chat Journal：`echo-agent-app-core/src/chat_event_log/journal.rs`
 - Observability projection：`echo-agent-app-core/src/observability/`
 - Workspace 文件布局：`echo-agent-app-core/src/workspace/layout.rs`

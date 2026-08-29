@@ -76,7 +76,7 @@ pub async fn submit_task(
         .as_ref()
         .ok_or_else(|| IpcError::Internal("Task service not initialized".to_string()))?;
 
-    use echo_agent_app_core::tasks::BackgroundTaskKind;
+    use echo_agent_app_core::api::tasks::BackgroundTaskKind;
     let params = params.unwrap_or_default();
 
     // Every accepted kind creates a TaskRun; the kind only changes the prompt.
@@ -169,7 +169,7 @@ pub async fn cancel_task(
 }
 
 fn task_to_info(
-    task: echo_agent_app_core::tasks::UnifiedTaskInfo,
+    task: echo_agent_app_core::api::tasks::UnifiedTaskInfo,
     progress: Option<echo_agent::tasks::progress::TaskProgress>,
 ) -> TaskInfo {
     // Progress is derived from the same TaskRuntime todo projection.

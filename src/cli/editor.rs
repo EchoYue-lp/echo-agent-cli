@@ -33,14 +33,14 @@ impl Default for EditorConfig {
     fn default() -> Self {
         Self {
             prompt: "echo".to_string(),
-            history_file: echo_agent_app_core::data_root::user_data_path("history.txt")
+            history_file: echo_agent_app_core::api::data_root::user_data_path("history.txt")
                 .to_string_lossy()
                 .into_owned(),
             history_size: 10000,
             keybinding_mode: KeybindingMode::Emacs,
             show_completion_menu: true,
             keybindings_path: Some(
-                echo_agent_app_core::data_root::user_data_path("keybindings.yaml")
+                echo_agent_app_core::api::data_root::user_data_path("keybindings.yaml")
                     .to_string_lossy()
                     .into_owned(),
             ),

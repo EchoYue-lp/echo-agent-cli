@@ -71,13 +71,13 @@ impl ChannelToolAddress {
     }
 
     pub(super) fn from_summary(
-        summary: &echo_agent_app_core::tool_execution::ToolExecutionSummary,
+        summary: &echo_agent_app_core::api::tool_execution::ToolExecutionSummary,
     ) -> Self {
         let owner = match &summary.owner {
-            echo_agent_app_core::tool_execution::ToolExecutionOwner::Chat { message_id } => {
+            echo_agent_app_core::api::tool_execution::ToolExecutionOwner::Chat { message_id } => {
                 ChannelToolOwner::Chat(message_id.clone())
             }
-            echo_agent_app_core::tool_execution::ToolExecutionOwner::Subagent {
+            echo_agent_app_core::api::tool_execution::ToolExecutionOwner::Subagent {
                 subagent_run_id,
             } => ChannelToolOwner::Subagent(subagent_run_id.clone()),
         };
@@ -93,7 +93,7 @@ impl ChannelToolAddress {
 
 pub(super) struct ChannelToolRenderEntry {
     address: ChannelToolAddress,
-    pub(super) summary: echo_agent_app_core::tool_execution::ToolExecutionSummary,
+    pub(super) summary: echo_agent_app_core::api::tool_execution::ToolExecutionSummary,
     output_events: usize,
     progress_events: usize,
     progress_limit_reported: bool,
@@ -113,7 +113,7 @@ pub(super) struct ChannelToolRenderState {
 impl ChannelToolRenderState {
     pub(super) fn observe(
         &mut self,
-        update: echo_agent_app_core::tool_execution_projection::ToolExecutionProjectionUpdate,
+        update: echo_agent_app_core::api::tool_execution_projection::ToolExecutionProjectionUpdate,
     ) -> ChannelToolObserveOutcome {
         let address = ChannelToolAddress::from_summary(&update.summary);
         let canonical_id = update.summary.id.clone();
@@ -390,11 +390,11 @@ pub(super) enum ChannelToolTerminal {
 pub(super) fn channel_tool_args_preview(args: &serde_json::Value) -> String {
     let mut args = args.clone();
     echo_agent::utils::retention::ContentRetentionPolicy {
-        max_string_chars: echo_agent_app_core::tool_execution::TOOL_ARGS_PREVIEW_CHARS,
+        max_string_chars: echo_agent_app_core::api::tool_execution::TOOL_ARGS_PREVIEW_CHARS,
         max_array_items: 32,
     }
     .sanitize_json(&mut args);
-    echo_agent_app_core::tool_execution::preview_args(&args)
+    echo_agent_app_core::api::tool_execution::preview_args(&args)
 }
 
 pub(super) fn channel_tool_result_message(
@@ -447,7 +447,7 @@ pub(super) fn channel_tool_result_message(
 }
 
 fn channel_tool_reference(
-    summary: Option<&echo_agent_app_core::tool_execution::ToolExecutionSummary>,
+    summary: Option<&echo_agent_app_core::api::tool_execution::ToolExecutionSummary>,
     artifact: Option<&echo_agent::tools::artifact::ToolOutputArtifactRef>,
     result: &echo_agent::tools::ToolResult,
 ) -> String {
@@ -480,8 +480,8 @@ fn channel_tool_reference(
 }
 
 pub(super) async fn channel_verified_artifact(
-    repository: Arc<echo_agent_app_core::tool_execution::ToolExecutionRepository>,
-    summary: Option<&echo_agent_app_core::tool_execution::ToolExecutionSummary>,
+    repository: Arc<echo_agent_app_core::api::tool_execution::ToolExecutionRepository>,
+    summary: Option<&echo_agent_app_core::api::tool_execution::ToolExecutionSummary>,
     result: &echo_agent::tools::ToolResult,
 ) -> Option<echo_agent::tools::artifact::ToolOutputArtifactRef> {
     let expected = result.artifact.clone()?;

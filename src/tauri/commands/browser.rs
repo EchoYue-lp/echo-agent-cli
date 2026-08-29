@@ -1,5 +1,5 @@
 use crate::tauri::state::TauriState;
-use echo_agent_app_core::browser::BrowserExtensionStatus;
+use echo_agent_app_core::api::browser::BrowserExtensionStatus;
 use std::process::Command;
 use tauri::State;
 

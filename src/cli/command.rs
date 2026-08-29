@@ -42,7 +42,7 @@ pub enum CommandOutcome {
     /// Resume one exact long-horizon TaskRun through a finite foreground turn.
     ResumeTaskRun {
         message: String,
-        identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity,
+        identity: echo_agent_app_core::api::tasks::task_runtime::TaskRunResumeIdentity,
     },
 }
 
@@ -95,17 +95,17 @@ pub struct CommandContext {
     /// Command registry (for /help to list commands dynamically).
     pub registry: Option<Arc<CommandRegistry>>,
     /// Background task service for submitting long-running tasks.
-    pub task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
+    pub task_service: Option<Arc<echo_agent_app_core::api::tasks::BackgroundTaskService>>,
     /// Scheduler runner for managing cron tasks.
-    pub scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+    pub scheduler: Option<Arc<echo_agent_app_core::api::scheduler::SchedulerRunner>>,
     /// Shared live plugin runtime used by every interaction surface.
-    pub plugin_runtime: Option<Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>>,
+    pub plugin_runtime: Option<Arc<echo_agent_app_core::api::plugin_runtime::PluginRuntimeService>>,
     /// Static prompt-module report captured during runtime bootstrap.
-    pub prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
+    pub prompt_assembly: Option<echo_agent_app_core::api::project::prompt::PromptAssembly>,
     /// Attachments staged for the next CLI chat turn.
     pub staged_attachments:
-        Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>>,
-    pub app_state: Option<Arc<echo_agent_app_core::state::AppState>>,
+        Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::api::attachments::AttachmentRef>>>,
+    pub app_state: Option<Arc<echo_agent_app_core::api::state::AppState>>,
     /// Persisted REPL conversation used to resolve its current TaskRun.
     pub conversation_id: Option<String>,
 }
@@ -147,7 +147,7 @@ impl CommandContext {
 
     pub fn with_task_service(
         mut self,
-        service: Arc<echo_agent_app_core::tasks::BackgroundTaskService>,
+        service: Arc<echo_agent_app_core::api::tasks::BackgroundTaskService>,
     ) -> Self {
         self.task_service = Some(service);
         self
@@ -155,7 +155,7 @@ impl CommandContext {
 
     pub fn with_scheduler(
         mut self,
-        runner: Arc<echo_agent_app_core::scheduler::SchedulerRunner>,
+        runner: Arc<echo_agent_app_core::api::scheduler::SchedulerRunner>,
     ) -> Self {
         self.scheduler = Some(runner);
         self
@@ -163,7 +163,7 @@ impl CommandContext {
 
     pub fn with_plugin_runtime(
         mut self,
-        runtime: Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
+        runtime: Arc<echo_agent_app_core::api::plugin_runtime::PluginRuntimeService>,
     ) -> Self {
         self.plugin_runtime = Some(runtime);
         self
@@ -171,7 +171,7 @@ impl CommandContext {
 
     pub fn with_prompt_assembly(
         mut self,
-        prompt_assembly: echo_agent_app_core::project::prompt::PromptAssembly,
+        prompt_assembly: echo_agent_app_core::api::project::prompt::PromptAssembly,
     ) -> Self {
         self.prompt_assembly = Some(prompt_assembly);
         self
@@ -183,9 +183,9 @@ impl CommandContext {
 }
 
 pub struct ScopedReviewControl {
-    pub runtime: echo_agent_app_core::state::ScopedChatRuntime,
-    pub integration: Arc<echo_agent_app_core::evolution::ReviewIntegration>,
-    pub generation: echo_agent_app_core::evolution::ReviewGenerationLease,
+    pub runtime: echo_agent_app_core::api::state::ScopedChatRuntime,
+    pub integration: Arc<echo_agent_app_core::api::evolution::ReviewIntegration>,
+    pub generation: echo_agent_app_core::api::evolution::ReviewGenerationLease,
 }
 
 impl CommandContext {

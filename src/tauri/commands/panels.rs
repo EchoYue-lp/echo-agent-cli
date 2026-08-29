@@ -6,13 +6,13 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent_app_core::state::{AuditDecision, PermissionBehavior, PermissionRuleConfig};
-use echo_agent_app_core::structured_extraction::{
+use echo_agent_app_core::api::state::{AuditDecision, PermissionBehavior, PermissionRuleConfig};
+use echo_agent_app_core::api::structured_extraction::{
     StructuredExtractionError, StructuredExtractionExample, StructuredExtractionOutcome,
     StructuredExtractionRequest, StructuredExtractionValidation,
 };
-use echo_agent_app_core::tasks::task_runtime::compact_context::RUNTIME_RECOVERY_MARKER;
-use echo_agent_app_core::workflow_service::{
+use echo_agent_app_core::api::tasks::task_runtime::compact_context::RUNTIME_RECOVERY_MARKER;
+use echo_agent_app_core::api::workflow_service::{
     StoredWorkflow, WorkflowExecution, WorkflowMutationReceipt, WorkflowServiceError,
 };
 use serde::Serialize;
@@ -23,9 +23,9 @@ use std::sync::Arc;
 use tauri::Emitter;
 
 struct ScopedEvolutionControl {
-    runtime: echo_agent_app_core::state::ScopedChatRuntime,
-    integration: Arc<echo_agent_app_core::evolution::ReviewIntegration>,
-    generation: echo_agent_app_core::evolution::ReviewGenerationLease,
+    runtime: echo_agent_app_core::api::state::ScopedChatRuntime,
+    integration: Arc<echo_agent_app_core::api::evolution::ReviewIntegration>,
+    generation: echo_agent_app_core::api::evolution::ReviewGenerationLease,
 }
 
 async fn current_evolution_control(state: &TauriState) -> Result<ScopedEvolutionControl, IpcError> {
@@ -78,7 +78,7 @@ pub async fn get_permissions_mode(
 ) -> Result<serde_json::Value, IpcError> {
     let mode = *state.app_state.config.permission_mode.read().await;
     Ok(serde_json::json!({
-        "mode": echo_agent_app_core::permission::permission_mode_id(mode)
+        "mode": echo_agent_app_core::api::permission::permission_mode_id(mode)
     }))
 }
 
@@ -87,9 +87,9 @@ pub async fn set_permissions_mode(
     state: tauri::State<'_, TauriState>,
     mode: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let framework_mode = echo_agent_app_core::permission::parse_permission_mode(&mode)
+    let framework_mode = echo_agent_app_core::api::permission::parse_permission_mode(&mode)
         .map_err(IpcError::Validation)?;
-    let normalized = echo_agent_app_core::permission::permission_mode_id(framework_mode);
+    let normalized = echo_agent_app_core::api::permission::permission_mode_id(framework_mode);
     let mut mode_lock = state.app_state.config.permission_mode.write().await;
     *mode_lock = framework_mode;
     drop(mode_lock);
@@ -273,8 +273,8 @@ pub async fn clear_audit_logs(
 // ════════════════════════════════════════════════════════════════════════════
 
 struct ScopedAutoMemoryControl {
-    runtime: echo_agent_app_core::state::ScopedChatRuntime,
-    generation: echo_agent_app_core::evolution::ReviewGenerationLease,
+    runtime: echo_agent_app_core::api::state::ScopedChatRuntime,
+    generation: echo_agent_app_core::api::evolution::ReviewGenerationLease,
 }
 
 async fn auto_memory_control_for_workspace(
@@ -329,19 +329,20 @@ async fn auto_memory_config_status(
     control: &ScopedAutoMemoryControl,
 ) -> Result<
     (
-        echo_agent_app_core::auto_memory::AutoMemoryConfig,
+        echo_agent_app_core::api::auto_memory::AutoMemoryConfig,
         usize,
         PathBuf,
     ),
     IpcError,
 > {
-    let config = echo_agent_app_core::auto_memory::AutoMemoryConfig {
+    let config = echo_agent_app_core::api::auto_memory::AutoMemoryConfig {
         enabled: crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
             .load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
     };
     let messages = scoped_agent_messages(control).await;
-    let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
+    let observations =
+        echo_agent_app_core::api::auto_memory::extract_observations(&messages, &config);
     let inbox_path = control.generation.evidence_store().path().to_path_buf();
     Ok((config, observations.len(), inbox_path))
 }
@@ -406,7 +407,7 @@ pub async fn extract_auto_memory(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let config = echo_agent_app_core::auto_memory::AutoMemoryConfig {
+    let config = echo_agent_app_core::api::auto_memory::AutoMemoryConfig {
         enabled: crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
             .load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
@@ -426,10 +427,11 @@ pub async fn extract_auto_memory(
     };
 
     let messages = scoped_agent_messages(&control).await;
-    let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
+    let observations =
+        echo_agent_app_core::api::auto_memory::extract_observations(&messages, &config);
     let store = control.generation.evidence_store();
     let candidates =
-        echo_agent_app_core::auto_memory::queue_observations(&store, &observations, &messages)
+        echo_agent_app_core::api::auto_memory::queue_observations(&store, &observations, &messages)
             .map_err(IpcError::Internal)?;
     let projection_settlement = if candidates.is_empty() {
         None
@@ -437,7 +439,8 @@ pub async fn extract_auto_memory(
         Some(control.generation.settle_hot_memory_projection().await)
     };
     let count = observations.len();
-    let formatted = echo_agent_app_core::auto_memory::format_observations_for_memory(&observations);
+    let formatted =
+        echo_agent_app_core::api::auto_memory::format_observations_for_memory(&observations);
 
     Ok(json!({
         "success": true,
@@ -456,16 +459,18 @@ pub async fn get_auto_memory_observations(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let config = echo_agent_app_core::auto_memory::AutoMemoryConfig {
+    let config = echo_agent_app_core::api::auto_memory::AutoMemoryConfig {
         enabled: crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
             .load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
     };
     let control = auto_memory_control_for_workspace(&state, &workspace_id).await?;
     let messages = scoped_agent_messages(&control).await;
-    let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
+    let observations =
+        echo_agent_app_core::api::auto_memory::extract_observations(&messages, &config);
     let count = observations.len();
-    let formatted = echo_agent_app_core::auto_memory::format_observations_for_memory(&observations);
+    let formatted =
+        echo_agent_app_core::api::auto_memory::format_observations_for_memory(&observations);
     Ok(json!({
         "observations": observations,
         "count": count,
@@ -610,7 +615,7 @@ pub async fn update_sandbox_config(
     state: tauri::State<'_, TauriState>,
     config: serde_json::Value,
 ) -> Result<serde_json::Value, IpcError> {
-    let new_config: echo_agent_app_core::state::SandboxConfigData =
+    let new_config: echo_agent_app_core::api::state::SandboxConfigData =
         serde_json::from_value(config).map_err(|e| IpcError::Validation(e.to_string()))?;
     let mut config_lock = state.app_state.config.sandbox_config.write().await;
     *config_lock = new_config;
@@ -718,10 +723,10 @@ pub async fn compress_context(
     let receipt = state
         .app_state
         .compress_conversation_owned(
-            echo_agent_app_core::manual_compression::ManualCompressionRequest {
+            echo_agent_app_core::api::manual_compression::ManualCompressionRequest {
                 workspace_id,
                 conversation_id,
-                surface: echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+                surface: echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
                 focus: None,
                 keep_messages: 12,
             },
@@ -766,7 +771,7 @@ pub async fn get_compression_stats(
     };
     let agent = execution
         .as_ref()
-        .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+        .map(echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease::agent)
         .unwrap_or_else(|| runtime.primary_agent());
     let (
         message_count,
@@ -826,7 +831,7 @@ pub async fn extract_data(
         .extract_structured_for_scope(
             &workspace_id,
             &conversation_id,
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
             StructuredExtractionRequest {
                 input,
                 schema,
@@ -891,9 +896,10 @@ pub async fn list_diagnostic_runs(
         .read(|agent| agent.run_store().cloned())
         .await
         .ok_or_else(|| IpcError::Internal("No run store configured".to_string()))?;
-    let summaries = echo_agent_app_core::observability::list_diagnostic_runs(run_store.as_ref())
-        .await
-        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let summaries =
+        echo_agent_app_core::api::observability::list_diagnostic_runs(run_store.as_ref())
+            .await
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
     serde_json::to_value(summaries).map_err(|error| IpcError::Internal(error.to_string()))
 }
 
@@ -916,7 +922,7 @@ pub async fn get_run_diagnostics(
         .read()
         .await
         .clone();
-    let diagnostics = echo_agent_app_core::observability::load_run_diagnostics(
+    let diagnostics = echo_agent_app_core::api::observability::load_run_diagnostics(
         run_store.as_ref(),
         &diagnostic_id,
         prompt_assembly,
@@ -1019,7 +1025,7 @@ pub async fn list_evidence_candidates(
     state: tauri::State<'_, TauriState>,
     status: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    use echo_agent_app_core::evolution::EvidenceReviewFilter;
+    use echo_agent_app_core::api::evolution::EvidenceReviewFilter;
 
     let filter = match status.as_deref() {
         None | Some("pending") => EvidenceReviewFilter::Pending,
@@ -1189,8 +1195,8 @@ pub async fn get_evolution_dashboard(
     )
     .map_err(|error| IpcError::Internal(error.to_string()))?;
 
-    let dashboard =
-        echo_agent_app_core::evolution::Dashboard::new(store, change_log).with_run_store(run_store);
+    let dashboard = echo_agent_app_core::api::evolution::Dashboard::new(store, change_log)
+        .with_run_store(run_store);
     let metrics = dashboard.generate_metrics().await;
     let trigger_delivery = Some(control.integration.trigger_delivery_status());
 
@@ -1357,7 +1363,7 @@ pub async fn generate_skill_draft(
     .map_err(|error| IpcError::Internal(error.to_string()))?;
     let typed = echo_agent::memory::TypedMemoryStore::new(store);
 
-    let curator = echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir);
+    let curator = echo_agent_app_core::api::evolution::workspace_curator(&echo_agent_dir);
     let generator = echo_agent::evolution::SkillDraftGenerator::new(echo_agent_dir, &change_log)
         .with_curator(curator);
     let result = generator
@@ -1365,7 +1371,7 @@ pub async fn generate_skill_draft(
         .await
         .map_err(|e| IpcError::Internal(format!("Failed to generate draft: {e}")))?;
 
-    echo_agent_app_core::evolution::fire_evolution_hook(
+    echo_agent_app_core::api::evolution::fire_evolution_hook(
         &agent,
         echo_agent::hooks::HookEvent::SkillLifecycleTransition,
         &result.name,
@@ -1408,8 +1414,8 @@ pub async fn activate_skill_draft(
         .publish_curated_skill(&state.app_state, Some(&runtime), generation, &name)
         .await
         .map_err(|error| IpcError::Internal(format!("Failed to promote Skill: {error}")))?;
-    let success =
-        receipt.status == echo_agent_app_core::extension_control::SkillSettlementStatus::Settled;
+    let success = receipt.status
+        == echo_agent_app_core::api::extension_control::SkillSettlementStatus::Settled;
 
     Ok(json!({
         "success": success,
@@ -1436,30 +1442,32 @@ struct WorktreeInfo {
 }
 
 struct ScopedWorktreeControl {
-    _control: echo_agent_app_core::state::ScopedWorkspaceControl,
+    _control: echo_agent_app_core::api::state::ScopedWorkspaceControl,
     repo_root: PathBuf,
-    store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    store: Option<Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>>,
 }
 
 async fn run_taskruntime_worktree_operation<T, E, F>(
-    store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    store: Option<Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>>,
     operation: &'static str,
     function: F,
 ) -> Result<T, IpcError>
 where
     T: Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    F: FnOnce(Option<&echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>) -> Result<T, E>
+    F: FnOnce(
+            Option<&echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
+        ) -> Result<T, E>
         + Send
         + 'static,
 {
     match store {
         Some(store) => {
             let operation_store = store.clone();
-            echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+            echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
                 .run_owned(operation, move || {
                     function(Some(operation_store.as_ref())).map_err(|error| {
-                        echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
+                        echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(
                             error.to_string(),
                         )
                     })
@@ -1687,7 +1695,7 @@ pub async fn create_worktree(
         .unwrap_or_else(|| "HEAD".to_string());
     let repo_root = git_repo_root_async(start).await?;
     let merge_lock =
-        echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
+        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
     let _merge_guard = merge_lock.lock().await;
     let created = tokio::task::spawn_blocking(move || {
         validate_branch_name(&repo_root, &branch)?;
@@ -1725,7 +1733,7 @@ pub async fn remove_worktree(
     let start = control.repo_root.clone();
     let repo_root = git_repo_root_async(start).await?;
     let merge_lock =
-        echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
+        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
     let _merge_guard = merge_lock.lock().await;
     tokio::task::spawn_blocking(move || {
         let target = PathBuf::from(path.trim());
@@ -1777,7 +1785,7 @@ pub async fn list_unattended_worktrees(
 
     let unattended =
         run_taskruntime_worktree_operation(store, "list unattended worktrees", move |store| {
-            echo_agent_app_core::tasks::task_runtime::worktree::list_unattended_worktrees(
+            echo_agent_app_core::api::tasks::task_runtime::worktree::list_unattended_worktrees(
                 &repo_root, store,
             )
         })
@@ -1818,7 +1826,7 @@ pub async fn merge_unattended_worktree(
     let store = control.store.clone();
     if let Some(store) = store.as_ref() {
         let lookup_run_id = run_id.clone();
-        let run = echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(
+        let run = echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(
             store.clone(),
         )
         .run_store("validate unattended worktree TaskRun", move |store| {
@@ -1837,12 +1845,12 @@ pub async fn merge_unattended_worktree(
         ));
     }
     let merge_lock =
-        echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
+        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
     let _merge_guard = merge_lock.lock().await;
     let run_id_for_merge = run_id.clone();
     let outcome =
         run_taskruntime_worktree_operation(store, "merge unattended worktree", move |store| {
-            echo_agent_app_core::tasks::task_runtime::worktree::merge_unattended_worktree(
+            echo_agent_app_core::api::tasks::task_runtime::worktree::merge_unattended_worktree(
                 &repo_root,
                 &run_id_for_merge,
                 store,
@@ -1872,11 +1880,11 @@ pub async fn discard_unattended_worktree(
     let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
     let store = control.store.clone();
     let merge_lock =
-        echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
+        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
     let _merge_guard = merge_lock.lock().await;
     let run_id_for_discard = run_id.clone();
     run_taskruntime_worktree_operation(store, "discard unattended worktree", move |store| {
-        echo_agent_app_core::tasks::task_runtime::worktree::discard_unattended_worktree(
+        echo_agent_app_core::api::tasks::task_runtime::worktree::discard_unattended_worktree(
             &repo_root,
             &run_id_for_discard,
             store,
@@ -1897,11 +1905,11 @@ pub async fn cleanup_unattended_worktrees(
     let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
     let store = control.store.clone();
     let merge_lock =
-        echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
+        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
     let _merge_guard = merge_lock.lock().await;
     let result =
         run_taskruntime_worktree_operation(store, "clean unattended worktrees", move |store| {
-            echo_agent_app_core::tasks::task_runtime::worktree::cleanup_unattended_worktrees(
+            echo_agent_app_core::api::tasks::task_runtime::worktree::cleanup_unattended_worktrees(
                 &repo_root, store,
             )
         })
@@ -1922,8 +1930,8 @@ mod scoped_control_tests {
 
     #[test]
     fn skill_wire_loaded_state_comes_from_extension_projection() {
-        let entry = echo_agent_app_core::extension_control::ExtensionSkillEntry {
-            catalog: echo_agent_app_core::skills_hub::SkillHubEntry {
+        let entry = echo_agent_app_core::api::extension_control::ExtensionSkillEntry {
+            catalog: echo_agent_app_core::api::skills_hub::SkillHubEntry {
                 name: "review".to_string(),
                 description: "Review changes".to_string(),
                 path: PathBuf::from("/tmp/skills/review"),
@@ -1988,8 +1996,10 @@ mod scoped_control_tests {
     #[test]
     fn primary_and_unattended_mutations_share_repo_lock() {
         let repo = std::env::temp_dir().join("eko-worktree-lock-contract");
-        let primary = echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo);
-        let unattended = echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo);
+        let primary =
+            echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo);
+        let unattended =
+            echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo);
         assert!(Arc::ptr_eq(&primary, &unattended));
     }
 }

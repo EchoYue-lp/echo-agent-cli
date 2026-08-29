@@ -26,7 +26,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use echo_agent_app_core::context_window::{ContextUsageAccumulator, ContextWindowSnapshot};
+use echo_agent_app_core::api::context_window::{ContextUsageAccumulator, ContextWindowSnapshot};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -113,7 +113,7 @@ impl Theme {
 
     /// Apply a plugin theme's semantic colors to the TUI palette.
     pub fn from_plugin_theme(
-        definition: &echo_agent_app_core::plugin_runtime::PluginThemeDefinition,
+        definition: &echo_agent_app_core::api::plugin_runtime::PluginThemeDefinition,
     ) -> Self {
         let mut theme = if definition.dark {
             Self::dark()
@@ -207,7 +207,7 @@ pub struct TaskProgressEntry {
 /// Exact TaskRun identity retained for one explicit resume wake.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskRunResumeWake {
-    pub identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity,
+    pub identity: echo_agent_app_core::api::tasks::task_runtime::TaskRunResumeIdentity,
     pub is_continuation: bool,
 }
 
@@ -217,9 +217,10 @@ pub struct TaskRunResumeWake {
 #[derive(Clone, Debug)]
 pub struct TuiTurnRequest {
     pub text: String,
-    pub attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
+    pub attachments: Vec<echo_agent_app_core::api::attachments::AttachmentRef>,
     pub run_resume: Option<TaskRunResumeWake>,
-    pub input_attempt: Option<echo_agent_app_core::conversation_input::ConversationInputAttempt>,
+    pub input_attempt:
+        Option<echo_agent_app_core::api::conversation_input::ConversationInputAttempt>,
 }
 
 /// Read-only TUI projection of the authoritative TaskRuntime state.
@@ -309,7 +310,7 @@ pub struct TuiApp {
     pub active_turn_agent: Option<AgentHandle>,
     /// Read-only projection of the durable ConversationInput authority.
     pub conversation_input_frontier:
-        Option<echo_agent_app_core::conversation_input::ConversationInputFrontier>,
+        Option<echo_agent_app_core::api::conversation_input::ConversationInputFrontier>,
     /// Current streaming text being received.
     pub streaming_text: String,
     /// Slash command suggestions (shown as completion popup).
@@ -388,17 +389,17 @@ pub struct TuiApp {
     /// Mouse selection end: (wrapped_line_index, visual_column).
     pub selection_end: Option<(usize, usize)>,
     /// Pending approval request from the agent (TUI HITL provider).
-    pub pending_approval: Option<echo_agent_app_core::hitl::PendingApprovalQueue>,
+    pub pending_approval: Option<echo_agent_app_core::api::hitl::PendingApprovalQueue>,
     /// Session-owned HITL transport replayed onto continuation pool agents.
     pub human_loop_provider:
-        Option<std::sync::Arc<echo_agent_app_core::hitl::TuiHumanLoopProvider>>,
+        Option<std::sync::Arc<echo_agent_app_core::api::hitl::TuiHumanLoopProvider>>,
     /// Shared webhook emitter for chat/tool lifecycle events.
-    pub webhook_emitter: Option<std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>>,
+    pub webhook_emitter: Option<std::sync::Arc<echo_agent_app_core::api::webhook::WebhookEmitter>>,
     /// Shared scheduler used by direct `/cron` commands.
-    pub scheduler: Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+    pub scheduler: Option<std::sync::Arc<echo_agent_app_core::api::scheduler::SchedulerRunner>>,
     /// Shared live plugin runtime used by direct `/plugins` commands.
     pub plugin_runtime:
-        Option<std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>>,
+        Option<std::sync::Arc<echo_agent_app_core::api::plugin_runtime::PluginRuntimeService>>,
     /// Latest TaskRuntime projection for the current conversation.
     pub task_runtime_view: Option<TaskRuntimeView>,
     /// Live subagent dispatches observed from the framework event bus.
@@ -407,7 +408,7 @@ pub struct TuiApp {
     /// them alongside the typed text as a multimodal message via
     /// `drive_chat(multimodal=Some)`, then drains the buffer. Empty = plain
     /// text turn.
-    pub pending_attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
+    pub pending_attachments: Vec<echo_agent_app_core::api::attachments::AttachmentRef>,
     /// Conversation id for this TUI session (TUI/GUI parity). Binds chat turns
     /// and TaskRuntime runs to one conversation; enables transcript projection.
     /// Generated once per session in `run_tui`.
@@ -415,7 +416,7 @@ pub struct TuiApp {
     /// File-backed conversation projection shared with GUI and headless entry.
     pub conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
     /// Shared application authority for workspace transitions and scoped stores.
-    pub app_state: Option<std::sync::Arc<echo_agent_app_core::state::AppState>>,
+    pub app_state: Option<std::sync::Arc<echo_agent_app_core::api::state::AppState>>,
     /// PTY currently attached to the TUI terminal pane.
     pub active_terminal_id: Option<String>,
     /// Bounded raw PTY output rendered by the terminal pane.
@@ -423,11 +424,11 @@ pub struct TuiApp {
     /// Active workspace root used by attachments, long-input artifacts and file views.
     pub workspace_root: Option<std::path::PathBuf>,
     /// Immutable execution scope captured for newly dispatched TUI turns.
-    pub workspace_execution_scope: echo_agent_app_core::workspace::WorkspaceExecutionScope,
+    pub workspace_execution_scope: echo_agent_app_core::api::workspace::WorkspaceExecutionScope,
     /// Runtime-ready configured models exposed by the product configuration.
-    pub configured_models: Vec<echo_agent_app_core::model_config::ModelRuntimeConfig>,
+    pub configured_models: Vec<echo_agent_app_core::api::model_config::ModelRuntimeConfig>,
     /// Static prompt-module report captured during runtime bootstrap.
-    pub prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
+    pub prompt_assembly: Option<echo_agent_app_core::api::project::prompt::PromptAssembly>,
     /// Preserve native terminal scrollback instead of entering the alternate screen.
     pub inline_mode: bool,
     /// Event-loop request to temporarily suspend the TUI and open `$VISUAL`/`$EDITOR`.
@@ -435,7 +436,7 @@ pub struct TuiApp {
     /// Project file requested by `/edit`, opened after the current input event settles.
     pub external_file_editor_requested: Option<std::path::PathBuf>,
     /// Shared browser runtime used by direct TUI browser commands.
-    pub browser_runtime: Option<std::sync::Arc<echo_agent_app_core::browser::BrowserRuntime>>,
+    pub browser_runtime: Option<std::sync::Arc<echo_agent_app_core::api::browser::BrowserRuntime>>,
     /// Project-relative paths used by `@` completion.
     pub project_files: Vec<String>,
     /// Current offset for repeated Ctrl+R reverse-history search.
@@ -451,7 +452,7 @@ pub struct TuiApp {
 impl TuiApp {
     pub(crate) fn discard_unsubmitted_attachments(&mut self) -> Result<(), String> {
         let attachments = std::mem::take(&mut self.pending_attachments);
-        echo_agent_app_core::attachments::discard_staged_attachment_refs(&attachments)
+        echo_agent_app_core::api::attachments::discard_staged_attachment_refs(&attachments)
     }
 
     pub(crate) fn conversation_input_queue_len(&self) -> usize {
@@ -903,7 +904,7 @@ impl TuiApp {
             terminal_output: Vec::new(),
             workspace_root: None,
             workspace_execution_scope:
-                echo_agent_app_core::workspace::WorkspaceExecutionScope::global("."),
+                echo_agent_app_core::api::workspace::WorkspaceExecutionScope::global("."),
             configured_models: Vec::new(),
             prompt_assembly: None,
             inline_mode: false,
@@ -1774,7 +1775,7 @@ mod state_tests {
 
     #[test]
     fn plugin_theme_maps_css_and_semantic_colors_without_panicking() {
-        let definition = echo_agent_app_core::plugin_runtime::PluginThemeDefinition {
+        let definition = echo_agent_app_core::api::plugin_runtime::PluginThemeDefinition {
             name: "local-theme".to_string(),
             display_name: None,
             dark: false,
@@ -1846,8 +1847,10 @@ mod state_tests {
 
     #[tokio::test]
     async fn tui_shutdown_waits_for_foreground_settlement() -> Result<(), String> {
-        use echo_agent_app_core::chat_driver::TurnOutcome;
-        use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+        use echo_agent_app_core::api::chat_driver::TurnOutcome;
+        use echo_agent_app_core::api::foreground_turn::{
+            ForegroundTurnControl, ForegroundTurnSurface,
+        };
 
         let control = ForegroundTurnControl::default();
         let lease = control
@@ -1950,11 +1953,11 @@ impl Drop for TerminalGuard {
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 async fn settle_tui_foreground_on_exit(
-    control: &echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    control: &echo_agent_app_core::api::foreground_turn::ForegroundTurnControl,
     workspace_id: &str,
     conversation_id: &str,
-) -> Result<(), echo_agent_app_core::foreground_turn::ForegroundTurnError> {
-    use echo_agent_app_core::foreground_turn::{ForegroundTurnError, ForegroundTurnSurface};
+) -> Result<(), echo_agent_app_core::api::foreground_turn::ForegroundTurnError> {
+    use echo_agent_app_core::api::foreground_turn::{ForegroundTurnError, ForegroundTurnSurface};
 
     loop {
         let Some(snapshot) =
@@ -1987,19 +1990,19 @@ async fn settle_tui_foreground_on_exit(
 #[allow(clippy::too_many_arguments)] // startup entry: agent + shared services + config are wired here
 pub async fn run_tui(
     agent: AgentHandle,
-    tui_config: &echo_agent_app_core::config::TuiConfig,
+    tui_config: &echo_agent_app_core::api::config::TuiConfig,
     mode_display: &str,
-    tui_pending: echo_agent_app_core::hitl::PendingApprovalQueue,
-    tui_provider: std::sync::Arc<echo_agent_app_core::hitl::TuiHumanLoopProvider>,
-    webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
-    scheduler: Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+    tui_pending: echo_agent_app_core::api::hitl::PendingApprovalQueue,
+    tui_provider: std::sync::Arc<echo_agent_app_core::api::hitl::TuiHumanLoopProvider>,
+    webhook_emitter: std::sync::Arc<echo_agent_app_core::api::webhook::WebhookEmitter>,
+    scheduler: Option<std::sync::Arc<echo_agent_app_core::api::scheduler::SchedulerRunner>>,
     conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
     conversation_id: String,
-    configured_models: Vec<echo_agent_app_core::model_config::ModelRuntimeConfig>,
-    browser_runtime: std::sync::Arc<echo_agent_app_core::browser::BrowserRuntime>,
-    prompt_assembly: echo_agent_app_core::project::prompt::PromptAssembly,
-    plugin_runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
-    app_state: std::sync::Arc<echo_agent_app_core::state::AppState>,
+    configured_models: Vec<echo_agent_app_core::api::model_config::ModelRuntimeConfig>,
+    browser_runtime: std::sync::Arc<echo_agent_app_core::api::browser::BrowserRuntime>,
+    prompt_assembly: echo_agent_app_core::api::project::prompt::PromptAssembly,
+    plugin_runtime: std::sync::Arc<echo_agent_app_core::api::plugin_runtime::PluginRuntimeService>,
+    app_state: std::sync::Arc<echo_agent_app_core::api::state::AppState>,
     inline_mode: bool,
 ) -> anyhow::Result<()> {
     let theme = Theme::dark();
@@ -2045,7 +2048,7 @@ pub async fn run_tui(
     app.tool_count = agent.read(|value| value.tool_names().len()).await;
     app.permission_mode = agent
         .read(|value| {
-            echo_agent_app_core::permission::permission_mode_id(value.get_permission_mode())
+            echo_agent_app_core::api::permission::permission_mode_id(value.get_permission_mode())
                 .to_string()
         })
         .await;

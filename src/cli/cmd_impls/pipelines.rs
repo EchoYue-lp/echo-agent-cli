@@ -4,7 +4,7 @@
 //! through the shared TaskRuntime and domain-aware Subagents.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
-use echo_agent_app_core::tasks::BackgroundTaskKind;
+use echo_agent_app_core::api::tasks::BackgroundTaskKind;
 
 // ── AnalyzeCommand ──────────────────────────────────────────────────
 

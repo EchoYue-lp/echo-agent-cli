@@ -20,7 +20,7 @@ pub enum CommandResult {
     /// Execute a resume turn explicitly bound to one TaskRun.
     ResumeTaskRun {
         message: String,
-        identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity,
+        identity: echo_agent_app_core::api::tasks::task_runtime::TaskRunResumeIdentity,
     },
 }
 
@@ -30,13 +30,13 @@ pub struct CommandHandler {
     current_mode: String,
     coding_loop: Option<Arc<tokio::sync::Mutex<crate::project::coding_loop::CodingLoop>>>,
     registry: Option<Arc<crate::cli::command::CommandRegistry>>,
-    task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
-    scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
-    plugin_runtime: Option<Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>>,
-    prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
+    task_service: Option<Arc<echo_agent_app_core::api::tasks::BackgroundTaskService>>,
+    scheduler: Option<Arc<echo_agent_app_core::api::scheduler::SchedulerRunner>>,
+    plugin_runtime: Option<Arc<echo_agent_app_core::api::plugin_runtime::PluginRuntimeService>>,
+    prompt_assembly: Option<echo_agent_app_core::api::project::prompt::PromptAssembly>,
     staged_attachments:
-        Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>>,
-    app_state: Option<Arc<echo_agent_app_core::state::AppState>>,
+        Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::api::attachments::AttachmentRef>>>,
+    app_state: Option<Arc<echo_agent_app_core::api::state::AppState>>,
     conversation_id: Option<String>,
 }
 
@@ -80,7 +80,7 @@ impl CommandHandler {
     /// Attach a BackgroundTaskService for submitting long-running tasks.
     pub fn with_task_service(
         mut self,
-        service: Arc<echo_agent_app_core::tasks::BackgroundTaskService>,
+        service: Arc<echo_agent_app_core::api::tasks::BackgroundTaskService>,
     ) -> Self {
         self.task_service = Some(service);
         self
@@ -89,7 +89,7 @@ impl CommandHandler {
     /// Attach an optional BackgroundTaskService.
     pub fn with_task_service_opt(
         mut self,
-        service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
+        service: Option<Arc<echo_agent_app_core::api::tasks::BackgroundTaskService>>,
     ) -> Self {
         self.task_service = service;
         self
@@ -98,7 +98,7 @@ impl CommandHandler {
     /// Attach an optional SchedulerRunner for cron task management.
     pub fn with_scheduler_opt(
         mut self,
-        scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+        scheduler: Option<Arc<echo_agent_app_core::api::scheduler::SchedulerRunner>>,
     ) -> Self {
         self.scheduler = scheduler;
         self
@@ -106,7 +106,7 @@ impl CommandHandler {
 
     pub fn with_plugin_runtime(
         mut self,
-        runtime: Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
+        runtime: Arc<echo_agent_app_core::api::plugin_runtime::PluginRuntimeService>,
     ) -> Self {
         self.plugin_runtime = Some(runtime);
         self
@@ -114,7 +114,7 @@ impl CommandHandler {
 
     pub fn with_plugin_runtime_opt(
         mut self,
-        runtime: Option<Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>>,
+        runtime: Option<Arc<echo_agent_app_core::api::plugin_runtime::PluginRuntimeService>>,
     ) -> Self {
         self.plugin_runtime = runtime;
         self
@@ -122,7 +122,7 @@ impl CommandHandler {
 
     pub fn with_prompt_assembly(
         mut self,
-        prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
+        prompt_assembly: Option<echo_agent_app_core::api::project::prompt::PromptAssembly>,
     ) -> Self {
         self.prompt_assembly = prompt_assembly;
         self
@@ -130,7 +130,7 @@ impl CommandHandler {
 
     pub fn with_app_state_opt(
         mut self,
-        app_state: Option<Arc<echo_agent_app_core::state::AppState>>,
+        app_state: Option<Arc<echo_agent_app_core::api::state::AppState>>,
     ) -> Self {
         self.app_state = app_state;
         self
@@ -143,7 +143,9 @@ impl CommandHandler {
 
     pub fn with_staged_attachments(
         mut self,
-        attachments: Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>>,
+        attachments: Arc<
+            tokio::sync::Mutex<Vec<echo_agent_app_core::api::attachments::AttachmentRef>>,
+        >,
     ) -> Self {
         self.staged_attachments = attachments;
         self

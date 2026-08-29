@@ -26,17 +26,17 @@ use tokio::sync::mpsc;
 
 use echo_agent::agent::subagent::SubagentEvent;
 use echo_agent::tools::{ToolFailure, artifact::ToolOutputArtifactRef};
-use echo_agent_app_core::chat_driver::TurnOutcome;
-use echo_agent_app_core::context_window::ContextWindowSnapshot;
-use echo_agent_app_core::conversation_input::{
+use echo_agent_app_core::api::chat_driver::TurnOutcome;
+use echo_agent_app_core::api::context_window::ContextWindowSnapshot;
+use echo_agent_app_core::api::conversation_input::{
     ConversationInputAddress, ConversationInputAttempt, ConversationInputFact,
     ConversationInputPhase, ConversationInputProjection, ConversationInputReceipt,
     ConversationInputSource, stable_scoped_input_id,
 };
-use echo_agent_app_core::foreground_turn::{
+use echo_agent_app_core::api::foreground_turn::{
     ForegroundTurnLease, ForegroundTurnSnapshot, ForegroundTurnSurface,
 };
-use echo_agent_app_core::terminal::TerminalEvent;
+use echo_agent_app_core::api::terminal::TerminalEvent;
 
 /// Poll interval for non-blocking event check.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -47,17 +47,17 @@ const MAX_TUI_TERMINAL_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 /// Returns `true` if the key was consumed.
 async fn handle_approval_key(
     _app: &mut TuiApp,
-    pending_handle: &echo_agent_app_core::hitl::PendingApprovalQueue,
+    pending_handle: &echo_agent_app_core::api::hitl::PendingApprovalQueue,
     key: &KeyEvent,
 ) -> bool {
     use echo_agent::human_loop::HumanLoopResponse;
-    use echo_agent_app_core::hitl::PendingHumanLoopKind;
+    use echo_agent_app_core::api::hitl::PendingHumanLoopKind;
 
     let mut guard = match pending_handle.try_lock() {
         Ok(g) => g,
         Err(_) => return false,
     };
-    echo_agent_app_core::hitl::prune_closed_pending(&mut guard);
+    echo_agent_app_core::api::hitl::prune_closed_pending(&mut guard);
     let approval = match guard.front_mut() {
         Some(a) => a,
         None => return false,
@@ -235,10 +235,10 @@ async fn handle_approval_key(
 
 /// Build the response for the currently selected option.
 fn pending_response(
-    approval: &mut echo_agent_app_core::hitl::PendingApproval,
+    approval: &mut echo_agent_app_core::api::hitl::PendingApproval,
 ) -> Option<echo_agent::human_loop::HumanLoopResponse> {
     use echo_agent::human_loop::{ApprovalScope, HumanLoopResponse};
-    use echo_agent_app_core::hitl::PendingHumanLoopKind;
+    use echo_agent_app_core::api::hitl::PendingHumanLoopKind;
 
     let response = match approval.kind {
         PendingHumanLoopKind::Input => HumanLoopResponse::Text(approval.feedback_input.clone()),
@@ -277,7 +277,7 @@ fn pending_response(
 
 /// Resolve and remove the exact front request before releasing the queue lock.
 fn send_and_remove_front(
-    pending: &mut echo_agent_app_core::hitl::tui_provider::TuiHumanLoopState,
+    pending: &mut echo_agent_app_core::api::hitl::tui_provider::TuiHumanLoopState,
     request_id: &str,
     response: echo_agent::human_loop::HumanLoopResponse,
 ) -> bool {
@@ -353,7 +353,7 @@ enum AgentEvent {
         usage_reported: bool,
     },
     Notice(String),
-    Execution(echo_agent_app_core::tasks::task_runtime::executor::ExecEvent),
+    Execution(echo_agent_app_core::api::tasks::task_runtime::executor::ExecEvent),
     TurnStatus(String),
     ConversationInputReceipt(Box<ConversationInputReceipt>),
     /// The sole TUI lifecycle terminal, emitted after the driver settles.
@@ -1626,7 +1626,7 @@ async fn submit_tui_conversation_input(
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
     text: String,
-    attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
+    attachments: Vec<echo_agent_app_core::api::attachments::AttachmentRef>,
 ) -> Result<(), String> {
     let app_state = app
         .app_state
@@ -1639,7 +1639,7 @@ async fn submit_tui_conversation_input(
         .product_data_io
         .run("read TUI conversation input attachments", {
             let attachments = attachments.clone();
-            move || echo_agent_app_core::attachments::attachment_refs_to_data(&attachments)
+            move || echo_agent_app_core::api::attachments::attachment_refs_to_data(&attachments)
         })
         .await
         .map_err(|error| error.to_string())?
@@ -1656,7 +1656,7 @@ async fn submit_tui_conversation_input(
         .session
         .product_data_io
         .run("retire submitted TUI attachment staging", move || {
-            echo_agent_app_core::attachments::discard_staged_attachment_refs(&attachments)
+            echo_agent_app_core::api::attachments::discard_staged_attachment_refs(&attachments)
         })
         .await;
     match retirement {
@@ -1719,7 +1719,7 @@ async fn refresh_conversation_input_frontier(app: &mut TuiApp, address: &Convers
 
 async fn refresh_conversation_input_frontier_with_service(
     app: &mut TuiApp,
-    service: &echo_agent_app_core::conversation_input::ConversationInputService,
+    service: &echo_agent_app_core::api::conversation_input::ConversationInputService,
     address: &ConversationInputAddress,
 ) {
     match service.list(address).await {
@@ -1734,7 +1734,7 @@ async fn refresh_conversation_input_frontier_with_service(
 async fn render_conversation_input_receipt(
     app: &mut TuiApp,
     receipt: ConversationInputReceipt,
-    service: Option<echo_agent_app_core::conversation_input::ConversationInputService>,
+    service: Option<echo_agent_app_core::api::conversation_input::ConversationInputService>,
 ) {
     let address = receipt.identity.address.clone();
     app.status_msg = format!(
@@ -1772,23 +1772,24 @@ fn exact_conversation_input_attempt(
 }
 
 async fn stage_conversation_input_attachments(
-    app_state: &echo_agent_app_core::state::AppState,
+    app_state: &echo_agent_app_core::api::state::AppState,
     workspace_root: std::path::PathBuf,
-    attachments: Vec<echo_agent_app_core::types::AttachmentData>,
-) -> Result<Vec<echo_agent_app_core::attachments::AttachmentRef>, String> {
+    attachments: Vec<echo_agent_app_core::api::types::AttachmentData>,
+) -> Result<Vec<echo_agent_app_core::api::attachments::AttachmentRef>, String> {
     app_state
         .session
         .product_data_io
         .run("stage TUI conversation input attachments", move || {
-            let uploads = echo_agent_app_core::attachments::resolve_uploads_dir(Some(
+            let uploads = echo_agent_app_core::api::attachments::resolve_uploads_dir(Some(
                 workspace_root.as_path(),
             ));
-            let saved = echo_agent_app_core::attachments::save_attachments(&attachments, &uploads)?;
-            Ok::<_, echo_agent_app_core::attachments::AttachmentError>(
+            let saved =
+                echo_agent_app_core::api::attachments::save_attachments(&attachments, &uploads)?;
+            Ok::<_, echo_agent_app_core::api::attachments::AttachmentError>(
                 saved
                     .iter()
                     .map(|(path, attachment)| {
-                        echo_agent_app_core::attachments::AttachmentRef::from_saved(
+                        echo_agent_app_core::api::attachments::AttachmentRef::from_saved(
                             path.clone(),
                             attachment,
                         )
@@ -1808,7 +1809,7 @@ enum RegisteredTuiSteerError {
 }
 
 async fn execute_registered_tui_steer<Effect, EffectFuture, ResultValue>(
-    registration: Result<(), echo_agent_app_core::foreground_turn::ForegroundTurnError>,
+    registration: Result<(), echo_agent_app_core::api::foreground_turn::ForegroundTurnError>,
     effect: Effect,
     handoff: tokio::sync::oneshot::Sender<ResultValue>,
 ) -> Result<(), RegisteredTuiSteerError>
@@ -1827,7 +1828,7 @@ where
 
 async fn steer_conversation_input_projection(
     app: &mut TuiApp,
-    app_state: &echo_agent_app_core::state::AppState,
+    app_state: &echo_agent_app_core::api::state::AppState,
     address: &ConversationInputAddress,
     projection: ConversationInputProjection,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
@@ -1843,11 +1844,11 @@ async fn steer_conversation_input_projection(
         projection.payload.attachments.clone(),
     )
     .await?;
-    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(
+    let spill_dir = echo_agent_app_core::api::prepared_turn::resolve_user_input_spill_dir(Some(
         execution_root.as_path(),
     ));
-    let prepared = echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
-        echo_agent_app_core::prepared_turn::UserTurnInput {
+    let prepared = echo_agent_app_core::api::prepared_turn::PreparedUserTurn::build(
+        echo_agent_app_core::api::prepared_turn::UserTurnInput {
             text: &projection.payload.text,
             attachments: &refs,
             spill_dir: &spill_dir,
@@ -1890,7 +1891,7 @@ async fn steer_conversation_input_projection(
     };
     let terminal_service = app_state.conversation_inputs();
     let terminal_attempt = attempt.clone();
-    let terminal_projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+    let terminal_projector: echo_agent_app_core::api::foreground_turn::ForegroundTerminalProjector =
         Arc::new(move |outcome| {
             let service = terminal_service.clone();
             let attempt = terminal_attempt.clone();
@@ -2091,10 +2092,10 @@ async fn dispatch_turn(
             };
         }
     }
-    let renderer: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
+    let renderer: std::sync::Arc<dyn echo_agent_app_core::api::chat_driver::ChatSink> =
         std::sync::Arc::new(TuiChatSink::new(agent_tx.clone()));
-    let sink = echo_agent_app_core::chat_event_log::bind_surface_chat_sink(
-        echo_agent_app_core::chat_event_log::ChatSurface::Tui,
+    let sink = echo_agent_app_core::api::chat_event_log::bind_surface_chat_sink(
+        echo_agent_app_core::api::chat_event_log::ChatSurface::Tui,
         renderer,
         app_state.storage.chat_events.clone(),
         app_state.storage.tool_executions.clone(),
@@ -2102,11 +2103,11 @@ async fn dispatch_turn(
         Some(conversation_id.clone()),
         turn_id.clone(),
     );
-    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(
+    let spill_dir = echo_agent_app_core::api::prepared_turn::resolve_user_input_spill_dir(Some(
         scoped_runtime.execution_scope().root(),
     ));
-    let prepared = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
-        echo_agent_app_core::prepared_turn::UserTurnInput {
+    let prepared = match echo_agent_app_core::api::prepared_turn::PreparedUserTurn::build(
+        echo_agent_app_core::api::prepared_turn::UserTurnInput {
             text: &turn.text,
             attachments: &turn.attachments,
             spill_dir: &spill_dir,
@@ -2132,7 +2133,7 @@ async fn dispatch_turn(
     } else {
         turn.text.clone()
     };
-    let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+    let res = std::sync::Arc::new(echo_agent_app_core::api::chat_resources::ChatResources {
         execution_scope: scoped_runtime.execution_scope().clone(),
         workspace_io_receipt: Some(scoped_runtime.workspace_io_receipt()),
         pool: scoped_runtime.pool(),
@@ -2208,7 +2209,7 @@ async fn dispatch_turn(
 
 fn request_from_prepared(
     turn: &TuiTurnRequest,
-    prepared: &echo_agent_app_core::prepared_turn::PreparedUserTurn,
+    prepared: &echo_agent_app_core::api::prepared_turn::PreparedUserTurn,
 ) -> TuiTurnRequest {
     TuiTurnRequest {
         text: prepared.instruction.clone(),
@@ -2223,30 +2224,30 @@ async fn begin_tui_foreground_turn(
     turn_id: &str,
 ) -> Result<
     (
-        echo_agent_app_core::state::ScopedChatRuntime,
+        echo_agent_app_core::api::state::ScopedChatRuntime,
         String,
         ForegroundTurnLease,
     ),
-    echo_agent_app_core::state::ScopedChatTurnError,
+    echo_agent_app_core::api::state::ScopedChatTurnError,
 > {
     let app_state = app.app_state.as_ref().ok_or_else(|| {
-        echo_agent_app_core::state::ScopedChatTurnError::Runtime(
+        echo_agent_app_core::api::state::ScopedChatTurnError::Runtime(
             "TUI application state is unavailable".to_string(),
         )
     })?;
     let runtime = app_state
         .current_control_runtime()
         .await
-        .map_err(echo_agent_app_core::state::ScopedChatTurnError::Control)?;
+        .map_err(echo_agent_app_core::api::state::ScopedChatTurnError::Control)?;
     let conversation_id = runtime
         .primary_agent()
         .read(|agent| agent.conversation_id().map(str::to_string))
         .await
         .filter(|conversation_id| !conversation_id.trim().is_empty())
         .ok_or({
-            echo_agent_app_core::state::ScopedChatTurnError::Conversation(
-                echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
-                    echo_agent_app_core::foreground_turn::ForegroundTurnError::EmptyConversationId,
+            echo_agent_app_core::api::state::ScopedChatTurnError::Conversation(
+                echo_agent_app_core::api::conversation_deletion::ConversationDeletionError::Foreground(
+                    echo_agent_app_core::api::foreground_turn::ForegroundTurnError::EmptyConversationId,
                 ),
             )
         })?;
@@ -2377,7 +2378,7 @@ async fn dispatch_next_conversation_input(
             .session
             .product_data_io
             .run("clean rejected TUI conversation input staging", move || {
-                echo_agent_app_core::attachments::discard_staged_attachment_refs(&attachments)
+                echo_agent_app_core::api::attachments::discard_staged_attachment_refs(&attachments)
             })
             .await;
         if !matches!(cleanup, Ok(Ok(()))) {
@@ -2436,7 +2437,7 @@ fn handle_pasted_text(app: &mut TuiApp, text: &str) {
         return;
     }
     use base64::Engine as _;
-    use echo_agent_app_core::types::{AttachmentData, AttachmentSource};
+    use echo_agent_app_core::api::types::{AttachmentData, AttachmentSource};
 
     let data = AttachmentData {
         name: format!(
@@ -2448,7 +2449,7 @@ fn handle_pasted_text(app: &mut TuiApp, text: &str) {
         size: u64::try_from(text.len()).unwrap_or(u64::MAX),
         source: AttachmentSource::Paste,
     };
-    match echo_agent_app_core::attachments::stage_attachment_data(
+    match echo_agent_app_core::api::attachments::stage_attachment_data(
         &data,
         app.workspace_root.as_deref(),
     ) {
@@ -2977,12 +2978,12 @@ impl TuiChatSink {
     }
 }
 
-impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
-    fn on_event(&self, event: echo_agent_app_core::chat_driver::ChatDriverEvent) -> bool {
-        use echo_agent_app_core::chat_driver::ChatDriverEvent;
+impl echo_agent_app_core::api::chat_driver::ChatSink for TuiChatSink {
+    fn on_event(&self, event: echo_agent_app_core::api::chat_driver::ChatDriverEvent) -> bool {
+        use echo_agent_app_core::api::chat_driver::ChatDriverEvent;
 
         if let Some(projection) =
-            echo_agent_app_core::tasks::task_runtime::project_awaiter_surface_event(&event)
+            echo_agent_app_core::api::tasks::task_runtime::project_awaiter_surface_event(&event)
         {
             return self
                 .tx
@@ -3213,11 +3214,11 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
 
 struct TuiAgentTurnContext {
     lease: ForegroundTurnLease,
-    run_turn_binding: Option<echo_agent_app_core::tasks::task_runtime::RunTurnBinding>,
-    planned_resume: Option<echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity>,
-    pool_execution: echo_agent_app_core::agent_pool::AgentPoolExecutionLease,
+    run_turn_binding: Option<echo_agent_app_core::api::tasks::task_runtime::RunTurnBinding>,
+    planned_resume: Option<echo_agent_app_core::api::tasks::task_runtime::TaskRunResumeIdentity>,
+    pool_execution: echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease,
     input_observation: Option<(
-        echo_agent_app_core::conversation_input::ConversationInputService,
+        echo_agent_app_core::api::conversation_input::ConversationInputService,
         ConversationInputAttempt,
     )>,
     receipt_tx: mpsc::UnboundedSender<AgentEvent>,
@@ -3238,11 +3239,11 @@ async fn settle_planned_resume_foreground(
 
 async fn send_to_agent(
     agent: &AgentHandle,
-    turn: echo_agent_app_core::prepared_turn::PreparedUserTurn,
-    res: std::sync::Arc<echo_agent_app_core::chat_resources::ChatResources>,
+    turn: echo_agent_app_core::api::prepared_turn::PreparedUserTurn,
+    res: std::sync::Arc<echo_agent_app_core::api::chat_resources::ChatResources>,
     context: TuiAgentTurnContext,
 ) -> TurnOutcome {
-    use echo_agent_app_core::foreground_turn::{
+    use echo_agent_app_core::api::foreground_turn::{
         drive_foreground_chat, drive_foreground_chat_turn, drive_foreground_chat_with_ingress,
     };
     let TuiAgentTurnContext {
@@ -3258,30 +3259,32 @@ async fn send_to_agent(
     // driver owns TaskRuntime, memory-generation, and pool admission, while
     // PreparedUserTurn preserves the same staged attachment path as GUI.
     if let Some(expected) = planned_resume {
-        let trace_sink = echo_agent_app_core::chat_driver::subagent_trace_sink_for(&res.sink);
+        let trace_sink = echo_agent_app_core::api::chat_driver::subagent_trace_sink_for(&res.sink);
         let result = match res.store.clone() {
-            Some(store) => echo_agent_app_core::tasks::task_runtime::launch_planned_run_resume(
-                store,
-                expected,
-                agent.clone(),
-                Some(pool_execution),
-                res.review_integration.clone(),
-                Some(trace_sink),
-                lease.cancellation_token(),
-                res.workspace_io_receipt
-                    .as_ref()
-                    .map(|receipt| receipt.invocation()),
-            )
-            .await
-            .map_err(|error| error.to_string()),
+            Some(store) => {
+                echo_agent_app_core::api::tasks::task_runtime::launch_planned_run_resume(
+                    store,
+                    expected,
+                    agent.clone(),
+                    Some(pool_execution),
+                    res.review_integration.clone(),
+                    Some(trace_sink),
+                    lease.cancellation_token(),
+                    res.workspace_io_receipt
+                        .as_ref()
+                        .map(|receipt| receipt.invocation()),
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
             None => Err("TaskRuntime store is unavailable".to_string()),
         };
         let outcome = match result {
             Ok(launch) => match launch.wait().await {
-                Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
+                Ok(echo_agent_app_core::api::tasks::task_runtime::RunOutcome::Completed) => {
                     TurnOutcome::Completed
                 }
-                Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Cancelled) => {
+                Ok(echo_agent_app_core::api::tasks::task_runtime::RunOutcome::Cancelled) => {
                     TurnOutcome::Cancelled
                 }
                 Ok(other) => TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
@@ -3306,7 +3309,7 @@ async fn send_to_agent(
     } else if let Some((service, attempt)) = input_observation {
         let observer_service = service.clone();
         let observer_attempt = attempt.clone();
-        let observer: echo_agent_app_core::chat_driver::InputReceiptObserver =
+        let observer: echo_agent_app_core::api::chat_driver::InputReceiptObserver =
             Arc::new(move |receipt| {
                 let service = observer_service.clone();
                 let attempt = observer_attempt.clone();
@@ -3350,14 +3353,14 @@ async fn send_to_agent(
 fn run_turn_binding_for_request(
     turn: &TuiTurnRequest,
     turn_id: &str,
-) -> Option<echo_agent_app_core::tasks::task_runtime::RunTurnBinding> {
+) -> Option<echo_agent_app_core::api::tasks::task_runtime::RunTurnBinding> {
     turn.run_resume.as_ref().and_then(|resume| {
         if !resume.is_continuation {
             return None;
         }
         let identity = &resume.identity;
         Some(
-            echo_agent_app_core::tasks::task_runtime::RunTurnBinding::resume_expected(
+            echo_agent_app_core::api::tasks::task_runtime::RunTurnBinding::resume_expected(
                 identity.clone(),
                 turn_id.to_string(),
             ),
@@ -3366,7 +3369,7 @@ fn run_turn_binding_for_request(
 }
 
 async fn handle_tui_cron(app: &TuiApp, args: &str) -> String {
-    use echo_agent_app_core::scheduler::{CronTask, CronTaskStatus};
+    use echo_agent_app_core::api::scheduler::{CronTask, CronTaskStatus};
 
     let Some(runner) = app.scheduler.as_ref() else {
         return "Scheduler is not available in this runtime.".to_string();
@@ -3434,7 +3437,7 @@ async fn handle_tui_cron(app: &TuiApp, args: &str) -> String {
 }
 
 async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
-    use echo_agent_app_core::tasks::task_runtime::worktree::{
+    use echo_agent_app_core::api::tasks::task_runtime::worktree::{
         cleanup_unattended_worktrees, discard_unattended_worktree, git_repo_root,
         list_unattended_worktrees, merge_unattended_worktree, repo_merge_lock,
     };
@@ -3458,16 +3461,19 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
         "list" | "ls" => {
             let operation_store = store.clone();
             let result =
-                echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
-                    .run_owned("list TUI unattended worktrees", move || {
-                        list_unattended_worktrees(&repo_root, Some(operation_store.as_ref()))
-                            .map_err(|error| {
-                                echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
-                                    error.to_string(),
-                                )
-                            })
-                    })
-                    .await;
+                echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(
+                    store,
+                )
+                .run_owned("list TUI unattended worktrees", move || {
+                    list_unattended_worktrees(&repo_root, Some(operation_store.as_ref())).map_err(
+                        |error| {
+                            echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(
+                                error.to_string(),
+                            )
+                        },
+                    )
+                })
+                .await;
             match result {
                 Ok(worktrees) => format_unattended_worktrees(&worktrees),
                 Err(error) => format!("Failed to list retained worktrees: {error}"),
@@ -3478,16 +3484,18 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
             let _guard = lock.lock().await;
             let operation_store = store.clone();
             let result =
-                echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
-                    .run_owned("clean TUI unattended worktrees", move || {
-                        cleanup_unattended_worktrees(&repo_root, Some(operation_store.as_ref()))
-                            .map_err(|error| {
-                                echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
-                                    error.to_string(),
-                                )
-                            })
-                    })
-                    .await;
+                echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(
+                    store,
+                )
+                .run_owned("clean TUI unattended worktrees", move || {
+                    cleanup_unattended_worktrees(&repo_root, Some(operation_store.as_ref()))
+                        .map_err(|error| {
+                            echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(
+                                error.to_string(),
+                            )
+                        })
+                })
+                .await;
             match result {
                 Ok(result) => format!(
                     "Worktree cleanup: removed={}, unlocked={}, kept={}, errors={}{}",
@@ -3513,20 +3521,22 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
             let run_id_for_merge = run_id.clone();
             let operation_store = store.clone();
             let result =
-                echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
-                    .run_owned("merge TUI unattended worktree", move || {
-                        merge_unattended_worktree(
-                            &repo_root,
-                            &run_id_for_merge,
-                            Some(operation_store.as_ref()),
+                echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(
+                    store,
+                )
+                .run_owned("merge TUI unattended worktree", move || {
+                    merge_unattended_worktree(
+                        &repo_root,
+                        &run_id_for_merge,
+                        Some(operation_store.as_ref()),
+                    )
+                    .map_err(|error| {
+                        echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(
+                            error.to_string(),
                         )
-                        .map_err(|error| {
-                            echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
-                                error.to_string(),
-                            )
-                        })
                     })
-                    .await;
+                })
+                .await;
             match result {
                 Ok(outcome) => {
                     let files = if outcome.changed_files.is_empty() {
@@ -3555,20 +3565,22 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
             let run_id_for_discard = run_id.clone();
             let operation_store = store.clone();
             let result =
-                echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
-                    .run_owned("discard TUI unattended worktree", move || {
-                        discard_unattended_worktree(
-                            &repo_root,
-                            &run_id_for_discard,
-                            Some(operation_store.as_ref()),
+                echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(
+                    store,
+                )
+                .run_owned("discard TUI unattended worktree", move || {
+                    discard_unattended_worktree(
+                        &repo_root,
+                        &run_id_for_discard,
+                        Some(operation_store.as_ref()),
+                    )
+                    .map_err(|error| {
+                        echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(
+                            error.to_string(),
                         )
-                        .map_err(|error| {
-                            echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
-                                error.to_string(),
-                            )
-                        })
                     })
-                    .await;
+                })
+                .await;
             match result {
                 Ok(()) => format!("Discarded retained worktree for run {run_id}."),
                 Err(error) => format!("Failed to discard retained worktree: {error}"),
@@ -3579,7 +3591,7 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
 }
 
 fn format_unattended_worktrees(
-    worktrees: &[echo_agent_app_core::tasks::task_runtime::worktree::UnattendedWorktreeInfo],
+    worktrees: &[echo_agent_app_core::api::tasks::task_runtime::worktree::UnattendedWorktreeInfo],
 ) -> String {
     if worktrees.is_empty() {
         return "No retained EKO unattended worktrees.".to_string();
@@ -3621,11 +3633,11 @@ fn format_unattended_worktrees(
 }
 
 async fn mutate_tui_cron_task(
-    runner: &echo_agent_app_core::scheduler::SchedulerRunner,
+    runner: &echo_agent_app_core::api::scheduler::SchedulerRunner,
     prefix: Option<&String>,
     operation: &str,
 ) -> String {
-    use echo_agent_app_core::scheduler::CronTaskStatus;
+    use echo_agent_app_core::api::scheduler::CronTaskStatus;
 
     let Some(prefix) = prefix.map(String::as_str) else {
         return format!("Usage: /cron {operation} <id>");
@@ -3698,11 +3710,11 @@ fn short_identifier(value: &str) -> String {
 /// (`handle_enter`) rebuilds a multimodal `Message` from the refs and passes it
 /// to `drive_chat`. Returns the display name + inferred MIME on success.
 fn stage_attachment(
-    out: &mut Vec<echo_agent_app_core::attachments::AttachmentRef>,
+    out: &mut Vec<echo_agent_app_core::api::attachments::AttachmentRef>,
     path: &std::path::Path,
     workspace_root: Option<&std::path::Path>,
 ) -> std::io::Result<(String, String)> {
-    use echo_agent_app_core::attachments::stage_local_attachment;
+    use echo_agent_app_core::api::attachments::stage_local_attachment;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -3752,7 +3764,7 @@ fn push_system_message(app: &mut TuiApp, content: String) {
 
 async fn current_tui_control_runtime(
     app: &TuiApp,
-) -> Result<echo_agent_app_core::state::ScopedChatRuntime, String> {
+) -> Result<echo_agent_app_core::api::state::ScopedChatRuntime, String> {
     let state = app
         .app_state
         .as_ref()
@@ -3767,8 +3779,8 @@ async fn current_tui_task_runtime(
     app: &TuiApp,
 ) -> Result<
     (
-        echo_agent_app_core::state::ScopedChatRuntime,
-        Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+        echo_agent_app_core::api::state::ScopedChatRuntime,
+        Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
     ),
     String,
 > {
@@ -3787,7 +3799,7 @@ async fn current_tui_task_runtime(
 }
 
 async fn current_tui_runtime_conversation_id(
-    runtime: &echo_agent_app_core::state::ScopedChatRuntime,
+    runtime: &echo_agent_app_core::api::state::ScopedChatRuntime,
 ) -> Result<String, String> {
     runtime
         .primary_agent()
@@ -3803,19 +3815,19 @@ async fn current_tui_runtime_conversation_id(
 }
 
 async fn tui_task_runtime_io<T, F>(
-    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    store: Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
     operation: &'static str,
     function: F,
 ) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce(
-            Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
-        ) -> Result<T, echo_agent_app_core::tasks::task_runtime::StoreError>
+            Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
+        ) -> Result<T, echo_agent_app_core::api::tasks::task_runtime::StoreError>
         + Send
         + 'static,
 {
-    echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+    echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
         .run_store(operation, function)
         .await
         .map_err(|error| error.to_string())
@@ -3823,10 +3835,10 @@ where
 
 async fn resolve_tui_task_run(
     app: &TuiApp,
-    runtime: &echo_agent_app_core::state::ScopedChatRuntime,
-    store: &Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    runtime: &echo_agent_app_core::api::state::ScopedChatRuntime,
+    store: &Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
     requested_run_id: Option<&str>,
-) -> Result<echo_agent_app_core::tasks::task_runtime::TaskRun, String> {
+) -> Result<echo_agent_app_core::api::tasks::task_runtime::TaskRun, String> {
     let workspace_id = runtime.execution_scope().workspace_id();
     let conversation_id = current_tui_runtime_conversation_id(runtime).await?;
     let implicit_view = requested_run_id
@@ -3850,7 +3862,7 @@ async fn resolve_tui_task_run(
 }
 
 fn validate_tui_task_run_scope(
-    run: &echo_agent_app_core::tasks::task_runtime::TaskRun,
+    run: &echo_agent_app_core::api::tasks::task_runtime::TaskRun,
     workspace_id: &str,
     conversation_id: &str,
     implicit_view: Option<&TaskRuntimeView>,
@@ -3878,8 +3890,8 @@ async fn current_tui_memory_control(
     app: &TuiApp,
 ) -> Result<
     (
-        echo_agent_app_core::state::ScopedChatRuntime,
-        echo_agent_app_core::evolution::ReviewGenerationLease,
+        echo_agent_app_core::api::state::ScopedChatRuntime,
+        echo_agent_app_core::api::evolution::ReviewGenerationLease,
         Arc<echo_agent::evolution::MemoryLayerManager>,
     ),
     String,
@@ -3899,7 +3911,7 @@ async fn current_tui_memory_control(
 }
 
 fn render_tui_reflection_receipt(
-    receipt: &echo_agent_app_core::reflection::ReflectionReceipt,
+    receipt: &echo_agent_app_core::api::reflection::ReflectionReceipt,
 ) -> String {
     receipt.display_message()
 }
@@ -3908,7 +3920,7 @@ fn render_tui_reflection_receipt(
 mod reflection_adapter_tests {
     #[test]
     fn tui_projects_the_shared_reflection_receipt() {
-        let receipt = echo_agent_app_core::reflection::reflection_receipt_fixture();
+        let receipt = echo_agent_app_core::api::reflection::reflection_receipt_fixture();
         let rendered = super::render_tui_reflection_receipt(&receipt);
         assert!(rendered.contains(&receipt.key));
         assert!(rendered.contains(&receipt.content_summary));
@@ -3917,7 +3929,7 @@ mod reflection_adapter_tests {
 
 async fn refresh_workspace_generation(
     app: &mut TuiApp,
-    state: &echo_agent_app_core::state::AppState,
+    state: &echo_agent_app_core::api::state::AppState,
 ) {
     if let Err(error) = app.discard_unsubmitted_attachments() {
         tracing::warn!(%error, "failed to clean staged attachments after workspace change");
@@ -3935,7 +3947,7 @@ async fn refresh_workspace_generation(
         .unwrap_or(fallback_scope);
     app.conversation_store = runtime
         .as_ref()
-        .and_then(echo_agent_app_core::state::ScopedChatRuntime::conversation_store);
+        .and_then(echo_agent_app_core::api::state::ScopedChatRuntime::conversation_store);
     app.conversation_id = match runtime {
         Some(runtime) => {
             runtime
@@ -3977,14 +3989,14 @@ fn push_tui_system_message(app: &mut TuiApp, content: impl Into<String>) {
     });
 }
 
-fn refresh_tui_models(app: &mut TuiApp, config: &echo_agent_app_core::config::EkoConfig) {
-    app.configured_models = echo_agent_app_core::model_config::configured_model_views(config)
+fn refresh_tui_models(app: &mut TuiApp, config: &echo_agent_app_core::api::config::EkoConfig) {
+    app.configured_models = echo_agent_app_core::api::model_config::configured_model_views(config)
         .into_iter()
         .map(|view| {
-            echo_agent_app_core::model_config::resolve_runtime_model(config, Some(&view.id))
+            echo_agent_app_core::api::model_config::resolve_runtime_model(config, Some(&view.id))
         })
         .collect();
-    app.model = echo_agent_app_core::model_config::resolve_runtime_model(config, None).model;
+    app.model = echo_agent_app_core::api::model_config::resolve_runtime_model(config, None).model;
 }
 
 async fn handle_tui_model_command(app: &mut TuiApp, args: &str) {
@@ -3996,7 +4008,7 @@ async fn handle_tui_model_command(app: &mut TuiApp, args: &str) {
     match parts.first().copied().unwrap_or("list") {
         "list" => {
             let config = app_state.config.app_config.read().await;
-            let models = echo_agent_app_core::model_config::configured_model_views(&config)
+            let models = echo_agent_app_core::api::model_config::configured_model_views(&config)
                 .into_iter()
                 .map(|model| {
                     let active = if model.is_default { "*" } else { " " };
@@ -4046,17 +4058,18 @@ async fn handle_tui_model_command(app: &mut TuiApp, args: &str) {
                 return;
             };
             let config = app_state.config.app_config.read().await.clone();
-            let runtime = match echo_agent_app_core::model_config::resolve_runtime_model_selector(
-                &config,
-                Some(selector),
-            ) {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    push_tui_system_message(app, error.to_string());
-                    return;
-                }
-            };
-            match echo_agent_app_core::infra::test_runtime_llm_connection(&runtime).await {
+            let runtime =
+                match echo_agent_app_core::api::model_config::resolve_runtime_model_selector(
+                    &config,
+                    Some(selector),
+                ) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        push_tui_system_message(app, error.to_string());
+                        return;
+                    }
+                };
+            match echo_agent_app_core::api::infra::test_runtime_llm_connection(&runtime).await {
                 Ok(result) => push_tui_system_message(
                     app,
                     format!(
@@ -4092,8 +4105,8 @@ async fn handle_tui_model_command(app: &mut TuiApp, args: &str) {
             if flags.contains(&"video") {
                 input_modalities.push(echo_agent::llm::ModelInputModality::Video);
             }
-            let mutation = echo_agent_app_core::state::ConfiguredModelMutation {
-                model: echo_agent_app_core::config::ConfiguredModel {
+            let mutation = echo_agent_app_core::api::state::ConfiguredModelMutation {
+                model: echo_agent_app_core::api::config::ConfiguredModel {
                     provider: (*provider).to_string(),
                     model: (*model).to_string(),
                     api_protocol: protocol,
@@ -4132,20 +4145,21 @@ async fn handle_tui_provider_command(app: &mut TuiApp, args: &str) {
     match parts.first().copied().unwrap_or("list") {
         "list" => {
             let config = app_state.config.app_config.read().await;
-            let providers = echo_agent_app_core::model_config::configured_provider_views(&config)
-                .into_iter()
-                .map(|provider| {
-                    format!(
-                        "{}  {}  {}  {:?}  {} models",
-                        provider.id,
-                        provider.name,
-                        provider.base_url,
-                        provider.default_api_protocol,
-                        provider.model_count
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let providers =
+                echo_agent_app_core::api::model_config::configured_provider_views(&config)
+                    .into_iter()
+                    .map(|provider| {
+                        format!(
+                            "{}  {}  {}  {:?}  {} models",
+                            provider.id,
+                            provider.name,
+                            provider.base_url,
+                            provider.default_api_protocol,
+                            provider.model_count
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
             push_tui_system_message(
                 app,
                 if providers.is_empty() {
@@ -4185,9 +4199,9 @@ async fn handle_tui_provider_command(app: &mut TuiApp, args: &str) {
                 .filter(|value| !value.trim().is_empty() && **value != "-")
                 .map(|value| (*value).to_string());
             let requires_api_key = parts.get(5).is_some_and(|value| *value == "requires-key");
-            let mutation = echo_agent_app_core::state::ModelProviderMutation {
+            let mutation = echo_agent_app_core::api::state::ModelProviderMutation {
                 id: (*id).to_string(),
-                provider: echo_agent_app_core::config::ModelProviderConfig {
+                provider: echo_agent_app_core::api::config::ModelProviderConfig {
                     name: (*id).to_string(),
                     api_key_env,
                     base_url: Some((*base_url).to_string()),
@@ -4276,8 +4290,10 @@ async fn handle_slash_command(
             let available = if let Some(app_state) = app.app_state.as_ref() {
                 let config = app_state.config.app_config.read().await;
                 let runtime =
-                    echo_agent_app_core::model_config::resolve_runtime_model(&config, None);
-                echo_agent_app_core::model_config::thinking_level_specs(runtime.thinking_profile)
+                    echo_agent_app_core::api::model_config::resolve_runtime_model(&config, None);
+                echo_agent_app_core::api::model_config::thinking_level_specs(
+                    runtime.thinking_profile,
+                )
             } else {
                 Vec::new()
             };
@@ -4343,7 +4359,7 @@ async fn handle_slash_command(
                 };
                 let active_agent = pool_execution
                     .as_ref()
-                    .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+                    .map(echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease::agent)
                     .unwrap_or_else(|| agent.clone());
                 let prompt = active_agent
                     .read(|value| value.current_system_prompt())
@@ -4406,7 +4422,7 @@ async fn handle_slash_command(
                 format!("/reflect {}", args.trim())
             };
             if let Err(error) =
-                echo_agent_app_core::reflection::ReflectionCommand::parse(&reflection_input)
+                echo_agent_app_core::api::reflection::ReflectionCommand::parse(&reflection_input)
             {
                 return push_system_message(app, error.to_string());
             }
@@ -4417,7 +4433,7 @@ async fn handle_slash_command(
                 }
             };
             let conversation_id = app.conversation_id.clone();
-            let content = match echo_agent_app_core::reflection::reflect_session(
+            let content = match echo_agent_app_core::api::reflection::reflect_session(
                 &runtime,
                 agent,
                 conversation_id.as_deref(),
@@ -4725,23 +4741,21 @@ async fn handle_slash_command(
         }
         Some(SlashCommand::Compact) => {
             let result = match (app.app_state.as_ref(), app.conversation_id.as_ref()) {
-                (Some(app_state), Some(conversation_id)) => {
-                    app_state
-                        .compress_conversation_owned(
-                            echo_agent_app_core::manual_compression::ManualCompressionRequest {
-                                workspace_id: app_state
-                                    .current_execution_scope()
-                                    .await
-                                    .workspace_id()
-                                    .to_string(),
-                                conversation_id: conversation_id.clone(),
-                                surface: ForegroundTurnSurface::Tui,
-                                focus: None,
-                                keep_messages: 12,
-                            },
-                        )
-                        .await
-                }
+                (Some(app_state), Some(conversation_id)) => app_state
+                    .compress_conversation_owned(
+                        echo_agent_app_core::api::manual_compression::ManualCompressionRequest {
+                            workspace_id: app_state
+                                .current_execution_scope()
+                                .await
+                                .workspace_id()
+                                .to_string(),
+                            conversation_id: conversation_id.clone(),
+                            surface: ForegroundTurnSurface::Tui,
+                            focus: None,
+                            keep_messages: 12,
+                        },
+                    )
+                    .await,
                 _ => {
                     app.messages.push(ChatMessage {
                         role: MessageRole::System,
@@ -4885,20 +4899,19 @@ async fn handle_slash_command(
                     content: format!("Permission mode: {}", app.permission_mode),
                 });
             } else {
-                let framework_mode = match echo_agent_app_core::permission::parse_permission_mode(
-                    args.trim(),
-                ) {
-                    Ok(mode) => mode,
-                    Err(_) => {
-                        app.messages.push(ChatMessage {
+                let framework_mode =
+                    match echo_agent_app_core::api::permission::parse_permission_mode(args.trim()) {
+                        Ok(mode) => mode,
+                        Err(_) => {
+                            app.messages.push(ChatMessage {
                                 role: MessageRole::System,
                                 content: "Unknown permission mode; use default, plan, auto-edit, full-auto, auto, bubble, dont-ask, or strict".to_string(),
                             });
-                        return;
-                    }
-                };
+                            return;
+                        }
+                    };
                 let normalized =
-                    echo_agent_app_core::permission::permission_mode_id(framework_mode);
+                    echo_agent_app_core::api::permission::permission_mode_id(framework_mode);
                 if let Some(state) = app.app_state.as_ref() {
                     *state.config.permission_mode.write().await = framework_mode;
                     state.apply_permission_mode_to_agents(framework_mode).await;
@@ -4918,7 +4931,7 @@ async fn handle_slash_command(
             app.should_quit = true;
         }
         Some(SlashCommand::AutoMemory) => {
-            use echo_agent_app_core::auto_memory::{
+            use echo_agent_app_core::api::auto_memory::{
                 AutoMemoryConfig, extract_observations, format_observations_for_memory,
                 queue_observations,
             };
@@ -5149,7 +5162,7 @@ async fn handle_slash_command(
             }
         }
         Some(SlashCommand::EvidenceInbox) => {
-            use echo_agent_app_core::evolution::EvidenceReviewFilter;
+            use echo_agent_app_core::api::evolution::EvidenceReviewFilter;
 
             let mut parts = args.trim().splitn(3, ' ');
             let sub = parts
@@ -5186,7 +5199,7 @@ async fn handle_slash_command(
                                         "Expired"
                                     } else if matches!(
                                         candidate.status,
-                                        echo_agent_app_core::evolution::EvidenceCandidateStatus::Applied
+                                        echo_agent_app_core::api::evolution::EvidenceCandidateStatus::Applied
                                     ) {
                                         "Undoable"
                                     } else {
@@ -5345,12 +5358,12 @@ async fn handle_slash_command(
                     );
                 }
             };
-            let dashboard = echo_agent_app_core::evolution::Dashboard::new(store, change_log)
+            let dashboard = echo_agent_app_core::api::evolution::Dashboard::new(store, change_log)
                 .with_run_store(run_store);
             let metrics = dashboard.generate_metrics().await;
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
-                content: echo_agent_app_core::evolution::Dashboard::format_metrics(&metrics),
+                content: echo_agent_app_core::api::evolution::Dashboard::format_metrics(&metrics),
             });
         }
         Some(SlashCommand::MemoryReview) => match current_tui_memory_control(app).await {
@@ -5370,7 +5383,7 @@ async fn handle_slash_command(
                 match review_integration.run_review().await {
                     Ok(report) => {
                         let formatted =
-                            echo_agent_app_core::evolution::format_review_report(&report);
+                            echo_agent_app_core::api::evolution::format_review_report(&report);
                         app.messages.push(ChatMessage {
                             role: MessageRole::System,
                             content: formatted,
@@ -5637,10 +5650,11 @@ async fn handle_slash_command(
                 }
             };
             let parsed_refs = parsed.iter().map(String::as_str).collect::<Vec<_>>();
-            let registry = echo_agent_app_core::developer_commands::DeveloperCommandRegistry::new(
-                state.terminal.clone(),
-                Some(state),
-            );
+            let registry =
+                echo_agent_app_core::api::developer_commands::DeveloperCommandRegistry::new(
+                    state.terminal.clone(),
+                    Some(state),
+                );
             match registry.execute("terminal", &parsed_refs).await {
                 Ok(output) => {
                     push_system_message(app, output.message);
@@ -5659,7 +5673,7 @@ async fn handle_slash_command(
                 None => "Run store not configured.".to_string(),
                 Some(store) => {
                     let diagnostic_id = if args.trim().is_empty() {
-                        match echo_agent_app_core::observability::list_diagnostic_runs(
+                        match echo_agent_app_core::api::observability::list_diagnostic_runs(
                             store.as_ref(),
                         )
                         .await
@@ -5674,7 +5688,7 @@ async fn handle_slash_command(
                         Err(message) => message,
                         Ok(None) => "No durable run diagnostics available.".to_string(),
                         Ok(Some(diagnostic_id)) => {
-                            match echo_agent_app_core::observability::load_run_diagnostics(
+                            match echo_agent_app_core::api::observability::load_run_diagnostics(
                                 store.as_ref(),
                                 &diagnostic_id,
                                 app.prompt_assembly.clone(),
@@ -5682,7 +5696,7 @@ async fn handle_slash_command(
                             .await
                             {
                                 Ok(Some(diagnostics)) => {
-                                    echo_agent_app_core::observability::format_run_diagnostics(
+                                    echo_agent_app_core::api::observability::format_run_diagnostics(
                                         &diagnostics,
                                     )
                                 }
@@ -5756,7 +5770,7 @@ async fn handle_slash_command(
                         .await
                         .map(|infos| infos.len())
                         .unwrap_or_default();
-                    echo_agent_app_core::tool_control::execute_tool_control_command(
+                    echo_agent_app_core::api::tool_control::execute_tool_control_command(
                         state, agent, args,
                     )
                     .await
@@ -5896,7 +5910,7 @@ async fn handle_slash_command(
                                 ),
                                 attachments: Vec::new(),
                                 run_resume: Some(crate::tui::TaskRunResumeWake {
-                                    identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(
+                                    identity: echo_agent_app_core::api::tasks::task_runtime::TaskRunResumeIdentity::capture(
                                         &resume_state,
                                     ),
                                     is_continuation: true,
@@ -5920,7 +5934,7 @@ async fn handle_slash_command(
                                 ),
                                 attachments: Vec::new(),
                                 run_resume: Some(crate::tui::TaskRunResumeWake {
-                                    identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(&resume_state),
+                                    identity: echo_agent_app_core::api::tasks::task_runtime::TaskRunResumeIdentity::capture(&resume_state),
                                     is_continuation: false,
                                 }),
                                 input_attempt: None,
@@ -6029,7 +6043,7 @@ async fn handle_slash_command(
                                 parsed.expected_goal_revision,
                                 &parsed.new_goal,
                                 &parsed.reason,
-                                echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Tui,
+                                echo_agent_app_core::api::tasks::task_runtime::RunGoalActorSource::Tui,
                             )
                             },
                         )
@@ -6107,7 +6121,7 @@ async fn handle_slash_command(
                                 parsed.expected_goal_revision,
                                 &parsed.requirement_id,
                                 &parsed.reason,
-                                echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Tui,
+                                echo_agent_app_core::api::tasks::task_runtime::RunGoalActorSource::Tui,
                             )
                             },
                         )
@@ -6166,7 +6180,7 @@ async fn handle_slash_command(
             let result = match parsed {
                 Ok(parsed) => {
                     let service =
-                        echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(
+                        echo_agent_app_core::api::tasks::task_runtime::SubagentControlService::new(
                             store,
                         );
                     match action {
@@ -6182,7 +6196,7 @@ async fn handle_slash_command(
                                 .send_message(
                                     parsed.identity,
                                     instruction,
-                                    echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Tui,
+                                    echo_agent_app_core::api::tasks::task_runtime::SubagentControlActorSource::Tui,
                                 )
                                 .await
                         }
@@ -6198,7 +6212,7 @@ async fn handle_slash_command(
                                 .queue_guidance_async(
                                     parsed.identity,
                                     instruction.to_string(),
-                                    echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Tui,
+                                    echo_agent_app_core::api::tasks::task_runtime::SubagentControlActorSource::Tui,
                                 )
                                 .await
                         }
@@ -6206,16 +6220,16 @@ async fn handle_slash_command(
                             service
                                 .interrupt_subagent(
                                     parsed.identity,
-                                    echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Tui,
+                                    echo_agent_app_core::api::tasks::task_runtime::SubagentControlActorSource::Tui,
                                 )
                                 .await
                         }
                         _ => return,
                     }
                 }
-                Err(error) => {
-                    Err(echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(error))
-                }
+                Err(error) => Err(
+                    echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(error),
+                ),
             };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -6341,7 +6355,7 @@ async fn handle_slash_command(
                     store.resolve_recovery_task(
                         &owned_run_id,
                         &owned_task_id,
-                        echo_agent_app_core::tasks::task_runtime::RecoveryDecision::Skip,
+                        echo_agent_app_core::api::tasks::task_runtime::RecoveryDecision::Skip,
                     )
                 })
                 .await
@@ -6433,7 +6447,7 @@ async fn handle_slash_command(
                     .execute_structured_extraction_command_for_scope(
                         &workspace_id,
                         &conversation_id,
-                        echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Tui,
+                        echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Tui,
                         args,
                     )
                     .await
@@ -6518,14 +6532,14 @@ async fn handle_slash_command(
 }
 
 async fn retry_tui_task(
-    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    store: Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
     agent: AgentHandle,
-    pool_execution: Option<echo_agent_app_core::agent_pool::AgentPoolExecutionLease>,
+    pool_execution: Option<echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease>,
     run_id: String,
     task_id: String,
-    review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
-    workspace_io: Option<echo_agent_app_core::state::WorkspaceIoInvocation>,
-) -> Result<String, echo_agent_app_core::tasks::task_runtime::StoreError> {
+    review_integration: Option<Arc<echo_agent_app_core::api::evolution::ReviewIntegration>>,
+    workspace_io: Option<echo_agent_app_core::api::state::WorkspaceIoInvocation>,
+) -> Result<String, echo_agent_app_core::api::tasks::task_runtime::StoreError> {
     let preparation = start_tui_task_retry_driver(
         store,
         agent,
@@ -6537,28 +6551,28 @@ async fn retry_tui_task(
     )
     .await?;
     match preparation {
-        echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation::Acceptance {
+        echo_agent_app_core::api::tasks::task_runtime::TaskRetryPreparation::Acceptance {
             next_attempt,
         } => Ok(format!(
             "Task {task_id} retried as attempt {next_attempt} on run {run_id}; executor started."
         )),
-        echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation::Recovery => Ok(format!(
-            "Recovery decision recorded for {run_id}/{task_id}: retry."
-        )),
+        echo_agent_app_core::api::tasks::task_runtime::TaskRetryPreparation::Recovery => Ok(
+            format!("Recovery decision recorded for {run_id}/{task_id}: retry."),
+        ),
     }
 }
 
 async fn start_tui_task_retry_driver(
-    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    store: Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
     agent: AgentHandle,
-    pool_execution: Option<echo_agent_app_core::agent_pool::AgentPoolExecutionLease>,
+    pool_execution: Option<echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease>,
     run_id: String,
     task_id: String,
-    review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
-    workspace_io: Option<echo_agent_app_core::state::WorkspaceIoInvocation>,
+    review_integration: Option<Arc<echo_agent_app_core::api::evolution::ReviewIntegration>>,
+    workspace_io: Option<echo_agent_app_core::api::state::WorkspaceIoInvocation>,
 ) -> Result<
-    echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation,
-    echo_agent_app_core::tasks::task_runtime::StoreError,
+    echo_agent_app_core::api::tasks::task_runtime::TaskRetryPreparation,
+    echo_agent_app_core::api::tasks::task_runtime::StoreError,
 > {
     let cancel = echo_agent::agent::CancellationToken::new();
     let preparation_store = store.clone();
@@ -6574,7 +6588,7 @@ async fn start_tui_task_retry_driver(
                     .map(|integration| integration.lease_generation())
                     .transpose()
                     .map_err(|error| {
-                        echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                        echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(format!(
                             "memory generation unavailable: {error}"
                         ))
                     })
@@ -6586,7 +6600,7 @@ async fn start_tui_task_retry_driver(
                 }
                 let reviewer_llm = agent.read(|value| value.llm_client().cloned()).await;
                 let run_store = agent.read(|value| value.run_store().cloned()).await;
-                let result = echo_agent_app_core::tasks::task_runtime::execute_run(
+                let result = echo_agent_app_core::api::tasks::task_runtime::execute_run(
                     preparation_store,
                     Some(agent),
                     reviewer_llm,
@@ -6595,7 +6609,7 @@ async fn start_tui_task_retry_driver(
                     None,
                     &preparation_run_id,
                     cancel,
-                    echo_agent_app_core::tasks::task_runtime::MemoryPolicy::BestEffortSettled,
+                    echo_agent_app_core::api::tasks::task_runtime::MemoryPolicy::BestEffortSettled,
                     workspace_io,
                 )
                 .await;
@@ -6655,7 +6669,7 @@ async fn reset_conversation_state(app: &mut TuiApp, agent: &AgentHandle, new_id:
     };
     let active_agent = pool_execution
         .as_ref()
-        .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+        .map(echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease::agent)
         .unwrap_or_else(|| agent.clone());
     app.messages.clear();
     app.tokens = (0, 0, 0);
@@ -6756,7 +6770,7 @@ async fn fork_conversation(
     };
     let source_agent = source_execution
         .as_ref()
-        .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+        .map(echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease::agent)
         .unwrap_or_else(|| agent.clone());
     let runtime_messages = source_agent
         .read_async(|value| Box::pin(async move { value.get_messages().await }))
@@ -6805,7 +6819,7 @@ async fn fork_conversation(
 async fn tui_conversation_execution(
     app: &TuiApp,
     conversation_id: &str,
-) -> anyhow::Result<echo_agent_app_core::agent_pool::AgentPoolExecutionLease> {
+) -> anyhow::Result<echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease> {
     let app_state = app
         .app_state
         .as_ref()
@@ -6826,8 +6840,8 @@ async fn tui_conversation_execution(
 /// blocking) and runtime metadata; this helper only aligns those rows with the
 /// plan's stable display order and EKO role/title fields.
 fn project_tui_task_views(
-    plan: &echo_agent_app_core::tasks::task_runtime::PlanRevision,
-    todos: &[echo_agent_app_core::tasks::task_runtime::TodoItem],
+    plan: &echo_agent_app_core::api::tasks::task_runtime::PlanRevision,
+    todos: &[echo_agent_app_core::api::tasks::task_runtime::TodoItem],
 ) -> Vec<TaskRuntimeTaskView> {
     plan.tasks
         .iter()
@@ -7073,7 +7087,7 @@ fn format_task_runtime_view(view: &TaskRuntimeView) -> String {
 }
 
 fn format_completion_gate(
-    report: &echo_agent_app_core::tasks::task_runtime::CompletionGateReport,
+    report: &echo_agent_app_core::api::tasks::task_runtime::CompletionGateReport,
 ) -> String {
     let mut content = format!(
         "Completion gate: Goal r{}, Plan r{} ({})",
@@ -7134,13 +7148,13 @@ fn append_subagent_summary(content: &mut String, runs: &[SubagentRuntimeView]) {
 
 fn apply_tui_plugin_theme(
     app: &mut TuiApp,
-    theme: Option<&echo_agent_app_core::extension_commands::PluginThemeProjection>,
+    theme: Option<&echo_agent_app_core::api::extension_commands::PluginThemeProjection>,
 ) {
     app.theme = theme.map_or_else(
         || app.default_theme.clone(),
         |theme| {
             crate::tui::Theme::from_plugin_theme(
-                &echo_agent_app_core::plugin_runtime::PluginThemeDefinition {
+                &echo_agent_app_core::api::plugin_runtime::PluginThemeDefinition {
                     name: theme.name.clone(),
                     display_name: theme.display_name.clone(),
                     dark: theme.dark,
@@ -7155,9 +7169,9 @@ fn apply_tui_plugin_theme(
 
 fn apply_tui_extension_receipt(
     app: &mut TuiApp,
-    receipt: &echo_agent_app_core::extension_commands::ExtensionCommandReceipt,
+    receipt: &echo_agent_app_core::api::extension_commands::ExtensionCommandReceipt,
 ) {
-    use echo_agent_app_core::extension_commands::{
+    use echo_agent_app_core::api::extension_commands::{
         ExtensionCommandReceipt, ExtensionCommandStatus, PluginCommandReceipt,
     };
 
@@ -7290,7 +7304,7 @@ fn apply_subagent_result(
     result: &echo_agent::agent::subagent::SubagentOutcome,
 ) {
     let result =
-        echo_agent_app_core::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(
+        echo_agent_app_core::api::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(
             result,
         );
     run.summary = result.summary;
@@ -7346,8 +7360,8 @@ mod tests {
         TaskRuntimeTaskView, TaskRuntimeView, Theme, ToolExecutionMessage, ToolExecutionStatus,
         TuiApp, TuiTurnRequest,
     };
-    use echo_agent_app_core::chat_driver::TurnOutcome;
-    use echo_agent_app_core::tasks::task_runtime::{
+    use echo_agent_app_core::api::chat_driver::TurnOutcome;
+    use echo_agent_app_core::api::tasks::task_runtime::{
         AttendedMode, DomainProfile, ExecutionMode, PlanRevision, PlanTask, TaskPlan,
         TaskRunStatus, TaskRuntimeStore, TodoItem, TodoStatus, commit_eko_task_plan,
     };
@@ -7398,7 +7412,7 @@ mod tests {
                 revision: 1,
                 domain_profile: DomainProfile::General,
                 goal_revision: 1,
-                goal_sha256: echo_agent_app_core::tasks::task_runtime::task_goal_sha256(
+                goal_sha256: echo_agent_app_core::api::tasks::task_runtime::task_goal_sha256(
                     "preserve retry state",
                 ),
                 assumptions: Vec::new(),
@@ -7532,7 +7546,7 @@ mod tests {
             text: "continue".to_string(),
             attachments: Vec::new(),
             run_resume: Some(TaskRunResumeWake {
-                identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity {
+                identity: echo_agent_app_core::api::tasks::task_runtime::TaskRunResumeIdentity {
                     run_id: "exact-run".to_string(),
                     workspace_id: "workspace-a".to_string(),
                     conversation_id: "conversation-a".to_string(),
@@ -7560,11 +7574,11 @@ mod tests {
         assert_eq!(binding.root_message_id, "exact-root-message");
         assert_eq!(
             binding.origin,
-            echo_agent_app_core::tasks::task_runtime::RunTurnOrigin::Resume
+            echo_agent_app_core::api::tasks::task_runtime::RunTurnOrigin::Resume
         );
         assert_eq!(
             binding.transcript_visibility,
-            echo_agent_app_core::tasks::task_runtime::TurnVisibility::Visible
+            echo_agent_app_core::api::tasks::task_runtime::TurnVisibility::Visible
         );
         Ok(())
     }
@@ -7577,30 +7591,30 @@ mod tests {
         );
         let request = TuiTurnRequest {
             text: "original".to_string(),
-            attachments: vec![echo_agent_app_core::attachments::AttachmentRef {
+            attachments: vec![echo_agent_app_core::api::attachments::AttachmentRef {
                 path: staged,
                 name: "input.txt".to_string(),
                 mime_type: "text/plain".to_string(),
-                source: echo_agent_app_core::types::AttachmentSource::Upload,
+                source: echo_agent_app_core::api::types::AttachmentSource::Upload,
             }],
             run_resume: None,
             input_attempt: None,
         };
-        let prepared = echo_agent_app_core::prepared_turn::PreparedUserTurn {
+        let prepared = echo_agent_app_core::api::prepared_turn::PreparedUserTurn {
             instruction: "prepared".to_string(),
-            resources: vec![echo_agent_app_core::prepared_turn::InputResourceRef {
+            resources: vec![echo_agent_app_core::api::prepared_turn::InputResourceRef {
                 path: scoped.clone(),
                 name: "input.txt".to_string(),
                 mime_type: "text/plain".to_string(),
-                kind: echo_agent_app_core::prepared_turn::ResourceKind::Document,
-                delivery: echo_agent_app_core::prepared_turn::Delivery::Inline,
+                kind: echo_agent_app_core::api::prepared_turn::ResourceKind::Document,
+                delivery: echo_agent_app_core::api::prepared_turn::Delivery::Inline,
                 bytes: 5,
                 chars: None,
                 lines: None,
                 sha256: None,
-                source: echo_agent_app_core::types::AttachmentSource::Upload,
+                source: echo_agent_app_core::api::types::AttachmentSource::Upload,
             }],
-            authorship: echo_agent_app_core::prepared_turn::InstructionAuthorship::User,
+            authorship: echo_agent_app_core::api::prepared_turn::InstructionAuthorship::User,
         };
 
         let retry = request_from_prepared(&request, &prepared);
@@ -7621,34 +7635,36 @@ mod tests {
             workspace_id: "workspace-a".to_string(),
             conversation_id: "conversation-a".to_string(),
         };
-        let identity = echo_agent_app_core::conversation_input::ConversationInputIdentity {
+        let identity = echo_agent_app_core::api::conversation_input::ConversationInputIdentity {
             address,
             input_id: "input-a".to_string(),
             revision: 1,
             payload_sha256: "payload-a".to_string(),
         };
         app.conversation_input_frontier = Some(
-            echo_agent_app_core::conversation_input::ConversationInputFrontier {
+            echo_agent_app_core::api::conversation_input::ConversationInputFrontier {
                 queue_revision: 1,
                 items: vec![ConversationInputProjection {
-                    receipt: echo_agent_app_core::conversation_input::ConversationInputReceipt {
-                        identity: identity.clone(),
-                        phase: ConversationInputPhase::Persisted,
-                        attempt: None,
-                        attempt_id: None,
-                        turn_id: None,
-                        outcome: None,
-                        drained: false,
-                        reason: None,
-                        duplicate: false,
-                        queue_revision: 1,
-                    },
-                    payload: echo_agent_app_core::conversation_input::ConversationInputPayload {
-                        text: "durable next input".to_string(),
-                        attachments: Vec::new(),
-                        submitted_at_ms: 1,
-                        payload_sha256: identity.payload_sha256,
-                    },
+                    receipt:
+                        echo_agent_app_core::api::conversation_input::ConversationInputReceipt {
+                            identity: identity.clone(),
+                            phase: ConversationInputPhase::Persisted,
+                            attempt: None,
+                            attempt_id: None,
+                            turn_id: None,
+                            outcome: None,
+                            drained: false,
+                            reason: None,
+                            duplicate: false,
+                            queue_revision: 1,
+                        },
+                    payload:
+                        echo_agent_app_core::api::conversation_input::ConversationInputPayload {
+                            text: "durable next input".to_string(),
+                            attachments: Vec::new(),
+                            submitted_at_ms: 1,
+                            payload_sha256: identity.payload_sha256,
+                        },
                     active_attempt: None,
                 }],
             },
@@ -7699,11 +7715,14 @@ mod tests {
     async fn typed_receipt_producer_reaches_render_and_refreshes_frontier()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
-        let log = std::sync::Arc::new(echo_agent_app_core::chat_event_log::ChatEventLog::open(
-            temp.path(),
-            echo_agent_app_core::chat_event_log::ChatEventRetention::default(),
-        )?);
-        let service = echo_agent_app_core::conversation_input::ConversationInputService::new(log);
+        let log = std::sync::Arc::new(
+            echo_agent_app_core::api::chat_event_log::ChatEventLog::open(
+                temp.path(),
+                echo_agent_app_core::api::chat_event_log::ChatEventRetention::default(),
+            )?,
+        );
+        let service =
+            echo_agent_app_core::api::conversation_input::ConversationInputService::new(log);
         let address = ConversationInputAddress {
             workspace_id: "workspace-receipt".to_string(),
             conversation_id: "conversation-receipt".to_string(),
@@ -7748,11 +7767,14 @@ mod tests {
     async fn exact_tui_terminal_projection_survives_stream_cache_eviction()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
-        let log = std::sync::Arc::new(echo_agent_app_core::chat_event_log::ChatEventLog::open(
-            temp.path(),
-            echo_agent_app_core::chat_event_log::ChatEventRetention::default(),
-        )?);
-        let service = echo_agent_app_core::conversation_input::ConversationInputService::new(log);
+        let log = std::sync::Arc::new(
+            echo_agent_app_core::api::chat_event_log::ChatEventLog::open(
+                temp.path(),
+                echo_agent_app_core::api::chat_event_log::ChatEventRetention::default(),
+            )?,
+        );
+        let service =
+            echo_agent_app_core::api::conversation_input::ConversationInputService::new(log);
         let address = ConversationInputAddress {
             workspace_id: "workspace-eviction".to_string(),
             conversation_id: "conversation-target".to_string(),
@@ -7851,7 +7873,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_lifecycle_registration_never_executes_the_steer_effect() -> Result<(), String> {
-        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let control = echo_agent_app_core::api::foreground_turn::ForegroundTurnControl::default();
         let lease = control
             .begin_scoped(
                 "workspace-closed",
@@ -7864,7 +7886,7 @@ mod tests {
             .settle_after_observers(TurnOutcome::Completed)
             .await
             .map_err(|error| error.to_string())?;
-        let projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+        let projector: echo_agent_app_core::api::foreground_turn::ForegroundTerminalProjector =
             Arc::new(|_| Box::pin(async { Ok(()) }));
         let registration = control.supervise_input_lifecycle_scoped(
             "workspace-closed",
@@ -7898,7 +7920,7 @@ mod tests {
 
     #[tokio::test]
     async fn fast_steer_handoff_keeps_owner_through_terminal_projection() -> Result<(), String> {
-        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let control = echo_agent_app_core::api::foreground_turn::ForegroundTurnControl::default();
         let lease = control
             .begin_scoped(
                 "workspace-fast",
@@ -7920,7 +7942,7 @@ mod tests {
         let projected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let projected_by_owner = std::sync::Arc::clone(&projected);
         let (handoff, receiver) = tokio::sync::oneshot::channel();
-        let projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+        let projector: echo_agent_app_core::api::foreground_turn::ForegroundTerminalProjector =
             Arc::new(move |outcome| {
                 let projected = std::sync::Arc::clone(&projected_by_owner);
                 Box::pin(async move {
@@ -7961,7 +7983,7 @@ mod tests {
 
     #[tokio::test]
     async fn planned_resume_waits_for_registered_live_terminal_projection() -> Result<(), String> {
-        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let control = echo_agent_app_core::api::foreground_turn::ForegroundTurnControl::default();
         let lease = control
             .begin_scoped(
                 "workspace-resume",
@@ -7980,7 +8002,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let (projected, projection_wait) = tokio::sync::oneshot::channel();
         let projector = Arc::new(std::sync::Mutex::new(Some(projected)));
-        let terminal_projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+        let terminal_projector: echo_agent_app_core::api::foreground_turn::ForegroundTerminalProjector =
             Arc::new(move |outcome| {
                 let projector = Arc::clone(&projector);
                 Box::pin(async move {
@@ -8132,7 +8154,7 @@ mod tests {
     async fn consecutive_hitl_inputs_advance_the_front_immediately() -> Result<(), String> {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
-        use echo_agent_app_core::hitl::TuiHumanLoopProvider;
+        use echo_agent_app_core::api::hitl::TuiHumanLoopProvider;
 
         let provider = std::sync::Arc::new(TuiHumanLoopProvider::new());
         let first_provider = provider.clone();
@@ -8213,7 +8235,7 @@ mod tests {
     async fn cancelled_hitl_front_exposes_the_next_request_on_input() -> Result<(), String> {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
-        use echo_agent_app_core::hitl::TuiHumanLoopProvider;
+        use echo_agent_app_core::api::hitl::TuiHumanLoopProvider;
 
         let provider = std::sync::Arc::new(TuiHumanLoopProvider::new());
         let first_provider = provider.clone();
@@ -8274,7 +8296,7 @@ mod tests {
     }
 
     async fn wait_for_tui_pending_count(
-        pending: &echo_agent_app_core::hitl::PendingApprovalQueue,
+        pending: &echo_agent_app_core::api::hitl::PendingApprovalQueue,
         expected: usize,
     ) -> Result<(), String> {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -8326,20 +8348,21 @@ mod tests {
 
     #[test]
     fn formats_retained_worktree_review_facts() {
-        let worktree = echo_agent_app_core::tasks::task_runtime::worktree::UnattendedWorktreeInfo {
-            run_id: "run-123".to_string(),
-            branch: "eko-unattended-run-123".to_string(),
-            path: None,
-            head: "abc123".to_string(),
-            status: "completed".to_string(),
-            active: false,
-            locked: true,
-            lock_reason: Some("in progress".to_string()),
-            uncommitted_changes: false,
-            ahead_commits: 0,
-            has_changes: false,
-            orphan_branch: true,
-        };
+        let worktree =
+            echo_agent_app_core::api::tasks::task_runtime::worktree::UnattendedWorktreeInfo {
+                run_id: "run-123".to_string(),
+                branch: "eko-unattended-run-123".to_string(),
+                path: None,
+                head: "abc123".to_string(),
+                status: "completed".to_string(),
+                active: false,
+                locked: true,
+                lock_reason: Some("in progress".to_string()),
+                uncommitted_changes: false,
+                ahead_commits: 0,
+                has_changes: false,
+                orphan_branch: true,
+            };
 
         let formatted = format_unattended_worktrees(&[worktree]);
         assert!(formatted.contains("unchanged,stale-lock,orphan-branch"));
@@ -8574,7 +8597,7 @@ mod tests {
             completion_ready: false,
             requirements: Vec::new(),
         };
-        let run = echo_agent_app_core::tasks::task_runtime::TaskRun {
+        let run = echo_agent_app_core::api::tasks::task_runtime::TaskRun {
             run_id: "same-run".to_string(),
             workspace_id: "workspace-b".to_string(),
             conversation_id: "conversation-b".to_string(),
@@ -8583,7 +8606,7 @@ mod tests {
             status: TaskRunStatus::Paused,
             goal: "goal B".to_string(),
             goal_revision: 1,
-            goal_sha256: echo_agent_app_core::tasks::task_runtime::task_goal_sha256("goal B"),
+            goal_sha256: echo_agent_app_core::api::tasks::task_runtime::task_goal_sha256("goal B"),
             plan_id: None,
             route: "task".to_string(),
             attended_mode: AttendedMode::Attended,

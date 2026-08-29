@@ -2,12 +2,12 @@
 
 use std::path::Path;
 
-use echo_agent_app_core::research::{
+use echo_agent_app_core::api::research::{
     CitationAuditReport, CreateReviewRequest, CreateSourceRequest, EvidenceRecord, ResearchError,
     ReviewDocument, ReviewExportArtifact, ReviewExportFormat, ReviewRecord, ReviewSummary,
     SourceRecord, UpsertEvidenceRequest,
 };
-use echo_agent_app_core::research_connectors::{
+use echo_agent_app_core::api::research_connectors::{
     EuropePmcEnrichmentResult, ScholarlyIngestResult, ScholarlySearchRequest, ZoteroSyncRequest,
     ZoteroSyncResult,
 };
@@ -61,7 +61,11 @@ pub async fn list_papers(
         &workspace_generation,
         "list research sources",
         move |root| {
-            echo_agent_app_core::research::list_sources(root, tag.as_deref(), search.as_deref())
+            echo_agent_app_core::api::research::list_sources(
+                root,
+                tag.as_deref(),
+                search.as_deref(),
+            )
         },
     )
     .await
@@ -79,7 +83,7 @@ pub async fn get_paper(
         &workspace_id,
         &workspace_generation,
         "load research source",
-        move |root| echo_agent_app_core::research::get_source(root, &id),
+        move |root| echo_agent_app_core::api::research::get_source(root, &id),
     )
     .await
 }
@@ -96,7 +100,7 @@ pub async fn create_paper(
         &workspace_id,
         &workspace_generation,
         "create research source",
-        move |root| echo_agent_app_core::research::create_source(root, request),
+        move |root| echo_agent_app_core::api::research::create_source(root, request),
     )
     .await
 }
@@ -114,7 +118,7 @@ pub async fn delete_paper(
         &workspace_id,
         &workspace_generation,
         "delete research source",
-        move |root| echo_agent_app_core::research::delete_source(root, &deleted),
+        move |root| echo_agent_app_core::api::research::delete_source(root, &deleted),
     )
     .await?;
     Ok(serde_json::json!({ "deleted": id }))
@@ -133,7 +137,7 @@ pub async fn update_paper_notes(
         &workspace_id,
         &workspace_generation,
         "update research source notes",
-        move |root| echo_agent_app_core::research::update_source_notes(root, &id, notes),
+        move |root| echo_agent_app_core::api::research::update_source_notes(root, &id, notes),
     )
     .await
 }
@@ -151,7 +155,7 @@ pub async fn add_paper_tags(
         &workspace_id,
         &workspace_generation,
         "update research source tags",
-        move |root| echo_agent_app_core::research::add_source_tags(root, &id, tags),
+        move |root| echo_agent_app_core::api::research::add_source_tags(root, &id, tags),
     )
     .await
 }
@@ -170,7 +174,7 @@ pub async fn list_research_evidence(
         &workspace_generation,
         "list research evidence",
         move |root| {
-            echo_agent_app_core::research::list_evidence(
+            echo_agent_app_core::api::research::list_evidence(
                 root,
                 source_id.as_deref(),
                 review_id.as_deref(),
@@ -192,7 +196,7 @@ pub async fn upsert_research_evidence(
         &workspace_id,
         &workspace_generation,
         "upsert research evidence",
-        move |root| echo_agent_app_core::research::upsert_evidence(root, request),
+        move |root| echo_agent_app_core::api::research::upsert_evidence(root, request),
     )
     .await
 }
@@ -209,7 +213,7 @@ pub async fn delete_research_evidence(
         &workspace_id,
         &workspace_generation,
         "delete research evidence",
-        move |root| echo_agent_app_core::research::delete_evidence(root, &evidence_id),
+        move |root| echo_agent_app_core::api::research::delete_evidence(root, &evidence_id),
     )
     .await?;
     Ok(true)
@@ -226,7 +230,7 @@ pub async fn list_systematic_reviews(
         &workspace_id,
         &workspace_generation,
         "list systematic reviews",
-        echo_agent_app_core::research::list_reviews,
+        echo_agent_app_core::api::research::list_reviews,
     )
     .await
 }
@@ -243,7 +247,7 @@ pub async fn create_systematic_review(
         &workspace_id,
         &workspace_generation,
         "create systematic review",
-        move |root| echo_agent_app_core::research::create_review(root, request),
+        move |root| echo_agent_app_core::api::research::create_review(root, request),
     )
     .await
 }
@@ -260,7 +264,7 @@ pub async fn get_systematic_review(
         &workspace_id,
         &workspace_generation,
         "load systematic review",
-        move |root| echo_agent_app_core::research::get_review(root, &review_id),
+        move |root| echo_agent_app_core::api::research::get_review(root, &review_id),
     )
     .await
 }
@@ -280,7 +284,12 @@ pub async fn save_systematic_review(
         &workspace_generation,
         "save systematic review",
         move |root| {
-            echo_agent_app_core::research::save_review(root, &review_id, record, &expected_revision)
+            echo_agent_app_core::api::research::save_review(
+                root,
+                &review_id,
+                record,
+                &expected_revision,
+            )
         },
     )
     .await
@@ -298,7 +307,7 @@ pub async fn delete_systematic_review(
         &workspace_id,
         &workspace_generation,
         "delete systematic review",
-        move |root| echo_agent_app_core::research::delete_review(root, &review_id),
+        move |root| echo_agent_app_core::api::research::delete_review(root, &review_id),
     )
     .await?;
     Ok(true)
@@ -314,7 +323,7 @@ pub async fn search_scholarly_sources(
     let control =
         super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
     let result =
-        echo_agent_app_core::research_connectors::search_and_ingest_scoped(&control, request)
+        echo_agent_app_core::api::research_connectors::search_and_ingest_scoped(&control, request)
             .await
             .map_err(ipc_error);
     drop(control);
@@ -330,9 +339,10 @@ pub async fn import_zotero_library(
 ) -> Result<ZoteroSyncResult, IpcError> {
     let control =
         super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
-    let result = echo_agent_app_core::research_connectors::import_zotero_scoped(&control, request)
-        .await
-        .map_err(ipc_error);
+    let result =
+        echo_agent_app_core::api::research_connectors::import_zotero_scoped(&control, request)
+            .await
+            .map_err(ipc_error);
     drop(control);
     result
 }
@@ -346,9 +356,10 @@ pub async fn export_zotero_library(
 ) -> Result<ZoteroSyncResult, IpcError> {
     let control =
         super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
-    let result = echo_agent_app_core::research_connectors::export_zotero_scoped(&control, request)
-        .await
-        .map_err(ipc_error);
+    let result =
+        echo_agent_app_core::api::research_connectors::export_zotero_scoped(&control, request)
+            .await
+            .map_err(ipc_error);
     drop(control);
     result
 }
@@ -362,7 +373,7 @@ pub async fn enrich_paper_europe_pmc(
 ) -> Result<EuropePmcEnrichmentResult, IpcError> {
     let control =
         super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
-    let result = echo_agent_app_core::research_connectors::enrich_from_europe_pmc_scoped(
+    let result = echo_agent_app_core::api::research_connectors::enrich_from_europe_pmc_scoped(
         &control, &source_id,
     )
     .await
@@ -383,7 +394,7 @@ pub async fn audit_systematic_review(
         &workspace_id,
         &workspace_generation,
         "audit systematic review",
-        move |root| echo_agent_app_core::research::audit_review(root, &review_id),
+        move |root| echo_agent_app_core::api::research::audit_review(root, &review_id),
     )
     .await
 }
@@ -404,7 +415,7 @@ pub async fn export_systematic_review(
             .session
             .product_data_io
             .run("export all systematic review formats", move || {
-                echo_agent_app_core::research::export_all_review_formats(
+                echo_agent_app_core::api::research::export_all_review_formats(
                     control.data_root(),
                     &review_id,
                 )
@@ -419,8 +430,12 @@ pub async fn export_systematic_review(
         .session
         .product_data_io
         .run("export systematic review", move || {
-            echo_agent_app_core::research::export_review(control.data_root(), &review_id, format)
-                .map(|artifact| vec![artifact])
+            echo_agent_app_core::api::research::export_review(
+                control.data_root(),
+                &review_id,
+                format,
+            )
+            .map(|artifact| vec![artifact])
         })
         .await
         .map_err(super::product_data::blocking_error)?

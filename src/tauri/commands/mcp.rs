@@ -3,11 +3,11 @@
 use crate::tauri::commands::extensions;
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent_app_core::extension_commands::{
+use echo_agent_app_core::api::extension_commands::{
     ExtensionCommand, ExtensionCommandReceipt, ExtensionRequestScope, McpCommand,
     McpConfigDocument, McpServerConfig,
 };
-use echo_agent_app_core::types::McpTransportConfig;
+use echo_agent_app_core::api::types::McpTransportConfig;
 
 async fn dispatch_mcp(
     state: &TauriState,

@@ -11,7 +11,7 @@ pub mod path_validator;
 pub mod state;
 pub mod terminal;
 
-use echo_agent_app_core::{AppState, browser::BrowserRuntime};
+use echo_agent_app_core::api::{AppState, browser::BrowserRuntime};
 use state::{TauriBridgeSupervisor, TauriState};
 use std::sync::Arc;
 use tauri::Emitter;
@@ -28,9 +28,9 @@ fn task_id_from_subagent_execution_id(execution_id: &str, run_id: &str) -> Optio
 
 fn emit_tool_projection_updates(
     app: &tauri::AppHandle,
-    updates: &[echo_agent_app_core::tool_execution_projection::ToolExecutionProjectionUpdate],
+    updates: &[echo_agent_app_core::api::tool_execution_projection::ToolExecutionProjectionUpdate],
 ) {
-    use echo_agent_app_core::tool_execution_projection::ToolExecutionProjectionKind;
+    use echo_agent_app_core::api::tool_execution_projection::ToolExecutionProjectionKind;
 
     for update in updates {
         commands::chat::emit_tool_execution_summary(
@@ -47,9 +47,9 @@ fn emit_tool_projection_updates(
 
 fn terminate_subagent_tools(
     app: &tauri::AppHandle,
-    projector: &echo_agent_app_core::tool_execution_projection::ToolExecutionProjector,
+    projector: &echo_agent_app_core::api::tool_execution_projection::ToolExecutionProjector,
     subagent_run_id: Option<&str>,
-    status: echo_agent_app_core::tool_execution::ToolExecutionStatus,
+    status: echo_agent_app_core::api::tool_execution::ToolExecutionStatus,
     agent: &str,
     workspace_id: Option<&str>,
 ) {
@@ -73,12 +73,12 @@ struct OrdinarySubagentProjectionAddress {
 }
 
 fn resolve_gui_subagent_projection_address(
-    foreground_turns: &echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    foreground_turns: &echo_agent_app_core::api::foreground_turn::ForegroundTurnControl,
     conversation_id: &str,
     message_id: Option<&str>,
 ) -> Option<OrdinarySubagentProjectionAddress> {
     let snapshots = foreground_turns
-        .snapshots(echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui)
+        .snapshots(echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui)
         .ok()?;
     let mut matches = snapshots.into_iter().filter(|snapshot| {
         snapshot.conversation_id == conversation_id
@@ -454,7 +454,7 @@ pub fn build_tauri_app(
                 let task_runtime_store = state.app_state.tasks.runtime.clone();
                 let tool_executions = state.app_state.storage.tool_executions.clone();
                 let tool_projector = Arc::new(
-                    echo_agent_app_core::tool_execution_projection::ToolExecutionProjector::new(
+                    echo_agent_app_core::api::tool_execution_projection::ToolExecutionProjector::new(
                         tool_executions,
                         task_runtime_store.clone(),
                     ),
@@ -537,7 +537,7 @@ pub fn build_tauri_app(
                                             continue;
                                         };
                                         match tool_projector.project_subagent_started(
-                                            echo_agent_app_core::tool_execution_projection::SubagentToolStart {
+                                            echo_agent_app_core::api::tool_execution_projection::SubagentToolStart {
                                                 workspace_id: &address.workspace_id,
                                                 subagent_run_id,
                                                 conversation_id: Some(&address.conversation_id),
@@ -610,7 +610,7 @@ pub fn build_tauri_app(
                                             &app_handle,
                                             &tool_projector,
                                             execution_id.as_deref(),
-                                            echo_agent_app_core::tool_execution::ToolExecutionStatus::Unknown,
+                                            echo_agent_app_core::api::tool_execution::ToolExecutionStatus::Unknown,
                                             agent,
                                             execution_id
                                                 .as_deref()
@@ -630,14 +630,14 @@ pub fn build_tauri_app(
                                     ) => {
                                         let tool_status = match *status {
                                             echo_agent::agent::subagent::SubagentStatus::Cancelled => {
-                                                echo_agent_app_core::tool_execution::ToolExecutionStatus::Cancelled
+                                                echo_agent_app_core::api::tool_execution::ToolExecutionStatus::Cancelled
                                             }
                                             echo_agent::agent::subagent::SubagentStatus::TimedOut => {
-                                                echo_agent_app_core::tool_execution::ToolExecutionStatus::TimedOut
+                                                echo_agent_app_core::api::tool_execution::ToolExecutionStatus::TimedOut
                                             }
                                             echo_agent::agent::subagent::SubagentStatus::Completed
                                             | echo_agent::agent::subagent::SubagentStatus::Failed => {
-                                                echo_agent_app_core::tool_execution::ToolExecutionStatus::Unknown
+                                                echo_agent_app_core::api::tool_execution::ToolExecutionStatus::Unknown
                                             }
                                         };
                                         terminate_subagent_tools(
@@ -665,7 +665,7 @@ pub fn build_tauri_app(
                                             &app_handle,
                                             &tool_projector,
                                             execution_id.as_deref(),
-                                            echo_agent_app_core::tool_execution::ToolExecutionStatus::Cancelled,
+                                            echo_agent_app_core::api::tool_execution::ToolExecutionStatus::Cancelled,
                                             agent,
                                             execution_id
                                                 .as_deref()
@@ -738,7 +738,7 @@ pub fn build_tauri_app(
                                             execution_id,
                                             run_id,
                                         } => {
-                                            let projected_result = echo_agent_app_core::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(result);
+                                            let projected_result = echo_agent_app_core::api::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(result);
                                             (
                                                 "completed",
                                                 execution_id.clone(),
@@ -768,7 +768,7 @@ pub fn build_tauri_app(
                                             execution_id,
                                             run_id,
                                         } => {
-                                            let projected_result = echo_agent_app_core::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(result);
+                                            let projected_result = echo_agent_app_core::api::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(result);
                                             (
                                                 status.as_str(),
                                                 execution_id.clone(),
@@ -793,7 +793,7 @@ pub fn build_tauri_app(
                                             execution_id,
                                             run_id,
                                         } => {
-                                            let projected_result = echo_agent_app_core::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(result);
+                                            let projected_result = echo_agent_app_core::api::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(result);
                                             (
                                                 "cancelled",
                                                 execution_id.clone(),
@@ -904,7 +904,7 @@ pub fn build_tauri_app(
                                     if let Some(store) = task_runtime_store.as_ref()
                                     {
                                         let lookup_run_id = run_id.to_string();
-                                        if let Ok(Some(run)) = echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone())
+                                        if let Ok(Some(run)) = echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone())
                                             .run_store("project Tauri TaskRun identity", move |store| store.get_run(&lookup_run_id))
                                             .await
                                         {
@@ -1001,7 +1001,9 @@ mod tests {
 
     #[test]
     fn ordinary_subagent_address_is_resolved_from_exact_gui_turn() -> Result<(), String> {
-        use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+        use echo_agent_app_core::api::foreground_turn::{
+            ForegroundTurnControl, ForegroundTurnSurface,
+        };
 
         let control = ForegroundTurnControl::default();
         let _workspace_a = control

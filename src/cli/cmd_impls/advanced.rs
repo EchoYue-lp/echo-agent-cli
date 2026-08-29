@@ -38,7 +38,7 @@ async fn cmd_export(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         })
     }).await;
 
-    let export_dir = echo_agent_app_core::data_root::user_data_path("exports");
+    let export_dir = echo_agent_app_core::api::data_root::user_data_path("exports");
     let _ = std::fs::create_dir_all(&export_dir);
 
     let ext = if fmt == "markdown" || fmt == "md" {
@@ -112,7 +112,7 @@ async fn cmd_doctor(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
     println!("\n--- Configuration Diagnostics ---\n");
 
     // Check config
-    let config_path = echo_agent_app_core::data_root::user_data_path("config.yaml");
+    let config_path = echo_agent_app_core::api::data_root::user_data_path("config.yaml");
     if config_path.exists() {
         println!("  [OK] Config file: {}", config_path.display());
     } else {

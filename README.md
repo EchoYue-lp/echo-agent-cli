@@ -45,9 +45,9 @@ echo-agent-cli/
 │   └── logging/            # 日志 inspector
 ├── echo-agent-app-core/    # 核心应用库（TUI/GUI 共享）
 │   └── src/
-│       ├── state.rs        # 应用状态管理
+│       ├── state/           # 配置、workspace/delivery scope 与 AppState 聚合
 │       ├── agent_handle.rs # Agent 并发封装
-│       ├── infra.rs        # Agent 创建、MCP 加载
+│       ├── infra/          # Agent 创建、MCP 加载、日志与诊断
 │       ├── config*.rs      # 配置加载与热重载
 │       ├── unified_memory.rs # 统一记忆系统
 │       ├── tasks/          # 后台任务、长程任务、流水线

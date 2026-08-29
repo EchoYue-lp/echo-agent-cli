@@ -17,25 +17,25 @@ fn parse_budget(value: &str, label: &str) -> Result<Option<u64>, String> {
 }
 
 struct ScopedTaskControl {
-    _runtime: echo_agent_app_core::state::ScopedChatRuntime,
-    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
-    snapshot: echo_agent_app_core::tasks::task_runtime::RunStateSnapshot,
+    _runtime: echo_agent_app_core::api::state::ScopedChatRuntime,
+    store: Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
+    snapshot: echo_agent_app_core::api::tasks::task_runtime::RunStateSnapshot,
 }
 
 async fn task_runtime_io<T, F>(
-    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    store: Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
     operation: &'static str,
     function: F,
 ) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce(
-            Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
-        ) -> Result<T, echo_agent_app_core::tasks::task_runtime::StoreError>
+            Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
+        ) -> Result<T, echo_agent_app_core::api::tasks::task_runtime::StoreError>
         + Send
         + 'static,
 {
-    echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+    echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
         .run_store(operation, function)
         .await
         .map_err(|error| error.to_string())
@@ -82,12 +82,12 @@ async fn current_task_run(
                 None => store.latest_run_for_conversation(&lookup_conversation_id)?,
             }
             .ok_or_else(|| {
-                echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
+                echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(
                     "no TaskRun was found for this conversation".to_string(),
                 )
             })?;
             let snapshot = store.get_run_state(&run.run_id)?.ok_or_else(|| {
-                echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(format!(
                     "TaskRun {} has no event projection",
                     run.run_id
                 ))
@@ -114,7 +114,9 @@ async fn current_task_run(
     })
 }
 
-fn print_task_run_status(snapshot: &echo_agent_app_core::tasks::task_runtime::RunStateSnapshot) {
+fn print_task_run_status(
+    snapshot: &echo_agent_app_core::api::tasks::task_runtime::RunStateSnapshot,
+) {
     println!("\n--- TaskRun {} ---", snapshot.run.run_id);
     println!("  Status: {}", snapshot.run.status.as_str());
     println!(
@@ -226,7 +228,7 @@ async fn cmd_task_run(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
         "resume" => {
             if snapshot.run.status
-                != echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Paused
+                != echo_agent_app_core::api::tasks::task_runtime::TaskRunStatus::Paused
             {
                 println!(
                     "\n  TaskRun {} is {}; resume requires paused.",
@@ -240,7 +242,7 @@ async fn cmd_task_run(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                         snapshot.run.run_id
                     ),
                     identity:
-                        echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(
+                        echo_agent_app_core::api::tasks::task_runtime::TaskRunResumeIdentity::capture(
                             &snapshot,
                         ),
                 };
@@ -316,7 +318,7 @@ async fn cmd_task_goal(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             parsed.expected_goal_revision,
             &parsed.new_goal,
             &parsed.reason,
-            echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Cli,
+            echo_agent_app_core::api::tasks::task_runtime::RunGoalActorSource::Cli,
         )
     })
     .await
@@ -337,7 +339,9 @@ cmd!(
     cmd_task_goal
 );
 
-fn print_completion_gate(report: &echo_agent_app_core::tasks::task_runtime::CompletionGateReport) {
+fn print_completion_gate(
+    report: &echo_agent_app_core::api::tasks::task_runtime::CompletionGateReport,
+) {
     println!(
         "\n--- Completion gate: Goal r{}, Plan r{} ({}) ---",
         report.goal_revision,
@@ -409,7 +413,7 @@ async fn cmd_task_requirement_skip(ctx: &CommandContext, args: &[&str]) -> Comma
             parsed.expected_goal_revision,
             &parsed.requirement_id,
             &parsed.reason,
-            echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Cli,
+            echo_agent_app_core::api::tasks::task_runtime::RunGoalActorSource::Cli,
         )
     })
     .await
@@ -476,43 +480,42 @@ async fn cmd_subagent_control(
             return CommandOutcome::Continue;
         }
     };
-    let service = echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(store);
-    let result = match action {
-        SubagentControlAction::Message => {
-            let Some(instruction) = parsed.instruction.as_deref() else {
-                println!("\n  Usage: {usage}");
-                return CommandOutcome::Continue;
-            };
-            service
+    let service = echo_agent_app_core::api::tasks::task_runtime::SubagentControlService::new(store);
+    let result =
+        match action {
+            SubagentControlAction::Message => {
+                let Some(instruction) = parsed.instruction.as_deref() else {
+                    println!("\n  Usage: {usage}");
+                    return CommandOutcome::Continue;
+                };
+                service
                 .send_message(
                     parsed.identity,
                     instruction,
-                    echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Cli,
+                    echo_agent_app_core::api::tasks::task_runtime::SubagentControlActorSource::Cli,
                 )
                 .await
-        }
-        SubagentControlAction::Followup => {
-            let Some(instruction) = parsed.instruction.as_deref() else {
-                println!("\n  Usage: {usage}");
-                return CommandOutcome::Continue;
-            };
-            service
+            }
+            SubagentControlAction::Followup => {
+                let Some(instruction) = parsed.instruction.as_deref() else {
+                    println!("\n  Usage: {usage}");
+                    return CommandOutcome::Continue;
+                };
+                service
                 .queue_guidance_async(
                     parsed.identity,
                     instruction.to_string(),
-                    echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Cli,
+                    echo_agent_app_core::api::tasks::task_runtime::SubagentControlActorSource::Cli,
                 )
                 .await
-        }
-        SubagentControlAction::Interrupt => {
-            service
+            }
+            SubagentControlAction::Interrupt => service
                 .interrupt_subagent(
                     parsed.identity,
-                    echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Cli,
+                    echo_agent_app_core::api::tasks::task_runtime::SubagentControlActorSource::Cli,
                 )
-                .await
-        }
-    };
+                .await,
+        };
     match result {
         Ok(receipt) => println!(
             "\n  Subagent command {} is {}{}.",

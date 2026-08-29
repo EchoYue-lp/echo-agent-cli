@@ -7,22 +7,25 @@
 
 use std::sync::Arc;
 
-use echo_agent_app_core::agent_router::AgentAddress;
-use echo_agent_app_core::tasks::task_runtime::{
+use echo_agent_app_core::api::agent_router::AgentAddress;
+use echo_agent_app_core::api::tasks::task_runtime::{
     AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, SubagentControlActorSource,
     SubagentControlIdentity, SubagentControlStatus, TaskPlan, TaskRuntimeStore,
     commit_eko_task_plan,
 };
 
-const AGENT_ROUTER: &str = include_str!("../src/agent_router.rs");
+const AGENT_ROUTER_INBOX: &str = include_str!("../src/agent_router/inbox.rs");
+const AGENT_ROUTER_ROUTER: &str = include_str!("../src/agent_router/router.rs");
 const SUBAGENT_CONTROL: &str = include_str!("../src/tasks/task_runtime/subagent_control.rs");
-const TASK_RUNTIME_EXECUTOR: &str = include_str!("../src/tasks/task_runtime/executor.rs");
-const TASK_RUNTIME_STORE: &str = include_str!("../src/tasks/task_runtime/store.rs");
+const TASK_RUNTIME_EXECUTOR: &str =
+    include_str!("../src/tasks/task_runtime/executor/unattended.rs");
+const TASK_RUNTIME_STORE: &str = include_str!("../src/tasks/task_runtime/store/runtime.rs");
 const TASK_RUNTIME_REGISTER: &str = include_str!("../src/tasks/task_runtime/register.rs");
 const TASK_RUNTIME_TYPES: &str = include_str!("../src/tasks/task_runtime/types.rs");
 const TOOL_EXPOSURE: &str = include_str!("../src/tool_exposure.rs");
-const INFRA: &str = include_str!("../src/infra.rs");
-const STATE: &str = include_str!("../src/state.rs");
+const INFRA: &str = include_str!("../src/infra/factory.rs");
+const STATE: &str = include_str!("../src/state/app_state.rs");
+const STATE_TESTS: &str = include_str!("../src/state/tests.rs");
 const FRAMEWORK_AGENT_TOOL: &str =
     include_str!("../../../echo-agent/src/tools/builtin/agent_dispatch.rs");
 const FRAMEWORK_REACT: &str = include_str!("../../../echo-agent/src/agent/react/mod.rs");
@@ -34,7 +37,7 @@ fn plan_for(run_id: &str, task_id: &str) -> TaskPlan {
         revision: 0,
         domain_profile: DomainProfile::General,
         goal_revision: 1,
-        goal_sha256: echo_agent_app_core::tasks::task_runtime::task_goal_sha256("goal"),
+        goal_sha256: echo_agent_app_core::api::tasks::task_runtime::task_goal_sha256("goal"),
         assumptions: Vec::new(),
         risks: Vec::new(),
         execution_mode: ExecutionMode::Sequential,
@@ -75,10 +78,10 @@ async fn store_with_plan(
 
 #[test]
 fn authority_definitions_register_and_reach_production_paths() {
-    assert!(AGENT_ROUTER.contains("pub struct AgentRouter"));
-    assert!(AGENT_ROUTER.contains("pub async fn enqueue"));
-    assert!(AGENT_ROUTER.contains("pub async fn pending"));
-    assert!(AGENT_ROUTER.contains("pub async fn records"));
+    assert!(AGENT_ROUTER_INBOX.contains("pub struct AgentRouter"));
+    assert!(AGENT_ROUTER_ROUTER.contains("pub async fn enqueue"));
+    assert!(AGENT_ROUTER_ROUTER.contains("pub async fn pending"));
+    assert!(AGENT_ROUTER_ROUTER.contains("pub async fn records"));
 
     assert!(SUBAGENT_CONTROL.contains("pub struct SubagentControlService"));
     assert!(SUBAGENT_CONTROL.contains("pub async fn send_message"));
@@ -112,11 +115,11 @@ fn authority_definitions_register_and_reach_production_paths() {
 #[test]
 fn conversation_address_and_task_subagent_identity_are_distinct_axes() -> Result<(), String> {
     let source = AgentAddress::new(
-        echo_agent_app_core::workspace::WorkspaceId::from_name("workspace-a"),
+        echo_agent_app_core::api::workspace::WorkspaceId::from_name("workspace-a"),
         "conversation-1",
     );
     let same_conversation_other_workspace = AgentAddress::new(
-        echo_agent_app_core::workspace::WorkspaceId::from_name("workspace-b"),
+        echo_agent_app_core::api::workspace::WorkspaceId::from_name("workspace-b"),
         "conversation-1",
     );
     assert_ne!(source, same_conversation_other_workspace);
@@ -159,7 +162,7 @@ fn conversation_address_and_task_subagent_identity_are_distinct_axes() -> Result
 #[tokio::test]
 async fn stale_revision_and_attempt_are_rejected_with_typed_store_errors() -> Result<(), String> {
     let store = store_with_plan("run-control-schema", "workspace-a").await?;
-    let service = echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(store);
+    let service = echo_agent_app_core::api::tasks::task_runtime::SubagentControlService::new(store);
 
     let stale_revision = SubagentControlIdentity {
         run_id: "run-control-schema".to_string(),
@@ -179,7 +182,7 @@ async fn stale_revision_and_attempt_are_rejected_with_typed_store_errors() -> Re
         .ok_or_else(|| "stale plan revision was accepted".to_string())?;
     assert!(matches!(
         revision_error,
-        echo_agent_app_core::tasks::task_runtime::StoreError::PlanConflict { .. }
+        echo_agent_app_core::api::tasks::task_runtime::StoreError::PlanConflict { .. }
     ));
 
     let stale_attempt = SubagentControlIdentity {
@@ -200,7 +203,7 @@ async fn stale_revision_and_attempt_are_rejected_with_typed_store_errors() -> Re
         .ok_or_else(|| "stale Subagent attempt was accepted".to_string())?;
     assert!(matches!(
         attempt_error,
-        echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(_)
+        echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(_)
     ));
     Ok(())
 }
@@ -217,12 +220,17 @@ fn stale_workspace_rejection_is_at_conversation_boundary_and_not_control_identit
 #[test]
 fn cold_start_and_active_message_boundaries_are_currently_observable() {
     assert!(
-        STATE.contains("async fn agent_delivery_cold_starts_target_and_routes_correlated_reply")
+        STATE_TESTS
+            .contains("async fn agent_delivery_cold_starts_target_and_routes_correlated_reply")
     );
-    assert!(STATE.contains("live_message.message_id = \"live-steer\""));
-    assert!(STATE.contains("record.phase == crate::agent_router::AgentDeliveryPhase::TurnSettled"));
+    assert!(STATE_TESTS.contains("live_message.message_id = \"live-steer\""));
     assert!(
-        STATE.contains("assert_eq!(live_record.turn_id.as_deref(), Some(\"active-target-turn\"))")
+        STATE_TESTS
+            .contains("record.phase == crate::agent_router::AgentDeliveryPhase::TurnSettled")
+    );
+    assert!(
+        STATE_TESTS
+            .contains("assert_eq!(live_record.turn_id.as_deref(), Some(\"active-target-turn\"))")
     );
 
     assert!(SUBAGENT_CONTROL.contains("RuntimeEventKind::SubagentGuidanceQueued"));

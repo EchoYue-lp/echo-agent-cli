@@ -1,8 +1,8 @@
 //! Workspace slash commands — new, list, switch, link, and info.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
-use echo_agent_app_core::state::AppState;
-use echo_agent_app_core::workspace::WorkspaceKind;
+use echo_agent_app_core::api::state::AppState;
+use echo_agent_app_core::api::workspace::WorkspaceKind;
 
 pub struct WorkspaceCommandResult {
     pub output: String,
@@ -21,7 +21,7 @@ async fn cmd_workspace(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             std::mem::take(&mut *staged)
         };
         if let Err(error) =
-            echo_agent_app_core::attachments::discard_staged_attachment_refs(&attachments)
+            echo_agent_app_core::api::attachments::discard_staged_attachment_refs(&attachments)
         {
             tracing::warn!(%error, "failed to clean staged attachments after workspace change");
         }
@@ -176,9 +176,9 @@ async fn ws_exit(state: &std::sync::Arc<AppState>) -> WorkspaceCommandResult {
 }
 
 fn transition_warning(
-    transition: &echo_agent_app_core::state::WorkspaceTransitionReceipt,
+    transition: &echo_agent_app_core::api::state::WorkspaceTransitionReceipt,
 ) -> String {
-    if transition.status != echo_agent_app_core::state::WorkspaceTransitionStatus::Degraded {
+    if transition.status != echo_agent_app_core::api::state::WorkspaceTransitionStatus::Degraded {
         return String::new();
     }
     let details = transition

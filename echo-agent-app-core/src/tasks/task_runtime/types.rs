@@ -511,7 +511,7 @@ impl ArtifactKind {
 /// Structured event emitted at every run / task / step boundary.
 ///
 /// Every state transition must write one of these inside the same
-/// persistence transaction as the state update (see `store.rs`).
+/// persistence transaction as the state update (see `store/runtime.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "RuntimeEventKind")]

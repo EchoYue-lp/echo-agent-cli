@@ -260,7 +260,7 @@ async fn cmd_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
 
     match sub {
         "show" => {
-            let user_path = echo_agent_app_core::data_root::user_data_path("user.md");
+            let user_path = echo_agent_app_core::api::data_root::user_data_path("user.md");
             let project_path = control
                 .runtime
                 .execution_scope()
@@ -329,7 +329,7 @@ async fn cmd_attach(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             let mut staged = ctx.staged_attachments.lock().await;
             std::mem::take(&mut *staged)
         };
-        match echo_agent_app_core::attachments::discard_staged_attachment_refs(&attachments) {
+        match echo_agent_app_core::api::attachments::discard_staged_attachment_refs(&attachments) {
             Ok(()) => println!("Cleared staged attachments."),
             Err(error) => println!("Cleared attachment refs, but staging cleanup failed: {error}"),
         }
@@ -353,7 +353,7 @@ async fn cmd_attach(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     };
     let root = runtime.execution_scope().root().to_path_buf();
     let staged = tokio::task::spawn_blocking(move || {
-        echo_agent_app_core::attachments::stage_local_attachment(&path, Some(&root))
+        echo_agent_app_core::api::attachments::stage_local_attachment(&path, Some(&root))
     })
     .await;
     match staged {
@@ -387,20 +387,20 @@ cmd!(
 // ── ReflectCommand ─────────────────────────────────────────────────────
 
 fn render_reflection_receipt(
-    receipt: &echo_agent_app_core::reflection::ReflectionReceipt,
+    receipt: &echo_agent_app_core::api::reflection::ReflectionReceipt,
 ) -> String {
     receipt.display_message()
 }
 
 fn validate_reflection_args(
     args: &[&str],
-) -> Result<(), echo_agent_app_core::reflection::ReflectionCommandParseError> {
+) -> Result<(), echo_agent_app_core::api::reflection::ReflectionCommandParseError> {
     let input = if args.is_empty() {
         "/reflect".to_string()
     } else {
         format!("/reflect {}", args.join(" "))
     };
-    echo_agent_app_core::reflection::ReflectionCommand::parse(&input).map(|_| ())
+    echo_agent_app_core::api::reflection::ReflectionCommand::parse(&input).map(|_| ())
 }
 
 async fn cmd_reflect(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
@@ -419,7 +419,7 @@ async fn cmd_reflect(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             return CommandOutcome::Continue;
         }
     };
-    match echo_agent_app_core::reflection::reflect_session(
+    match echo_agent_app_core::api::reflection::reflect_session(
         &runtime,
         &ctx.agent,
         ctx.conversation_id.as_deref(),
@@ -447,7 +447,7 @@ pub static AUTO_MEMORY_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
 async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    use echo_agent_app_core::auto_memory::{
+    use echo_agent_app_core::api::auto_memory::{
         AutoMemoryConfig, extract_observations, format_observations_for_memory, queue_observations,
     };
 
@@ -588,7 +588,7 @@ mod tests {
     fn cli_reflection_adapter_projects_shared_receipt() {
         assert!(validate_reflection_args(&[]).is_ok());
         assert!(validate_reflection_args(&["extra"]).is_err());
-        let receipt = echo_agent_app_core::reflection::reflection_receipt_fixture();
+        let receipt = echo_agent_app_core::api::reflection::reflection_receipt_fixture();
         let rendered = render_reflection_receipt(&receipt);
         assert!(rendered.contains(&receipt.key));
         assert!(rendered.contains(&receipt.content_summary));

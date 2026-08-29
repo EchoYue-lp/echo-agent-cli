@@ -1,15 +1,15 @@
-//! M0 failing contract tests for the 2026-08-21 reliability spec (F01-F18).
-//!
-//! Every `#[ignore]` test pins the *corrected* contract from
-//! `design/specs/runtime-reliability.md` and is
-//! expected to fail on the pre-repair implementation. The failing baseline is
-//! recorded by running `cargo test -p echo-agent-app-core -- --ignored`; each
-//! milestone (M1-M8) flips its tests back on and must leave them green.
-//! Tests without `#[ignore]` are positive baselines: they pin behavior that
-//! already matches the spec and must never regress.
-//!
-//! This module is a child of `state` so the fixtures can reuse the private
-//! workspace-runtime resolution paths exactly like production code.
+// M0 failing contract tests for the 2026-08-21 reliability spec (F01-F18).
+//
+// Every `#[ignore]` test pins the *corrected* contract from
+// `design/specs/runtime-reliability.md` and is
+// expected to fail on the pre-repair implementation. The failing baseline is
+// recorded by running `cargo test -p echo-agent-app-core -- --ignored`; each
+// milestone (M1-M8) flips its tests back on and must leave them green.
+// Tests without `#[ignore]` are positive baselines: they pin behavior that
+// already matches the spec and must never regress.
+//
+// This module is a child of `state` so the fixtures can reuse the private
+// workspace-runtime resolution paths exactly like production code.
 
 use std::sync::Arc;
 

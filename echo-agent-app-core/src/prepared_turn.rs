@@ -18,7 +18,7 @@
 //! # Long-text strategy
 //!
 //! A user paste that exceeds [`SPILL_THRESHOLD_BYTES`] (32 KiB, aligned with
-//! the tool-output artifact threshold in `infra.rs`) is written to
+//! the tool-output artifact threshold in `infra/factory.rs`) is written to
 //! `.eko/artifacts/user-input/{conversation}/{turn}/...` and delivered to the
 //! model as a lightweight reference (path + sha256 + preview) instead of the
 //! full text. The model recovers the content on demand via `grep` (once it
@@ -48,7 +48,7 @@ use crate::types::AttachmentSource;
 /// Size above which raw user text or an uploaded text resource is spilled to
 /// a user-input artifact instead of being inlined into the model message.
 /// Text explicitly marked as pasted is always spilled. Aligned with the 32 KiB
-/// tool-output threshold (`infra.rs`); product policy, not framework
+/// tool-output threshold (`infra/factory.rs`); product policy, not framework
 /// semantics.
 pub const SPILL_THRESHOLD_BYTES: usize = 32 * 1024;
 

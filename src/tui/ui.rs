@@ -140,7 +140,7 @@ fn draw_terminal(f: &mut Frame, app: &TuiApp, size: Rect) {
 
 /// Render the approval request card as an inline overlay at the bottom of the chat area.
 fn render_approval_card(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
-    use echo_agent_app_core::hitl::{PendingApproval, PendingHumanLoopKind};
+    use echo_agent_app_core::api::hitl::{PendingApproval, PendingHumanLoopKind};
 
     // Check if there's a pending approval
     let pending_handle = match &app.pending_approval {
@@ -151,7 +151,7 @@ fn render_approval_card(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
         Ok(g) => g,
         Err(_) => return,
     };
-    echo_agent_app_core::hitl::prune_closed_pending(&mut guard);
+    echo_agent_app_core::api::hitl::prune_closed_pending(&mut guard);
     let approval = match guard.front() {
         Some(a) => a,
         None => return,

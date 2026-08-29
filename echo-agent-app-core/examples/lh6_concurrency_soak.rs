@@ -8,13 +8,13 @@ use echo_agent::sandbox::SandboxManager;
 use echo_agent::tools::cell::{
     CommandCellOwner, CommandCellPhase, CommandCellRegistry, CommandCellRequest,
 };
-use echo_agent_app_core::chat_driver::ChatDriverEvent;
-use echo_agent_app_core::chat_event_log::{ChatEventLog, ChatEventRetention};
-use echo_agent_app_core::tasks::task_runtime::command_cells::CommandCellRuntimeService;
-use echo_agent_app_core::tasks::task_runtime::{
+use echo_agent_app_core::api::chat_driver::ChatDriverEvent;
+use echo_agent_app_core::api::chat_event_log::{ChatEventLog, ChatEventRetention};
+use echo_agent_app_core::api::tasks::task_runtime::command_cells::CommandCellRuntimeService;
+use echo_agent_app_core::api::tasks::task_runtime::{
     ProcessExecutionResourceSnapshot, TaskRuntimeStore, process_execution_resource_snapshot,
 };
-use echo_agent_app_core::workspace::{WorkspaceExecutionScope, WorkspaceId};
+use echo_agent_app_core::api::workspace::{WorkspaceExecutionScope, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -220,9 +220,9 @@ fn new_service(
     chat_events: Arc<ChatEventLog>,
 ) -> Result<(
     Arc<CommandCellRuntimeService>,
-    echo_agent_app_core::product_data_io::ProductDataIoService,
+    echo_agent_app_core::api::product_data_io::ProductDataIoService,
 )> {
-    let product_data_io = echo_agent_app_core::product_data_io::ProductDataIoService::new();
+    let product_data_io = echo_agent_app_core::api::product_data_io::ProductDataIoService::new();
     let service = CommandCellRuntimeService::new(
         Arc::new(SandboxManager::local_only()),
         chat_events,

@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use echo_agent::agent::AgentEvent;
-use echo_agent_app_core::chat_driver::ChatDriverEvent;
-use echo_agent_app_core::chat_event_log::ChatEventEnvelope;
-use echo_agent_app_core::tasks::task_runtime::RuntimeEventKind;
-use echo_agent_app_core::tasks::task_runtime::executor::ExecEventScope;
+use echo_agent_app_core::api::chat_driver::ChatDriverEvent;
+use echo_agent_app_core::api::chat_event_log::ChatEventEnvelope;
+use echo_agent_app_core::api::tasks::task_runtime::RuntimeEventKind;
+use echo_agent_app_core::api::tasks::task_runtime::executor::ExecEventScope;
 
 #[derive(Clone, Copy, Debug)]
 enum FixtureMode {
@@ -592,7 +592,7 @@ fn count_turn_status(events: &[ChatEventEnvelope], expected: &str) -> usize {
 
 fn execution_events(
     events: &[ChatEventEnvelope],
-) -> impl Iterator<Item = &echo_agent_app_core::tasks::task_runtime::executor::ExecEvent> {
+) -> impl Iterator<Item = &echo_agent_app_core::api::tasks::task_runtime::executor::ExecEvent> {
     events
         .iter()
         .filter_map(|envelope| match &envelope.payload {
@@ -664,13 +664,13 @@ fn jsonl_extension_management_emits_typed_receipt_without_driving_the_model() ->
     assert_eq!(receipts.len(), 1);
     assert!(matches!(
         receipts.first(),
-        Some(echo_agent_app_core::extension_commands::ExtensionCommandReceipt::Skills {
+        Some(echo_agent_app_core::api::extension_commands::ExtensionCommandReceipt::Skills {
             meta,
             receipt: Some(
-                echo_agent_app_core::extension_commands::SkillCommandReceipt::Listed { .. }
+                echo_agent_app_core::api::extension_commands::SkillCommandReceipt::Listed { .. }
             ),
         }) if meta.status
-            == echo_agent_app_core::extension_commands::ExtensionCommandStatus::Settled
+            == echo_agent_app_core::api::extension_commands::ExtensionCommandStatus::Settled
             && !meta.request_id.is_empty()
             && !meta.operation_id.is_empty()
     ));
@@ -701,9 +701,9 @@ fn jsonl_extension_committed_receipt_is_pending_not_completed_or_degraded() -> R
         .collect::<Vec<_>>();
     assert!(matches!(
         receipts.as_slice(),
-        [echo_agent_app_core::extension_commands::ExtensionCommandReceipt::Mcp { meta, .. }]
+        [echo_agent_app_core::api::extension_commands::ExtensionCommandReceipt::Mcp { meta, .. }]
             if meta.status
-                == echo_agent_app_core::extension_commands::ExtensionCommandStatus::Committed
+                == echo_agent_app_core::api::extension_commands::ExtensionCommandStatus::Committed
                 && meta.error.is_none()
     ));
     assert_eq!(count_turn_status(&events, "completed"), 0);

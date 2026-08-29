@@ -18,7 +18,7 @@
 //! ```
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, SubCommandDef};
-use echo_agent_app_core::scheduler::{CronTask, CronTaskStatus};
+use echo_agent_app_core::api::scheduler::{CronTask, CronTaskStatus};
 use std::sync::Arc;
 
 // ── CronCommand (subcommand dispatcher) ────────────────────────────

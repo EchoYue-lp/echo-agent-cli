@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
-use echo_agent_app_core::extension_commands::{
+use echo_agent_app_core::api::extension_commands::{
     ExtensionCommandDispatcher, ExtensionCommandIdentity, ExtensionCommandReceipt, ExtensionKind,
     ExtensionRequestScope, parse_extension_command,
 };
-use echo_agent_app_core::state::AppState;
+use echo_agent_app_core::api::state::AppState;
 
 fn kind_for_root(root: &str) -> Option<ExtensionKind> {
     match root {
@@ -122,7 +122,7 @@ pub(crate) async fn dispatch_extension_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use echo_agent_app_core::extension_commands::{
+    use echo_agent_app_core::api::extension_commands::{
         ExtensionCommandReceipt, ExtensionCommandStatus, ExtensionMessageReceipt,
         ExtensionReceiptMeta,
     };

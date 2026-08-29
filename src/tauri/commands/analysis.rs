@@ -1,6 +1,6 @@
 //! File-backed analysis workbench IPC.
 
-use echo_agent_app_core::analysis::{
+use echo_agent_app_core::api::analysis::{
     AnalysisDocument, AnalysisError, AnalysisLanguage, AnalysisSummary, SaveAnalysisRequest,
 };
 use serde_json::Value;
@@ -42,8 +42,10 @@ fn ipc_error(error: AnalysisError) -> IpcError {
     }
 }
 
-fn control_error(error: echo_agent_app_core::product_data_io::AnalysisRunControlError) -> IpcError {
-    use echo_agent_app_core::product_data_io::AnalysisRunControlError;
+fn control_error(
+    error: echo_agent_app_core::api::product_data_io::AnalysisRunControlError,
+) -> IpcError {
+    use echo_agent_app_core::api::product_data_io::AnalysisRunControlError;
     match &error {
         AnalysisRunControlError::SupervisorClosed
         | AnalysisRunControlError::AlreadyRunning { .. }
@@ -67,7 +69,7 @@ pub async fn list_analyses(
         &workspace_id,
         &workspace_generation,
         "list analyses",
-        echo_agent_app_core::analysis::list_analyses,
+        echo_agent_app_core::api::analysis::list_analyses,
     )
     .await
 }
@@ -85,7 +87,7 @@ pub async fn create_analysis(
         &workspace_id,
         &workspace_generation,
         "create analysis",
-        move |root| echo_agent_app_core::analysis::create_analysis(root, &title, language),
+        move |root| echo_agent_app_core::api::analysis::create_analysis(root, &title, language),
     )
     .await
 }
@@ -102,7 +104,7 @@ pub async fn get_analysis(
         &workspace_id,
         &workspace_generation,
         "load analysis",
-        move |root| echo_agent_app_core::analysis::load_analysis(root, &analysis_id),
+        move |root| echo_agent_app_core::api::analysis::load_analysis(root, &analysis_id),
     )
     .await
 }
@@ -162,7 +164,7 @@ pub async fn cancel_analysis(
     workspace_id: String,
     workspace_generation: String,
     analysis_id: String,
-) -> Result<echo_agent_app_core::product_data_io::AnalysisCancelReceipt, IpcError> {
+) -> Result<echo_agent_app_core::api::product_data_io::AnalysisCancelReceipt, IpcError> {
     let control =
         super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
     control

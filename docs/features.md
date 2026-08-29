@@ -9,7 +9,7 @@
 | 能力           | 当前实现                                                                      | 主要依据                                        |
 | -------------- | ----------------------------------------------------------------------------- | ----------------------------------------------- |
 | 流式对话       | TUI、GUI、CLI/JSONL、channel 共享 `drive_chat` 与 typed `TurnOutcome`         | `echo-agent-app-core/src/chat_driver.rs`        |
-| 多会话 Agent   | `AgentPool` 按 conversation 维护 Agent，忙会话不会被驱逐                      | `echo-agent-app-core/src/agent_pool.rs`         |
+| 多会话 Agent   | `AgentPool` 按 conversation 维护 Agent，忙会话不会被驱逐                      | `echo-agent-app-core/src/agent_pool/pool.rs`         |
 | Channel 会话   | sender-scoped 产品 ID + incarnation Agent/checkpoint/cache ID，reset 保留历史 | `src/cli/channels.rs`                           |
 | 前台 turn 控制 | admission、steer、cancel、settlement 由 app-core 统一拥有                     | `echo-agent-app-core/src/foreground_turn.rs`    |
 | 会话追加输入   | 四个交互 surface 共用 durable frontier、tracked drain 与 exact terminal       | `echo-agent-app-core/src/conversation_input.rs` |
@@ -22,7 +22,7 @@
 | 能力              | 当前实现                                                                             | 主要依据                                                         |
 | ----------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------- |
 | 统一任务关系      | `task_create/task_update/task_list/task_execute` 使用同一个 revisioned TaskRun graph | `echo-agent-app-core/src/tasks/task_runtime/register.rs`         |
-| 动态 DAG          | 原子 plan、revision patch、claim、重试、取消、safe-point reload                      | `echo-agent-app-core/src/tasks/task_runtime/store.rs`            |
+| 动态 DAG          | 原子 plan、revision patch、claim、重试、取消、safe-point reload                      | `echo-agent-app-core/src/tasks/task_runtime/store/runtime.rs`            |
 | 长程继续          | Goal、RunTurn、budget、provider retry、boot admission、checkpoint-backed hot state   | `echo-agent-app-core/src/tasks/task_runtime/continuation.rs`     |
 | Subagent 执行     | direct、planned、fork、teammate、team 共用 prompt compiler 和结果合同                | `echo-agent-app-core/src/subagent_prompt.rs`                     |
 | Subagent 控制     | message、follow-up、interrupt、attempt identity 与 durable result                    | `echo-agent-app-core/src/tasks/task_runtime/subagent_control.rs` |
@@ -52,8 +52,8 @@ launcher 不再维护跨 TaskRun metadata DAG 或轮询器。CLI 使用 `/tasks 
 | Tool output    | summary/detail 分离、opaque detail ref、cursor page、文件/JSONL 恢复                     | `echo-agent-app-core/src/tool_execution_projection.rs` |
 | Agent 协作控制面 | discriminated Conversation/TaskSubagent target、bounded list/inspect/message/followup/wait/interrupt | `echo-agent-app-core/src/agent_control.rs` |
 | Hooks/Webhooks | 生命周期事件、command/Subagent/MCP actions、配置热重载                                   | `echo-agent-app-core/src/hook_config_loader.rs`        |
-| Plugins        | framework prepared generation、captured target fanout、typed generation receipt、Subagents/LSP/scope-qualified monitors/themes/styles | `echo-agent-app-core/src/plugin_runtime.rs` |
-| Skills         | 递归发现、安装、启停、upstream staging sync 与 durable desired/settled generation        | `skills_hub/` + `extension_control.rs`                 |
+| Plugins        | framework prepared generation、captured target fanout、typed generation receipt、Subagents/LSP/scope-qualified monitors/themes/styles | `echo-agent-app-core/src/plugin_runtime/runtime.rs` |
+| Skills         | 递归发现、安装、启停、upstream staging sync 与 durable desired/settled generation        | `skills_hub/` + `extension_control/skills.rs`                 |
 
 ### Extension Control Authority
 

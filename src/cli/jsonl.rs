@@ -7,8 +7,8 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use echo_agent_app_core::chat_driver::{ChatDriverEvent, ChatSink};
-use echo_agent_app_core::chat_event_log::ChatEventEnvelope;
+use echo_agent_app_core::api::chat_driver::{ChatDriverEvent, ChatSink};
+use echo_agent_app_core::api::chat_event_log::ChatEventEnvelope;
 
 use crate::cli::args::JsonlApprovalPolicy;
 
@@ -31,7 +31,7 @@ impl JsonlChatSink {
     /// Emit the typed result of the finite reflection control command.
     pub fn write_reflection_receipt(
         &self,
-        receipt: &echo_agent_app_core::reflection::ReflectionReceipt,
+        receipt: &echo_agent_app_core::api::reflection::ReflectionReceipt,
     ) -> bool {
         self.write_json_line(&serde_json::json!({
             "source": "reflection_receipt",
@@ -156,7 +156,7 @@ impl echo_agent::human_loop::HumanLoopProvider for JsonlHumanLoopProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use echo_agent_app_core::chat_event_log::{ChatEventLog, ChatEventRetention};
+    use echo_agent_app_core::api::chat_event_log::{ChatEventLog, ChatEventRetention};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, MutexGuard};
 
@@ -282,9 +282,9 @@ mod tests {
         let shared = SharedOutput::default();
         let captured = shared.0.clone();
         let sink = JsonlChatSink::new(Box::new(shared));
-        let receipt = echo_agent_app_core::extension_commands::ExtensionCommandReceipt::failed(
-            echo_agent_app_core::extension_commands::ExtensionKind::Mcp,
-            echo_agent_app_core::extension_commands::ExtensionCommandIdentity {
+        let receipt = echo_agent_app_core::api::extension_commands::ExtensionCommandReceipt::failed(
+            echo_agent_app_core::api::extension_commands::ExtensionKind::Mcp,
+            echo_agent_app_core::api::extension_commands::ExtensionCommandIdentity {
                 request_id: "request-1".to_string(),
                 operation_id: "operation-1".to_string(),
             },
@@ -317,7 +317,7 @@ mod tests {
             decoded.payload,
             ChatDriverEvent::ExtensionReceipt(receipt)
                 if receipt.status()
-                    == echo_agent_app_core::extension_commands::ExtensionCommandStatus::Failed
+                    == echo_agent_app_core::api::extension_commands::ExtensionCommandStatus::Failed
         ));
         Ok(())
     }
@@ -327,7 +327,7 @@ mod tests {
         let shared = SharedOutput::default();
         let captured = shared.0.clone();
         let sink = JsonlChatSink::new(Box::new(shared));
-        let receipt = echo_agent_app_core::reflection::reflection_receipt_fixture();
+        let receipt = echo_agent_app_core::api::reflection::reflection_receipt_fixture();
         assert!(sink.write_reflection_receipt(&receipt));
 
         let bytes = lock_output(&captured).clone();
@@ -337,7 +337,7 @@ mod tests {
             value.get("source").and_then(serde_json::Value::as_str),
             Some("reflection_receipt")
         );
-        echo_agent_app_core::reflection::validate_reflection_receipt_wire(
+        echo_agent_app_core::api::reflection::validate_reflection_receipt_wire(
             value
                 .get("event")
                 .ok_or_else(|| "JSONL reflection event is missing".to_string())?,

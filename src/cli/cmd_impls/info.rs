@@ -10,7 +10,7 @@ async fn cmd_tools(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     if let Some(state) = ctx.app_state.as_ref() {
         println!(
             "{}",
-            echo_agent_app_core::tool_control::execute_tool_control_command(
+            echo_agent_app_core::api::tool_control::execute_tool_control_command(
                 state,
                 &ctx.agent,
                 &args.join(" "),

@@ -3,14 +3,14 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::agent::{Agent, ReactAgent};
-use echo_agent_app_core::model_config;
-use echo_agent_app_core::types::{
+use echo_agent_app_core::api::model_config;
+use echo_agent_app_core::api::types::{
     AgentConfigResponse, ChannelsConfigResponse, FeishuConfigResponse, FullConfigResponse,
     LoggingConfigResponse, McpConfigResponse, ModelConfigResponse, QqConfigResponse,
     ServerConfigResponse, SessionConfigResponse, UpdateConfigRequest, UpdateFullConfigRequest,
 };
 
-fn configured_model_names(cfg: &echo_agent_app_core::config::EkoConfig) -> Vec<String> {
+fn configured_model_names(cfg: &echo_agent_app_core::api::config::EkoConfig) -> Vec<String> {
     cfg.configured_models
         .iter()
         .filter(|model| model.enabled)
@@ -18,9 +18,9 @@ fn configured_model_names(cfg: &echo_agent_app_core::config::EkoConfig) -> Vec<S
         .collect()
 }
 
-fn full_config_response(cfg: &echo_agent_app_core::config::EkoConfig) -> FullConfigResponse {
+fn full_config_response(cfg: &echo_agent_app_core::api::config::EkoConfig) -> FullConfigResponse {
     let runtime = model_config::resolve_runtime_model(cfg, cfg.model.default_model_id.as_deref());
-    let token_limit = echo_agent_app_core::infra::effective_token_limit(cfg, Some(&runtime));
+    let token_limit = echo_agent_app_core::api::infra::effective_token_limit(cfg, Some(&runtime));
     let available_models = configured_model_names(cfg);
     FullConfigResponse {
         model: ModelConfigResponse {
@@ -263,7 +263,7 @@ pub async fn update_full_config(
         })
         .await
         .map_err(|error| match error {
-            echo_agent_app_core::state::ModelMutationError::Validation(message) => {
+            echo_agent_app_core::api::state::ModelMutationError::Validation(message) => {
                 IpcError::Validation(message)
             }
             other => IpcError::Internal(other.to_string()),
@@ -283,7 +283,7 @@ pub async fn update_full_config(
 
 #[tauri::command]
 pub async fn discover_config() -> Result<serde_json::Value, IpcError> {
-    use echo_agent_app_core::config_discovery::ConfigDiscovery;
+    use echo_agent_app_core::api::config_discovery::ConfigDiscovery;
 
     let discovery = ConfigDiscovery::new();
     let inventory = discovery.discover_all();

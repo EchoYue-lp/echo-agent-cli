@@ -3,11 +3,11 @@
 use std::sync::Arc;
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
-use echo_agent_app_core::agent_router::{
+use echo_agent_app_core::api::agent_router::{
     AgentAddress, AgentDeliveryRecord, AgentGroupMember, AgentMessage,
 };
-use echo_agent_app_core::state::AppState;
-use echo_agent_app_core::workspace::WorkspaceId;
+use echo_agent_app_core::api::state::AppState;
+use echo_agent_app_core::api::workspace::WorkspaceId;
 
 pub async fn list_agent_endpoints(state: Option<&Arc<AppState>>) -> String {
     let Some(state) = state else {
@@ -113,7 +113,7 @@ fn parse_group_members(args: &[&str]) -> Result<Vec<AgentGroupMember>, String> {
     Ok(members)
 }
 
-fn format_agent_groups(groups: Vec<echo_agent_app_core::agent_router::AgentGroup>) -> String {
+fn format_agent_groups(groups: Vec<echo_agent_app_core::api::agent_router::AgentGroup>) -> String {
     if groups.is_empty() {
         return "No Agent groups.".to_string();
     }

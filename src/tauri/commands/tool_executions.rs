@@ -1,6 +1,6 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent_app_core::tool_execution::{
+use echo_agent_app_core::api::tool_execution::{
     DEFAULT_DETAIL_PAGE_BYTES, ToolExecutionDetailManifest, ToolExecutionDetailPage,
     ToolExecutionError, ToolExecutionSummary,
 };

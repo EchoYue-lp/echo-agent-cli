@@ -6,13 +6,13 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent_app_core::scheduler::{CronTask, CronTaskStatus};
+use echo_agent_app_core::api::scheduler::{CronTask, CronTaskStatus};
 
 /// Helper: borrow the scheduler runner from Tauri state, returning an IPC
 /// error if the scheduler was never initialized.
 fn get_runner(
     state: &TauriState,
-) -> Result<&std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>, IpcError> {
+) -> Result<&std::sync::Arc<echo_agent_app_core::api::scheduler::SchedulerRunner>, IpcError> {
     state
         .app_state
         .scheduler

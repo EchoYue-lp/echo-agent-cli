@@ -1,6 +1,6 @@
 //! Subagent `.md` hot-loader (Sprint 6).
 //!
-//! Replaces the hardcoded `SUBAGENT_DEFINITIONS` array in `infra.rs`. Subagent
+//! Replaces the hardcoded `SUBAGENT_DEFINITIONS` array in `infra/factory.rs`. Subagent
 //! prompts now live in `.md` files (frontmatter + markdown body) and can be
 //! edited without recompiling.
 //!

@@ -5,19 +5,19 @@
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use echo_agent::tools::research::ZoteroLibraryKind;
-use echo_agent_app_core::product_data_io::ScopedProductData;
-use echo_agent_app_core::research::{
+use echo_agent_app_core::api::product_data_io::ScopedProductData;
+use echo_agent_app_core::api::research::{
     CreateReviewRequest, CreateSourceRequest, ResearchResult, ReviewDomain, ReviewExportFormat,
     ReviewRecord, UpsertEvidenceRequest, add_source_tags, audit_review, create_review,
     create_source, delete_evidence, delete_review, delete_source, export_all_review_formats,
     export_review, get_review, get_source, list_evidence, list_reviews, list_sources, save_review,
     update_source_notes, upsert_evidence,
 };
-use echo_agent_app_core::research_connectors::{
+use echo_agent_app_core::api::research_connectors::{
     ResearchProvider, ScholarlySearchRequest, ZoteroSyncRequest, enrich_from_europe_pmc_scoped,
     export_zotero_scoped, import_zotero_scoped, search_and_ingest_scoped,
 };
-use echo_agent_app_core::tasks::{BackgroundTaskKind, ResearchOutputFormat};
+use echo_agent_app_core::api::tasks::{BackgroundTaskKind, ResearchOutputFormat};
 use std::sync::Arc;
 
 async fn research_io<T, F>(

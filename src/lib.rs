@@ -11,7 +11,7 @@ pub fn configure_data_root() -> anyhow::Result<()> {
         if !root.is_absolute() {
             anyhow::bail!("EKO_DATA_DIR must be an absolute path: {}", root.display());
         }
-        echo_agent_app_core::data_root::configure(root.clone()).map_err(|current| {
+        echo_agent_app_core::api::data_root::configure(root.clone()).map_err(|current| {
             anyhow::anyhow!(
                 "EKO data root was already initialized at {}",
                 current.display()
@@ -19,7 +19,7 @@ pub fn configure_data_root() -> anyhow::Result<()> {
         })?;
         return Ok(());
     }
-    echo_agent_app_core::data_root::configure(
+    echo_agent_app_core::api::data_root::configure(
         std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -45,7 +45,7 @@ pub mod tauri;
 pub mod tui;
 
 // Re-export from app-core
-pub use echo_agent_app_core::{
+pub use echo_agent_app_core::api::{
     AppState, agent_handle, config_watcher, error, infra, output, profiles, project, scheduler,
     skills_hub, state, tasks, types, webhook,
 };

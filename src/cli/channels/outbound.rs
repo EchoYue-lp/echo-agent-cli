@@ -37,7 +37,10 @@ impl ChannelSurfaceSink {
         }
     }
 
-    fn deliver_driver(&self, event: echo_agent_app_core::chat_driver::ChatDriverEvent) -> bool {
+    fn deliver_driver(
+        &self,
+        event: echo_agent_app_core::api::chat_driver::ChatDriverEvent,
+    ) -> bool {
         let event_bytes = match channel_serialized_size(&event, CHANNEL_TURN_EVENT_BYTES) {
             Some(bytes) => bytes,
             None => return self.reject_delivery("channel event exceeds turn byte budget"),
@@ -46,7 +49,7 @@ impl ChannelSurfaceSink {
         if !accept_channel_event(&mut budget, event_bytes) {
             return self.reject_delivery("channel event budget exhausted");
         }
-        if let echo_agent_app_core::chat_driver::ChatDriverEvent::Agent(envelope) = &event
+        if let echo_agent_app_core::api::chat_driver::ChatDriverEvent::Agent(envelope) = &event
             && let echo_agent::agent::AgentEvent::Token(token) = &envelope.payload
         {
             return self.append_token(&mut budget, token);
@@ -59,7 +62,7 @@ impl ChannelSurfaceSink {
 
     fn deliver_projection(
         &self,
-        update: echo_agent_app_core::tool_execution_projection::ToolExecutionProjectionUpdate,
+        update: echo_agent_app_core::api::tool_execution_projection::ToolExecutionProjectionUpdate,
     ) -> bool {
         let event_bytes = match channel_serialized_size(&update.summary, CHANNEL_TURN_EVENT_BYTES) {
             Some(bytes) => bytes.saturating_add(update.agent.len()),
@@ -77,7 +80,7 @@ impl ChannelSurfaceSink {
 
     fn deliver_journaled(
         &self,
-        envelope: echo_agent_app_core::chat_event_log::ChatEventEnvelope,
+        envelope: echo_agent_app_core::api::chat_event_log::ChatEventEnvelope,
     ) -> bool {
         let event_bytes = match channel_serialized_size(&envelope, CHANNEL_TURN_EVENT_BYTES) {
             Some(bytes) => bytes,
@@ -87,7 +90,8 @@ impl ChannelSurfaceSink {
         if !accept_channel_event(&mut budget, event_bytes) {
             return self.reject_delivery("journaled channel event budget exhausted");
         }
-        if let echo_agent_app_core::chat_driver::ChatDriverEvent::Agent(agent) = &envelope.payload
+        if let echo_agent_app_core::api::chat_driver::ChatDriverEvent::Agent(agent) =
+            &envelope.payload
             && let echo_agent::agent::AgentEvent::Token(token) = &agent.payload
         {
             return self.append_token(&mut budget, token);
@@ -151,21 +155,21 @@ impl ChannelSurfaceSink {
     }
 }
 
-impl echo_agent_app_core::chat_driver::ChatSink for ChannelSurfaceSink {
-    fn on_event(&self, event: echo_agent_app_core::chat_driver::ChatDriverEvent) -> bool {
+impl echo_agent_app_core::api::chat_driver::ChatSink for ChannelSurfaceSink {
+    fn on_event(&self, event: echo_agent_app_core::api::chat_driver::ChatDriverEvent) -> bool {
         self.deliver_driver(event)
     }
 
     fn on_journaled_event(
         &self,
-        envelope: echo_agent_app_core::chat_event_log::ChatEventEnvelope,
+        envelope: echo_agent_app_core::api::chat_event_log::ChatEventEnvelope,
     ) -> bool {
         self.deliver_journaled(envelope)
     }
 
     fn on_tool_execution_projection(
         &self,
-        update: &echo_agent_app_core::tool_execution_projection::ToolExecutionProjectionUpdate,
+        update: &echo_agent_app_core::api::tool_execution_projection::ToolExecutionProjectionUpdate,
     ) -> bool {
         self.deliver_projection(update.clone())
     }
@@ -621,7 +625,7 @@ const CHANNEL_TERMINAL_MAX_EVENTS_PER_SECOND: usize = 32;
 pub(super) fn channel_terminal_stream(
     message: &echo_agent::channels::InboundMessage,
     initial: String,
-    mut events: tokio::sync::broadcast::Receiver<echo_agent_app_core::terminal::TerminalEvent>,
+    mut events: tokio::sync::broadcast::Receiver<echo_agent_app_core::api::terminal::TerminalEvent>,
     terminal_id: String,
 ) -> futures::stream::BoxStream<
     'static,
@@ -665,7 +669,7 @@ pub(super) fn channel_terminal_stream(
                 received = events.recv() => received,
             };
             match received {
-                Ok(echo_agent_app_core::terminal::TerminalEvent::Output { id, bytes })
+                Ok(echo_agent_app_core::api::terminal::TerminalEvent::Output { id, bytes })
                     if id == terminal_id =>
                 {
                     let now = tokio::time::Instant::now();
@@ -694,7 +698,7 @@ pub(super) fn channel_terminal_stream(
                         yield Ok(ChannelOutboundDraft::stream(text));
                     }
                 }
-                Ok(echo_agent_app_core::terminal::TerminalEvent::Exited { id, reason })
+                Ok(echo_agent_app_core::api::terminal::TerminalEvent::Exited { id, reason })
                     if id == terminal_id =>
                 {
                     if let Some(text) = decoder.finish() {

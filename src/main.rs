@@ -13,7 +13,7 @@
 //! ```
 
 #[cfg(any(feature = "tui", feature = "gui", feature = "channels"))]
-use echo_agent_app_core::config;
+use echo_agent_app_core::api::config;
 #[cfg(any(feature = "tui", feature = "gui", feature = "channels"))]
 use echo_agent_cli::cli;
 #[cfg(any(feature = "tui", feature = "gui", feature = "channels"))]
@@ -69,7 +69,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     let configured_mcp_path = app_config.mcp.config_path.clone();
     // Resolve MCP before the generic environment overlay copies
     // MCP_CONFIG_PATH into EkoConfig. This preserves CLI > YAML > env.
-    let mcp_config_path = echo_agent_app_core::mcp_config_runtime::resolve_mcp_config_path(
+    let mcp_config_path = echo_agent_app_core::api::mcp_config_runtime::resolve_mcp_config_path(
         args.mcp_config.as_deref(),
         &app_config,
     );
@@ -116,7 +116,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     }
 
     // TUI/CLI and GUI share the same file-backed conversation projection.
-    let conversation_store = echo_agent_app_core::infra::create_conversation_store();
+    let conversation_store = echo_agent_app_core::api::infra::create_conversation_store();
     let requested_conversation_id = if let Some(id) = args.resume.as_ref() {
         Some(id.clone())
     } else if args.r#continue {
@@ -159,9 +159,12 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         execution_scope: None,
     };
     // ── Bootstrap Agent Runtime (shared TUI/GUI initialization) ──
-    let runtime =
-        echo_agent_app_core::runtime::AgentRuntime::bootstrap(&app_config, params, mcp_config_path)
-            .await?;
+    let runtime = echo_agent_app_core::api::runtime::AgentRuntime::bootstrap(
+        &app_config,
+        params,
+        mcp_config_path,
+    )
+    .await?;
     let agent_handle = runtime.agent_handle.clone();
 
     let run_jsonl = args.jsonl.is_some();
@@ -172,7 +175,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     // attended request. Surface rendering still starts only after composition.
     #[cfg(feature = "tui")]
     let mut tui_session = if is_tui_entry {
-        use echo_agent_app_core::hitl::TuiHumanLoopProvider;
+        use echo_agent_app_core::api::hitl::TuiHumanLoopProvider;
         let provider = std::sync::Arc::new(TuiHumanLoopProvider::new());
         let pending = provider.pending_handle();
         let registration = runtime
@@ -194,33 +197,34 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     };
 
     #[cfg_attr(not(feature = "channels"), allow(unused_mut))]
-    let mut application_services = match echo_agent_app_core::runtime::ApplicationServices::compose(
-        &runtime,
-        args.config.as_deref(),
-        conversation_store.clone(),
-        echo_agent::tools::permission::PermissionMode::Default,
-    )
-    .await
-    {
-        Ok(services) => services,
-        Err(error) => {
-            #[cfg(feature = "tui")]
-            if let Some((provider, _, registration)) = tui_session.take() {
-                provider.close_now("TUI bootstrap failed");
-                drop(registration);
+    let mut application_services =
+        match echo_agent_app_core::api::runtime::ApplicationServices::compose(
+            &runtime,
+            args.config.as_deref(),
+            conversation_store.clone(),
+            echo_agent::tools::permission::PermissionMode::Default,
+        )
+        .await
+        {
+            Ok(services) => services,
+            Err(error) => {
+                #[cfg(feature = "tui")]
+                if let Some((provider, _, registration)) = tui_session.take() {
+                    provider.close_now("TUI bootstrap failed");
+                    drop(registration);
+                }
+                let hitl_shutdown_error = match repl_hitl_session.take() {
+                    Some(session) => session.shutdown("CLI bootstrap failed").await.err(),
+                    None => None,
+                };
+                return match hitl_shutdown_error {
+                    Some(hitl_error) => Err(anyhow::anyhow!(
+                        "{error}; REPL HITL bootstrap shutdown failed: {hitl_error}"
+                    )),
+                    None => Err(error),
+                };
             }
-            let hitl_shutdown_error = match repl_hitl_session.take() {
-                Some(session) => session.shutdown("CLI bootstrap failed").await.err(),
-                None => None,
-            };
-            return match hitl_shutdown_error {
-                Some(hitl_error) => Err(anyhow::anyhow!(
-                    "{error}; REPL HITL bootstrap shutdown failed: {hitl_error}"
-                )),
-                None => Err(error),
-            };
-        }
-    };
+        };
 
     if requested_conversation_id.is_some() {
         let restore_result = async {
@@ -249,7 +253,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 }
                 let receipt = application_services
                     .settle(
-                        echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
+                        echo_agent_app_core::api::runtime::ApplicationLifecycleReason::BootstrapRollback,
                         Some(error),
                     )
                     .await;
@@ -284,7 +288,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             None => {
                 let receipt = application_services
                     .settle(
-                        echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
+                        echo_agent_app_core::api::runtime::ApplicationLifecycleReason::BootstrapRollback,
                         Some(anyhow::anyhow!("TUI HITL session owner is unavailable")),
                     )
                     .await;
@@ -310,7 +314,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 .iter()
                 .filter(|model| model.enabled)
                 .map(|model| {
-                    echo_agent_app_core::model_config::resolve_runtime_model(
+                    echo_agent_app_core::api::model_config::resolve_runtime_model(
                         &app_config,
                         Some(&model.id),
                     )
@@ -486,7 +490,7 @@ fn process_args_request_jsonl(args: impl IntoIterator<Item = std::ffi::OsString>
 mod tests {
     use super::*;
     use echo_agent::prelude::*;
-    use echo_agent_app_core::config;
+    use echo_agent_app_core::api::config;
 
     #[test]
     fn test_create_agent_config() {
@@ -525,7 +529,7 @@ mod tests {
             browser_runtime: None,
             command_cell_runtime: None,
             product_data_io: Some(
-                echo_agent_app_core::product_data_io::ProductDataIoService::new(),
+                echo_agent_app_core::api::product_data_io::ProductDataIoService::new(),
             ),
             execution_scope: None,
         };

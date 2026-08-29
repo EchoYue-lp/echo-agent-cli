@@ -718,7 +718,8 @@ pub fn attachment_refs_to_data(
 /// suitable for subagents that reconstruct the message long after the original
 /// upload. Returns a plain text `Message` when there are no refs. The five
 /// entry points now go through [`PreparedUserTurn`](crate::prepared_turn::PreparedUserTurn)
-/// instead; this helper remains for the subagent rebuild path in `executor.rs`.
+/// instead; this helper remains for the subagent rebuild path in the executor
+/// authority.
 pub fn build_message_from_refs(
     text: &str,
     attachments: &[AttachmentRef],

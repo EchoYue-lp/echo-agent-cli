@@ -2,11 +2,11 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent_app_core::agent_router::{AgentAddress, AgentGroupMember, AgentMessage};
-use echo_agent_app_core::workspace::WorkspaceId;
+use echo_agent_app_core::api::agent_router::{AgentAddress, AgentGroupMember, AgentMessage};
+use echo_agent_app_core::api::workspace::WorkspaceId;
 
 fn delivery_status_response(
-    records: Vec<echo_agent_app_core::agent_router::AgentDeliveryRecord>,
+    records: Vec<echo_agent_app_core::api::agent_router::AgentDeliveryRecord>,
 ) -> serde_json::Value {
     serde_json::json!({
         "count": records.len(),
@@ -59,7 +59,8 @@ mod tests {
     #[tokio::test]
     async fn agent_delivery_wire_uses_only_canonical_receipt_vocabulary() -> Result<(), String> {
         let root = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let router = echo_agent_app_core::agent_router::AgentRouter::new(root.path().to_path_buf());
+        let router =
+            echo_agent_app_core::api::agent_router::AgentRouter::new(root.path().to_path_buf());
         let target = AgentAddress::new(WorkspaceId::from_name("wire-target"), "wire-conversation");
         let receipt = router
             .enqueue(AgentMessage::user_text(None, target.clone(), "persist me"))

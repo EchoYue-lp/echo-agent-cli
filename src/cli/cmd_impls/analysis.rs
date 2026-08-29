@@ -5,11 +5,11 @@ use std::sync::Arc;
 use crate::cli::command::{
     CommandCategory, CommandContext, CommandOutcome, CommandRegistry, SlashCommand, SubCommandDef,
 };
-use echo_agent_app_core::analysis::{
+use echo_agent_app_core::api::analysis::{
     AnalysisLanguage, SaveAnalysisRequest, create_analysis, format_analysis_document,
     format_analysis_list, list_analyses, load_analysis,
 };
-use echo_agent_app_core::product_data_io::ScopedProductData;
+use echo_agent_app_core::api::product_data_io::ScopedProductData;
 
 const USAGE: &str = "Usage: /analysis list | create <python|r> <title> | show <analysis-id> | save <analysis-id> <request-json> | run <analysis-id> | wait <analysis-id> <owner-id> | cancel <analysis-id> | delete <analysis-id>";
 
@@ -87,7 +87,7 @@ pub async fn execute_analysis_command(product_data: &ScopedProductData, args: &[
             let (Some(analysis_id), Some(owner_id)) = (args.get(1), args.get(2)) else {
                 return USAGE.to_string();
             };
-            let receipt = echo_agent_app_core::product_data_io::AnalysisRunReceipt {
+            let receipt = echo_agent_app_core::api::product_data_io::AnalysisRunReceipt {
                 workspace_id: product_data.workspace_id().to_string(),
                 workspace_generation: product_data.generation(),
                 analysis_id: analysis_id.to_string(),

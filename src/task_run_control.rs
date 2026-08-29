@@ -17,7 +17,7 @@ pub struct ParsedRunGoalUpdate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSubagentControl {
-    pub identity: echo_agent_app_core::tasks::task_runtime::SubagentControlIdentity,
+    pub identity: echo_agent_app_core::api::tasks::task_runtime::SubagentControlIdentity,
     pub instruction: Option<String>,
 }
 
@@ -60,7 +60,7 @@ pub fn parse_subagent_control_args(
         return Err(format!("Usage: {usage}"));
     }
     Ok(ParsedSubagentControl {
-        identity: echo_agent_app_core::tasks::task_runtime::SubagentControlIdentity {
+        identity: echo_agent_app_core::api::tasks::task_runtime::SubagentControlIdentity {
             run_id: run_id.to_string(),
             task_id: task_id.to_string(),
             execution_id: execution_id.to_string(),

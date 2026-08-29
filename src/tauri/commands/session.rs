@@ -4,14 +4,14 @@ use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::agent::Agent;
 use echo_agent::memory::ConversationFilter;
-use echo_agent_app_core::types::SessionInfo;
+use echo_agent_app_core::api::types::SessionInfo;
 use serde::Serialize;
 
 async fn session_agent(
     state: &TauriState,
     workspace_id: &str,
     conversation_id: &str,
-) -> Result<echo_agent_app_core::agent_pool::AgentPoolExecutionLease, IpcError> {
+) -> Result<echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease, IpcError> {
     if conversation_id.trim().is_empty() {
         return Err(IpcError::Validation(
             "conversation_id must not be empty".to_string(),

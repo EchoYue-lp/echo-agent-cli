@@ -1,7 +1,7 @@
 //! Typed Tauri adapter for the application-owned Extension command authority.
 
 use crate::tauri::state::TauriState;
-use echo_agent_app_core::extension_commands::{
+use echo_agent_app_core::api::extension_commands::{
     ExtensionCommand, ExtensionCommandDispatcher, ExtensionCommandIdentity,
     ExtensionCommandReceipt, ExtensionCommandRequest, ExtensionRequestScope,
 };

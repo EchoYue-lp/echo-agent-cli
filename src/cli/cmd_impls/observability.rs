@@ -14,7 +14,9 @@ async fn cmd_trace(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let diagnostic_id = match args.first().copied().filter(|value| !value.is_empty()) {
         Some(value) => value.to_string(),
         None => {
-            match echo_agent_app_core::observability::list_diagnostic_runs(store.as_ref()).await {
+            match echo_agent_app_core::api::observability::list_diagnostic_runs(store.as_ref())
+                .await
+            {
                 Ok(runs) => match runs.first() {
                     Some(run) => run.diagnostic_id.clone(),
                     None => {
@@ -29,7 +31,7 @@ async fn cmd_trace(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }
         }
     };
-    match echo_agent_app_core::observability::load_run_diagnostics(
+    match echo_agent_app_core::api::observability::load_run_diagnostics(
         store.as_ref(),
         &diagnostic_id,
         ctx.prompt_assembly.clone(),
@@ -38,7 +40,7 @@ async fn cmd_trace(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     {
         Ok(Some(diagnostics)) => println!(
             "\n{}",
-            echo_agent_app_core::observability::format_run_diagnostics(&diagnostics)
+            echo_agent_app_core::api::observability::format_run_diagnostics(&diagnostics)
         ),
         Ok(None) => println!("Run diagnostics not found: {diagnostic_id}"),
         Err(error) => println!("Unable to load run diagnostics: {error}"),

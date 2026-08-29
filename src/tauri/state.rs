@@ -1,6 +1,6 @@
 //! Tauri shared state wrapper.
 
-use echo_agent_app_core::{AppState, browser::BrowserRuntime};
+use echo_agent_app_core::api::{AppState, browser::BrowserRuntime};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -278,7 +278,7 @@ mod tests {
 
         let begin = Arc::clone(&supervisor);
         let join = Arc::clone(&supervisor);
-        let mut lifecycle = echo_agent_app_core::runtime::ApplicationLifecycleOwner::new(
+        let mut lifecycle = echo_agent_app_core::api::runtime::ApplicationLifecycleOwner::new(
             tokio_util::sync::CancellationToken::new(),
         );
         lifecycle.track_external_owner(
@@ -291,7 +291,7 @@ mod tests {
         );
         let receipt = lifecycle
             .settle(
-                echo_agent_app_core::runtime::ApplicationLifecycleReason::Shutdown,
+                echo_agent_app_core::api::runtime::ApplicationLifecycleReason::Shutdown,
                 None,
             )
             .await;

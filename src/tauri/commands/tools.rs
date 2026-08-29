@@ -6,7 +6,7 @@ use crate::tauri::state::TauriState;
 #[tauri::command]
 pub async fn list_tools(
     state: tauri::State<'_, TauriState>,
-) -> Result<Vec<echo_agent_app_core::types::ToolInfo>, IpcError> {
+) -> Result<Vec<echo_agent_app_core::api::types::ToolInfo>, IpcError> {
     let runtime = current_tool_runtime(&state).await?;
     let agent = runtime.primary_agent();
     state
@@ -20,7 +20,7 @@ pub async fn list_tools(
 pub async fn get_tool(
     state: tauri::State<'_, TauriState>,
     name: String,
-) -> Result<echo_agent_app_core::types::ToolInfo, IpcError> {
+) -> Result<echo_agent_app_core::api::types::ToolInfo, IpcError> {
     let runtime = current_tool_runtime(&state).await?;
     let agent = runtime.primary_agent();
     let infos = state
@@ -38,7 +38,7 @@ pub async fn get_tool(
 pub async fn enable_tool(
     state: tauri::State<'_, TauriState>,
     name: String,
-) -> Result<echo_agent_app_core::tool_control::ToolControlReceipt, IpcError> {
+) -> Result<echo_agent_app_core::api::tool_control::ToolControlReceipt, IpcError> {
     let runtime = current_tool_runtime(&state).await?;
     let agent = runtime.primary_agent();
     state
@@ -52,7 +52,7 @@ pub async fn enable_tool(
 pub async fn disable_tool(
     state: tauri::State<'_, TauriState>,
     name: String,
-) -> Result<echo_agent_app_core::tool_control::ToolControlReceipt, IpcError> {
+) -> Result<echo_agent_app_core::api::tool_control::ToolControlReceipt, IpcError> {
     let runtime = current_tool_runtime(&state).await?;
     let agent = runtime.primary_agent();
     state
@@ -64,7 +64,7 @@ pub async fn disable_tool(
 
 async fn current_tool_runtime(
     state: &TauriState,
-) -> Result<echo_agent_app_core::state::ScopedChatRuntime, IpcError> {
+) -> Result<echo_agent_app_core::api::state::ScopedChatRuntime, IpcError> {
     state
         .app_state
         .current_control_runtime()
@@ -72,9 +72,9 @@ async fn current_tool_runtime(
         .map_err(|error| IpcError::Internal(error.to_string()))
 }
 
-fn tool_control_error(error: echo_agent_app_core::tool_control::ToolControlError) -> IpcError {
+fn tool_control_error(error: echo_agent_app_core::api::tool_control::ToolControlError) -> IpcError {
     match error {
-        echo_agent_app_core::tool_control::ToolControlError::NotRegistered { name } => {
+        echo_agent_app_core::api::tool_control::ToolControlError::NotRegistered { name } => {
             IpcError::NotFound(format!("Tool '{name}' not found"))
         }
         error => IpcError::Internal(error.to_string()),

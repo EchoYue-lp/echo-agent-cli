@@ -19,8 +19,8 @@ fn parse_llm_protocol(value: &str) -> Option<echo_agent::llm::LlmApiProtocol> {
 async fn cmd_think(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let available = if let Some(app_state) = ctx.app_state.as_ref() {
         let config = app_state.config.app_config.read().await;
-        let runtime = echo_agent_app_core::model_config::resolve_runtime_model(&config, None);
-        echo_agent_app_core::model_config::thinking_level_specs(runtime.thinking_profile)
+        let runtime = echo_agent_app_core::api::model_config::resolve_runtime_model(&config, None);
+        echo_agent_app_core::api::model_config::thinking_level_specs(runtime.thinking_profile)
     } else {
         Vec::new()
     };
@@ -79,7 +79,7 @@ async fn cmd_model(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     match args.first().copied().unwrap_or("list") {
         "list" => {
             let config = app_state.config.app_config.read().await;
-            for model in echo_agent_app_core::model_config::configured_model_views(&config) {
+            for model in echo_agent_app_core::api::model_config::configured_model_views(&config) {
                 let active = if model.is_default { "*" } else { " " };
                 println!(
                     "{active} {}  {}  {:?}  {:?}",
@@ -113,17 +113,18 @@ async fn cmd_model(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 return CommandOutcome::Continue;
             };
             let config = app_state.config.app_config.read().await.clone();
-            let runtime = match echo_agent_app_core::model_config::resolve_runtime_model_selector(
-                &config,
-                Some(selector),
-            ) {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    println!("{error}");
-                    return CommandOutcome::Continue;
-                }
-            };
-            match echo_agent_app_core::infra::test_runtime_llm_connection(&runtime).await {
+            let runtime =
+                match echo_agent_app_core::api::model_config::resolve_runtime_model_selector(
+                    &config,
+                    Some(selector),
+                ) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        println!("{error}");
+                        return CommandOutcome::Continue;
+                    }
+                };
+            match echo_agent_app_core::api::infra::test_runtime_llm_connection(&runtime).await {
                 Ok(result) => println!(
                     "Connection succeeded: {} ({})",
                     result.model, result.response
@@ -153,8 +154,8 @@ async fn cmd_model(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             if flags.contains(&"video") {
                 input_modalities.push(echo_agent::llm::ModelInputModality::Video);
             }
-            let mutation = echo_agent_app_core::state::ConfiguredModelMutation {
-                model: echo_agent_app_core::config::ConfiguredModel {
+            let mutation = echo_agent_app_core::api::state::ConfiguredModelMutation {
+                model: echo_agent_app_core::api::config::ConfiguredModel {
                     provider: (*provider).to_string(),
                     model: (*model).to_string(),
                     api_protocol: protocol,
@@ -191,7 +192,9 @@ async fn cmd_provider(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     match args.first().copied().unwrap_or("list") {
         "list" => {
             let config = app_state.config.app_config.read().await;
-            for provider in echo_agent_app_core::model_config::configured_provider_views(&config) {
+            for provider in
+                echo_agent_app_core::api::model_config::configured_provider_views(&config)
+            {
                 println!(
                     "{}  {}  {}  {:?}  {} models",
                     provider.id,
@@ -228,9 +231,9 @@ async fn cmd_provider(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 .filter(|value| !value.trim().is_empty() && **value != "-")
                 .map(|value| (*value).to_string());
             let requires_api_key = args.get(5).is_some_and(|value| *value == "requires-key");
-            let mutation = echo_agent_app_core::state::ModelProviderMutation {
+            let mutation = echo_agent_app_core::api::state::ModelProviderMutation {
                 id: (*id).to_string(),
-                provider: echo_agent_app_core::config::ModelProviderConfig {
+                provider: echo_agent_app_core::api::config::ModelProviderConfig {
                     name: (*id).to_string(),
                     api_key_env,
                     base_url: Some((*base_url).to_string()),
@@ -270,7 +273,7 @@ async fn cmd_system(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         };
         let agent = pool_execution
             .as_ref()
-            .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+            .map(echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease::agent)
             .unwrap_or_else(|| ctx.agent.clone());
         agent
             .read_async(|a| {
@@ -329,14 +332,14 @@ async fn run_manual_compression(
     };
     match app_state
         .compress_conversation_owned(
-            echo_agent_app_core::manual_compression::ManualCompressionRequest {
+            echo_agent_app_core::api::manual_compression::ManualCompressionRequest {
                 workspace_id: app_state
                     .current_execution_scope()
                     .await
                     .workspace_id()
                     .to_string(),
                 conversation_id: conversation_id.clone(),
-                surface: echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                surface: echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                 focus,
                 keep_messages,
             },

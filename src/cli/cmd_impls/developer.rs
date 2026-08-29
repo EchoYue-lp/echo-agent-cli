@@ -1,8 +1,8 @@
 //! CLI adapters for the shared application developer commands.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, SlashCommand};
-use echo_agent_app_core::developer_commands::DeveloperCommandRegistry;
-use echo_agent_app_core::terminal::TerminalEvent;
+use echo_agent_app_core::api::developer_commands::DeveloperCommandRegistry;
+use echo_agent_app_core::api::terminal::TerminalEvent;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
@@ -149,7 +149,7 @@ mod tests {
     async fn pre_dispatch_receiver_keeps_fast_terminal_output() -> Result<(), String> {
         use tokio::io::AsyncReadExt;
 
-        let terminal = echo_agent_app_core::terminal::TerminalService::new();
+        let terminal = echo_agent_app_core::api::terminal::TerminalService::new();
         let receiver = terminal.subscribe();
         terminal
             .create("cli-fast".to_string(), None, 24, 80)

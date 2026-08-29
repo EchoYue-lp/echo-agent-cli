@@ -52,7 +52,7 @@ impl SlashCommand for ExtractCommand {
                         .execute_structured_extraction_command_for_scope(
                             scope.workspace_id(),
                             conversation_id,
-                            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                             &args.join(" "),
                         )
                         .await

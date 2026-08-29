@@ -31,22 +31,24 @@ static FILE_CHANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 struct QueuedReplTurn {
     message: String,
-    attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
-    staged_attachment_batch: Option<echo_agent_app_core::attachments::StagedAttachmentBatch>,
-    task_run_resume: Option<echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity>,
+    attachments: Vec<echo_agent_app_core::api::attachments::AttachmentRef>,
+    staged_attachment_batch: Option<echo_agent_app_core::api::attachments::StagedAttachmentBatch>,
+    task_run_resume: Option<echo_agent_app_core::api::tasks::task_runtime::TaskRunResumeIdentity>,
 }
 
 enum ReplTurnStartError {
-    Retryable(echo_agent_app_core::foreground_turn::ForegroundTurnError),
+    Retryable(echo_agent_app_core::api::foreground_turn::ForegroundTurnError),
     WorkspaceTransition(String),
     Permanent(String),
 }
 
 impl ReplTurnStartError {
-    fn from_admission(error: echo_agent_app_core::foreground_turn::ForegroundTurnError) -> Self {
+    fn from_admission(
+        error: echo_agent_app_core::api::foreground_turn::ForegroundTurnError,
+    ) -> Self {
         match error {
-            error @ (echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy { .. }
-            | echo_agent_app_core::foreground_turn::ForegroundTurnError::AdmissionSuspended) => {
+            error @ (echo_agent_app_core::api::foreground_turn::ForegroundTurnError::Busy { .. }
+            | echo_agent_app_core::api::foreground_turn::ForegroundTurnError::AdmissionSuspended) => {
                 Self::Retryable(error)
             }
             error => Self::Permanent(error.to_string()),
@@ -54,10 +56,10 @@ impl ReplTurnStartError {
     }
 
     fn from_conversation_admission(
-        error: echo_agent_app_core::conversation_deletion::ConversationDeletionError,
+        error: echo_agent_app_core::api::conversation_deletion::ConversationDeletionError,
     ) -> Self {
         match error {
-            echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+            echo_agent_app_core::api::conversation_deletion::ConversationDeletionError::Foreground(
                 error,
             ) => Self::from_admission(error),
             error => Self::Permanent(error.to_string()),
@@ -78,16 +80,16 @@ impl ReplTurnStartError {
 }
 
 struct PreparedReplTurnStart {
-    scoped_runtime: echo_agent_app_core::state::ScopedChatRuntime,
-    pool_execution: echo_agent_app_core::agent_pool::AgentPoolExecutionLease,
+    scoped_runtime: echo_agent_app_core::api::state::ScopedChatRuntime,
+    pool_execution: echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease,
     conversation_id: String,
     turn_id: String,
-    turn: echo_agent_app_core::prepared_turn::PreparedUserTurn,
-    control: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
-    lease: echo_agent_app_core::foreground_turn::ForegroundTurnLease,
+    turn: echo_agent_app_core::api::prepared_turn::PreparedUserTurn,
+    control: echo_agent_app_core::api::foreground_turn::ForegroundTurnControl,
+    lease: echo_agent_app_core::api::foreground_turn::ForegroundTurnLease,
     resume_is_continuation: bool,
     conversation_input_attempt:
-        Option<echo_agent_app_core::conversation_input::ConversationInputAttempt>,
+        Option<echo_agent_app_core::api::conversation_input::ConversationInputAttempt>,
 }
 
 struct ActiveReplTurn {
@@ -95,7 +97,7 @@ struct ActiveReplTurn {
     execution_root: std::path::PathBuf,
     conversation_id: String,
     turn_id: String,
-    control: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    control: echo_agent_app_core::api::foreground_turn::ForegroundTurnControl,
     task: Option<tokio::task::JoinHandle<usize>>,
     completion: Option<tokio::sync::oneshot::Receiver<()>>,
     cancel_on_drop: bool,
@@ -124,7 +126,7 @@ impl Drop for ActiveReplTurn {
         }
         if let Err(error) = self.control.request_root_cancel_scoped(
             &self.workspace_id,
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
             &self.conversation_id,
             &self.turn_id,
         ) {
@@ -156,31 +158,33 @@ struct ReplExternalOutput {
 /// into [`run_repl`] and closes admission, rejects exact pending requests, and
 /// unregisters the provider on every exit path.
 pub struct ReplHumanLoopSession {
-    registration: Option<echo_agent_app_core::hitl::HitlProviderRegistration>,
-    provider: Option<Arc<echo_agent_app_core::hitl::ReplHumanLoopProvider>>,
+    registration: Option<echo_agent_app_core::api::hitl::HitlProviderRegistration>,
+    provider: Option<Arc<echo_agent_app_core::api::hitl::ReplHumanLoopProvider>>,
     external_printer: Option<reedline::ExternalPrinter<String>>,
     live_output: ReplExternalOutput,
     request_rx: tokio::sync::mpsc::UnboundedReceiver<
-        echo_agent_app_core::hitl::PendingReplHumanLoopRequest,
+        echo_agent_app_core::api::hitl::PendingReplHumanLoopRequest,
     >,
     failure_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
 
 impl ReplHumanLoopSession {
-    pub async fn register(dispatcher: Arc<echo_agent_app_core::hitl::HitlDispatcher>) -> Self {
+    pub async fn register(dispatcher: Arc<echo_agent_app_core::api::hitl::HitlDispatcher>) -> Self {
         let external_printer = reedline::ExternalPrinter::new(4096);
         let external_sender = external_printer.sender();
         let live_output =
             ReplExternalOutput::new(move |message| external_sender.try_send(message).is_ok());
         let prompt_output = live_output.clone();
         let (provider, request_rx, failure_rx) =
-            echo_agent_app_core::hitl::ReplHumanLoopProvider::channel(Arc::new(move |prompt| {
-                if prompt_output.emit(prompt) {
-                    Ok(())
-                } else {
-                    Err("external printer receiver closed or queue full".to_string())
-                }
-            }));
+            echo_agent_app_core::api::hitl::ReplHumanLoopProvider::channel(Arc::new(
+                move |prompt| {
+                    if prompt_output.emit(prompt) {
+                        Ok(())
+                    } else {
+                        Err("external printer receiver closed or queue full".to_string())
+                    }
+                },
+            ));
         let provider = Arc::new(provider);
         let registration = dispatcher.register_owned("repl", provider.clone()).await;
         Self {
@@ -639,9 +643,9 @@ impl ReplChatSink {
     fn project_outcome(
         &self,
         state: &mut ReplRenderState,
-        result: &Result<echo_agent_app_core::chat_driver::TurnOutcome, String>,
+        result: &Result<echo_agent_app_core::api::chat_driver::TurnOutcome, String>,
     ) {
-        use echo_agent_app_core::chat_driver::TurnOutcome;
+        use echo_agent_app_core::api::chat_driver::TurnOutcome;
 
         match result {
             Ok(TurnOutcome::Completed) => {}
@@ -682,7 +686,7 @@ impl ReplChatSink {
 
     fn finish(
         &self,
-        result: &Result<echo_agent_app_core::chat_driver::TurnOutcome, String>,
+        result: &Result<echo_agent_app_core::api::chat_driver::TurnOutcome, String>,
     ) -> usize {
         let mut state = match self.state.lock() {
             Ok(state) => state,
@@ -728,13 +732,13 @@ impl ReplChatSink {
     }
 }
 
-impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
-    fn on_event(&self, event: echo_agent_app_core::chat_driver::ChatDriverEvent) -> bool {
+impl echo_agent_app_core::api::chat_driver::ChatSink for ReplChatSink {
+    fn on_event(&self, event: echo_agent_app_core::api::chat_driver::ChatDriverEvent) -> bool {
         if self.output.delivery_failed() {
             return false;
         }
         if let Some(projection) =
-            echo_agent_app_core::tasks::task_runtime::project_awaiter_surface_event(&event)
+            echo_agent_app_core::api::tasks::task_runtime::project_awaiter_surface_event(&event)
         {
             return self.output.emit(projection.display_message());
         }
@@ -746,26 +750,26 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
             }
         };
         match event {
-            echo_agent_app_core::chat_driver::ChatDriverEvent::Agent(envelope) => {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::Agent(envelope) => {
                 self.render_agent_event(&mut state, envelope.payload)
             }
-            echo_agent_app_core::chat_driver::ChatDriverEvent::Execution(event) => {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::Execution(event) => {
                 let detail: String = event.payload.to_string().chars().take(500).collect();
                 self.output.emit(format!(
                     "TaskRuntime {} [{}]: {detail}",
                     event.event, event.run_id
                 ))
             }
-            echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus { status } => {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::TurnStatus { status } => {
                 status == "running" || self.output.emit(format!("Turn status: {status}"))
             }
-            echo_agent_app_core::chat_driver::ChatDriverEvent::ExtensionReceipt(receipt) => {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::ExtensionReceipt(receipt) => {
                 self.output.emit(receipt.display_message())
             }
-            echo_agent_app_core::chat_driver::ChatDriverEvent::ExecutionPath { observed_path } => {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::ExecutionPath { observed_path } => {
                 self.output.emit(format!("Execution path: {observed_path}"))
             }
-            echo_agent_app_core::chat_driver::ChatDriverEvent::TurnConfiguration {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::TurnConfiguration {
                 permission_mode,
                 approval_policy,
                 attachments,
@@ -774,21 +778,21 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
                  approval={approval_policy}, attachments={}",
                 attachments.len()
             )),
-            echo_agent_app_core::chat_driver::ChatDriverEvent::Interrupt {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::Interrupt {
                 run_id,
                 goal,
                 new_message,
             } => self.output.emit(format!(
                 "Run {run_id} paused ({goal}); new instruction: {new_message}"
             )),
-            echo_agent_app_core::chat_driver::ChatDriverEvent::InputLifecycle(fact) => {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::InputLifecycle(fact) => {
                 self.output.emit(format!(
                     "Conversation input {}: {}",
                     fact.identity().input_id,
                     conversation_input_fact_phase(fact.as_ref())
                 ))
             }
-            echo_agent_app_core::chat_driver::ChatDriverEvent::ApprovalRequest {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::ApprovalRequest {
                 request_id,
                 tool_name,
                 prompt,
@@ -796,13 +800,13 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
             } => self.output.emit(format!(
                 "Approval requested [{request_id}] for {tool_name}: {prompt}"
             )),
-            echo_agent_app_core::chat_driver::ChatDriverEvent::InputRequest {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::InputRequest {
                 request_id,
                 prompt,
             } => self
                 .output
                 .emit(format!("Input requested [{request_id}]: {prompt}")),
-            echo_agent_app_core::chat_driver::ChatDriverEvent::SelectionRequest {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::SelectionRequest {
                 request_id,
                 prompt,
                 options,
@@ -811,26 +815,26 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
                 "Selection requested [{request_id}]: {prompt} ({})",
                 options.join(", ")
             )),
-            echo_agent_app_core::chat_driver::ChatDriverEvent::CommandCellStarted { cell } => {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::CommandCellStarted { cell } => {
                 self.output.emit(format!(
                     "Command cell {} started: {}",
                     cell.cell_id, cell.name
                 ))
             }
-            echo_agent_app_core::chat_driver::ChatDriverEvent::CommandCellSettled { cell } => {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::CommandCellSettled { cell } => {
                 self.output.emit(format!(
                     "Command cell {} settled: {}",
                     cell.cell_id, cell.phase
                 ))
             }
-            echo_agent_app_core::chat_driver::ChatDriverEvent::AwaiterResultReady { .. }
-            | echo_agent_app_core::chat_driver::ChatDriverEvent::AwaiterResultDeliveryStarted {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::AwaiterResultReady { .. }
+            | echo_agent_app_core::api::chat_driver::ChatDriverEvent::AwaiterResultDeliveryStarted {
                 ..
             }
-            | echo_agent_app_core::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged {
+            | echo_agent_app_core::api::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged {
                 ..
             } => true,
-            echo_agent_app_core::chat_driver::ChatDriverEvent::ContextCompressed {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::ContextCompressed {
                 before_count,
                 after_count,
                 before_tokens,
@@ -847,9 +851,9 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
 }
 
 fn conversation_input_fact_phase(
-    fact: &echo_agent_app_core::conversation_input::ConversationInputFact,
+    fact: &echo_agent_app_core::api::conversation_input::ConversationInputFact,
 ) -> &'static str {
-    use echo_agent_app_core::conversation_input::ConversationInputFact;
+    use echo_agent_app_core::api::conversation_input::ConversationInputFact;
     match fact {
         ConversationInputFact::Persisted { .. } => "persisted",
         ConversationInputFact::AttemptStarted { .. } => "attempt_started",
@@ -890,7 +894,7 @@ enum ActiveInputDisposition {
 }
 
 struct ReplInputSubmission {
-    address: echo_agent_app_core::conversation_input::ConversationInputAddress,
+    address: echo_agent_app_core::api::conversation_input::ConversationInputAddress,
     cleanup_warning: Option<String>,
 }
 
@@ -914,21 +918,23 @@ impl std::fmt::Display for ReplInputSubmitFailure {
 }
 
 struct ReplProjectionAttachments {
-    refs: Vec<echo_agent_app_core::attachments::AttachmentRef>,
-    batch: Option<echo_agent_app_core::attachments::StagedAttachmentBatch>,
+    refs: Vec<echo_agent_app_core::api::attachments::AttachmentRef>,
+    batch: Option<echo_agent_app_core::api::attachments::StagedAttachmentBatch>,
 }
 
 struct ReplProjectionResources {
-    prepared: Option<echo_agent_app_core::prepared_turn::PreparedUserTurn>,
+    prepared: Option<echo_agent_app_core::api::prepared_turn::PreparedUserTurn>,
     spill_dir: std::path::PathBuf,
-    staged_attachment_batch: Option<echo_agent_app_core::attachments::StagedAttachmentBatch>,
+    staged_attachment_batch: Option<echo_agent_app_core::api::attachments::StagedAttachmentBatch>,
 }
 
 impl ReplProjectionResources {
     fn new(
-        prepared: echo_agent_app_core::prepared_turn::PreparedUserTurn,
+        prepared: echo_agent_app_core::api::prepared_turn::PreparedUserTurn,
         spill_dir: std::path::PathBuf,
-        staged_attachment_batch: Option<echo_agent_app_core::attachments::StagedAttachmentBatch>,
+        staged_attachment_batch: Option<
+            echo_agent_app_core::api::attachments::StagedAttachmentBatch,
+        >,
     ) -> Self {
         Self {
             prepared: Some(prepared),
@@ -997,10 +1003,10 @@ fn line_target(
 async fn wait_for_queued_follow_up<F, I>(
     active: &mut ActiveReplTurn,
     hitl_rx: &mut tokio::sync::mpsc::UnboundedReceiver<
-        echo_agent_app_core::hitl::PendingReplHumanLoopRequest,
+        echo_agent_app_core::api::hitl::PendingReplHumanLoopRequest,
     >,
     failure_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
-    pending_hitl: &mut VecDeque<echo_agent_app_core::hitl::PendingReplHumanLoopRequest>,
+    pending_hitl: &mut VecDeque<echo_agent_app_core::api::hitl::PendingReplHumanLoopRequest>,
     output: &OutputRenderer,
     mut read_signal: F,
     interrupt: I,
@@ -1010,7 +1016,7 @@ where
     I: std::future::Future<Output = ()>,
 {
     enum Wake {
-        Hitl(Box<Option<echo_agent_app_core::hitl::PendingReplHumanLoopRequest>>),
+        Hitl(Box<Option<echo_agent_app_core::api::hitl::PendingReplHumanLoopRequest>>),
         SessionFailed(Option<String>),
         Interrupted,
         Settled,
@@ -1091,33 +1097,34 @@ pub struct ReplConfig {
     pub history_file: String,
     pub mode: String,
     pub project: Option<String>,
-    pub task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
-    pub scheduler_runner: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+    pub task_service: Option<Arc<echo_agent_app_core::api::tasks::BackgroundTaskService>>,
+    pub scheduler_runner: Option<Arc<echo_agent_app_core::api::scheduler::SchedulerRunner>>,
     /// Shared live plugin runtime from bootstrap.
-    pub plugin_runtime: Option<Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>>,
+    pub plugin_runtime: Option<Arc<echo_agent_app_core::api::plugin_runtime::PluginRuntimeService>>,
     /// Shared ReviewIntegration from bootstrap. It is the sole Memory binding
     /// authority for Dreaming, chat turns, auto-memory, and session-end review.
-    pub review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    pub review_integration: Option<Arc<echo_agent_app_core::api::evolution::ReviewIntegration>>,
     /// Static prompt-module report captured during runtime bootstrap.
-    pub prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
+    pub prompt_assembly: Option<echo_agent_app_core::api::project::prompt::PromptAssembly>,
     /// Shared pool used by `create_complex_task` and background TaskRuntime runs.
-    pub pool: Option<Arc<echo_agent_app_core::agent_pool::AgentPool>>,
+    pub pool: Option<Arc<echo_agent_app_core::api::agent_pool::AgentPool>>,
     /// Canonical TaskRuntime store shared with TUI/channel/GUI entry points.
-    pub task_runtime_store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    pub task_runtime_store:
+        Option<Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>>,
     /// Persisted conversation identity for the shared chat driver.
     pub conversation_id: String,
     /// Shared webhook emitter (built from `EkoConfig.webhooks` at bootstrap).
     /// `None` means no endpoints configured — emit calls are skipped cheaply.
-    pub webhook_emitter: Option<std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>>,
+    pub webhook_emitter: Option<std::sync::Arc<echo_agent_app_core::api::webhook::WebhookEmitter>>,
     /// Authoritative application state used by workspace and other stateful commands.
-    pub app_state: Option<Arc<echo_agent_app_core::state::AppState>>,
+    pub app_state: Option<Arc<echo_agent_app_core::api::state::AppState>>,
 }
 
 impl Default for ReplConfig {
     fn default() -> Self {
         Self {
             prompt: "echo".to_string(),
-            history_file: echo_agent_app_core::data_root::user_data_path("history.txt")
+            history_file: echo_agent_app_core::api::data_root::user_data_path("history.txt")
                 .to_string_lossy()
                 .into_owned(),
             mode: "general".to_string(),
@@ -1188,9 +1195,10 @@ async fn run_repl_inner(
     let instructions_count = project_ctx
         .as_ref()
         .map(|c| {
-            let provider = echo_agent_app_core::instruction_provider::InstructionProvider::load_for(
-                Some(&c.root),
-            );
+            let provider =
+                echo_agent_app_core::api::instruction_provider::InstructionProvider::load_for(
+                    Some(&c.root),
+                );
             [
                 provider.user_level.as_ref(),
                 provider.project_level.as_ref(),
@@ -1667,8 +1675,9 @@ async fn run_repl_inner(
         let mut staged = staged_attachments.lock().await;
         std::mem::take(&mut *staged)
     };
-    let cleanup =
-        echo_agent_app_core::attachments::discard_staged_attachment_refs(&abandoned_attachments);
+    let cleanup = echo_agent_app_core::api::attachments::discard_staged_attachment_refs(
+        &abandoned_attachments,
+    );
     match (repl_result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
@@ -1686,9 +1695,9 @@ async fn run_repl_inner(
 /// Non-blocking: errors are silently ignored to avoid disrupting exit flow.
 pub(crate) async fn run_auto_memory_on_exit(
     agent: &AgentHandle,
-    review_integration: &Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    review_integration: &Option<Arc<echo_agent_app_core::api::evolution::ReviewIntegration>>,
 ) {
-    use echo_agent_app_core::auto_memory::{
+    use echo_agent_app_core::api::auto_memory::{
         AutoMemoryConfig, extract_observations, queue_observations,
     };
 
@@ -1761,7 +1770,7 @@ pub(crate) async fn run_auto_memory_on_exit(
 /// errors are reported without disrupting exit flow.
 ///
 pub(crate) async fn run_memory_review_on_exit(
-    shared_ri: &Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    shared_ri: &Option<Arc<echo_agent_app_core::api::evolution::ReviewIntegration>>,
 ) {
     let Some(ri) = shared_ri else {
         tracing::debug!("session-end memory review skipped: ReviewIntegration is not configured");
@@ -1790,9 +1799,9 @@ pub(crate) async fn run_memory_review_on_exit(
 
 fn drain_pending_hitl(
     receiver: &mut tokio::sync::mpsc::UnboundedReceiver<
-        echo_agent_app_core::hitl::PendingReplHumanLoopRequest,
+        echo_agent_app_core::api::hitl::PendingReplHumanLoopRequest,
     >,
-    pending: &mut VecDeque<echo_agent_app_core::hitl::PendingReplHumanLoopRequest>,
+    pending: &mut VecDeque<echo_agent_app_core::api::hitl::PendingReplHumanLoopRequest>,
 ) {
     while let Ok(request) = receiver.try_recv() {
         pending.push_back(request);
@@ -1800,13 +1809,13 @@ fn drain_pending_hitl(
 }
 
 fn discard_expired_hitl(
-    pending: &mut VecDeque<echo_agent_app_core::hitl::PendingReplHumanLoopRequest>,
+    pending: &mut VecDeque<echo_agent_app_core::api::hitl::PendingReplHumanLoopRequest>,
 ) {
     pending.retain(|request| !request.is_expired());
 }
 
 fn resolve_front_hitl(
-    pending: &mut VecDeque<echo_agent_app_core::hitl::PendingReplHumanLoopRequest>,
+    pending: &mut VecDeque<echo_agent_app_core::api::hitl::PendingReplHumanLoopRequest>,
     input: &str,
     output: &OutputRenderer,
 ) -> bool {
@@ -1825,7 +1834,7 @@ fn resolve_front_hitl(
 }
 
 fn reject_pending_hitl(
-    pending: &mut VecDeque<echo_agent_app_core::hitl::PendingReplHumanLoopRequest>,
+    pending: &mut VecDeque<echo_agent_app_core::api::hitl::PendingReplHumanLoopRequest>,
     reason: &str,
 ) {
     while let Some(request) = pending.pop_front() {
@@ -1871,19 +1880,21 @@ async fn finish_active_turn(
 }
 
 async fn cancel_and_drain_active(
-    control: &echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    control: &echo_agent_app_core::api::foreground_turn::ForegroundTurnControl,
     active: &mut Option<ActiveReplTurn>,
     output: &OutputRenderer,
 ) -> Option<PendingGitAction> {
     let identity = active.as_ref()?;
     let waiter = match control.request_root_cancel_scoped(
         &identity.workspace_id,
-        echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+        echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
         &identity.conversation_id,
         &identity.turn_id,
     ) {
         Ok(waiter) => Some(waiter),
-        Err(echo_agent_app_core::foreground_turn::ForegroundTurnError::NoActiveTurn { .. }) => None,
+        Err(echo_agent_app_core::api::foreground_turn::ForegroundTurnError::NoActiveTurn {
+            ..
+        }) => None,
         Err(error) => {
             output.print_warning(&format!("CLI turn cancellation was not accepted: {error}"));
             None
@@ -1907,8 +1918,8 @@ async fn current_repl_input_scope(
     config: &ReplConfig,
 ) -> Result<
     (
-        echo_agent_app_core::state::ScopedChatRuntime,
-        echo_agent_app_core::conversation_input::ConversationInputAddress,
+        echo_agent_app_core::api::state::ScopedChatRuntime,
+        echo_agent_app_core::api::conversation_input::ConversationInputAddress,
     ),
     String,
 > {
@@ -1926,7 +1937,7 @@ async fn current_repl_input_scope(
         .await
         .filter(|conversation_id| !conversation_id.trim().is_empty())
         .ok_or_else(|| "CLI conversation identity is unavailable".to_string())?;
-    let address = echo_agent_app_core::conversation_input::ConversationInputAddress {
+    let address = echo_agent_app_core::api::conversation_input::ConversationInputAddress {
         workspace_id: runtime.execution_scope().workspace_id().to_string(),
         conversation_id,
     };
@@ -1936,7 +1947,7 @@ async fn current_repl_input_scope(
 async fn submit_repl_conversation_input(
     config: &ReplConfig,
     message: &str,
-    attachments: &[echo_agent_app_core::attachments::AttachmentRef],
+    attachments: &[echo_agent_app_core::api::attachments::AttachmentRef],
 ) -> Result<ReplInputSubmission, ReplInputSubmitFailure> {
     let app_state = config.app_state.as_ref().ok_or_else(|| {
         ReplInputSubmitFailure::BeforePersist(
@@ -1951,15 +1962,15 @@ async fn submit_repl_conversation_input(
         .session
         .product_data_io
         .run("persist CLI conversation input attachments", move || {
-            echo_agent_app_core::attachments::attachment_refs_to_data(&refs_for_read)
+            echo_agent_app_core::api::attachments::attachment_refs_to_data(&refs_for_read)
         })
         .await
         .map_err(|error| ReplInputSubmitFailure::BeforePersist(error.to_string()))?
         .map_err(|error| ReplInputSubmitFailure::BeforePersist(error.to_string()))?;
     let external_id = uuid::Uuid::new_v4().to_string();
-    let input_id = echo_agent_app_core::conversation_input::stable_scoped_input_id(
+    let input_id = echo_agent_app_core::api::conversation_input::stable_scoped_input_id(
         &address,
-        echo_agent_app_core::conversation_input::ConversationInputSource::Cli,
+        echo_agent_app_core::api::conversation_input::ConversationInputSource::Cli,
         &external_id,
     )
     .map_err(|error| ReplInputSubmitFailure::BeforePersist(error.to_string()))?;
@@ -1981,7 +1992,7 @@ async fn submit_repl_conversation_input(
         .session
         .product_data_io
         .run("retire persisted CLI input staging", move || {
-            echo_agent_app_core::attachments::discard_staged_attachment_refs(&refs_for_cleanup)
+            echo_agent_app_core::api::attachments::discard_staged_attachment_refs(&refs_for_cleanup)
         })
         .await
         .map_err(|error| error.to_string())
@@ -2003,9 +2014,9 @@ async fn submit_repl_conversation_input(
 
 async fn restore_repl_staged_attachments(
     staged_attachments: &Arc<
-        tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>,
+        tokio::sync::Mutex<Vec<echo_agent_app_core::api::attachments::AttachmentRef>>,
     >,
-    attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
+    attachments: Vec<echo_agent_app_core::api::attachments::AttachmentRef>,
 ) {
     if attachments.is_empty() {
         return;
@@ -2014,7 +2025,7 @@ async fn restore_repl_staged_attachments(
 }
 
 fn stage_repl_projection_attachments(
-    attachment_data: &[echo_agent_app_core::types::AttachmentData],
+    attachment_data: &[echo_agent_app_core::api::types::AttachmentData],
     execution_root: &std::path::Path,
 ) -> Result<ReplProjectionAttachments, String> {
     if attachment_data.is_empty() {
@@ -2023,16 +2034,21 @@ fn stage_repl_projection_attachments(
             batch: None,
         });
     }
-    let uploads_dir = echo_agent_app_core::attachments::resolve_uploads_dir(Some(execution_root));
-    let saved = echo_agent_app_core::attachments::save_attachments(attachment_data, &uploads_dir)
-        .map_err(|error| error.to_string())?;
+    let uploads_dir =
+        echo_agent_app_core::api::attachments::resolve_uploads_dir(Some(execution_root));
+    let saved =
+        echo_agent_app_core::api::attachments::save_attachments(attachment_data, &uploads_dir)
+            .map_err(|error| error.to_string())?;
     let refs = saved
         .iter()
         .map(|(path, attachment)| {
-            echo_agent_app_core::attachments::AttachmentRef::from_saved(path.clone(), attachment)
+            echo_agent_app_core::api::attachments::AttachmentRef::from_saved(
+                path.clone(),
+                attachment,
+            )
         })
         .collect();
-    let batch = echo_agent_app_core::attachments::StagedAttachmentBatch::from_saved(&saved);
+    let batch = echo_agent_app_core::api::attachments::StagedAttachmentBatch::from_saved(&saved);
     Ok(ReplProjectionAttachments {
         refs,
         batch: Some(batch),
@@ -2041,8 +2057,8 @@ fn stage_repl_projection_attachments(
 
 async fn repl_turn_from_projection(
     config: &ReplConfig,
-    runtime: &echo_agent_app_core::state::ScopedChatRuntime,
-    projection: &echo_agent_app_core::conversation_input::ConversationInputProjection,
+    runtime: &echo_agent_app_core::api::state::ScopedChatRuntime,
+    projection: &echo_agent_app_core::api::conversation_input::ConversationInputProjection,
 ) -> Result<QueuedReplTurn, String> {
     let app_state = config
         .app_state
@@ -2067,10 +2083,10 @@ async fn repl_turn_from_projection(
 }
 
 fn conversation_attempt(
-    projection: &echo_agent_app_core::conversation_input::ConversationInputProjection,
-) -> Result<echo_agent_app_core::conversation_input::ConversationInputAttempt, String> {
+    projection: &echo_agent_app_core::api::conversation_input::ConversationInputProjection,
+) -> Result<echo_agent_app_core::api::conversation_input::ConversationInputAttempt, String> {
     Ok(
-        echo_agent_app_core::conversation_input::ConversationInputAttempt {
+        echo_agent_app_core::api::conversation_input::ConversationInputAttempt {
             identity: projection.receipt.identity.clone(),
             attempt: projection
                 .receipt
@@ -2178,7 +2194,7 @@ async fn route_active_input(
     mut input: QueuedReplTurn,
     config: &ReplConfig,
     staged_attachments: &Arc<
-        tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>,
+        tokio::sync::Mutex<Vec<echo_agent_app_core::api::attachments::AttachmentRef>>,
     >,
     live_output: ReplExternalOutput,
     output: &OutputRenderer,
@@ -2217,7 +2233,7 @@ async fn route_active_input(
         .control
         .snapshot_scoped(
             &active.workspace_id,
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
             &active.conversation_id,
         )
         .filter(|snapshot| snapshot.root_turn_id == active.turn_id)
@@ -2273,11 +2289,11 @@ async fn route_active_input(
             return ActiveInputDisposition::Queued;
         }
     };
-    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(
+    let spill_dir = echo_agent_app_core::api::prepared_turn::resolve_user_input_spill_dir(Some(
         active.execution_root.as_path(),
     ));
-    let prepared = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
-        echo_agent_app_core::prepared_turn::UserTurnInput {
+    let prepared = match echo_agent_app_core::api::prepared_turn::PreparedUserTurn::build(
+        echo_agent_app_core::api::prepared_turn::UserTurnInput {
             text: &durable_input.message,
             attachments: &durable_input.attachments,
             spill_dir: &spill_dir,
@@ -2341,8 +2357,8 @@ async fn route_active_input(
 async fn supervise_repl_steer_delivery<Steer, SteerFuture>(
     active: &ActiveReplTurn,
     expected_turn_id: &str,
-    service: echo_agent_app_core::conversation_input::ConversationInputService,
-    attempt: echo_agent_app_core::conversation_input::ConversationInputAttempt,
+    service: echo_agent_app_core::api::conversation_input::ConversationInputService,
+    attempt: echo_agent_app_core::api::conversation_input::ConversationInputAttempt,
     resources: ReplProjectionResources,
     output: ReplExternalOutput,
     steer: Steer,
@@ -2379,7 +2395,7 @@ where
     };
     if let Err(error) = active.control.supervise_input_lifecycle_scoped(
         &active.workspace_id,
-        echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+        echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
         &active.conversation_id,
         expected_turn_id,
         observer,
@@ -2403,10 +2419,10 @@ where
 }
 
 fn repl_input_terminal_projector(
-    service: echo_agent_app_core::conversation_input::ConversationInputService,
-    attempt: echo_agent_app_core::conversation_input::ConversationInputAttempt,
+    service: echo_agent_app_core::api::conversation_input::ConversationInputService,
+    attempt: echo_agent_app_core::api::conversation_input::ConversationInputAttempt,
     output: Option<ReplExternalOutput>,
-) -> echo_agent_app_core::foreground_turn::ForegroundTerminalProjector {
+) -> echo_agent_app_core::api::foreground_turn::ForegroundTerminalProjector {
     Arc::new(move |outcome| {
         let service = service.clone();
         let attempt = attempt.clone();
@@ -2428,7 +2444,7 @@ fn repl_input_terminal_projector(
 
 fn emit_repl_input_receipt(
     output: &ReplExternalOutput,
-    receipt: &echo_agent_app_core::conversation_input::ConversationInputReceipt,
+    receipt: &echo_agent_app_core::api::conversation_input::ConversationInputReceipt,
 ) {
     let _ = output.emit(format!(
         "Conversation input {}: {}",
@@ -2438,9 +2454,9 @@ fn emit_repl_input_receipt(
 }
 
 fn conversation_input_phase_label(
-    phase: echo_agent_app_core::conversation_input::ConversationInputPhase,
+    phase: echo_agent_app_core::api::conversation_input::ConversationInputPhase,
 ) -> &'static str {
-    use echo_agent_app_core::conversation_input::ConversationInputPhase;
+    use echo_agent_app_core::api::conversation_input::ConversationInputPhase;
     match phase {
         ConversationInputPhase::Persisted => "persisted",
         ConversationInputPhase::AttemptStarted => "attempt_started",
@@ -2454,9 +2470,9 @@ fn conversation_input_phase_label(
 }
 
 async fn settle_repl_planned_resume(
-    lease: echo_agent_app_core::foreground_turn::ForegroundTurnLease,
-    outcome: echo_agent_app_core::chat_driver::TurnOutcome,
-) -> Result<echo_agent_app_core::chat_driver::TurnOutcome, String> {
+    lease: echo_agent_app_core::api::foreground_turn::ForegroundTurnLease,
+    outcome: echo_agent_app_core::api::chat_driver::TurnOutcome,
+) -> Result<echo_agent_app_core::api::chat_driver::TurnOutcome, String> {
     lease
         .settle_after_observers(outcome.clone())
         .await
@@ -2465,10 +2481,10 @@ async fn settle_repl_planned_resume(
 }
 
 fn repl_taskrun_resume_binding(
-    resume: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity,
+    resume: echo_agent_app_core::api::tasks::task_runtime::TaskRunResumeIdentity,
     turn_id: impl Into<String>,
-) -> echo_agent_app_core::tasks::task_runtime::RunTurnBinding {
-    echo_agent_app_core::tasks::task_runtime::RunTurnBinding::resume_expected(resume, turn_id)
+) -> echo_agent_app_core::api::tasks::task_runtime::RunTurnBinding {
+    echo_agent_app_core::api::tasks::task_runtime::RunTurnBinding::resume_expected(resume, turn_id)
 }
 
 fn handle_git_action(input: &str, changes: usize, output: &OutputRenderer) {
@@ -2495,11 +2511,11 @@ fn handle_git_action(input: &str, changes: usize, output: &OutputRenderer) {
 }
 
 async fn settle_repl_start_failure(
-    lease: echo_agent_app_core::foreground_turn::ForegroundTurnLease,
+    lease: echo_agent_app_core::api::foreground_turn::ForegroundTurnLease,
     code: &'static str,
     detail: String,
 ) -> ReplTurnStartError {
-    let outcome = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+    let outcome = echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
         echo_agent::error::AgentFailure::message(code, detail.clone()),
     );
     match lease.settle_after_observers(outcome).await {
@@ -2517,7 +2533,7 @@ async fn prepare_repl_turn_start(
     config: &ReplConfig,
     turn_id: String,
     conversation_input_attempt: Option<
-        echo_agent_app_core::conversation_input::ConversationInputAttempt,
+        echo_agent_app_core::api::conversation_input::ConversationInputAttempt,
     >,
 ) -> Result<PreparedReplTurnStart, ReplTurnStartError> {
     let app_state = config.app_state.as_ref().ok_or_else(|| {
@@ -2528,10 +2544,10 @@ async fn prepare_repl_turn_start(
             .current_control_runtime()
             .await
             .map_err(|error| match error {
-                echo_agent_app_core::state::ScopedControlError::WorkspaceTransition => {
+                echo_agent_app_core::api::state::ScopedControlError::WorkspaceTransition => {
                     ReplTurnStartError::WorkspaceTransition(error.to_string())
                 }
-                echo_agent_app_core::state::ScopedControlError::Runtime(_) => {
+                echo_agent_app_core::api::state::ScopedControlError::Runtime(_) => {
                     ReplTurnStartError::Permanent(error.to_string())
                 }
             })?;
@@ -2550,7 +2566,7 @@ async fn prepare_repl_turn_start(
     let lease = scoped_runtime
         .begin_turn(
             &control,
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
             &conversation_id,
             turn_id.clone(),
         )
@@ -2586,12 +2602,12 @@ async fn prepare_repl_turn_start(
             return Err(settle_repl_start_failure(lease, "agent_pool", detail).await);
         }
     };
-    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(
+    let spill_dir = echo_agent_app_core::api::prepared_turn::resolve_user_input_spill_dir(Some(
         scoped_runtime.execution_scope().root(),
     ));
     let runtime_authored = input.task_run_resume.is_some();
-    let turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
-        echo_agent_app_core::prepared_turn::UserTurnInput {
+    let turn = match echo_agent_app_core::api::prepared_turn::PreparedUserTurn::build(
+        echo_agent_app_core::api::prepared_turn::UserTurnInput {
             text: &input.message,
             attachments: &input.attachments,
             spill_dir: &spill_dir,
@@ -2640,13 +2656,13 @@ fn spawn_prepared_repl_turn(
     } = prepared;
     let cancel = lease.cancellation_token();
     let renderer = Arc::new(ReplChatSink::new(live_output.clone(), output.config()));
-    let render_sink: Arc<dyn echo_agent_app_core::chat_driver::ChatSink> = renderer.clone();
+    let render_sink: Arc<dyn echo_agent_app_core::api::chat_driver::ChatSink> = renderer.clone();
     let sink = config
         .app_state
         .as_ref()
         .map_or(render_sink.clone(), |state| {
-            echo_agent_app_core::chat_event_log::bind_surface_chat_sink(
-                echo_agent_app_core::chat_event_log::ChatSurface::Cli,
+            echo_agent_app_core::api::chat_event_log::bind_surface_chat_sink(
+                echo_agent_app_core::api::chat_event_log::ChatSurface::Cli,
                 render_sink,
                 state.storage.chat_events.clone(),
                 state.storage.tool_executions.clone(),
@@ -2656,7 +2672,7 @@ fn spawn_prepared_repl_turn(
             )
         });
     let _ = live_output.bind_turn_cancel(cancel.clone());
-    let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+    let resources = Arc::new(echo_agent_app_core::api::chat_resources::ChatResources {
         execution_scope: scoped_runtime.execution_scope().clone(),
         workspace_io_receipt: Some(scoped_runtime.workspace_io_receipt()),
         pool: scoped_runtime.pool(),
@@ -2688,7 +2704,7 @@ fn spawn_prepared_repl_turn(
     ));
     let input_drained = Arc::new(AtomicBool::new(false));
     let durable_input_attempt = conversation_input_attempt.is_some();
-    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(
+    let spill_dir = echo_agent_app_core::api::prepared_turn::resolve_user_input_spill_dir(Some(
         scoped_runtime.execution_scope().root(),
     ));
     let (completion_tx, completion) = tokio::sync::oneshot::channel();
@@ -2698,7 +2714,7 @@ fn spawn_prepared_repl_turn(
         let result = match input.task_run_resume {
             Some(resume) if resume_is_continuation => {
                 let _pool_execution = pool_execution;
-                echo_agent_app_core::foreground_turn::drive_foreground_chat_turn(
+                echo_agent_app_core::api::foreground_turn::drive_foreground_chat_turn(
                     lease,
                     &agent_owned,
                     &turn,
@@ -2709,10 +2725,10 @@ fn spawn_prepared_repl_turn(
             }
             Some(resume) => {
                 let trace_sink =
-                    echo_agent_app_core::chat_driver::subagent_trace_sink_for(&resources.sink);
+                    echo_agent_app_core::api::chat_driver::subagent_trace_sink_for(&resources.sink);
                 let launch = match resources.store.clone() {
                     Some(store) => {
-                        echo_agent_app_core::tasks::task_runtime::launch_planned_run_resume(
+                        echo_agent_app_core::api::tasks::task_runtime::launch_planned_run_resume(
                             store,
                             resume,
                             agent_owned,
@@ -2729,23 +2745,23 @@ fn spawn_prepared_repl_turn(
                 };
                 let turn_outcome = match launch {
                     Ok(launch) => match launch.wait().await {
-                        Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
-                            echo_agent_app_core::chat_driver::TurnOutcome::Completed
-                        }
-                        Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Cancelled) => {
-                            echo_agent_app_core::chat_driver::TurnOutcome::Cancelled
-                        }
-                        Ok(other) => echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                        Ok(
+                            echo_agent_app_core::api::tasks::task_runtime::RunOutcome::Completed,
+                        ) => echo_agent_app_core::api::chat_driver::TurnOutcome::Completed,
+                        Ok(
+                            echo_agent_app_core::api::tasks::task_runtime::RunOutcome::Cancelled,
+                        ) => echo_agent_app_core::api::chat_driver::TurnOutcome::Cancelled,
+                        Ok(other) => echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
                             echo_agent::error::AgentFailure::message(
                                 "planned_resume",
                                 format!("planned resume ended with {other:?}"),
                             ),
                         ),
-                        Err(error) => echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                        Err(error) => echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
                             echo_agent::error::AgentFailure::message("planned_resume", error),
                         ),
                     },
-                    Err(error) => echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    Err(error) => echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
                         echo_agent::error::AgentFailure::message("planned_resume", error),
                     ),
                 };
@@ -2763,7 +2779,7 @@ fn spawn_prepared_repl_turn(
                         let observer_batch = Arc::clone(&staged_attachment_batch);
                         let observer_drained = Arc::clone(&input_drained);
                         let observer_output = live_output.clone();
-                        let observer: echo_agent_app_core::chat_driver::InputReceiptObserver =
+                        let observer: echo_agent_app_core::api::chat_driver::InputReceiptObserver =
                             Arc::new(move |receipt| {
                                 let service = observer_service.clone();
                                 let attempt = observer_attempt.clone();
@@ -2788,7 +2804,7 @@ fn spawn_prepared_repl_turn(
                         let terminal_service = service.clone();
                         let terminal_attempt = attempt.clone();
                         let terminal_output = live_output.clone();
-                        echo_agent_app_core::foreground_turn::drive_foreground_chat_with_ingress(
+                        echo_agent_app_core::api::foreground_turn::drive_foreground_chat_with_ingress(
                             lease,
                             &agent_owned,
                             &turn,
@@ -2813,7 +2829,7 @@ fn spawn_prepared_repl_turn(
                         .await
                     }
                     _ => {
-                        echo_agent_app_core::foreground_turn::drive_foreground_chat(
+                        echo_agent_app_core::api::foreground_turn::drive_foreground_chat(
                             lease,
                             &agent_owned,
                             &turn,
@@ -2929,7 +2945,7 @@ mod tests {
     }
 
     fn test_active_repl_turn(
-        control: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+        control: echo_agent_app_core::api::foreground_turn::ForegroundTurnControl,
         execution_root: std::path::PathBuf,
         workspace_id: &str,
         conversation_id: &str,
@@ -2952,18 +2968,19 @@ mod tests {
         conversation_id: &str,
         turn_id: &str,
     ) -> Result<(ReplProjectionResources, std::path::PathBuf), String> {
-        let attachment = echo_agent_app_core::types::AttachmentData {
+        let attachment = echo_agent_app_core::api::types::AttachmentData {
             name: "guidance.txt".to_string(),
             mime_type: "text/plain".to_string(),
             data: "ZHVyYWJsZSBndWlkYW5jZQ==".to_string(),
             size: 16,
-            source: echo_agent_app_core::types::AttachmentSource::Paste,
+            source: echo_agent_app_core::api::types::AttachmentSource::Paste,
         };
         let mut staged = stage_repl_projection_attachments(&[attachment], execution_root)?;
-        let spill_dir =
-            echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(execution_root));
-        let prepared = echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
-            echo_agent_app_core::prepared_turn::UserTurnInput {
+        let spill_dir = echo_agent_app_core::api::prepared_turn::resolve_user_input_spill_dir(
+            Some(execution_root),
+        );
+        let prepared = echo_agent_app_core::api::prepared_turn::PreparedUserTurn::build(
+            echo_agent_app_core::api::prepared_turn::UserTurnInput {
                 text: "use durable guidance",
                 attachments: &staged.refs,
                 spill_dir: &spill_dir,
@@ -2999,7 +3016,7 @@ mod tests {
     #[test]
     fn durable_attachment_staging_rolls_back_earlier_item_when_later_item_fails()
     -> Result<(), String> {
-        use echo_agent_app_core::types::{AttachmentData, AttachmentSource};
+        use echo_agent_app_core::api::types::{AttachmentData, AttachmentSource};
 
         let temp = TestDirectory::new("durable-attachment-rollback")?;
         let attachments = vec![
@@ -3021,7 +3038,7 @@ mod tests {
         if stage_repl_projection_attachments(&attachments, temp.path()).is_ok() {
             return Err("invalid later attachment unexpectedly staged".to_string());
         }
-        let uploads = echo_agent_app_core::attachments::resolve_uploads_dir(Some(temp.path()));
+        let uploads = echo_agent_app_core::api::attachments::resolve_uploads_dir(Some(temp.path()));
         let remaining = if uploads.exists() {
             std::fs::read_dir(&uploads)
                 .map_err(|error| error.to_string())?
@@ -3050,11 +3067,11 @@ mod tests {
     #[tokio::test]
     async fn closed_registration_defers_without_steer_and_rolls_back_resources()
     -> Result<(), String> {
-        use echo_agent_app_core::chat_event_log::{ChatEventLog, ChatEventRetention};
-        use echo_agent_app_core::conversation_input::{
+        use echo_agent_app_core::api::chat_event_log::{ChatEventLog, ChatEventRetention};
+        use echo_agent_app_core::api::conversation_input::{
             ConversationInputAddress, ConversationInputPhase, ConversationInputService,
         };
-        use echo_agent_app_core::foreground_turn::{
+        use echo_agent_app_core::api::foreground_turn::{
             ForegroundTerminalProjector, ForegroundTurnControl, ForegroundTurnSurface,
         };
 
@@ -3120,7 +3137,9 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let settling = tokio::spawn(async move {
             lease
-                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+                .settle_after_observers(
+                    echo_agent_app_core::api::chat_driver::TurnOutcome::Completed,
+                )
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), observer_entered_rx)
@@ -3177,11 +3196,13 @@ mod tests {
     #[tokio::test]
     async fn fast_terminal_is_observed_after_registration_and_commits_resources()
     -> Result<(), String> {
-        use echo_agent_app_core::chat_event_log::{ChatEventLog, ChatEventRetention};
-        use echo_agent_app_core::conversation_input::{
+        use echo_agent_app_core::api::chat_event_log::{ChatEventLog, ChatEventRetention};
+        use echo_agent_app_core::api::conversation_input::{
             ConversationInputAddress, ConversationInputService,
         };
-        use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+        use echo_agent_app_core::api::foreground_turn::{
+            ForegroundTurnControl, ForegroundTurnSurface,
+        };
 
         let temp = TestDirectory::new("fast-live-terminal")?;
         let service = ConversationInputService::new(Arc::new(
@@ -3252,7 +3273,7 @@ mod tests {
             return Err("fast terminal steer was not mailbox-accepted".to_string());
         }
         lease
-            .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+            .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Completed)
             .await
             .map_err(|error| error.to_string())?;
         if !artifact_path.exists() {
@@ -3281,14 +3302,14 @@ mod tests {
     #[tokio::test]
     async fn planned_resume_with_live_steer_projects_terminal_before_foreground_release()
     -> Result<(), String> {
-        use echo_agent_app_core::chat_event_log::{ChatEventLog, ChatEventRetention};
-        use echo_agent_app_core::conversation_input::{
+        use echo_agent_app_core::api::chat_event_log::{ChatEventLog, ChatEventRetention};
+        use echo_agent_app_core::api::conversation_input::{
             ConversationInputAddress, ConversationInputService,
         };
-        use echo_agent_app_core::foreground_turn::{
+        use echo_agent_app_core::api::foreground_turn::{
             ForegroundTerminalProjector, ForegroundTurnControl, ForegroundTurnSurface,
         };
-        use echo_agent_app_core::tasks::task_runtime::{RunTurnOrigin, TaskRunResumeIdentity};
+        use echo_agent_app_core::api::tasks::task_runtime::{RunTurnOrigin, TaskRunResumeIdentity};
 
         let resume = TaskRunResumeIdentity {
             run_id: "taskrun-repl".to_string(),
@@ -3392,7 +3413,7 @@ mod tests {
         let settling = tokio::spawn(async move {
             settle_repl_planned_resume(
                 lease,
-                echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+                echo_agent_app_core::api::chat_driver::TurnOutcome::Completed,
             )
             .await
         });
@@ -3417,7 +3438,7 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
-        if planned_outcome != echo_agent_app_core::chat_driver::TurnOutcome::Completed {
+        if planned_outcome != echo_agent_app_core::api::chat_driver::TurnOutcome::Completed {
             return Err("planned resume settlement changed its terminal outcome".to_string());
         }
         if control
@@ -3444,12 +3465,14 @@ mod tests {
 
     #[tokio::test]
     async fn live_observer_failure_projects_failed_terminal_before_release() -> Result<(), String> {
-        use echo_agent_app_core::chat_event_log::{ChatEventLog, ChatEventRetention};
-        use echo_agent_app_core::conversation_input::{
+        use echo_agent_app_core::api::chat_event_log::{ChatEventLog, ChatEventRetention};
+        use echo_agent_app_core::api::conversation_input::{
             ConversationInputAddress, ConversationInputOutcome, ConversationInputPhase,
             ConversationInputService,
         };
-        use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+        use echo_agent_app_core::api::foreground_turn::{
+            ForegroundTurnControl, ForegroundTurnSurface,
+        };
 
         let temp = TestDirectory::new("live-observer-failure")?;
         let service = ConversationInputService::new(Arc::new(
@@ -3496,12 +3519,12 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
         let settlement = lease
-            .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+            .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Completed)
             .await
             .map_err(|error| error.to_string())?;
         if !matches!(
             settlement.outcome,
-            echo_agent_app_core::chat_driver::TurnOutcome::Failed(_)
+            echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(_)
         ) {
             return Err("observer failure did not replace foreground outcome".to_string());
         }
@@ -3536,7 +3559,7 @@ mod tests {
 
     #[test]
     fn input_lifecycle_render_is_a_typed_projection() {
-        use echo_agent_app_core::conversation_input::{
+        use echo_agent_app_core::api::conversation_input::{
             ConversationInputAddress, ConversationInputFact, ConversationInputIdentity,
             ConversationInputPayload,
         };
@@ -3562,8 +3585,8 @@ mod tests {
 
     #[tokio::test]
     async fn cli_conversation_input_survives_reopen_without_local_queue() -> Result<(), String> {
-        use echo_agent_app_core::chat_event_log::{ChatEventLog, ChatEventRetention};
-        use echo_agent_app_core::conversation_input::{
+        use echo_agent_app_core::api::chat_event_log::{ChatEventLog, ChatEventRetention};
+        use echo_agent_app_core::api::conversation_input::{
             ConversationInputAddress, ConversationInputService, ConversationInputSource,
             stable_scoped_input_id,
         };
@@ -3617,7 +3640,7 @@ mod tests {
     #[tokio::test]
     async fn repl_hitl_session_registers_before_bootstrap_and_rejects_on_shutdown()
     -> Result<(), String> {
-        let dispatcher = Arc::new(echo_agent_app_core::hitl::HitlDispatcher::new());
+        let dispatcher = Arc::new(echo_agent_app_core::api::hitl::HitlDispatcher::new());
         let mut session = ReplHumanLoopSession::register(Arc::clone(&dispatcher)).await;
         if dispatcher.provider_count().await != 1 {
             return Err("REPL provider was not registered by the session owner".to_string());
@@ -3660,7 +3683,7 @@ mod tests {
     #[tokio::test]
     async fn aborted_repl_owner_unregisters_exact_provider_before_reregister() -> Result<(), String>
     {
-        let dispatcher = Arc::new(echo_agent_app_core::hitl::HitlDispatcher::new());
+        let dispatcher = Arc::new(echo_agent_app_core::api::hitl::HitlDispatcher::new());
         let first = ReplHumanLoopSession::register(Arc::clone(&dispatcher)).await;
         let mut replacement = ReplHumanLoopSession::register(Arc::clone(&dispatcher)).await;
         if dispatcher.provider_count().await != 2 {
@@ -3712,7 +3735,7 @@ mod tests {
     async fn queued_follow_up_broker_handles_hitl_then_wakes_on_settlement_once()
     -> Result<(), String> {
         let (provider, mut hitl_rx, mut failure_rx) =
-            echo_agent_app_core::hitl::ReplHumanLoopProvider::channel(Arc::new(
+            echo_agent_app_core::api::hitl::ReplHumanLoopProvider::channel(Arc::new(
                 |_prompt: String| Ok(()),
             ));
         let provider = Arc::new(provider);
@@ -3721,10 +3744,10 @@ mod tests {
         let response_provider = Arc::clone(&provider);
         let response_task = tokio::spawn(async move { response_provider.request(request).await });
 
-        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let control = echo_agent_app_core::api::foreground_turn::ForegroundTurnControl::default();
         let lease = control
             .begin(
-                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                 "queued-follow-up-conversation",
                 "queued-follow-up-turn",
             )
@@ -3739,7 +3762,9 @@ mod tests {
             );
             response_flag.store(exact, Ordering::Release);
             let _ = lease
-                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+                .settle_after_observers(
+                    echo_agent_app_core::api::chat_driver::TurnOutcome::Completed,
+                )
                 .await;
             let _ = completion_tx.send(());
             0
@@ -3790,7 +3815,7 @@ mod tests {
         }
         if control
             .snapshot(
-                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                 "queued-follow-up-conversation",
             )
             .is_some()
@@ -3805,13 +3830,13 @@ mod tests {
     async fn queued_follow_up_wait_maps_injected_interrupt_to_exact_settlement()
     -> Result<(), String> {
         let (_provider, mut hitl_rx, mut failure_rx) =
-            echo_agent_app_core::hitl::ReplHumanLoopProvider::channel(Arc::new(
+            echo_agent_app_core::api::hitl::ReplHumanLoopProvider::channel(Arc::new(
                 |_prompt: String| Ok(()),
             ));
-        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let control = echo_agent_app_core::api::foreground_turn::ForegroundTurnControl::default();
         let lease = control
             .begin(
-                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                 "interrupt-conversation",
                 "interrupt-turn",
             )
@@ -3821,7 +3846,9 @@ mod tests {
         let task = tokio::spawn(async move {
             cancel.cancelled().await;
             let _ = lease
-                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled)
+                .settle_after_observers(
+                    echo_agent_app_core::api::chat_driver::TurnOutcome::Cancelled,
+                )
                 .await;
             let _ = completion_tx.send(());
             0
@@ -3871,7 +3898,7 @@ mod tests {
         if active.is_some()
             || control
                 .snapshot(
-                    echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                    echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                     "interrupt-conversation",
                 )
                 .is_some()
@@ -3887,7 +3914,7 @@ mod tests {
     async fn queued_follow_up_wait_fails_without_stdin_when_prompt_sink_fails() -> Result<(), String>
     {
         let (provider, mut hitl_rx, mut failure_rx) =
-            echo_agent_app_core::hitl::ReplHumanLoopProvider::channel(Arc::new(
+            echo_agent_app_core::api::hitl::ReplHumanLoopProvider::channel(Arc::new(
                 |_prompt: String| Err("external printer closed".to_string()),
             ));
         let response = provider
@@ -3898,10 +3925,10 @@ mod tests {
             return Err("prompt sink failure did not reject its exact request".to_string());
         }
 
-        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let control = echo_agent_app_core::api::foreground_turn::ForegroundTurnControl::default();
         let lease = control
             .begin(
-                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                 "sink-failure-conversation",
                 "sink-failure-turn",
             )
@@ -3911,7 +3938,9 @@ mod tests {
         let task = tokio::spawn(async move {
             cancel.cancelled().await;
             let _ = lease
-                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled)
+                .settle_after_observers(
+                    echo_agent_app_core::api::chat_driver::TurnOutcome::Cancelled,
+                )
                 .await;
             let _ = completion_tx.send(());
             0
@@ -3960,7 +3989,7 @@ mod tests {
         if active.is_some()
             || control
                 .snapshot(
-                    echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                    echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                     "sink-failure-conversation",
                 )
                 .is_some()
@@ -4021,8 +4050,8 @@ mod tests {
 
     #[test]
     fn extension_receipt_uses_external_output_projection() -> Result<(), String> {
-        use echo_agent_app_core::chat_driver::{ChatDriverEvent, ChatSink};
-        use echo_agent_app_core::extension_commands::{
+        use echo_agent_app_core::api::chat_driver::{ChatDriverEvent, ChatSink};
+        use echo_agent_app_core::api::extension_commands::{
             ExtensionCommandIdentity, ExtensionCommandReceipt, ExtensionKind,
         };
 
@@ -4056,7 +4085,7 @@ mod tests {
 
     #[test]
     fn terminal_outcome_projection_does_not_duplicate_stream_terminal() -> Result<(), String> {
-        use echo_agent_app_core::chat_driver::TurnOutcome;
+        use echo_agent_app_core::api::chat_driver::TurnOutcome;
 
         let (cancel_output, cancel_messages) = collecting_output();
         let cancel_sink = ReplChatSink::new(cancel_output, crate::output::OutputConfig::default());
@@ -4092,7 +4121,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_printer_settles_foreground_as_downstream_disconnect() -> Result<(), String> {
-        use echo_agent_app_core::chat_driver::{ChatSink, TurnOutcome};
+        use echo_agent_app_core::api::chat_driver::{ChatSink, TurnOutcome};
 
         let probe_printer = reedline::ExternalPrinter::new(1);
         let probe_sender = probe_printer.sender();
@@ -4107,7 +4136,7 @@ mod tests {
             ReplChatSink::new(probe_output.clone(), crate::output::OutputConfig::default());
         if ChatSink::on_event(
             &probe_sink,
-            echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::TurnStatus {
                 status: "probe".to_string(),
             },
         ) || !probe_output.delivery_failed()
@@ -4121,10 +4150,10 @@ mod tests {
         drop(printer);
         let output = ReplExternalOutput::new(move |message| sender.try_send(message).is_ok());
 
-        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let control = echo_agent_app_core::api::foreground_turn::ForegroundTurnControl::default();
         let lease = control
             .begin(
-                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                 "closed-printer-conversation",
                 "closed-printer-turn",
             )
@@ -4151,8 +4180,10 @@ mod tests {
                 .build()
                 .map_err(|error| error.to_string())?,
         );
-        let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
-            execution_scope: echo_agent_app_core::workspace::WorkspaceExecutionScope::global("."),
+        let resources = Arc::new(echo_agent_app_core::api::chat_resources::ChatResources {
+            execution_scope: echo_agent_app_core::api::workspace::WorkspaceExecutionScope::global(
+                ".",
+            ),
             workspace_io_receipt: None,
             pool: None,
             store: None,
@@ -4166,12 +4197,12 @@ mod tests {
             memory_generation: None,
             human_loop_provider: None,
         });
-        let turn = echo_agent_app_core::prepared_turn::PreparedUserTurn {
+        let turn = echo_agent_app_core::api::prepared_turn::PreparedUserTurn {
             instruction: "respond".to_string(),
             resources: Vec::new(),
-            authorship: echo_agent_app_core::prepared_turn::InstructionAuthorship::User,
+            authorship: echo_agent_app_core::api::prepared_turn::InstructionAuthorship::User,
         };
-        let outcome = echo_agent_app_core::foreground_turn::drive_foreground_chat(
+        let outcome = echo_agent_app_core::api::foreground_turn::drive_foreground_chat(
             lease, &agent, &turn, resources,
         )
         .await?;
@@ -4186,7 +4217,7 @@ mod tests {
         }
         if control
             .snapshot(
-                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                 "closed-printer-conversation",
             )
             .is_some()
@@ -4201,10 +4232,10 @@ mod tests {
     #[tokio::test]
     async fn dropping_active_turn_requests_root_cancel_and_owner_settles_registry()
     -> Result<(), String> {
-        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let control = echo_agent_app_core::api::foreground_turn::ForegroundTurnControl::default();
         let lease = control
             .begin(
-                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                 "drop-conversation",
                 "drop-turn",
             )
@@ -4217,7 +4248,9 @@ mod tests {
             let _delivered = cancelled_tx.send(());
             let _released = release_rx.await;
             let _ = lease
-                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled)
+                .settle_after_observers(
+                    echo_agent_app_core::api::chat_driver::TurnOutcome::Cancelled,
+                )
                 .await;
             0
         });
@@ -4239,7 +4272,7 @@ mod tests {
             .map_err(|_| "root cancellation observer ended early".to_string())?;
         let snapshot = control
             .snapshot(
-                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                 "drop-conversation",
             )
             .ok_or_else(|| {
@@ -4255,7 +4288,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while control
                 .snapshot(
-                    echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                    echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                     "drop-conversation",
                 )
                 .is_some()
@@ -4270,7 +4303,7 @@ mod tests {
 
     async fn assert_input_boundary_rejects_and_settles(reason: &str) -> Result<(), String> {
         let (provider, mut hitl_rx, _failure_rx) =
-            echo_agent_app_core::hitl::ReplHumanLoopProvider::channel(Arc::new(
+            echo_agent_app_core::api::hitl::ReplHumanLoopProvider::channel(Arc::new(
                 |_prompt: String| Ok(()),
             ));
         let provider = Arc::new(provider);
@@ -4284,17 +4317,17 @@ mod tests {
             .ok_or_else(|| "HITL request was not queued".to_string())?;
         let mut pending_hitl = VecDeque::from([request]);
 
-        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let control = echo_agent_app_core::api::foreground_turn::ForegroundTurnControl::default();
         let lease = control
             .begin(
-                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                 format!("conversation-{reason}"),
                 format!("turn-{reason}"),
             )
             .map_err(|error| error.to_string())?;
         let other_lease = control
             .begin(
-                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                 format!("other-conversation-{reason}"),
                 format!("other-turn-{reason}"),
             )
@@ -4303,7 +4336,9 @@ mod tests {
         let task = tokio::spawn(async move {
             cancel.cancelled().await;
             let _ = lease
-                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled)
+                .settle_after_observers(
+                    echo_agent_app_core::api::chat_driver::TurnOutcome::Cancelled,
+                )
                 .await;
             0
         });
@@ -4328,7 +4363,7 @@ mod tests {
         }
         if control
             .snapshot(
-                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                 &conversation_id,
             )
             .is_some()
@@ -4337,7 +4372,7 @@ mod tests {
         }
         if control
             .snapshot(
-                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                 other_lease.conversation_id(),
             )
             .is_none()

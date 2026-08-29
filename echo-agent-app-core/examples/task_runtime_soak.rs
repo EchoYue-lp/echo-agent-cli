@@ -10,8 +10,10 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::Utc;
 use clap::Parser;
 use echo_agent::state::journal::{CheckpointStore, FileCheckpointStore};
-use echo_agent_app_core::tasks::task_runtime::store::{RunTurnClaimOutcome, RunTurnCompletion};
-use echo_agent_app_core::tasks::task_runtime::{
+use echo_agent_app_core::api::tasks::task_runtime::store::{
+    RunTurnClaimOutcome, RunTurnCompletion,
+};
+use echo_agent_app_core::api::tasks::task_runtime::{
     Artifact, ArtifactKind, AttendedMode, BootAutoResumeOutcome, DomainProfile, ExecutionMode,
     PlanTask, PlanTaskKind, RunPauseReason, RunTurnOrigin, RunTurnStatus, TaskPlan,
     TaskRunResumeIdentity, TaskRunStatus, TaskRuntimeStore, TurnVisibility, commit_eko_task_plan,
@@ -622,7 +624,7 @@ fn validate_runtime(
     let mut fingerprints = BTreeSet::new();
     for event in &events {
         if event.event_type
-            != echo_agent_app_core::tasks::task_runtime::RuntimeEventKind::RunTurnFinished
+            != echo_agent_app_core::api::tasks::task_runtime::RuntimeEventKind::RunTurnFinished
         {
             continue;
         }

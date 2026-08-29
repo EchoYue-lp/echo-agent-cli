@@ -5,7 +5,7 @@
 use crate::cli::command::{
     CommandCategory, CommandContext, CommandOutcome, SlashCommand, SubCommandDef,
 };
-use echo_agent_app_core::tasks::BackgroundTaskKind;
+use echo_agent_app_core::api::tasks::BackgroundTaskKind;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -113,7 +113,7 @@ async fn pipeline_research(ctx: &CommandContext, args: &[&str]) -> CommandOutcom
     let kind = BackgroundTaskKind::Research {
         topic: query.clone(),
         max_papers: 20,
-        output_format: echo_agent_app_core::tasks::ResearchOutputFormat::Markdown,
+        output_format: echo_agent_app_core::api::tasks::ResearchOutputFormat::Markdown,
     };
 
     match service

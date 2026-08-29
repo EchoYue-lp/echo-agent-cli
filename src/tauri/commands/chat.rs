@@ -6,21 +6,21 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
-use echo_agent_app_core::chat_driver::ChatDriverEvent;
-use echo_agent_app_core::chat_driver::ChatSink;
-use echo_agent_app_core::chat_event_log::{
+use echo_agent_app_core::api::chat_driver::ChatDriverEvent;
+use echo_agent_app_core::api::chat_driver::ChatSink;
+use echo_agent_app_core::api::chat_event_log::{
     ChatEventEnvelope, ChatEventLog, ChatSurface, bind_surface_chat_sink,
 };
 #[cfg(test)]
-use echo_agent_app_core::conversation_input::ConversationInputPhase;
-use echo_agent_app_core::conversation_input::{
+use echo_agent_app_core::api::conversation_input::ConversationInputPhase;
+use echo_agent_app_core::api::conversation_input::{
     ConversationInputAddress, ConversationInputAttempt, ConversationInputIdentity,
     ConversationInputProjection, ConversationInputReceipt, ConversationInputSource,
     stable_scoped_input_id,
 };
-use echo_agent_app_core::tasks::task_runtime::executor::{ExecEvent, ExecEventScope};
-use echo_agent_app_core::tool_execution::{ToolExecutionRepository, ToolExecutionSummary};
-use echo_agent_app_core::tool_execution_projection::{
+use echo_agent_app_core::api::tasks::task_runtime::executor::{ExecEvent, ExecEventScope};
+use echo_agent_app_core::api::tool_execution::{ToolExecutionRepository, ToolExecutionSummary};
+use echo_agent_app_core::api::tool_execution_projection::{
     ToolExecutionProjectionKind, ToolExecutionProjectionUpdate, ToolExecutionProjector,
 };
 use futures::future::BoxFuture;
@@ -114,9 +114,9 @@ fn emit_gui_turn_status(sink: &Arc<dyn ChatSink>, status: &str) -> bool {
 }
 
 async fn settle_gui_input_attempt(
-    service: &echo_agent_app_core::conversation_input::ConversationInputService,
+    service: &echo_agent_app_core::api::conversation_input::ConversationInputService,
     attempt: &ConversationInputAttempt,
-    outcome: &echo_agent_app_core::chat_driver::TurnOutcome,
+    outcome: &echo_agent_app_core::api::chat_driver::TurnOutcome,
 ) -> Result<u64, String> {
     let receipt = service
         .settle_attempt(attempt, outcome)
@@ -132,7 +132,7 @@ pub struct SendChatMessageRequest {
     message: String,
     conversation_id: Option<String>,
     message_key: Option<String>,
-    attachments: Option<Vec<echo_agent_app_core::types::AttachmentData>>,
+    attachments: Option<Vec<echo_agent_app_core::api::types::AttachmentData>>,
     input_identity: Option<ConversationInputIdentity>,
     expected_queue_revision: Option<u64>,
 }
@@ -573,27 +573,29 @@ pub async fn send_chat_message(
     // path), so the in-memory `build_message` helper is no longer used here.
     let saved_attachments = queued_input.payload.attachments.clone();
     let (attachment_refs, mut staged_attachment_batch): (
-        Vec<echo_agent_app_core::attachments::AttachmentRef>,
-        Option<echo_agent_app_core::attachments::StagedAttachmentBatch>,
+        Vec<echo_agent_app_core::api::attachments::AttachmentRef>,
+        Option<echo_agent_app_core::api::attachments::StagedAttachmentBatch>,
     ) = if saved_attachments.is_empty() {
         (Vec::new(), None)
     } else {
-        let uploads_dir = echo_agent_app_core::attachments::resolve_uploads_dir(Some(&ws_root));
-        let saved =
-            echo_agent_app_core::attachments::save_attachments(&saved_attachments, &uploads_dir)
-                .map_err(|error| {
-                    IpcError::Validation(format!("Failed to stage attachments: {error}"))
-                })?;
+        let uploads_dir =
+            echo_agent_app_core::api::attachments::resolve_uploads_dir(Some(&ws_root));
+        let saved = echo_agent_app_core::api::attachments::save_attachments(
+            &saved_attachments,
+            &uploads_dir,
+        )
+        .map_err(|error| IpcError::Validation(format!("Failed to stage attachments: {error}")))?;
         // Build refs (path + name + mime) for binding to the run so plan-level
         // subagents can rebuild the multimodal message later, and so the
         // PreparedUserTurn can re-read them for inline delivery.
         let refs = saved
             .iter()
             .map(|(path, att)| {
-                echo_agent_app_core::attachments::AttachmentRef::from_saved(path.clone(), att)
+                echo_agent_app_core::api::attachments::AttachmentRef::from_saved(path.clone(), att)
             })
             .collect();
-        let batch = echo_agent_app_core::attachments::StagedAttachmentBatch::from_saved(&saved);
+        let batch =
+            echo_agent_app_core::api::attachments::StagedAttachmentBatch::from_saved(&saved);
         (refs, Some(batch))
     };
     if !attachment_refs.is_empty() {
@@ -619,7 +621,7 @@ pub async fn send_chat_message(
     // abandon).
     let in_progress_run = if let Some(store) = scoped_runtime.task_runtime() {
         let conv_id = conversation_id.clone();
-        echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+        echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
             .run_store("load GUI in-progress TaskRun", move |store| {
                 store.find_in_progress_run_by_conversation(&conv_id)
             })
@@ -632,8 +634,8 @@ pub async fn send_chat_message(
     if let Some(existing) = in_progress_run
         && matches!(
             existing.status,
-            echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Running
-                | echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Paused
+            echo_agent_app_core::api::tasks::task_runtime::TaskRunStatus::Running
+                | echo_agent_app_core::api::tasks::task_runtime::TaskRunStatus::Paused
         )
     {
         let conv_id = existing.conversation_id.clone();
@@ -663,16 +665,18 @@ pub async fn send_chat_message(
     let foreground_lease = match scoped_runtime
         .begin_turn(
             &state.app_state.session.foreground_turns,
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
             &active_turn_key,
             message_key.clone(),
         )
         .await
     {
         Ok(lease) => lease,
-        Err(echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
-            echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy { .. },
-        )) => {
+        Err(
+            echo_agent_app_core::api::conversation_deletion::ConversationDeletionError::Foreground(
+                echo_agent_app_core::api::foreground_turn::ForegroundTurnError::Busy { .. },
+            ),
+        ) => {
             return Ok(serde_json::json!({
                 "kind": "queued",
                 "workspace_id": workspace_id,
@@ -698,7 +702,7 @@ pub async fn send_chat_message(
     // to <1% because every request is treated as from a different user).
     // Persisted to ~/.eko/cache_user_id — generated once, reused forever.
     {
-        let cache_id = echo_agent_app_core::infra::load_or_create_cache_user_id();
+        let cache_id = echo_agent_app_core::api::infra::load_or_create_cache_user_id();
         agent_handle
             .write_async(|a| {
                 Box::pin(async move {
@@ -722,7 +726,7 @@ pub async fn send_chat_message(
             })
         })
         .await;
-    let browser_approval_address = echo_agent_app_core::browser::BrowserApprovalAddress::new(
+    let browser_approval_address = echo_agent_app_core::api::browser::BrowserApprovalAddress::new(
         workspace_id.clone(),
         active_turn_key.clone(),
     );
@@ -744,9 +748,9 @@ pub async fn send_chat_message(
     // spilled to user-input artifacts). Replaces the old
     // (message, multimodal_message) pair handed to drive_chat.
     let spill_dir =
-        echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(&ws_root));
-    let prepared_turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
-        echo_agent_app_core::prepared_turn::UserTurnInput {
+        echo_agent_app_core::api::prepared_turn::resolve_user_input_spill_dir(Some(&ws_root));
+    let prepared_turn = match echo_agent_app_core::api::prepared_turn::PreparedUserTurn::build(
+        echo_agent_app_core::api::prepared_turn::UserTurnInput {
             text: &queued_input.payload.text,
             attachments: &attachment_refs,
             spill_dir: &spill_dir,
@@ -758,7 +762,7 @@ pub async fn send_chat_message(
         Err(e) => {
             tracing::warn!(error = %e, "failed to prepare user turn");
             let settlement_error = foreground_lease
-                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
                     echo_agent::error::AgentFailure::message("prepared_turn", e.to_string()),
                 ))
                 .await
@@ -776,7 +780,7 @@ pub async fn send_chat_message(
             )));
         }
     };
-    let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+    let res = std::sync::Arc::new(echo_agent_app_core::api::chat_resources::ChatResources {
         execution_scope: scoped_runtime.execution_scope().clone(),
         workspace_io_receipt: Some(scoped_runtime.workspace_io_receipt()),
         pool: scoped_runtime.pool(),
@@ -798,7 +802,9 @@ pub async fn send_chat_message(
         Ok(started) => started,
         Err(error) => {
             let settlement_error = foreground_lease
-                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled)
+                .settle_after_observers(
+                    echo_agent_app_core::api::chat_driver::TurnOutcome::Cancelled,
+                )
                 .await
                 .err();
             browser_approval_registration.close().await;
@@ -836,7 +842,7 @@ pub async fn send_chat_message(
     let observer_app = app.clone();
     let observer_log = state.app_state.storage.chat_events.clone();
     let observer_after_cursor = started_input.receipt.queue_revision;
-    let input_observer: echo_agent_app_core::chat_driver::InputReceiptObserver =
+    let input_observer: echo_agent_app_core::api::chat_driver::InputReceiptObserver =
         Arc::new(move |receipt| {
             let service = observer_service.clone();
             let attempt = observer_attempt.clone();
@@ -875,34 +881,35 @@ pub async fn send_chat_message(
         // files re-read from disk via refs). Background runs created by
         // create_complex_task pick up attachments via ChatResources.attachments
         // (already bound above).
-        let outcome = echo_agent_app_core::foreground_turn::drive_foreground_chat_with_ingress(
-            foreground_lease,
-            &agent_handle_clone,
-            &prepared_turn,
-            res,
-            input_observer,
-            move |outcome| {
-                let service = terminal_service.clone();
-                let address = terminal_address.clone();
-                let attempt = terminal_attempt.clone();
-                let app = durable_app.clone();
-                let log = durable_log.clone();
-                async move {
-                    let after_cursor =
-                        settle_gui_input_attempt(&service, &attempt, &outcome).await?;
-                    if let Err(error) = emit_conversation_input_lifecycle_after(
-                        &app,
-                        log.as_ref(),
-                        &address,
-                        after_cursor,
-                    ) {
-                        record_gui_transport_debt("terminal_input_lifecycle", error);
+        let outcome =
+            echo_agent_app_core::api::foreground_turn::drive_foreground_chat_with_ingress(
+                foreground_lease,
+                &agent_handle_clone,
+                &prepared_turn,
+                res,
+                input_observer,
+                move |outcome| {
+                    let service = terminal_service.clone();
+                    let address = terminal_address.clone();
+                    let attempt = terminal_attempt.clone();
+                    let app = durable_app.clone();
+                    let log = durable_log.clone();
+                    async move {
+                        let after_cursor =
+                            settle_gui_input_attempt(&service, &attempt, &outcome).await?;
+                        if let Err(error) = emit_conversation_input_lifecycle_after(
+                            &app,
+                            log.as_ref(),
+                            &address,
+                            after_cursor,
+                        ) {
+                            record_gui_transport_debt("terminal_input_lifecycle", error);
+                        }
+                        Ok(())
                     }
-                    Ok(())
-                }
-            },
-        )
-        .await;
+                },
+            )
+            .await;
         let terminal_status = match &outcome {
             Ok(terminal_outcome) => {
                 let status = terminal_outcome.status();
@@ -922,7 +929,7 @@ pub async fn send_chat_message(
         agent_handle_clone
             .write_async(|agent| {
                 Box::pin(async move {
-                    let empty = Arc::new(echo_agent_app_core::hitl::HitlDispatcher::new());
+                    let empty = Arc::new(echo_agent_app_core::api::hitl::HitlDispatcher::new());
                     agent.set_human_loop_provider_preserving_approvals(empty);
                 })
             })
@@ -1004,23 +1011,24 @@ pub async fn steer_chat_message(
         .ok_or_else(|| IpcError::Validation("queued input is no longer pending".to_string()))?;
     let saved_attachments = queued.payload.attachments.clone();
     let ws_root = scoped_runtime.execution_scope().root();
-    let uploads_dir = echo_agent_app_core::attachments::resolve_uploads_dir(Some(ws_root));
-    let saved =
-        echo_agent_app_core::attachments::save_attachments(&saved_attachments, &uploads_dir)
-            .map_err(|error| {
-                IpcError::Validation(format!("Failed to stage attachments: {error}"))
-            })?;
+    let uploads_dir = echo_agent_app_core::api::attachments::resolve_uploads_dir(Some(ws_root));
+    let saved = echo_agent_app_core::api::attachments::save_attachments(
+        &saved_attachments,
+        &uploads_dir,
+    )
+    .map_err(|error| IpcError::Validation(format!("Failed to stage attachments: {error}")))?;
     let mut staged_attachment_batch =
-        Some(echo_agent_app_core::attachments::StagedAttachmentBatch::from_saved(&saved));
+        Some(echo_agent_app_core::api::attachments::StagedAttachmentBatch::from_saved(&saved));
     let attachment_refs: Vec<_> = saved
         .iter()
         .map(|(path, att)| {
-            echo_agent_app_core::attachments::AttachmentRef::from_saved(path.clone(), att)
+            echo_agent_app_core::api::attachments::AttachmentRef::from_saved(path.clone(), att)
         })
         .collect();
-    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(ws_root));
-    let prepared = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
-        echo_agent_app_core::prepared_turn::UserTurnInput {
+    let spill_dir =
+        echo_agent_app_core::api::prepared_turn::resolve_user_input_spill_dir(Some(ws_root));
+    let prepared = match echo_agent_app_core::api::prepared_turn::PreparedUserTurn::build(
+        echo_agent_app_core::api::prepared_turn::UserTurnInput {
             text: &queued.payload.text,
             attachments: &attachment_refs,
             spill_dir: &spill_dir,
@@ -1103,7 +1111,7 @@ pub async fn steer_chat_message(
     let terminal_attempt = attempt.clone();
     let terminal_app = app.clone();
     let terminal_log = state.app_state.storage.chat_events.clone();
-    let terminal_projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+    let terminal_projector: echo_agent_app_core::api::foreground_turn::ForegroundTerminalProjector =
         Arc::new(move |outcome| {
             let service = terminal_service.clone();
             let address = terminal_address.clone();
@@ -1215,7 +1223,7 @@ pub async fn steer_chat_message(
         .foreground_turns
         .supervise_input_lifecycle_scoped(
             &workspace_id,
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
             &conversation_id,
             &expected_turn_id,
             observer,
@@ -1256,11 +1264,11 @@ pub async fn steer_chat_message(
 }
 
 fn select_active_chat_turn(
-    control: &echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    control: &echo_agent_app_core::api::foreground_turn::ForegroundTurnControl,
     workspace_id: &str,
     conversation_id: Option<&str>,
-) -> Result<Option<echo_agent_app_core::foreground_turn::ForegroundTurnSnapshot>, IpcError> {
-    use echo_agent_app_core::foreground_turn::ForegroundTurnSurface;
+) -> Result<Option<echo_agent_app_core::api::foreground_turn::ForegroundTurnSnapshot>, IpcError> {
+    use echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface;
 
     if let Some(conversation_id) = conversation_id {
         return Ok(control.snapshot_scoped(
@@ -1292,7 +1300,7 @@ pub async fn get_active_chat_turn(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
     conversation_id: Option<String>,
-) -> Result<Option<echo_agent_app_core::foreground_turn::ForegroundTurnSnapshot>, IpcError> {
+) -> Result<Option<echo_agent_app_core::api::foreground_turn::ForegroundTurnSnapshot>, IpcError> {
     select_active_chat_turn(
         &state.app_state.session.foreground_turns,
         &workspace_id,
@@ -1308,7 +1316,7 @@ pub async fn replay_chat_events(
     conversation_id: Option<String>,
     message_key: Option<String>,
     after_cursor: Option<u64>,
-) -> Result<echo_agent_app_core::chat_event_log::ChatEventReplay, IpcError> {
+) -> Result<echo_agent_app_core::api::chat_event_log::ChatEventReplay, IpcError> {
     let turn_id = message_key
         .or_else(|| conversation_id.clone())
         .filter(|value| !value.trim().is_empty())
@@ -1381,7 +1389,7 @@ pub async fn queue_chat_input(
     conversation_id: String,
     external_id: String,
     text: String,
-    attachments: Option<Vec<echo_agent_app_core::types::AttachmentData>>,
+    attachments: Option<Vec<echo_agent_app_core::api::types::AttachmentData>>,
 ) -> Result<ConversationInputReceipt, IpcError> {
     validate_queue_address(&state, &workspace_id, &conversation_id).await?;
     let address = conversation_input_address(&workspace_id, &conversation_id);
@@ -1417,7 +1425,7 @@ pub async fn list_queued_chat_inputs(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
     conversation_id: String,
-) -> Result<echo_agent_app_core::conversation_input::ConversationInputFrontier, IpcError> {
+) -> Result<echo_agent_app_core::api::conversation_input::ConversationInputFrontier, IpcError> {
     validate_queue_address(&state, &workspace_id, &conversation_id).await?;
     state
         .app_state
@@ -1489,13 +1497,15 @@ pub async fn reorder_queued_chat_inputs(
 
 /// Cancel an active chat stream.
 fn request_chat_cancel(
-    control: &echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    control: &echo_agent_app_core::api::foreground_turn::ForegroundTurnControl,
     workspace_id: &str,
     conversation_id: &str,
     root_turn_id: &str,
-) -> Result<Option<echo_agent_app_core::foreground_turn::ForegroundTurnSettlementWaiter>, IpcError>
-{
-    use echo_agent_app_core::foreground_turn::{ForegroundTurnError, ForegroundTurnSurface};
+) -> Result<
+    Option<echo_agent_app_core::api::foreground_turn::ForegroundTurnSettlementWaiter>,
+    IpcError,
+> {
+    use echo_agent_app_core::api::foreground_turn::{ForegroundTurnError, ForegroundTurnSurface};
 
     match control.request_root_cancel_scoped(
         workspace_id,
@@ -1551,7 +1561,7 @@ pub async fn cancel_chat(
     if let Some(expected_active_turn_id) = expected_active_turn_id
         && let Some(snapshot) = state.app_state.session.foreground_turns.snapshot_scoped(
             &workspace_id,
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
             &conversation_id,
         )
         && snapshot.active_turn_id != expected_active_turn_id
@@ -1827,7 +1837,9 @@ impl TauriExecutionProjector {
     pub(crate) fn new(
         app: tauri::AppHandle,
         tool_executions: Arc<ToolExecutionRepository>,
-        task_runtime_store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+        task_runtime_store: Option<
+            Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
+        >,
     ) -> Self {
         Self {
             app: Some(app),
@@ -1855,7 +1867,9 @@ impl TauriExecutionProjector {
     #[cfg(test)]
     fn without_app(
         tool_executions: Arc<ToolExecutionRepository>,
-        task_runtime_store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+        task_runtime_store: Option<
+            Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
+        >,
     ) -> Self {
         Self {
             app: None,
@@ -1902,7 +1916,7 @@ pub(crate) fn tauri_chat_sink(
     workspace_id: String,
     message_key: String,
     conversation_id: Option<String>,
-    tool_executions: Arc<echo_agent_app_core::tool_execution::ToolExecutionRepository>,
+    tool_executions: Arc<echo_agent_app_core::api::tool_execution::ToolExecutionRepository>,
     chat_events: Arc<ChatEventLog>,
 ) -> Arc<dyn ChatSink> {
     let envelope_app = app.clone();
@@ -1955,7 +1969,7 @@ fn lock_std<'a, T>(mutex: &'a StdMutex<T>, label: &str) -> StdMutexGuard<'a, T> 
     })
 }
 
-impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
+impl echo_agent_app_core::api::chat_driver::ChatSink for TauriChatSink {
     fn on_event(&self, _event: ChatDriverEvent) -> bool {
         tracing::error!("TauriChatSink received an event before the ordered chat journal boundary");
         false
@@ -1980,8 +1994,8 @@ mod chat_sink_contract_tests {
     use super::*;
     use echo_agent::agent::{AgentEvent, EventEnvelope, EventIdentity, ToolInvocation};
     use echo_agent::tools::ToolResult;
-    use echo_agent_app_core::chat_event_log::ChatEventRetention;
-    use echo_agent_app_core::tool_execution::ToolExecutionStatus;
+    use echo_agent_app_core::api::chat_event_log::ChatEventRetention;
+    use echo_agent_app_core::api::tool_execution::ToolExecutionStatus;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2058,7 +2072,8 @@ mod chat_sink_contract_tests {
             temp.path().join("pre-driver-ingress"),
             ChatEventRetention::default(),
         )?);
-        let service = echo_agent_app_core::conversation_input::ConversationInputService::new(log);
+        let service =
+            echo_agent_app_core::api::conversation_input::ConversationInputService::new(log);
         let address = conversation_input_address("workspace-1", "conversation-1");
         let persisted = service
             .submit(
@@ -2081,7 +2096,7 @@ mod chat_sink_contract_tests {
         settle_gui_input_attempt(
             &service,
             &attempt,
-            &echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+            &echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
                 echo_agent::error::AgentFailure::message(
                     "pre_driver",
                     "driver preparation failed before observer invocation",
@@ -2108,7 +2123,7 @@ mod chat_sink_contract_tests {
         let temp = TestDir::new()?;
         let root = temp.path().join("exact-projector-eviction");
         let log = Arc::new(ChatEventLog::open(&root, ChatEventRetention::default())?);
-        let service = echo_agent_app_core::conversation_input::ConversationInputService::new(
+        let service = echo_agent_app_core::api::conversation_input::ConversationInputService::new(
             Arc::clone(&log),
         );
         let address = conversation_input_address("workspace-1", "conversation-held");
@@ -2149,14 +2164,14 @@ mod chat_sink_contract_tests {
         settle_gui_input_attempt(
             &service,
             &attempt,
-            &echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+            &echo_agent_app_core::api::chat_driver::TurnOutcome::Completed,
         )
         .await?;
         assert!(service.list(&address).await?.items.is_empty());
         drop(service);
         drop(log);
 
-        let reopened = echo_agent_app_core::conversation_input::ConversationInputService::new(
+        let reopened = echo_agent_app_core::api::conversation_input::ConversationInputService::new(
             Arc::new(ChatEventLog::open(&root, ChatEventRetention::default())?),
         );
         assert!(reopened.list(&address).await?.items.is_empty());
@@ -2183,7 +2198,8 @@ mod chat_sink_contract_tests {
             temp.path().join("live-terminal-projector"),
             ChatEventRetention::default(),
         )?);
-        let service = echo_agent_app_core::conversation_input::ConversationInputService::new(log);
+        let service =
+            echo_agent_app_core::api::conversation_input::ConversationInputService::new(log);
         let address = conversation_input_address("workspace-1", "conversation-live");
         let persisted = service
             .submit(
@@ -2202,16 +2218,16 @@ mod chat_sink_contract_tests {
             )
             .await?;
         let attempt = conversation_input_attempt(&started)?;
-        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let control = echo_agent_app_core::api::foreground_turn::ForegroundTurnControl::default();
         let lease = control.begin_scoped(
             "workspace-1",
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
             "conversation-live",
             "turn-live",
         )?;
         let waiter = control.settlement_waiter_scoped(
             "workspace-1",
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
             "conversation-live",
             "turn-live",
         )?;
@@ -2221,7 +2237,7 @@ mod chat_sink_contract_tests {
         let projector_release = Arc::new(tokio::sync::Notify::new());
         let entered_for_projector = Arc::clone(&projector_entered);
         let release_for_projector = Arc::clone(&projector_release);
-        let projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+        let projector: echo_agent_app_core::api::foreground_turn::ForegroundTerminalProjector =
             Arc::new(move |outcome| {
                 let service = projector_service.clone();
                 let attempt = projector_attempt.clone();
@@ -2237,7 +2253,7 @@ mod chat_sink_contract_tests {
             });
         control.supervise_input_lifecycle_scoped(
             "workspace-1",
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
             "conversation-live",
             "turn-live",
             async { Ok(()) },
@@ -2245,7 +2261,9 @@ mod chat_sink_contract_tests {
         )?;
         let settling = tokio::spawn(async move {
             lease
-                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+                .settle_after_observers(
+                    echo_agent_app_core::api::chat_driver::TurnOutcome::Completed,
+                )
                 .await
         });
         projector_entered.notified().await;
@@ -2267,7 +2285,7 @@ mod chat_sink_contract_tests {
         let settlement = waiting.await?;
         assert_eq!(
             settlement.outcome,
-            echo_agent_app_core::chat_driver::TurnOutcome::Completed
+            echo_agent_app_core::api::chat_driver::TurnOutcome::Completed
         );
         Ok(())
     }
@@ -2280,7 +2298,8 @@ mod chat_sink_contract_tests {
             temp.path().join("live-observer-failure"),
             ChatEventRetention::default(),
         )?);
-        let service = echo_agent_app_core::conversation_input::ConversationInputService::new(log);
+        let service =
+            echo_agent_app_core::api::conversation_input::ConversationInputService::new(log);
         let address = conversation_input_address("workspace-1", "conversation-failure");
         let persisted = service
             .submit(
@@ -2299,16 +2318,16 @@ mod chat_sink_contract_tests {
             )
             .await?;
         let attempt = conversation_input_attempt(&started)?;
-        let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
+        let control = echo_agent_app_core::api::foreground_turn::ForegroundTurnControl::default();
         let lease = control.begin_scoped(
             "workspace-1",
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
             "conversation-failure",
             "turn-live-failure",
         )?;
         let waiter = control.settlement_waiter_scoped(
             "workspace-1",
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
             "conversation-failure",
             "turn-live-failure",
         )?;
@@ -2316,7 +2335,7 @@ mod chat_sink_contract_tests {
         let observer_attempt = attempt.clone();
         let projector_service = service.clone();
         let projector_attempt = attempt;
-        let projector: echo_agent_app_core::foreground_turn::ForegroundTerminalProjector =
+        let projector: echo_agent_app_core::api::foreground_turn::ForegroundTerminalProjector =
             Arc::new(move |outcome| {
                 let service = projector_service.clone();
                 let attempt = projector_attempt.clone();
@@ -2328,7 +2347,7 @@ mod chat_sink_contract_tests {
             });
         control.supervise_input_lifecycle_scoped(
             "workspace-1",
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
             "conversation-failure",
             "turn-live-failure",
             async move {
@@ -2344,13 +2363,15 @@ mod chat_sink_contract_tests {
 
         let settlement = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            lease.settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed),
+            lease.settle_after_observers(
+                echo_agent_app_core::api::chat_driver::TurnOutcome::Completed,
+            ),
         )
         .await
         .map_err(|_| std::io::Error::other("GUI observer settlement exceeded its bound"))??;
         assert!(matches!(
             settlement.outcome,
-            echo_agent_app_core::chat_driver::TurnOutcome::Failed(_)
+            echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(_)
         ));
         let observed = tokio::time::timeout(std::time::Duration::from_secs(1), waiter.wait())
             .await
@@ -2722,9 +2743,11 @@ mod hitl_pending_tests {
 #[cfg(test)]
 mod execution_projector_tests {
     use super::*;
-    use echo_agent_app_core::tasks::task_runtime::types::RuntimeEventKind;
-    use echo_agent_app_core::tasks::task_runtime::{AttendedMode, DomainProfile, TaskRuntimeStore};
-    use echo_agent_app_core::tool_execution::ToolExecutionStatus;
+    use echo_agent_app_core::api::tasks::task_runtime::types::RuntimeEventKind;
+    use echo_agent_app_core::api::tasks::task_runtime::{
+        AttendedMode, DomainProfile, TaskRuntimeStore,
+    };
+    use echo_agent_app_core::api::tool_execution::ToolExecutionStatus;
     use std::path::{Path, PathBuf};
 
     struct TestDir(PathBuf);
@@ -2893,7 +2916,7 @@ mod execution_projector_tests {
 #[cfg(test)]
 mod foreground_turn_command_tests {
     use super::*;
-    use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+    use echo_agent_app_core::api::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
 
     #[tokio::test]
     async fn active_snapshot_returns_real_message_scope_without_product_conversation()
@@ -2906,7 +2929,7 @@ mod foreground_turn_command_tests {
         assert_eq!(snapshot.root_turn_id, "turn-1");
         assert_eq!(snapshot.active_turn_id, "turn-1");
         lease
-            .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+            .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Completed)
             .await?;
         Ok(())
     }
@@ -2927,10 +2950,10 @@ mod foreground_turn_command_tests {
         assert_eq!(snapshot.root_turn_id, "turn-2");
         assert_eq!(snapshot.active_turn_id, "turn-2");
         first
-            .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+            .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Completed)
             .await?;
         second
-            .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+            .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Completed)
             .await?;
         Ok(())
     }
@@ -2946,7 +2969,7 @@ mod foreground_turn_command_tests {
             "turn-1",
         )?;
         lease
-            .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+            .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Completed)
             .await?;
 
         let waiter = request_chat_cancel(&control, "workspace-1", "conversation-1", "turn-1")?;
@@ -2977,7 +3000,7 @@ mod foreground_turn_command_tests {
         ));
         assert!(!lease.cancellation_token().is_cancelled());
         lease
-            .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Completed)
+            .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Completed)
             .await?;
         Ok(())
     }

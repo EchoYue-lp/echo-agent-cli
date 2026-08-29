@@ -38,11 +38,11 @@ impl Widget for StatusBar {
         } else {
             None
         };
-        let ring = echo_agent_app_core::context_window::render_ring_char(pct);
-        let tier = echo_agent_app_core::context_window::usage_tier(pct);
+        let ring = echo_agent_app_core::api::context_window::render_ring_char(pct);
+        let tier = echo_agent_app_core::api::context_window::usage_tier(pct);
         let ctx_color = match tier {
-            echo_agent_app_core::context_window::UsageTier::Critical => t.red,
-            echo_agent_app_core::context_window::UsageTier::High => t.yellow,
+            echo_agent_app_core::api::context_window::UsageTier::Critical => t.red,
+            echo_agent_app_core::api::context_window::UsageTier::High => t.yellow,
             _ => t.subtext,
         };
         let cache_span = match app.usage_accumulator.cache_hit_rate() {
@@ -54,17 +54,19 @@ impl Widget for StatusBar {
         };
         let context_span = if ctx.is_available() {
             let used_str =
-                echo_agent_app_core::context_window::format_token_count(ctx.input_tokens);
-            let win_str =
-                echo_agent_app_core::context_window::format_token_count(ctx.context_window_size);
+                echo_agent_app_core::api::context_window::format_token_count(ctx.input_tokens);
+            let win_str = echo_agent_app_core::api::context_window::format_token_count(
+                ctx.context_window_size,
+            );
             match pct {
                 Some(p) => format!("{} {}/{} {}%{}", ring, used_str, win_str, p, cache_span),
                 None => format!("{} {}{}", ring, used_str, cache_span),
             }
         } else {
             // 首次响应前 / 刚压缩后：占用占位；cache 率可能仍有值（压缩不清 Accumulator）。
-            let win_str =
-                echo_agent_app_core::context_window::format_token_count(ctx.context_window_size);
+            let win_str = echo_agent_app_core::api::context_window::format_token_count(
+                ctx.context_window_size,
+            );
             format!("{} --/{}{}", ring, win_str, cache_span)
         };
         let sidebar_hint = if app.sidebar_visible {

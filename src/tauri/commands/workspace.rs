@@ -3,12 +3,12 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 #[cfg(test)]
-use echo_agent_app_core::workspace::Workspace;
+use echo_agent_app_core::api::workspace::Workspace;
 #[cfg(test)]
-use echo_agent_app_core::workspace::WorkspaceId;
-use echo_agent_app_core::workspace::WorkspaceKind;
+use echo_agent_app_core::api::workspace::WorkspaceId;
+use echo_agent_app_core::api::workspace::WorkspaceKind;
 #[cfg(test)]
-use echo_agent_app_core::workspace::registry::WorkspaceRegistry;
+use echo_agent_app_core::api::workspace::registry::WorkspaceRegistry;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -51,8 +51,8 @@ fn create_or_open_workspace(
 }
 
 async fn switch_opened_workspace(
-    app_state: &Arc<echo_agent_app_core::AppState>,
-    workspace_id: echo_agent_app_core::workspace::WorkspaceId,
+    app_state: &Arc<echo_agent_app_core::api::AppState>,
+    workspace_id: echo_agent_app_core::api::workspace::WorkspaceId,
 ) -> Result<serde_json::Value, IpcError> {
     let transition = app_state
         .switch_workspace_registered(workspace_id.clone())
@@ -209,7 +209,7 @@ pub async fn get_workspace(
     state: tauri::State<'_, TauriState>,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let ws_id = echo_agent_app_core::workspace::WorkspaceId::from_raw(id);
+    let ws_id = echo_agent_app_core::api::workspace::WorkspaceId::from_raw(id);
     let registry = Arc::clone(&state.app_state.workspace.registry);
     match state
         .app_state
@@ -241,7 +241,7 @@ pub async fn delete_workspace(
     state: tauri::State<'_, TauriState>,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let ws_id = echo_agent_app_core::workspace::WorkspaceId::from_raw(id.clone());
+    let ws_id = echo_agent_app_core::api::workspace::WorkspaceId::from_raw(id.clone());
 
     state
         .app_state
@@ -260,7 +260,7 @@ pub async fn switch_workspace(
     state: tauri::State<'_, TauriState>,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let ws_id = echo_agent_app_core::workspace::WorkspaceId::from_raw(id.clone());
+    let ws_id = echo_agent_app_core::api::workspace::WorkspaceId::from_raw(id.clone());
     switch_opened_workspace(&state.app_state, ws_id)
         .await
         .map_err(|error| match error {
@@ -361,7 +361,7 @@ pub async fn link_project(
     id: String,
     path: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let ws_id = echo_agent_app_core::workspace::WorkspaceId::from_raw(id);
+    let ws_id = echo_agent_app_core::api::workspace::WorkspaceId::from_raw(id);
     let project_path = std::path::PathBuf::from(&path);
 
     match state

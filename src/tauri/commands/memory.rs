@@ -8,8 +8,8 @@ use crate::tauri::state::TauriState;
 use echo_agent::evolution::MemoryLayer;
 use echo_agent::evolution::MemoryLayerManager;
 use echo_agent::memory::{MemoryFilter, MemoryMeta, MemorySource, MemoryType, TypedMemoryEntry};
-use echo_agent_app_core::evolution::ReviewGenerationLease;
-use echo_agent_app_core::reflection::ReflectionReceipt;
+use echo_agent_app_core::api::evolution::ReviewGenerationLease;
+use echo_agent_app_core::api::reflection::ReflectionReceipt;
 use std::sync::Arc;
 
 const AGENT_MEMORY_NAMESPACE: &str = "agent/memories";
@@ -288,11 +288,15 @@ pub async fn reflect_session(
     };
     let agent = execution
         .as_ref()
-        .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+        .map(echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease::agent)
         .unwrap_or_else(|| runtime.primary_agent());
-    echo_agent_app_core::reflection::reflect_session(&runtime, &agent, conversation_id.as_deref())
-        .await
-        .map_err(|error| IpcError::Internal(error.to_string()))
+    echo_agent_app_core::api::reflection::reflect_session(
+        &runtime,
+        &agent,
+        conversation_id.as_deref(),
+    )
+    .await
+    .map_err(|error| IpcError::Internal(error.to_string()))
 }
 
 #[cfg(test)]
@@ -329,9 +333,10 @@ mod tests {
 
     #[test]
     fn reflection_receipt_keeps_typed_gui_wire_fields() -> Result<(), String> {
-        let value =
-            serde_json::to_value(echo_agent_app_core::reflection::reflection_receipt_fixture())
-                .map_err(|error| error.to_string())?;
-        echo_agent_app_core::reflection::validate_reflection_receipt_wire(&value)
+        let value = serde_json::to_value(
+            echo_agent_app_core::api::reflection::reflection_receipt_fixture(),
+        )
+        .map_err(|error| error.to_string())?;
+        echo_agent_app_core::api::reflection::validate_reflection_receipt_wire(&value)
     }
 }

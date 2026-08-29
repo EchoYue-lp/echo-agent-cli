@@ -7,19 +7,19 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use echo_agent_app_core::agent_control::{
+use echo_agent_app_core::api::agent_control::{
     AgentControlError, AgentControlService, AgentMessageDelivery, AgentMessageRequest, AgentTarget,
     TaskSubagentTarget,
 };
-use echo_agent_app_core::agent_router::AgentRouter;
-use echo_agent_app_core::subagent_loader::{SubagentCatalogSnapshot, discover_subagents};
-use echo_agent_app_core::tasks::task_runtime::task_tools::TaskCapabilityCatalog;
-use echo_agent_app_core::tasks::task_runtime::{
+use echo_agent_app_core::api::agent_router::AgentRouter;
+use echo_agent_app_core::api::subagent_loader::{SubagentCatalogSnapshot, discover_subagents};
+use echo_agent_app_core::api::tasks::task_runtime::task_tools::TaskCapabilityCatalog;
+use echo_agent_app_core::api::tasks::task_runtime::{
     AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPatch, TaskPlan,
     TaskRunStatus, TaskRuntimeStore, TaskUpdateOperation, TaskUpdateRequest, apply_eko_task_update,
     build_eko_task_revision_service, commit_eko_task_plan, task_goal_sha256,
 };
-use echo_agent_app_core::workspace::registry::WorkspaceRegistry;
+use echo_agent_app_core::api::workspace::registry::WorkspaceRegistry;
 
 fn task_plan(run_id: &str) -> TaskPlan {
     TaskPlan {

@@ -5,14 +5,14 @@
 
 use crate::{cli, infra};
 use clap::Parser;
-use echo_agent_app_core::config;
+use echo_agent_app_core::api::config;
 use std::ffi::OsString;
 use std::sync::Arc;
 
 /// Crash log path — written to when the app panics before Tauri starts.
 /// This is the only way to debug silent crashes on macOS (no terminal attached).
 fn crash_log_path() -> std::path::PathBuf {
-    echo_agent_app_core::data_root::user_data_path("crash.log")
+    echo_agent_app_core::api::data_root::user_data_path("crash.log")
 }
 
 /// Install a panic hook that writes the panic message to a crash log file.
@@ -135,7 +135,7 @@ async fn run_desktop() -> anyhow::Result<()> {
     let configured_mcp_path = app_config.mcp.config_path.clone();
     // Resolve MCP before the generic environment overlay copies
     // MCP_CONFIG_PATH into EkoConfig. This preserves CLI > YAML > env.
-    let mcp_config_path = echo_agent_app_core::mcp_config_runtime::resolve_mcp_config_path(
+    let mcp_config_path = echo_agent_app_core::api::mcp_config_runtime::resolve_mcp_config_path(
         args.mcp_config.as_deref(),
         &app_config,
     );
@@ -166,11 +166,14 @@ async fn run_desktop() -> anyhow::Result<()> {
         execution_scope: None,
     };
 
-    let runtime =
-        echo_agent_app_core::runtime::AgentRuntime::bootstrap(&app_config, params, mcp_config_path)
-            .await?;
+    let runtime = echo_agent_app_core::api::runtime::AgentRuntime::bootstrap(
+        &app_config,
+        params,
+        mcp_config_path,
+    )
+    .await?;
     let conversation_store = infra::create_conversation_store();
-    let mut services = echo_agent_app_core::runtime::ApplicationServices::compose(
+    let mut services = echo_agent_app_core::api::runtime::ApplicationServices::compose(
         &runtime,
         args.config.as_deref(),
         conversation_store,
@@ -207,7 +210,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         .map(|error| anyhow::anyhow!("error while running Tauri application: {error}"));
     let receipt = services
         .settle(
-            echo_agent_app_core::runtime::ApplicationLifecycleReason::Shutdown,
+            echo_agent_app_core::api::runtime::ApplicationLifecycleReason::Shutdown,
             primary_error,
         )
         .await;

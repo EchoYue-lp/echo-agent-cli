@@ -19,6 +19,33 @@ Agent 能力的不同输入/渲染适配层，不是不同产品版本。
 EKO 专属的 workspace identity、GUI 投影、worktree、review policy、资源预算和删除策略
 留在应用层。可以跨产品复用的 task graph、状态迁移、模型协议和 tool contract 留在框架。
 
+## R4 App-Core Modules and Facade
+
+R4 keeps the framework/app split above and makes it auditable in the physical
+tree. `echo-agent-app-core::api` is the supported import boundary for CLI, TUI,
+Tauri, channel, examples and integration tests. It is a re-export facade only;
+it does not introduce a second runtime, store, DAG traversal, retry loop,
+terminal reducer or publication registry. Implementation modules are
+crate-private; callers use the facade rather than relying on internal paths.
+
+The former aggregate files are now directory facades with authority-oriented
+source files. `state` owns configuration, connection/storage DTOs,
+workspace/delivery scope and the `AppState` aggregate. `tasks::task_runtime::store`
+owns the EKO file journal, plan/run projections, recovery and workspace
+supervisor; `tasks::task_runtime::executor` owns only resource, dispatch,
+review, unattended and event adapters around framework
+`RuntimeTaskService`/`RuntimeDagController`. `agent_router`, `chat_event_log`,
+`agent_pool`, `extension_control`, `plugin_runtime` and `infra` follow the same
+address/inbox, journal/projection, admission/generation, policy/publication and
+factory/store/diagnostic boundaries.
+
+The split is namespace-preserving and item-boundary based, so JSON/JSONL,
+serde/TS bindings, file layout, error codes and five-surface behavior do not
+change. A separate EKO contracts/domain/runtime crate is not created until
+dependency and compile measurements show two real consumers and a cycle-free
+boundary. See [ADR 0025](./adr/0025-app-core-global-modularization.md) for the
+mapping and deletion conditions.
+
 ## 运行时所有权
 
 ```text

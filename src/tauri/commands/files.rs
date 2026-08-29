@@ -39,7 +39,7 @@ pub struct WorkspaceChange {
     pub status: String,
 }
 
-pub type DiffResult = echo_agent_app_core::diff::WorkspaceFileDiff;
+pub type DiffResult = echo_agent_app_core::api::diff::WorkspaceFileDiff;
 
 #[derive(Debug, Serialize)]
 pub struct TreeNode {
@@ -306,7 +306,7 @@ pub async fn diff_file(
         .session
         .product_data_io
         .run("diff workspace file", move || {
-            echo_agent_app_core::diff::WorkspaceDiffService::new(control.project_root())
+            echo_agent_app_core::api::diff::WorkspaceDiffService::new(control.project_root())
                 .diff_file(&path, &ref_str)
                 .map_err(workspace_diff_error)
         })
@@ -314,12 +314,12 @@ pub async fn diff_file(
         .map_err(super::product_data::blocking_error)?
 }
 
-fn workspace_diff_error(error: echo_agent_app_core::diff::WorkspaceDiffError) -> IpcError {
+fn workspace_diff_error(error: echo_agent_app_core::api::diff::WorkspaceDiffError) -> IpcError {
     match error {
-        echo_agent_app_core::diff::WorkspaceDiffError::Validation(message) => {
+        echo_agent_app_core::api::diff::WorkspaceDiffError::Validation(message) => {
             IpcError::Validation(message)
         }
-        echo_agent_app_core::diff::WorkspaceDiffError::Operation(message) => {
+        echo_agent_app_core::api::diff::WorkspaceDiffError::Operation(message) => {
             IpcError::Internal(message)
         }
     }

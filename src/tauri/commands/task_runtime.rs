@@ -7,9 +7,9 @@ use crate::tauri::commands::chat::TauriExecutionProjector;
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 
-use echo_agent_app_core::state::ScopedChatRuntime;
-use echo_agent_app_core::tasks::task_runtime::types::*;
-use echo_agent_app_core::tasks::task_runtime::{TaskRuntimeBlockingAdapter, TaskRuntimeStore};
+use echo_agent_app_core::api::state::ScopedChatRuntime;
+use echo_agent_app_core::api::tasks::task_runtime::types::*;
+use echo_agent_app_core::api::tasks::task_runtime::{TaskRuntimeBlockingAdapter, TaskRuntimeStore};
 use std::sync::Arc;
 
 // ── Exact workspace runtime resolution ───────────────────────────────────
@@ -66,7 +66,7 @@ where
     T: Send + 'static,
     F: FnOnce(
             Arc<TaskRuntimeStore>,
-        ) -> Result<T, echo_agent_app_core::tasks::task_runtime::StoreError>
+        ) -> Result<T, echo_agent_app_core::api::tasks::task_runtime::StoreError>
         + Send
         + 'static,
 {
@@ -234,7 +234,7 @@ pub async fn send_task_subagent_message(
 ) -> Result<SubagentControlReceipt, IpcError> {
     let (_runtime, store, _run) =
         task_runtime_for_run(&state, &workspace_id, &identity.run_id).await?;
-    echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(store)
+    echo_agent_app_core::api::tasks::task_runtime::SubagentControlService::new(store)
         .send_message(identity, &instruction, SubagentControlActorSource::Gui)
         .await
         .map_err(internal)
@@ -250,7 +250,7 @@ pub async fn queue_task_subagent_guidance(
 ) -> Result<SubagentControlReceipt, IpcError> {
     let (_runtime, store, _run) =
         task_runtime_for_run(&state, &workspace_id, &identity.run_id).await?;
-    echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(store)
+    echo_agent_app_core::api::tasks::task_runtime::SubagentControlService::new(store)
         .queue_guidance_async(identity, instruction, SubagentControlActorSource::Gui)
         .await
         .map_err(internal)
@@ -265,7 +265,7 @@ pub async fn interrupt_task_subagent(
 ) -> Result<SubagentControlReceipt, IpcError> {
     let (_runtime, store, _run) =
         task_runtime_for_run(&state, &workspace_id, &identity.run_id).await?;
-    echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(store)
+    echo_agent_app_core::api::tasks::task_runtime::SubagentControlService::new(store)
         .interrupt_subagent(identity, SubagentControlActorSource::Gui)
         .await
         .map_err(internal)
@@ -517,16 +517,17 @@ pub async fn resume_task_run(
         .as_ref()
         .map(|snapshot| snapshot.run.conversation_id.clone())
         .ok_or_else(|| IpcError::Validation("TaskRun not found".to_string()))?;
-    let expected_resume = echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(
-        run_state
-            .as_ref()
-            .ok_or_else(|| IpcError::Validation("TaskRun not found".to_string()))?,
-    );
+    let expected_resume =
+        echo_agent_app_core::api::tasks::task_runtime::TaskRunResumeIdentity::capture(
+            run_state
+                .as_ref()
+                .ok_or_else(|| IpcError::Validation("TaskRun not found".to_string()))?,
+        );
     let turn_id = uuid::Uuid::new_v4().to_string();
     let lease = runtime
         .begin_turn(
             &state.app_state.session.foreground_turns,
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
             &conversation_id,
             turn_id,
         )
@@ -536,7 +537,7 @@ pub async fn resume_task_run(
         Ok(execution) => execution,
         Err(error) => {
             lease
-                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
                     echo_agent::error::AgentFailure::message("agent_pool", error.to_string()),
                 ))
                 .await
@@ -551,10 +552,10 @@ pub async fn resume_task_run(
         state.app_state.storage.tool_executions.clone(),
         Some(store.clone()),
     ));
-    let trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
+    let trace_sink: echo_agent_app_core::api::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
         execution_projector.emit(ev);
     });
-    let launch = match echo_agent_app_core::tasks::task_runtime::launch_planned_run_resume(
+    let launch = match echo_agent_app_core::api::tasks::task_runtime::launch_planned_run_resume(
         store,
         expected_resume,
         primary_agent,
@@ -569,7 +570,7 @@ pub async fn resume_task_run(
         Ok(launch) => launch,
         Err(error) => {
             lease
-                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
                     echo_agent::error::AgentFailure::message("planned_resume", error.to_string()),
                 ))
                 .await
@@ -580,16 +581,16 @@ pub async fn resume_task_run(
     tokio::spawn(async move {
         let launched_run_id = launch.run_id.clone();
         let outcome = match launch.wait().await {
-            Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
+            Ok(echo_agent_app_core::api::tasks::task_runtime::RunOutcome::Completed) => {
                 tracing::info!(run_id = %launched_run_id, "resumed run completed");
-                echo_agent_app_core::chat_driver::TurnOutcome::Completed
+                echo_agent_app_core::api::chat_driver::TurnOutcome::Completed
             }
-            Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Cancelled) => {
-                echo_agent_app_core::chat_driver::TurnOutcome::Cancelled
+            Ok(echo_agent_app_core::api::tasks::task_runtime::RunOutcome::Cancelled) => {
+                echo_agent_app_core::api::chat_driver::TurnOutcome::Cancelled
             }
             Ok(other) => {
                 tracing::warn!(run_id = %launched_run_id, ?other, "resumed run ended non-completed");
-                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
                     echo_agent::error::AgentFailure::message(
                         "planned_resume",
                         format!("planned resume ended with {other:?}"),
@@ -598,7 +599,7 @@ pub async fn resume_task_run(
             }
             Err(error) => {
                 tracing::error!(run_id = %launched_run_id, %error, "resumed run executor error");
-                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
                     echo_agent::error::AgentFailure::message("planned_resume", error),
                 )
             }
@@ -693,11 +694,11 @@ async fn resume_continuation_run(
     let turn_id = uuid::Uuid::new_v4().to_string();
     let conversation_id = snapshot.run.conversation_id.clone();
     let expected_resume =
-        echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(&snapshot);
+        echo_agent_app_core::api::tasks::task_runtime::TaskRunResumeIdentity::capture(&snapshot);
     let lease = runtime
         .begin_turn(
             &state.app_state.session.foreground_turns,
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
             &conversation_id,
             turn_id.clone(),
         )
@@ -707,7 +708,7 @@ async fn resume_continuation_run(
         Ok(execution) => execution,
         Err(error) => {
             lease
-                .settle_after_observers(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
                     echo_agent::error::AgentFailure::message("agent_pool", error.to_string()),
                 ))
                 .await
@@ -724,14 +725,16 @@ async fn resume_continuation_run(
         state.app_state.storage.chat_events.clone(),
     );
     let _ = sink.on_event(
-        echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
+        echo_agent_app_core::api::chat_driver::ChatDriverEvent::TurnStatus {
             status: "running".to_string(),
         },
     );
-    let turn = echo_agent_app_core::prepared_turn::PreparedUserTurn::runtime_instruction(format!(
-        "Resume the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative runtime projection and continue the next useful work."
-    ));
-    let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+    let turn = echo_agent_app_core::api::prepared_turn::PreparedUserTurn::runtime_instruction(
+        format!(
+            "Resume the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative runtime projection and continue the next useful work."
+        ),
+    );
+    let resources = Arc::new(echo_agent_app_core::api::chat_resources::ChatResources {
         execution_scope: runtime.execution_scope().clone(),
         workspace_io_receipt: Some(runtime.workspace_io_receipt()),
         pool: runtime.pool(),
@@ -758,7 +761,7 @@ async fn resume_continuation_run(
     let status_store = store;
     tokio::spawn(async move {
         let _pool_execution = pool_execution;
-        let outcome = echo_agent_app_core::foreground_turn::drive_foreground_chat_turn(
+        let outcome = echo_agent_app_core::api::foreground_turn::drive_foreground_chat_turn(
             lease, &agent, &turn, resources, binding,
         )
         .await;
@@ -781,7 +784,7 @@ async fn resume_continuation_run(
                     .unwrap_or_else(|_| "failed".to_string())
             });
         let _ = sink.on_event(
-            echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::TurnStatus {
                 status: terminal_status,
             },
         );
@@ -828,7 +831,7 @@ pub async fn retry_blocked_task(
         state.app_state.storage.tool_executions.clone(),
         Some(store.clone()),
     ));
-    let trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
+    let trace_sink: echo_agent_app_core::api::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
         execution_projector.emit(ev);
     });
     let preparation = spawn_tauri_task_retry(
@@ -844,16 +847,16 @@ pub async fn retry_blocked_task(
     )
     .await
     .map_err(|error| match error {
-        echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(message) => {
+        echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(message) => {
             IpcError::Validation(message)
         }
         other => internal(other),
     })?;
     let (kind, next_attempt) = match preparation {
-        echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation::Acceptance {
+        echo_agent_app_core::api::tasks::task_runtime::TaskRetryPreparation::Acceptance {
             next_attempt,
         } => (TaskRetryKind::RetryScheduled, Some(next_attempt)),
-        echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation::Recovery => {
+        echo_agent_app_core::api::tasks::task_runtime::TaskRetryPreparation::Recovery => {
             (TaskRetryKind::RecoveryRetryRecorded, None)
         }
     };
@@ -869,17 +872,17 @@ pub async fn retry_blocked_task(
 #[allow(clippy::too_many_arguments)]
 async fn spawn_tauri_task_retry(
     store: Arc<TaskRuntimeStore>,
-    primary_agent: echo_agent_app_core::agent_handle::AgentHandle,
-    pool_execution: Option<echo_agent_app_core::agent_pool::AgentPoolExecutionLease>,
-    review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
-    trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink,
+    primary_agent: echo_agent_app_core::api::agent_handle::AgentHandle,
+    pool_execution: Option<echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease>,
+    review_integration: Option<Arc<echo_agent_app_core::api::evolution::ReviewIntegration>>,
+    trace_sink: echo_agent_app_core::api::tasks::task_runtime::ExecSink,
     cancel: echo_agent::agent::CancellationToken,
     run_id: String,
     task_id: String,
-    workspace_io: Option<echo_agent_app_core::state::WorkspaceIoInvocation>,
+    workspace_io: Option<echo_agent_app_core::api::state::WorkspaceIoInvocation>,
 ) -> Result<
-    echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation,
-    echo_agent_app_core::tasks::task_runtime::StoreError,
+    echo_agent_app_core::api::tasks::task_runtime::TaskRetryPreparation,
+    echo_agent_app_core::api::tasks::task_runtime::StoreError,
 > {
     let driver_store = store.clone();
     let driver_run_id = run_id.clone();
@@ -895,7 +898,7 @@ async fn spawn_tauri_task_retry(
                 .map(|integration| integration.lease_generation())
                 .transpose()
                 .map_err(|error| {
-                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                    echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(format!(
                         "memory generation unavailable: {error}"
                     ))
                 })?;
@@ -910,7 +913,7 @@ async fn spawn_tauri_task_retry(
             let reviewer_llm = primary_agent
                 .read(|agent| agent.llm_client().cloned())
                 .await;
-            let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
+            let outcome = echo_agent_app_core::api::tasks::task_runtime::execute_run(
                 driver_store.clone(),
                 Some(primary_agent),
                 reviewer_llm,
@@ -919,12 +922,12 @@ async fn spawn_tauri_task_retry(
                 Some(trace_sink),
                 &driver_run_id,
                 cancel,
-                echo_agent_app_core::tasks::task_runtime::MemoryPolicy::BestEffortSettled,
+                echo_agent_app_core::api::tasks::task_runtime::MemoryPolicy::BestEffortSettled,
                 workspace_io,
             )
             .await;
             match outcome {
-                Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
+                Ok(echo_agent_app_core::api::tasks::task_runtime::RunOutcome::Completed) => {
                     tracing::info!(run_id = %driver_run_id, "retried run completed");
                 }
                 Ok(other) => {
@@ -957,12 +960,12 @@ pub async fn update_tasks(
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;
     let agent = execution.agent();
-    let service = echo_agent_app_core::tasks::task_runtime::task_revision_service_for_agent(
+    let service = echo_agent_app_core::api::tasks::task_runtime::task_revision_service_for_agent(
         &agent,
         store.clone(),
     )
     .await;
-    echo_agent_app_core::tasks::task_runtime::apply_eko_task_update(
+    echo_agent_app_core::api::tasks::task_runtime::apply_eko_task_update(
         &service, store, &run_id, request,
     )
     .await
@@ -1041,7 +1044,7 @@ pub async fn get_progress_ledger(
     let (runtime, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     let workspace_root = runtime.execution_scope().root().to_path_buf();
     task_runtime_io(&store, "write TaskRun progress ledger", move |store| {
-        echo_agent_app_core::tasks::task_runtime::write_progress(
+        echo_agent_app_core::api::tasks::task_runtime::write_progress(
             &store,
             &run_id,
             Some(&workspace_root),
@@ -1146,17 +1149,17 @@ mod tests {
         }
     }
 
-    fn test_agent() -> Result<echo_agent_app_core::agent_handle::AgentHandle, String> {
+    fn test_agent() -> Result<echo_agent_app_core::api::agent_handle::AgentHandle, String> {
         echo_agent::agent::ReactAgentBuilder::new()
             .model("test")
             .llm_client(Arc::new(TestLlmClient))
             .build()
-            .map(echo_agent_app_core::agent_handle::AgentHandle::new)
+            .map(echo_agent_app_core::api::agent_handle::AgentHandle::new)
             .map_err(|error| error.to_string())
     }
 
     async fn prepare_retry_run(
-        store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+        store: Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
         run_id: &str,
         task_id: &str,
         recovery: bool,
@@ -1173,7 +1176,7 @@ mod tests {
                 AttendedMode::Attended,
             )
             .map_err(|error| error.to_string())?;
-        echo_agent_app_core::tasks::task_runtime::commit_eko_task_plan(
+        echo_agent_app_core::api::tasks::task_runtime::commit_eko_task_plan(
             store.clone(),
             TaskPlan {
                 plan_id: format!("{run_id}-plan"),
@@ -1181,7 +1184,7 @@ mod tests {
                 revision: 1,
                 domain_profile: DomainProfile::General,
                 goal_revision: 1,
-                goal_sha256: echo_agent_app_core::tasks::task_runtime::task_goal_sha256(
+                goal_sha256: echo_agent_app_core::api::tasks::task_runtime::task_goal_sha256(
                     "retry from GUI",
                 ),
                 assumptions: Vec::new(),
@@ -1227,7 +1230,7 @@ mod tests {
     type RetryRuntimeSnapshot = (TaskRunStatus, Option<(TodoStatus, u32)>, usize);
 
     fn snapshot(
-        store: &echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore,
+        store: &echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore,
         run_id: &str,
     ) -> Result<RetryRuntimeSnapshot, String> {
         let run = store
@@ -1246,7 +1249,7 @@ mod tests {
         Ok((run.status, task, event_count))
     }
 
-    fn trace_sink() -> echo_agent_app_core::tasks::task_runtime::ExecSink {
+    fn trace_sink() -> echo_agent_app_core::api::tasks::task_runtime::ExecSink {
         Arc::new(|_| {})
     }
 
@@ -1257,18 +1260,18 @@ mod tests {
             (
                 "gui-acceptance",
                 false,
-                echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation::Acceptance {
+                echo_agent_app_core::api::tasks::task_runtime::TaskRetryPreparation::Acceptance {
                     next_attempt: 1,
                 },
             ),
             (
                 "gui-recovery",
                 true,
-                echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation::Recovery,
+                echo_agent_app_core::api::tasks::task_runtime::TaskRetryPreparation::Recovery,
             ),
         ] {
             let store = Arc::new(
-                echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                     .map_err(|error| error.to_string())?,
             );
             prepare_retry_run(store.clone(), run_id, "retry-task", recovery).await?;
@@ -1297,7 +1300,7 @@ mod tests {
     #[tokio::test]
     async fn gui_recovery_retry_closed_admission_does_not_mutate_runtime() -> Result<(), String> {
         let store = Arc::new(
-            echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+            echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
         prepare_retry_run(store.clone(), "gui-closed", "retry-task", true).await?;
@@ -1327,7 +1330,7 @@ mod tests {
     async fn gui_retry_registration_infrastructure_failure_does_not_mutate_runtime()
     -> Result<(), String> {
         let store = Arc::new(
-            echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+            echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
         prepare_retry_run(store.clone(), "gui-registration", "retry-task", false).await?;

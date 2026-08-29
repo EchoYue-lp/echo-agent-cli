@@ -199,7 +199,7 @@ async fn cmd_curator(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Applied {} transition(s):", transitions.len());
                 for (name, from, to) in &transitions {
                     println!("  {name}: {from:?} → {to:?}");
-                    echo_agent_app_core::evolution::fire_evolution_hook(
+                    echo_agent_app_core::api::evolution::fire_evolution_hook(
                         &agent,
                         echo_agent::hooks::HookEvent::SkillLifecycleTransition,
                         name,
@@ -600,7 +600,7 @@ async fn cmd_memory_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutco
 
     match control.integration.run_review().await {
         Ok(report) => {
-            let formatted = echo_agent_app_core::evolution::format_review_report(&report);
+            let formatted = echo_agent_app_core::api::evolution::format_review_report(&report);
             println!("{formatted}");
         }
         Err(e) => {
@@ -755,7 +755,7 @@ async fn cmd_skill_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcom
     {
         Ok(receipt)
             if receipt.status
-                == echo_agent_app_core::extension_control::SkillSettlementStatus::Settled =>
+                == echo_agent_app_core::api::extension_control::SkillSettlementStatus::Settled =>
         {
             println!(
                 "✓ Skill '{}' promoted to Active and loaded from {}.",
@@ -831,7 +831,7 @@ async fn cmd_skill_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
 
     let echo_agent_dir = control.generation.echo_agent_dir().to_path_buf();
     let store = control.generation.memory_store();
-    let curator = echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir);
+    let curator = echo_agent_app_core::api::evolution::workspace_curator(&echo_agent_dir);
 
     // Generate draft from candidate.
     let typed_store = echo_agent::memory::TypedMemoryStore::new(store);
@@ -905,7 +905,7 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
     };
     let store = control.generation.memory_store();
     let echo_agent_dir = control.generation.echo_agent_dir().to_path_buf();
-    let curator = echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir);
+    let curator = echo_agent_app_core::api::evolution::workspace_curator(&echo_agent_dir);
 
     // If no args, run similarity detection and show proposals
     if args.is_empty() {
@@ -1067,7 +1067,7 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                         );
                         // Fire SkillMergeApplied hook so registered hooks
                         // are notified of the skill merge.
-                        echo_agent_app_core::evolution::fire_evolution_hook(
+                        echo_agent_app_core::api::evolution::fire_evolution_hook(
                             &control.runtime.primary_agent(),
                             echo_agent::hooks::HookEvent::SkillMergeApplied,
                             &proposal.primary_skill,
@@ -1114,7 +1114,7 @@ async fn cmd_skill_health(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
     let store = control.generation.memory_store();
     let agent = control.runtime.primary_agent();
 
-    let observer = echo_agent_app_core::evolution::evolution_hook_observer(&agent).await;
+    let observer = echo_agent_app_core::api::evolution::evolution_hook_observer(&agent).await;
     let monitor =
         echo_agent::evolution::SkillHealthMonitor::new(store).with_evolution_observer(observer);
 
@@ -1376,7 +1376,7 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
             Ok(()) => {
                 println!("✓ Patch applied to {}", descriptor.location.display());
                 // Fire SkillPatchApplied hook.
-                echo_agent_app_core::evolution::fire_evolution_hook(
+                echo_agent_app_core::api::evolution::fire_evolution_hook(
                     &agent,
                     echo_agent::hooks::HookEvent::SkillPatchApplied,
                     skill_name,
@@ -1543,13 +1543,13 @@ async fn cmd_evolution_dashboard(ctx: &CommandContext, _args: &[&str]) -> Comman
         }
     };
 
-    let dashboard =
-        echo_agent_app_core::evolution::Dashboard::new(store, change_log).with_run_store(run_store);
+    let dashboard = echo_agent_app_core::api::evolution::Dashboard::new(store, change_log)
+        .with_run_store(run_store);
 
     println!("Generating evolution dashboard...\n");
 
     let metrics = dashboard.generate_metrics().await;
-    let output = echo_agent_app_core::evolution::Dashboard::format_metrics(&metrics);
+    let output = echo_agent_app_core::api::evolution::Dashboard::format_metrics(&metrics);
 
     println!("{}", output);
     let delivery = control.integration.trigger_delivery_status();
@@ -1599,7 +1599,7 @@ async fn cmd_skill_register(ctx: &CommandContext, args: &[&str]) -> CommandOutco
         }
     };
     let echo_agent_dir = control.generation.echo_agent_dir();
-    let curator = echo_agent_app_core::evolution::workspace_curator(echo_agent_dir);
+    let curator = echo_agent_app_core::api::evolution::workspace_curator(echo_agent_dir);
     let skill_path = echo_agent_dir.join("skills").join(name).join("SKILL.md");
     let path = skill_path.exists().then_some(skill_path.as_path());
     match curator.touch_skill_at(name, path, false) {
@@ -1706,7 +1706,7 @@ cmd!(
 // ── EvidenceInboxCommand ────────────────────────────────────────────
 
 async fn cmd_evidence_inbox(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    use echo_agent_app_core::evolution::EvidenceReviewFilter;
+    use echo_agent_app_core::api::evolution::EvidenceReviewFilter;
 
     let control = match evolution_control(ctx).await {
         Ok(control) => control,
@@ -1740,7 +1740,7 @@ async fn cmd_evidence_inbox(ctx: &CommandContext, args: &[&str]) -> CommandOutco
                                 "Expired"
                             } else if matches!(
                                 candidate.status,
-                                echo_agent_app_core::evolution::EvidenceCandidateStatus::Applied
+                                echo_agent_app_core::api::evolution::EvidenceCandidateStatus::Applied
                             ) {
                                 "Undoable"
                             } else {
