@@ -1,35 +1,11 @@
 ---
 name: paper-search
-description: >-
-  学术论文检索。当用户需要搜索学术论文、查找文献综述、了解某领域研究进展、
-  或寻找特定主题的学术文章时激活。支持 ArXiv 和 Semantic Scholar 交叉检索。
-  注意：医学文献请使用 evidence-medicine skill。
-triggers:
-  - 论文检索
-  - 学术论文
-  - 文献检索
-  - arxiv
-  - semantic scholar
-  - 引用数
-  - paper search
-  - academic paper
-  - research paper
-  - 找论文
-  - 文献综述
-allowed-tools:
-  - "read_file"
-  - "read_artifact"
-  - "apply_patch"
-  - "web_search"
-  - "web_fetch"
-  - "arxiv_search"
-  - "semantic_scholar_search"
-  - "pdf_fetch"
-  - "bibtex_generate"
+description: 学术论文检索。当用户需要搜索学术论文、查找文献综述、了解某领域研究进展、 或寻找特定主题的学术文章时激活。支持 ArXiv 和 Semantic Scholar 交叉检索。 注意：医学文献请使用 evidence-medicine skill。
+allowed-tools: read_file read_artifact apply_patch web_search web_fetch arxiv_search semantic_scholar_search pdf_fetch bibtex_generate
 metadata:
   author: echo-agent-cli
-  version: "1.0.0"
-  tags: "academic, paper, arxiv, search, literature"
+  version: 1.0.0
+  tags: academic, paper, arxiv, search, literature
 ---
 
 ## 学术论文检索

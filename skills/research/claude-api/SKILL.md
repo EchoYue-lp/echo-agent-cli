@@ -4,16 +4,9 @@ description: 构建、调试和优化 Claude API / Anthropic SDK 应用，含 pr
 metadata:
   category: research
   source: anthropic
-  upstream-version: "1.0"
+  upstream-version: '1.0'
   author: anthropic
-  tags: [claude, api, sdk, anthropic, prompt-cache]
-triggers:
-  - Claude API
-  - Anthropic SDK
-  - prompt caching
-  - 模型迁移
-  - API 调用
-allowed-tools: []
+  tags: claude, api, sdk, anthropic, prompt-cache
 ---
 # Claude API
 
@@ -28,3 +21,12 @@ Build or diagnose Claude API integrations from current Anthropic documentation a
 - Never expose API keys in code, logs, examples, or tool results. Distinguish authentication, rate-limit, overload, validation, and application errors.
 
 Run the smallest real or mocked request that proves the change. Report the SDK/model versions, official sources used, verification, and any behavior not exercised.
+
+## Workflow
+
+1. Capture the provider dependency/version, configured model, request builder, streaming path, and credential source.
+2. Check current official documentation for the exact model, endpoint, tool schema, cache semantics, and limits involved.
+3. Reproduce with a redacted fixture or mock before changing production code; preserve retry and cancellation behavior.
+4. Verify complete and partial or invalid responses, then document the tested version and remaining provider assumptions.
+
+Never paste credentials into a prompt, fixture, trace, screenshot, or issue, even when diagnosing an authentication failure.

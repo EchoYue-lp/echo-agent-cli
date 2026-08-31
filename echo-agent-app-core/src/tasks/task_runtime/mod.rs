@@ -16,8 +16,9 @@
 //!   review checklist).
 //! - [`planner`] — structured plan generation via a JSON-mode LLM call, with
 //!   plan-quality validation.
-//! - [`executor`] — EKO controller/dispatcher adapter for the framework DAG
-//!   executor, including review, resource limits, worktrees, and event mapping.
+//! - [`executor`] — EKO controller/dispatcher integration for the framework
+//!   DAG executor, including review, resource limits, worktrees, and event
+//!   mapping.
 //! - [`review`] — review gates (spec + code quality) + retry circuit breaker.
 //! - [`ledger`] — progress.md export derived from canonical run files.
 //! - [`memory_bridge`] — sinks run/task lifecycle events into long-term
@@ -29,7 +30,8 @@
 //! To avoid shadowing, this module's event type is named `RuntimeTaskEvent`
 //! and its event-kind enum is `RuntimeEventKind`.
 //!
-//! Raw journal and file-store adapters are deliberately not public bypasses:
+//! Raw journal and file-store implementations are deliberately not public
+//! bypasses:
 //!
 //! ```compile_fail
 //! use echo_agent_app_core::tasks::task_runtime::file_shadow::FileTaskShadow;
@@ -58,7 +60,7 @@ pub mod planner;
 pub mod profiles;
 pub mod register;
 pub mod review;
-pub mod revisioned_adapter;
+pub mod revisioned_runtime;
 mod root_authority;
 mod run_authority;
 pub mod store;
@@ -70,13 +72,15 @@ pub mod types;
 pub mod worktree;
 
 pub use boot_reconciler::{TaskRunBootOutcome, TaskRunBootReconciler};
-pub use command_cells::{AwaiterSurfaceProjection, project_awaiter_surface_event};
+pub use command_cells::{
+    CommandCellWatchSurfaceProjection, project_command_cell_watch_surface_event,
+};
 pub use completion_gate::requirements_for_plan;
 pub use execution_target::TaskExecutionTargetResolver;
 pub(crate) use executor::drive_unattended_run;
 pub use executor::{
     EkoExecutionLimits, ExecError, ExecSink, PlannedRunResumeLaunch, PreflightRejection,
-    ProcessExecutionResourceSnapshot, RunOutcome, TaskRuntimeBlockingAdapter, execute_run,
+    ProcessExecutionResourceSnapshot, RunOutcome, TaskRuntimeOperation, execute_run,
     launch_planned_run_resume, preflight_unattended_plan, preflight_unattended_task,
     process_execution_resource_snapshot,
 };
@@ -89,12 +93,11 @@ pub use planner::{
 };
 pub use profiles::ProfileTemplate;
 pub use register::{
-    bind_task_execute_to_pool, register_task_tools_on_agent, task_revision_service_for_agent,
+    bind_task_execute_to_pool, default_subagent_catalog, register_task_tools_on_agent,
+    task_revision_service_for_agent,
 };
 pub use review::{BreakerAction, ReviewError, build_fix_task, requires_review, review_task};
-pub use revisioned_adapter::{
-    apply_eko_task_update, build_eko_task_revision_service, commit_eko_task_plan,
-};
+pub use revisioned_runtime::{apply_task_update, build_task_revision_service, commit_task_plan};
 pub use store::{
     AbandonedRunSettlement, BootAutoResumeBlocker, BootAutoResumeDecision, BootAutoResumeOutcome,
     ProviderRetryDisposition, RunDriverReceiptOwner, RuntimeEventQuery, StoreError,

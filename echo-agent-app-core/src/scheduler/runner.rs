@@ -4,11 +4,11 @@
 //! The framework's runner is generic over a `FireFn` callback; this module
 //! provides [`build_fire_fn`] which constructs one that launches TaskRuntime runs.
 //!
-//! Phase 3.1: ALL cron tasks route through the unified TaskRuntime executor
-//! (`drive_existing_cron_run`). The legacy `[plan]` prefix is stripped for backward
-//! compatibility but no longer selects a separate path — simple prompts are
-//! answered directly by the agent and materialized as a one-task Plan with
-//! completion evidence; complex prompts drive task_create + task_execute.
+//! All cron tasks route through the unified TaskRuntime executor
+//! (`drive_existing_cron_run`). Prompts are passed through unchanged; simple
+//! prompts are answered directly by the agent and materialized as a one-task
+//! Plan with completion evidence, while complex prompts drive task creation and
+//! execution.
 
 use crate::agent_handle::AgentHandle;
 use crate::agent_pool::AgentPool;
@@ -23,29 +23,17 @@ use std::sync::Arc;
 /// The CLI's scheduler runner is the framework's `SchedulerRunner`.
 pub type SchedulerRunner = FrameworkSchedulerRunner;
 
-/// Legacy plan-orchestration marker prefix. Phase 3.1: stripped for backward
-/// compatibility but no longer routes — all cron tasks go through
-/// the canonical supervised cron driver regardless.
-const PLAN_MARKER: &str = "[plan]";
-
 /// Build a `FireFn` that dispatches cron task execution.
 ///
-/// Phase 3.1+: ALL cron prompts route through the unified supervised
-/// TaskRuntime executor, `Unattended`). The `[plan]` prefix is stripped for
-/// backward compatibility. Simple prompts are answered directly by the agent
+/// All cron prompts route through the unified supervised TaskRuntime executor
+/// in unattended mode. Simple prompts are answered directly by the agent
 /// and materialized as a one-task Plan with completion evidence; complex prompts
 /// drive task_create + task_execute.
 ///
-/// Phase 3.5: the dead-in-practice `runtime_store=None` fallback (legacy
-/// `BackgroundTaskService::submit` + `execute_direct`) has been removed —
-/// `AppState` always constructs a `TaskRuntimeStore` at boot.
-///
-/// Phase C: cron now runs on a POOL-ACQUIRED per-run agent (not the shared
-/// primary chat agent). This fixes the latent `working_dir` override bug —
-/// each cron run's worktree binding lives on its own agent, so overlapping
-/// runs no longer clobber each other's working_dir (previously masked only by
-/// the agent's execution_mutex). When no pool is configured, falls back to the
-/// shared `agent` (the pre-C behavior, still correct for single-agent setups).
+/// `AppState` provides the required `TaskRuntimeStore`. When an `AgentPool` is
+/// available, each cron run acquires its own Agent so worktree state cannot be
+/// shared across overlapping runs; single-Agent embeddings use the supplied
+/// fallback Agent.
 pub fn build_fire_fn(
     agent: AgentHandle,
     task_runtime_store: Option<Arc<TaskRuntimeStore>>,
@@ -84,15 +72,10 @@ fn build_fire_fn_with_cancel(
                     "TaskRuntimeStore not configured — cron cannot run".into(),
                 )
             })?;
-            // [plan] prefix strip for backward compat; no longer routes.
-            let prompt = task
-                .prompt
-                .strip_prefix(PLAN_MARKER)
-                .map(str::trim)
-                .unwrap_or(&task.prompt);
-            if prompt.is_empty() {
+            let prompt = task.prompt.as_str();
+            if prompt.trim().is_empty() {
                 return Err(echo_agent::error::ReactError::Other(
-                    "cron prompt is empty (after [plan] strip)".into(),
+                    "cron prompt is empty".into(),
                 ));
             }
             let fire_id = uuid::Uuid::new_v4().to_string();
@@ -209,9 +192,9 @@ fn build_fire_fn_with_cancel(
     })
 }
 
-/// Register the `task_execute` tool on a cron run's pool-acquired agent
-/// (Phase C). The normal shared pool registry already contains a
-/// conversation-aware tool; this fills the gap for standalone runners.
+/// Register `task_execute` on a cron run's pool-acquired Agent. The normal
+/// shared pool registry already contains a conversation-aware tool; this fills
+/// the gap for standalone runners.
 async fn register_task_execute_on_agent(agent_handle: &AgentHandle, store: Arc<TaskRuntimeStore>) {
     use crate::tasks::task_runtime::ExecuteTaskTool;
     if agent_handle
@@ -237,10 +220,9 @@ async fn register_task_execute_on_agent(agent_handle: &AgentHandle, store: Arc<T
 /// Convenience constructor: build a `SchedulerRunner` with the CLI's
 /// preferred wiring (agent + optional background task service).
 ///
-/// U1c phase-1 → Phase 3.1: `task_runtime_store` enables the unified
-/// cron TaskRuntime path (all cron, not just `[plan]`).
-/// Phase C: `pool` enables per-run agent isolation (recommended when an
-/// `AgentPool` exists); falls back to the shared `agent` when `None`.
+/// `task_runtime_store` owns the unified TaskRuntime path for every prompt.
+/// `pool` enables per-run Agent isolation and the supplied Agent is the
+/// fallback for single-Agent embeddings.
 pub async fn new_scheduler_runner(
     store: CronTaskStore,
     cancel: echo_agent::agent::CancellationToken,
@@ -265,12 +247,11 @@ pub async fn new_scheduler_runner(
 mod tests {
     use super::*; // AgentHandle, Arc, CronTask, TaskRuntimeStore, CancellationToken, ...
     use crate::tasks::task_runtime::TaskRunStatus;
-    use echo_agent::agent::react::builder::ReactAgentBuilder;
+    use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::testing::MockLlmClient;
 
-    /// Phase 3.1: 非 `[plan]` cron 必须经 supervised TaskRuntime driver(在 store 建 run),
-    /// 而非旧 `agent.chat`/`execute_direct`。mock LLM 返回纯文本(无 tool call),
-    /// agent 直接作答,driver 的 direct 分支自动转 Completed。
+    /// Cron 必须经 supervised TaskRuntime driver（在 store 建 run）。mock LLM
+    /// 返回纯文本时，driver 的 direct 分支自动转 Completed。
     #[tokio::test]
     async fn build_fire_fn_routes_non_plan_cron_to_supervised_run() -> Result<(), String> {
         let llm = MockLlmClient::new().with_response("ok");
@@ -287,8 +268,7 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
 
-        // task_service=None:Phase 3.1 前会逼非-[plan] prompt 走 execute_direct;
-        // 3.1 后 runtime_store(此处置 Some)接管所有 prompt → supervised driver。
+        // runtime_store 接管所有 prompt，并统一进入 supervised driver。
         let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None, None);
 
         let task = CronTask::new("plain", "*/5 * * * *", "hello world");
@@ -301,7 +281,7 @@ mod tests {
         assert_eq!(
             completed.len(),
             1,
-            "非-[plan] cron 应经 supervised driver 建恰好 1 个 Completed run"
+            "cron 应经 supervised driver 建恰好 1 个 Completed run"
         );
         let completed_run = completed
             .first()
@@ -310,9 +290,8 @@ mod tests {
         Ok(())
     }
 
-    /// `[plan]` 前缀仍经 supervised driver(marker strip,向后兼容)。
     #[tokio::test]
-    async fn build_fire_fn_strips_plan_marker_and_routes_to_supervised_run() -> Result<(), String> {
+    async fn build_fire_fn_preserves_plan_marker_as_prompt_text() -> Result<(), String> {
         let llm = MockLlmClient::new().with_response("ok");
         let agent = ReactAgentBuilder::new()
             .llm_client(Arc::new(llm))
@@ -330,11 +309,11 @@ mod tests {
         let completed = store
             .list_runs_in(&[TaskRunStatus::Completed])
             .map_err(|error| error.to_string())?;
-        assert_eq!(
-            completed.len(),
-            1,
-            "[plan] cron 应 strip marker 后建 1 个 Completed run"
-        );
+        assert_eq!(completed.len(), 1, "cron 应建立 1 个 Completed run");
+        let completed_run = completed
+            .first()
+            .ok_or_else(|| "completed cron run is missing".to_string())?;
+        assert_eq!(completed_run.goal, "[plan] do the thing");
         Ok(())
     }
 

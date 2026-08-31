@@ -17,7 +17,7 @@ pub async fn execute_run(
     memory_policy: super::memory_bridge::MemoryPolicy,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<RunOutcome, ExecError> {
-    let blocking = TaskRuntimeBlockingAdapter::new(store.clone());
+    let blocking = TaskRuntimeOperation::new(store.clone());
     let initial_run_id = run_id.to_string();
     let (run, initial_plan) = blocking
         .run("load runtime execution admission", move |store| {

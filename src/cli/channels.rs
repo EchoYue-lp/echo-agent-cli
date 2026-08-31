@@ -2206,7 +2206,7 @@ impl AppChannelMessageHandler {
             + Send
             + 'static,
     {
-        echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+        echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeOperation::new(store)
             .run_store(operation, function)
             .await
             .map_err(|error| error.to_string())
@@ -5548,17 +5548,17 @@ async fn aggregate_by_sentence_with_repository<'a>(
                     flush_all!();
                     yield ChannelOutboundDraft::ordinary(format!("[cell:{}] settled: {}", cell.cell_id, cell.phase));
                 }
-                ChannelRenderEvent::Driver(ChatDriverEvent::AwaiterResultReady { result }) => {
+                ChannelRenderEvent::Driver(ChatDriverEvent::CommandCellWatchReady { result }) => {
                     flush_all!();
-                    let event = ChatDriverEvent::AwaiterResultReady { result };
-                    let message = echo_agent_app_core::api::tasks::task_runtime::project_awaiter_surface_event(&event)
+                    let event = ChatDriverEvent::CommandCellWatchReady { result };
+                    let message = echo_agent_app_core::api::tasks::task_runtime::project_command_cell_watch_surface_event(&event)
                         .map(|projection| projection.display_message())
-                        .unwrap_or_else(|| "Awaiter result is unavailable".to_string());
+                        .unwrap_or_else(|| "CommandCellWatch result is unavailable".to_string());
                     yield ChannelOutboundDraft::ordinary(message);
                 }
                 ChannelRenderEvent::Driver(
-                    ChatDriverEvent::AwaiterResultDeliveryStarted { .. }
-                    | ChatDriverEvent::AwaiterResultAcknowledged { .. },
+                    ChatDriverEvent::CommandCellWatchDeliveryStarted { .. }
+                    | ChatDriverEvent::CommandCellWatchAcknowledged { .. },
                 ) => {}
                 ChannelRenderEvent::Driver(ChatDriverEvent::ExtensionReceipt(receipt)) => {
                     flush_all!();

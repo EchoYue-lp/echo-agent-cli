@@ -1,27 +1,11 @@
 ---
 name: translation
-description: >-
-  翻译与多语言处理。当用户需要翻译文本、校对译文、处理多语言内容、
-  或进行本地化工作时激活。
-triggers:
-  - 翻译
-  - translate
-  - 翻译一下
-  - 翻译成中文
-  - 翻译成英文
-  - 中英对照
-  - 本地化
-  - localization
-  - i18n
-  - 多语言
-allowed-tools:
-  - "read_file"
-  - "read_artifact"
-  - "apply_patch"
+description: 翻译与多语言处理。当用户需要翻译文本、校对译文、处理多语言内容、 或进行本地化工作时激活。
+allowed-tools: read_file read_artifact apply_patch
 metadata:
   author: echo-agent-cli
-  version: "1.0.0"
-  tags: "translation, multilingual, localization, i18n"
+  version: 1.0.0
+  tags: translation, multilingual, localization, i18n
 ---
 
 ## 翻译与多语言处理

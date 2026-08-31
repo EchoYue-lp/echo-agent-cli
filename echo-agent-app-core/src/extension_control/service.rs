@@ -794,14 +794,44 @@ impl ExtensionControlService {
             .await;
         let mut hub = state.skills_hub.write().await;
         hub.refresh();
-        Ok(hub
+        let mut entries = hub
             .list()
             .into_iter()
             .map(|entry| ExtensionSkillEntry {
                 loaded: loaded.contains(&entry.name),
                 catalog: entry.clone(),
             })
-            .collect())
+            .collect::<Vec<_>>();
+        drop(hub);
+
+        let builtin_hub = crate::skills_hub::SkillsHub::with_root(
+            crate::skills_hub::builtin_skills_root(),
+        );
+        let enabled_config = crate::skills_hub::EnabledSkillsConfig::load(
+            &crate::data_root::user_data_path("enabled-skills.json"),
+        )
+        .ok();
+        for entry in builtin_hub.list() {
+            let builtin_active = enabled_config
+                .as_ref()
+                .is_some_and(|config| config.is_enabled(&entry.name));
+            let builtin_entry = ExtensionSkillEntry {
+                loaded: loaded.contains(&entry.name),
+                catalog: entry.clone(),
+            };
+            if let Some(existing) = entries
+                .iter_mut()
+                .find(|current| current.catalog.name == entry.name)
+            {
+                if builtin_active {
+                    *existing = builtin_entry;
+                }
+            } else {
+                entries.push(builtin_entry);
+            }
+        }
+        entries.sort_by(|left, right| left.catalog.name.cmp(&right.catalog.name));
+        Ok(entries)
     }
 
     pub async fn enable_skill(
@@ -1218,8 +1248,20 @@ impl ExtensionControlService {
                         break;
                     }
                     let workspace_generation = target.workspace_generation().to_string();
-                    let receipt = match reconcile_target_skills(target, &desired, &skill_root).await
-                    {
+                    let builtin_result = target
+                        .pool()
+                        .reconcile_builtin_skills(crate::skills_hub::builtin_skills_root())
+                        .await;
+                    let receipt = match builtin_result {
+                        Err(error) => SkillTargetSettlementReceipt {
+                            target: target.scope().to_string(),
+                            workspace_generation,
+                            specialist_generation: config.desired_generation,
+                            status: SkillTargetSettlementStatus::Degraded,
+                            changed_entries: Vec::new(),
+                            error: Some(error),
+                        },
+                        Ok(()) => match reconcile_target_skills(target, &desired, &skill_root).await {
                         Ok(mut changed_entries) => {
                             changed_entries.sort();
                             changed_entries.dedup();
@@ -1239,6 +1281,7 @@ impl ExtensionControlService {
                             status: SkillTargetSettlementStatus::Degraded,
                             changed_entries: Vec::new(),
                             error: Some(error.to_string()),
+                        },
                         },
                     };
                     target_receipts.push(receipt);

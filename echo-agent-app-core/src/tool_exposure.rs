@@ -67,7 +67,7 @@ const CELL_TOOLS: &[&str] = &[
     "stop_cell",
     "list_cells",
     "watch_cell",
-    "interrupt_awaiter",
+    "interrupt_command_cell_watch",
 ];
 const WEB_SEARCH_TOOLS: &[&str] = &["web_search"];
 const WEB_FETCH_TOOLS: &[&str] = &["web_fetch"];
@@ -216,7 +216,7 @@ mod tests {
                 "final_answer",
                 "glob",
                 "grep",
-                "interrupt_awaiter",
+                "interrupt_command_cell_watch",
                 "list_cells",
                 "list_dir",
                 "read_artifact",
@@ -289,7 +289,12 @@ mod tests {
         let agent = crate::agent_handle::AgentHandle::new(agent);
         let task_store =
             std::sync::Arc::new(crate::tasks::task_runtime::store::TaskRuntimeStore::new()?);
-        crate::tasks::task_runtime::register_task_tools_on_agent(&agent, task_store).await;
+        crate::tasks::task_runtime::register_task_tools_on_agent(
+            &agent,
+            task_store,
+            crate::tasks::task_runtime::default_subagent_catalog(),
+        )
+        .await;
         let (definitions, registered) = agent
             .read(|agent| (Agent::tool_definitions(agent), agent.tool_names()))
             .await;

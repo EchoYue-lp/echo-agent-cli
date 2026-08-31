@@ -13,14 +13,7 @@ mod tests {
     impl crate::tasks::task_runtime::store::RunDriverExecutionReceipt for MemoryReleaseProbe {
         fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
             Box::pin(async move {
-                let pool_is_idle = self
-                    .pool
-                    .admission
-                    .active
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .total
-                    == 0;
+                let pool_is_idle = self.pool.active_execution_count() == 0;
                 self.released_after_pool
                     .store(pool_is_idle, Ordering::SeqCst);
             })
@@ -764,7 +757,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             context_window: None,
-            thinking_profile: echo_agent::llm::core::capabilities::ThinkingProfile::unknown(),
+            thinking_profile: echo_agent::llm::ThinkingProfile::unknown(),
         };
 
         let prepared = infra::prepare_runtime_llm(&runtime)?;
@@ -843,7 +836,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let selected = crate::model_config::resolve_runtime_model(&config, Some("local:b"));
+        let selected = crate::model_config::resolve_runtime_model(&config, Some("local:b"))
+            .map_err(|error| error.to_string())?;
         let session = crate::model_config::session_config_for_runtime(&config, &selected)?;
         let pool = AgentPool::new_for_test_with_config(&agent, None, None, 3, false, session).await;
 

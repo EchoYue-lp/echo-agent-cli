@@ -15,7 +15,7 @@ async fn probe_model_connectivity(model: &str) -> echo_agent::error::Result<()> 
     use echo_agent::error::ReactError;
     let mut app_config = crate::config::load_config(None);
     crate::config::apply_env_overrides(&mut app_config);
-    let runtime = model_config::resolve_runtime_model_selector(&app_config, Some(model))
+    let runtime = model_config::resolve_runtime_model(&app_config, Some(model))
         .map_err(|error| ReactError::Other(error.to_string()))?;
     let prepared = prepare_runtime_llm(&runtime).map_err(ReactError::Other)?;
     let response = prepared
@@ -45,7 +45,10 @@ async fn probe_model_connectivity(model: &str) -> echo_agent::error::Result<()> 
 pub fn run_base_doctor() -> DoctorResult {
     let mut config = crate::config::load_config(None);
     crate::config::apply_env_overrides(&mut config);
-    run_base_doctor_for_model(&config.model.get_model_name())
+    let model = model_config::resolve_runtime_model(&config, None)
+        .map(|runtime| runtime.model)
+        .unwrap_or_else(|_| "not configured".to_string());
+    run_base_doctor_for_model(&model)
 }
 
 /// 执行基础环境诊断（API Key、配置文件、数据目录等）

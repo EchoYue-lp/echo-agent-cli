@@ -4,9 +4,10 @@
 
 use std::sync::Arc;
 
-use echo_agent::agent::subagent::{
-    AgentFactory, FnAgentFactory, SubagentBuilder, SubagentPromptCompiler,
-    SubagentSystemPromptInput,
+use echo_agent::subagent::{
+    AgentFactory, FnAgentFactory, SubagentAccessMode, SubagentBuilder,
+    SubagentExecutionBoundary, SubagentPromptCompiler, SubagentSystemPromptInput,
+    ToolCapabilitySnapshot,
 };
 use echo_agent::llm::{LlmApiProtocol, LlmClient, LlmConfig};
 use echo_agent::memory::ConversationStore;
@@ -190,7 +191,7 @@ fn resolve_fixed_subagent_generation(
         },
         Some(selector) => selector.to_string(),
     };
-    let runtime = match model_config::resolve_runtime_model_selector(app_config, Some(&selector)) {
+    let runtime = match model_config::resolve_runtime_model(app_config, Some(&selector)) {
         Ok(runtime) => runtime,
         Err(error) => {
             tracing::warn!(
@@ -225,9 +226,16 @@ fn resolve_fixed_subagent_generation(
 
 #[derive(Clone)]
 struct InheritedSubagentFactory {
-    definition: echo_agent::agent::subagent::SubagentDefinition,
+    definition: echo_agent::subagent::SubagentDefinition,
     handle: AgentHandle,
     factory: Arc<dyn AgentFactory>,
+}
+
+#[derive(Clone)]
+struct SubagentPromptPublication {
+    definition: crate::subagent_loader::SubagentDefinition,
+    handle: AgentHandle,
+    compiler: Arc<dyn SubagentPromptCompiler>,
 }
 
 /// EKO-owned model consumers attached to one parent agent generation.
@@ -236,24 +244,90 @@ struct InheritedSubagentFactory {
 /// Explicit frontmatter values are resolved once and remain fixed.
 #[derive(Clone)]
 pub struct AgentModelConsumers {
+    subagent_catalog: Arc<crate::subagent_loader::SubagentCatalogSnapshot>,
     inherited_generation: Arc<tokio::sync::RwLock<SubagentRuntimeGeneration>>,
-    registry: Arc<echo_agent::agent::subagent::SubagentRegistry>,
+    registry: Arc<echo_agent::subagent::SubagentRegistry>,
     inherited_factories: Arc<Vec<InheritedSubagentFactory>>,
-    tool_control_handles: Arc<Vec<AgentHandle>>,
+    prompt_publications: Arc<Vec<SubagentPromptPublication>>,
+    prompt_compiler: Arc<dyn SubagentPromptCompiler>,
     disabled_tools_projection: Arc<tokio::sync::RwLock<Option<std::collections::HashSet<String>>>>,
 }
 
 impl AgentModelConsumers {
+    pub(crate) fn subagent_catalog(
+        &self,
+    ) -> Arc<crate::subagent_loader::SubagentCatalogSnapshot> {
+        self.subagent_catalog.clone()
+    }
+
     pub(crate) async fn apply_disabled_tools(
         &self,
         disabled_tools: Option<std::collections::HashSet<String>>,
     ) {
         *self.disabled_tools_projection.write().await = disabled_tools.clone();
-        for handle in self.tool_control_handles.iter() {
+        for publication in self.prompt_publications.iter() {
             let disabled_tools = disabled_tools.clone();
-            handle
-                .read(|agent| agent.set_disabled_tools(disabled_tools))
+            let definition = publication.definition.clone();
+            let compiler = publication.compiler.clone();
+            publication
+                .handle
+                .write(move |agent| {
+                    agent.set_disabled_tools(disabled_tools.clone());
+                    let disabled = disabled_tools.unwrap_or_default();
+                    let capabilities = ToolCapabilitySnapshot::from_definitions(
+                        &agent.tool_definitions(),
+                        &disabled,
+                    );
+                    let compiled = compiler.compile_system(&SubagentSystemPromptInput {
+                        actor: echo_agent::subagent::PromptActor::Subagent,
+                        name: &definition.name,
+                        description: &definition.description,
+                        role_prompt: &definition.system_prompt,
+                        capabilities: &capabilities,
+                        boundary: SubagentExecutionBoundary {
+                            access: if definition.readonly {
+                                SubagentAccessMode::ReadOnly
+                            } else {
+                                SubagentAccessMode::Write
+                            },
+                            isolation: crate::subagent_loader::subagent_isolation(&definition),
+                            can_delegate: definition.can_delegate,
+                        },
+                    });
+                    agent.replace_system_prompt(compiled.system_prompt);
+                })
                 .await;
+        }
+        for definition in self.registry.list_available().await {
+            if !matches!(
+                &definition.kind,
+                echo_agent::subagent::SubagentKind::Plugin { .. }
+            ) {
+                continue;
+            }
+            let Some(agent) = self.registry.get_agent(&definition.name).await else {
+                continue;
+            };
+            let capabilities = ToolCapabilitySnapshot::from_definitions(
+                &agent.tool_definitions(),
+                &agent.disabled_tool_names(),
+            );
+            let role_prompt = definition.system_prompt.as_deref().unwrap_or_default();
+            let compiled = self
+                .prompt_compiler
+                .compile_system(&SubagentSystemPromptInput {
+                    actor: echo_agent::subagent::PromptActor::Subagent,
+                    name: &definition.name,
+                    description: &definition.description,
+                    role_prompt,
+                    capabilities: &capabilities,
+                    boundary: SubagentExecutionBoundary {
+                        access: definition.access_mode,
+                        isolation: definition.isolation.as_deref().unwrap_or("context"),
+                        can_delegate: definition.can_delegate,
+                    },
+                });
+            agent.set_system_prompt(&compiled.system_prompt);
         }
     }
 
@@ -265,11 +339,11 @@ impl AgentModelConsumers {
             .await
             .as_ref()
             .is_some_and(|disabled| disabled.contains(name));
-        if !projection_contains || self.tool_control_handles.is_empty() {
+        if !projection_contains || self.prompt_publications.is_empty() {
             return false;
         }
-        for handle in self.tool_control_handles.iter() {
-            if !crate::tool_control::snapshot_disabled_tools(handle)
+        for publication in self.prompt_publications.iter() {
+            if !crate::tool_control::snapshot_disabled_tools(&publication.handle)
                 .await
                 .contains(name)
             {
@@ -318,18 +392,6 @@ impl AgentModelConsumers {
             .find(|inherited| inherited.definition.name == name)
             .map(|inherited| inherited.handle.clone())
     }
-}
-
-/// Registration-time static environment for Subagent system prompts.
-///
-/// OS/arch are stable for the Agent's lifetime. Date and working directory are
-/// dispatch-time facts and are rendered by the invocation compiler.
-fn static_subagent_environment() -> String {
-    format!(
-        "- OS: {} ({})\n- Runtime: local personal assistant on the user's machine",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    )
 }
 
 /// Product-owned storage policy for complete oversized tool output.
@@ -491,7 +553,7 @@ pub async fn create_agent_with_diagnostics(
     // must still resolve, while an absent selector leaves the Agent detached
     // from LLM transport until the first model mutation is published.
     let runtime_model =
-        match model_config::resolve_runtime_model_selector(app_config, params.model.as_deref()) {
+        match model_config::resolve_runtime_model(app_config, params.model.as_deref()) {
             Ok(runtime) => {
                 model_config::validate_runtime_model_requirements(&runtime)?;
                 Some(runtime)
@@ -505,12 +567,10 @@ pub async fn create_agent_with_diagnostics(
         .unwrap_or_default();
     let temperature = runtime_model
         .as_ref()
-        .and_then(|runtime| runtime.temperature)
-        .or(app_config.model.temperature);
+        .and_then(|runtime| runtime.temperature);
     let max_tokens = runtime_model
         .as_ref()
-        .and_then(|runtime| runtime.max_tokens)
-        .or(app_config.model.max_tokens);
+        .and_then(|runtime| runtime.max_tokens);
 
     let base_system_prompt = params
         .system_prompt
@@ -597,7 +657,7 @@ pub async fn create_agent_with_diagnostics(
         command_cell_runtime.scoped(execution_scope.clone(), params.task_runtime_store.clone());
     let subagent_prompt_compiler: Arc<dyn SubagentPromptCompiler> =
         Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler);
-    let subagent_registry = Arc::new(echo_agent::agent::subagent::SubagentRegistry::new());
+    let subagent_registry = Arc::new(echo_agent::subagent::SubagentRegistry::new());
     let run_code_available = sandbox_manager.has_local_os_sandbox().await;
     if !run_code_available {
         tracing::warn!("OS sandbox unavailable; run_code will be disabled for this EKO runtime");
@@ -729,7 +789,7 @@ pub async fn create_agent_with_diagnostics(
     let repo_root = subagent_project_root
         .as_ref()
         .and_then(|root| crate::tasks::task_runtime::worktree::git_repo_root(root).ok());
-    let isolation_provider: std::sync::Arc<dyn echo_agent::agent::subagent::IsolationProvider> =
+    let isolation_provider: std::sync::Arc<dyn echo_agent::subagent::IsolationProvider> =
         std::sync::Arc::new(
             crate::tasks::task_runtime::worktree::EkoIsolationProvider::new(repo_root),
         );
@@ -770,7 +830,7 @@ pub async fn create_agent_with_diagnostics(
             crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
             crate::turn_context::turn_prompt_context_registry(),
         )
-        .with_awaiter_results(command_cell_runtime.clone(), execution_scope.clone()),
+        .with_command_cell_watches(command_cell_runtime.clone(), execution_scope.clone()),
     )));
     let cache_user_id = load_or_create_cache_user_id();
     agent.config_mut().set_cache_user_id(&cache_user_id);
@@ -865,7 +925,7 @@ pub async fn create_agent_with_diagnostics(
             tool_names,
         ));
         let revision_service =
-            crate::tasks::task_runtime::build_eko_task_revision_service(store, capabilities);
+            crate::tasks::task_runtime::build_task_revision_service(store, capabilities);
         echo_agent::tasks::register_task_tools(&mut agent, revision_service);
         tracing::info!(
             "Registered revisioned task-management tools (task_create/task_update/task_list)"
@@ -929,7 +989,7 @@ async fn register_default_subagents(
     cache_user_id: &str,
     subagents: &[crate::subagent_loader::SubagentDefinition],
     prompt_compiler: Arc<dyn SubagentPromptCompiler>,
-    subagent_registry: Arc<echo_agent::agent::subagent::SubagentRegistry>,
+    subagent_registry: Arc<echo_agent::subagent::SubagentRegistry>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
     command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
@@ -944,7 +1004,8 @@ async fn register_default_subagents(
     );
 
     struct BuiltSubagent {
-        definition: echo_agent::agent::subagent::SubagentDefinition,
+        definition: echo_agent::subagent::SubagentDefinition,
+        prompt_definition: crate::subagent_loader::SubagentDefinition,
         handle: crate::agent_handle::AgentHandle,
         fork_factory: Arc<dyn AgentFactory>,
         readonly: bool,
@@ -980,22 +1041,10 @@ async fn register_default_subagents(
         // generation's (inherited parent or registration-time fixed) thinking.
         let initial_thinking =
             subagent_build_thinking(subagent_def.thinking.as_deref(), &initial_generation);
-        let compiled_system = prompt_compiler.compile_system(&SubagentSystemPromptInput {
-            name: &subagent_def.name,
-            description: &subagent_def.description,
-            role_prompt: &subagent_def.system_prompt,
-            readonly: subagent_def.readonly,
-            // Wire the frontmatter declaration through so the system-prompt
-            // delegation wording matches the `.md` claim and the parent-facing
-            // catalog (previously hardcoded false — a display inconsistency).
-            can_delegate: subagent_def.can_delegate,
-            isolation,
-            environment: Some(static_subagent_environment()),
-        });
         let build_result = if subagent_def.readonly {
             build_readonly_subagent_agent(
                 &subagent_def.name,
-                &compiled_system.system_prompt,
+                &subagent_def.system_prompt,
                 &initial_generation.model,
                 initial_generation.llm_config.clone(),
                 initial_generation.llm_client.clone(),
@@ -1016,7 +1065,7 @@ async fn register_default_subagents(
         } else {
             build_writer_subagent_agent(
                 &subagent_def.name,
-                &compiled_system.system_prompt,
+                &subagent_def.system_prompt,
                 &initial_generation.model,
                 initial_generation.llm_config.clone(),
                 initial_generation.llm_client.clone(),
@@ -1039,8 +1088,34 @@ async fn register_default_subagents(
             )
         };
         match build_result {
-            Ok(subagent) => {
-                subagent.set_disabled_tools(disabled_tools_projection.read().await.clone());
+            Ok(mut subagent) => {
+                let disabled_tools: std::collections::HashSet<String> = disabled_tools_projection
+                    .read()
+                    .await
+                    .clone()
+                    .unwrap_or_default();
+                subagent.set_disabled_tools((!disabled_tools.is_empty()).then_some(disabled_tools.clone()));
+                let capabilities = ToolCapabilitySnapshot::from_definitions(
+                    &subagent.tool_definitions(),
+                    &disabled_tools,
+                );
+                let compiled_system = prompt_compiler.compile_system(&SubagentSystemPromptInput {
+                    actor: echo_agent::subagent::PromptActor::Subagent,
+                    name: &subagent_def.name,
+                    description: &subagent_def.description,
+                    role_prompt: &subagent_def.system_prompt,
+                    capabilities: &capabilities,
+                    boundary: SubagentExecutionBoundary {
+                        access: if subagent_def.readonly {
+                            SubagentAccessMode::ReadOnly
+                        } else {
+                            SubagentAccessMode::Write
+                        },
+                        isolation,
+                        can_delegate: subagent_def.can_delegate,
+                    },
+                });
+                subagent.replace_system_prompt(compiled_system.system_prompt);
                 subagent.set_tool_output_artifacts(tool_output_artifacts.clone());
                 crate::tasks::task_runtime::compact_context::install_task_context_protection(
                     &subagent,
@@ -1051,6 +1126,9 @@ async fn register_default_subagents(
                 let mut builder = SubagentBuilder::new(&subagent_def.name)
                     .description(&subagent_def.description)
                     .fork_mode();
+                if subagent_def.readonly {
+                    builder = builder.read_only();
+                }
                 if let Some(path) = subagent_def
                     .source
                     .strip_prefix("project:")
@@ -1085,9 +1163,8 @@ async fn register_default_subagents(
                 if let Some(max_turns) = subagent_def.max_turns {
                     builder = builder.max_iterations(max_turns);
                 }
-                // Per-subagent execution timeout (e.g. the awaiter watches one
-                // background cell for up to `timeout_secs` before the framework
-                // escalates). None → framework default (no timeout).
+                // Optional per-Subagent execution timeout. None keeps the
+                // framework default.
                 if let Some(timeout_secs) = subagent_def.timeout_secs {
                     builder = builder.timeout(timeout_secs);
                 }
@@ -1123,7 +1200,6 @@ async fn register_default_subagents(
                 let factory_script_execution_profile_resolver =
                     script_execution_profile_resolver.clone();
                 let factory_tool_output_artifacts = tool_output_artifacts.clone();
-                let factory_system_prompt = compiled_system.system_prompt.clone();
                 let factory_prompt_compiler = prompt_compiler.clone();
                 let factory_subagent_registry = subagent_registry.clone();
                 let factory_disabled_tools = Arc::clone(&disabled_tools_projection);
@@ -1138,7 +1214,6 @@ async fn register_default_subagents(
                         let script_execution_profile_resolver =
                             factory_script_execution_profile_resolver.clone();
                         let tool_output_artifacts = factory_tool_output_artifacts.clone();
-                        let system_prompt = factory_system_prompt.clone();
                         let prompt_compiler = factory_prompt_compiler.clone();
                         let subagent_registry = factory_subagent_registry.clone();
                         let disabled_tools = Arc::clone(&factory_disabled_tools);
@@ -1153,10 +1228,10 @@ async fn register_default_subagents(
                                 &model_generation,
                             );
                             let catalog_registry = subagent_registry.clone();
-                            let subagent = if subagent_def.readonly {
+                            let mut subagent = if subagent_def.readonly {
                                 build_readonly_subagent_agent(
                                     &subagent_def.name,
-                                    &system_prompt,
+                                    &subagent_def.system_prompt,
                                     &model_generation.model,
                                     model_generation.llm_config,
                                     model_generation.llm_client,
@@ -1169,7 +1244,7 @@ async fn register_default_subagents(
                                     &cache_user_id,
                                     max_iterations,
                                     subagent_def.can_delegate,
-                                    prompt_compiler,
+                                    prompt_compiler.clone(),
                                     subagent_registry,
                                     browser_runtime,
                                     command_cells,
@@ -1177,7 +1252,7 @@ async fn register_default_subagents(
                             } else {
                                 build_writer_subagent_agent(
                                     &subagent_def.name,
-                                    &system_prompt,
+                                    &subagent_def.system_prompt,
                                     &model_generation.model,
                                     model_generation.llm_config,
                                     model_generation.llm_client,
@@ -1190,7 +1265,7 @@ async fn register_default_subagents(
                                     &cache_user_id,
                                     max_iterations,
                                     subagent_def.can_delegate,
-                                    prompt_compiler,
+                                    prompt_compiler.clone(),
                                     subagent_registry,
                                     browser_runtime,
                                     sandbox_manager,
@@ -1199,7 +1274,39 @@ async fn register_default_subagents(
                                     run_code_available,
                                 )?
                             };
-                            subagent.set_disabled_tools(disabled_tools.read().await.clone());
+                            let disabled_tools: std::collections::HashSet<String> = disabled_tools
+                                .read()
+                                .await
+                                .clone()
+                                .unwrap_or_default();
+                            subagent.set_disabled_tools(
+                                (!disabled_tools.is_empty()).then_some(disabled_tools.clone()),
+                            );
+                            let capabilities = ToolCapabilitySnapshot::from_definitions(
+                                &subagent.tool_definitions(),
+                                &disabled_tools,
+                            );
+                            let compiled_system = prompt_compiler.compile_system(
+                                &SubagentSystemPromptInput {
+                                    actor: echo_agent::subagent::PromptActor::Subagent,
+                                    name: &subagent_def.name,
+                                    description: &subagent_def.description,
+                                    role_prompt: &subagent_def.system_prompt,
+                                    capabilities: &capabilities,
+                                    boundary: SubagentExecutionBoundary {
+                                        access: if subagent_def.readonly {
+                                            SubagentAccessMode::ReadOnly
+                                        } else {
+                                            SubagentAccessMode::Write
+                                        },
+                                        isolation: crate::subagent_loader::subagent_isolation(
+                                            &subagent_def,
+                                        ),
+                                        can_delegate: subagent_def.can_delegate,
+                                    },
+                                },
+                            );
+                            subagent.replace_system_prompt(compiled_system.system_prompt);
                             subagent.set_tool_output_artifacts(tool_output_artifacts);
                             if subagent_def.can_delegate {
                                 let definitions = catalog_registry.list_available().await;
@@ -1215,6 +1322,7 @@ async fn register_default_subagents(
                 )) as Arc<dyn AgentFactory>;
                 built_subagents.push(BuiltSubagent {
                     definition: def,
+                    prompt_definition: subagent_def.clone(),
                     handle: subagent_handle,
                     fork_factory,
                     readonly: subagent_def.readonly,
@@ -1272,15 +1380,23 @@ async fn register_default_subagents(
             factory: built.fork_factory.clone(),
         })
         .collect();
-    let tool_control_handles = built_subagents
+    let prompt_publications = built_subagents
         .iter()
-        .map(|built| built.handle.clone())
+        .map(|built| SubagentPromptPublication {
+            definition: built.prompt_definition.clone(),
+            handle: built.handle.clone(),
+            compiler: prompt_compiler.clone(),
+        })
         .collect();
     AgentModelConsumers {
+        subagent_catalog: Arc::new(
+            crate::subagent_loader::SubagentCatalogSnapshot::from_definitions(subagents),
+        ),
         inherited_generation,
         registry: subagent_registry,
         inherited_factories: Arc::new(inherited_factories),
-        tool_control_handles: Arc::new(tool_control_handles),
+        prompt_publications: Arc::new(prompt_publications),
+        prompt_compiler,
         disabled_tools_projection,
     }
 }
@@ -1307,7 +1423,7 @@ fn build_writer_subagent_agent(
     max_iterations: usize,
     can_delegate: bool,
     prompt_compiler: Arc<dyn SubagentPromptCompiler>,
-    subagent_registry: Arc<echo_agent::agent::subagent::SubagentRegistry>,
+    subagent_registry: Arc<echo_agent::subagent::SubagentRegistry>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
     command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
@@ -1433,7 +1549,7 @@ fn build_readonly_subagent_agent(
     max_iterations: usize,
     can_delegate: bool,
     prompt_compiler: Arc<dyn SubagentPromptCompiler>,
-    subagent_registry: Arc<echo_agent::agent::subagent::SubagentRegistry>,
+    subagent_registry: Arc<echo_agent::subagent::SubagentRegistry>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
@@ -1454,8 +1570,8 @@ fn build_readonly_subagent_agent(
             timeout_ms: tool_timeout_ms,
             ..Default::default()
         })
-        // readonly 子智能体没有 shell,但注入共享 cell registry 后仍获得
-        // wait/stop_cell/list_cells——awaiter 角色正是靠这组工具等待后台命令。
+        // Read-only Subagents cannot launch shell work, but may inspect command
+        // cells already owned by their invocation scope.
         .command_cells(command_cells);
 
     if max_iterations > 0 {

@@ -1,18 +1,13 @@
 ---
 name: using-git-worktrees
 description: 使用 git worktree 隔离功能开发——确保在独立工作区中工作
+allowed-tools: shell read_file read_artifact git_*
 metadata:
   category: development
   source: superpowers
-  upstream-version: "6.0.3"
+  upstream-version: 6.0.3
   author: obra
-  tags: [git, worktree, isolation]
-triggers:
-  - worktree
-  - git worktree
-  - 工作区隔离
-  - 独立分支
-allowed-tools: [shell, read_file, read_artifact, git_*]
+  tags: git, worktree, isolation
 ---
 
 # Using Git Worktrees

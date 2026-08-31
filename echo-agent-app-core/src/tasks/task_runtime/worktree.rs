@@ -1294,17 +1294,14 @@ impl EkoWorktreeFactory {
     fn isolate(
         &self,
         label: &str,
-    ) -> Result<
-        echo_agent::agent::subagent::IsolationHandle,
-        echo_agent::agent::subagent::IsolationError,
-    > {
+    ) -> Result<echo_agent::subagent::IsolationHandle, echo_agent::subagent::IsolationError> {
         // Build the worktree via the shared RunWorktree lifecycle. `acquire_fork`
         // runs blocking git subprocesses; Fork dispatch is already inside a
         // `tokio::spawn`, but the git ops themselves are short and synchronous
         // — acceptable. (If they ever block the runtime, wrap in
         // spawn_blocking inside the factory.)
         let wt = RunWorktree::acquire_fork(label, &self.repo_root)
-            .map_err(|error| echo_agent::agent::subagent::IsolationError::new(error.message))?;
+            .map_err(|error| echo_agent::subagent::IsolationError::new(error.message))?;
         let path = wt.path.clone();
         let evidence_subject = path.to_string_lossy().to_string();
         tracing::info!(
@@ -1316,36 +1313,34 @@ impl EkoWorktreeFactory {
         // `finalize` owns `wt`: clean checkouts are disposable and removed
         // immediately; changed checkouts are summarized, unlocked, and retained
         // for retry or review/integration.
-        Ok(echo_agent::agent::subagent::IsolationHandle {
+        Ok(echo_agent::subagent::IsolationHandle {
             path,
-            observed: echo_agent::agent::subagent::ObservedIsolation::new("worktree"),
+            observed: echo_agent::subagent::ObservedIsolation::new("worktree"),
             finalize: Box::new(move || {
                 let has_changes = match wt.has_changes() {
                     Ok(has_changes) => has_changes,
                     Err(error) => {
                         let _ = wt.unlock();
-                        return Err(echo_agent::agent::subagent::IsolationError::new(
-                            error.message,
-                        ));
+                        return Err(echo_agent::subagent::IsolationError::new(error.message));
                     }
                 };
                 if !has_changes {
                     cleanup_managed_worktree(&wt.repo_root, &wt.path, &wt.branch)
-                        .map_err(echo_agent::agent::subagent::IsolationError::new)?;
+                        .map_err(echo_agent::subagent::IsolationError::new)?;
                     tracing::info!(
                         worktree = %wt.path.display(),
                         branch = %wt.branch,
                         "Removed clean Fork-subagent worktree"
                     );
-                    return Ok(echo_agent::agent::subagent::IsolationOutcome {
+                    return Ok(echo_agent::subagent::IsolationOutcome {
                         summary: "(no worktree changes; clean checkout removed)".to_string(),
                         artifacts: Vec::new(),
-                        evidence: vec![echo_agent::agent::subagent::SubagentEvidence {
+                        evidence: vec![echo_agent::subagent::SubagentEvidence {
                             kind: "worktree".to_string(),
                             subject: evidence_subject,
                             outcome: Some("clean".to_string()),
                             details: String::new(),
-                            source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                            source: echo_agent::subagent::SubagentEvidenceSource::Observed,
                             attributes: serde_json::Value::Null,
                         }],
                     });
@@ -1353,21 +1348,21 @@ impl EkoWorktreeFactory {
                 let summary = wt.diff_summary();
                 let unlock = wt.unlock();
                 match (summary, unlock) {
-                    (Ok(summary), Ok(())) => Ok(echo_agent::agent::subagent::IsolationOutcome {
+                    (Ok(summary), Ok(())) => Ok(echo_agent::subagent::IsolationOutcome {
                         summary: summary.clone(),
                         artifacts: Vec::new(),
-                        evidence: vec![echo_agent::agent::subagent::SubagentEvidence {
+                        evidence: vec![echo_agent::subagent::SubagentEvidence {
                             kind: "worktree".to_string(),
                             subject: evidence_subject,
                             outcome: Some("changed".to_string()),
                             details: summary,
-                            source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                            source: echo_agent::subagent::SubagentEvidenceSource::Observed,
                             attributes: serde_json::Value::Null,
                         }],
                     }),
-                    (Err(error), _) | (_, Err(error)) => Err(
-                        echo_agent::agent::subagent::IsolationError::new(error.message),
-                    ),
+                    (Err(error), _) | (_, Err(error)) => {
+                        Err(echo_agent::subagent::IsolationError::new(error.message))
+                    }
                 }
             }),
         })
@@ -1410,10 +1405,7 @@ impl EkoDataWorkspaceFactory {
     fn isolate(
         &self,
         label: &str,
-    ) -> Result<
-        echo_agent::agent::subagent::IsolationHandle,
-        echo_agent::agent::subagent::IsolationError,
-    > {
+    ) -> Result<echo_agent::subagent::IsolationHandle, echo_agent::subagent::IsolationError> {
         // Sanitize the label into a directory-name prefix (TempDir appends a
         // random suffix, so collisions are impossible and the prefix just aids
         // debuggability when listing /tmp).
@@ -1435,7 +1427,7 @@ impl EkoDataWorkspaceFactory {
             None => tempfile::Builder::new().prefix(&prefix).tempdir(),
         }
         .map_err(|e| {
-            echo_agent::agent::subagent::IsolationError::new(format!(
+            echo_agent::subagent::IsolationError::new(format!(
                 "failed to create data workspace tmpdir ({prefix}): {e}"
             ))
         })?;
@@ -1453,9 +1445,9 @@ impl EkoDataWorkspaceFactory {
         );
 
         let path_for_finalize = final_path.clone();
-        Ok(echo_agent::agent::subagent::IsolationHandle {
+        Ok(echo_agent::subagent::IsolationHandle {
             path: final_path,
-            observed: echo_agent::agent::subagent::ObservedIsolation::new("workspace"),
+            observed: echo_agent::subagent::ObservedIsolation::new("workspace"),
             finalize: Box::new(move || {
                 // List the files the subagent generated (non-recursive top-level
                 // entries; data tools typically write flat outputs). The
@@ -1463,7 +1455,7 @@ impl EkoDataWorkspaceFactory {
                 // for concat+synthesize.
                 let mut entries: Vec<String> = std::fs::read_dir(&path_for_finalize)
                     .map_err(|e| {
-                        echo_agent::agent::subagent::IsolationError::new(format!(
+                        echo_agent::subagent::IsolationError::new(format!(
                             "workspace finalize read_dir failed: {e}"
                         ))
                     })?
@@ -1481,7 +1473,7 @@ impl EkoDataWorkspaceFactory {
                 };
                 let artifacts = entries
                     .into_iter()
-                    .map(|entry| echo_agent::agent::subagent::SubagentArtifact {
+                    .map(|entry| echo_agent::subagent::SubagentArtifact {
                         path: path_for_finalize.join(&entry).to_string_lossy().to_string(),
                         kind: "workspace_output".to_string(),
                         bytes: None,
@@ -1490,7 +1482,7 @@ impl EkoDataWorkspaceFactory {
                         available: path_for_finalize.join(entry).is_file(),
                     })
                     .collect();
-                Ok(echo_agent::agent::subagent::IsolationOutcome {
+                Ok(echo_agent::subagent::IsolationOutcome {
                     summary,
                     artifacts,
                     evidence: Vec::new(),
@@ -1515,26 +1507,23 @@ impl EkoIsolationProvider {
     }
 }
 
-impl echo_agent::agent::subagent::IsolationProvider for EkoIsolationProvider {
+impl echo_agent::subagent::IsolationProvider for EkoIsolationProvider {
     fn isolate(
         &self,
-        request: &echo_agent::agent::subagent::IsolationRequest,
-    ) -> Result<
-        echo_agent::agent::subagent::IsolationHandle,
-        echo_agent::agent::subagent::IsolationError,
-    > {
+        request: &echo_agent::subagent::IsolationRequest,
+    ) -> Result<echo_agent::subagent::IsolationHandle, echo_agent::subagent::IsolationError> {
         match request.kind.as_str() {
             "worktree" => self
                 .worktree
                 .as_ref()
                 .ok_or_else(|| {
-                    echo_agent::agent::subagent::IsolationError::new(
+                    echo_agent::subagent::IsolationError::new(
                         "worktree isolation requires a git repository",
                     )
                 })?
                 .isolate(&request.label),
             "workspace" => self.workspace.isolate(&request.label),
-            kind => Err(echo_agent::agent::subagent::IsolationError::new(format!(
+            kind => Err(echo_agent::subagent::IsolationError::new(format!(
                 "unsupported EKO isolation kind '{kind}'"
             ))),
         }

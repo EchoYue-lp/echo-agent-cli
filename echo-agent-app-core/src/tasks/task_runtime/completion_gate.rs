@@ -315,9 +315,9 @@ fn assess_requirement(
             &requirement.requirement_sha256,
             run.goal_revision,
         );
-    let execution_passed = summary.result.status == SubagentRunStatus::Completed
-        && !summary.result.summary.trim().is_empty()
-        && summary.result.remaining_work.is_empty();
+    let execution_passed = summary.outcome.status == SubagentStatus::Completed
+        && !summary.outcome.summary.trim().is_empty()
+        && summary.outcome.remaining_work.is_empty();
     evidence.push(evidence_from_event(
         &requirement,
         RequirementEvidenceKind::TaskExecution,
@@ -359,8 +359,8 @@ fn assess_requirement(
     }
 
     for required in &requirement.execution_checks {
-        let matched = summary.result.verification.iter().find(|item| {
-            item.source == SubagentVerificationSource::Observed
+        let matched = summary.outcome.verification.iter().find(|item| {
+            item.source == SubagentEvidenceSource::Observed
                 && verification_matches(required, &item.check)
         });
         let passed = matched.is_some_and(|item| item.status == SubagentVerificationStatus::Passed);
@@ -395,7 +395,7 @@ fn assess_requirement(
 
     for required in &requirement.required_artifacts {
         let artifact = summary
-            .result
+            .outcome
             .artifacts
             .iter()
             .find(|item| artifact_matches(required, &item.path));
@@ -614,7 +614,7 @@ enum ArtifactVerificationError {
     Unavailable(String),
 }
 
-fn verify_artifact(artifact: &SubagentArtifactResult) -> Result<String, ArtifactVerificationError> {
+fn verify_artifact(artifact: &SubagentArtifact) -> Result<String, ArtifactVerificationError> {
     if !artifact.available {
         return Err(ArtifactVerificationError::Unavailable(format!(
             "artifact was reported unavailable: {}",
@@ -747,11 +747,11 @@ mod tests {
             run_id: "run".to_string(),
             task_id: "task".to_string(),
             subagent_name: "test_subagent".to_string(),
-            result: SubagentTaskResult {
+            outcome: SubagentOutcome {
                 contract_version: 1,
-                status: SubagentRunStatus::Completed,
+                status: SubagentStatus::Completed,
                 summary: "output produced".to_string(),
-                artifacts: vec![SubagentArtifactResult {
+                artifacts: vec![SubagentArtifact {
                     path: artifact_path.to_string(),
                     kind: "file".to_string(),
                     bytes: None,
@@ -760,11 +760,11 @@ mod tests {
                     available: true,
                 }],
                 evidence: Vec::new(),
-                verification: vec![SubagentVerificationResult {
+                verification: vec![SubagentVerification {
                     check: "cargo   test -p sample".to_string(),
                     status: SubagentVerificationStatus::Passed,
                     details: "passed".to_string(),
-                    source: SubagentVerificationSource::Observed,
+                    source: SubagentEvidenceSource::Observed,
                 }],
                 remaining_work: Vec::new(),
                 touched_files: SubagentTouchedFiles::default(),

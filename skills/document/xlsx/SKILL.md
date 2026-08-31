@@ -1,28 +1,15 @@
 ---
 name: xlsx
 description: Excel 电子表格创建、公式计算、数据分析和图表
+allowed-tools: shell read_file read_artifact apply_patch
 metadata:
   category: document
   source: anthropic
-  upstream-version: "1.0"
+  upstream-version: '1.0'
   author: anthropic
-  tags: [excel, spreadsheet, office, data]
-  requires-binaries: "soffice"
-  requires-python-packages: "openpyxl"
-triggers:
-  - Excel
-  - xlsx
-  - 电子表格
-  - 公式
-  - 数据表
-allowed-tools: [shell, read_file, read_artifact, apply_patch]
-hooks:
-  UserPromptSubmit:
-    - matcher: "\\.xlsx"
-      hooks:
-        - type: activate_skill
-          skill: xlsx
-          reason: 检测到 .xlsx 文件路径
+  tags: excel, spreadsheet, office, data
+  requires-binaries: soffice
+  requires-python-packages: openpyxl
 ---
 # XLSX Skill
 

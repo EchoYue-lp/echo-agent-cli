@@ -30,13 +30,6 @@ impl TaskRuntimeStore {
     /// No database is opened. Root authority, durable directory creation, and
     /// cross-process lease failures are propagated to bootstrap.
     pub fn new() -> anyhow::Result<Self> {
-        Self::open()
-    }
-
-    /// Create the store. No path is needed anymore (no SQLite); the file shadow
-    /// root is the real storage location. Kept as `open()` with no args for
-    /// call-site compatibility with the old `open(path)` constructor.
-    pub fn open() -> anyhow::Result<Self> {
         let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::try_new(
             super::file_shadow::FileTaskShadow::default_root(),
         )?);
@@ -914,10 +907,10 @@ impl TaskRuntimeStore {
             driver_token,
             execution_context_id: execution_context_id.clone(),
         };
-        let operation_adapter =
-            super::executor::TaskRuntimeBlockingAdapter::new(std::sync::Arc::clone(self));
+        let operation =
+            super::executor::TaskRuntimeOperation::new(std::sync::Arc::clone(self));
         let operation_reservation =
-            operation_adapter.reserve_settlement("drive registered TaskRun")?;
+            operation.reserve_settlement("drive registered TaskRun")?;
         admission.active = false;
         supervisor.pending_admissions = supervisor.pending_admissions.saturating_sub(1);
         let reservations_idle = supervisor.pending_admissions == 0;
@@ -935,7 +928,7 @@ impl TaskRuntimeStore {
             },
         );
         let operation_driver_token = driver_token;
-        let driver_operation = operation_adapter.spawn_reserved_settlement(
+        let driver_operation = operation.spawn_reserved_settlement(
             "drive registered TaskRun",
             operation_reservation,
             async move {
@@ -967,7 +960,7 @@ impl TaskRuntimeStore {
             let operation_store = settlement_store.clone();
             let operation_run_id = run_id.clone();
             let (settled_result, release_receipts) =
-                super::executor::TaskRuntimeBlockingAdapter::new(settlement_store.clone())
+                super::executor::TaskRuntimeOperation::new(settlement_store.clone())
                     .run_owned("settle registered TaskRun", move || {
                 let mut release_receipts = !should_settle;
                 if should_settle {
@@ -1271,7 +1264,7 @@ impl TaskRuntimeStore {
 
     /// Async-surface variant of [`Self::spawn_supervised_task_retry`]. Driver
     /// admission remains on the Tokio runtime, while the journal-backed retry
-    /// preparation runs through the process-wide bounded blocking adapter.
+    /// preparation runs through the process-wide bounded blocking operation.
     ///
     /// The registration is owned by the blocking closure once file I/O starts.
     /// Dropping the caller therefore cannot release the workspace generation
@@ -1301,7 +1294,7 @@ impl TaskRuntimeStore {
         let registration = self.register_run_driver::<()>(admission, generation_lease)?;
         let operation_store = std::sync::Arc::clone(self);
         let (registration, preparation, context) =
-            super::executor::TaskRuntimeBlockingAdapter::new(std::sync::Arc::clone(self))
+            super::executor::TaskRuntimeOperation::new(std::sync::Arc::clone(self))
                 .run_owned("prepare supervised task retry", move || {
                     let mut registration = registration;
                     let context = match preflight() {
@@ -2879,8 +2872,10 @@ impl TaskRuntimeStore {
         for spec in plan.tasks {
             let execution = executions
                 .remove(&spec.id)
-                .unwrap_or_else(|| EkoTaskExecution::pending(spec.id.clone()));
-            let framework_spec = spec.to_task_spec().map_err(StoreError::InvalidPlan)?;
+                .unwrap_or_else(|| echo_agent::tasks::TaskExecution::pending(spec.id.clone()));
+            let framework_spec: echo_agent::tasks::TaskSpec = spec
+                .try_into()
+                .map_err(StoreError::InvalidPlan)?;
             tasks.push(echo_agent::tasks::Task {
                 spec: framework_spec,
                 execution: echo_agent::tasks::TaskExecution {
@@ -3037,14 +3032,14 @@ impl TaskRuntimeStore {
                 || !task.acceptance_criteria.is_empty()
                 || !task.allowed_tools.is_empty()
                 || task.execution_target.is_some()
-                || summary.result.status != SubagentRunStatus::Completed
-                || summary.result.summary.trim().is_empty()
-                || !summary.result.remaining_work.is_empty()
-                || summary.result.evidence.iter().any(|evidence| {
+                || summary.outcome.status != SubagentStatus::Completed
+                || summary.outcome.summary.trim().is_empty()
+                || !summary.outcome.remaining_work.is_empty()
+                || summary.outcome.evidence.iter().any(|evidence| {
                     evidence.kind == "file_write"
                         && evidence.outcome.as_deref() == Some("succeeded")
                 })
-                || !summary.result.touched_files.written.is_empty()
+                || !summary.outcome.touched_files.written.is_empty()
                 || task_summary.trim().is_empty()
             {
                 return Err(StoreError::InvalidPlan(
@@ -3204,7 +3199,7 @@ impl TaskRuntimeStore {
     }
 
     /// Unit-test convenience for exercising the canonical framework patch
-    /// engine through EKO's file commit adapter.
+    /// engine through EKO's file commit operation.
     #[cfg(test)]
     pub(crate) fn apply_task_patch_for_test(
         &self,
@@ -3228,8 +3223,8 @@ impl TaskRuntimeStore {
                 "task_update requires a non-empty reason".to_string(),
             ));
         }
-        let patch = request
-            .to_task_plan_patch()
+    let patch: echo_agent::tasks::TaskPlanPatch = request
+        .try_into()
             .map_err(StoreError::InvalidPlan)?;
         let application = echo_agent::tasks::TaskPatchEngine::apply_operations(
             &current.snapshot.tasks,
@@ -4183,7 +4178,7 @@ impl TaskRuntimeStore {
                         .map(|claim| claim.execution_id(&run.run_id, &task.id))
                 });
                 let completed_subagent = match task.and_then(|task| task.claim.as_ref()) {
-                    Some(claim) => self.recoverable_subagent_result_for_attempt(
+                    Some(claim) => self.recoverable_subagent_outcome_for_attempt(
                         &run.run_id,
                         &task_id,
                         &claim.execution_id(&run.run_id, &task_id),
@@ -4251,7 +4246,7 @@ impl TaskRuntimeStore {
                     serde_json::json!({
                         "task_id": boundary.task_id,
                         "execution_id": boundary.execution_id,
-                        "status": SubagentRunStatus::Failed.as_str(),
+                        "status": SubagentStatus::Failed.as_str(),
                         "terminal_cause": "process_interrupted",
                     })
                 })
@@ -5592,7 +5587,7 @@ impl TaskRuntimeStore {
 
     /// Persist the boundary immediately before a task Subagent starts model/tool
     /// execution. A matching [`record_subagent_released`](Self::record_subagent_released)
-    /// makes the Subagent result recoverable without dispatching it again.
+    /// makes the Subagent outcome recoverable without dispatching it again.
     #[allow(clippy::too_many_arguments)]
     pub fn record_subagent_assigned(
         &self,
@@ -5624,7 +5619,7 @@ impl TaskRuntimeStore {
         ))
     }
 
-    /// Persist a Subagent terminal fact with the structured result needed for resume.
+    /// Persist a Subagent terminal fact with the structured outcome needed for resume.
     pub(crate) fn record_subagent_released(
         &self,
         record: SubagentReleaseRecord<'_>,
@@ -5639,13 +5634,13 @@ impl TaskRuntimeStore {
             plan_revision,
             attempt,
             status,
-            result,
+            outcome,
             full_output,
             usage,
             dispatch_hook,
         } = record;
         self.with_run_lock(run_id, || {
-            let summary = result.map(|value| bounded_event_text(&value.summary, 2_000));
+            let summary = outcome.map(|value| bounded_event_text(&value.summary, 2_000));
             let mut events = vec![RuntimeJournalEvent::for_append(
                 run_id,
                 Some(task_id),
@@ -5659,7 +5654,7 @@ impl TaskRuntimeStore {
                     "attempt": attempt,
                     "status": status,
                     "summary": summary,
-                    "result": result,
+                    "outcome": outcome,
                     "full_output": full_output,
                     "usage": usage,
                     "dispatch_hook": dispatch_hook,
@@ -5744,21 +5739,21 @@ impl TaskRuntimeStore {
         ))
     }
 
-    /// Return a completed Subagent result for a stable logical attempt.
+    /// Return a completed Subagent outcome for a stable logical attempt.
     ///
     /// A physical claim gets a fresh execution id when an interrupted task is
     /// reclaimed. Revision and attempt remain stable across that reclaim, so
     /// they form the durable idempotency key. A later assignment for the same
     /// logical attempt clears the terminal fact, while a retry or edited task
     /// has a different attempt or revision and cannot reuse stale output.
-    pub(crate) fn recoverable_subagent_result_for_attempt(
+    pub(crate) fn recoverable_subagent_outcome_for_attempt(
         &self,
         run_id: &str,
         task_id: &str,
         execution_id: &str,
         plan_revision: u64,
         attempt: u32,
-    ) -> Result<Option<RecoverableSubagentResult>, StoreError> {
+    ) -> Result<Option<RecoverableSubagentOutcome>, StoreError> {
         let events = self.list_events(run_id, 0)?;
         let current_claim_index = events.iter().position(|event| {
             event.task_id.as_deref() == Some(task_id)
@@ -5798,16 +5793,16 @@ impl TaskRuntimeStore {
                         if json_string(&event.payload, "status").as_deref() == Some("completed") {
                             event
                                 .payload
-                                .get("result")
+                                .get("outcome")
                                 .cloned()
                                 .and_then(|value| {
-                                    serde_json::from_value::<SubagentTaskResult>(value).ok()
+                                    serde_json::from_value::<SubagentOutcome>(value).ok()
                                 })
-                                .map(|result| RecoverableSubagentResult {
+                                .map(|outcome| RecoverableSubagentOutcome {
                                     full_output: json_string(&event.payload, "full_output")
                                         .filter(|output| !output.trim().is_empty())
-                                        .unwrap_or_else(|| result.summary.clone()),
-                                    result,
+                                        .unwrap_or_else(|| outcome.summary.clone()),
+                                    outcome,
                                 })
                         } else {
                             None

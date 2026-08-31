@@ -25,7 +25,7 @@ impl ChatEventLog {
         .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?
     }
 
-    pub async fn settle_all_started_awaiter_deliveries_async(
+    pub async fn settle_all_started_command_cell_watch_deliveries_async(
         self: &Arc<Self>,
     ) -> Result<usize, ChatEventLogError> {
         let permit = PROCESS_CHAT_EVENT_IO
@@ -36,14 +36,14 @@ impl ChatEventLog {
         let log = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let recoveries = log.all_started_awaiter_deliveries()?;
+            let recoveries = log.all_started_command_cell_watch_deliveries()?;
             let mut settled = 0_usize;
             for (workspace_id, conversation_id, root_turn_id, acknowledgement) in recoveries {
                 log.append(
                     &workspace_id,
                     conversation_id.as_deref(),
                     &root_turn_id,
-                    ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement },
+                    ChatDriverEvent::CommandCellWatchAcknowledged { acknowledgement },
                 )?;
                 settled = settled.saturating_add(1);
             }
@@ -53,11 +53,11 @@ impl ChatEventLog {
         .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?
     }
 
-    pub async fn pending_awaiter_results_for_conversation_async(
+    pub async fn pending_command_cell_watches_for_conversation_async(
         self: &Arc<Self>,
         workspace_id: String,
         conversation_id: String,
-    ) -> Result<Vec<crate::tasks::task_runtime::command_cells::AwaiterResult>, ChatEventLogError>
+    ) -> Result<Vec<crate::tasks::task_runtime::command_cells::CommandCellWatchResult>, ChatEventLogError>
     {
         let permit = PROCESS_CHAT_EVENT_IO
             .clone()
@@ -67,7 +67,7 @@ impl ChatEventLog {
         let log = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            log.pending_awaiter_results_for_conversation(&workspace_id, &conversation_id)
+            log.pending_command_cell_watches_for_conversation(&workspace_id, &conversation_id)
         })
         .await
         .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?
@@ -138,7 +138,7 @@ impl ChatEventLog {
         root_turn_id: &str,
         event: ChatDriverEvent,
     ) -> Result<ChatEventEnvelope, ChatEventLogError> {
-        validate_event_stream_identity(workspace_id, conversation_id, &event)?;
+        validate_event_stream_identity(workspace_id, conversation_id, root_turn_id, &event)?;
         validate_driver_event(&event)?;
         if let ChatDriverEvent::InputLifecycle(fact) = &event
             && fact.identity().input_id != root_turn_id
@@ -196,8 +196,8 @@ impl ChatEventLog {
         message_id: String,
         event: ChatDriverEvent,
     ) -> Result<ChatEventEnvelope, ChatEventLogError> {
-        if let Some(fact_key) = awaiter_fact_key(&event)
-            && let Some(sequence) = authority.pins.awaiter_facts.get(&fact_key).copied()
+        if let Some(fact_key) = command_cell_watch_fact_key(&event)
+            && let Some(sequence) = authority.pins.command_cell_watch_facts.get(&fact_key).copied()
         {
             let record = authority
                 .journal
@@ -508,12 +508,12 @@ impl ChatEventLog {
         Ok(recovered)
     }
 
-    pub fn pending_awaiter_results(
+    pub fn pending_command_cell_watches(
         &self,
         workspace_id: &str,
         conversation_id: &str,
         root_turn_id: &str,
-    ) -> Result<Vec<crate::tasks::task_runtime::command_cells::AwaiterResult>, ChatEventLogError>
+    ) -> Result<Vec<crate::tasks::task_runtime::command_cells::CommandCellWatchResult>, ChatEventLogError>
     {
         let selected_stream_id = stream_id(workspace_id, Some(conversation_id), root_turn_id)?;
         let Some(cached) = self.stream_journal(&selected_stream_id, false)? else {
@@ -529,7 +529,7 @@ impl ChatEventLog {
         let path = self.stream_dir(&selected_stream_id);
         let pending = authority
             .pins
-            .pending_awaiters
+            .pending_command_cell_watches
             .iter()
             .map(|(key, sequence)| (key.clone(), *sequence))
             .collect::<BTreeMap<_, _>>();
@@ -545,20 +545,20 @@ impl ChatEventLog {
                 .ok_or_else(|| {
                     corrupt(
                         &path,
-                        format!("pending Awaiter {key} is missing at {sequence}"),
+                        format!("pending CommandCellWatch {key} is missing at {sequence}"),
                     )
                 })?;
             let envelope = envelope_from_record(record, &path, &selected_stream_id)?;
-            let ChatDriverEvent::AwaiterResultReady { result } = envelope.payload else {
+            let ChatDriverEvent::CommandCellWatchReady { result } = envelope.payload else {
                 return Err(corrupt(
                     &path,
-                    format!("pending Awaiter {key} does not point to a Ready fact"),
+                    format!("pending CommandCellWatch {key} does not point to a Ready fact"),
                 ));
             };
-            if awaiter_receipt_key(&result.receipt) != key {
+            if command_cell_watch_receipt_key(&result.receipt) != key {
                 return Err(corrupt(
                     &path,
-                    format!("pending Awaiter {key} points to a different receipt"),
+                    format!("pending CommandCellWatch {key} points to a different receipt"),
                 ));
             }
             results.push(*result);
@@ -569,18 +569,18 @@ impl ChatEventLog {
         Ok(results)
     }
 
-    pub fn pending_awaiter_results_for_conversation(
+    pub fn pending_command_cell_watches_for_conversation(
         &self,
         workspace_id: &str,
         conversation_id: &str,
-    ) -> Result<Vec<crate::tasks::task_runtime::command_cells::AwaiterResult>, ChatEventLogError>
+    ) -> Result<Vec<crate::tasks::task_runtime::command_cells::CommandCellWatchResult>, ChatEventLogError>
     {
         let mut pending = Vec::new();
         for stream in self.enumerate_streams()? {
             if stream.first.workspace_id == workspace_id
                 && stream.first.conversation_id.as_deref() == Some(conversation_id)
             {
-                pending.extend(self.pending_awaiter_results(
+                pending.extend(self.pending_command_cell_watches(
                     workspace_id,
                     conversation_id,
                     &stream.first.root_turn_id,
@@ -596,9 +596,9 @@ impl ChatEventLog {
         Ok(pending)
     }
 
-    fn all_started_awaiter_deliveries(
+    fn all_started_command_cell_watch_deliveries(
         &self,
-    ) -> Result<Vec<StartedAwaiterDelivery>, ChatEventLogError> {
+    ) -> Result<Vec<StartedCommandCellWatchDelivery>, ChatEventLogError> {
         let mut started = Vec::new();
         for stream in self.enumerate_streams()? {
             let Some(cached) = self.stream_journal(&stream.stream_id, false)? else {
@@ -611,7 +611,7 @@ impl ChatEventLog {
             started.extend(
                 authority
                     .pins
-                    .started_awaiters
+                    .started_command_cell_watches
                     .values()
                     .map(|(_, acknowledgement)| {
                         (
@@ -669,6 +669,7 @@ impl ChatEventLog {
         validate_event_stream_identity(
             &address.workspace_id,
             Some(&address.conversation_id),
+            root_turn_id,
             &event,
         )?;
         validate_driver_event(&event)?;

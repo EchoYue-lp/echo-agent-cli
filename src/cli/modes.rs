@@ -507,10 +507,11 @@ pub async fn run_jsonl_mode(
         .await
         .map_err(anyhow::Error::from)?;
     let agent = pool_execution.agent();
-    let permission_mode = echo_agent_app_core::api::permission::parse_permission_mode(
-        options.permission_mode.as_str(),
-    )
-    .map_err(anyhow::Error::msg)?;
+    let permission_mode = options
+        .permission_mode
+        .as_str()
+        .parse::<echo_agent::tools::permission::PermissionMode>()
+        .map_err(anyhow::Error::msg)?;
     agent
         .write(|agent| agent.set_permission_mode(permission_mode))
         .await;

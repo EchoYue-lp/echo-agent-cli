@@ -15,7 +15,7 @@ use super::background::BackgroundTaskKind;
 use super::task_runtime::{
     AttendedMode, DomainProfile, ExecuteTaskTool, ExecutionMode, MemoryPolicy, PlanRevision,
     PlanTask, RecoveryBlocker, RecoveryDecision, TaskPlan, TaskRetryPreparation, TaskRun,
-    TaskRunBootOutcome, TaskRunBootReconciler, TaskRunStatus, TaskRuntimeBlockingAdapter,
+    TaskRunBootOutcome, TaskRunBootReconciler, TaskRunStatus, TaskRuntimeOperation,
     TaskRuntimeStore, TodoItem, TodoStatus, UnattendedWriteMode,
 };
 use crate::agent_handle::AgentHandle;
@@ -280,7 +280,7 @@ impl BackgroundTaskService {
         let preparation_domain_profile = request.domain_profile;
         let preparation_priority = request.priority;
         let preparation_store = self.task_runtime_store.clone();
-        let registration = TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+        let registration = TaskRuntimeOperation::new(self.task_runtime_store.clone())
             .run_owned("prepare background TaskRun", move || {
                 let mut registration = registration;
                 registration.mark_preparation_started();
@@ -358,7 +358,7 @@ impl BackgroundTaskService {
         let preparation_conversation_id = conversation_id.clone();
         let preparation_goal = goal.to_string();
         let preparation_kind = task_kind.clone();
-        let (registration, run) = TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+        let (registration, run) = TaskRuntimeOperation::new(self.task_runtime_store.clone())
             .run_owned("prepare background TaskRun DAG", move || {
                 let mut registration = registration;
                 registration.mark_preparation_started();
@@ -379,7 +379,7 @@ impl BackgroundTaskService {
                 }
             })
             .await?;
-        if let Err(error) = super::task_runtime::revisioned_adapter::publish_eko_task_plan(
+        if let Err(error) = super::task_runtime::revisioned_runtime::publish_task_plan(
             self.task_runtime_store.clone(),
             run,
             super::task_runtime::store::InitialRunTriggerMetadata {
@@ -440,7 +440,7 @@ impl BackgroundTaskService {
 
     pub async fn cancel(&self, id: &str) -> bool {
         let run_id = id.to_string();
-        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+        TaskRuntimeOperation::new(self.task_runtime_store.clone())
             .run_store("cancel background TaskRun", move |store| {
                 store.request_cancel(&run_id)
             })
@@ -450,7 +450,7 @@ impl BackgroundTaskService {
 
     pub async fn pause(&self, id: &str) -> anyhow::Result<bool> {
         let run_id = id.to_string();
-        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+        TaskRuntimeOperation::new(self.task_runtime_store.clone())
             .run_store("pause background TaskRun", move |store| {
                 store.request_pause(&run_id)
             })
@@ -474,7 +474,7 @@ impl BackgroundTaskService {
         let agent_provider = self.agent_provider.clone();
         let review_integration = self.review_integration.clone();
         let run_semaphore = self.run_semaphore.clone();
-        TaskRuntimeBlockingAdapter::new(store.clone())
+        TaskRuntimeOperation::new(store.clone())
             .run_owned("prepare exact background resume", move || {
                 let mut registration = registration;
                 let snapshot = store
@@ -525,7 +525,7 @@ impl BackgroundTaskService {
 
     pub async fn recovery_blockers(&self, id: &str) -> anyhow::Result<Vec<RecoveryBlocker>> {
         let run_id = id.to_string();
-        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+        TaskRuntimeOperation::new(self.task_runtime_store.clone())
             .run_store("load background recovery blockers", move |store| {
                 store.list_recovery_blockers(&run_id)
             })
@@ -541,7 +541,7 @@ impl BackgroundTaskService {
     ) -> anyhow::Result<()> {
         let run_id = id.to_string();
         let task_id = task_id.to_string();
-        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+        TaskRuntimeOperation::new(self.task_runtime_store.clone())
             .run_store("resolve background recovery task", move |store| {
                 store.resolve_recovery_task(&run_id, &task_id, decision)
             })
@@ -604,7 +604,7 @@ impl BackgroundTaskService {
 
     pub async fn list_unified(&self, status_filter: Option<&str>) -> Vec<UnifiedTaskInfo> {
         let status_filter = status_filter.map(str::to_string);
-        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+        TaskRuntimeOperation::new(self.task_runtime_store.clone())
             .run_store("list background TaskRuns", move |store| {
                 store.list_runs_in(&all_run_statuses()).map(|runs| {
                     runs.into_iter()
@@ -624,7 +624,7 @@ impl BackgroundTaskService {
 
     pub async fn get_unified(&self, id: &str) -> Option<UnifiedTaskInfo> {
         let run_id = id.to_string();
-        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+        TaskRuntimeOperation::new(self.task_runtime_store.clone())
             .run_store("load background TaskRun", move |store| {
                 store.get_run(&run_id).map(|run| {
                     run.filter(|run| run.conversation_id.starts_with("background:"))
@@ -642,7 +642,7 @@ impl BackgroundTaskService {
 
     pub async fn get_task_plan(&self, run_id: &str) -> anyhow::Result<Option<PlanRevision>> {
         let run_id = run_id.to_string();
-        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+        TaskRuntimeOperation::new(self.task_runtime_store.clone())
             .run_store("load background TaskRun plan", move |store| {
                 store.get_plan_revision(&run_id)
             })
@@ -652,7 +652,7 @@ impl BackgroundTaskService {
 
     pub async fn list_task_todos(&self, run_id: &str) -> anyhow::Result<Vec<TodoItem>> {
         let run_id = run_id.to_string();
-        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+        TaskRuntimeOperation::new(self.task_runtime_store.clone())
             .run_store("list background TaskRun todos", move |store| {
                 store.list_todos(&run_id)
             })
@@ -665,7 +665,7 @@ impl BackgroundTaskService {
             .recover_once()
             .await
             .map_err(anyhow::Error::msg)?;
-        let mut runs = TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+        let mut runs = TaskRuntimeOperation::new(self.task_runtime_store.clone())
             .run_store("load pending background TaskRuns", move |store| {
                 store
                     .list_runs_in(&[TaskRunStatus::Pending, TaskRunStatus::Paused])
@@ -742,7 +742,7 @@ impl BackgroundTaskService {
 
     pub async fn get_progress(&self, run_id: &str) -> Option<TaskProgress> {
         let run_id = run_id.to_string();
-        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+        TaskRuntimeOperation::new(self.task_runtime_store.clone())
             .run_store("load background TaskRun progress", move |store| {
                 let Some(run) = store.get_run(&run_id)? else {
                     return Ok(None);
@@ -806,7 +806,7 @@ async fn drive_background_run(
     cancel: CancellationToken,
     mut receipt_owner: super::task_runtime::store::RunDriverReceiptOwner,
 ) -> Result<(), String> {
-    let blocking = TaskRuntimeBlockingAdapter::new(store.clone());
+    let blocking = TaskRuntimeOperation::new(store.clone());
     if cancel.is_cancelled() {
         let failure_run_id = run_id.clone();
         let failure_store = store.clone();

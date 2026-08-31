@@ -4,15 +4,9 @@ description: 接收代码审查反馈时的处理指南——需要技术严谨�
 metadata:
   category: methodology
   source: superpowers
-  upstream-version: "6.0.3"
+  upstream-version: 6.0.3
   author: obra
-  tags: [review, feedback, collaboration]
-triggers:
-  - 收到审查
-  - 审查反馈
-  - review feedback
-  - code review comments
-allowed-tools: []
+  tags: review, feedback, collaboration
 ---
 
 # Receiving Code Review

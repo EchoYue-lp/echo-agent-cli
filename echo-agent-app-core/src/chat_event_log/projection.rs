@@ -98,8 +98,8 @@ impl RetentionPins {
 
     fn apply(&mut self, sequence: u64, event: &PersistedChatEvent) {
         self.cursor = sequence;
-        if let Some(fact_key) = awaiter_fact_key(&event.payload) {
-            self.awaiter_facts.entry(fact_key).or_insert(sequence);
+        if let Some(fact_key) = command_cell_watch_fact_key(&event.payload) {
+            self.command_cell_watch_facts.entry(fact_key).or_insert(sequence);
         }
         match &event.payload {
             ChatDriverEvent::CommandCellStarted { cell } => {
@@ -114,29 +114,29 @@ impl RetentionPins {
                 let removed = self.active_cells.remove(&cell.cell_id);
                 self.refresh_earliest_if_removed(removed);
             }
-            ChatDriverEvent::AwaiterResultReady { result } => {
-                let key = awaiter_receipt_key(&result.receipt);
+            ChatDriverEvent::CommandCellWatchReady { result } => {
+                let key = command_cell_watch_receipt_key(&result.receipt);
                 if let std::collections::hash_map::Entry::Vacant(entry) =
-                    self.pending_awaiters.entry(key)
+                    self.pending_command_cell_watches.entry(key)
                 {
                     entry.insert(sequence);
                     self.earliest = Some(self.earliest.map_or(sequence, |old| old.min(sequence)));
                 }
             }
-            ChatDriverEvent::AwaiterResultDeliveryStarted { acknowledgement } => {
-                let key = awaiter_ack_key(acknowledgement);
-                let removed = self.pending_awaiters.remove(&key);
-                self.started_awaiters
+            ChatDriverEvent::CommandCellWatchDeliveryStarted { acknowledgement } => {
+                let key = command_cell_watch_ack_key(acknowledgement);
+                let removed = self.pending_command_cell_watches.remove(&key);
+                self.started_command_cell_watches
                     .entry(key)
                     .or_insert_with(|| (sequence, acknowledgement.clone()));
                 self.refresh_earliest_if_removed(removed);
                 self.earliest = Some(self.earliest.map_or(sequence, |old| old.min(sequence)));
             }
-            ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement } => {
-                let key = awaiter_ack_key(acknowledgement);
-                let pending = self.pending_awaiters.remove(&key);
+            ChatDriverEvent::CommandCellWatchAcknowledged { acknowledgement } => {
+                let key = command_cell_watch_ack_key(acknowledgement);
+                let pending = self.pending_command_cell_watches.remove(&key);
                 let started = self
-                    .started_awaiters
+                    .started_command_cell_watches
                     .remove(&key)
                     .map(|(sequence, _)| sequence);
                 self.refresh_earliest_if_removed(pending.or(started));
@@ -153,11 +153,11 @@ impl RetentionPins {
     }
 
     fn discard_before(&mut self, retained_floor: u64) {
-        self.awaiter_facts
+        self.command_cell_watch_facts
             .retain(|_, sequence| *sequence >= retained_floor);
-        self.pending_awaiters
+        self.pending_command_cell_watches
             .retain(|_, sequence| *sequence >= retained_floor);
-        self.started_awaiters
+        self.started_command_cell_watches
             .retain(|_, (sequence, _)| *sequence >= retained_floor);
         self.active_cells
             .retain(|_, sequence| *sequence >= retained_floor);
@@ -181,9 +181,9 @@ impl RetentionPins {
             .map(conversation_input_pin_sequence)
             .min();
         self.earliest = self
-            .pending_awaiters
+            .pending_command_cell_watches
             .values()
-            .chain(self.started_awaiters.values().map(|(sequence, _)| sequence))
+            .chain(self.started_command_cell_watches.values().map(|(sequence, _)| sequence))
             .chain(self.active_cells.values())
             .chain(conversation_input_earliest.iter())
             .copied()
@@ -634,6 +634,7 @@ fn validate_persisted_record(
     validate_event_stream_identity(
         &persisted.workspace_id,
         persisted.conversation_id.as_deref(),
+        &persisted.root_turn_id,
         &persisted.payload,
     )
     .map_err(|error| corrupt(path, error.to_string()))?;
@@ -777,9 +778,9 @@ fn append_durability(event: &ChatDriverEvent) -> FileDurability {
         | ChatDriverEvent::Interrupt { .. }
         | ChatDriverEvent::CommandCellStarted { .. }
         | ChatDriverEvent::CommandCellSettled { .. }
-        | ChatDriverEvent::AwaiterResultReady { .. }
-        | ChatDriverEvent::AwaiterResultDeliveryStarted { .. }
-        | ChatDriverEvent::AwaiterResultAcknowledged { .. }
+        | ChatDriverEvent::CommandCellWatchReady { .. }
+        | ChatDriverEvent::CommandCellWatchDeliveryStarted { .. }
+        | ChatDriverEvent::CommandCellWatchAcknowledged { .. }
         | ChatDriverEvent::InputLifecycle(_)
         | ChatDriverEvent::ApprovalRequest { .. }
         | ChatDriverEvent::InputRequest { .. }
@@ -857,25 +858,22 @@ fn event_identity(event: &ChatDriverEvent, root_turn_id: &str) -> (String, Strin
     }
 }
 
-fn awaiter_receipt_key(
-    receipt: &crate::tasks::task_runtime::command_cells::AwaiterWatchReceipt,
+fn command_cell_watch_receipt_key(
+    receipt: &crate::tasks::task_runtime::command_cells::CommandCellWatchReceipt,
+) -> String {
+    format!("{}:{}", receipt.execution_id, receipt.watch_generation)
+}
+
+fn command_cell_watch_ack_key(
+    acknowledgement: &crate::tasks::task_runtime::command_cells::CommandCellWatchAcknowledgement,
 ) -> String {
     format!(
-        "{}:{}:{}",
-        receipt.execution_id, receipt.attempt, receipt.watch_generation
+        "{}:{}",
+        acknowledgement.execution_id, acknowledgement.watch_generation
     )
 }
 
-fn awaiter_ack_key(
-    acknowledgement: &crate::tasks::task_runtime::command_cells::AwaiterResultAcknowledgement,
-) -> String {
-    format!(
-        "{}:{}:{}",
-        acknowledgement.execution_id, acknowledgement.attempt, acknowledgement.watch_generation
-    )
-}
-
-fn awaiter_fact_key(event: &ChatDriverEvent) -> Option<String> {
+fn command_cell_watch_fact_key(event: &ChatDriverEvent) -> Option<String> {
     match event {
         ChatDriverEvent::CommandCellStarted { cell } => {
             Some(format!("cell_started:{}", cell.cell_id))
@@ -883,14 +881,14 @@ fn awaiter_fact_key(event: &ChatDriverEvent) -> Option<String> {
         ChatDriverEvent::CommandCellSettled { cell } => {
             Some(format!("cell_settled:{}", cell.cell_id))
         }
-        ChatDriverEvent::AwaiterResultReady { result } => {
-            Some(format!("ready:{}", awaiter_receipt_key(&result.receipt)))
+        ChatDriverEvent::CommandCellWatchReady { result } => {
+            Some(format!("ready:{}", command_cell_watch_receipt_key(&result.receipt)))
         }
-        ChatDriverEvent::AwaiterResultDeliveryStarted { acknowledgement } => {
-            Some(format!("started:{}", awaiter_ack_key(acknowledgement)))
+        ChatDriverEvent::CommandCellWatchDeliveryStarted { acknowledgement } => {
+            Some(format!("started:{}", command_cell_watch_ack_key(acknowledgement)))
         }
-        ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement } => {
-            Some(format!("ack:{}", awaiter_ack_key(acknowledgement)))
+        ChatDriverEvent::CommandCellWatchAcknowledged { acknowledgement } => {
+            Some(format!("ack:{}", command_cell_watch_ack_key(acknowledgement)))
         }
         _ => None,
     }
@@ -899,6 +897,7 @@ fn awaiter_fact_key(event: &ChatDriverEvent) -> Option<String> {
 fn validate_event_stream_identity(
     workspace_id: &str,
     conversation_id: Option<&str>,
+    root_turn_id: &str,
     event: &ChatDriverEvent,
 ) -> Result<(), ChatEventLogError> {
     match event {
@@ -927,6 +926,26 @@ fn validate_event_stream_identity(
         {
             return Err(ChatEventLogError::InvalidIdentity(
                 "conversation input fact address does not match journal stream".to_string(),
+            ));
+        }
+        ChatDriverEvent::CommandCellWatchReady { result }
+            if result.receipt.workspace_id != workspace_id
+                || Some(result.receipt.conversation_id.as_str()) != conversation_id
+                || result.receipt.root_turn_id != root_turn_id =>
+        {
+            return Err(ChatEventLogError::InvalidIdentity(
+                "command-cell-watch Ready address does not match journal stream".to_string(),
+            ));
+        }
+        ChatDriverEvent::CommandCellWatchDeliveryStarted { acknowledgement }
+        | ChatDriverEvent::CommandCellWatchAcknowledged { acknowledgement }
+            if acknowledgement.workspace_id != workspace_id
+                || Some(acknowledgement.conversation_id.as_str()) != conversation_id
+                || acknowledgement.root_turn_id != root_turn_id =>
+        {
+            return Err(ChatEventLogError::InvalidIdentity(
+                "command-cell-watch acknowledgement address does not match journal stream"
+                    .to_string(),
             ));
         }
         _ => {}
@@ -989,23 +1008,34 @@ fn validate_driver_event(event: &ChatDriverEvent) -> Result<(), ChatEventLogErro
                 "command-cell terminal fact must have a settled typed state".to_string(),
             ))
         }
-        ChatDriverEvent::AwaiterResultReady { result }
+        ChatDriverEvent::CommandCellWatchReady { result }
             if result.receipt.execution_id.trim().is_empty()
+                || result.receipt.watch_generation == 0
+                || !matches!(
+                    result.receipt.state,
+                    crate::tasks::task_runtime::command_cells::CommandCellWatchState::Settled
+                        | crate::tasks::task_runtime::command_cells::CommandCellWatchState::Cancelled
+                )
+                || result.receipt.settled_at.is_none()
                 || result.receipt.cell_id != result.cell.cell_id
                 || result.cell.is_active() =>
         {
             Err(ChatEventLogError::InvalidEvent(
-                "Awaiter Ready fact requires exact receipt identity and terminal cell truth"
+                "CommandCellWatch Ready fact requires exact receipt identity and terminal cell truth"
                     .to_string(),
             ))
         }
-        ChatDriverEvent::AwaiterResultDeliveryStarted { acknowledgement }
-        | ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement }
+        ChatDriverEvent::CommandCellWatchDeliveryStarted { acknowledgement }
+        | ChatDriverEvent::CommandCellWatchAcknowledged { acknowledgement }
             if acknowledgement.execution_id.trim().is_empty()
+                || acknowledgement.watch_generation == 0
+                || acknowledgement.workspace_id.trim().is_empty()
+                || acknowledgement.conversation_id.trim().is_empty()
+                || acknowledgement.root_turn_id.trim().is_empty()
                 || acknowledgement.acknowledged_turn_id.trim().is_empty() =>
         {
             Err(ChatEventLogError::InvalidEvent(
-                "Awaiter acknowledgement identity is incomplete".to_string(),
+                "CommandCellWatch acknowledgement identity is incomplete".to_string(),
             ))
         }
         ChatDriverEvent::ExtensionReceipt(receipt)

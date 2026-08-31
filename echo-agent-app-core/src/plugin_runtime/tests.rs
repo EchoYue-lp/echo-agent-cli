@@ -69,7 +69,7 @@ mod tests {
         std::fs::write(
             plugin.join("skills/example/SKILL.md"),
             format!(
-                "---\nname: {name}-example\ndescription: Example skill\ntriggers:\n  - route {name} work\n---\nUse this skill for {name} tasks.\n"
+                "---\nname: {name}-example\ndescription: Example skill for route {name} work and related tasks.\n---\nUse this skill for {name} tasks.\n"
             ),
         )
         .map_err(|error| error.to_string())?;
@@ -198,7 +198,7 @@ done
         std::fs::write(
             skill_root.join("SKILL.md"),
             format!(
-                "---\nname: {name}\ndescription: Application skill replay fixture\ntriggers:\n  - use {name}\n---\nUse this skill for replay tests.\n"
+                "---\nname: {name}\ndescription: Application skill replay fixture for use {name}.\n---\nUse this skill for replay tests.\n"
             ),
         )
         .map_err(|error| error.to_string())?;

@@ -1,34 +1,11 @@
-enum ClaimSettlement {
-    EffectStarted {
-        turn_id: String,
-    },
-    MailboxAccepted {
-        turn_id: String,
-    },
-    Drained {
-        turn_id: String,
-    },
-    Deferred {
-        reason: String,
-        next_attempt_at: DateTime<Utc>,
-    },
-    TurnSettled {
-        turn_id: Option<String>,
-        outcome: AgentDeliveryOutcome,
-        drained: Option<bool>,
-        reason: Option<String>,
-        retryable: bool,
-        next_attempt_at: Option<DateTime<Utc>>,
-        reply_message_id: Option<String>,
-    },
-}
+use echo_agent::state::journal::JournalDurabilityStatus;
 
 impl AgentInboxAuthority {
     fn open(root: &Path, target: &AgentAddress) -> Result<Arc<Self>, AgentRouterError> {
         let inbox = inbox_dir(root, target);
         let directory = inbox.join("journal");
         let checkpoint_path = inbox.join("projection.checkpoint.json");
-        let state = Self::open_state(&directory, &checkpoint_path, target)?;
+        let state = Self::open_state(&directory, &checkpoint_path)?;
         let manifest = inbox.join("target.json");
         let encoded = serde_json::to_vec(target).map_err(|error| AgentRouterError::Corrupt {
             path: manifest.clone(),
@@ -52,36 +29,44 @@ impl AgentInboxAuthority {
     fn open_state(
         directory: &Path,
         checkpoint_path: &Path,
-        target: &AgentAddress,
     ) -> Result<AgentInboxAuthorityState, AgentRouterError> {
+        let config = echo_agent::delivery::DeliveryLedgerConfig {
+            terminal_retention: INBOX_TERMINAL_RETENTION,
+            terminal_retention_bytes: INBOX_TERMINAL_RETENTION_BYTES,
+        };
         let journal = Arc::new(
-            SegmentedFileEventJournal::open(
+            SegmentedFileEventJournal::<FrameworkDeliveryEvent>::open(
                 directory,
                 INBOX_SEGMENT_BYTES,
                 FileDurability::SyncData,
             )
             .map_err(|error| journal_error(directory, error))?,
         );
-        let checkpoints = Arc::new(FileCheckpointStore::open(checkpoint_path));
-        let reducer = CheckpointedReducer::new(
+        let checkpoints = Arc::new(FileCheckpointStore::<FrameworkDeliveryProjection>::open(
+            checkpoint_path,
+        ));
+        let ledger = FrameworkDeliveryLedger::new(
             Arc::clone(&journal),
-            checkpoints as Arc<dyn CheckpointStore<AgentInboxProjection>>,
+            checkpoints as Arc<dyn CheckpointStore<FrameworkDeliveryProjection>>,
+            config,
             INBOX_CHECKPOINT_EVERY,
         );
-        reducer
+        ledger
             .recover()
             .map_err(|error| journal_error(directory, error))?;
-        reducer.with_state(|projection| projection.validate(directory, target))?;
         Ok(AgentInboxAuthorityState {
-            journal,
-            reducer,
-            durability_debt: None,
+            framework: AgentFrameworkState {
+                journal,
+                ledger,
+                checkpoint_path: checkpoint_path.to_path_buf(),
+                durability_debt: None,
+            },
         })
     }
 
     fn with_projection<T>(
         &self,
-        operation: impl FnOnce(&AgentInboxProjection) -> Result<T, AgentRouterError>,
+        operation: impl FnOnce(&FrameworkDeliveryProjection) -> Result<T, AgentRouterError>,
     ) -> Result<T, AgentRouterError> {
         let guard = self
             .state
@@ -91,7 +76,50 @@ impl AgentInboxAuthority {
             path: self.directory.clone(),
             message: "Agent inbox authority is closed".to_string(),
         })?;
-        state.reducer.with_state(|projection| operation(projection))
+        state.framework.ledger.with_projection(|projection| {
+            self.validate_routes(projection)?;
+            operation(projection)
+        })
+    }
+
+    fn validate_routes(
+        &self,
+        projection: &FrameworkDeliveryProjection,
+    ) -> Result<(), AgentRouterError> {
+        for record in projection.records() {
+            if record.route != self.expected_target {
+                return Err(AgentRouterError::Corrupt {
+                    path: self.directory.clone(),
+                    message: format!(
+                        "message {} targets another Agent address",
+                        record.message_id
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Access the framework ledger after checking this authority's route
+    /// boundary. Callers can prepare semantic lifecycle events without
+    /// reaching into the reducer or projection implementation.
+    fn with_ledger<T>(
+        &self,
+        operation: impl FnOnce(&FrameworkDeliveryLedger) -> Result<T, AgentRouterError>,
+    ) -> Result<T, AgentRouterError> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| AgentRouterError::StateUnavailable)?;
+        let state = guard.as_ref().ok_or_else(|| AgentRouterError::Corrupt {
+            path: self.directory.clone(),
+            message: "Agent inbox authority is closed".to_string(),
+        })?;
+        state
+            .framework
+            .ledger
+            .with_projection(|projection| self.validate_routes(projection))?;
+        operation(&state.framework.ledger)
     }
 
     fn lock_operation(&self) -> Result<std::sync::MutexGuard<'_, ()>, AgentRouterError> {
@@ -100,7 +128,7 @@ impl AgentInboxAuthority {
             .map_err(|_| AgentRouterError::StateUnavailable)
     }
 
-    fn append(&self, event: AgentInboxEvent) -> Result<JournalDurabilityStatus, AgentRouterError> {
+    fn append(&self, event: FrameworkDeliveryEvent) -> Result<JournalDurabilityStatus, AgentRouterError> {
         let prepared =
             PreparedJournalBatch::new(vec![event]).map_err(|error| AgentRouterError::Corrupt {
                 path: self.directory.clone(),
@@ -122,34 +150,51 @@ impl AgentInboxAuthority {
             Self::retry_durability_debt(state, &self.directory);
             let batch = prepared.take().ok_or_else(|| AgentRouterError::Corrupt {
                 path: self.directory.clone(),
-                message: "prepared Agent inbox batch ownership was lost".to_string(),
+                message: "prepared Agent delivery batch ownership was lost".to_string(),
             })?;
-            let mut receipt = match state.reducer.apply_batch(batch) {
+            let mut receipt = match state
+                .framework
+                .ledger
+                .apply_prepared_with(batch, |batch| {
+                    state.framework.journal.append_batch(batch)
+                }) {
                 Ok(receipt) => receipt,
-                Err(CheckpointedApplyError::Journal(JournalBatchAppendError::NotCommitted {
-                    batch,
-                    error,
-                })) if attempts < MAX_INBOX_APPEND_ATTEMPTS => {
+                Err(DeliveryLedgerError::Apply(error))
+                    if matches!(
+                        error.as_ref(),
+                        CheckpointedApplyError::Journal(
+                            JournalBatchAppendError::NotCommitted { .. }
+                        )
+                    ) && attempts < MAX_INBOX_APPEND_ATTEMPTS =>
+                {
+                    let batch = error.into_prepared().ok_or_else(|| AgentRouterError::Corrupt {
+                        path: self.directory.clone(),
+                        message: "framework delivery append lost retry batch".to_string(),
+                    })?;
                     prepared = Some(batch);
-                    tracing::warn!(%batch_id, attempts, %error, "retrying uncommitted Agent inbox batch");
                     continue;
                 }
-                Err(CheckpointedApplyError::Journal(JournalBatchAppendError::NotCommitted {
-                    error,
-                    ..
-                })) => {
+                Err(DeliveryLedgerError::Apply(error))
+                    if matches!(
+                        error.as_ref(),
+                        CheckpointedApplyError::Journal(
+                            JournalBatchAppendError::NotCommitted { .. }
+                        )
+                    ) =>
+                {
                     return Err(AgentRouterError::AppendNotCommitted {
                         batch_id,
                         attempts,
-                        detail: error,
+                        detail: error.to_string(),
                     });
                 }
-                Err(CheckpointedApplyError::Journal(error)) if error.requires_reopen() => {
+                Err(DeliveryLedgerError::Apply(error)) if error.requires_reopen() => {
                     let detail = error.to_string();
                     let batch = error.into_prepared().ok_or_else(|| {
                         AgentRouterError::AppendOutcomeUnknown {
                             batch_id: batch_id.clone(),
-                            detail: "journal did not return prepared batch ownership".to_string(),
+                            detail: "framework delivery journal did not return prepared batch"
+                                .to_string(),
                         }
                     })?;
                     let stale = guard.take();
@@ -157,24 +202,20 @@ impl AgentInboxAuthority {
                     let reopened = Self::open_state(
                         &self.directory,
                         &self.checkpoint_path,
-                        &self.expected_target,
                     )
-                    .map_err(|error| {
-                        AgentRouterError::AppendOutcomeUnknown {
-                            batch_id: batch_id.clone(),
-                            detail: format!("{detail}; verified reopen failed: {error}"),
-                        }
+                    .map_err(|error| AgentRouterError::AppendOutcomeUnknown {
+                        batch_id: batch_id.clone(),
+                        detail: format!("{detail}; verified reopen failed: {error}"),
                     })?;
-                    match reopened.journal.lookup_batch(&batch).map_err(|error| {
+                    match reopened.framework.ledger.lookup_batch(&batch).map_err(|error| {
                         AgentRouterError::AppendOutcomeUnknown {
                             batch_id: batch_id.clone(),
                             detail: format!("{detail}; lookup failed: {error}"),
                         }
                     })? {
-                        JournalBatchLookup::AlreadyCommitted(_) => {
+                        JournalBatchLookup::AlreadyCommitted(receipt) => {
                             *guard = Some(reopened);
-                            prepared = Some(batch);
-                            continue;
+                            return Ok(receipt.durability().clone());
                         }
                         JournalBatchLookup::Absent if attempts < MAX_INBOX_APPEND_ATTEMPTS => {
                             *guard = Some(reopened);
@@ -197,13 +238,20 @@ impl AgentInboxAuthority {
                         }
                     }
                 }
-                Err(CheckpointedApplyError::Journal(error)) => {
+                Err(DeliveryLedgerError::Apply(error)) => {
                     return Err(AgentRouterError::AppendIdentityConflict {
                         batch_id,
                         detail: error.to_string(),
                     });
                 }
-                Err(CheckpointedApplyError::CommittedInvariant { error, .. }) => {
+                Err(DeliveryLedgerError::InvalidEvent { error, .. })
+                | Err(DeliveryLedgerError::InvalidBatch { error, .. }) => {
+                    return Err(AgentRouterError::Corrupt {
+                        path: self.directory.clone(),
+                        message: error,
+                    });
+                }
+                Err(DeliveryLedgerError::CommittedInvariant { error, .. }) => {
                     let stale = guard.take();
                     drop(stale);
                     return Err(AgentRouterError::AppendOutcomeUnknown {
@@ -211,37 +259,29 @@ impl AgentInboxAuthority {
                         detail: error,
                     });
                 }
-                Err(CheckpointedApplyError::Prepare(error)) => {
-                    return Err(AgentRouterError::Corrupt {
-                        path: self.directory.clone(),
-                        message: error.to_string(),
-                    });
-                }
             };
-            state
-                .reducer
-                .with_state(|projection| projection.ensure_incremental_valid(&self.directory))?;
             match &receipt.journal {
-                JournalDurabilityStatus::Confirmed => state.durability_debt = None,
+                JournalDurabilityStatus::Confirmed => state.framework.durability_debt = None,
                 JournalDurabilityStatus::Unconfirmed => {
-                    state.durability_debt = Some(format!(
-                        "Agent inbox batch {} has unconfirmed durability",
+                    state.framework.durability_debt = Some(format!(
+                        "Agent delivery batch {} has unconfirmed durability",
                         receipt.batch_id
                     ));
                 }
                 JournalDurabilityStatus::Degraded { error } => {
-                    state.durability_debt = Some(error.clone());
+                    state.framework.durability_debt = Some(error.clone());
                 }
             }
             Self::retry_durability_debt(state, &self.directory);
             receipt.journal = state
+                .framework
                 .durability_debt
                 .clone()
                 .map_or(JournalDurabilityStatus::Confirmed, |error| {
                     JournalDurabilityStatus::Degraded { error }
                 });
             if let CheckpointApplyStatus::Degraded { error } = &receipt.checkpoint {
-                tracing::warn!(path = %self.checkpoint_path.display(), %error, "Agent inbox checkpoint write is degraded; authoritative journal remains committed");
+                tracing::warn!(path = %state.framework.checkpoint_path.display(), %error, "Agent delivery checkpoint write is degraded; authoritative ledger remains committed");
             }
             Self::maintain_retention(state, &self.directory);
             return Ok(receipt.journal);
@@ -249,11 +289,11 @@ impl AgentInboxAuthority {
     }
 
     fn retry_durability_debt(state: &mut AgentInboxAuthorityState, directory: &Path) {
-        if state.durability_debt.is_some() {
-            match state.journal.sync_data() {
-                Ok(()) => state.durability_debt = None,
+        if state.framework.durability_debt.is_some() {
+            match state.framework.journal.sync_data() {
+                Ok(()) => state.framework.durability_debt = None,
                 Err(error) => {
-                    state.durability_debt = Some(error.to_string());
+                    state.framework.durability_debt = Some(error.to_string());
                     tracing::warn!(path = %directory.display(), %error, "Agent inbox durability debt remains pending");
                 }
             }
@@ -261,11 +301,11 @@ impl AgentInboxAuthority {
     }
 
     fn maintain_retention(state: &mut AgentInboxAuthorityState, directory: &Path) {
-        let segments = state.journal.segments();
+        let segments = state.framework.journal.segments();
         if segments.len() <= INBOX_MAX_SEGMENTS {
             return;
         }
-        if let Err(error) = state.reducer.checkpoint() {
+        if let Err(error) = state.framework.ledger.checkpoint() {
             tracing::warn!(path = %directory.display(), %error, "Agent inbox checkpoint compaction is degraded");
             return;
         }
@@ -273,7 +313,11 @@ impl AgentInboxAuthority {
             .get(segments.len().saturating_sub(INBOX_MAX_SEGMENTS))
             .map(|segment| segment.start_sequence)
             .unwrap_or(1);
-        if let Err(error) = state.journal.prune_closed_segments_before(keep_from) {
+        if let Err(error) = state
+            .framework
+            .journal
+            .prune_closed_segments_before(keep_from)
+        {
             tracing::warn!(path = %directory.display(), %error, "Agent inbox segment cleanup remains pending");
         }
     }

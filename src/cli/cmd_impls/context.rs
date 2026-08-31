@@ -19,8 +19,13 @@ fn parse_llm_protocol(value: &str) -> Option<echo_agent::llm::LlmApiProtocol> {
 async fn cmd_think(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let available = if let Some(app_state) = ctx.app_state.as_ref() {
         let config = app_state.config.app_config.read().await;
-        let runtime = echo_agent_app_core::api::model_config::resolve_runtime_model(&config, None);
-        echo_agent_app_core::api::model_config::thinking_level_specs(runtime.thinking_profile)
+        echo_agent_app_core::api::model_config::resolve_runtime_model(&config, None)
+            .map(|runtime| {
+                echo_agent_app_core::api::model_config::thinking_level_specs(
+                    runtime.thinking_profile,
+                )
+            })
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -113,17 +118,16 @@ async fn cmd_model(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 return CommandOutcome::Continue;
             };
             let config = app_state.config.app_config.read().await.clone();
-            let runtime =
-                match echo_agent_app_core::api::model_config::resolve_runtime_model_selector(
-                    &config,
-                    Some(selector),
-                ) {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        println!("{error}");
-                        return CommandOutcome::Continue;
-                    }
-                };
+            let runtime = match echo_agent_app_core::api::model_config::resolve_runtime_model(
+                &config,
+                Some(selector),
+            ) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    println!("{error}");
+                    return CommandOutcome::Continue;
+                }
+            };
             match echo_agent_app_core::api::infra::test_runtime_llm_connection(&runtime).await {
                 Ok(result) => println!(
                     "Connection succeeded: {} ({})",
@@ -294,7 +298,16 @@ async fn cmd_system(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             Some(state) => state.apply_system_prompt_to_agents(prompt).await,
             None => {
                 ctx.agent
-                    .write_async(|a| Box::pin(async move { a.set_system_prompt(prompt).await }))
+                    .write_async(|a| {
+                        Box::pin(async move {
+                            a.set_system_prompt(prompt).await;
+                            let disabled_tools = a.disabled_tool_names();
+                            echo_agent_app_core::api::subagent_prompt::refresh_primary_system_prompt(
+                                a,
+                                &disabled_tools,
+                            );
+                        })
+                    })
                     .await;
             }
         }

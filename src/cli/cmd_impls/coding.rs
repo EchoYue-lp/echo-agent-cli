@@ -686,16 +686,10 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     if mode.is_empty() {
         // Show current permission mode
         let current = match ctx.app_state.as_ref() {
-            Some(state) => echo_agent_app_core::api::permission::permission_mode_id(
-                *state.config.permission_mode.read().await,
-            ),
+            Some(state) => state.config.permission_mode.read().await.id(),
             None => {
                 ctx.agent
-                    .read(|agent| {
-                        echo_agent_app_core::api::permission::permission_mode_id(
-                            agent.get_permission_mode(),
-                        )
-                    })
+                    .read(|agent| agent.get_permission_mode().id())
                     .await
             }
         };
@@ -713,14 +707,14 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         return CommandOutcome::Continue;
     }
 
-    let framework_mode = match echo_agent_app_core::api::permission::parse_permission_mode(mode) {
+    let framework_mode = match mode.parse::<echo_agent::tools::permission::PermissionMode>() {
         Ok(mode) => mode,
         Err(error) => {
             println!("{error}");
             return CommandOutcome::Continue;
         }
     };
-    let normalized = echo_agent_app_core::api::permission::permission_mode_id(framework_mode);
+    let normalized = framework_mode.id();
 
     match ctx.app_state.as_ref() {
         Some(state) => {

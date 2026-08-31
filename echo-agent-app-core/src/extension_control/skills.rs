@@ -16,7 +16,20 @@ async fn skill_source_present(
 async fn skill_entry(state: &AppState, name: &str) -> anyhow::Result<(PathBuf, String)> {
     let mut hub = state.skills_hub.write().await;
     hub.refresh();
-    let entry = hub
+    if let Some(entry) = hub.get(name) {
+        let load_root = entry
+            .path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| entry.path.clone());
+        return Ok((load_root, entry.category.clone()));
+    }
+    drop(hub);
+
+    let builtin_hub = crate::skills_hub::SkillsHub::with_root(
+        crate::skills_hub::builtin_skills_root(),
+    );
+    let entry = builtin_hub
         .get(name)
         .ok_or_else(|| anyhow::anyhow!("Skill '{name}' not found"))?;
     let load_root = entry

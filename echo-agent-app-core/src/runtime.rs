@@ -723,6 +723,7 @@ impl ApplicationServices {
         crate::tasks::task_runtime::register_task_tools_on_agent(
             &runtime.agent_handle,
             task_runtime.clone(),
+            runtime.model_consumers.subagent_catalog(),
         )
         .await;
 
@@ -1101,9 +1102,20 @@ impl AgentRuntime {
             .await;
 
         // ── 5. Built-in skills ──
+        // The durable enabled-skills file is the activation authority. All
+        // bundled files remain discoverable in SkillsHub, but disabled entries
+        // never register descriptors, hooks, or intent-routing candidates.
         {
-            let builtin_skills_dir =
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("skills");
+            let builtin_skills_dir = crate::skills_hub::builtin_skills_root();
+            let enabled_config_path = crate::data_root::user_data_path("enabled-skills.json");
+            let active_policy = Arc::new(crate::skills_hub::ActiveSkillLoadPolicy::new(
+                enabled_config_path,
+                builtin_skills_dir.clone(),
+                None,
+            ));
+            agent_handle
+                .write(|agent| agent.set_skill_load_policy(Some(active_policy.clone())))
+                .await;
             if builtin_skills_dir.is_dir() {
                 agent_handle
                     .write_async(|a| {
@@ -1128,15 +1140,31 @@ impl AgentRuntime {
         // are always active without requiring explicit activate_skill calls.
         {
             let enabled_config_path = crate::data_root::user_data_path("enabled-skills.json");
-            let enabled_config = crate::skills_hub::EnabledSkillsConfig::load(&enabled_config_path)
-                .unwrap_or_default();
+            let enabled_config = match crate::skills_hub::EnabledSkillsConfig::load(
+                &enabled_config_path,
+            ) {
+                Ok(config) => Some(config),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %enabled_config_path.display(),
+                        %error,
+                        "Skipping methodology baseline injection because enabled-skills.json is invalid"
+                    );
+                    None
+                }
+            };
             // 收集 baseline 名为 owned Vec<String>,move 进 async 闭包(闭包要 'static,
             // 不能借用会在块结束 drop 的 enabled_config)。
             let baseline_names: Vec<String> = enabled_config
-                .enabled_baseline_names()
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect();
+                .as_ref()
+                .map(|config| {
+                    config
+                        .enabled_baseline_names()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             tracing::info!(
                 count = baseline_names.len(),
                 skills = ?baseline_names,
@@ -1157,6 +1185,11 @@ impl AgentRuntime {
                             a.skill_registry()
                                 .inject_methodology_baseline(&mut sp, &refs);
                             a.set_system_prompt(sp).await;
+                            let disabled_tools = a.disabled_tool_names();
+                            crate::subagent_prompt::refresh_primary_system_prompt(
+                                a,
+                                &disabled_tools,
+                            );
                         })
                     })
                     .await;
@@ -1212,7 +1245,7 @@ impl AgentRuntime {
                 crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
                 crate::turn_context::turn_prompt_context_registry(),
             )
-            .with_awaiter_results(command_cell_runtime.clone(), execution_scope)
+            .with_command_cell_watches(command_cell_runtime.clone(), execution_scope)
             .with_hot_memory_source(review_integration.hot_memory_projection_source());
             agent_handle
                 .read(|agent| agent.set_pre_model_context_projector(Some(Arc::new(projector))))
@@ -1257,7 +1290,11 @@ impl AgentRuntime {
                 }
             };
             let trigger_sink = review_integration.clone();
-            let skill_policy = review_integration.clone();
+            let skill_policy = Arc::new(crate::skills_hub::ActiveSkillLoadPolicy::new(
+                crate::data_root::user_data_path("enabled-skills.json"),
+                crate::skills_hub::builtin_skills_root(),
+                Some(review_integration.clone()),
+            ));
             let skill_curator = review_integration.curator();
             let workspace_skills = review_echo_agent_dir.join("skills");
             agent_handle
@@ -1267,6 +1304,7 @@ impl AgentRuntime {
                         a.set_memory_trigger_sink(Some(trigger_sink));
                         a.set_skill_load_policy(Some(skill_policy));
                         a.set_skill_curator(Some(skill_curator));
+                        let _ = a.reconcile_skill_load_policy().await;
                         if workspace_skills.is_dir()
                             && let Err(error) = a.load_skills_from_dir(workspace_skills).await
                         {
@@ -1390,7 +1428,7 @@ impl AgentRuntime {
 
 /// Rebuild EKO intent routing from one agent's committed skill catalog.
 pub(crate) fn configure_intent_router(
-    agent: &mut echo_agent::agent::react::ReactAgent,
+    agent: &mut echo_agent::agent::ReactAgent,
 ) -> KeywordClassifier {
     let descriptors = agent.skill_descriptors();
     let mut keyword_classifier = KeywordClassifier::new();
@@ -1734,11 +1772,11 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
-        let adapter = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone());
+        let operation = crate::tasks::task_runtime::TaskRuntimeOperation::new(store.clone());
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let caller = tokio::spawn(async move {
-            adapter
+            operation
                 .run_owned("application shutdown barrier", move || {
                     let _ = entered_tx.send(());
                     release_rx
@@ -1759,7 +1797,7 @@ mod tests {
         let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
         owner.bind_task_runtime(store.clone());
         let receipt = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
-        let rejected = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone())
+        let rejected = crate::tasks::task_runtime::TaskRuntimeOperation::new(store.clone())
             .run_owned("late application operation", || Ok(()))
             .await;
         if !rejected.is_err_and(|error| error.to_string().contains("admission is closed")) {
@@ -1895,7 +1933,7 @@ mod tests {
 
         let skill_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills");
         let mut loader = SkillLoader::new();
-        let descriptors = loader.discover_from_dir(skill_root).await?;
+        let descriptors = loader.discover_directory(skill_root).await?;
         assert!(
             !descriptors.is_empty(),
             "bundled skills were not discovered"

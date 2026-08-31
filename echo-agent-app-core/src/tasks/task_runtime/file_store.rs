@@ -11,8 +11,8 @@
 
 use super::file_shadow::FileTaskShadow;
 use super::types::{
-    Artifact, EkoTaskExecution, PlanRevision, PlanTask, ReviewResult, RunStateSnapshot,
-    RuntimeTaskEvent, TaskExecutionSummary, TaskPlan, TaskRun, TodoItem, TodoStatus,
+    Artifact, PlanRevision, PlanTask, ReviewResult, RunStateSnapshot, RuntimeTaskEvent,
+    TaskExecutionSummary, TaskPlan, TaskRun, TodoItem, TodoStatus,
 };
 
 /// File-backed read store. Cheap to clone (wraps a `FileTaskShadow`).
@@ -191,17 +191,16 @@ impl FileTaskStore {
             .into_iter()
             .map(|task| (task.task_id.clone(), task))
             .collect::<std::collections::HashMap<_, _>>();
-        let tasks = plan
-            .tasks
-            .into_iter()
-            .map(|spec| {
-                let state = execution
-                    .get(&spec.id)
-                    .cloned()
-                    .unwrap_or_else(|| EkoTaskExecution::pending(spec.id.clone()));
-                PlanTask::from_parts(spec, state)
-            })
-            .collect();
+        let tasks =
+            plan.tasks
+                .into_iter()
+                .map(|spec| {
+                    let state = execution.get(&spec.id).cloned().unwrap_or_else(|| {
+                        echo_agent::tasks::TaskExecution::pending(spec.id.clone())
+                    });
+                    PlanTask::from_parts(spec, state)
+                })
+                .collect();
         Ok(Some(TaskPlan {
             plan_id: plan.plan_id,
             run_id: plan.run_id,
@@ -240,7 +239,7 @@ impl FileTaskStore {
         let runtime_tasks = plan
             .tasks
             .iter()
-            .map(|task| task.to_task().map_err(FileReadError::InvalidPlan))
+            .map(|task| echo_agent::tasks::Task::try_from(task).map_err(FileReadError::InvalidPlan))
             .collect::<Result<Vec<_>, _>>()?;
         let dependency_states = echo_agent::tasks::DagExecutionState::from_tasks(&runtime_tasks)
             .dependency_states(&runtime_tasks);
@@ -286,7 +285,7 @@ impl FileTaskStore {
                 title: task.title.clone(),
                 // run-state.json is the authoritative execution projection.
                 // Historical Task* events only supply fields that are not
-                // stored in EkoTaskExecution; otherwise an earlier Blocked event
+                // stored in echo_agent::tasks::TaskExecution; otherwise an earlier Blocked event
                 // can overwrite a later plan skip/reset.
                 status,
                 retry_count: task.retry_count,

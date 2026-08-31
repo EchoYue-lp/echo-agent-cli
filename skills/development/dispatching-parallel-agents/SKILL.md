@@ -1,19 +1,13 @@
 ---
 name: dispatching-parallel-agents
 description: 并行派发独立子代理处理多个互不依赖的任务
+allowed-tools: shell read_artifact task_create task_update task_list task_execute
 metadata:
   category: development
   source: superpowers
-  upstream-version: "6.0.3"
+  upstream-version: 6.0.3
   author: obra
-  tags: [parallel, subagent, concurrency]
-triggers:
-  - 并行
-  - parallel
-  - 同时
-  - 多个任务
-  - 并发
-allowed-tools: [shell, read_artifact, task_create, task_update, task_list, task_execute]
+  tags: parallel, subagent, concurrency
 ---
 
 # Dispatching Parallel Agents

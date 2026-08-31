@@ -411,7 +411,7 @@ mod model_mutation_tests {
 
     async fn invalidate_model_budget(handle: &AgentHandle) {
         let invalid_budget =
-            echo_agent::workspace::core::budget::TokenBudgetConfig::enabled().with_total_window(0);
+            echo_agent::budget::TokenBudgetConfig::enabled().with_total_window(0);
         handle
             .write(|agent| {
                 let config = agent.config();
@@ -2038,15 +2038,15 @@ mod workspace_transition_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         };
         assert_eq!(
-            source_record.message.correlation_id.as_deref(),
+            source_record.payload.correlation_id.as_deref(),
             Some("cold-delivery")
         );
         assert_eq!(
-            source_record.message.causation_id.as_deref(),
+            source_record.payload.causation_id.as_deref(),
             Some("cold-delivery")
         );
         assert!(matches!(
-            source_record.message.payload,
+            source_record.payload.payload,
             crate::agent_router::AgentMessagePayload::Reply { ref text }
                 if text == "target answer"
         ));
@@ -2985,16 +2985,16 @@ mod workspace_transition_tests {
             return Err(format!("workspace B projection did not settle: {error}"));
         }
         let profile_store_a =
-            echo_agent::workspace::state::profiles::ProfileStore::new(memory_a.memory_store());
+            echo_agent::profiles::ProfileStore::new(memory_a.memory_store());
         let profile_store_b =
-            echo_agent::workspace::state::profiles::ProfileStore::new(memory_b.memory_store());
-        let mut profile_a = echo_agent::workspace::state::profiles::UserProfile::new();
+            echo_agent::profiles::ProfileStore::new(memory_b.memory_store());
+        let mut profile_a = echo_agent::profiles::UserProfile::new();
         profile_a.set_preference("scope", "workspace A");
         profile_store_a
             .save_user_profile(&profile_a)
             .await
             .map_err(|error| error.to_string())?;
-        let mut profile_b = echo_agent::workspace::state::profiles::UserProfile::new();
+        let mut profile_b = echo_agent::profiles::UserProfile::new();
         profile_b.set_preference("scope", "workspace B");
         profile_store_b
             .save_user_profile(&profile_b)
@@ -3745,15 +3745,16 @@ mod permission_rule_tests {
     }
 
     #[test]
-    fn application_permission_rule_converts_without_losing_semantics()
+    fn framework_permission_rule_parsing_preserves_semantics()
     -> std::result::Result<(), String> {
-        let config = PermissionRuleConfig {
-            matcher: "permission:write".to_string(),
-            behavior: PermissionBehavior::Deny,
-            source: "projectSettings".to_string(),
+        let rule = echo_agent::tools::permission::PermissionRule {
+            matcher: "permission:write".parse().map_err(|error: String| error)?,
+            behavior: "deny".parse().map_err(|error: String| error)?,
+            source: "projectSettings"
+                .parse()
+                .map_err(|error: String| error)?,
+            description: Some("EKO application permission rule".to_string()),
         };
-
-        let rule = config.to_framework_rule()?;
         assert!(matches!(
             rule.matcher,
             RuleMatcher::Permission {

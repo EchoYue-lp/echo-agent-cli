@@ -100,16 +100,16 @@ fn enqueue_sync(
         .map_err(|_| AgentRouterError::StateUnavailable)?;
     ensure_inbox_not_retiring(inboxes, &target)?;
     let existing = authority
-        .with_projection(|projection| Ok(projection.message(&message.message_id).cloned()))?;
+        .with_projection(|projection| Ok(projection.record(&message.message_id).cloned()))?;
     if let Some(existing) = existing {
-        if !same_logical_message(&existing.message, &message) {
+        if existing.route != target || !same_logical_message(&existing.payload, &message) {
             return Err(AgentRouterError::IdCollision {
                 message_id: message.message_id.clone(),
             });
         }
         return Ok(AgentDeliveryReceipt {
-            message_id: existing.message.message_id.clone(),
-            target: existing.message.to.clone(),
+            message_id: existing.message_id.clone(),
+            target: existing.route.clone(),
             phase: existing.phase,
             outcome: existing.outcome,
             drained: existing.drained,
@@ -121,10 +121,19 @@ fn enqueue_sync(
     }
 
     let persisted_at = Utc::now();
-    let durability = authority.append(AgentInboxEvent::Persisted {
-        message: message.clone(),
-        persisted_at,
+    let event = authority.with_ledger(|ledger| {
+        ledger
+            .prepare_enqueue(DeliveryEnvelope::new(
+                message.message_id.clone(),
+                target.clone(),
+                message.clone(),
+            ))
+            .map_err(|error| AgentRouterError::Corrupt {
+                path: authority.directory.clone(),
+                message: error.to_string(),
+            })
     })?;
+    let durability = authority.append(event)?;
     Ok(AgentDeliveryReceipt {
         message_id: message.message_id,
         target: message.to,
@@ -134,7 +143,7 @@ fn enqueue_sync(
         reason: None,
         persisted_at,
         duplicate: false,
-        durability: durability.into(),
+        durability,
     })
 }
 
@@ -146,6 +155,7 @@ fn same_logical_message(left: &AgentMessage, right: &AgentMessage) -> bool {
         && left.correlation_id == right.correlation_id
         && left.causation_id == right.causation_id
         && left.origin == right.origin
+        && left.created_at == right.created_at
 }
 
 fn pending_sync(
@@ -156,8 +166,8 @@ fn pending_sync(
     let authority = authority_for(root, inboxes, target)?;
     authority.with_projection(|projection| {
         Ok(projection
-            .frontier_entries()
-            .map(|entry| entry.message.clone())
+            .frontier()
+            .map(|entry| entry.payload.clone())
             .collect())
     })
 }
@@ -174,39 +184,19 @@ fn claim_next_sync(
         .lock()
         .map_err(|_| AgentRouterError::StateUnavailable)?;
     ensure_inbox_not_retiring(inboxes, target)?;
-    let next = authority.with_projection(|projection| Ok(projection.frontier_entry().cloned()))?;
-    let Some(next) = next else {
+    let draft = authority.with_ledger(|ledger| {
+        ledger
+            .prepare_claim_next()
+            .map_err(|error| AgentRouterError::Corrupt {
+                path: authority.directory.clone(),
+                message: error.to_string(),
+            })
+    })?;
+    let Some(draft) = draft else {
         return Ok(None);
     };
-    if next.effect_started_at.is_some()
-        || matches!(
-            next.phase,
-            AgentDeliveryPhase::MailboxAccepted | AgentDeliveryPhase::Drained
-        )
-    {
-        return Ok(None);
-    }
-    if next
-        .next_attempt_at
-        .is_some_and(|deadline| deadline > Utc::now())
-    {
-        return Ok(None);
-    }
-    let attempt = next.attempt.saturating_add(1);
-    let attempt_id = uuid::Uuid::new_v4().to_string();
-    let claimed_at = Utc::now();
-    authority.append(AgentInboxEvent::Claimed {
-        message_id: next.message.message_id.clone(),
-        attempt_id: attempt_id.clone(),
-        attempt,
-        claimed_at,
-    })?;
-    Ok(Some(AgentDeliveryClaim {
-        message: next.message,
-        attempt_id,
-        attempt,
-        claimed_at,
-    }))
+    authority.append(draft.event)?;
+    Ok(Some(draft.claim))
 }
 
 fn in_flight_claim_sync(
@@ -216,7 +206,7 @@ fn in_flight_claim_sync(
 ) -> Result<Option<AgentDeliveryInFlight>, AgentRouterError> {
     let authority = authority_for(root, inboxes, target)?;
     authority.with_projection(|projection| {
-        let Some(entry) = projection.frontier_entry().cloned() else {
+        let Some(entry) = projection.frontier().next().cloned() else {
             return Ok(None);
         };
         if entry.effect_started_at.is_none()
@@ -232,7 +222,7 @@ fn in_flight_claim_sync(
                 &authority.directory,
                 format!(
                     "injected message {} has no attempt identity",
-                    entry.message.message_id
+                    entry.message_id
                 ),
             )
         })?;
@@ -241,7 +231,7 @@ fn in_flight_claim_sync(
                 &authority.directory,
                 format!(
                     "injected message {} has no claim timestamp",
-                    entry.message.message_id
+                    entry.message_id
                 ),
             )
         })?;
@@ -253,7 +243,9 @@ fn in_flight_claim_sync(
         })?;
         Ok(Some(AgentDeliveryInFlight {
             claim: AgentDeliveryClaim {
-                message: entry.message,
+                payload: entry.payload,
+                message_id: entry.message_id,
+                route: entry.route,
                 attempt_id,
                 attempt: entry.attempt,
                 claimed_at,
@@ -269,71 +261,47 @@ fn settle_claim_sync(
     root: &Path,
     inboxes: &AgentInboxRegistry,
     claim: &AgentDeliveryClaim,
-    settlement: ClaimSettlement,
+    transition: DeliveryTransition,
 ) -> Result<AgentDeliveryReceipt, AgentRouterError> {
-    let target = claim.message.to.clone();
+    let target = claim.payload.to.clone();
     let authority = authority_for(root, inboxes, &target)?;
     let _operation = authority.lock_operation()?;
     let entry = authority.with_projection(|projection| {
         projection
-            .message(&claim.message.message_id)
+            .record(&claim.payload.message_id)
             .cloned()
             .ok_or_else(|| AgentRouterError::StaleClaim {
-                message_id: claim.message.message_id.clone(),
+                message_id: claim.payload.message_id.clone(),
                 attempt_id: claim.attempt_id.clone(),
             })
     })?;
-    let valid_phase = match &settlement {
-        ClaimSettlement::EffectStarted { .. } => {
-            entry.phase == AgentDeliveryPhase::Claimed && entry.effect_started_at.is_none()
-        }
-        ClaimSettlement::MailboxAccepted { turn_id } => {
-            entry.phase == AgentDeliveryPhase::Claimed
-                && entry.effect_started_at.is_some()
-                && entry.turn_id.as_deref() == Some(turn_id)
-        }
-        ClaimSettlement::Drained { turn_id } => {
-            entry.phase == AgentDeliveryPhase::MailboxAccepted
-                && entry.turn_id.as_deref() == Some(turn_id)
-        }
-        ClaimSettlement::Deferred { .. } => matches!(entry.phase, AgentDeliveryPhase::Claimed),
-        ClaimSettlement::TurnSettled {
-            turn_id, drained, ..
-        } => {
-            matches!(
-                entry.phase,
-                AgentDeliveryPhase::Claimed
-                    | AgentDeliveryPhase::MailboxAccepted
-                    | AgentDeliveryPhase::Drained
-            ) && turn_id
-                .as_deref()
-                .is_none_or(|turn_id| entry.turn_id.as_deref() == Some(turn_id))
-                && drained.is_none_or(|drained| drained == entry.drained)
-        }
-    };
-    if entry.attempt_id.as_deref() != Some(claim.attempt_id.as_str()) || !valid_phase {
+    if entry.attempt_id.as_deref() != Some(claim.attempt_id.as_str()) {
         return Err(AgentRouterError::StaleClaim {
-            message_id: claim.message.message_id.clone(),
+            message_id: claim.payload.message_id.clone(),
             attempt_id: claim.attempt_id.clone(),
         });
     }
-    let (phase, outcome, drained, reason, event) = match settlement {
-        ClaimSettlement::EffectStarted { turn_id } => {
-            let event = AgentInboxEvent::EffectStarted {
-                message_id: claim.message.message_id.clone(),
-                attempt_id: claim.attempt_id.clone(),
-                started_at: Utc::now(),
-                turn_id,
-            };
-            (AgentDeliveryPhase::Claimed, None, false, None, event)
+    let (phase, outcome, drained, reason, event) = match transition {
+        DeliveryTransition::EffectStarted { turn_id } => {
+            let event = authority.with_ledger(|ledger| {
+                ledger
+                    .prepare_transition(claim, DeliveryTransition::effect_started(turn_id))
+                    .map_err(|_| AgentRouterError::StaleClaim {
+                        message_id: claim.payload.message_id.clone(),
+                        attempt_id: claim.attempt_id.clone(),
+                    })
+            })?;
+            (AgentDeliveryPhase::EffectStarted, None, false, None, event)
         }
-        ClaimSettlement::MailboxAccepted { turn_id } => {
-            let event = AgentInboxEvent::MailboxAccepted {
-                message_id: claim.message.message_id.clone(),
-                attempt_id: claim.attempt_id.clone(),
-                accepted_at: Utc::now(),
-                turn_id,
-            };
+        DeliveryTransition::MailboxAccepted { turn_id } => {
+            let event = authority.with_ledger(|ledger| {
+                ledger
+                    .prepare_transition(claim, DeliveryTransition::mailbox_accepted(turn_id))
+                    .map_err(|_| AgentRouterError::StaleClaim {
+                        message_id: claim.payload.message_id.clone(),
+                        attempt_id: claim.attempt_id.clone(),
+                    })
+            })?;
             (
                 AgentDeliveryPhase::MailboxAccepted,
                 None,
@@ -342,59 +310,77 @@ fn settle_claim_sync(
                 event,
             )
         }
-        ClaimSettlement::Drained { turn_id } => {
-            let event = AgentInboxEvent::Drained {
-                message_id: claim.message.message_id.clone(),
-                attempt_id: claim.attempt_id.clone(),
-                drained_at: Utc::now(),
-                turn_id,
-            };
+        DeliveryTransition::Drained { turn_id } => {
+            let event = authority.with_ledger(|ledger| {
+                ledger
+                    .prepare_transition(claim, DeliveryTransition::drained(turn_id))
+                    .map_err(|_| AgentRouterError::StaleClaim {
+                        message_id: claim.payload.message_id.clone(),
+                        attempt_id: claim.attempt_id.clone(),
+                    })
+            })?;
             (AgentDeliveryPhase::Drained, None, true, None, event)
         }
-        ClaimSettlement::Deferred {
+        DeliveryTransition::Deferred {
             reason,
             next_attempt_at,
         } => {
-            let event = AgentInboxEvent::Deferred {
-                message_id: claim.message.message_id.clone(),
-                attempt_id: claim.attempt_id.clone(),
-                deferred_at: Utc::now(),
-                reason: reason.clone(),
-                next_attempt_at: Some(next_attempt_at),
-            };
+            let event = authority.with_ledger(|ledger| {
+                ledger
+                    .prepare_transition(
+                        claim,
+                        DeliveryTransition::deferred(reason.clone(), next_attempt_at),
+                    )
+                    .map_err(|_| AgentRouterError::StaleClaim {
+                        message_id: claim.payload.message_id.clone(),
+                        attempt_id: claim.attempt_id.clone(),
+                    })
+            })?;
             (
-                AgentDeliveryPhase::Persisted,
+                AgentDeliveryPhase::Deferred,
                 None,
                 false,
                 Some(reason),
                 event,
             )
         }
-        ClaimSettlement::TurnSettled {
-            turn_id,
-            outcome,
-            drained,
-            reason,
-            retryable,
-            next_attempt_at,
-            reply_message_id,
-        } => {
-            let drained = drained.unwrap_or(entry.drained);
-            let turn_id = turn_id.or_else(|| entry.turn_id.clone());
-            let event = AgentInboxEvent::TurnSettled {
-                message_id: claim.message.message_id.clone(),
-                attempt_id: claim.attempt_id.clone(),
-                settled_at: Utc::now(),
-                turn_id,
+        DeliveryTransition::Settled { settlement } => {
+            let DeliverySettlement {
+                turn_id: supplied_turn_id,
                 outcome,
-                drained,
-                reason: reason.clone(),
+                drained: supplied_drained,
+                reason,
                 retryable,
                 next_attempt_at,
                 reply_message_id,
-            };
+            } = settlement;
+            let drained = supplied_drained.unwrap_or(entry.drained);
+            let turn_id = supplied_turn_id.or_else(|| entry.turn_id.clone());
+            let event = authority.with_ledger(|ledger| {
+                ledger
+                    .prepare_transition(
+                        claim,
+                        DeliveryTransition::settled(DeliverySettlement {
+                            turn_id: turn_id.clone(),
+                            outcome,
+                            drained: Some(drained),
+                            reason: reason.clone(),
+                            retryable,
+                            next_attempt_at,
+                            reply_message_id: reply_message_id.clone(),
+                        }),
+                    )
+                    .map_err(|_| AgentRouterError::StaleClaim {
+                        message_id: claim.payload.message_id.clone(),
+                        attempt_id: claim.attempt_id.clone(),
+                    })
+            })?;
             (
-                AgentDeliveryPhase::TurnSettled,
+                if retryable {
+                    AgentDeliveryPhase::Deferred
+                } else {
+                    AgentDeliveryPhase::TurnSettled
+                },
                 Some(outcome),
                 drained,
                 reason,
@@ -405,7 +391,7 @@ fn settle_claim_sync(
     let persisted_at = entry.persisted_at;
     let durability = authority.append(event)?;
     Ok(AgentDeliveryReceipt {
-        message_id: claim.message.message_id.clone(),
+        message_id: claim.payload.message_id.clone(),
         target: target.clone(),
         phase,
         outcome,
@@ -413,7 +399,7 @@ fn settle_claim_sync(
         reason,
         persisted_at,
         duplicate: false,
-        durability: durability.into(),
+        durability,
     })
 }
 
@@ -424,12 +410,7 @@ fn records_sync(
 ) -> Result<Vec<AgentDeliveryRecord>, AgentRouterError> {
     let authority = authority_for(root, inboxes, target)?;
     authority.with_projection(|projection| {
-        projection.validate(&authority.directory, target)?;
-        Ok(projection
-            .ordered(&authority.directory)?
-            .into_iter()
-            .map(FoldedDelivery::record)
-            .collect())
+        Ok(projection.records().cloned().collect())
     })
 }
 
@@ -441,7 +422,8 @@ fn next_attempt_at_sync(
     let authority = authority_for(root, inboxes, target)?;
     authority.with_projection(|projection| {
         Ok(projection
-            .frontier_entry()
+            .frontier()
+            .next()
             .and_then(|entry| entry.next_attempt_at))
     })
 }
@@ -594,25 +576,4 @@ fn write_groups(path: &Path, groups: &[AgentGroup]) -> Result<(), AgentRouterErr
         source,
     })
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FoldedDelivery {
-    message: AgentMessage,
-    persisted_at: DateTime<Utc>,
-    phase: AgentDeliveryPhase,
-    outcome: Option<AgentDeliveryOutcome>,
-    drained: bool,
-    reason: Option<String>,
-    attempt_id: Option<String>,
-    attempt: u32,
-    claimed_at: Option<DateTime<Utc>>,
-    effect_started_at: Option<DateTime<Utc>>,
-    mailbox_accepted_at: Option<DateTime<Utc>>,
-    drained_at: Option<DateTime<Utc>>,
-    turn_settled_at: Option<DateTime<Utc>>,
-    turn_id: Option<String>,
-    reply_message_id: Option<String>,
-    next_attempt_at: Option<DateTime<Utc>>,
-    terminal: bool,
-    retained_bytes: usize,
-}
+use echo_agent::delivery::DeliveryEnvelope;

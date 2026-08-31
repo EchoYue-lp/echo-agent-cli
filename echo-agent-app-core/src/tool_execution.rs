@@ -80,8 +80,8 @@ pub enum ToolExecutionStatus {
     Unknown,
 }
 
-impl ToolExecutionStatus {
-    fn from_result(result: &ToolResult) -> Self {
+impl From<&ToolResult> for ToolExecutionStatus {
+    fn from(result: &ToolResult) -> Self {
         result.failure.as_ref().map_or_else(
             || {
                 if result.success {
@@ -101,7 +101,9 @@ impl ToolExecutionStatus {
             },
         )
     }
+}
 
+impl ToolExecutionStatus {
     fn is_orphan_terminal(self) -> bool {
         matches!(
             self,
@@ -419,7 +421,7 @@ impl ToolExecutionRepository {
         }
 
         let finished_at = now_millis();
-        manifest.summary.status = ToolExecutionStatus::from_result(result);
+        manifest.summary.status = ToolExecutionStatus::from(result);
         manifest.summary.finished_at = Some(finished_at);
         manifest.summary.duration_ms =
             Some(finished_at.saturating_sub(manifest.summary.started_at));

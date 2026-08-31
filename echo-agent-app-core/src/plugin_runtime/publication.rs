@@ -77,7 +77,7 @@ fn active_output_style_instructions_for(
 }
 
 async fn load_exact_application_skill(
-    agent: &mut echo_agent::agent::react::ReactAgent,
+    agent: &mut echo_agent::agent::ReactAgent,
     requested: &str,
     load_root: PathBuf,
     requested_source: &str,
@@ -266,7 +266,7 @@ fn retire_plugin_lifecycles(
 }
 
 async fn unload_application_components(
-    agent: &mut echo_agent::agent::react::ReactAgent,
+    agent: &mut echo_agent::agent::ReactAgent,
     application: &PreparedApplicationComponents,
 ) {
     for plugin_agent in &application.agents {

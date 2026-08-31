@@ -6,7 +6,8 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent_app_core::api::state::{AuditDecision, PermissionBehavior, PermissionRuleConfig};
+use echo_agent::tools::permission::{PermissionRule, RuleBehavior, RuleMatcher, RuleSource};
+use echo_agent_app_core::api::state::AuditDecision;
 use echo_agent_app_core::api::structured_extraction::{
     StructuredExtractionError, StructuredExtractionExample, StructuredExtractionOutcome,
     StructuredExtractionRequest, StructuredExtractionValidation,
@@ -78,7 +79,7 @@ pub async fn get_permissions_mode(
 ) -> Result<serde_json::Value, IpcError> {
     let mode = *state.app_state.config.permission_mode.read().await;
     Ok(serde_json::json!({
-        "mode": echo_agent_app_core::api::permission::permission_mode_id(mode)
+        "mode": mode.id()
     }))
 }
 
@@ -87,9 +88,10 @@ pub async fn set_permissions_mode(
     state: tauri::State<'_, TauriState>,
     mode: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let framework_mode = echo_agent_app_core::api::permission::parse_permission_mode(&mode)
+    let framework_mode = mode
+        .parse::<echo_agent::tools::permission::PermissionMode>()
         .map_err(IpcError::Validation)?;
-    let normalized = echo_agent_app_core::api::permission::permission_mode_id(framework_mode);
+    let normalized = framework_mode.id();
     let mut mode_lock = state.app_state.config.permission_mode.write().await;
     *mode_lock = framework_mode;
     drop(mode_lock);
@@ -107,17 +109,7 @@ pub async fn list_permission_rules(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
     let rules = state.app_state.config.permission_rules.read().await;
-    let list: Vec<serde_json::Value> = rules
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "matcher": r.matcher,
-                "behavior": r.behavior.to_string(),
-                "source": r.source,
-            })
-        })
-        .collect();
-    Ok(serde_json::to_value(list).unwrap_or_default())
+    serde_json::to_value(&*rules).map_err(|error| IpcError::Internal(error.to_string()))
 }
 
 #[tauri::command]
@@ -127,25 +119,22 @@ pub async fn add_permission_rule(
     behavior: String,
     source: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let behavior = match behavior.as_str() {
-        "allow" => PermissionBehavior::Allow,
-        "deny" => PermissionBehavior::Deny,
-        "ask" => PermissionBehavior::Ask,
-        _ => {
-            return Err(IpcError::Validation(format!(
-                "Invalid behavior '{}', valid: allow, deny, ask",
-                behavior
-            )));
-        }
-    };
-
-    let rule = PermissionRuleConfig {
+    let matcher = matcher
+        .parse::<RuleMatcher>()
+        .map_err(IpcError::Validation)?;
+    let behavior = behavior
+        .parse::<RuleBehavior>()
+        .map_err(IpcError::Validation)?;
+    let source = source
+        .unwrap_or_else(|| "manual".to_string())
+        .parse::<RuleSource>()
+        .map_err(IpcError::Validation)?;
+    let rule = PermissionRule {
         matcher: matcher.clone(),
         behavior,
-        source: source.unwrap_or_else(|| "manual".to_string()),
+        source,
+        description: Some("EKO application permission rule".to_string()),
     };
-
-    let framework_rule = rule.to_framework_rule().map_err(IpcError::Validation)?;
     let permission_service = state
         .app_state
         .connection
@@ -163,18 +152,19 @@ pub async fn add_permission_rule(
         .iter_mut()
         .find(|candidate| candidate.matcher == matcher)
     {
-        *existing = rule;
+        *existing = rule.clone();
     } else {
-        rules.push(rule);
+        rules.push(rule.clone());
     }
     drop(rules);
     if let Some(previous) = previous {
-        let previous = previous.to_framework_rule().map_err(IpcError::Validation)?;
         permission_service.remove_rule(&previous).await;
     }
-    permission_service.add_rule(framework_rule).await;
+    let response =
+        serde_json::to_value(&rule).map_err(|error| IpcError::Internal(error.to_string()))?;
+    permission_service.add_rule(rule).await;
 
-    Ok(serde_json::json!({"success": true}))
+    Ok(response)
 }
 
 #[tauri::command]
@@ -182,6 +172,9 @@ pub async fn remove_permission_rule(
     state: tauri::State<'_, TauriState>,
     matcher: String,
 ) -> Result<serde_json::Value, IpcError> {
+    let matcher = matcher
+        .parse::<RuleMatcher>()
+        .map_err(IpcError::Validation)?;
     let permission_service = state
         .app_state
         .connection
@@ -202,11 +195,9 @@ pub async fn remove_permission_rule(
         )));
     }
     drop(rules);
-    let framework_rule = removed_rule
-        .ok_or_else(|| IpcError::NotFound(format!("Permission rule '{}' not found", matcher)))?
-        .to_framework_rule()
-        .map_err(IpcError::Validation)?;
-    permission_service.remove_rule(&framework_rule).await;
+    let removed_rule = removed_rule
+        .ok_or_else(|| IpcError::NotFound(format!("Permission rule '{}' not found", matcher)))?;
+    permission_service.remove_rule(&removed_rule).await;
 
     Ok(serde_json::json!({"success": true, "removed": removed}))
 }
@@ -1464,7 +1455,7 @@ where
     match store {
         Some(store) => {
             let operation_store = store.clone();
-            echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+            echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeOperation::new(store)
                 .run_owned(operation, move || {
                     function(Some(operation_store.as_ref())).map_err(|error| {
                         echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(
@@ -1826,14 +1817,13 @@ pub async fn merge_unattended_worktree(
     let store = control.store.clone();
     if let Some(store) = store.as_ref() {
         let lookup_run_id = run_id.clone();
-        let run = echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(
-            store.clone(),
-        )
-        .run_store("validate unattended worktree TaskRun", move |store| {
-            store.get_run(&lookup_run_id)
-        })
-        .await
-        .map_err(|error| IpcError::Internal(error.to_string()))?;
+        let run =
+            echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeOperation::new(store.clone())
+                .run_store("validate unattended worktree TaskRun", move |store| {
+                    store.get_run(&lookup_run_id)
+                })
+                .await
+                .map_err(|error| IpcError::Internal(error.to_string()))?;
         if run.is_none_or(|run| run.workspace_id != workspace_id) {
             return Err(IpcError::Validation(format!(
                 "TaskRun '{run_id}' does not belong to workspace '{workspace_id}'"

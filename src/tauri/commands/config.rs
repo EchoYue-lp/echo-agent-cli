@@ -19,20 +19,28 @@ fn configured_model_names(cfg: &echo_agent_app_core::api::config::EkoConfig) -> 
 }
 
 fn full_config_response(cfg: &echo_agent_app_core::api::config::EkoConfig) -> FullConfigResponse {
-    let runtime = model_config::resolve_runtime_model(cfg, cfg.model.default_model_id.as_deref());
-    let token_limit = echo_agent_app_core::api::infra::effective_token_limit(cfg, Some(&runtime));
+    let runtime = model_config::resolve_runtime_model(cfg, None).ok();
+    let token_limit = echo_agent_app_core::api::infra::effective_token_limit(cfg, runtime.as_ref());
     let available_models = configured_model_names(cfg);
     FullConfigResponse {
         model: ModelConfigResponse {
-            provider: runtime.provider.clone(),
-            name: runtime.model.clone(),
-            has_auth_token: runtime.auth_token.is_some(),
-            base_url: runtime.base_url.clone(),
-            max_tokens: runtime.max_tokens,
-            temperature: runtime.temperature,
+            provider: runtime
+                .as_ref()
+                .map(|value| value.provider.clone())
+                .unwrap_or_default(),
+            name: runtime
+                .as_ref()
+                .map(|value| value.model.clone())
+                .unwrap_or_default(),
+            has_auth_token: runtime
+                .as_ref()
+                .is_some_and(|value| value.auth_token.is_some()),
+            base_url: runtime.as_ref().and_then(|value| value.base_url.clone()),
+            max_tokens: runtime.as_ref().and_then(|value| value.max_tokens),
+            temperature: runtime.as_ref().and_then(|value| value.temperature),
         },
         agent: AgentConfigResponse {
-            model: runtime.model,
+            model: runtime.map(|value| value.model).unwrap_or_default(),
             system_prompt: cfg.agent.system_prompt.clone(),
             max_iterations: cfg.agent.max_iterations,
             token_limit,
@@ -169,18 +177,21 @@ pub async fn update_full_config(
         .app_state
         .update_app_config_owned(reapply_active_model, move |cfg| {
             if let Some(m) = req.model {
-                cfg.model.max_tokens = m.max_tokens.or(cfg.model.max_tokens);
-                cfg.model.temperature = m.temperature.or(cfg.model.temperature);
-                let max_tokens = cfg.model.max_tokens;
-                let temperature = cfg.model.temperature;
-                if let Some(default_id) = cfg.model.default_model_id.clone()
-                    && let Some(default_model) = cfg
+                let active_model_id = model_config::resolve_runtime_model(cfg, None)
+                    .ok()
+                    .map(|runtime| runtime.id);
+                if let Some(active_model_id) = active_model_id
+                    && let Some(active_model) = cfg
                         .configured_models
                         .iter_mut()
-                        .find(|model| model.id == default_id)
+                        .find(|model| model.id == active_model_id)
                 {
-                    default_model.max_tokens = max_tokens;
-                    default_model.temperature = temperature;
+                    if let Some(max_tokens) = m.max_tokens {
+                        active_model.max_tokens = Some(max_tokens);
+                    }
+                    if let Some(temperature) = m.temperature {
+                        active_model.temperature = Some(temperature);
+                    }
                 }
             }
 

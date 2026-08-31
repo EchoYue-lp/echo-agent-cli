@@ -23,10 +23,10 @@ import {
   useToolExecutionStore,
 } from '../../stores/toolExecutionStore';
 import { statusLabel } from '../../utils/subagentProgress';
-import { subagentResultPresentation } from '../../utils/subagentResult';
+import { subagentOutcomePresentation } from '../../utils/subagentOutcome';
 import MarkdownContent from '../common/MarkdownContent';
 import { InlineToolCall } from '../chat/InlineToolCall';
-import { SubagentResultView } from '../subagent/SubagentResultView';
+import { SubagentOutcomeView } from '../subagent/SubagentOutcomeView';
 import { CacheUsageCard, cacheUsageForRuns } from './TaskRuntimePanel';
 
 interface SubagentDetailViewProps {
@@ -62,7 +62,7 @@ export function SubagentDetailView({ run, onBack }: SubagentDetailViewProps) {
   const [activeTab, setActiveTab] = useState<'task' | 'process' | 'result'>(
     run.status === 'running' ? 'process' : 'result'
   );
-  const presentation = subagentResultPresentation(run);
+  const presentation = subagentOutcomePresentation(run);
   const addToast = useToastStore((state) => state.addToast);
   const [controlPending, setControlPending] = useState<'message' | 'followup' | 'interrupt' | null>(
     null
@@ -267,8 +267,8 @@ export function SubagentDetailView({ run, onBack }: SubagentDetailViewProps) {
         {activeTab === 'result' && (
           <div className="mx-auto max-w-[880px]">
             <SectionTitle title="结果" subtitle="subagent 返回的完整最终结果" />
-            {run.result || presentation.text ? (
-              <SubagentResultView result={run.result} content={presentation.text} />
+            {run.outcome || presentation.text ? (
+              <SubagentOutcomeView outcome={run.outcome} content={presentation.text} />
             ) : (
               <EmptyState text="还没有可展示的结果。" />
             )}

@@ -1,6 +1,6 @@
 //! Model-callable Agent collaboration control plane.
 //!
-//! This is deliberately an application adapter. `AgentRouter` remains the
+//! This is deliberately an application routing service. `AgentRouter` remains the
 //! durable Conversation inbox owner, `SubagentControlService` remains the
 //! exact TaskRun attempt owner, and `TaskRuntimeStore` remains the event
 //! authority. This module only validates discriminated targets, selects the
@@ -23,7 +23,7 @@ use crate::tasks::task_runtime::{
     RuntimeEventKind, RuntimeEventQuery, StoreError, SubagentControlActorSource,
     SubagentControlIdentity, SubagentControlPhase, SubagentControlReceipt, SubagentControlService,
     SubagentGuidanceKind, SubagentRun, SubagentRunSnapshot, TaskPlan, TaskRun, TaskRunStatus,
-    TaskRuntimeBlockingAdapter, TaskRuntimeStore,
+    TaskRuntimeOperation, TaskRuntimeStore,
 };
 use crate::workspace::WorkspaceId;
 use crate::workspace::registry::WorkspaceRegistry;
@@ -349,12 +349,12 @@ fn runtime_control_error(error: StoreError, target: &TaskSubagentTarget) -> Agen
     }
 }
 
-/// Thin routing adapter shared by all model invocations and all surfaces.
+/// Routing service shared by all model invocations and all surfaces.
 #[derive(Clone)]
 pub struct AgentControlService {
     router: Arc<AgentRouter>,
     task_runtime: Arc<TaskRuntimeStore>,
-    task_runtime_blocking: TaskRuntimeBlockingAdapter,
+    task_runtime_blocking: TaskRuntimeOperation,
     workspace_registry: Arc<WorkspaceRegistry>,
     known_conversations: Arc<std::sync::Mutex<HashSet<AgentAddress>>>,
     delivery_wake: Option<DeliveryWake>,
@@ -371,7 +371,7 @@ impl AgentControlService {
         Self {
             router,
             task_runtime: Arc::clone(&task_runtime),
-            task_runtime_blocking: TaskRuntimeBlockingAdapter::new(Arc::clone(&task_runtime)),
+            task_runtime_blocking: TaskRuntimeOperation::new(Arc::clone(&task_runtime)),
             workspace_registry,
             known_conversations: Arc::new(std::sync::Mutex::new(HashSet::new())),
             delivery_wake: None,
@@ -381,7 +381,7 @@ impl AgentControlService {
     }
 
     /// Bind the existing application delivery supervisor. The callback is
-    /// intentionally an adapter boundary: AgentControlService persists the
+    /// intentionally a composition boundary: AgentControlService persists the
     /// message through AgentRouter, then asks AppState to wake its sole owner.
     pub fn with_delivery_wake(mut self, wake: DeliveryWake) -> Self {
         self.delivery_wake = Some(wake);
@@ -650,7 +650,7 @@ impl AgentControlService {
                         target,
                         status,
                         summary: subagent
-                            .result
+                            .outcome
                             .as_ref()
                             .map(|result| bounded_text(&result.summary, MAX_SUMMARY_CHARS)),
                         attempt: Some(subagent.attempt),
@@ -708,11 +708,11 @@ impl AgentControlService {
                     status: subagent.status.as_str().to_string(),
                     phase: Some(latest.event_type.as_str().to_string()),
                     outcome: subagent
-                        .result
+                        .outcome
                         .as_ref()
                         .map(|result| result.status.as_str().to_string()),
                     summary: subagent
-                        .result
+                        .outcome
                         .as_ref()
                         .map(|result| bounded_text(&result.summary, MAX_SUMMARY_CHARS)),
                     attempt: Some(subagent.attempt),
@@ -1192,7 +1192,7 @@ impl AgentControlService {
         }
         if require_active {
             let subagent = self.exact_subagent(target).await?;
-            if subagent.status != crate::tasks::task_runtime::SubagentRunStatus::Running {
+            if subagent.status != crate::tasks::task_runtime::SubagentStatus::Running {
                 return Err(AgentControlError::StaleAttempt {
                     execution_id: target.execution_id.clone(),
                     attempt: target.attempt,
@@ -1927,8 +1927,8 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::SubagentReleaseRecord;
     use crate::tasks::task_runtime::{
-        AttendedMode, DomainProfile, ExecutionMode, PlanTask, SubagentRunStatus, SubagentRunUsage,
-        SubagentTaskResult, TaskPlan, task_goal_sha256,
+        AttendedMode, DomainProfile, ExecutionMode, ExecutionUsage, PlanTask, SubagentOutcome,
+        SubagentStatus, TaskPlan, task_goal_sha256,
     };
     use echo_agent::memory::{ConversationStore, FileConversationStore, NewConversation};
 
@@ -2103,7 +2103,7 @@ mod tests {
             .await
             .map_err(|e| e.to_string())?;
         assert_eq!(
-            records.first().map(|record| record.message.origin),
+            records.first().map(|record| record.payload.origin),
             Some(crate::agent_router::AgentMessageOrigin::Agent)
         );
         let second = service.message(request).await.map_err(|e| e.to_string())?;
@@ -2257,12 +2257,12 @@ mod tests {
                 .note("run-bounded", None, &format!("unrelated event {index}"))
                 .map_err(|error| error.to_string())?;
         }
-        let result = SubagentTaskResult::terminal(
-            SubagentRunStatus::Completed,
+        let result = SubagentOutcome::terminal(
+            SubagentStatus::Completed,
             "完成 ✅ adapter result",
             Vec::new(),
         );
-        let usage = SubagentRunUsage {
+        let usage = ExecutionUsage {
             duration_ms: Some(17),
             tokens_used: Some(23),
             iterations: Some(2),
@@ -2278,7 +2278,7 @@ mod tests {
                 plan_revision: 1,
                 attempt: 1,
                 status: "completed",
-                result: Some(&result),
+                outcome: Some(&result),
                 full_output: None,
                 usage: Some(&usage),
                 dispatch_hook: false,
@@ -2425,7 +2425,7 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "first Conversation claim was not admitted".to_string())?;
-        assert_eq!(first_claim.message.message_id, "f5-first-turn");
+        assert_eq!(first_claim.payload.message_id, "f5-first-turn");
         settle_claim(&service.router, &first_claim, &first_turn_id).await?;
 
         let second_claim = service
@@ -2434,7 +2434,7 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "second Conversation claim was not admitted".to_string())?;
-        assert_eq!(second_claim.message.message_id, "f5-second-turn");
+        assert_eq!(second_claim.payload.message_id, "f5-second-turn");
         settle_claim(&service.router, &second_claim, &second_turn_id).await?;
 
         let records = service
@@ -2512,7 +2512,7 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "running Conversation claim is missing".to_string())?;
-        let running_turn_id = claim.message.delivery_turn_id();
+        let running_turn_id = claim.payload.delivery_turn_id();
         service
             .router
             .begin_injection(&claim, running_turn_id.clone())
@@ -2548,7 +2548,7 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "follow-up replaced the running Conversation claim".to_string())?;
-        assert_eq!(in_flight.claim.message.message_id, "f5-idle-message");
+        assert_eq!(in_flight.claim.payload.message_id, "f5-idle-message");
         assert_eq!(in_flight.turn_id, running_turn_id);
         let pending = service
             .router
@@ -2677,7 +2677,7 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "late Conversation claim is missing".to_string())?;
-        let turn_id = claim.message.delivery_turn_id();
+        let turn_id = claim.payload.delivery_turn_id();
         settle_claim(&service.router, &claim, &turn_id).await?;
 
         let late = service
@@ -2876,7 +2876,7 @@ mod tests {
                 plan_revision: 1,
                 attempt: 1,
                 status: "completed",
-                result: None,
+                outcome: None,
                 full_output: None,
                 usage: None,
                 dispatch_hook: false,

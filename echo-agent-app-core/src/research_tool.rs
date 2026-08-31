@@ -95,12 +95,10 @@ impl Tool for ResearchLibraryTool {
                 Some(action) => action.to_string(),
                 None => return Ok(ToolResult::invalid_arguments("action is required")),
             };
-            let Some(workspace_io) =
-                crate::state::WorkspaceIoInvocation::from_tool_context_for_identity(
-                    context,
-                    &self.workspace_io_identity,
-                )
-            else {
+            let Some(workspace_io) = crate::state::WorkspaceIoInvocation::scoped_to_identity(
+                context,
+                &self.workspace_io_identity,
+            ) else {
                 return Ok(ToolResult::error(
                     "research_library requires the exact EKO workspace lifetime receipt",
                 ));

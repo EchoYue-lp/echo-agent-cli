@@ -371,9 +371,12 @@ mod tests {
         let message_id = message.message_id.clone();
         let timestamp = Utc::now();
         let record: AgentDeliveryRecord = serde_json::from_value(serde_json::json!({
-            "message": message,
             "message_id": message_id.clone(),
-            "target": target,
+            "route": target,
+            "payload": message,
+            "metadata": {},
+            "correlation_id": null,
+            "causation_id": null,
             "phase": "turn_settled",
             "outcome": "completed",
             "drained": true,
@@ -382,12 +385,15 @@ mod tests {
             "attempt_id": "attempt-1",
             "attempt": 1,
             "claimed_at": timestamp,
+            "effect_started_at": timestamp,
             "mailbox_accepted_at": timestamp,
             "drained_at": timestamp,
             "turn_settled_at": timestamp,
             "turn_id": "turn-1",
             "reply_message_id": "reply-1",
-            "next_attempt_at": null
+            "next_attempt_at": null,
+            "terminal": true,
+            "retained_bytes": 0
         }))
         .map_err(|error| format!("canonical Agent delivery fixture is invalid: {error}"))?;
         let records = vec![record];

@@ -31,14 +31,18 @@
 // agent.chat_stream("Hello").await;  // Keep `lease` until execution settles.
 // ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use echo_agent::agent::admission::{
+    KeyedExecutionAdmission, KeyedExecutionAdmissionError, KeyedExecutionLease,
+    KeyedExecutionRetirement,
+};
 use echo_agent::agent::AgentHandle;
 use echo_agent::agent::CancellationToken;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 
 use crate::config::EkoConfig;
 use crate::infra;
@@ -243,7 +247,7 @@ pub struct SharedResources {
     pub permission_service: Option<Arc<echo_agent::human_loop::service::PermissionService>>,
     pub state_store: Option<Arc<dyn echo_agent::state::RuntimeStateStore>>,
     pub tool_execution_pipeline:
-        Option<Arc<echo_agent::agent::react::run::pipeline::ToolExecutionPipeline>>,
+        Option<Arc<echo_agent::agent::ToolExecutionPipeline>>,
     pub review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
     /// TaskRuntime store handle. When present, pool agents get the task
     /// management tools (task_create/task_update/task_list) registered so
@@ -327,180 +331,91 @@ struct PooledAgent {
 }
 
 struct AgentPoolAdmission {
-    active: Mutex<AgentPoolAdmissionState>,
-    idle: Notify,
-}
-
-struct AgentPoolAdmissionState {
-    accepting: bool,
-    total: usize,
-    by_key: HashMap<String, usize>,
-    process_permits: HashMap<String, tokio::sync::OwnedSemaphorePermit>,
-    retiring: HashSet<String>,
+    framework: Arc<KeyedExecutionAdmission>,
 }
 
 impl Default for AgentPoolAdmission {
     fn default() -> Self {
         Self {
-            active: Mutex::new(AgentPoolAdmissionState {
-                accepting: true,
-                total: 0,
-                by_key: HashMap::new(),
-                process_permits: HashMap::new(),
-                retiring: HashSet::new(),
-            }),
-            idle: Notify::new(),
+            framework: Arc::new(KeyedExecutionAdmission::default()),
         }
     }
 }
 
 impl AgentPoolAdmission {
-    fn issue(
-        self: &Arc<Self>,
-        key: &str,
-        agent: AgentHandle,
-        process_permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    ) -> Result<AgentPoolExecutionLease, PoolError> {
-        let mut active = self
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !active.accepting {
-            return Err(PoolError::ShuttingDown);
-        }
-        if active.retiring.contains(key) {
-            return Err(PoolError::ConversationRetirementPending {
-                conversation_id: key.to_string(),
-            });
-        }
-        let total = active
-            .total
-            .checked_add(1)
-            .ok_or(PoolError::ExecutionLeaseCapacity)?;
-        let key_count = active
-            .by_key
-            .get(key)
-            .copied()
-            .unwrap_or_default()
-            .checked_add(1)
-            .ok_or(PoolError::ExecutionLeaseCapacity)?;
-        if key_count == 1 {
-            let permit = process_permit.ok_or(PoolError::ExecutionLeaseCapacity)?;
-            active.process_permits.insert(key.to_string(), permit);
-        }
-        active.total = total;
-        active.by_key.insert(key.to_string(), key_count);
-        drop(active);
-        Ok(AgentPoolExecutionLease {
-            agent,
-            admission: Some((Arc::clone(self), key.to_string())),
-        })
-    }
-
     fn issue_process_scoped(
         self: &Arc<Self>,
         key: &str,
         agent: AgentHandle,
         governor: &Arc<AgentExecutionGovernor>,
     ) -> Result<AgentPoolExecutionLease, PoolError> {
-        if self.is_active(key) {
-            match self.issue(key, agent.clone(), None) {
-                Ok(lease) => return Ok(lease),
-                Err(PoolError::ExecutionLeaseCapacity) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        let permit = match governor.semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(tokio::sync::TryAcquireError::NoPermits) if self.is_active(key) => {
-                return self.issue(key, agent, None);
-            }
-            Err(tokio::sync::TryAcquireError::NoPermits) => {
-                return Err(PoolError::ExecutionLeaseCapacity);
-            }
-            Err(tokio::sync::TryAcquireError::Closed) => return Err(PoolError::ShuttingDown),
-        };
-        self.issue(key, agent, Some(permit))
+        let framework_lease = self
+            .framework
+            .issue_process_scoped(key, &governor.semaphore)
+            .map_err(PoolError::from)?;
+        Ok(AgentPoolExecutionLease {
+            agent,
+            admission: Some((Arc::clone(self), key.to_string())),
+            framework_lease: Some(framework_lease),
+        })
     }
 
     fn is_active(&self, key: &str) -> bool {
-        self.active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .by_key
-            .get(key)
-            .is_some_and(|count| *count != 0)
+        self.framework.is_active(key)
     }
 
     fn is_retiring(&self, key: &str) -> bool {
-        self.active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retiring
-            .contains(key)
+        self.framework.is_retiring(key)
     }
 
     fn begin_retirement(
         self: &Arc<Self>,
         key: &str,
     ) -> Result<AgentPoolRetirementAdmission, PoolError> {
-        let mut active = self
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !active.accepting {
-            return Err(PoolError::ShuttingDown);
-        }
-        if !active.retiring.insert(key.to_string()) {
-            return Err(PoolError::ConversationRetirementPending {
-                conversation_id: key.to_string(),
-            });
-        }
-        drop(active);
+        let framework = self.framework.begin_retirement(key).map_err(PoolError::from)?;
         Ok(AgentPoolRetirementAdmission {
             admission: Arc::clone(self),
-            key: key.to_string(),
+            framework: Some(framework),
             active: true,
         })
     }
 
     async fn wait_key_idle(&self, key: &str) {
-        loop {
-            let notified = self.idle.notified();
-            if !self.is_active(key) {
-                return;
-            }
-            notified.await;
-        }
+        self.framework.wait_key_idle(key).await;
     }
 
     fn close(&self) {
-        self.active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .accepting = false;
+        self.framework.close();
     }
 
     async fn wait_until_idle(&self) {
-        loop {
-            let notified = self.idle.notified();
-            if self
-                .active
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .total
-                == 0
-            {
-                return;
+        self.framework.wait_until_idle().await;
+    }
+
+    fn active_count(&self) -> usize {
+        self.framework.active_count()
+    }
+}
+
+impl From<KeyedExecutionAdmissionError> for PoolError {
+    fn from(error: KeyedExecutionAdmissionError) -> Self {
+        match error {
+            KeyedExecutionAdmissionError::Closed => Self::ShuttingDown,
+            KeyedExecutionAdmissionError::Retiring { key }
+            | KeyedExecutionAdmissionError::RetirementAlreadyActive { key } => {
+                Self::ConversationRetirementPending {
+                    conversation_id: key,
+                }
             }
-            notified.await;
+            KeyedExecutionAdmissionError::CapacityOverflow { .. }
+            | KeyedExecutionAdmissionError::ProcessCapacity => Self::ExecutionLeaseCapacity,
         }
     }
 }
 
 struct AgentPoolRetirementAdmission {
     admission: Arc<AgentPoolAdmission>,
-    key: String,
+    framework: Option<KeyedExecutionRetirement>,
     active: bool,
 }
 
@@ -520,13 +435,7 @@ impl Drop for AgentPoolRetirementAdmission {
         if !self.active {
             return;
         }
-        self.admission
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retiring
-            .remove(&self.key);
-        self.admission.idle.notify_waiters();
+        drop(self.framework.take());
         self.active = false;
     }
 }
@@ -542,6 +451,7 @@ impl Drop for AgentPoolRetirementAdmission {
 pub struct AgentPoolExecutionLease {
     agent: AgentHandle,
     admission: Option<(Arc<AgentPoolAdmission>, String)>,
+    framework_lease: Option<KeyedExecutionLease>,
 }
 
 impl AgentPoolExecutionLease {
@@ -553,44 +463,28 @@ impl AgentPoolExecutionLease {
         Self {
             agent,
             admission: None,
+            framework_lease: None,
         }
     }
 
     fn owns(&self, admission: &Arc<AgentPoolAdmission>, key: &str) -> bool {
         self.admission
             .as_ref()
-            .is_some_and(|(owner, owned_key)| Arc::ptr_eq(owner, admission) && owned_key == key)
+            .is_some_and(|(owner, owned_key)| {
+                Arc::ptr_eq(owner, admission)
+                    && owned_key == key
+                    && self
+                        .framework_lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.owns(&admission.framework, key))
+            })
     }
 }
 
 impl Drop for AgentPoolExecutionLease {
     fn drop(&mut self) {
-        let Some((admission, key)) = self.admission.take() else {
-            return;
-        };
-        let mut active = admission
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        active.total = active.total.saturating_sub(1);
-        let mut release_process_permit = false;
-        if let Some(count) = active.by_key.get_mut(&key) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                active.by_key.remove(&key);
-                release_process_permit = true;
-            }
-        }
-        let process_permit = release_process_permit
-            .then(|| active.process_permits.remove(&key))
-            .flatten();
-        let released_key = !active.by_key.contains_key(&key);
-        let released_last = active.total == 0;
-        drop(active);
-        drop(process_permit);
-        if released_key || released_last {
-            admission.idle.notify_waiters();
-        }
+        self.admission.take();
+        self.framework_lease.take();
     }
 }
 

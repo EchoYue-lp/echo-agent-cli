@@ -7,7 +7,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+#[cfg(test)]
+use echo_agent::skills::external::SkillDocument;
+use echo_agent::skills::external::{SkillDescriptor, SkillLoadPolicy};
 
 pub(crate) mod u64_string {
     use serde::{Deserialize, Deserializer, Serializer, de};
@@ -173,10 +178,82 @@ pub const DEFAULT_BASELINE_SKILLS: &[&str] = &[
     "writing-plans",
 ];
 
+/// Built-in skills shipped with EKO. They are cataloged in the source tree but
+/// only the active subset enters an Agent runtime.
+pub const BUILTIN_SKILL_NAMES: &[&str] = &[
+    "algorithmic-art",
+    "brainstorming",
+    "brand-guidelines",
+    "canvas-design",
+    "claude-api",
+    "coding",
+    "data-visualization",
+    "data-wrangling",
+    "dispatching-parallel-agents",
+    "doc-writing",
+    "docx",
+    "evidence-medicine",
+    "executing-plans",
+    "finishing-a-development-branch",
+    "frontend-design",
+    "git-workflow",
+    "internal-comms",
+    "mcp-builder",
+    "paper-reader",
+    "paper-search",
+    "pdf",
+    "pptx",
+    "receiving-code-review",
+    "requesting-code-review",
+    "slack-gif-creator",
+    "statistical-analysis",
+    "subagent-driven-development",
+    "systematic-debugging",
+    "test-driven-development",
+    "theme-factory",
+    "translation",
+    "using-git-worktrees",
+    "verification-before-completion",
+    "web-artifacts-builder",
+    "web-search",
+    "webapp-testing",
+    "writing-plans",
+    "writing-skills",
+    "xlsx",
+];
+
+/// Small always-on set. Other shipped skills remain discoverable in the
+/// source/catalog but are opt-in through `enabled-skills.json`.
+pub const DEFAULT_ACTIVE_BUILTIN_SKILLS: &[&str] = &[
+    "coding",
+    "brainstorming",
+    "systematic-debugging",
+    "verification-before-completion",
+    "writing-plans",
+    "git-workflow",
+    "web-search",
+    "translation",
+];
+
+/// Filesystem root of the skills shipped with the EKO application.
+///
+/// Canonicalized because the framework loader canonicalizes every discovered
+/// `SKILL.md` location (resolving symlinks such as `/tmp` → `/private/tmp` on
+/// macOS); the policy boundary must use the same form or every builtin would
+/// compare as a user skill and bypass `enabled-skills.json`.
+pub fn builtin_skills_root() -> PathBuf {
+    let raw = Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills");
+    std::fs::canonicalize(&raw).unwrap_or(raw)
+}
+
+/// Whether a descriptor path belongs to the shipped application Skill tree.
+pub fn is_builtin_skill_path(path: &Path) -> bool {
+    path.starts_with(builtin_skills_root())
+}
+
 /// Non-baseline methodology skills (catalog-only by default).
 const OTHER_METHODOLOGY: &[&str] = &[
     "test-driven-development",
-    "using-superpowers",
     "writing-skills",
     "requesting-code-review",
     "receiving-code-review",
@@ -204,6 +281,15 @@ fn default_skills() -> HashMap<String, SkillEnableEntry> {
             },
         );
     }
+    for name in BUILTIN_SKILL_NAMES {
+        skills
+            .entry((*name).to_string())
+            .or_insert_with(|| SkillEnableEntry {
+                category: "builtin".into(),
+                enabled: DEFAULT_ACTIVE_BUILTIN_SKILLS.contains(name),
+                baseline: false,
+            });
+    }
     skills
 }
 
@@ -222,6 +308,16 @@ impl Default for EnabledSkillsConfig {
 }
 
 impl EnabledSkillsConfig {
+    /// Whether a skill may enter the current Agent runtime. Missing entries
+    /// use the shipped default only for built-ins so older config files gain
+    /// newly shipped core skills without enabling optional bundles.
+    pub fn is_enabled(&self, name: &str) -> bool {
+        self.skills
+            .get(name)
+            .map(|entry| entry.enabled)
+            .unwrap_or_else(|| DEFAULT_ACTIVE_BUILTIN_SKILLS.contains(&name))
+    }
+
     /// Load from disk; returns default (and persists it) when file is missing.
     pub fn load(path: &Path) -> std::io::Result<Self> {
         if !path.exists() {
@@ -353,6 +449,73 @@ impl EnabledSkillsConfig {
     }
 }
 
+/// EKO's runtime activation policy for compiled-in skills plus the existing
+/// product policy for user/plugin skills. Discovery and SkillsHub may still
+/// catalog every installed artifact; only accepted descriptors are registered
+/// into an Agent's runtime, hooks, and intent router.
+pub struct ActiveSkillLoadPolicy {
+    enabled_config_path: std::path::PathBuf,
+    builtin_root: std::path::PathBuf,
+    product_policy: Option<Arc<dyn SkillLoadPolicy>>,
+}
+
+impl ActiveSkillLoadPolicy {
+    pub fn new(
+        enabled_config_path: std::path::PathBuf,
+        builtin_root: std::path::PathBuf,
+        product_policy: Option<Arc<dyn SkillLoadPolicy>>,
+    ) -> Self {
+        // Same canonicalization rationale as `builtin_skills_root`: the
+        // loader canonicalizes descriptor locations, so the boundary must too.
+        let builtin_root = std::fs::canonicalize(&builtin_root).unwrap_or(builtin_root);
+        Self {
+            enabled_config_path,
+            builtin_root,
+            product_policy,
+        }
+    }
+
+    fn enabled_config(&self) -> Option<EnabledSkillsConfig> {
+        match std::fs::read_to_string(&self.enabled_config_path) {
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(config) => Some(config),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %self.enabled_config_path.display(),
+                        %error,
+                        "Ignoring malformed enabled-skills.json; built-in Skills fail closed"
+                    );
+                    None
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Some(EnabledSkillsConfig::default())
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %self.enabled_config_path.display(),
+                    %error,
+                    "Unable to read enabled-skills.json; built-in Skills fail closed"
+                );
+                None
+            }
+        }
+    }
+}
+
+impl SkillLoadPolicy for ActiveSkillLoadPolicy {
+    fn allows(&self, descriptor: &SkillDescriptor) -> bool {
+        if descriptor.location.starts_with(&self.builtin_root) {
+            return self
+                .enabled_config()
+                .is_some_and(|config| config.is_enabled(&descriptor.name));
+        }
+        self.product_policy
+            .as_ref()
+            .is_none_or(|policy| policy.allows(descriptor))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +529,50 @@ mod tests {
         assert!(base.contains(&"systematic-debugging"));
         assert!(base.contains(&"verification-before-completion"));
         assert!(base.contains(&"writing-plans"));
+    }
+
+    #[test]
+    fn default_config_activates_only_core_builtin_bundle() {
+        let config = EnabledSkillsConfig::default();
+        assert!(config.is_enabled("coding"));
+        assert!(config.is_enabled("web-search"));
+        assert!(!config.is_enabled("frontend-design"));
+        assert!(!config.is_enabled("docx"));
+        assert_eq!(
+            BUILTIN_SKILL_NAMES
+                .iter()
+                .filter(|name| config.is_enabled(name))
+                .count(),
+            DEFAULT_ACTIVE_BUILTIN_SKILLS.len()
+        );
+    }
+
+    #[test]
+    fn active_policy_filters_only_builtin_paths() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let config_path = temp.path().join("enabled-skills.json");
+        EnabledSkillsConfig::default()
+            .save(&config_path)
+            .map_err(|error| error.to_string())?;
+        let builtin_root = temp.path().join("builtin");
+        let policy = ActiveSkillLoadPolicy::new(config_path, builtin_root.clone(), None);
+        let mut optional =
+            SkillDocument::parse("---\nname: frontend-design\ndescription: optional\n---\nbody")
+                .map_err(|error| error.to_string())?
+                .into_descriptor();
+        optional.location = builtin_root.join("frontend-design/SKILL.md");
+        assert!(!policy.allows(&optional));
+        let mut core = SkillDocument::parse("---\nname: coding\ndescription: core\n---\nbody")
+            .map_err(|error| error.to_string())?
+            .into_descriptor();
+        core.location = builtin_root.join("coding/SKILL.md");
+        assert!(policy.allows(&core));
+        let mut user = SkillDocument::parse("---\nname: my-skill\ndescription: user\n---\nbody")
+            .map_err(|error| error.to_string())?
+            .into_descriptor();
+        user.location = temp.path().join("user/my-skill/SKILL.md");
+        assert!(policy.allows(&user));
+        Ok(())
     }
 
     #[test]

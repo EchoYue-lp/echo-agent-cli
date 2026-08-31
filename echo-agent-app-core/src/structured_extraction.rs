@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extraction_returns_one_typed_outcome_from_framework_path() -> Result<(), String> {
+    async fn extraction_returns_one_typed_outcome_from_runtime_path() -> Result<(), String> {
         let agent = ReactAgentBuilder::new()
             .model("structured-extraction-test")
             .system_prompt("Extract structured data")

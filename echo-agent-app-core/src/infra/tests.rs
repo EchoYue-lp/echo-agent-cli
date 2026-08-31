@@ -63,7 +63,7 @@ mod llm_config_tests {
             temperature: None,
             max_tokens: None,
             context_window: None,
-            thinking_profile: echo_agent::llm::core::capabilities::ThinkingProfile::unknown(),
+            thinking_profile: echo_agent::llm::ThinkingProfile::unknown(),
         };
 
         let config = build_runtime_llm_config(&runtime)?;
@@ -93,7 +93,7 @@ mod llm_config_tests {
             temperature: None,
             max_tokens: None,
             context_window: None,
-            thinking_profile: echo_agent::llm::core::capabilities::ThinkingProfile::unknown(),
+            thinking_profile: echo_agent::llm::ThinkingProfile::unknown(),
         };
 
         assert!(prepare_runtime_llm(&runtime).is_err());
@@ -116,7 +116,7 @@ mod llm_config_tests {
             temperature: None,
             max_tokens: None,
             context_window: None,
-            thinking_profile: echo_agent::llm::core::capabilities::ThinkingProfile::unknown(),
+            thinking_profile: echo_agent::llm::ThinkingProfile::unknown(),
         };
 
         let error = test_runtime_llm_connection(&runtime)
@@ -253,7 +253,7 @@ mod resolve_subagent_model_tests {
     };
     use crate::config::{ConfiguredModel, EkoConfig, ModelProviderConfig};
     use echo_agent::agent::ReactAgentBuilder;
-    use echo_agent::agent::subagent::{SubagentPromptCompiler, SubagentRegistry};
+    use echo_agent::subagent::{SubagentPromptCompiler, SubagentRegistry};
     use echo_agent::sandbox::SandboxManager;
     use std::sync::Arc;
 
@@ -579,13 +579,12 @@ mod resolve_subagent_model_tests {
 
     #[test]
     fn readonly_subagent_applies_per_subagent_thinking() -> echo_agent::error::Result<()> {
-        // build_readonly_subagent_agent must install the resolved thinking on
-        // the built agent (ReactAgent::thinking getter) — this is the wire the
-        // awaiter's `thinking: low` frontmatter rides on.
+        // The readonly builder must install an explicitly resolved thinking
+        // profile on any ordinary role.
         let low = echo_agent::llm::ThinkingConfig::Level(echo_agent::llm::ThinkingLevel::Low);
         let subagent = build_readonly_subagent_agent(
-            "awaiter",
-            "wait for one background cell",
+            "low-thinking-reviewer",
+            "review with reduced reasoning depth",
             "test-model",
             None,
             None,
@@ -632,11 +631,11 @@ mod resolve_subagent_model_tests {
 
     #[test]
     fn readonly_and_writer_subagents_share_cell_tools() -> echo_agent::error::Result<()> {
-        // C2b:两个构建路径都注入进程级共享 cell registry——readonly 子智能体
-        // (如 awaiter)没有 shell,但必须拥有 wait/stop_cell/list_cells。
+        // Both builder paths receive the scoped cell registry. A read-only
+        // inspector has no shell launcher but may inspect existing cells.
         let readonly = build_readonly_subagent_agent(
-            "awaiter",
-            "wait for one background cell",
+            "cell-inspector",
+            "inspect existing background cells",
             "test-model",
             None,
             None,
@@ -670,18 +669,14 @@ mod resolve_subagent_model_tests {
 
     #[test]
     fn loader_thinking_specs_parse_through_binding_path() -> Result<(), String> {
-        // The builtin awaiter declares `thinking: low`; the same parse_spec the
-        // binding uses must accept it, and the loader spec string must flow
-        // unchanged from the .md frontmatter.
-        let defs = crate::subagent_loader::discover_subagents(None, None);
-        let awaiter = defs
-            .iter()
-            .find(|d| d.name == "awaiter")
-            .ok_or_else(|| "builtin awaiter.md must load".to_string())?;
+        let definition = crate::subagent_loader::parse_subagent_md(
+            "---\nname: low-thinking-reviewer\ndescription: review\nreadonly: true\nthinking: low\n---\nReview the assigned evidence.",
+            None,
+        )?;
         let parsed = echo_agent::llm::ThinkingConfig::parse_spec(
-            awaiter.thinking.as_deref().unwrap_or_default(),
+            definition.thinking.as_deref().unwrap_or_default(),
         )
-        .map_err(|error| format!("awaiter thinking spec must parse: {error}"))?;
+        .map_err(|error| format!("readonly role thinking spec must parse: {error}"))?;
         assert_eq!(
             parsed,
             Some(echo_agent::llm::ThinkingConfig::Level(

@@ -1,6 +1,6 @@
-import type { SubagentRunStatus } from '../stores/subagentRunStore';
+import type { SubagentStatus } from '../stores/subagentRunStore';
 
-export function statusLabel(status: SubagentRunStatus): string {
+export function statusLabel(status: SubagentStatus): string {
   switch (status) {
     case 'running':
       return '运行中';

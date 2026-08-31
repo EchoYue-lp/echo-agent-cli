@@ -9,6 +9,7 @@ use std::process::Output;
 use std::time::Duration;
 
 use chrono::Utc;
+use echo_agent::skills::external::validate_skill_dir as validate_standard_skill_dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -411,10 +412,16 @@ fn validate_skill_dir(source: &Path) -> Result<(), String> {
     if !source.is_dir() {
         return Err(format!("源路径不是目录: {}", source.display()));
     }
-    if !source.join("SKILL.md").is_file() {
-        return Err(format!("目录中缺少 SKILL.md: {}", source.display()));
+    let report = validate_standard_skill_dir(source);
+    if report.is_valid() {
+        Ok(())
+    } else {
+        Err(format!(
+            "技能目录 {} 未通过官方 Agent Skills 校验: {}",
+            source.display(),
+            report.violations.join("; ")
+        ))
     }
-    Ok(())
 }
 
 fn replace_skill_directory(
@@ -697,8 +704,11 @@ mod tests {
     fn source_record_hash_detects_local_changes() -> Result<(), String> {
         let source = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root = tempfile::tempdir().map_err(|error| error.to_string())?;
-        std::fs::write(source.path().join("SKILL.md"), "# Skill\n")
-            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            source.path().join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo Skill\n---\n\n# Skill\n",
+        )
+        .map_err(|error| error.to_string())?;
         let destination = root.path().join("demo");
         let now = Utc::now().to_rfc3339();
         replace_skill_directory(
@@ -733,8 +743,11 @@ mod tests {
 
         let source = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root = tempfile::tempdir().map_err(|error| error.to_string())?;
-        std::fs::write(source.path().join("SKILL.md"), "# Original\n")
-            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            source.path().join("SKILL.md"),
+            "---\nname: local-change\ndescription: Local change Skill\n---\n\n# Original\n",
+        )
+        .map_err(|error| error.to_string())?;
         let destination = root.path().join("local-change");
         let now = Utc::now().to_rfc3339();
         replace_skill_directory(

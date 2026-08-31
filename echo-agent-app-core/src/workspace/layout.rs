@@ -122,21 +122,6 @@ impl WorkspaceLayout {
         Self::state_dir(root).join("workspace.json")
     }
 
-    /// 旧版工作区清单文件：`{root}/.workspace.json`
-    pub fn legacy_manifest(root: &Path) -> PathBuf {
-        root.join(".workspace.json")
-    }
-
-    /// 返回当前存在的清单路径，优先使用新版路径。
-    pub fn existing_manifest(root: &Path) -> PathBuf {
-        let manifest = Self::manifest(root);
-        if manifest.exists() {
-            manifest
-        } else {
-            Self::legacy_manifest(root)
-        }
-    }
-
     /// 上传文件临时目录：`{root}/.eko/uploads/`
     pub fn uploads(root: &Path) -> PathBuf {
         Self::state_dir(root).join("uploads")
@@ -169,7 +154,7 @@ impl WorkspaceLayout {
 
     /// 检查工作区目录是否有效（存在且包含清单文件）。
     pub fn is_valid_workspace(root: &Path) -> bool {
-        root.exists() && (Self::manifest(root).exists() || Self::legacy_manifest(root).exists())
+        root.exists() && Self::manifest(root).exists()
     }
 }
 
@@ -215,6 +200,14 @@ mod tests {
         assert!(WorkspaceLayout::traces(root).exists());
         assert!(WorkspaceLayout::uploads(root).exists());
         assert!(WorkspaceLayout::logs(root).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn retired_root_marker_is_not_a_workspace_manifest() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        std::fs::write(tmp.path().join(".workspace.json"), "{}")?;
+        assert!(!WorkspaceLayout::is_valid_workspace(tmp.path()));
         Ok(())
     }
 }

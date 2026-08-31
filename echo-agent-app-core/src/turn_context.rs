@@ -130,7 +130,7 @@ pub fn turn_prompt_context_registry() -> Arc<TurnPromptContextRegistry> {
 pub struct EkoContextProjector {
     task_runtime: TaskRuntimeContextProjector,
     turns: Arc<TurnPromptContextRegistry>,
-    awaiter: Option<(
+    command_cell_watch: Option<(
         Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>,
         crate::workspace::WorkspaceExecutionScope,
     )>,
@@ -145,7 +145,7 @@ impl EkoContextProjector {
         Self {
             task_runtime: TaskRuntimeContextProjector::new(task_runtime_registry),
             turns,
-            awaiter: None,
+            command_cell_watch: None,
             hot_memory: Arc::new(crate::unified_memory::HotMemoryProjectionSource::new()),
         }
     }
@@ -158,12 +158,12 @@ impl EkoContextProjector {
         self
     }
 
-    pub fn with_awaiter_results(
+    pub fn with_command_cell_watches(
         mut self,
         service: Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>,
         execution_scope: crate::workspace::WorkspaceExecutionScope,
     ) -> Self {
-        self.awaiter = Some((service, execution_scope));
+        self.command_cell_watch = Some((service, execution_scope));
         self
     }
 }
@@ -184,20 +184,24 @@ impl PreModelContextProjector for EkoContextProjector {
                 message: contract.map(render_turn_contract).map(Message::user),
             });
             projections.push(self.hot_memory.projection());
-            let pending_awaiter = match (
-                self.awaiter.as_ref(),
+            let pending_command_cell_watch = match (
+                self.command_cell_watch.as_ref(),
                 context.conversation_id.as_deref(),
                 context.turn_id.as_deref(),
             ) {
                 (Some((service, scope)), Some(conversation_id), Some(turn_id)) => service
-                    .project_pending_awaiter_results(scope.workspace_id(), conversation_id, turn_id)
+                    .project_pending_command_cell_watches(
+                        scope.workspace_id(),
+                        conversation_id,
+                        turn_id,
+                    )
                     .await
                     .map_err(echo_agent::error::ReactError::Other)?,
                 _ => None,
             };
             projections.push(ContextProjection {
-                marker: "[eko_pending_awaiter_results]".to_string(),
-                message: pending_awaiter.map(Message::user),
+                marker: "[eko_pending_command_cell_watches]".to_string(),
+                message: pending_command_cell_watch.map(Message::user),
             });
             Ok(projections)
         })

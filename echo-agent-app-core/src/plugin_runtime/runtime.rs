@@ -2010,7 +2010,7 @@ impl PluginRuntimeService {
     #[allow(clippy::result_large_err)]
     async fn replace_agent_components(
         &self,
-        agent: &mut echo_agent::agent::react::ReactAgent,
+        agent: &mut echo_agent::agent::ReactAgent,
         previous_registry: PluginRegistry,
         previous_framework: HashMap<String, WiredPluginComponents>,
         previous_framework_generation: Option<Arc<PreparedPluginSet>>,

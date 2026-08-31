@@ -16,16 +16,17 @@ import { create } from 'zustand';
 import { isCanonicalUsageEvent } from '../components/compress/subagentUsage';
 import type {
   RuntimeTaskEvent,
-  SubagentArtifactResult,
-  SubagentRunStatus,
-  SubagentTaskResult,
+  SubagentArtifact,
+  SubagentEvidence,
+  SubagentStatus,
+  SubagentOutcome,
   SubagentTouchedFiles,
-  SubagentVerificationResult,
+  SubagentVerification,
   PlanRevision,
   TaskRun,
 } from '../generated';
 
-export type { SubagentRunStatus } from '../generated';
+export type { SubagentStatus } from '../generated';
 
 /** Event variants carried on execution://event with kind="subagent". */
 export type SubagentRunEventKind =
@@ -37,7 +38,7 @@ export type SubagentRunEventKind =
   | 'timed_out'
   | 'cancelled';
 
-interface WireSubagentArtifactResult {
+interface WireSubagentArtifact {
   path: string;
   kind: string;
   bytes?: number | string | bigint | null;
@@ -90,8 +91,9 @@ export interface ExecutionEvent {
   summary?: string;
   contract_version?: number;
   terminal_status?: 'completed' | 'failed' | 'cancelled' | 'timed_out';
-  artifacts?: WireSubagentArtifactResult[];
-  verification?: SubagentVerificationResult[];
+  artifacts?: WireSubagentArtifact[];
+  evidence?: SubagentEvidence[];
+  verification?: SubagentVerification[];
   remaining_work?: string[];
   touched_files?: SubagentTouchedFiles;
   [key: string]: unknown;
@@ -112,7 +114,7 @@ export interface SubagentRunState {
    * in the current conversation, not just the single activeRun (P1.0: each
    * inline subagent now has its own run_id). */
   conversationId?: string;
-  status: SubagentRunStatus;
+  status: SubagentStatus;
   startedAt: number;
   durationMs?: number;
   tokensUsed?: number;
@@ -131,8 +133,8 @@ export interface SubagentRunState {
   /** True when started via background dispatch (agent_tool background=true or
    * role is_background). Completion raises a toast without duplicating chat. */
   background?: boolean;
-  /** Runtime-owned terminal result. Absent while running. */
-  result?: SubagentTaskResult;
+  /** Runtime-owned terminal outcome. Absent while running. */
+  outcome?: SubagentOutcome;
   /** Accumulated LLM usage across all model calls in this run (for cache diagnostics). */
   usageEvents?: ExecutionEvent[];
   /** Bounded lifecycle and usage event log. Tool details live in toolExecutionStore. */
@@ -161,7 +163,7 @@ export function subagentRunStoreKey(runId: string, subagentRunId: string): strin
   return `${runId}\u0000${subagentRunId}`;
 }
 
-function statusFromEvent(event: SubagentRunEventKind): SubagentRunStatus | null {
+function statusFromEvent(event: SubagentRunEventKind): SubagentStatus | null {
   switch (event) {
     case 'started':
       return 'running';
@@ -178,7 +180,7 @@ function statusFromEvent(event: SubagentRunEventKind): SubagentRunStatus | null 
   }
 }
 
-function artifactBytes(value: WireSubagentArtifactResult['bytes']): bigint | null {
+function artifactBytes(value: WireSubagentArtifact['bytes']): bigint | null {
   if (typeof value === 'bigint') return value;
   if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
     return BigInt(Math.trunc(value));
@@ -194,7 +196,7 @@ function artifactBytes(value: WireSubagentArtifactResult['bytes']): bigint | nul
   return null;
 }
 
-function normalizeArtifact(artifact: WireSubagentArtifactResult): SubagentArtifactResult {
+function normalizeArtifact(artifact: WireSubagentArtifact): SubagentArtifact {
   return {
     path: artifact.path,
     kind: artifact.kind,
@@ -205,10 +207,10 @@ function normalizeArtifact(artifact: WireSubagentArtifactResult): SubagentArtifa
   };
 }
 
-function terminalResult(
+function terminalOutcome(
   ev: ExecutionEvent,
-  status: SubagentRunStatus | null
-): SubagentTaskResult | undefined {
+  status: SubagentStatus | null
+): SubagentOutcome | undefined {
   if (!status || status === 'running') return undefined;
   const summary =
     (typeof ev.summary === 'string' && ev.summary.trim()) ||
@@ -219,6 +221,7 @@ function terminalResult(
     status,
     summary,
     artifacts: Array.isArray(ev.artifacts) ? ev.artifacts.map(normalizeArtifact) : [],
+    evidence: Array.isArray(ev.evidence) ? ev.evidence : [],
     verification: Array.isArray(ev.verification) ? ev.verification : [],
     remaining_work: Array.isArray(ev.remaining_work) ? ev.remaining_work : [],
     touched_files:
@@ -264,9 +267,9 @@ function runtimeTerminalEvent(value: unknown): TerminalSubagentRunEventKind | nu
   }
 }
 
-function runtimeArtifacts(value: unknown): WireSubagentArtifactResult[] {
+function runtimeArtifacts(value: unknown): WireSubagentArtifact[] {
   if (!Array.isArray(value)) return [];
-  const artifacts: WireSubagentArtifactResult[] = [];
+  const artifacts: WireSubagentArtifact[] = [];
   for (const item of value) {
     const artifact = jsonRecord(item);
     const path = jsonString(artifact?.path);
@@ -289,9 +292,9 @@ function runtimeArtifacts(value: unknown): WireSubagentArtifactResult[] {
   return artifacts;
 }
 
-function runtimeVerification(value: unknown): SubagentVerificationResult[] {
+function runtimeVerification(value: unknown): SubagentVerification[] {
   if (!Array.isArray(value)) return [];
-  const verification: SubagentVerificationResult[] = [];
+  const verification: SubagentVerification[] = [];
   for (const item of value) {
     const candidate = jsonRecord(item);
     const check = jsonString(candidate?.check);
@@ -326,7 +329,7 @@ function runtimeEventTimestamp(timestamp: string): number | undefined {
 }
 
 /**
- * Thin application adapter from durable TaskRuntime boundaries to the existing
+ * Translate durable TaskRuntime boundaries into the existing
  * realtime Subagent lifecycle stream. It restores the same GUI cards after a
  * page reload without introducing a second Subagent state machine.
  */
@@ -379,10 +382,10 @@ export function taskRuntimeSubagentExecutionEvents(
       continue;
     }
 
-    const result = jsonRecord(payload?.result);
-    const terminalEvent = runtimeTerminalEvent(payload?.status ?? result?.status);
+    const outcome = jsonRecord(payload?.outcome);
+    const terminalEvent = runtimeTerminalEvent(payload?.status ?? outcome?.status);
     if (!terminalEvent) continue;
-    const summary = jsonString(result?.summary) ?? jsonString(payload?.summary);
+    const summary = jsonString(outcome?.summary) ?? jsonString(payload?.summary);
     const output = jsonString(payload?.full_output);
     projected.push({
       kind: 'subagent',
@@ -401,12 +404,12 @@ export function taskRuntimeSubagentExecutionEvents(
       output,
       error: terminalEvent === 'failed' ? (summary ?? output) : undefined,
       summary,
-      contract_version: jsonNumber(result?.contract_version),
+      contract_version: jsonNumber(outcome?.contract_version),
       terminal_status: terminalEvent,
-      artifacts: runtimeArtifacts(result?.artifacts),
-      verification: runtimeVerification(result?.verification),
-      remaining_work: jsonStringArray(result?.remaining_work),
-      touched_files: runtimeTouchedFiles(result?.touched_files),
+      artifacts: runtimeArtifacts(outcome?.artifacts),
+      verification: runtimeVerification(outcome?.verification),
+      remaining_work: jsonStringArray(outcome?.remaining_work),
+      touched_files: runtimeTouchedFiles(outcome?.touched_files),
     });
   }
 
@@ -503,7 +506,7 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
       const usageEvents = isCanonicalUsageEvent(ev)
         ? [...(run.usageEvents ?? []), ev]
         : run.usageEvents;
-      const result = terminalResult(ev, newStatus) ?? run.result;
+      const outcome = terminalOutcome(ev, newStatus) ?? run.outcome;
       const next: SubagentRunState = {
         ...run,
         // Preserve any field present on the event (overwrites prev).
@@ -527,7 +530,7 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         returns: ev.returns ?? run.returns,
         messageId: ev.message_id ?? run.messageId,
         background: typeof ev.background === 'boolean' ? ev.background : run.background,
-        result,
+        outcome,
         usageEvents,
         events,
       };

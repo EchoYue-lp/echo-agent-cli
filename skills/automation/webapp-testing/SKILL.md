@@ -1,19 +1,13 @@
 ---
 name: webapp-testing
 description: 使用 Playwright 进行 Web 应用交互测试——表单填写、截图、UI 验证
+allowed-tools: shell read_artifact
 metadata:
   category: automation
   source: anthropic
-  upstream-version: "1.0"
+  upstream-version: '1.0'
   author: anthropic
-  tags: [testing, web, playwright, e2e]
-triggers:
-  - 测试
-  - web test
-  - Playwright
-  - 浏览器测试
-  - e2e
-allowed-tools: [shell, read_artifact]
+  tags: testing, web, playwright, e2e
 ---
 # Webapp Testing
 
@@ -31,3 +25,10 @@ Test the real user workflow in a browser and leave reproducible evidence, not me
 ## Delivery
 
 Report the tested URL/viewport, steps, observed result, console/network issues, and artifact paths. Distinguish product defects, test-environment failures, and unverified paths.
+
+## Workflow
+
+1. Turn the request into a short acceptance table: precondition, action, expected state, and evidence.
+2. Start from a clean browser context when possible and seed only non-sensitive test data.
+3. Assert visible state and accessible semantics after each meaningful action; capture evidence at the assertion boundary.
+4. On failure, preserve the first console error, failed request, screenshot, and reproduction step before retrying.

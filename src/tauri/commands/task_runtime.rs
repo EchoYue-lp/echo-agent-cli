@@ -9,7 +9,7 @@ use crate::tauri::state::TauriState;
 
 use echo_agent_app_core::api::state::ScopedChatRuntime;
 use echo_agent_app_core::api::tasks::task_runtime::types::*;
-use echo_agent_app_core::api::tasks::task_runtime::{TaskRuntimeBlockingAdapter, TaskRuntimeStore};
+use echo_agent_app_core::api::tasks::task_runtime::{TaskRuntimeOperation, TaskRuntimeStore};
 use std::sync::Arc;
 
 // ── Exact workspace runtime resolution ───────────────────────────────────
@@ -70,7 +70,7 @@ where
         + Send
         + 'static,
 {
-    TaskRuntimeBlockingAdapter::new(store.clone())
+    TaskRuntimeOperation::new(store.clone())
         .run_store(operation, function)
         .await
         .map_err(internal)
@@ -769,7 +769,7 @@ async fn resume_continuation_run(
             tracing::warn!(%error, run_id = %spawned_run_id, "long-horizon GUI resume failed");
         }
         let terminal_run_id = spawned_run_id.clone();
-        let terminal_status = TaskRuntimeBlockingAdapter::new(status_store)
+        let terminal_status = TaskRuntimeOperation::new(status_store)
             .run_store("load resumed TaskRun terminal", move |store| {
                 store.get_run(&terminal_run_id)
             })
@@ -963,9 +963,10 @@ pub async fn update_tasks(
     let service = echo_agent_app_core::api::tasks::task_runtime::task_revision_service_for_agent(
         &agent,
         store.clone(),
+        echo_agent_app_core::api::tasks::task_runtime::default_subagent_catalog(),
     )
     .await;
-    echo_agent_app_core::api::tasks::task_runtime::apply_eko_task_update(
+    echo_agent_app_core::api::tasks::task_runtime::apply_task_update(
         &service, store, &run_id, request,
     )
     .await
@@ -1176,7 +1177,7 @@ mod tests {
                 AttendedMode::Attended,
             )
             .map_err(|error| error.to_string())?;
-        echo_agent_app_core::api::tasks::task_runtime::commit_eko_task_plan(
+        echo_agent_app_core::api::tasks::task_runtime::commit_task_plan(
             store.clone(),
             TaskPlan {
                 plan_id: format!("{run_id}-plan"),

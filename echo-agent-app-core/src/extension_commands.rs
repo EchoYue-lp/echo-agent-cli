@@ -196,24 +196,9 @@ pub enum SkillCommand {
     Sync { target: Option<String>, force: bool },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum PluginInstallScope {
-    User,
-    Project,
-    Local,
-}
-
-impl From<PluginInstallScope> for echo_agent::plugin::PluginScope {
-    fn from(value: PluginInstallScope) -> Self {
-        match value {
-            PluginInstallScope::User => Self::User,
-            PluginInstallScope::Project => Self::Project,
-            PluginInstallScope::Local => Self::Local,
-        }
-    }
-}
+/// Framework-owned plugin installation scope retained under the stable EKO
+/// TypeScript wire name.
+pub use echo_agent::plugin::PluginScope as PluginInstallScope;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -226,6 +211,7 @@ pub enum PluginCommand {
     Reload,
     Install {
         source: String,
+        #[ts(type = "PluginInstallScope")]
         scope: PluginInstallScope,
     },
     Uninstall {
@@ -272,6 +258,7 @@ pub enum McpCommand {
     },
     Upsert {
         name: String,
+        #[ts(type = "McpServerConfig")]
         server: McpServerConfig,
     },
     Remove {
@@ -293,50 +280,19 @@ pub struct McpConfigDocument {
     #[serde(rename = "$schema")]
     pub schema: Option<String>,
     #[serde(rename = "mcpServers")]
+    #[ts(type = "Record<string, McpServerConfig>")]
     pub mcp_servers: HashMap<String, McpServerConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
-#[serde(deny_unknown_fields)]
-#[ts(export)]
-pub struct McpServerConfig {
-    #[serde(rename = "type")]
-    pub server_type: Option<String>,
-    pub command: Option<String>,
-    pub args: Vec<String>,
-    pub env: HashMap<String, String>,
-    pub cwd: Option<String>,
-    pub url: Option<String>,
-    pub headers: HashMap<String, String>,
-    pub transport: Option<String>,
-    pub disabled: bool,
-}
-
-impl From<McpServerConfig> for echo_agent::mcp::McpServerEntry {
-    fn from(value: McpServerConfig) -> Self {
-        Self {
-            server_type: value.server_type,
-            command: value.command,
-            args: value.args,
-            env: value.env,
-            cwd: value.cwd,
-            url: value.url,
-            headers: value.headers,
-            transport: value.transport,
-            disabled: value.disabled,
-        }
-    }
-}
+/// Framework-owned MCP server configuration retained under the EKO command
+/// wire name.
+pub use echo_agent::mcp::McpServerEntry as McpServerConfig;
 
 impl From<McpConfigDocument> for echo_agent::mcp::McpConfigFile {
     fn from(value: McpConfigDocument) -> Self {
         Self {
             schema: value.schema,
-            mcp_servers: value
-                .mcp_servers
-                .into_iter()
-                .map(|(name, server)| (name, server.into()))
-                .collect(),
+            mcp_servers: value.mcp_servers.into_iter().collect(),
         }
     }
 }
@@ -630,16 +586,9 @@ fn parse_plugin_command(input: &str) -> Result<PluginCommand, ExtensionCommandPa
                 let scope_value = values.next().ok_or_else(|| {
                     error("/plugins install <source> [--scope user|project|local]")
                 })?;
-                scope = match scope_value {
-                    "user" | "u" => PluginInstallScope::User,
-                    "project" | "p" => PluginInstallScope::Project,
-                    "local" | "l" => PluginInstallScope::Local,
-                    _ => {
-                        return Err(error(
-                            "/plugins install <source> [--scope user|project|local]",
-                        ));
-                    }
-                };
+                scope = scope_value
+                    .parse()
+                    .map_err(|_| error("/plugins install <source> [--scope user|project|local]"))?;
             }
             Ok(PluginCommand::Install { source, scope })
         }
@@ -2303,7 +2252,7 @@ async fn dispatch_plugin(
             let source = echo_agent::plugin::InstallSource::parse(&source);
             state
                 .extension_control
-                .install_plugin_scoped(state, runtime, &source, scope.into())
+                .install_plugin_scoped(state, runtime, &source, scope)
                 .await
                 .map(project_plugin_mutation)
         }
@@ -2448,7 +2397,7 @@ async fn dispatch_mcp(
             }),
         McpCommand::Upsert { name, server } => state
             .extension_control
-            .upsert_mcp_server(state, name.clone(), server.into())
+            .upsert_mcp_server(state, name.clone(), server)
             .await
             .map_err(anyhow::Error::new)
             .map(|generation| McpCommandReceipt::Configured {

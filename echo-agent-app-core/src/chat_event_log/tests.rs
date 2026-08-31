@@ -2,8 +2,8 @@
 mod tests {
     use super::*;
     use crate::tasks::task_runtime::command_cells::{
-        AwaiterResult, AwaiterResultAcknowledgement, AwaiterSummaryStatus, AwaiterWatchReceipt,
-        AwaiterWatchState,
+        CommandCellWatchResult, CommandCellWatchAcknowledgement, CommandCellWatchReceipt,
+        CommandCellWatchState,
     };
     use crate::tasks::task_runtime::types::{
         BackgroundCellArtifactStatus, BackgroundCellPhase, BackgroundCellState,
@@ -87,20 +87,18 @@ mod tests {
             .recovered_records)
     }
 
-    fn awaiter_result() -> AwaiterResult {
+    fn command_cell_watch() -> CommandCellWatchResult {
         let now = Utc::now();
-        AwaiterResult {
-            receipt: AwaiterWatchReceipt {
+        CommandCellWatchResult {
+            receipt: CommandCellWatchReceipt {
                 execution_id: "await-execution".to_string(),
-                control_task_id: "awaiter:cell:1".to_string(),
-                attempt: 1,
                 watch_generation: 1,
                 cell_id: "cell".to_string(),
                 workspace_id: "workspace-1".to_string(),
                 conversation_id: "conversation-1".to_string(),
                 run_id: None,
                 root_turn_id: "turn-1".to_string(),
-                state: AwaiterWatchState::Settled,
+                state: CommandCellWatchState::Settled,
                 started_at: now,
                 settled_at: Some(now),
             },
@@ -125,13 +123,11 @@ mod tests {
                 started_at: now,
                 finished_at: Some(now),
             },
-            awaiter_status: AwaiterSummaryStatus::Completed,
-            awaiter_summary: Some("done".to_string()),
         }
     }
 
     fn active_chat_cell(cell_id: &str) -> BackgroundCellState {
-        let mut cell = awaiter_result().cell;
+        let mut cell = command_cell_watch().cell;
         cell.cell_id = cell_id.to_string();
         cell.phase = BackgroundCellPhase::Running;
         cell.terminal_cause = None;
@@ -139,6 +135,67 @@ mod tests {
         cell.artifact_status = BackgroundCellArtifactStatus::Writing;
         cell.finished_at = None;
         cell
+    }
+
+    #[test]
+    fn command_cell_watch_ready_requires_exact_stream_and_settled_generation()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        let mutations: [fn(&mut CommandCellWatchResult); 3] = [
+            |result: &mut CommandCellWatchResult| {
+                result.receipt.workspace_id = "other-workspace".to_string();
+            },
+            |result: &mut CommandCellWatchResult| {
+                result.receipt.conversation_id = "other-conversation".to_string();
+            },
+            |result: &mut CommandCellWatchResult| {
+                result.receipt.root_turn_id = "other-turn".to_string();
+            },
+        ];
+        for mutate in mutations {
+            let mut result = command_cell_watch();
+            mutate(&mut result);
+            assert!(matches!(
+                log.append(
+                    "workspace-1",
+                    Some("conversation-1"),
+                    "turn-1",
+                    ChatDriverEvent::CommandCellWatchReady {
+                        result: Box::new(result),
+                    },
+                ),
+                Err(ChatEventLogError::InvalidIdentity(_))
+            ));
+        }
+
+        for result in [
+            {
+                let mut result = command_cell_watch();
+                result.receipt.watch_generation = 0;
+                result
+            },
+            {
+                let mut result = command_cell_watch();
+                result.receipt.state = CommandCellWatchState::Started;
+                result.receipt.settled_at = None;
+                result
+            },
+        ] {
+            assert!(matches!(
+                log.append(
+                    "workspace-1",
+                    Some("conversation-1"),
+                    "turn-1",
+                    ChatDriverEvent::CommandCellWatchReady {
+                        result: Box::new(result),
+                    },
+                ),
+                Err(ChatEventLogError::InvalidEvent(_))
+            ));
+        }
+        Ok(())
     }
 
     #[test]
@@ -351,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn unacknowledged_awaiter_pins_then_acknowledgement_converges() -> Result<(), String> {
+    fn unacknowledged_command_cell_watch_pins_then_acknowledgement_converges() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let log = ChatEventLog::open(
             temp.path(),
@@ -362,8 +419,8 @@ mod tests {
             },
         )
         .map_err(|error| error.to_string())?;
-        let result = awaiter_result();
-        let event = || ChatDriverEvent::AwaiterResultReady {
+        let result = command_cell_watch();
+        let event = || ChatDriverEvent::CommandCellWatchReady {
             result: Box::new(result.clone()),
         };
         let first = log
@@ -378,7 +435,7 @@ mod tests {
         }
         assert!(segment_count(&log)? > 1);
         assert_eq!(
-            log.pending_awaiter_results("workspace-1", "conversation-1", "turn-1")
+            log.pending_command_cell_watches("workspace-1", "conversation-1", "turn-1")
                 .map_err(|error| error.to_string())?,
             vec![result.clone()]
         );
@@ -386,15 +443,17 @@ mod tests {
             "workspace-1",
             Some("conversation-1"),
             "turn-1",
-            ChatDriverEvent::AwaiterResultAcknowledged {
-                acknowledgement: AwaiterResultAcknowledgement {
+            ChatDriverEvent::CommandCellWatchAcknowledged {
+                acknowledgement: CommandCellWatchAcknowledgement {
                     execution_id: result.receipt.execution_id,
-                    attempt: result.receipt.attempt,
                     watch_generation: result.receipt.watch_generation,
                     cell_id: result.receipt.cell_id,
+                    workspace_id: result.receipt.workspace_id,
+                    conversation_id: result.receipt.conversation_id,
+                    root_turn_id: result.receipt.root_turn_id,
                     acknowledged_turn_id: "next-turn".to_string(),
                     outcome:
-                        crate::tasks::task_runtime::command_cells::AwaiterDeliveryOutcome::Drained,
+                        crate::tasks::task_runtime::command_cells::CommandCellWatchDeliveryOutcome::Drained,
                 },
             },
         )
@@ -870,12 +929,12 @@ mod tests {
             max_replay_events: 1,
         };
         let log = ChatEventLog::open(&root, retention).map_err(|error| error.to_string())?;
-        let result = awaiter_result();
+        let result = command_cell_watch();
         log.append(
             "workspace-1",
             Some("conversation-1"),
             "turn-1",
-            ChatDriverEvent::AwaiterResultReady {
+            ChatDriverEvent::CommandCellWatchReady {
                 result: Box::new(result),
             },
         )
@@ -888,7 +947,7 @@ mod tests {
         let reopened = ChatEventLog::open(root, retention).map_err(|error| error.to_string())?;
         assert_eq!(
             reopened
-                .pending_awaiter_results("workspace-1", "conversation-1", "turn-1")
+                .pending_command_cell_watches("workspace-1", "conversation-1", "turn-1")
                 .map_err(|error| error.to_string())?
                 .len(),
             1
@@ -899,7 +958,7 @@ mod tests {
             append_status(&reopened, "completed")?;
             assert_eq!(
                 reopened
-                    .pending_awaiter_results("workspace-1", "conversation-1", "turn-1")
+                    .pending_command_cell_watches("workspace-1", "conversation-1", "turn-1")
                     .map_err(|error| error.to_string())?
                     .len(),
                 1
@@ -933,8 +992,8 @@ mod tests {
                 .is_empty()
         );
 
-        let result = awaiter_result();
-        let ready = || ChatDriverEvent::AwaiterResultReady {
+        let result = command_cell_watch();
+        let ready = || ChatDriverEvent::CommandCellWatchReady {
             result: Box::new(result.clone()),
         };
         let original = first
@@ -945,13 +1004,13 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert_eq!(original.event_id, duplicate.event_id);
         let mut conflicting = result;
-        conflicting.awaiter_summary = Some("conflict".to_string());
+        conflicting.cell.output_excerpt = Some("conflict".to_string());
         assert!(matches!(
             second.append(
                 "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
-                ChatDriverEvent::AwaiterResultReady {
+                ChatDriverEvent::CommandCellWatchReady {
                     result: Box::new(conflicting),
                 },
             ),
@@ -1262,16 +1321,15 @@ mod tests {
             let start = Arc::clone(&start);
             handles.push(std::thread::spawn(move || {
                 start.wait();
-                let mut result = awaiter_result();
-                result.receipt.execution_id = format!("awaiter-{index}");
-                result.receipt.control_task_id = format!("awaiter:cell-{index}:1");
+                let mut result = command_cell_watch();
+                result.receipt.execution_id = format!("command_cell_watch-{index}");
                 result.receipt.cell_id = format!("cell-{index}");
                 result.cell.cell_id = format!("cell-{index}");
                 log.append(
                     "workspace-1",
                     Some("conversation-1"),
                     &format!("root-{index}"),
-                    ChatDriverEvent::AwaiterResultReady {
+                    ChatDriverEvent::CommandCellWatchReady {
                         result: Box::new(result),
                     },
                 )
@@ -1303,7 +1361,7 @@ mod tests {
         );
         assert_eq!(
             second
-                .pending_awaiter_results("workspace-1", "conversation-1", "ignored")
+                .pending_command_cell_watches("workspace-1", "conversation-1", "ignored")
                 .map_err(|error| error.to_string())?
                 .len(),
             32

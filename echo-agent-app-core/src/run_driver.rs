@@ -25,7 +25,7 @@ use echo_agent::human_loop::HumanLoopProvider;
 
 use crate::agent_pool::AgentPool;
 use crate::tasks::task_runtime::executor::{
-    ExecSink, RunOutcome, RunPlanPolicy, TaskRuntimeBlockingAdapter, drive_agent_run,
+    ExecSink, RunOutcome, RunPlanPolicy, TaskRuntimeOperation, drive_agent_run,
 };
 use crate::tasks::task_runtime::memory_bridge::{MemoryEvent, MemoryPolicy};
 use crate::tasks::task_runtime::store::TaskRuntimeStore;
@@ -120,7 +120,7 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
     let pool_agent = pool_lease.agent();
     receipt_owner.retain(pool.retain_for_supervised_run(run_id.clone(), pool_lease));
     let hitl_run_id = run_id.clone();
-    let attended_mode = TaskRuntimeBlockingAdapter::new(store.clone())
+    let attended_mode = TaskRuntimeOperation::new(store.clone())
         .run("load independent run HITL policy", move |store| {
             store
                 .get_run(&hitl_run_id)?
@@ -203,7 +203,7 @@ async fn drive_run_async_inner(
 
     let load_run_id = payload.run_id.clone();
     let run =
-        TaskRuntimeBlockingAdapter::new(payload.store.clone())
+        TaskRuntimeOperation::new(payload.store.clone())
             .run("load final supervised run status", move |store| {
                 store.get_run(&load_run_id)?.ok_or(
                     crate::tasks::task_runtime::StoreError::RunNotFound(load_run_id),
@@ -267,7 +267,7 @@ async fn settle_driver_error(
     };
     let run_id = run_id.to_string();
     let error = error.to_string();
-    TaskRuntimeBlockingAdapter::new(store)
+    TaskRuntimeOperation::new(store)
         .run("settle supervised run error", move |store| {
             store.finalize_run(&run_id, target, Some(&error))
         })

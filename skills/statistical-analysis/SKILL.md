@@ -1,33 +1,11 @@
 ---
 name: statistical-analysis
-description: >-
-  统计分析与假设检验。当用户需要进行统计检验（t检验、卡方、ANOVA 等）、
-  回归分析、统计建模、或选择合适的统计方法时激活。
-triggers:
-  - 假设检验
-  - t检验
-  - 卡方检验
-  - 回归分析
-  - ANOVA
-  - p值
-  - 显著性检验
-  - statistics
-  - hypothesis test
-  - regression
-  - 统计建模
-  - 置信区间
-  - 效应量
-allowed-tools:
-  - "shell"
-  - "run_code"
-  - "read_file"
-  - "read_artifact"
-  - "apply_patch"
-  - "generate_chart"
+description: 统计分析与假设检验。当用户需要进行统计检验（t检验、卡方、ANOVA 等）、 回归分析、统计建模、或选择合适的统计方法时激活。
+allowed-tools: shell run_code read_file read_artifact apply_patch generate_chart
 metadata:
   author: echo-agent-cli
-  version: "1.0.0"
-  tags: "statistics, analysis, hypothesis, regression, testing"
+  version: 1.0.0
+  tags: statistics, analysis, hypothesis, regression, testing
 ---
 
 ## 统计分析与假设检验

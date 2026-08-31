@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use echo_agent::agent::subagent::SubagentPromptCompiler;
+    use echo_agent::subagent::{SubagentPromptCompiler, SubagentTaskContext};
     use futures::future::BoxFuture;
     use futures::stream::{self, BoxStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -127,7 +127,7 @@ mod tests {
         let sink = EkoAgentTurnSink::for_run(
             run,
             turn_id,
-            TaskRuntimeBlockingAdapter::new(store),
+            TaskRuntimeOperation::new(store),
             HashSet::new(),
             None,
         );
@@ -148,23 +148,32 @@ mod tests {
             task,
             dependency_summaries,
             delegation_policy.can_delegate(),
-            user_goal,
-            None,
         )
         .to_value()?;
+        let context = SubagentTaskContext {
+            task_title: Some(task.title.clone()),
+            user_goal: user_goal.map(str::to_string),
+            files: task.files.clone(),
+            execution_checks: task.execution_checks.clone(),
+            acceptance_criteria: task.acceptance_criteria.clone(),
+            required_artifacts: task.required_artifacts.clone(),
+            ..SubagentTaskContext::default()
+        };
         let compiler = crate::subagent_prompt::EkoSubagentPromptCompiler;
         Ok(compiler
-            .compile_invocation(&SubagentPromptInput {
+            .compile_invocation(&SubagentInvocation {
                 agent_name: &task.agent_role,
                 task: &task.description,
-                mode: echo_agent::agent::subagent::ExecutionMode::Fork,
+                mode: echo_agent::subagent::ExecutionMode::Fork,
                 transfer_policy: ContextTransferPolicy::Fresh,
-                parent_context: None,
-                inherit_history: None,
+                history: &[],
+                history_limit: None,
+                current_message: None,
+                context: &context,
+                capability_override: None,
                 payload: Some(&payload),
-                constraints: &[],
             })
-            .task_input)
+            .task_input())
     }
 
     async fn drive_dynamic_permission_case(
@@ -235,12 +244,7 @@ mod tests {
 
         assert!(matches!(receipt.outcome, TurnOutcome::Failed(_)));
         assert!(receipt.final_answer.is_none());
-        assert_eq!(
-            TaskExecutionUsage::from_turn_receipt(&receipt)
-                .durable
-                .tokens_used,
-            None
-        );
+        assert_eq!(receipt.usage().tokens_used, None);
         Ok(())
     }
 
@@ -303,7 +307,7 @@ mod tests {
             &run,
             &task,
             &execution_id,
-            TaskRuntimeBlockingAdapter::new(store.clone()),
+            TaskRuntimeOperation::new(store.clone()),
             HashSet::new(),
             None,
         );
@@ -416,8 +420,8 @@ mod tests {
                     return Err("provider timeout claim unexpectedly reloaded".to_string());
                 }
             };
-            let mut result = SubagentTaskResult::terminal(
-                SubagentRunStatus::TimedOut,
+            let mut result = SubagentOutcome::terminal(
+                SubagentStatus::TimedOut,
                 failure.message.clone(),
                 vec![failure.message.clone()],
             );
@@ -475,7 +479,7 @@ mod tests {
             .get_summary(&run_id, &task.id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "provider timeout summary missing".to_string())?;
-        assert!(summary.result.evidence.iter().any(|evidence| {
+        assert!(summary.outcome.evidence.iter().any(|evidence| {
             evidence.kind == "agent_failure"
                 && evidence
                     .attributes
@@ -876,7 +880,7 @@ Read the runtime path and found one missing branch.
 }
 ```
 "#;
-        let tasks = extract_suggested_tasks_from_subagent_output(output);
+        let tasks = parse_suggested_tasks(output);
         assert_eq!(tasks.len(), 1);
         let task = tasks
             .first()
@@ -1079,7 +1083,7 @@ Read the runtime path and found one missing branch.
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "direct completion summary missing".to_string())?;
         assert!(
-            summary.result.evidence.iter().any(|evidence| {
+            summary.outcome.evidence.iter().any(|evidence| {
                 evidence.kind == "file_read" && evidence.subject == "README.md"
             })
         );
@@ -1391,21 +1395,21 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn task_runtime_blocking_adapter_keeps_async_heartbeat_responsive() -> Result<(), String>
+    async fn task_runtime_operation_keeps_async_heartbeat_responsive() -> Result<(), String>
     {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        let adapter = TaskRuntimeBlockingAdapter::new(store);
+        let operation = TaskRuntimeOperation::new(store);
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let operation = tokio::spawn(async move {
-            adapter
-                .run("blocking adapter heartbeat test", move |_store| {
+            operation
+                .run("TaskRuntime operation heartbeat test", move |_store| {
                     let _ignored = entered_tx.send(());
                     release_rx
                         .recv_timeout(std::time::Duration::from_secs(2))
                         .map_err(|error| {
                             StoreError::InvalidPlan(format!(
-                                "blocking adapter test release failed: {error}"
+                                "TaskRuntime operation release failed: {error}"
                             ))
                         })?;
                     Ok(())
@@ -1433,7 +1437,7 @@ Read the runtime path and found one missing branch.
             .map_err(|error| format!("failed to release blocking operation: {error}"))?;
         operation
             .await
-            .map_err(|error| format!("blocking adapter task failed to join: {error}"))?
+            .map_err(|error| format!("TaskRuntime operation failed to join: {error}"))?
             .map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -1441,13 +1445,13 @@ Read the runtime path and found one missing branch.
     #[tokio::test(flavor = "current_thread")]
     async fn accepted_blocking_operation_finishes_after_caller_drop() -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        let adapter = TaskRuntimeBlockingAdapter::new(store.clone());
+        let operation = TaskRuntimeOperation::new(store.clone());
         let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let completed_in_operation = completed.clone();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let caller = tokio::spawn(async move {
-            adapter
+            operation
                 .run_owned("caller drop contract", move || {
                     let _ignored = entered_tx.send(());
                     release_rx
@@ -1494,14 +1498,14 @@ Read the runtime path and found one missing branch.
     #[tokio::test]
     async fn sealed_operation_admission_cannot_revive_after_join() -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        let adapter = TaskRuntimeBlockingAdapter::new(store.clone());
-        let parked_adapter = adapter.clone();
+        let operation = TaskRuntimeOperation::new(store.clone());
+        let parked_operation = operation.clone();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let parked = tokio::spawn(async move {
             let _ = entered_tx.send(());
             let _ = release_rx.await;
-            parked_adapter.reserve_settlement("parked settlement after seal")
+            parked_operation.reserve_settlement("parked settlement after seal")
         });
         entered_rx
             .await
@@ -1621,7 +1625,7 @@ Read the runtime path and found one missing branch.
         use std::sync::Arc;
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         // Seed a run + plan via the public store API, then drive the state
-        // machine the way the runtime plan adapter would.
+        // machine the way the runtime plan integration does.
         store
             .create_run(
                 "r1",
@@ -1727,7 +1731,7 @@ Read the runtime path and found one missing branch.
         }
     }
 
-    type ScriptedDispatchResult = Result<(SubagentTaskResult, String), String>;
+    type ScriptedDispatchResult = Result<(SubagentOutcome, String), String>;
 
     /// A dispatcher that returns scripted results per task id and records the
     /// order tasks were dispatched. Semaphores/locks are ignored (the mock
@@ -1771,24 +1775,24 @@ Read the runtime path and found one missing branch.
                 );
         }
         /// Script a structured terminal result for `id`.
-        fn respond(self: &Arc<Self>, id: &str, result: SubagentTaskResult) {
-            let full_output = result.summary.clone();
+        fn respond(self: &Arc<Self>, id: &str, outcome: SubagentOutcome) {
+            let full_output = outcome.summary.clone();
             self.results
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .insert(id.into(), Ok((result, full_output)));
+                .insert(id.into(), Ok((outcome, full_output)));
         }
         /// Script a bounded parent summary plus a distinct complete review output.
         fn respond_with_output(
             self: &Arc<Self>,
             id: &str,
-            result: SubagentTaskResult,
+            outcome: SubagentOutcome,
             full_output: &str,
         ) {
             self.results
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .insert(id.into(), Ok((result, full_output.to_string())));
+                .insert(id.into(), Ok((outcome, full_output.to_string())));
         }
         /// Script a failure result for `id`.
         fn fail(self: &Arc<Self>, id: &str, err: &str) {
@@ -1840,7 +1844,7 @@ Read the runtime path and found one missing branch.
         fn dispatch(
             &self,
             _store: Arc<TaskRuntimeStore>,
-            _blocking: TaskRuntimeBlockingAdapter,
+            _blocking: TaskRuntimeOperation,
             context: echo_agent::tasks::TaskSubagentContext,
             _claim: echo_agent::tasks::TaskClaim,
             task: PlanTask,
@@ -1888,7 +1892,7 @@ Read the runtime path and found one missing branch.
                 let result = match results {
                     Some(Ok((result, full_output))) => Ok(TaskDispatchSuccess {
                         task_id,
-                        result,
+                        outcome: result,
                         full_output,
                         suggested_tasks: Vec::new(),
                     }),
@@ -1896,7 +1900,7 @@ Read the runtime path and found one missing branch.
                     // Default: generic success for unscripted tasks.
                     None => Ok(TaskDispatchSuccess {
                         task_id,
-                        result: successful_task_result("ok"),
+                        outcome: successful_task_result("ok"),
                         full_output: "ok".to_string(),
                         suggested_tasks: Vec::new(),
                     }),
@@ -1912,7 +1916,7 @@ Read the runtime path and found one missing branch.
         fn integrate(
             &self,
             _store: Arc<TaskRuntimeStore>,
-            _blocking: TaskRuntimeBlockingAdapter,
+            _blocking: TaskRuntimeOperation,
             _run_id: String,
             task: PlanTask,
             _execution_id: String,
@@ -1945,10 +1949,10 @@ Read the runtime path and found one missing branch.
         }
     }
 
-    fn successful_task_result(summary: &str) -> SubagentTaskResult {
-        SubagentTaskResult {
+    fn successful_task_result(summary: &str) -> SubagentOutcome {
+        SubagentOutcome {
             contract_version: 1,
-            status: SubagentRunStatus::Completed,
+            status: SubagentStatus::Completed,
             summary: summary.to_string(),
             artifacts: Vec::new(),
             evidence: Vec::new(),
@@ -1987,13 +1991,13 @@ Read the runtime path and found one missing branch.
         //     and artifact lacks hash/producer. Must NOT be ExecutionFailed
         //     (the Subagent completed) and must NOT pass.
         result.remaining_work.clear();
-        result.verification.push(SubagentVerificationResult {
+        result.verification.push(SubagentVerification {
             check: "cargo test --workspace".to_string(),
             status: SubagentVerificationStatus::Passed,
             details: "claimed by subagent".to_string(),
-            source: SubagentVerificationSource::Reported,
+            source: SubagentEvidenceSource::Reported,
         });
-        result.artifacts.push(SubagentArtifactResult {
+        result.artifacts.push(SubagentArtifact {
             path: "reports/result.json".to_string(),
             kind: "report".to_string(),
             bytes: Some(12),
@@ -2020,7 +2024,7 @@ Read the runtime path and found one missing branch.
 
         // (c) Executed: observed pass + integrity metadata present.
         if let Some(verification) = result.verification.first_mut() {
-            verification.source = SubagentVerificationSource::Observed;
+            verification.source = SubagentEvidenceSource::Observed;
         }
         if let Some(artifact) = result.artifacts.first_mut() {
             artifact.sha256 = Some("a".repeat(64));
@@ -2053,11 +2057,11 @@ Read the runtime path and found one missing branch.
         let run_id = seed_run(&store, vec![task.clone()])?;
         let dispatcher = ScriptedDispatcher::new();
         let mut result = successful_task_result("tests claimed complete");
-        result.verification.push(SubagentVerificationResult {
+        result.verification.push(SubagentVerification {
             check: "cargo test --workspace".to_string(),
             status: SubagentVerificationStatus::Passed,
             details: "subagent report only".to_string(),
-            source: SubagentVerificationSource::Reported,
+            source: SubagentEvidenceSource::Reported,
         });
         dispatcher.respond(&task.id, result);
 
@@ -2133,7 +2137,7 @@ Read the runtime path and found one missing branch.
                 run_id: run_id.clone(),
                 task_id: task.id.clone(),
                 subagent_name: task.agent_role.clone(),
-                result: successful_task_result("durable result"),
+                outcome: successful_task_result("durable result"),
                 decisions: Vec::new(),
                 next_implications: Vec::new(),
                 suggested_tasks: Vec::new(),
@@ -2436,13 +2440,13 @@ Read the runtime path and found one missing branch.
         assert_eq!(subagent_runs.len(), 1);
         assert_eq!(subagent_run.run_id, run_id);
         assert_eq!(subagent_run.task_id, "remote-verification");
-        assert_eq!(subagent_run.status, SubagentRunStatus::Completed);
-        let result = subagent_run
-            .result
+        assert_eq!(subagent_run.status, SubagentStatus::Completed);
+        let outcome = subagent_run
+            .outcome
             .as_ref()
-            .ok_or_else(|| "SubagentRun result is missing".to_string())?;
-        assert!(result.summary.contains(REMOTE_MARKER));
-        assert!(!result.summary.contains("LOCAL_AGENT_MUST_NOT_RUN"));
+            .ok_or_else(|| "SubagentRun outcome is missing".to_string())?;
+        assert!(outcome.summary.contains(REMOTE_MARKER));
+        assert!(!outcome.summary.contains("LOCAL_AGENT_MUST_NOT_RUN"));
         Ok(())
     }
 
@@ -2778,7 +2782,7 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn runtime_plan_reuses_durable_subagent_result_after_restart() -> Result<(), String> {
+    async fn runtime_plan_reuses_durable_subagent_outcome_after_restart() -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let task = solo_readonly_task("a");
         let run_id = seed_run(&store, vec![task.clone()])?;
@@ -2807,7 +2811,7 @@ Read the runtime path and found one missing branch.
                 plan_revision: 1,
                 attempt: 1,
                 status: "completed",
-                result: Some(&recovered_result),
+                outcome: Some(&recovered_result),
                 full_output: Some("recovered full output"),
                 usage: None,
                 dispatch_hook: true,
@@ -3231,7 +3235,7 @@ Read the runtime path and found one missing branch.
     #[tokio::test]
     async fn main_agent_task_streams_tool_events_to_subagent_trace() -> Result<(), String> {
         use crate::agent_handle::AgentHandle;
-        use echo_agent::agent::react::builder::ReactAgentBuilder;
+        use echo_agent::agent::ReactAgentBuilder;
         use echo_agent::testing::{MockLlmClient, MockTool};
         use std::sync::Mutex;
 
@@ -3283,7 +3287,7 @@ Read the runtime path and found one missing branch.
 
         let output = run_main_agent_task(
             &handle,
-            TaskRuntimeBlockingAdapter::new(store),
+            TaskRuntimeOperation::new(store),
             &run_id,
             &task,
             &execution_id,
@@ -3373,9 +3377,9 @@ Read the runtime path and found one missing branch.
             acceptance_criteria: Vec::new(),
             ..PlanTask::default()
         };
-        let result = SubagentTaskResult {
+        let result = SubagentOutcome {
             contract_version: 0, // plain-text fallback, NOT a failure
-            status: SubagentRunStatus::Completed,
+            status: SubagentStatus::Completed,
             summary: "Frontend uses React 19 + Zustand.".into(),
             artifacts: Vec::new(),
             evidence: Vec::new(),
@@ -3397,9 +3401,9 @@ Read the runtime path and found one missing branch.
             acceptance_criteria: Vec::new(),
             ..PlanTask::default()
         };
-        let result = SubagentTaskResult {
+        let result = SubagentOutcome {
             contract_version: 0,
-            status: SubagentRunStatus::Completed,
+            status: SubagentStatus::Completed,
             summary: "done".into(),
             artifacts: Vec::new(),
             evidence: Vec::new(),
@@ -3442,9 +3446,9 @@ Read the runtime path and found one missing branch.
         // Subagents returned.
         dispatcher.respond(
             &task.id,
-            SubagentTaskResult {
+            SubagentOutcome {
                 contract_version: 0,
-                status: SubagentRunStatus::Completed,
+                status: SubagentStatus::Completed,
                 summary: "Backend has 4 modules.".into(),
                 artifacts: Vec::new(),
                 evidence: Vec::new(),
@@ -3508,9 +3512,9 @@ Read the runtime path and found one missing branch.
         // Always report remaining_work → ExecutionFailed every time.
         dispatcher.respond(
             &task.id,
-            SubagentTaskResult {
+            SubagentOutcome {
                 contract_version: 1,
-                status: SubagentRunStatus::Completed,
+                status: SubagentStatus::Completed,
                 summary: "partial".into(),
                 artifacts: Vec::new(),
                 evidence: Vec::new(),
@@ -3563,9 +3567,9 @@ Read the runtime path and found one missing branch.
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.respond(
             &clean.id,
-            SubagentTaskResult {
+            SubagentOutcome {
                 contract_version: 1,
-                status: SubagentRunStatus::Completed,
+                status: SubagentStatus::Completed,
                 summary: "clean run".into(),
                 artifacts: Vec::new(),
                 evidence: Vec::new(),
@@ -3576,9 +3580,9 @@ Read the runtime path and found one missing branch.
         );
         dispatcher.respond(
             &blocked.id,
-            SubagentTaskResult {
+            SubagentOutcome {
                 contract_version: 1,
-                status: SubagentRunStatus::Completed,
+                status: SubagentStatus::Completed,
                 summary: "blocked run".into(),
                 artifacts: Vec::new(),
                 evidence: Vec::new(),

@@ -1301,7 +1301,7 @@ async fn f1_cold_drain_is_durable_before_terminal_and_reopen_visible() -> anyhow
         recovered.phase,
         crate::agent_router::AgentDeliveryPhase::Drained
     );
-    assert_eq!(recovered.claim.message.message_id, message.message_id);
+    assert_eq!(recovered.claim.payload.message_id, message.message_id);
     assert_eq!(recovered.turn_id, message.delivery_turn_id());
 
     let delivered = delivery.await??;
@@ -1380,7 +1380,7 @@ async fn f1_cold_owner_exit_after_drain_recovers_without_model_replay() -> anyho
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     };
-    assert_eq!(injected.claim.message.message_id, message.message_id);
+    assert_eq!(injected.claim.payload.message_id, message.message_id);
     assert_eq!(injected.claim.attempt, 1);
     assert_eq!(injected.turn_id, expected_turn_id);
 

@@ -149,7 +149,7 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
             let (goal, recovery) = match (run_id, store) {
                 (Some(run_id), Some(store)) => {
                     let run_id = run_id.to_string();
-                    super::executor::TaskRuntimeBlockingAdapter::new(store)
+                    super::executor::TaskRuntimeOperation::new(store)
                         .run_store("project TaskRuntime model context", move |store| {
                             Ok((
                                 build_runtime_goal_contract(&store, &run_id),
@@ -531,16 +531,20 @@ fn task_sort_key(tasks: &[PlanTask], task_id: &str) -> i64 {
 
 fn format_summary(summary: &TaskExecutionSummary) -> String {
     let mut parts = Vec::new();
-    if !summary.result.summary.trim().is_empty() {
+    if !summary.outcome.summary.trim().is_empty() {
         push_summary_field(
             &mut parts,
             "done",
-            std::slice::from_ref(&summary.result.summary),
+            std::slice::from_ref(&summary.outcome.summary),
         );
     }
-    push_summary_field(&mut parts, "changed", &summary.result.touched_files.written);
+    push_summary_field(
+        &mut parts,
+        "changed",
+        &summary.outcome.touched_files.written,
+    );
     push_summary_field(&mut parts, "decisions", &summary.decisions);
-    push_summary_field(&mut parts, "remaining", &summary.result.remaining_work);
+    push_summary_field(&mut parts, "remaining", &summary.outcome.remaining_work);
     push_summary_field(&mut parts, "next", &summary.next_implications);
     truncate_chars(&parts.join(" | "), MAX_SUMMARY_CHARS)
 }
@@ -601,8 +605,8 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::tasks::task_runtime::types::{
-        AttendedMode, DomainProfile, ExecutionMode, PlanTaskKind, SubagentRunStatus,
-        SubagentTaskResult, SubagentTouchedFiles, TaskPlan, TaskRunStatus,
+        AttendedMode, DomainProfile, ExecutionMode, PlanTaskKind, SubagentOutcome, SubagentStatus,
+        SubagentTouchedFiles, TaskPlan, TaskRunStatus,
     };
     use chrono::Utc;
     use echo_agent::compression::{ContextManager, PreModelContextProjector, ProjectionContext};
@@ -729,9 +733,9 @@ mod tests {
                 run_id: "r1".to_string(),
                 task_id: "t1".to_string(),
                 subagent_name: "explorer".to_string(),
-                result: SubagentTaskResult {
+                outcome: SubagentOutcome {
                     contract_version: 1,
-                    status: SubagentRunStatus::Completed,
+                    status: SubagentStatus::Completed,
                     summary: "确认 force_compress 不携带 TaskRuntime 状态".to_string(),
                     artifacts: Vec::new(),
                     evidence: Vec::new(),

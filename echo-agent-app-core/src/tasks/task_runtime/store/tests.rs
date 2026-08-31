@@ -105,12 +105,12 @@ mod tests {
                 serde_json::json!({ "message": format!("after-{index}") }),
             )
         }));
-        let result = SubagentTaskResult::terminal(
-            SubagentRunStatus::Completed,
+        let result = SubagentOutcome::terminal(
+            SubagentStatus::Completed,
             "完成 ✅ bounded result",
             Vec::new(),
         );
-        let usage = SubagentRunUsage {
+        let usage = ExecutionUsage {
             duration_ms: Some(41),
             tokens_used: Some(73),
             iterations: Some(5),
@@ -122,7 +122,7 @@ mod tests {
             RuntimeEventKind::SubagentReleased,
             serde_json::json!({
                 "status": "completed",
-                "result": result,
+                "outcome": result,
                 "usage": usage,
             }),
         ));
@@ -152,7 +152,7 @@ mod tests {
         assert_eq!(
             snapshot
                 .run
-                .result
+                .outcome
                 .as_ref()
                 .map(|value| value.summary.as_str()),
             Some("完成 ✅ bounded result")
@@ -617,8 +617,8 @@ mod tests {
                 run_id: run_id.clone(),
                 task_id: "task-a".to_string(),
                 subagent_name: "subagent".to_string(),
-                result: SubagentTaskResult::terminal(
-                    SubagentRunStatus::Completed,
+                outcome: SubagentOutcome::terminal(
+                    SubagentStatus::Completed,
                     "bounded query complete",
                     Vec::new(),
                 ),
@@ -2902,17 +2902,17 @@ mod tests {
             run_id: "r1".into(),
             task_id: "t1".into(),
             subagent_name: "code_reviewer".into(),
-            result: SubagentTaskResult {
+            outcome: SubagentOutcome {
                 contract_version: 1,
-                status: SubagentRunStatus::Completed,
+                status: SubagentStatus::Completed,
                 summary: "read chat.rs".into(),
                 artifacts: Vec::new(),
                 evidence: Vec::new(),
-                verification: vec![SubagentVerificationResult {
+                verification: vec![SubagentVerification {
                     check: "cargo check".into(),
                     status: SubagentVerificationStatus::Passed,
                     details: String::new(),
-                    source: SubagentVerificationSource::Observed,
+                    source: SubagentEvidenceSource::Observed,
                 }],
                 remaining_work: Vec::new(),
                 touched_files: SubagentTouchedFiles {
@@ -2929,7 +2929,7 @@ mod tests {
         let got = s
             .get_summary("r1", "t1")?
             .ok_or_else(|| StoreError::TaskNotFound("t1 summary".to_string()))?;
-        assert_eq!(got.result.summary, "read chat.rs");
+        assert_eq!(got.outcome.summary, "read chat.rs");
         assert_eq!(got.next_implications.len(), 1);
         Ok(())
     }
@@ -3117,12 +3117,12 @@ mod tests {
         assert_eq!(subagent_run.subagent_run_id, "execution-1");
         assert_eq!(subagent_run.usage.tokens_used, Some(20));
         assert_eq!(subagent_run.usage.duration_ms, Some(2_500));
-        let result = SubagentTaskResult::terminal(
-            SubagentRunStatus::Completed,
+        let result = SubagentOutcome::terminal(
+            SubagentStatus::Completed,
             "review complete",
             Vec::new(),
         );
-        let terminal_usage = SubagentRunUsage {
+        let terminal_usage = ExecutionUsage {
             duration_ms: Some(2_500),
             tokens_used: Some(20),
             iterations: Some(2),
@@ -3136,7 +3136,7 @@ mod tests {
             plan_revision: 1,
             attempt: 1,
             status: "completed",
-            result: Some(&result),
+            outcome: Some(&result),
             full_output: Some("review complete"),
             usage: Some(&terminal_usage),
             dispatch_hook: false,
@@ -3145,8 +3145,8 @@ mod tests {
         let settled = settled_runs.first().ok_or_else(|| {
             StoreError::InvalidPlan("settled SubagentRun projection missing".to_string())
         })?;
-        assert_eq!(settled.status, SubagentRunStatus::Completed);
-        assert_eq!(settled.result.as_ref(), Some(&result));
+        assert_eq!(settled.status, SubagentStatus::Completed);
+        assert_eq!(settled.outcome.as_ref(), Some(&result));
         assert_eq!(settled.usage, terminal_usage);
         assert_eq!(
             store
@@ -4902,7 +4902,8 @@ mod tests {
             .get_plan("r1")?
             .and_then(|plan| plan.tasks.into_iter().next())
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
-        let runtime_task = task.to_task().map_err(StoreError::InvalidPlan)?;
+        let runtime_task = echo_agent::tasks::Task::try_from(&task)
+            .map_err(StoreError::InvalidPlan)?;
         let claim = match store.claim_runtime_task("r1", &runtime_task, 1)? {
             echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
             echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
@@ -4932,7 +4933,7 @@ mod tests {
             .into_iter()
             .find(|run| run.subagent_run_id == execution_id)
             .ok_or_else(|| StoreError::InvalidPlan("orphan Subagent missing".to_string()))?;
-        assert_eq!(subagent.status, SubagentRunStatus::Failed);
+        assert_eq!(subagent.status, SubagentStatus::Failed);
         let recovery = store
             .list_events("r1", 0)?
             .into_iter()
@@ -4966,7 +4967,8 @@ mod tests {
             .first()
             .cloned()
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
-        let runtime_task = task.to_task().map_err(StoreError::InvalidPlan)?;
+        let runtime_task = echo_agent::tasks::Task::try_from(&task)
+            .map_err(StoreError::InvalidPlan)?;
         let claim = match store.claim_runtime_task("r1", &runtime_task, 1)? {
             echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
             echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
@@ -4987,8 +4989,8 @@ mod tests {
             true,
             true,
         )?;
-        let result = SubagentTaskResult::terminal(
-            SubagentRunStatus::Completed,
+        let result = SubagentOutcome::terminal(
+            SubagentStatus::Completed,
             "durable result",
             Vec::new(),
         );
@@ -5001,7 +5003,7 @@ mod tests {
             plan_revision: claim.revision,
             attempt: claim.attempt,
             status: "completed",
-            result: Some(&result),
+            outcome: Some(&result),
             full_output: Some("durable full output"),
             usage: None,
             dispatch_hook: true,
@@ -5009,15 +5011,15 @@ mod tests {
 
         assert_eq!(store.recover_incomplete()?, 1);
         assert_eq!(
-            store.recoverable_subagent_result_for_attempt(
+            store.recoverable_subagent_outcome_for_attempt(
                 "r1",
                 "t1",
                 &execution_id,
                 claim.revision,
                 claim.attempt,
             )?,
-            Some(RecoverableSubagentResult {
-                result,
+            Some(RecoverableSubagentOutcome {
+                outcome: result,
                 full_output: "durable full output".to_string(),
             })
         );
@@ -5589,8 +5591,8 @@ mod tests {
             run_id: "r1".to_string(),
             task_id: "t1".to_string(),
             subagent_name: "subagent".to_string(),
-            result: SubagentTaskResult::terminal(
-                SubagentRunStatus::Completed,
+            outcome: SubagentOutcome::terminal(
+                SubagentStatus::Completed,
                 "new physical claim result",
                 Vec::new(),
             ),
@@ -5627,8 +5629,8 @@ mod tests {
             echo_agent::tasks::RuntimeTaskResolution::Completed
         );
         let stale_summary = TaskExecutionSummary {
-            result: SubagentTaskResult::terminal(
-                SubagentRunStatus::Completed,
+            outcome: SubagentOutcome::terminal(
+                SubagentStatus::Completed,
                 "stale physical claim result",
                 Vec::new(),
             ),
@@ -5665,7 +5667,7 @@ mod tests {
             store
                 .get_summary("r1", "t1")?
                 .ok_or_else(|| StoreError::TaskNotFound("t1 summary".to_string()))?
-                .result
+                .outcome
                 .summary,
             "new physical claim result"
         );
@@ -5834,8 +5836,8 @@ mod tests {
             true,
             true,
         )?;
-        let stale_result = SubagentTaskResult::terminal(
-            SubagentRunStatus::Completed,
+        let stale_result = SubagentOutcome::terminal(
+            SubagentStatus::Completed,
             "late result from old physical claim",
             Vec::new(),
         );
@@ -5848,7 +5850,7 @@ mod tests {
             plan_revision: old_claim.revision,
             attempt: old_claim.attempt,
             status: "completed",
-            result: Some(&stale_result),
+            outcome: Some(&stale_result),
             full_output: Some("late result from old physical claim"),
             usage: None,
             dispatch_hook: true,
@@ -5856,7 +5858,7 @@ mod tests {
 
         assert!(
             store
-                .recoverable_subagent_result_for_attempt(
+                .recoverable_subagent_outcome_for_attempt(
                     "r1",
                     "t1",
                     &new_execution_id,
@@ -5867,7 +5869,7 @@ mod tests {
         );
         assert!(
             store
-                .recoverable_subagent_result_for_attempt(
+                .recoverable_subagent_outcome_for_attempt(
                     "r1",
                     "t1",
                     &old_execution_id,
@@ -5889,7 +5891,7 @@ mod tests {
             .tasks
             .first()
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?
-            .to_task()
+            .try_into()
             .map_err(StoreError::InvalidPlan)?;
         store.apply_task_patch_for_test(
             "r1",
@@ -5930,7 +5932,7 @@ mod tests {
             .tasks
             .first()
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?
-            .to_task()
+            .try_into()
             .map_err(StoreError::InvalidPlan)?;
         let claim = match store.claim_runtime_task("r1", &expected, 1)? {
             echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
@@ -5982,7 +5984,8 @@ mod tests {
             .first()
             .cloned()
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
-        let original_runtime = original.to_task().map_err(StoreError::InvalidPlan)?;
+        let original_runtime = echo_agent::tasks::Task::try_from(&original)
+            .map_err(StoreError::InvalidPlan)?;
         let old_claim = echo_agent::tasks::TaskClaim::new(
             1,
             1,
@@ -5992,8 +5995,8 @@ mod tests {
                 .map_err(StoreError::InvalidPlan)?,
         );
         let old_execution_id = old_claim.execution_id("r1", &original.id);
-        let durable_result = SubagentTaskResult::terminal(
-            SubagentRunStatus::Completed,
+        let durable_result = SubagentOutcome::terminal(
+            SubagentStatus::Completed,
             "old spec result",
             Vec::new(),
         );
@@ -6017,7 +6020,7 @@ mod tests {
             plan_revision: old_claim.revision,
             attempt: old_claim.attempt,
             status: "completed",
-            result: Some(&durable_result),
+            outcome: Some(&durable_result),
             full_output: Some("old spec full output"),
             usage: None,
             dispatch_hook: true,
@@ -6049,7 +6052,8 @@ mod tests {
             .cloned()
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
         assert_eq!(patched_task.retry_count, 0);
-        let patched_runtime = patched_task.to_task().map_err(StoreError::InvalidPlan)?;
+        let patched_runtime = echo_agent::tasks::Task::try_from(&patched_task)
+            .map_err(StoreError::InvalidPlan)?;
         let new_claim = match store.claim_runtime_task("r1", &patched_runtime, patched.revision)? {
             echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
             echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
@@ -6064,7 +6068,7 @@ mod tests {
         assert_ne!(old_claim.spec_hash, new_claim.spec_hash);
         assert!(
             store
-                .recoverable_subagent_result_for_attempt(
+                .recoverable_subagent_outcome_for_attempt(
                     "r1",
                     "t1",
                     &old_execution_id,
@@ -6075,7 +6079,7 @@ mod tests {
         );
         assert!(
             store
-                .recoverable_subagent_result_for_attempt(
+                .recoverable_subagent_outcome_for_attempt(
                     "r1",
                     "t1",
                     &new_execution_id,
@@ -6150,8 +6154,8 @@ mod tests {
                 run_id: "r1".to_string(),
                 task_id: task_id.to_string(),
                 subagent_name: "explorer".to_string(),
-                result: SubagentTaskResult::terminal(
-                    SubagentRunStatus::Completed,
+                outcome: SubagentOutcome::terminal(
+                    SubagentStatus::Completed,
                     "verified task result",
                     Vec::new(),
                 ),
@@ -8255,8 +8259,8 @@ mod tests {
             run_id: run_id.to_string(),
             task_id: task_id.to_string(),
             subagent_name: "primary-agent".to_string(),
-            result: SubagentTaskResult::terminal(
-                SubagentRunStatus::Completed,
+            outcome: SubagentOutcome::terminal(
+                SubagentStatus::Completed,
                 "complete answer",
                 Vec::new(),
             ),
@@ -8266,7 +8270,7 @@ mod tests {
             created_at: Utc::now(),
         };
         store.fail_next_runtime_mutation_projection_for_test();
-        super::super::revisioned_adapter::commit_eko_direct_completion(
+        super::super::revisioned_runtime::commit_direct_completion(
             store.clone(),
             plan,
             summary,

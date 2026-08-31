@@ -1,27 +1,15 @@
 ---
 name: pdf
 description: PDF 文档创建、编辑、提取和表单处理
+allowed-tools: shell read_file read_artifact apply_patch
 metadata:
   category: document
   source: anthropic
-  upstream-version: "1.0"
+  upstream-version: '1.0'
   author: anthropic
-  tags: [pdf, document]
-  requires-binaries: "soffice, pdftoppm"
-  requires-python-packages: "pypdf, Pillow"
-triggers:
-  - PDF
-  - pdf
-  - 导出PDF
-  - .pdf
-allowed-tools: [shell, read_file, read_artifact, apply_patch]
-hooks:
-  UserPromptSubmit:
-    - matcher: "\\.pdf"
-      hooks:
-        - type: activate_skill
-          skill: pdf
-          reason: 检测到 .pdf 文件路径
+  tags: pdf, document
+  requires-binaries: soffice, pdftoppm
+  requires-python-packages: pypdf, Pillow
 ---
 # PDF Skill
 

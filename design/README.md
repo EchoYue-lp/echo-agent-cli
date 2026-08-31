@@ -8,7 +8,6 @@
 当前活跃规格：
 
 - [runtime reliability](./specs/runtime-reliability.md)
-- [long-horizon runtime closure](./specs/long-horizon-runtime-closure.md)
 - [surface parity cleanup](./specs/surface-parity.md)
 
 规格完成后，先把稳定事实合并到 `docs/` 或代码注释，再删除规格。阶段 review diff、

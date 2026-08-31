@@ -20,8 +20,8 @@ use super::run_authority::RuntimeJournalEvent;
 use super::types::{
     ActiveSubagentBoundary, ActiveToolBoundary, Artifact, ArtifactKind, AttendedMode,
     BackgroundCellArtifactStatus, BackgroundCellPhase, BackgroundCellState,
-    BackgroundCellTerminalCause, BlockerAudit, DomainProfile, EkoTaskExecution, ExecutionMode,
-    PlanRevision, PlanTask, ProviderRetryState, RecoveryBlocker, ReviewOutcome, ReviewResult,
+    BackgroundCellTerminalCause, BlockerAudit, DomainProfile, ExecutionMode, PlanRevision,
+    PlanTask, ProviderRetryState, RecoveryBlocker, ReviewOutcome, ReviewResult,
     RunContinuationState, RunPause, RunPauseReason, RunStateEventIndex, RunStateSnapshot,
     RunTurnOrigin, RunTurnStatus, RunTurnSummary, RuntimeEventKind, RuntimeTaskEvent,
     TaskExecutionSummary, TaskPlan, TaskRun, TaskRunStatus, TurnVisibility,
@@ -521,7 +521,9 @@ impl EventFoldState {
                                 let execution = previous_execution
                                     .get(&spec.id)
                                     .cloned()
-                                    .unwrap_or_else(|| EkoTaskExecution::pending(spec.id.clone()));
+                                    .unwrap_or_else(|| {
+                                        echo_agent::tasks::TaskExecution::pending(spec.id.clone())
+                                    });
                                 PlanTask::from_parts(spec, execution)
                             })
                             .collect();

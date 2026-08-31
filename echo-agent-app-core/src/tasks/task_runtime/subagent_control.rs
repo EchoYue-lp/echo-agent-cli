@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use echo_agent::agent::subagent::{
+use echo_agent::subagent::{
     SubagentAttemptIdentity, SubagentControlPhase as FrameworkSubagentControlPhase,
     SubagentExecutor,
 };
@@ -60,7 +60,7 @@ impl Drop for SubagentControlTargetGuard {
 #[derive(Clone)]
 pub struct SubagentControlService {
     store: Arc<TaskRuntimeStore>,
-    blocking: super::executor::TaskRuntimeBlockingAdapter,
+    blocking: super::executor::TaskRuntimeOperation,
     #[cfg(test)]
     command_test_barrier: Option<Arc<SubagentControlTestBarrier>>,
     #[cfg(test)]
@@ -78,7 +78,7 @@ struct SubagentControlTestBarrier {
 impl SubagentControlService {
     pub fn new(store: Arc<TaskRuntimeStore>) -> Self {
         Self {
-            blocking: super::executor::TaskRuntimeBlockingAdapter::new(store.clone()),
+            blocking: super::executor::TaskRuntimeOperation::new(store.clone()),
             store,
             #[cfg(test)]
             command_test_barrier: None,
@@ -477,7 +477,7 @@ impl SubagentControlService {
         &self,
         identity: SubagentControlIdentity,
         actor_source: SubagentControlActorSource,
-        receipt: echo_agent::agent::subagent::SubagentMessageReceipt,
+        receipt: echo_agent::subagent::SubagentMessageReceipt,
         reservation: super::executor::TaskRuntimeSettlementReservation,
         accepted_tx: tokio::sync::oneshot::Sender<Result<(), StoreError>>,
     ) {
@@ -1448,7 +1448,7 @@ fn validate_guidance_transition(
 }
 
 async fn persist_guidance_transition(
-    blocking: &super::executor::TaskRuntimeBlockingAdapter,
+    blocking: &super::executor::TaskRuntimeOperation,
     identity: SubagentControlIdentity,
     event_type: RuntimeEventKind,
     kind: SubagentGuidanceKind,
@@ -1917,17 +1917,6 @@ fn framework_outcome_name(outcome: echo_agent::agent::AgentSteerTurnOutcome) -> 
     }
 }
 
-fn framework_identity(
-    identity: &SubagentControlIdentity,
-) -> Result<SubagentAttemptIdentity, StoreError> {
-    SubagentAttemptIdentity::new(
-        identity.task_id.clone(),
-        identity.execution_id.clone(),
-        identity.attempt,
-    )
-    .map_err(|error| StoreError::InvalidPlan(error.to_string()))
-}
-
 pub(crate) fn attempt_identity(
     run_id: &str,
     task_id: &str,
@@ -1943,7 +1932,9 @@ pub(crate) fn attempt_identity(
         attempt,
         command_id: String::new(),
     };
-    let framework = framework_identity(&identity)?;
+    let framework =
+        SubagentAttemptIdentity::new(task_id.to_string(), execution_id.to_string(), attempt)
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
     Ok((identity, framework))
 }
 
@@ -2270,8 +2261,8 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
         let executor = SubagentExecutor::new(
-            Arc::new(echo_agent::agent::subagent::SubagentRegistry::new()),
-            echo_agent::agent::subagent::SubagentExecutorConfig::default(),
+            Arc::new(echo_agent::subagent::SubagentRegistry::new()),
+            echo_agent::subagent::SubagentExecutorConfig::default(),
         );
         let target = SubagentControlIdentity {
             execution_id: "run-delivery:task-1:1:1:claim".to_string(),
@@ -2389,13 +2380,13 @@ mod tests {
     async fn active_message_receipt_tracks_mailbox_drain_and_turn_settlement() -> Result<(), String>
     {
         use echo_agent::agent::CancellationToken;
-        use echo_agent::agent::subagent::{
+        use echo_agent::subagent::{
             DispatchRequest, ExecutionMode as FrameworkExecutionMode, SubagentDefinition,
             SubagentStatus,
         };
 
         let store = store_with_plan("run-live-message", &["task-1"])?;
-        let registry = Arc::new(echo_agent::agent::subagent::SubagentRegistry::new());
+        let registry = Arc::new(echo_agent::subagent::SubagentRegistry::new());
         let guidance_settle = Arc::new(tokio::sync::Notify::new());
         registry
             .register(
@@ -2408,7 +2399,7 @@ mod tests {
             .await;
         let executor = Arc::new(SubagentExecutor::new(
             registry,
-            echo_agent::agent::subagent::SubagentExecutorConfig::default(),
+            echo_agent::subagent::SubagentExecutorConfig::default(),
         ));
         let execution_id = "run-live-message:task-1:1:1:claim-1";
         let (_control_identity, framework_identity) =
@@ -2441,6 +2432,7 @@ mod tests {
                     runtime_context: None,
                     message: None,
                     prompt_payload: None,
+                    prompt_context: None,
                     constraints: Vec::new(),
                     background: false,
                 },
@@ -2577,13 +2569,13 @@ mod tests {
     #[tokio::test]
     async fn reservation_failure_rejects_before_framework_effect() -> Result<(), String> {
         use echo_agent::agent::CancellationToken;
-        use echo_agent::agent::subagent::{
+        use echo_agent::subagent::{
             DispatchRequest, ExecutionMode as FrameworkExecutionMode, SubagentDefinition,
         };
 
         let store = store_with_plan("run-reservation-failure", &["task-1"])?;
         let steer_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let registry = Arc::new(echo_agent::agent::subagent::SubagentRegistry::new());
+        let registry = Arc::new(echo_agent::subagent::SubagentRegistry::new());
         registry
             .register(
                 SubagentDefinition::new("slow", "Slow Subagent"),
@@ -2595,7 +2587,7 @@ mod tests {
             .await;
         let executor = Arc::new(SubagentExecutor::new(
             registry,
-            echo_agent::agent::subagent::SubagentExecutorConfig::default(),
+            echo_agent::subagent::SubagentExecutorConfig::default(),
         ));
         let execution_id = "run-reservation-failure:task-1:1:1:claim-1";
         let (_, framework_identity) =
@@ -2628,6 +2620,7 @@ mod tests {
                     runtime_context: None,
                     message: None,
                     prompt_payload: None,
+                    prompt_context: None,
                     constraints: Vec::new(),
                     background: false,
                 },
@@ -2971,7 +2964,7 @@ mod tests {
                 plan_revision: 1,
                 attempt: 1,
                 status: "completed",
-                result: None,
+                outcome: None,
                 full_output: None,
                 usage: None,
                 dispatch_hook: false,
@@ -3096,7 +3089,7 @@ mod tests {
                 plan_revision: 1,
                 attempt: 1,
                 status: "completed",
-                result: None,
+                outcome: None,
                 full_output: None,
                 usage: None,
                 dispatch_hook: false,
@@ -3173,14 +3166,14 @@ mod tests {
     #[tokio::test]
     async fn exact_interrupt_routes_once_and_settles_durably() -> Result<(), String> {
         use echo_agent::agent::CancellationToken;
-        use echo_agent::agent::subagent::{
+        use echo_agent::subagent::{
             DispatchRequest, ExecutionMode as FrameworkExecutionMode, SubagentDefinition,
             SubagentStatus,
         };
         use echo_agent::testing::MockAgent;
 
         let store = store_with_plan("run-interrupt", &["task-1"])?;
-        let registry = Arc::new(echo_agent::agent::subagent::SubagentRegistry::new());
+        let registry = Arc::new(echo_agent::subagent::SubagentRegistry::new());
         registry
             .register(
                 SubagentDefinition::new("slow", "Slow Subagent"),
@@ -3193,7 +3186,7 @@ mod tests {
             .await;
         let executor = Arc::new(SubagentExecutor::new(
             registry,
-            echo_agent::agent::subagent::SubagentExecutorConfig::default(),
+            echo_agent::subagent::SubagentExecutorConfig::default(),
         ));
         let execution_id = "run-interrupt:task-1:1:1:claim-1";
         let (_control_identity, framework_identity) =
@@ -3226,6 +3219,7 @@ mod tests {
                     runtime_context: None,
                     message: None,
                     prompt_payload: None,
+                    prompt_context: None,
                     constraints: Vec::new(),
                     background: false,
                 },
@@ -3284,14 +3278,14 @@ mod tests {
     async fn caller_abort_cannot_leave_interrupt_requested_without_settlement() -> Result<(), String>
     {
         use echo_agent::agent::CancellationToken;
-        use echo_agent::agent::subagent::{
+        use echo_agent::subagent::{
             DispatchRequest, ExecutionMode as FrameworkExecutionMode, SubagentDefinition,
             SubagentStatus,
         };
         use echo_agent::testing::MockAgent;
 
         let store = store_with_plan("run-abort-interrupt", &["task-1"])?;
-        let registry = Arc::new(echo_agent::agent::subagent::SubagentRegistry::new());
+        let registry = Arc::new(echo_agent::subagent::SubagentRegistry::new());
         registry
             .register(
                 SubagentDefinition::new("slow", "Slow Subagent"),
@@ -3304,7 +3298,7 @@ mod tests {
             .await;
         let executor = Arc::new(SubagentExecutor::new(
             registry,
-            echo_agent::agent::subagent::SubagentExecutorConfig::default(),
+            echo_agent::subagent::SubagentExecutorConfig::default(),
         ));
         let execution_id = "run-abort-interrupt:task-1:1:1:claim-1";
         let (_, framework_identity) =
@@ -3337,6 +3331,7 @@ mod tests {
                     runtime_context: None,
                     message: None,
                     prompt_payload: None,
+                    prompt_context: None,
                     constraints: Vec::new(),
                     background: false,
                 },

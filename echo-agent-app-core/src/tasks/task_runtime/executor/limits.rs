@@ -36,7 +36,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use echo_agent::agent::subagent::{ContextTransferPolicy, SubagentPromptInput};
+use echo_agent::subagent::{ContextTransferPolicy, SubagentInvocation};
 use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
 use echo_agent::runtime::{
     AgentTurnDriver, EventSink, SinkControl, TurnMode, TurnOutcome, TurnReceipt, TurnRequest,
@@ -71,10 +71,6 @@ pub(crate) fn process_execution_governor() -> Arc<ProcessExecutionGovernor> {
 impl ProcessExecutionGovernor {
     pub(crate) fn shell_semaphore(&self) -> Arc<Semaphore> {
         self.shell.clone()
-    }
-
-    pub(crate) fn subagent_semaphore(&self) -> Arc<Semaphore> {
-        self.subagent.clone()
     }
 
     fn snapshot(&self) -> ProcessExecutionResourceSnapshot {
@@ -281,13 +277,13 @@ fn subagent_execution_id(
     claim.execution_id(run_id, task_id)
 }
 
-fn subagent_terminal_event(status: SubagentRunStatus) -> RuntimeEventKind {
+fn subagent_terminal_event(status: SubagentStatus) -> RuntimeEventKind {
     match status {
-        SubagentRunStatus::Running => RuntimeEventKind::Running,
-        SubagentRunStatus::Completed => RuntimeEventKind::Completed,
-        SubagentRunStatus::Failed => RuntimeEventKind::Failed,
-        SubagentRunStatus::Cancelled => RuntimeEventKind::Cancelled,
-        SubagentRunStatus::TimedOut => RuntimeEventKind::TimedOut,
+        SubagentStatus::Running => RuntimeEventKind::Running,
+        SubagentStatus::Completed => RuntimeEventKind::Completed,
+        SubagentStatus::Failed => RuntimeEventKind::Failed,
+        SubagentStatus::Cancelled => RuntimeEventKind::Cancelled,
+        SubagentStatus::TimedOut => RuntimeEventKind::TimedOut,
     }
 }
 
@@ -345,7 +341,7 @@ pub async fn launch_planned_run_resume(
     let admission = store.reserve_run_driver_admission(run_id.clone(), cancel.clone())?;
     let generation_lease = store.lease_active_workspace_generation()?;
     let registration = store.register_run_driver::<RunOutcome>(admission, generation_lease)?;
-    TaskRuntimeBlockingAdapter::new(store.clone())
+    TaskRuntimeOperation::new(store.clone())
         .run_owned("prepare exact planned resume", move || {
             let mut registration = registration;
             let memory_generation = match review_integration

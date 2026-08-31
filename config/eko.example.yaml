@@ -9,10 +9,6 @@
 # CLI/TUI/GUI 会读取同一份 default_model_id。
 model:
   default_model_id: "deepseek:deepseek-v4-flash"
-  provider: "deepseek"        # 运行时镜像字段，由模型供应商配置同步
-  name: "deepseek-v4-flash"   # 运行时镜像字段，不建议手动编辑
-  max_tokens: 8192
-  temperature: 0.7
 
 model_providers:
   deepseek:
@@ -41,7 +37,7 @@ agent:
   enable_tools: true          # 启用工具调用
   enable_memory: true         # 启用记忆
   enable_human_in_loop: true  # 启用人工介入
-  memory_path: "~/.echo-agent/memory"  # 记忆存储路径
+  memory_path: "~/.eko/store.json"  # 记忆存储路径
   tool_timeout_ms: 120000     # 单次工具调用超时（毫秒）
   max_tool_output_tokens: 8000 # 单个工具结果进入模型上下文的 Token 上限
   token_limit: 0              # 0 = 使用模型上下文窗口或应用默认值
@@ -52,7 +48,7 @@ agent:
 mcp:
   # MCP 配置文件路径（支持 mcp.json）
   # 如果不指定，会按顺序搜索：
-  #   ./mcp.json → ./.echo-agent/mcp.json → ~/.echo-agent/mcp.json
+  #   ./mcp.json → ~/.eko/mcp.json
   # config_path: "mcp.json"
 
 # ── IM 通道配置 ─────────────────────────────────────────────────────

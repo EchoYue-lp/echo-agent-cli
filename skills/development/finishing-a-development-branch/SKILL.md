@@ -1,19 +1,13 @@
 ---
 name: finishing-a-development-branch
 description: 实施完成后整理分支——合并、PR 或清理
+allowed-tools: shell read_file read_artifact git_*
 metadata:
   category: development
   source: superpowers
-  upstream-version: "6.0.3"
+  upstream-version: 6.0.3
   author: obra
-  tags: [git, merge, cleanup]
-triggers:
-  - 完成开发
-  - 合并分支
-  - finish branch
-  - PR
-  - 清理分支
-allowed-tools: [shell, read_file, read_artifact, git_*]
+  tags: git, merge, cleanup
 ---
 
 # Finishing a Development Branch

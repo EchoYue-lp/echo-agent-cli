@@ -1,37 +1,11 @@
 ---
 name: data-wrangling
-description: >-
-  数据加载、清洗与探索性分析。当用户需要加载 CSV/Excel/JSON 等数据文件、
-  检查数据质量、处理缺失值、进行探索性数据分析 (EDA) 时激活。
-triggers:
-  - 加载数据
-  - 读取CSV
-  - 读取Excel
-  - 数据清洗
-  - 缺失值处理
-  - EDA
-  - 探索性分析
-  - 数据预处理
-  - data wrangling
-  - data cleaning
-  - dataframe
-  - 数据质量
-allowed-tools:
-  - "shell"
-  - "run_code"
-  - "read_file"
-  - "read_artifact"
-  - "apply_patch"
-  - "excel_info"
-  - "read_excel"
-  - "excel_profile"
-  - "excel_to_csv"
-  - "write_excel"
-  - "generate_chart"
+description: 数据加载、清洗与探索性分析。当用户需要加载 CSV/Excel/JSON 等数据文件、 检查数据质量、处理缺失值、进行探索性数据分析 (EDA) 时激活。
+allowed-tools: shell run_code read_file read_artifact apply_patch excel_info read_excel excel_profile excel_to_csv write_excel generate_chart
 metadata:
   author: echo-agent-cli
-  version: "1.0.0"
-  tags: "data, cleaning, EDA, wrangling, quality"
+  version: 1.0.0
+  tags: data, cleaning, EDA, wrangling, quality
 ---
 
 ## 数据加载、清洗与探索性分析

@@ -1,30 +1,15 @@
 ---
 name: docx
 description: Word 文档创建、编辑、批注和修订标记
+allowed-tools: shell read_file read_artifact apply_patch
 metadata:
   category: document
   source: anthropic
-  upstream-version: "1.0"
+  upstream-version: '1.0'
   author: anthropic
-  tags: [word, document, office]
-  requires-binaries: "soffice"
-  requires-python-packages: "defusedxml, lxml"
-triggers:
-  - Word
-  - docx
-  - 修订
-  - 批注
-  - 公文
-  - word 文档
-  - .docx
-allowed-tools: [shell, read_file, read_artifact, apply_patch]
-hooks:
-  UserPromptSubmit:
-    - matcher: "\\.docx"
-      hooks:
-        - type: activate_skill
-          skill: docx
-          reason: 检测到 .docx 文件路径
+  tags: word, document, office
+  requires-binaries: soffice
+  requires-python-packages: defusedxml, lxml
 ---
 # DOCX Skill
 

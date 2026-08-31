@@ -77,21 +77,21 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
       );
       break;
     }
-    case 'awaiter_result_ready': {
+    case 'command_cell_watch_ready': {
       const result = payload.event.result;
       handleChatEvent(
         {
           type: 'notice',
           level: result.cell.phase === 'succeeded' ? 'info' : 'warning',
-          code: 'awaiter_result_ready',
-          message: `Awaiter ${result.receipt.execution_id}: cell ${result.cell.cell_id} ${result.cell.phase}`,
+          code: 'command_cell_watch_ready',
+          message: `Command cell watch ${result.receipt.execution_id}: cell ${result.cell.cell_id} ${result.cell.phase}`,
         },
         ctx
       );
       break;
     }
-    case 'awaiter_result_delivery_started':
-    case 'awaiter_result_acknowledged':
+    case 'command_cell_watch_delivery_started':
+    case 'command_cell_watch_acknowledged':
       break;
     case 'execution':
       // The exact payload remains in the durable envelope. The dedicated

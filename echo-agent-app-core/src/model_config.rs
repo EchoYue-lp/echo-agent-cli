@@ -1,52 +1,12 @@
 use crate::config::{ConfiguredModel, EkoConfig, ModelProviderConfig};
-use echo_agent::llm::core::capabilities::{
-    ThinkingProfile, infer_context_window, resolve_thinking_profile,
+use echo_agent::llm::{
+    LlmApiProtocol, ModelInputModality, ThinkingProfile, infer_context_window,
+    resolve_protocol_endpoint, resolve_thinking_profile,
 };
-use echo_agent::llm::{LlmApiProtocol, ModelInputModality, resolve_protocol_endpoint};
 use serde::Serialize;
 use ts_rs::TS;
 
 const DEFAULT_CONTEXT_WINDOW: u32 = 396_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export, rename = "LlmApiProtocol")]
-pub enum LlmApiProtocolWire {
-    ChatCompletions,
-    Responses,
-    Anthropic,
-}
-
-impl From<LlmApiProtocol> for LlmApiProtocolWire {
-    fn from(protocol: LlmApiProtocol) -> Self {
-        match protocol {
-            LlmApiProtocol::ChatCompletions => Self::ChatCompletions,
-            LlmApiProtocol::Responses => Self::Responses,
-            LlmApiProtocol::Anthropic => Self::Anthropic,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export, rename = "ModelInputModality")]
-pub enum ModelInputModalityWire {
-    Text,
-    Image,
-    Audio,
-    Video,
-}
-
-impl From<ModelInputModality> for ModelInputModalityWire {
-    fn from(modality: ModelInputModality) -> Self {
-        match modality {
-            ModelInputModality::Text => Self::Text,
-            ModelInputModality::Image => Self::Image,
-            ModelInputModality::Audio => Self::Audio,
-            ModelInputModality::Video => Self::Video,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export)]
@@ -56,7 +16,8 @@ pub struct ModelProviderView {
     pub base_url: String,
     pub api_key_env: Option<String>,
     pub requires_api_key: bool,
-    pub default_api_protocol: LlmApiProtocolWire,
+    #[ts(type = "LlmApiProtocol")]
+    pub default_api_protocol: LlmApiProtocol,
     pub has_auth_token: bool,
     pub auth_source: String,
     pub model_count: usize,
@@ -69,8 +30,10 @@ pub struct ConfiguredModelView {
     pub display_name: String,
     pub provider: String,
     pub model: String,
-    pub api_protocol: LlmApiProtocolWire,
-    pub input_modalities: Vec<ModelInputModalityWire>,
+    #[ts(type = "LlmApiProtocol")]
+    pub api_protocol: LlmApiProtocol,
+    #[ts(type = "Array<ModelInputModality>")]
+    pub input_modalities: Vec<ModelInputModality>,
     /// Effective manual choices. `auto` is always implicit and is not repeated.
     pub thinking_levels: Vec<String>,
     pub enabled: bool,
@@ -183,8 +146,7 @@ pub fn configured_provider_views(config: &EkoConfig) -> Vec<ModelProviderView> {
                 requires_api_key: provider.requires_api_key,
                 default_api_protocol: provider
                     .default_api_protocol
-                    .unwrap_or(LlmApiProtocol::ChatCompletions)
-                    .into(),
+                    .unwrap_or(LlmApiProtocol::ChatCompletions),
                 has_auth_token: has_config_token || env_token.is_some(),
                 auth_source: if has_config_token {
                     "config".to_string()
@@ -213,19 +175,14 @@ pub fn configured_model_views(config: &EkoConfig) -> Vec<ConfiguredModelView> {
         .configured_models
         .iter()
         .map(|model| {
-            let runtime = resolve_runtime_model(config, Some(&model.id));
+            let runtime = runtime_from_configured_model(config, model);
             ConfiguredModelView {
                 id: model.id.clone(),
                 display_name: model.display_name.clone(),
                 provider: model.provider.clone(),
                 model: model.model.clone(),
-                api_protocol: runtime.api_protocol.into(),
-                input_modalities: model
-                    .input_modalities
-                    .iter()
-                    .copied()
-                    .map(Into::into)
-                    .collect(),
+                api_protocol: runtime.api_protocol,
+                input_modalities: model.input_modalities.clone(),
                 thinking_levels: thinking_level_specs(runtime.thinking_profile),
                 enabled: model.enabled,
                 is_default: Some(model.id.as_str()) == default_id.as_deref(),
@@ -374,12 +331,13 @@ pub fn upsert_configured_model(
     }
 
     let id = model.id.clone();
+    let can_be_default = model.enabled;
     if let Some(existing) = config.configured_models.iter_mut().find(|m| m.id == id) {
         *existing = model;
     } else {
         config.configured_models.push(model);
     }
-    if config.model.default_model_id.is_none() {
+    if config.model.default_model_id.is_none() && can_be_default {
         config.model.default_model_id = Some(id.clone());
     }
     Ok(id)
@@ -397,17 +355,7 @@ pub fn set_default_model(
         .ok_or_else(|| format!("Model '{model_id}' is not configured or is disabled"))?;
 
     config.model.default_model_id = Some(model.id.clone());
-    config.model.provider = model.provider.clone();
-    config.model.name = model.model.clone();
-    config.model.api_protocol = Some(model.api_protocol);
-    config.model.temperature = model.temperature;
-    config.model.max_tokens = model.max_tokens;
-    config.model.context_window = model.context_window;
-    let provider_config = config.model_providers.get(&model.provider);
-    config.model.auth_token = provider_config.and_then(|provider| provider.auth_token.clone());
-    config.model.base_url = provider_config.and_then(|provider| provider.base_url.clone());
-
-    Ok(resolve_runtime_model(config, Some(model_id)))
+    Ok(runtime_from_configured_model(config, &model))
 }
 
 /// Build the non-persistent configuration used by agents created later in the
@@ -471,92 +419,15 @@ pub fn delete_configured_model(
 
 pub(crate) fn clear_selected_model(config: &mut EkoConfig) {
     config.model.default_model_id = None;
-    config.model.provider.clear();
-    config.model.name.clear();
-    config.model.auth_token = None;
-    config.model.base_url = None;
-    config.model.api_protocol = None;
-    config.model.max_tokens = None;
-    config.model.temperature = None;
-    config.model.context_window = None;
 }
 
-pub fn resolve_runtime_model(config: &EkoConfig, model_id: Option<&str>) -> ModelRuntimeConfig {
-    let selected = model_id
-        .and_then(|id| config.configured_models.iter().find(|model| model.id == id))
-        .or_else(|| {
-            config
-                .model
-                .default_model_id
-                .as_deref()
-                .and_then(|id| config.configured_models.iter().find(|model| model.id == id))
-        })
-        .or_else(|| config.configured_models.iter().find(|model| model.enabled));
-
-    let fallback_id = config
-        .model
-        .default_model_id
-        .clone()
-        .unwrap_or_else(|| stable_model_id(&config.model.provider, &config.model.name));
-
-    let (
-        id,
-        display_name,
-        provider,
-        model,
-        api_protocol,
-        input_modalities,
-        temperature,
-        max_tokens,
-        context_window,
-    ) = if let Some(selected) = selected {
-        (
-            selected.id.clone(),
-            selected.display_name.clone(),
-            selected.provider.clone(),
-            selected.model.clone(),
-            selected.api_protocol,
-            selected.input_modalities.clone(),
-            selected.temperature,
-            selected.max_tokens,
-            Some(effective_context_window(selected)),
-        )
-    } else {
-        (
-            fallback_id,
-            display_name_from_model(&config.model.name),
-            config.model.provider.clone(),
-            config.model.name.clone(),
-            config
-                .model
-                .api_protocol
-                .unwrap_or(LlmApiProtocol::ChatCompletions),
-            ModelInputModality::text_only(),
-            config.model.temperature,
-            config.model.max_tokens,
-            Some({
-                let context_window = config
-                    .model
-                    .context_window
-                    .or_else(|| infer_context_window(&config.model.provider, &config.model.name))
-                    .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-                if context_window == 0 {
-                    0
-                } else {
-                    context_window.min(10_000_000)
-                }
-            }),
-        )
-    };
-
-    let provider_config = config.model_providers.get(&provider);
+fn runtime_from_configured_model(
+    config: &EkoConfig,
+    selected: &ConfiguredModel,
+) -> ModelRuntimeConfig {
+    let provider_config = config.model_providers.get(&selected.provider);
     let config_token = provider_config
-        .and_then(|p| p.auth_token.clone())
-        .or_else(|| {
-            (provider == config.model.provider)
-                .then(|| config.model.auth_token.clone())
-                .flatten()
-        })
+        .and_then(|provider| provider.auth_token.clone())
         .filter(|token| !token.is_empty());
     let (auth_token, auth_source) = if let Some(token) = config_token {
         (Some(token), "config".to_string())
@@ -567,47 +438,53 @@ pub fn resolve_runtime_model(config: &EkoConfig, model_id: Option<&str>) -> Mode
     };
 
     let base_url = provider_config
-        .and_then(|p| p.base_url.clone())
-        .or_else(|| {
-            (provider == config.model.provider)
-                .then(|| config.model.base_url.clone())
-                .flatten()
-        })
+        .and_then(|provider| provider.base_url.clone())
         .filter(|url| !url.trim().is_empty());
-    let thinking_profile =
-        resolve_thinking_profile(&provider, &model, api_protocol, base_url.as_deref());
+    let thinking_profile = resolve_thinking_profile(
+        &selected.provider,
+        &selected.model,
+        selected.api_protocol,
+        base_url.as_deref(),
+    );
     ModelRuntimeConfig {
-        id,
-        display_name,
-        provider,
-        model,
-        api_protocol,
-        input_modalities,
+        id: selected.id.clone(),
+        display_name: selected.display_name.clone(),
+        provider: selected.provider.clone(),
+        model: selected.model.clone(),
+        api_protocol: selected.api_protocol,
+        input_modalities: selected.input_modalities.clone(),
         thinking_profile,
         auth_token,
         auth_source,
         base_url,
         api_key_env: provider_config.and_then(|provider| provider.api_key_env.clone()),
         requires_api_key: provider_config.is_some_and(|provider| provider.requires_api_key),
-        temperature,
-        max_tokens,
-        context_window,
+        temperature: selected.temperature,
+        max_tokens: selected.max_tokens,
+        context_window: Some(effective_context_window(selected)),
     }
 }
 
 /// Resolve a CLI/TUI model selector without splitting model identity from its
 /// provider credentials, endpoint, and protocol.
-pub fn resolve_runtime_model_selector(
+pub fn resolve_runtime_model(
     config: &EkoConfig,
     selector: Option<&str>,
 ) -> Result<ModelRuntimeConfig, ModelSelectionError> {
     let Some(selector) = selector.map(str::trim).filter(|value| !value.is_empty()) else {
-        return config
-            .configured_models
-            .iter()
-            .any(|model| model.enabled)
-            .then(|| resolve_runtime_model(config, config.model.default_model_id.as_deref()))
-            .ok_or(ModelSelectionError::NotConfigured);
+        let selected = config
+            .model
+            .default_model_id
+            .as_deref()
+            .and_then(|id| {
+                config
+                    .configured_models
+                    .iter()
+                    .find(|model| model.enabled && model.id == id)
+            })
+            .or_else(|| config.configured_models.iter().find(|model| model.enabled))
+            .ok_or(ModelSelectionError::NotConfigured)?;
+        return Ok(runtime_from_configured_model(config, selected));
     };
 
     if let Some(selected) = config
@@ -620,7 +497,7 @@ pub fn resolve_runtime_model_selector(
                 selector: selector.to_string(),
             });
         }
-        return Ok(resolve_runtime_model(config, Some(&selected.id)));
+        return Ok(runtime_from_configured_model(config, selected));
     }
 
     let mut matches = config
@@ -648,7 +525,7 @@ pub fn resolve_runtime_model_selector(
         });
     }
 
-    Ok(resolve_runtime_model(config, Some(&selected.id)))
+    Ok(runtime_from_configured_model(config, selected))
 }
 
 /// Validate that the provider root can resolve to the selected model protocol.
@@ -749,6 +626,13 @@ mod tests {
         }
     }
 
+    fn resolve_test_model(
+        config: &EkoConfig,
+        selector: Option<&str>,
+    ) -> Result<ModelRuntimeConfig, String> {
+        resolve_runtime_model(config, selector).map_err(|error| error.to_string())
+    }
+
     #[test]
     fn effective_context_window_prefers_explicit_value() {
         let model = configured_model("anthropic", "claude-4-sonnet", Some(353_000));
@@ -794,14 +678,14 @@ mod tests {
             ..EkoConfig::default()
         };
         config.model.default_model_id = Some("local:a".to_string());
-        let selected = resolve_runtime_model_selector(&config, Some("local:b"))
-            .map_err(|error| error.to_string())?;
+        let selected =
+            resolve_runtime_model(&config, Some("local:b")).map_err(|error| error.to_string())?;
 
         let session = session_config_for_runtime(&config, &selected)?;
 
         assert_eq!(config.model.default_model_id.as_deref(), Some("local:a"));
         assert_eq!(session.model.default_model_id.as_deref(), Some("local:b"));
-        let future = resolve_runtime_model(&session, None);
+        let future = resolve_test_model(&session, None)?;
         assert_eq!(future.model, "b");
         assert_eq!(future.context_window, Some(200_000));
         Ok(())
@@ -828,7 +712,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let runtime = resolve_runtime_model(&config, Some("local:zero"));
+        let runtime = resolve_test_model(&config, Some("local:zero"))?;
 
         assert_eq!(runtime.context_window, Some(0));
         let error = validate_runtime_model_requirements(&runtime)
@@ -863,7 +747,7 @@ mod tests {
                 ..ConfiguredModel::default()
             },
         )?;
-        let runtime = resolve_runtime_model(&config, Some(&model_id));
+        let runtime = resolve_test_model(&config, Some(&model_id))?;
 
         assert_eq!(
             runtime.input_modalities,
@@ -943,8 +827,6 @@ mod tests {
 
         assert!(matches!(outcome, DeleteConfiguredModelOutcome::Deactivated));
         assert!(config.model.default_model_id.is_none());
-        assert!(config.model.provider.is_empty());
-        assert!(config.model.name.is_empty());
         assert!(config.configured_models.is_empty());
         Ok(())
     }
@@ -1022,29 +904,28 @@ mod tests {
         assert!(config.model_providers.is_empty());
         assert!(config.configured_models.is_empty());
         assert!(config.model.default_model_id.is_none());
-        assert!(config.model.name.is_empty());
         Ok(())
     }
 
     #[test]
-    fn successor_without_provider_config_clears_legacy_credentials() -> Result<(), String> {
-        let mut config = EkoConfig::default();
-        config.model.auth_token = Some("old-provider-token".to_string());
-        config.model.base_url = Some("https://old.example/v1/responses".to_string());
-        config.configured_models = vec![
-            ConfiguredModel {
-                id: "old:a".to_string(),
-                provider: "old".to_string(),
-                model: "a".to_string(),
-                ..ConfiguredModel::default()
-            },
-            ConfiguredModel {
-                id: "new:b".to_string(),
-                provider: "new".to_string(),
-                model: "b".to_string(),
-                ..ConfiguredModel::default()
-            },
-        ];
+    fn successor_without_provider_config_has_no_credentials() -> Result<(), String> {
+        let mut config = EkoConfig {
+            configured_models: vec![
+                ConfiguredModel {
+                    id: "old:a".to_string(),
+                    provider: "old".to_string(),
+                    model: "a".to_string(),
+                    ..ConfiguredModel::default()
+                },
+                ConfiguredModel {
+                    id: "new:b".to_string(),
+                    provider: "new".to_string(),
+                    model: "b".to_string(),
+                    ..ConfiguredModel::default()
+                },
+            ],
+            ..EkoConfig::default()
+        };
         config.model.default_model_id = Some("old:a".to_string());
 
         let outcome = delete_configured_model(&mut config, "old:a")?;
@@ -1054,8 +935,6 @@ mod tests {
             DeleteConfiguredModelOutcome::ActivatedSuccessor(ref runtime)
                 if runtime.id == "new:b" && runtime.auth_token.is_none()
         ));
-        assert!(config.model.auth_token.is_none());
-        assert!(config.model.base_url.is_none());
         Ok(())
     }
 
@@ -1074,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_key_policy_is_applied_without_provider_name_inference() {
+    fn provider_key_policy_is_applied_without_provider_name_inference() -> Result<(), String> {
         let mut config = EkoConfig {
             configured_models: vec![ConfiguredModel {
                 id: "gateway:model".to_string(),
@@ -1094,8 +973,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        let runtime = resolve_runtime_model(&config, Some("gateway:model"));
+        let runtime = resolve_test_model(&config, Some("gateway:model"))?;
         assert!(validate_runtime_model_requirements(&runtime).is_err());
+        Ok(())
     }
 
     #[test]
@@ -1116,7 +996,7 @@ mod tests {
             provider,
             Some(ModelProviderView {
                 id,
-                default_api_protocol: LlmApiProtocolWire::Responses,
+                default_api_protocol: LlmApiProtocol::Responses,
                 ..
             }) if id == "my-gateway"
         ));
@@ -1124,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn model_protocol_is_explicit_and_independent_of_provider_name() {
+    fn model_protocol_is_explicit_and_independent_of_provider_name() -> Result<(), String> {
         for provider in ["openai", "anthropic", "custom"] {
             let mut config = EkoConfig::default();
             let model_id = stable_model_id(provider, "model");
@@ -1137,11 +1017,12 @@ mod tests {
             }];
 
             assert_eq!(
-                resolve_runtime_model(&config, Some(&model_id)).api_protocol,
+                resolve_test_model(&config, Some(&model_id))?.api_protocol,
                 LlmApiProtocol::Responses,
                 "unexpected runtime protocol for {provider}"
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -1163,7 +1044,7 @@ mod tests {
             ..ConfiguredModel::default()
         }];
         assert_eq!(
-            resolve_runtime_model(&config, Some("custom:inferred")).api_protocol,
+            resolve_test_model(&config, Some("custom:inferred"))?.api_protocol,
             LlmApiProtocol::Responses
         );
 
@@ -1172,14 +1053,14 @@ mod tests {
             .first_mut()
             .ok_or_else(|| "configured model fixture is missing".to_string())?;
         configured.api_protocol = LlmApiProtocol::Anthropic;
-        let explicit = resolve_runtime_model(&config, Some("custom:inferred"));
+        let explicit = resolve_test_model(&config, Some("custom:inferred"))?;
         assert_eq!(explicit.api_protocol, LlmApiProtocol::Anthropic);
         assert!(validate_runtime_model_endpoint(&explicit).is_ok());
         Ok(())
     }
 
     #[test]
-    fn provider_root_accepts_explicit_responses_protocol() {
+    fn provider_root_accepts_explicit_responses_protocol() -> Result<(), String> {
         let mut config = EkoConfig::default();
         config.model_providers.insert(
             "openai".to_string(),
@@ -1198,7 +1079,7 @@ mod tests {
             ..ConfiguredModel::default()
         }];
 
-        let runtime = resolve_runtime_model(&config, Some("openai:root-only"));
+        let runtime = resolve_test_model(&config, Some("openai:root-only"))?;
         assert_eq!(runtime.api_protocol, LlmApiProtocol::Responses);
         assert!(validate_runtime_model_endpoint(&runtime).is_ok());
 
@@ -1206,13 +1087,14 @@ mod tests {
         if let Some(configured) = configured {
             configured.api_protocol = LlmApiProtocol::Anthropic;
         }
-        let explicit = resolve_runtime_model(&config, Some("openai:root-only"));
+        let explicit = resolve_test_model(&config, Some("openai:root-only"))?;
         assert_eq!(explicit.api_protocol, LlmApiProtocol::Anthropic);
         assert!(validate_runtime_model_endpoint(&explicit).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn complete_endpoint_is_rewritten_for_each_explicit_protocol() {
+    fn complete_endpoint_is_rewritten_for_each_explicit_protocol() -> Result<(), String> {
         let mut config = EkoConfig::default();
         config.model_providers.insert(
             "openai".to_string(),
@@ -1230,7 +1112,7 @@ mod tests {
             ..ConfiguredModel::default()
         }];
 
-        let inferred = resolve_runtime_model(&config, Some("openai:compatible"));
+        let inferred = resolve_test_model(&config, Some("openai:compatible"))?;
         assert_eq!(inferred.api_protocol, LlmApiProtocol::ChatCompletions);
         assert!(validate_runtime_model_endpoint(&inferred).is_ok());
 
@@ -1238,9 +1120,10 @@ mod tests {
         if let Some(configured) = configured {
             configured.api_protocol = LlmApiProtocol::Responses;
         }
-        let mismatched = resolve_runtime_model(&config, Some("openai:compatible"));
+        let mismatched = resolve_test_model(&config, Some("openai:compatible"))?;
         assert_eq!(mismatched.api_protocol, LlmApiProtocol::Responses);
         assert!(validate_runtime_model_endpoint(&mismatched).is_ok());
+        Ok(())
     }
 
     #[test]
@@ -1287,7 +1170,7 @@ mod tests {
             },
         ];
 
-        let selected = resolve_runtime_model_selector(&config, Some("anthropic:shared"));
+        let selected = resolve_runtime_model(&config, Some("anthropic:shared"));
         assert!(matches!(
             selected,
             Ok(ModelRuntimeConfig {
@@ -1297,21 +1180,21 @@ mod tests {
             }) if provider == "anthropic"
         ));
         assert!(matches!(
-            resolve_runtime_model_selector(&config, Some("missing-model")),
+            resolve_runtime_model(&config, Some("missing-model")),
             Err(ModelSelectionError::Unknown { selector })
                 if selector == "missing-model"
         ));
         assert!(matches!(
-            resolve_runtime_model_selector(&config, Some("shared")),
+            resolve_runtime_model(&config, Some("shared")),
             Err(ModelSelectionError::AmbiguousName { selector }) if selector == "shared"
         ));
         assert!(matches!(
-            resolve_runtime_model_selector(&config, Some("openai:disabled")),
+            resolve_runtime_model(&config, Some("openai:disabled")),
             Err(ModelSelectionError::Disabled { selector })
                 if selector == "openai:disabled"
         ));
         assert!(matches!(
-            resolve_runtime_model_selector(&config, Some("disabled")),
+            resolve_runtime_model(&config, Some("disabled")),
             Err(ModelSelectionError::Disabled { selector })
                 if selector == "disabled"
         ));
@@ -1340,15 +1223,15 @@ configured_models:
         .map_err(|error| error.to_string())?;
 
         assert_eq!(
-            resolve_runtime_model(&config, Some("openai:default")).api_protocol,
+            resolve_test_model(&config, Some("openai:default"))?.api_protocol,
             LlmApiProtocol::ChatCompletions
         );
         assert_eq!(
-            resolve_runtime_model(&config, Some("anthropic:chat-override")).api_protocol,
+            resolve_test_model(&config, Some("anthropic:chat-override"))?.api_protocol,
             LlmApiProtocol::ChatCompletions
         );
         assert_eq!(
-            resolve_runtime_model(&config, Some("custom:inferred")).api_protocol,
+            resolve_test_model(&config, Some("custom:inferred"))?.api_protocol,
             LlmApiProtocol::ChatCompletions
         );
         Ok(())
@@ -1356,14 +1239,12 @@ configured_models:
 
     #[test]
     fn empty_configuration_has_no_synthetic_model() {
-        let mut config = EkoConfig::default();
-        config.model.provider = "ignored-legacy-provider".to_string();
-        config.model.name = "ignored-legacy-model".to_string();
+        let config = EkoConfig::default();
 
         let views = configured_model_views(&config);
         assert!(views.is_empty());
         assert!(matches!(
-            resolve_runtime_model_selector(&config, None),
+            resolve_runtime_model(&config, None),
             Err(ModelSelectionError::NotConfigured)
         ));
     }

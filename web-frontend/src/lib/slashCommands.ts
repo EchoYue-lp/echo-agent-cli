@@ -1,12 +1,5 @@
 export type GuiSlashTarget =
-  | 'clear'
-  | 'tasks'
-  | 'analysis'
-  | 'research'
-  | 'browser'
-  | 'files'
-  | 'workflows'
-  | 'extract';
+  'clear' | 'tasks' | 'analysis' | 'research' | 'browser' | 'files' | 'workflows' | 'extract';
 
 export interface SlashCommand {
   name: string;

@@ -4,12 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use echo_agent::agent::subagent::{
-    AgentFactory, DefaultSubagentPromptCompiler, ExecutionMode, FnAgentFactory, SubagentKind,
-};
 use echo_agent::agent::{Agent, ReactAgent, ReactAgentBuilder};
 use echo_agent::lsp::LspConfig;
 use echo_agent::plugin::{PluginVariables, PreparedPluginSet, ResolvedComponents};
+use echo_agent::subagent::{
+    AgentFactory, ExecutionMode, FnAgentFactory, SubagentAccessMode, SubagentExecutionBoundary,
+    SubagentKind, SubagentPromptCompiler, SubagentSystemPromptInput, ToolCapabilitySnapshot,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::scheduler::{CronTask, CronTaskStatus};
@@ -68,9 +69,10 @@ struct PluginAgentResources {
     llm_client: Option<Arc<dyn echo_agent::llm::LlmClient>>,
     llm_config: Option<echo_agent::llm::LlmConfig>,
     parent_model: String,
-    registry: Arc<echo_agent::agent::subagent::SubagentRegistry>,
+    registry: Arc<echo_agent::subagent::SubagentRegistry>,
     sandbox: Option<Arc<echo_agent::sandbox::SandboxManager>>,
     working_dir: Option<PathBuf>,
+    tool_visibility: echo_agent::agent::ToolVisibilityPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,13 +352,29 @@ fn validate_skill_directory_at_depth(
             continue;
         }
         if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
-            match read_component_text(&path, Some(variables)).and_then(|content| {
-                echo_agent::skills::external::parse_skill_md(&content)
-                    .map_err(|error| error.to_string())
-            }) {
-                Ok(descriptor) => {
-                    if let Some(definition) = descriptor.hooks {
-                        validate_hooks_definition(plugin, &path, definition, errors);
+            match read_component_text(&path, Some(variables)) {
+                Ok(content) => {
+                    let dir_name = path
+                        .parent()
+                        .and_then(|dir| dir.file_name())
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default();
+                    let report =
+                        echo_agent::skills::external::validate_skill_markdown(&content, dir_name);
+                    if !report.is_valid() {
+                        errors.push(format!(
+                            "Plugin '{plugin}' skill '{}': {}",
+                            path.display(),
+                            report.violations.join("; ")
+                        ));
+                    }
+                    if let Some(skill_dir) = path.parent()
+                        && skill_dir.join("hooks.json").is_file()
+                    {
+                        errors.push(format!(
+                            "Plugin '{plugin}' skill '{}': hooks.json is not an official Skill file",
+                            skill_dir.display()
+                        ));
                     }
                 }
                 Err(error) => errors.push(format!(
@@ -364,8 +382,6 @@ fn validate_skill_directory_at_depth(
                     path.display()
                 )),
             }
-        } else if path.file_name().and_then(|name| name.to_str()) == Some("hooks.json") {
-            validate_hooks_document(plugin, &path, variables, true, errors);
         }
     }
 }
@@ -713,6 +729,7 @@ pub(crate) async fn register_plugin_agents(
         registry: agent.subagent_registry().clone(),
         sandbox: agent.sandbox_manager().cloned(),
         working_dir: agent.working_dir(),
+        tool_visibility: agent.tool_visibility_policy(),
     };
     let mut registered = Vec::with_capacity(prepared.len());
     for plugin_agent in prepared {
@@ -733,18 +750,25 @@ pub(crate) async fn register_plugin_agents(
         agent.register_subagent_factory(framework_definition, factory);
         registered.push(plugin_agent.definition.name.clone());
     }
+    let disabled_tools = agent.disabled_tool_names();
+    crate::subagent_prompt::refresh_primary_system_prompt(agent, &disabled_tools);
     Ok(registered)
 }
 
 fn framework_definition(
     plugin_agent: &PreparedPluginAgent,
-) -> echo_agent::agent::subagent::SubagentDefinition {
+) -> echo_agent::subagent::SubagentDefinition {
     let definition = &plugin_agent.definition;
-    echo_agent::agent::subagent::SubagentDefinition {
+    echo_agent::subagent::SubagentDefinition {
         name: definition.name.clone(),
         description: definition.description.clone(),
         kind: SubagentKind::Plugin {
             source: plugin_agent.plugin.clone(),
+        },
+        access_mode: if definition.readonly {
+            SubagentAccessMode::ReadOnly
+        } else {
+            SubagentAccessMode::Write
         },
         execution_mode: if definition.team.is_some() {
             ExecutionMode::Team
@@ -817,7 +841,7 @@ fn build_plugin_agent(
         builder = builder
             .enable_subagent()
             .subagent_registry(resources.registry.clone())
-            .subagent_prompt_compiler(Arc::new(DefaultSubagentPromptCompiler))
+            .subagent_prompt_compiler(Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler))
             .register_agent_dispatch_tool();
     }
     if let Some(client) = resources.llm_client.clone() {
@@ -825,7 +849,31 @@ fn build_plugin_agent(
     } else if let Some(config) = resources.llm_config.clone() {
         builder = builder.llm_config(config);
     }
-    builder.build()
+    let mut agent = builder.build()?;
+    agent.use_tool_visibility_policy(resources.tool_visibility.clone());
+    let disabled_tools = resources.tool_visibility.disabled_names();
+    let capabilities =
+        ToolCapabilitySnapshot::from_definitions(&agent.tool_definitions(), &disabled_tools);
+    let compiled_system = crate::subagent_prompt::EkoSubagentPromptCompiler.compile_system(
+        &SubagentSystemPromptInput {
+            actor: echo_agent::subagent::PromptActor::Subagent,
+            name: &definition.name,
+            description: &definition.description,
+            role_prompt: &definition.system_prompt,
+            capabilities: &capabilities,
+            boundary: SubagentExecutionBoundary {
+                access: if definition.readonly {
+                    SubagentAccessMode::ReadOnly
+                } else {
+                    SubagentAccessMode::Write
+                },
+                isolation: crate::subagent_loader::subagent_isolation(definition),
+                can_delegate: definition.can_delegate,
+            },
+        },
+    );
+    agent.replace_system_prompt(compiled_system.system_prompt);
+    Ok(agent)
 }
 
 #[cfg(test)]

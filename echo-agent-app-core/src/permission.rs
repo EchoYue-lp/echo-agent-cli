@@ -1,96 +1,6 @@
-//! Lossless EKO permission-mode wire adapter.
+//! EKO's product-specific command policy over framework permission modes.
 
-use echo_agent::tools::permission::PermissionMode;
 use echo_agent::tools::{CommandPolicy, CommandPolicyDecision};
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PermissionModeDto {
-    Default,
-    Plan,
-    AutoEdit,
-    FullAuto,
-    Auto,
-    Bubble,
-    DontAsk,
-    Strict,
-}
-
-impl PermissionModeDto {
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Plan => "plan",
-            Self::AutoEdit => "auto-edit",
-            Self::FullAuto => "full-auto",
-            Self::Auto => "auto",
-            Self::Bubble => "bubble",
-            Self::DontAsk => "dont-ask",
-            Self::Strict => "strict",
-        }
-    }
-}
-
-impl TryFrom<&str> for PermissionModeDto {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "default" | "ask" => Ok(Self::Default),
-            "plan" => Ok(Self::Plan),
-            "auto-edit" | "autoedit" | "accept-edits" | "acceptedits" => Ok(Self::AutoEdit),
-            "full-auto" | "fullauto" | "bypass" | "bypass-permissions" | "bypasspermissions" => {
-                Ok(Self::FullAuto)
-            }
-            "auto" => Ok(Self::Auto),
-            "bubble" => Ok(Self::Bubble),
-            "dont-ask" | "dontask" => Ok(Self::DontAsk),
-            "strict" | "strict-confirm" | "strict-confirmation" => Ok(Self::Strict),
-            other => Err(format!(
-                "invalid permission mode '{other}'; expected default, plan, auto-edit, full-auto, auto, bubble, dont-ask, or strict"
-            )),
-        }
-    }
-}
-
-impl From<PermissionModeDto> for PermissionMode {
-    fn from(value: PermissionModeDto) -> Self {
-        match value {
-            PermissionModeDto::Default => Self::Default,
-            PermissionModeDto::Plan => Self::Plan,
-            PermissionModeDto::AutoEdit => Self::AcceptEdits,
-            PermissionModeDto::FullAuto => Self::BypassPermissions,
-            PermissionModeDto::Auto => Self::Auto,
-            PermissionModeDto::Bubble => Self::Bubble,
-            PermissionModeDto::DontAsk => Self::DontAsk,
-            PermissionModeDto::Strict => Self::StrictConfirm,
-        }
-    }
-}
-
-impl From<PermissionMode> for PermissionModeDto {
-    fn from(value: PermissionMode) -> Self {
-        match value {
-            PermissionMode::Default => Self::Default,
-            PermissionMode::Plan => Self::Plan,
-            PermissionMode::AcceptEdits => Self::AutoEdit,
-            PermissionMode::BypassPermissions => Self::FullAuto,
-            PermissionMode::Auto => Self::Auto,
-            PermissionMode::Bubble => Self::Bubble,
-            PermissionMode::DontAsk => Self::DontAsk,
-            PermissionMode::StrictConfirm => Self::Strict,
-        }
-    }
-}
-
-pub fn parse_permission_mode(value: &str) -> Result<PermissionMode, String> {
-    PermissionModeDto::try_from(value).map(Into::into)
-}
-
-pub fn permission_mode_id(value: PermissionMode) -> &'static str {
-    PermissionModeDto::from(value).id()
-}
 
 /// EKO's local-assistant command policy.
 ///
@@ -110,6 +20,7 @@ impl CommandPolicy for EkoCommandPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use echo_agent::tools::permission::PermissionMode;
 
     #[test]
     fn every_framework_mode_round_trips_without_loss() {
@@ -124,15 +35,14 @@ mod tests {
             PermissionMode::StrictConfirm,
         ];
         for mode in modes {
-            let dto = PermissionModeDto::from(mode);
-            assert_eq!(PermissionMode::from(dto), mode);
-            assert_eq!(parse_permission_mode(dto.id()), Ok(mode));
+            assert_eq!(mode.id().parse::<PermissionMode>(), Ok(mode));
+            assert_eq!(mode.to_string(), mode.id());
         }
     }
 
     #[test]
     fn unknown_mode_is_rejected() {
-        assert!(parse_permission_mode("surprise").is_err());
+        assert!("surprise".parse::<PermissionMode>().is_err());
     }
 
     #[test]

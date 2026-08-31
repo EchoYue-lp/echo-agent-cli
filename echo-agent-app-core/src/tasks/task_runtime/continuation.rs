@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 
 use echo_agent::agent::{AgentHandle, CancellationToken};
+use echo_agent::runtime::TurnReceipt;
 use futures::FutureExt;
 
 use crate::chat_resources::ChatResources;
@@ -572,7 +573,7 @@ impl TaskContinuationRuntime {
             )
             .await;
             match result {
-                Ok(outcome) => terminal = outcome.terminal,
+                Ok(outcome) => terminal = outcome.outcome,
                 Err(error) => {
                     tracing::warn!(run_id, %error, "long-horizon continuation turn failed");
                     let terminal = if dispatch_cancel.is_cancelled() {
@@ -849,7 +850,7 @@ async fn drive_continuation_turn(
     run_id: String,
     binding: RunTurnBinding,
     cancel: CancellationToken,
-) -> Result<crate::chat_driver::ChatTurnOutcome, String> {
+) -> Result<TurnReceipt, String> {
     let turn_id = binding.turn_id.clone();
     let resources = Arc::new(ChatResources {
         execution_scope: launcher.resources.execution_scope.clone(),
@@ -933,7 +934,7 @@ async fn stopped_terminal_for_run(
     previous: crate::chat_driver::TurnOutcome,
 ) -> crate::chat_driver::TurnOutcome {
     let lookup_run_id = run_id.to_string();
-    let run = super::executor::TaskRuntimeBlockingAdapter::new(store.clone())
+    let run = super::executor::TaskRuntimeOperation::new(store.clone())
         .run_store("load stopped continuation TaskRun", move |store| {
             store.get_run(&lookup_run_id)
         })
@@ -1027,7 +1028,7 @@ async fn continuation_eligibility(
     run_id: &str,
 ) -> ContinuationEligibility {
     let lookup_run_id = run_id.to_string();
-    let Ok(Some(snapshot)) = super::executor::TaskRuntimeBlockingAdapter::new(store.clone())
+    let Ok(Some(snapshot)) = super::executor::TaskRuntimeOperation::new(store.clone())
         .run_store("load continuation eligibility", move |store| {
             store.get_run_state(&lookup_run_id)
         })
@@ -1069,7 +1070,7 @@ async fn continuation_eligibility(
 
 async fn request_continuation_cancel(store: &Arc<TaskRuntimeStore>, run_id: &str) {
     let run_id = run_id.to_string();
-    if let Err(error) = super::executor::TaskRuntimeBlockingAdapter::new(store.clone())
+    if let Err(error) = super::executor::TaskRuntimeOperation::new(store.clone())
         .run_store("cancel continuation TaskRun", move |store| {
             store.request_cancel(&run_id)
         })

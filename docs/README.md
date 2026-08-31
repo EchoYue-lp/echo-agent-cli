@@ -1,58 +1,29 @@
-# EKO 项目文档
+# EKO Documentation
 
-`docs/` 只保存与当前代码同步、需要长期维护的项目文档。实施设计、阶段规格、
-审计报告和一次性验证记录不放在这里。
+The EKO documentation set is maintained as two equal release trees:
 
-## 文档导航
+- [中文主源](./zh/README.md) (`zh`): the editorial source for product facts.
+- [English translation](./en/README.md) (`en`): publishable only after semantic review.
 
-| 文档                                                                                  | 内容                                                            |
-| ------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| [快速入门](./getting-started.md)                                                      | 环境准备、TUI/GUI/JSONL 启动与首次配置                          |
-| [功能总览](./features.md)                                                             | 已接入真实主路径的产品能力与代码依据                            |
-| [架构说明](./architecture.md)                                                         | 框架/应用边界、运行时所有权、数据流和文件布局                   |
-| [持久化概念](./persistence.md)                                                        | Store、Journal、Checkpoint、Trace 与权威关系                    |
-| [配置指南](./configuration.md)                                                        | 模型、MCP、Hooks、Browser、Channel 与环境变量                   |
-| [Provider 架构](./architecture/providers.md)                                          | 动态 Provider、模型协议和思考能力解析                           |
-| [RuntimeTaskService 决策](./architecture/runtime-task-service.md)                     | Task DAG 权威、EKO adapter、journal 与 blocking 边界            |
-| [Foreground continuation ADR](./adr/0005-foreground-continuation-owner.md)            | 多 RunTurn 单一 owner、steer/cancel 与 settlement               |
-| [TaskRuntime Agent Turn ADR](./adr/0007-taskruntime-agent-turn-authority.md)          | AgentTurnDriver、typed terminal 与 RunTurn 原子权威             |
-| [TaskRuntime 有界查询投影 ADR](./adr/0008-taskruntime-bounded-query-projections.md)   | 热 checkpoint、增量 history segment 与 typed degraded receipt   |
-| [TaskRuntime Async Boundary ADR](./adr/0009-taskruntime-async-io-and-ipc-boundary.md) | bounded file I/O、caller drop 与 typed IPC                      |
-| [Boot 与 Agent Inbox ADR](./adr/0011-boot-inbox-recovery-authority.md)                | boot owner、tracked steer、orphan 与 inbox journal              |
-| [Extension Control ADR](./adr/0012-extension-control-authority.md)                    | durable Skill settlement、specialist 边界与多入口 typed control |
-| [Conversation input ADR](./adr/0014-durable-conversation-input-ingress.md)           | 多入口 durable follow-up、tracked drain 与 exact terminal       |
-| [Task graph status ADR](./adr/0015-task-graph-status-authority.md)                    | canonical TaskStatus、PlanRevision artifact 与只读 Todo 投影     |
-| [Agent control tools ADR](./adr/0016-agent-control-tools.md)                         | 模型 Agent 协作 target、message/wait/interrupt 与统一注册        |
-| [Agent 协同 ADR](./adr/0001-agent-collaboration.md)                                   | Codex 协同机制与 EKO 功能设计                                   |
-| [Codex 工具目录 ADR](./adr/0002-codex-tool-capability-catalog.md)                     | Codex 工具能力与 EKO 参考设计                                   |
-| [Claude Code 能力目录](./adr/0003-claude-code-capability-catalog.md)                  | Claude Code 工具、子智能体和 Skills 快照                        |
-| [应用生命周期 ADR](./adr/0004-application-lifecycle-supervisor.md)                    | GUI/headless admission、取消、join 与 rollback                  |
-| [Scoped product-data I/O](./adr/0006-scoped-product-data-io.md)                       | 文件、研究和分析的 workspace authority 与阻塞边界               |
-| [Channel scope parity ADR](./adr/0010-channel-scope-parity.md)                        | sender-scoped runtime、精确 stop/reset 与 tool identity         |
-| [Skill 同步](./skill-sync.md)                                                         | 内置/用户 Skill、启用状态与上游同步                             |
-| [项目状态](./MASTER-PLAN.md)                                                          | 当前权威路径、活跃工作与下一步                                  |
+The long-term target layout is mirrored by relative path. Architecture,
+operations, reference pages, project status, and ADRs keep separate duties;
+duplicate current facts are merged, while decision history remains in ADRs.
 
-仓库根 [README](../README.md) 负责产品介绍、构建命令和常用交互；本文档集不再
-复制完整的 slash command 或历史里程碑清单。
+## Parity gate
 
-## 设计文档边界
+Before publishing or synchronizing the website, run:
 
-尚未完成、仍驱动代码变更的设计与规格放在 [`design/specs/`](../design/specs/)。
-架构决策记录放在 [`docs/adr/`](./adr/)。
-完成验收后删除对应规格，把仍有长期价值的事实合并回 `docs/` 或代码注释。
+```text
+node scripts/check-docs-parity.mjs
+```
 
-当前活跃规格：
+The gate is fail-closed. It rejects missing language trees, missing pairs,
+unreviewed English pages, ADR identity drift, language-mismatched prose, and
+legacy files that are still present after migration.
+The migration inventory is [doc-parity-manifest.json](./doc-parity-manifest.json).
+The staged migration is complete: all long-term pages now live under the
+mirrored `docs/zh` and `docs/en` trees, and the inventory records removed legacy
+paths for traceability.
 
-- [workspace/conversation runtime reliability](../design/specs/runtime-reliability.md)
-- [long-horizon runtime closure](../design/specs/long-horizon-runtime-closure.md)
-
-Extension Control 已按 ADR 0012 完成 durable-first Skill settlement、specialist owner 协调和
-GUI/TUI/CLI/JSONL/channel 入口收敛；当前集成状态以 [项目状态](./MASTER-PLAN.md) 为准。
-
-## 维护规则
-
-1. 功能只有在生产入口可达，并且至少有对应测试或稳定调用点时，才写入“已实现”。
-2. `docs/` 描述当前事实，不保留按日期命名的实施日志、review diff 或 soak 账本。
-3. `echo-agent` 的通用能力在框架仓库文档中维护；这里仅说明 EKO 如何使用它。
-4. EKO 使用文件持久化，不启用 SQLite；所有 surface 共享同一套核心能力。
-5. 产品术语统一为 `TaskRun -> PlanTask -> SubagentRun`。
+The framework documentation is maintained in the sibling `echo-agent`
+repository. EKO documents describe application policy and composition only.

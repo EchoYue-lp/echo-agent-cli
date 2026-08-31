@@ -94,7 +94,7 @@ GUI、TUI 和 CLI 共享 `model_providers`、`configured_models` 和 `default_mo
 
 也可以通过 `eko.yaml` 设置模型。完整配置参考：
 
-- [配置指南](docs/configuration.md)
+- [配置指南](docs/zh/configuration.md)
 
 #### 配置文件位置
 
@@ -217,7 +217,7 @@ GUI 已接真实 Tauri 后端的聊天/会话、TaskRuntime/Subagent、记忆/�
 MCP、技能、Plugin、模型供应商、权限/审计、压缩、定时任务、Trace、Terminal、
 Browser、Sandbox、数据分析和论文/系统综述工作台。Workflow 和通用结构化抽取的后端
 已存在，但 React panel 尚未接入生产导航，不能算 GUI 完成。当前代码依据与尚在收口的
-缺口见 [功能总览](docs/features.md)。
+缺口见 [功能总览](docs/zh/features.md)。
 
 > **注意**：每个平台只能打包该平台原生的安装包。如需交叉编译请使用 CI/CD（如 GitHub Actions）。
 
@@ -340,7 +340,7 @@ EKO 不启用 framework `sqlite` feature；会话、runtime、memory 和 TaskRun
 - `pdf_fetch` — 下载并解析论文全文
 - `web_search` + `web_fetch` — 网络搜索补充信息
 
-所有医学工具**免费使用**，无需 API Key。详见 [配置指南](docs/configuration.md)。
+所有医学工具**免费使用**，无需 API Key。详见 [配置指南](docs/zh/configuration.md)。
 
 #### Pipeline 流水线
 
@@ -577,11 +577,10 @@ workspaces/
 
 详细文档请参阅 `docs/` 目录：
 
-- [文档索引](docs/README.md) — 项目文档边界与导航
-- [功能总览](docs/features.md) — 已实现能力与代码依据
-- [架构说明](docs/architecture.md) — 当前运行时所有权与数据流
-- [配置指南](docs/configuration.md) — 配置文件详解
-- [入门指南](docs/getting-started.md) — 从零开始使用
+- [文档入口](docs/README.md) — `zh` 主源、`en` 审阅翻译和迁移状态
+- [中文文档](docs/zh/README.md) — EKO 长期文档主源（迁移完成后承载全部页面）
+- [English documentation](docs/en/README.md) — reviewed English release tree
+- [文档 parity gate](scripts/check-docs-parity.mjs) — 发布前的 fail-closed 检查
 
 ---
 

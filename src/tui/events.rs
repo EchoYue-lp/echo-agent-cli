@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use echo_agent::agent::subagent::SubagentEvent;
+use echo_agent::subagent::SubagentEvent;
 use echo_agent::tools::{ToolFailure, artifact::ToolOutputArtifactRef};
 use echo_agent_app_core::api::chat_driver::TurnOutcome;
 use echo_agent_app_core::api::context_window::ContextWindowSnapshot;
@@ -2983,7 +2983,9 @@ impl echo_agent_app_core::api::chat_driver::ChatSink for TuiChatSink {
         use echo_agent_app_core::api::chat_driver::ChatDriverEvent;
 
         if let Some(projection) =
-            echo_agent_app_core::api::tasks::task_runtime::project_awaiter_surface_event(&event)
+            echo_agent_app_core::api::tasks::task_runtime::project_command_cell_watch_surface_event(
+                &event,
+            )
         {
             return self
                 .tx
@@ -3045,10 +3047,10 @@ impl echo_agent_app_core::api::chat_driver::ChatSink for TuiChatSink {
                 "Command cell {} settled: {}",
                 cell.cell_id, cell.phase
             )),
-            ChatDriverEvent::AwaiterResultReady { .. }
-            | ChatDriverEvent::AwaiterResultDeliveryStarted { .. }
-            | ChatDriverEvent::AwaiterResultAcknowledged { .. } => {
-                AgentEvent::Notice("Awaiter projection unavailable".to_string())
+            ChatDriverEvent::CommandCellWatchReady { .. }
+            | ChatDriverEvent::CommandCellWatchDeliveryStarted { .. }
+            | ChatDriverEvent::CommandCellWatchAcknowledged { .. } => {
+                AgentEvent::Notice("CommandCellWatch projection unavailable".to_string())
             }
             ChatDriverEvent::ExtensionReceipt(receipt) => {
                 AgentEvent::Notice(receipt.display_message())
@@ -3460,20 +3462,19 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
     match subcommand {
         "list" | "ls" => {
             let operation_store = store.clone();
-            let result =
-                echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(
-                    store,
+            let result = echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeOperation::new(
+                store,
+            )
+            .run_owned("list TUI unattended worktrees", move || {
+                list_unattended_worktrees(&repo_root, Some(operation_store.as_ref())).map_err(
+                    |error| {
+                        echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(
+                            error.to_string(),
+                        )
+                    },
                 )
-                .run_owned("list TUI unattended worktrees", move || {
-                    list_unattended_worktrees(&repo_root, Some(operation_store.as_ref())).map_err(
-                        |error| {
-                            echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(
-                                error.to_string(),
-                            )
-                        },
-                    )
-                })
-                .await;
+            })
+            .await;
             match result {
                 Ok(worktrees) => format_unattended_worktrees(&worktrees),
                 Err(error) => format!("Failed to list retained worktrees: {error}"),
@@ -3484,18 +3485,16 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
             let _guard = lock.lock().await;
             let operation_store = store.clone();
             let result =
-                echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(
-                    store,
-                )
-                .run_owned("clean TUI unattended worktrees", move || {
-                    cleanup_unattended_worktrees(&repo_root, Some(operation_store.as_ref()))
+                echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeOperation::new(store)
+                    .run_owned("clean TUI unattended worktrees", move || {
+                        cleanup_unattended_worktrees(&repo_root, Some(operation_store.as_ref()))
                         .map_err(|error| {
                             echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(
                                 error.to_string(),
                             )
                         })
-                })
-                .await;
+                    })
+                    .await;
             match result {
                 Ok(result) => format!(
                     "Worktree cleanup: removed={}, unlocked={}, kept={}, errors={}{}",
@@ -3521,22 +3520,20 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
             let run_id_for_merge = run_id.clone();
             let operation_store = store.clone();
             let result =
-                echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(
-                    store,
-                )
-                .run_owned("merge TUI unattended worktree", move || {
-                    merge_unattended_worktree(
-                        &repo_root,
-                        &run_id_for_merge,
-                        Some(operation_store.as_ref()),
-                    )
-                    .map_err(|error| {
-                        echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(
-                            error.to_string(),
+                echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeOperation::new(store)
+                    .run_owned("merge TUI unattended worktree", move || {
+                        merge_unattended_worktree(
+                            &repo_root,
+                            &run_id_for_merge,
+                            Some(operation_store.as_ref()),
                         )
+                        .map_err(|error| {
+                            echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(
+                                error.to_string(),
+                            )
+                        })
                     })
-                })
-                .await;
+                    .await;
             match result {
                 Ok(outcome) => {
                     let files = if outcome.changed_files.is_empty() {
@@ -3565,22 +3562,20 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
             let run_id_for_discard = run_id.clone();
             let operation_store = store.clone();
             let result =
-                echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(
-                    store,
-                )
-                .run_owned("discard TUI unattended worktree", move || {
-                    discard_unattended_worktree(
-                        &repo_root,
-                        &run_id_for_discard,
-                        Some(operation_store.as_ref()),
-                    )
-                    .map_err(|error| {
-                        echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(
-                            error.to_string(),
+                echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeOperation::new(store)
+                    .run_owned("discard TUI unattended worktree", move || {
+                        discard_unattended_worktree(
+                            &repo_root,
+                            &run_id_for_discard,
+                            Some(operation_store.as_ref()),
                         )
+                        .map_err(|error| {
+                            echo_agent_app_core::api::tasks::task_runtime::StoreError::InvalidPlan(
+                                error.to_string(),
+                            )
+                        })
                     })
-                })
-                .await;
+                    .await;
             match result {
                 Ok(()) => format!("Discarded retained worktree for run {run_id}."),
                 Err(error) => format!("Failed to discard retained worktree: {error}"),
@@ -3827,7 +3822,7 @@ where
         + Send
         + 'static,
 {
-    echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+    echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeOperation::new(store)
         .run_store(operation, function)
         .await
         .map_err(|error| error.to_string())
@@ -3992,11 +3987,14 @@ fn push_tui_system_message(app: &mut TuiApp, content: impl Into<String>) {
 fn refresh_tui_models(app: &mut TuiApp, config: &echo_agent_app_core::api::config::EkoConfig) {
     app.configured_models = echo_agent_app_core::api::model_config::configured_model_views(config)
         .into_iter()
-        .map(|view| {
+        .filter_map(|view| {
             echo_agent_app_core::api::model_config::resolve_runtime_model(config, Some(&view.id))
+                .ok()
         })
         .collect();
-    app.model = echo_agent_app_core::api::model_config::resolve_runtime_model(config, None).model;
+    app.model = echo_agent_app_core::api::model_config::resolve_runtime_model(config, None)
+        .map(|runtime| runtime.model)
+        .unwrap_or_default();
 }
 
 async fn handle_tui_model_command(app: &mut TuiApp, args: &str) {
@@ -4058,17 +4056,16 @@ async fn handle_tui_model_command(app: &mut TuiApp, args: &str) {
                 return;
             };
             let config = app_state.config.app_config.read().await.clone();
-            let runtime =
-                match echo_agent_app_core::api::model_config::resolve_runtime_model_selector(
-                    &config,
-                    Some(selector),
-                ) {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        push_tui_system_message(app, error.to_string());
-                        return;
-                    }
-                };
+            let runtime = match echo_agent_app_core::api::model_config::resolve_runtime_model(
+                &config,
+                Some(selector),
+            ) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    push_tui_system_message(app, error.to_string());
+                    return;
+                }
+            };
             match echo_agent_app_core::api::infra::test_runtime_llm_connection(&runtime).await {
                 Ok(result) => push_tui_system_message(
                     app,
@@ -4289,11 +4286,13 @@ async fn handle_slash_command(
         Some(SlashCommand::Think) => {
             let available = if let Some(app_state) = app.app_state.as_ref() {
                 let config = app_state.config.app_config.read().await;
-                let runtime =
-                    echo_agent_app_core::api::model_config::resolve_runtime_model(&config, None);
-                echo_agent_app_core::api::model_config::thinking_level_specs(
-                    runtime.thinking_profile,
-                )
+                echo_agent_app_core::api::model_config::resolve_runtime_model(&config, None)
+                    .map(|runtime| {
+                        echo_agent_app_core::api::model_config::thinking_level_specs(
+                            runtime.thinking_profile,
+                        )
+                    })
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -4349,7 +4348,6 @@ async fn handle_slash_command(
             }
         }
         Some(SlashCommand::System) => {
-            use echo_agent::agent::Agent;
             if args.trim().is_empty() {
                 let pool_execution = match app.conversation_id.as_deref() {
                     Some(conversation_id) => {
@@ -4375,7 +4373,17 @@ async fn handle_slash_command(
                         .await;
                 } else {
                     agent
-                        .read(|value| value.set_system_prompt(args.trim()))
+                        .write_async(|value| {
+                            let prompt = args.trim().to_string();
+                            Box::pin(async move {
+                                value.set_system_prompt(prompt).await;
+                                let disabled_tools = value.disabled_tool_names();
+                                echo_agent_app_core::api::subagent_prompt::refresh_primary_system_prompt(
+                                    value,
+                                    &disabled_tools,
+                                );
+                            })
+                        })
                         .await;
                 }
                 app.messages.push(ChatMessage {
@@ -4899,19 +4907,20 @@ async fn handle_slash_command(
                     content: format!("Permission mode: {}", app.permission_mode),
                 });
             } else {
-                let framework_mode =
-                    match echo_agent_app_core::api::permission::parse_permission_mode(args.trim()) {
-                        Ok(mode) => mode,
-                        Err(_) => {
-                            app.messages.push(ChatMessage {
+                let framework_mode = match args
+                    .trim()
+                    .parse::<echo_agent::tools::permission::PermissionMode>()
+                {
+                    Ok(mode) => mode,
+                    Err(_) => {
+                        app.messages.push(ChatMessage {
                                 role: MessageRole::System,
                                 content: "Unknown permission mode; use default, plan, auto-edit, full-auto, auto, bubble, dont-ask, or strict".to_string(),
                             });
-                            return;
-                        }
-                    };
-                let normalized =
-                    echo_agent_app_core::api::permission::permission_mode_id(framework_mode);
+                        return;
+                    }
+                };
+                let normalized = framework_mode.id();
                 if let Some(state) = app.app_state.as_ref() {
                     *state.config.permission_mode.write().await = framework_mode;
                     state.apply_permission_mode_to_agents(framework_mode).await;
@@ -7258,37 +7267,37 @@ fn update_subagent_runs(app: &mut TuiApp, event: &SubagentEvent) {
             execution_id,
             duration_ms,
             tokens_used,
-            result,
+            outcome,
             ..
         } => {
             if let Some(run) = find_subagent_run_mut(app, execution_id.as_deref(), agent) {
-                run.status = result.status.as_str().to_string();
+                run.status = outcome.status.as_str().to_string();
                 run.duration_ms = Some(*duration_ms);
                 run.tokens_used = *tokens_used;
-                apply_subagent_result(run, result);
+                apply_subagent_outcome(run, outcome);
             }
         }
         SubagentEvent::DispatchFailed {
             agent,
             execution_id,
             status,
-            result,
+            outcome,
             ..
         } => {
             if let Some(run) = find_subagent_run_mut(app, execution_id.as_deref(), agent) {
                 run.status = status.as_str().to_string();
-                apply_subagent_result(run, result);
+                apply_subagent_outcome(run, outcome);
             }
         }
         SubagentEvent::DispatchCancelled {
             agent,
             execution_id,
-            result,
+            outcome,
             ..
         } => {
             if let Some(run) = find_subagent_run_mut(app, execution_id.as_deref(), agent) {
                 run.status = "cancelled".to_string();
-                apply_subagent_result(run, result);
+                apply_subagent_outcome(run, outcome);
             }
         }
         _ => {}
@@ -7299,28 +7308,25 @@ fn update_subagent_runs(app: &mut TuiApp, event: &SubagentEvent) {
     }
 }
 
-fn apply_subagent_result(
+fn apply_subagent_outcome(
     run: &mut SubagentRuntimeView,
-    result: &echo_agent::agent::subagent::SubagentOutcome,
+    outcome: &echo_agent::subagent::SubagentOutcome,
 ) {
-    let result =
-        echo_agent_app_core::api::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(
-            result,
-        );
-    run.summary = result.summary;
-    run.artifacts = result
+    run.summary = outcome.summary.clone();
+    run.artifacts = outcome
         .artifacts
         .iter()
         .map(|artifact| artifact.path.clone())
         .collect();
-    run.verification = result
-        .verification
+    run.verification = outcome
+        .verification()
         .iter()
         .map(|item| format!("{}: {:?}", item.check, item.status))
         .collect();
-    run.remaining_work = result.remaining_work;
-    run.files_read = result.touched_files.read;
-    run.files_written = result.touched_files.written;
+    run.remaining_work = outcome.remaining_work.clone();
+    let touched_files = outcome.touched_files();
+    run.files_read = touched_files.read.clone();
+    run.files_written = touched_files.written.clone();
 }
 
 fn subagent_event_id(execution_id: Option<&str>, agent: &str) -> String {
@@ -7363,7 +7369,7 @@ mod tests {
     use echo_agent_app_core::api::chat_driver::TurnOutcome;
     use echo_agent_app_core::api::tasks::task_runtime::{
         AttendedMode, DomainProfile, ExecutionMode, PlanRevision, PlanTask, TaskPlan,
-        TaskRunStatus, TaskRuntimeStore, TodoItem, TodoStatus, commit_eko_task_plan,
+        TaskRunStatus, TaskRuntimeStore, TodoItem, TodoStatus, commit_task_plan,
     };
     use std::sync::Arc;
     use std::time::Instant;
@@ -7404,7 +7410,7 @@ mod tests {
                 AttendedMode::Attended,
             )
             .map_err(|error| error.to_string())?;
-        commit_eko_task_plan(
+        commit_task_plan(
             store.clone(),
             TaskPlan {
                 plan_id: "tui-retry-plan".to_string(),
@@ -8656,7 +8662,7 @@ mod tests {
 
     #[test]
     fn subagent_events_update_live_projection() {
-        use echo_agent::agent::subagent::{ExecutionMode, SubagentEvent};
+        use echo_agent::subagent::{ExecutionMode, SubagentEvent};
 
         let mut app = app();
         update_subagent_runs(
@@ -8690,11 +8696,11 @@ mod tests {
                 run_id: Some("run-1".to_string()),
             },
         );
-        let terminal_result = echo_agent::agent::subagent::SubagentOutcome {
+        let mut terminal_outcome = echo_agent::subagent::SubagentOutcome {
             contract_version: 2,
-            status: echo_agent::agent::subagent::SubagentStatus::Completed,
+            status: echo_agent::subagent::SubagentStatus::Completed,
             summary: "done".to_string(),
-            artifacts: vec![echo_agent::agent::subagent::SubagentArtifact {
+            artifacts: vec![echo_agent::subagent::SubagentArtifact {
                 path: "report.json".to_string(),
                 kind: "report".to_string(),
                 bytes: Some(42),
@@ -8703,33 +8709,36 @@ mod tests {
                 available: true,
             }],
             evidence: vec![
-                echo_agent::agent::subagent::SubagentEvidence {
+                echo_agent::subagent::SubagentEvidence {
                     kind: "verification".to_string(),
                     subject: "cargo test".to_string(),
                     outcome: Some("passed".to_string()),
                     details: "ok".to_string(),
-                    source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                    source: echo_agent::subagent::SubagentEvidenceSource::Observed,
                     attributes: serde_json::Value::Null,
                 },
-                echo_agent::agent::subagent::SubagentEvidence {
+                echo_agent::subagent::SubagentEvidence {
                     kind: "file_read".to_string(),
                     subject: "src/lib.rs".to_string(),
                     outcome: Some("succeeded".to_string()),
                     details: String::new(),
-                    source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                    source: echo_agent::subagent::SubagentEvidenceSource::Observed,
                     attributes: serde_json::Value::Null,
                 },
-                echo_agent::agent::subagent::SubagentEvidence {
+                echo_agent::subagent::SubagentEvidence {
                     kind: "file_write".to_string(),
                     subject: "report.json".to_string(),
                     outcome: Some("succeeded".to_string()),
                     details: String::new(),
-                    source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                    source: echo_agent::subagent::SubagentEvidenceSource::Observed,
                     attributes: serde_json::Value::Null,
                 },
             ],
+            verification: Vec::new(),
             remaining_work: Vec::new(),
+            touched_files: echo_agent::subagent::SubagentTouchedFiles::default(),
         };
+        terminal_outcome.refresh_derived_views();
         update_subagent_runs(
             &mut app,
             &SubagentEvent::DispatchCompleted {
@@ -8739,7 +8748,7 @@ mod tests {
                 tokens_used: Some(42),
                 iterations: Some(1),
                 output: "done".to_string(),
-                result: terminal_result,
+                outcome: terminal_outcome,
                 execution_id: Some("task-1:1".to_string()),
                 run_id: Some("run-1".to_string()),
             },

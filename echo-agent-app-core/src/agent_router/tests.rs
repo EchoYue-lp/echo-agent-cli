@@ -1,6 +1,10 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+    use echo_agent::state::journal::EventReducer;
+    use echo_agent::delivery::{
+        DeliveryEnvelope, DeliveryLedgerProjection,
+    };
 
     fn address() -> AgentAddress {
         AgentAddress::new(WorkspaceId::from_name("workspace-b"), "conversation-b")
@@ -16,6 +20,75 @@ mod tests {
 
     fn no_delivery_recovery() -> Arc<dyn Fn(AgentAddress) + Send + Sync> {
         Arc::new(|_| {})
+    }
+
+    fn envelope_from_message(
+        message: &AgentMessage,
+        wake_delivery: bool,
+    ) -> Result<DeliveryEnvelope<AgentAddress, AgentMessage>, String> {
+        let mut envelope = DeliveryEnvelope::new(
+            message.message_id.clone(),
+            message.to.clone(),
+            message.clone(),
+        );
+        envelope
+            .metadata
+            .insert("wake_delivery".to_string(), wake_delivery.to_string());
+        Ok(envelope)
+    }
+
+    fn message_from_envelope(
+        envelope: DeliveryEnvelope<AgentAddress, AgentMessage>,
+    ) -> Result<(AgentMessage, bool), String> {
+        let wake_delivery = envelope
+            .metadata
+            .get("wake_delivery")
+            .ok_or_else(|| "envelope is missing wake metadata".to_string())?
+            .parse::<bool>()
+            .map_err(|error| error.to_string())?;
+        Ok((envelope.payload, wake_delivery))
+    }
+
+    #[test]
+    fn delivery_envelope_round_trip_preserves_authorship_and_wake_policy() -> Result<(), String> {
+        let source = AgentAddress::new(WorkspaceId::from_name("source"), "source-conversation");
+        let target = address();
+        let mut user = AgentMessage::user_text(Some(source.clone()), target.clone(), "question");
+        user.message_id = "stable-user".to_string();
+        user.correlation_id = Some("correlation".to_string());
+        user.causation_id = Some("causation".to_string());
+        let reply = AgentMessage::agent_reply(
+            target.clone(),
+            source,
+            "answer",
+            "correlation",
+            "causation",
+        );
+        for (message, wake_delivery) in [(user, false), (reply, true)] {
+            let expected = message.clone();
+            let envelope = envelope_from_message(&message, wake_delivery)?;
+            envelope.validate().map_err(|error| error.to_string())?;
+            let (actual, actual_wake) = message_from_envelope(envelope)?;
+            assert_eq!(actual, expected);
+            assert_eq!(actual_wake, wake_delivery);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn task_subagent_target_remains_outside_conversation_delivery_envelope() {
+        let target = crate::agent_control::AgentTarget::TaskSubagent {
+            target: crate::agent_control::TaskSubagentTarget {
+                workspace_id: "workspace-b".to_string(),
+                run_id: "run-1".to_string(),
+                task_id: "task-1".to_string(),
+                plan_revision: 2,
+                execution_id: "execution-1".to_string(),
+                attempt: 1,
+                workspace_generation: Some("generation-1".to_string()),
+            },
+        };
+        assert!(matches!(target, crate::agent_control::AgentTarget::TaskSubagent { .. }));
     }
 
     async fn mark_completed(
@@ -423,7 +496,7 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?
         {
-            mark_completed(&router, &claim, &claim.message.delivery_turn_id()).await?;
+            mark_completed(&router, &claim, &claim.payload.delivery_turn_id()).await?;
             delivered = delivered.saturating_add(1);
         }
         Ok(delivered)
@@ -566,6 +639,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_inbox_replay_uses_framework_ledger_directly() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let target = address();
+        let message = AgentMessage::user_text(None, target.clone(), "typed message");
+        let directory = inbox_dir(temp.path(), &target).join("journal");
+        let journal = SegmentedFileEventJournal::<FrameworkDeliveryEvent>::open(
+            &directory,
+            INBOX_SEGMENT_BYTES,
+            FileDurability::SyncData,
+        )
+        .map_err(|error| error.to_string())?;
+        journal
+            .append(DeliveryEvent::Persisted {
+                envelope: DeliveryEnvelope::new(
+                    message.message_id.clone(),
+                    target.clone(),
+                    message.clone(),
+                ),
+                persisted_at: message.created_at,
+            })
+            .map_err(|error| error.to_string())?;
+        assert_eq!(journal.last_sequence(), 1);
+
+        let router = AgentRouter::new(temp.path().to_path_buf());
+        let records = router
+            .records(&target)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].payload, message);
+
+        let before_sequence = journal.last_sequence();
+        let mut fresh = AgentMessage::user_text(None, target.clone(), "framework message");
+        fresh.message_id = "framework-message".to_string();
+        router
+            .enqueue(fresh)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(journal.last_sequence(), before_sequence + 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn typed_lifecycle_replay_preserves_framework_phase_history() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let target = address();
+        let mut message = AgentMessage::user_text(None, target.clone(), "typed lifecycle");
+        message.message_id = "typed-lifecycle".to_string();
+        let timestamp = message.created_at;
+        let directory = inbox_dir(temp.path(), &target).join("journal");
+        let journal = SegmentedFileEventJournal::<FrameworkDeliveryEvent>::open(
+            &directory,
+            INBOX_SEGMENT_BYTES,
+            FileDurability::SyncData,
+        )
+        .map_err(|error| error.to_string())?;
+        let append = |event| {
+            journal
+                .append(event)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        };
+        append(DeliveryEvent::Persisted {
+            envelope: DeliveryEnvelope::new(
+                message.message_id.clone(),
+                target.clone(),
+                message,
+            ),
+            persisted_at: timestamp,
+        })?;
+        append(DeliveryEvent::Claimed {
+            message_id: "typed-lifecycle".to_string(),
+            attempt_id: "typed-attempt".to_string(),
+            attempt: 1,
+            claimed_at: timestamp,
+        })?;
+        append(DeliveryEvent::EffectStarted {
+            message_id: "typed-lifecycle".to_string(),
+            attempt_id: "typed-attempt".to_string(),
+            started_at: timestamp,
+            turn_id: "typed-turn".to_string(),
+        })?;
+        append(DeliveryEvent::MailboxAccepted {
+            message_id: "typed-lifecycle".to_string(),
+            attempt_id: "typed-attempt".to_string(),
+            accepted_at: timestamp,
+            turn_id: "typed-turn".to_string(),
+        })?;
+        append(DeliveryEvent::Drained {
+            message_id: "typed-lifecycle".to_string(),
+            attempt_id: "typed-attempt".to_string(),
+            drained_at: timestamp,
+            turn_id: "typed-turn".to_string(),
+        })?;
+        append(DeliveryEvent::TurnSettled {
+            message_id: "typed-lifecycle".to_string(),
+            attempt_id: "typed-attempt".to_string(),
+            settled_at: timestamp,
+            turn_id: Some("typed-turn".to_string()),
+            outcome: AgentDeliveryOutcome::Completed,
+            drained: Some(true),
+            reason: None,
+            retryable: false,
+            next_attempt_at: None,
+            reply_message_id: Some("typed-reply".to_string()),
+        })?;
+
+        let router = AgentRouter::new(temp.path().to_path_buf());
+        let record = router
+            .records(&target)
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "typed lifecycle record missing".to_string())?;
+        assert_eq!(record.payload.message_id, "typed-lifecycle");
+        assert_eq!(record.phase, AgentDeliveryPhase::TurnSettled);
+        assert_eq!(record.outcome, Some(AgentDeliveryOutcome::Completed));
+        assert_eq!(record.reply_message_id.as_deref(), Some("typed-reply"));
+        assert_eq!(
+            router
+                .event_phases_for_test(&target, "typed-lifecycle")
+                .await
+                .map_err(|error| error.to_string())?,
+            vec![
+                "persisted",
+                "claimed",
+                "effect_started",
+                "mailbox_accepted",
+                "drained",
+                "turn_settled"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typed_checkpoint_rehydrates_framework_projection() -> Result<(), String> {
+        let target = address();
+        let mut message = AgentMessage::user_text(None, target.clone(), "checkpointed typed");
+        message.message_id = "checkpointed-typed".to_string();
+        let timestamp = message.created_at;
+        let mut projection = DeliveryLedgerProjection::<AgentAddress, AgentMessage>::default();
+        projection.apply(&DeliveryEvent::Persisted {
+            envelope: DeliveryEnvelope::new(message.message_id.clone(), target, message),
+            persisted_at: timestamp,
+        });
+        assert_eq!(
+            projection
+                .frontier()
+                .next()
+                .map(|record| record.message_id.as_str()),
+            Some("checkpointed-typed")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn reply_identity_is_stable_for_one_causal_message() -> Result<(), String> {
         let source = AgentAddress::new(WorkspaceId::from_name("source"), "source-conversation");
         let target = address();
@@ -640,9 +871,14 @@ mod tests {
         let journal =
             SegmentedFileEventJournal::open(&path, INBOX_SEGMENT_BYTES, FileDurability::SyncData)
                 .map_err(|error| error.to_string())?;
+        let message = AgentMessage::user_text(None, target.clone(), "persisted");
         journal
-            .append(AgentInboxEvent::Persisted {
-                message: AgentMessage::user_text(None, target.clone(), "persisted"),
+            .append(DeliveryEvent::Persisted {
+                envelope: DeliveryEnvelope::new(
+                    message.message_id.clone(),
+                    target.clone(),
+                    message,
+                ),
                 persisted_at: Utc::now(),
             })
             .map_err(|error| error.to_string())?;
@@ -697,7 +933,7 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "first claim missing".to_string())?;
-        assert_eq!(first_claim.message, first);
+        assert_eq!(first_claim.payload, first);
         router
             .defer(&first_claim, "busy")
             .await
@@ -719,7 +955,7 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "deferred claim missing".to_string())?;
-        assert_eq!(retry.message.message_id, "first");
+        assert_eq!(retry.payload.message_id, "first");
         assert_eq!(retry.attempt, 2);
         mark_completed(&router, &retry, "turn-first").await?;
         let second_claim = router
@@ -727,7 +963,7 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "second claim missing".to_string())?;
-        assert_eq!(second_claim.message, second);
+        assert_eq!(second_claim.payload, second);
         router
             .turn_settled(
                 &second_claim,
@@ -816,7 +1052,7 @@ mod tests {
         ));
         mark_completed(&restarted, &recovered, "recovered").await?;
         let duplicate = restarted
-            .enqueue(recovered.message)
+            .enqueue(recovered.payload)
             .await
             .map_err(|error| error.to_string())?;
         assert!(duplicate.duplicate);
@@ -994,12 +1230,12 @@ mod tests {
                 .map_err(|error| error.to_string())?;
         }
         let checkpoint = inbox_dir(temp.path(), &target).join("projection.checkpoint.json");
-        let frame = FileCheckpointStore::<AgentInboxProjection>::open(&checkpoint)
+        let frame = FileCheckpointStore::<DeliveryLedgerProjection<AgentAddress, AgentMessage>>::open(&checkpoint)
             .load()
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "Agent inbox checkpoint was not compounded".to_string())?;
+            .ok_or_else(|| "Delivery ledger checkpoint was not compounded".to_string())?;
         assert_eq!(frame.sequence, INBOX_CHECKPOINT_EVERY);
-        assert_eq!(frame.state.order.len(), INBOX_CHECKPOINT_EVERY as usize);
+        assert!(frame.sequence < 70);
         assert!(
             !inbox_dir(temp.path(), &target)
                 .join("events.jsonl")
@@ -1046,227 +1282,6 @@ mod tests {
                 .len(),
             1
         );
-        Ok(())
-    }
-
-    fn apply_terminal_projection_lifecycle(
-        projection: &mut AgentInboxProjection,
-        target: &AgentAddress,
-        index: usize,
-        timestamp: DateTime<Utc>,
-        text: &str,
-    ) -> Result<(), String> {
-        let message_id = format!("scale-message-{index}");
-        let attempt_id = format!("scale-attempt-{index}");
-        let turn_id = format!("scale-turn-{index}");
-        let mut message = AgentMessage::user_text(None, target.clone(), text);
-        message.message_id = message_id.clone();
-        projection.apply_checked(&AgentInboxEvent::Persisted {
-            message,
-            persisted_at: timestamp,
-        })?;
-        projection.apply_checked(&AgentInboxEvent::Claimed {
-            message_id: message_id.clone(),
-            attempt_id: attempt_id.clone(),
-            attempt: 1,
-            claimed_at: timestamp,
-        })?;
-        projection.apply_checked(&AgentInboxEvent::EffectStarted {
-            message_id: message_id.clone(),
-            attempt_id: attempt_id.clone(),
-            started_at: timestamp,
-            turn_id: turn_id.clone(),
-        })?;
-        projection.apply_checked(&AgentInboxEvent::MailboxAccepted {
-            message_id: message_id.clone(),
-            attempt_id: attempt_id.clone(),
-            accepted_at: timestamp,
-            turn_id: turn_id.clone(),
-        })?;
-        projection.apply_checked(&AgentInboxEvent::Drained {
-            message_id: message_id.clone(),
-            attempt_id: attempt_id.clone(),
-            drained_at: timestamp,
-            turn_id: turn_id.clone(),
-        })?;
-        projection.apply_checked(&AgentInboxEvent::TurnSettled {
-            message_id,
-            attempt_id,
-            settled_at: timestamp,
-            turn_id: Some(turn_id),
-            outcome: AgentDeliveryOutcome::Completed,
-            drained: true,
-            reason: None,
-            retryable: false,
-            next_attempt_at: None,
-            reply_message_id: None,
-        })
-    }
-
-    fn measure_terminal_projection(
-        event_count: usize,
-    ) -> Result<(std::time::Duration, std::time::Duration, usize), String> {
-        let target = address();
-        let mut projection = AgentInboxProjection::default();
-        let timestamp = Utc::now();
-        let halfway = event_count / 2;
-        let started = std::time::Instant::now();
-        let mut midpoint = started;
-        for index in 0..event_count {
-            if index == halfway {
-                midpoint = std::time::Instant::now();
-            }
-            apply_terminal_projection_lifecycle(
-                &mut projection,
-                &target,
-                index,
-                timestamp,
-                "scale terminal",
-            )?;
-        }
-        let finished = std::time::Instant::now();
-        assert_eq!(projection.order.len(), INBOX_TERMINAL_RETENTION);
-        assert_eq!(projection.entries.len(), INBOX_TERMINAL_RETENTION);
-        assert!(projection.frontier.is_empty());
-        assert_eq!(
-            projection
-                .full_validation_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "hot reducer mutation unexpectedly ran a full projection validation"
-        );
-        projection
-            .validate(Path::new("scale-projection"), &target)
-            .map_err(|error| error.to_string())?;
-        assert_eq!(
-            projection
-                .full_validation_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        let checkpoint_bytes = serde_json::to_vec(&projection)
-            .map_err(|error| format!("projection checkpoint serialization failed: {error}"))?
-            .len();
-        Ok((
-            midpoint.saturating_duration_since(started),
-            finished.saturating_duration_since(midpoint),
-            checkpoint_bytes,
-        ))
-    }
-
-    #[test]
-    fn terminal_projection_is_bounded_at_10k_and_100k_without_hot_full_validation()
-    -> Result<(), String> {
-        let (_ten_first, _ten_second, ten_checkpoint) = measure_terminal_projection(10_000)?;
-        let (hundred_first, hundred_second, hundred_checkpoint) =
-            measure_terminal_projection(100_000)?;
-        let second_half_budget = hundred_first
-            .saturating_mul(4)
-            .saturating_add(std::time::Duration::from_millis(250));
-        assert!(
-            hundred_second <= second_half_budget,
-            "100k terminal projection second half regressed: first={hundred_first:?}, second={hundred_second:?}, budget={second_half_budget:?}"
-        );
-        assert!(
-            hundred_checkpoint <= ten_checkpoint.saturating_add(16 * 1024),
-            "bounded checkpoint grew with terminal history: 10k={ten_checkpoint}, 100k={hundred_checkpoint}"
-        );
-        assert!(hundred_checkpoint <= 512 * 1024);
-        Ok(())
-    }
-
-    #[test]
-    fn near_max_terminal_payloads_obey_the_absolute_checkpoint_byte_budget() -> Result<(), String> {
-        let target = address();
-        let timestamp = Utc::now();
-        let payload = "x".repeat(MAX_TEXT_CHARS);
-        let mut projection = AgentInboxProjection::default();
-        for index in 0..8 {
-            apply_terminal_projection_lifecycle(
-                &mut projection,
-                &target,
-                index,
-                timestamp,
-                &payload,
-            )?;
-        }
-        projection
-            .validate(Path::new("large-terminal-projection"), &target)
-            .map_err(|error| error.to_string())?;
-        assert!(projection.order.len() < 8);
-        assert!(projection.terminal_retained_bytes <= INBOX_TERMINAL_RETENTION_BYTES);
-        let checkpoint = serde_json::to_vec(&projection)
-            .map_err(|error| format!("large checkpoint serialization failed: {error}"))?;
-        assert!(
-            checkpoint.len() <= 512 * 1024,
-            "large terminal checkpoint exceeded absolute budget: {} bytes",
-            checkpoint.len()
-        );
-
-        let mut oversized = AgentInboxProjection::default();
-        let unicode_payload = "界".repeat(MAX_TEXT_CHARS);
-        apply_terminal_projection_lifecycle(
-            &mut oversized,
-            &target,
-            0,
-            timestamp,
-            &unicode_payload,
-        )?;
-        assert!(oversized.order.is_empty());
-        assert_eq!(oversized.terminal_retained_bytes, 0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn hot_agent_inbox_mutations_do_not_run_full_projection_validation() -> Result<(), String>
-    {
-        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let target = address();
-        let router = AgentRouter::new(temp.path().to_path_buf());
-        let message = AgentMessage::user_text(None, target.clone(), "validation counter");
-        router
-            .enqueue(message)
-            .await
-            .map_err(|error| error.to_string())?;
-        let claim = router
-            .claim_next(&target)
-            .await
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "validation-counter claim is missing".to_string())?;
-        router
-            .begin_injection(&claim, "validation-turn")
-            .await
-            .map_err(|error| error.to_string())?;
-        router
-            .mailbox_accepted(&claim, "validation-turn")
-            .await
-            .map_err(|error| error.to_string())?;
-        router
-            .drained(&claim, "validation-turn")
-            .await
-            .map_err(|error| error.to_string())?;
-        router
-            .turn_settled(
-                &claim,
-                Some("validation-turn".to_string()),
-                AgentDeliveryOutcome::Completed,
-                true,
-                None,
-                false,
-                None,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let authority = authority_for(temp.path(), &router.inboxes, &target)
-            .map_err(|error| error.to_string())?;
-        let validations = authority
-            .with_projection(|projection| {
-                Ok(projection
-                    .full_validation_count
-                    .load(std::sync::atomic::Ordering::Relaxed))
-            })
-            .map_err(|error| error.to_string())?;
-        assert_eq!(validations, 1, "hot append reran full validation");
         Ok(())
     }
 

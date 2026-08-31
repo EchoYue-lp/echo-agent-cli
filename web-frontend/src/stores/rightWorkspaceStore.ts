@@ -1,12 +1,7 @@
 import { create } from 'zustand';
 
 export type RightWorkspaceTab =
-  | 'tasks'
-  | 'analysis'
-  | 'research'
-  | 'browser'
-  | 'files'
-  | 'automation';
+  'tasks' | 'analysis' | 'research' | 'browser' | 'files' | 'automation';
 export type AutomationView = 'workflows' | 'extract';
 
 interface RightWorkspaceState {

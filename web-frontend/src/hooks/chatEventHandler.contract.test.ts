@@ -298,7 +298,7 @@ describe('canonical chat event v4 contract', () => {
     );
   });
 
-  it('renders runtime cell truth from an Awaiter Ready fact after turn settlement', () => {
+  it('renders runtime cell truth from a command-cell-watch Ready fact after turn settlement', () => {
     const base = fixture[0];
     if (!base) throw new Error('contract fixture is incomplete');
     const refs = context();
@@ -311,12 +311,12 @@ describe('canonical chat event v4 contract', () => {
       refs
     );
     const terminalCell = {
-      cell_id: 'cell-awaiter',
+      cell_id: 'cell-command_cell_watch',
       name: 'long test',
       command_hash: 'sha256:test',
       turn_id: base.turn_id,
       execution_id: 'cell-execution',
-      call_id: 'call-awaiter',
+      call_id: 'call-command_cell_watch',
       phase: 'succeeded' as const,
       terminal_cause: 'exited' as const,
       terminal_message: null,
@@ -336,15 +336,13 @@ describe('canonical chat event v4 contract', () => {
         ...base,
         sequence: 3,
         payload: {
-          source: 'awaiter_result_ready',
+          source: 'command_cell_watch_ready',
           event: {
             result: {
               receipt: {
-                execution_id: 'awaiter-execution',
-                control_task_id: 'awaiter:cell-awaiter:1',
-                attempt: 1,
+                execution_id: 'command_cell_watch-execution',
                 watch_generation: 1,
-                cell_id: 'cell-awaiter',
+                cell_id: 'cell-command_cell_watch',
                 workspace_id: base.workspace_id,
                 conversation_id: base.conversation_id ?? 'conversation',
                 run_id: null,
@@ -354,8 +352,6 @@ describe('canonical chat event v4 contract', () => {
                 settled_at: '2026-08-22T00:00:01Z',
               },
               cell: terminalCell,
-              awaiter_status: 'completed',
-              awaiter_summary: 'prose incorrectly says failed',
             },
           },
         },
@@ -363,7 +359,7 @@ describe('canonical chat event v4 contract', () => {
       refs
     );
     expect(useChatStore.getState().messages.at(-1)?.content).toContain(
-      'cell cell-awaiter succeeded'
+      'cell cell-command_cell_watch succeeded'
     );
   });
 

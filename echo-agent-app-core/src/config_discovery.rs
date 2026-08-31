@@ -16,7 +16,7 @@
 //! | `project.md` | `<project-root>/.eko/` | Project-level instructions |
 //! | `local.md` | `<cwd>/.eko/` | Local directory instructions |
 //! | `plugin.json` | Plugin directories | Agent Plugin manifests |
-//! | `.workspace.json` | Workspace directories | Workspace metadata |
+//! | `.eko/workspace.json` | Workspace directories | Workspace metadata |
 //! | `.lsp.yaml` | Project root | LSP server configuration |
 
 use std::path::PathBuf;
@@ -363,10 +363,10 @@ impl ConfigDiscovery {
         }
         if let Ok(entries) = std::fs::read_dir(&ws_dir) {
             for entry in entries.flatten() {
-                let ws_file = entry.path().join(".workspace.json");
+                let ws_file = crate::workspace::layout::WorkspaceLayout::manifest(&entry.path());
                 if ws_file.exists() {
                     inv.workspace_configs.push(ConfigFile {
-                        name: format!(".workspace.json ({})", entry.file_name().to_string_lossy()),
+                        name: format!("workspace.json ({})", entry.file_name().to_string_lossy()),
                         path: ws_file,
                         scope: ConfigScope::Global,
                         category: ConfigCategory::Workspace,

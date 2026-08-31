@@ -487,7 +487,7 @@ async fn run_analysis_with_runtime(
         match prepared_runtime {
             Ok(runtime) => Some(runtime),
             Err(error) => {
-                let terminal = terminal_from_runtime_error(&error);
+                let terminal = classify_runtime_error(&error);
                 return settle_analysis_run(
                     workspace_root,
                     analysis_id,
@@ -1111,7 +1111,7 @@ fn run_status(result: &echo_agent::tools::ToolResult) -> AnalysisRunStatus {
 }
 
 fn terminal_from_react_error(error: &echo_agent::error::ReactError) -> AnalysisTerminal {
-    let failure = echo_agent::error::AgentFailure::from_react_error(error);
+    let failure = echo_agent::error::AgentFailure::from(error);
     let status = match failure.terminal_kind {
         echo_agent::error::AgentTerminalKind::Cancelled => AnalysisRunStatus::Cancelled,
         echo_agent::error::AgentTerminalKind::TimedOut => AnalysisRunStatus::TimedOut,
@@ -1128,7 +1128,7 @@ fn terminal_from_react_error(error: &echo_agent::error::ReactError) -> AnalysisT
     }
 }
 
-fn terminal_from_runtime_error(
+fn classify_runtime_error(
     error: &crate::analysis_runtime::AnalyticsRuntimeError,
 ) -> AnalysisTerminal {
     let status = match error {

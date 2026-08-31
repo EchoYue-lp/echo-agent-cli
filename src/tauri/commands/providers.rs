@@ -120,7 +120,7 @@ fn resolve_connection_probe(
     base_url: Option<String>,
     api_protocol: LlmApiProtocol,
     input_modalities: Vec<ModelInputModality>,
-) -> ConnectionProbe {
+) -> Result<ConnectionProbe, IpcError> {
     let provider_config = app_config.model_providers.get(&provider);
     let auth = resolve_auth_token(api_key.as_deref(), provider_config);
     let base_url = base_url
@@ -144,10 +144,11 @@ fn resolve_connection_probe(
         enabled: true,
         ..ConfiguredModel::default()
     }];
-    ConnectionProbe {
-        runtime: model_config::resolve_runtime_model(&probe_config, Some(&probe_id)),
+    Ok(ConnectionProbe {
+        runtime: model_config::resolve_runtime_model(&probe_config, Some(&probe_id))
+            .map_err(|error| IpcError::Validation(error.to_string()))?,
         auth,
-    }
+    })
 }
 
 #[tauri::command]
@@ -292,8 +293,13 @@ pub async fn set_thinking(
     let requested = spec.trim().to_ascii_lowercase();
     let available = {
         let config = state.app_state.config.app_config.read().await;
-        let runtime = echo_agent_app_core::api::model_config::resolve_runtime_model(&config, None);
-        echo_agent_app_core::api::model_config::thinking_level_specs(runtime.thinking_profile)
+        echo_agent_app_core::api::model_config::resolve_runtime_model(&config, None)
+            .map(|runtime| {
+                echo_agent_app_core::api::model_config::thinking_level_specs(
+                    runtime.thinking_profile,
+                )
+            })
+            .unwrap_or_default()
     };
     if requested != "auto" && !available.iter().any(|level| level == &requested) {
         return Err(IpcError::Validation(format!(
@@ -368,7 +374,7 @@ async fn test_connection_inner(
         base_url,
         api_protocol,
         input_modalities,
-    );
+    )?;
     if probe.runtime.requires_api_key && probe.auth.token.is_empty() {
         return Ok(serde_json::json!({
             "success": false,
@@ -420,7 +426,8 @@ mod tests {
             Some("https://api.openai.com/v1/responses".to_string()),
             LlmApiProtocol::Responses,
             echo_agent::llm::ModelInputModality::text_only(),
-        );
+        )
+        .map_err(|error| error.to_string())?;
         let probe_error = prepare_runtime_llm(&probe.runtime)
             .err()
             .ok_or_else(|| "invalid connection probe unexpectedly passed preflight".to_string())?;

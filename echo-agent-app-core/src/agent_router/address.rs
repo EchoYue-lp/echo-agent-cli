@@ -4,7 +4,7 @@
 // write conversation transcripts and does not own an Agent executor; later
 // delivery stages must invoke the existing chat driver for the target host.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,10 +13,13 @@ use std::sync::Mutex as StdMutex;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use echo_agent::retry::RetryPolicy;
+#[cfg(test)]
+use echo_agent::delivery::DeliveryEvent;
+use echo_agent::delivery::{DeliveryLedgerError, DeliverySettlement, DeliveryTransition};
 use echo_agent::state::journal::{
-    CheckpointApplyStatus, CheckpointStore, CheckpointedApplyError, CheckpointedReducer,
-    EventJournal, EventReducer, FileCheckpointStore, JournalBatchAppendError, JournalBatchLookup,
-    JournalDurabilityStatus, PreparedJournalBatch, SegmentedFileEventJournal,
+    CheckpointApplyStatus, CheckpointStore, CheckpointedApplyError,
+    EventJournal, FileCheckpointStore, JournalBatchAppendError,
+    JournalBatchLookup, PreparedJournalBatch, SegmentedFileEventJournal,
 };
 use echo_agent::utils::fs::FileDurability;
 use fs2::FileExt;
@@ -69,6 +72,12 @@ impl AgentAddress {
             )));
         }
         Ok(())
+    }
+}
+
+impl echo_agent::delivery::DeliveryRoute for AgentAddress {
+    fn validate(&self) -> echo_agent::error::Result<()> {
+        AgentAddress::validate(self).map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
     }
 }
 
@@ -295,67 +304,9 @@ impl AgentMessage {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentDeliveryPhase {
-    Persisted,
-    Claimed,
-    MailboxAccepted,
-    Drained,
-    TurnSettled,
-}
-
-impl AgentDeliveryPhase {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Persisted => "persisted",
-            Self::Claimed => "claimed",
-            Self::MailboxAccepted => "mailbox_accepted",
-            Self::Drained => "drained",
-            Self::TurnSettled => "turn_settled",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentDeliveryOutcome {
-    Completed,
-    Failed,
-    Cancelled,
-    Dropped,
-    OutcomeUnknown,
-}
-
-impl AgentDeliveryOutcome {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::Dropped => "dropped",
-            Self::OutcomeUnknown => "outcome_unknown",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum AgentDeliveryDurability {
-    Unconfirmed,
-    Confirmed,
-    Degraded { error: String },
-}
-
-impl From<JournalDurabilityStatus> for AgentDeliveryDurability {
-    fn from(value: JournalDurabilityStatus) -> Self {
-        match value {
-            JournalDurabilityStatus::Unconfirmed => Self::Unconfirmed,
-            JournalDurabilityStatus::Confirmed => Self::Confirmed,
-            JournalDurabilityStatus::Degraded { error } => Self::Degraded { error },
-        }
-    }
-}
+pub use echo_agent::delivery::DeliveryOutcome as AgentDeliveryOutcome;
+pub use echo_agent::delivery::DeliveryPhase as AgentDeliveryPhase;
+pub use echo_agent::state::journal::JournalDurabilityStatus as AgentDeliveryDurability;
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentDeliveryReceipt {
@@ -372,42 +323,13 @@ pub struct AgentDeliveryReceipt {
     pub durability: AgentDeliveryDurability,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgentDeliveryClaim {
-    pub message: AgentMessage,
-    pub attempt_id: String,
-    pub attempt: u32,
-    pub claimed_at: DateTime<Utc>,
-}
+pub type AgentDeliveryClaim =
+    echo_agent::delivery::DeliveryClaim<AgentAddress, AgentMessage>;
+pub type AgentDeliveryInFlight =
+    echo_agent::delivery::DeliveryInFlight<AgentAddress, AgentMessage>;
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct AgentDeliveryInFlight {
-    pub claim: AgentDeliveryClaim,
-    pub phase: AgentDeliveryPhase,
-    pub effect_started: bool,
-    pub turn_id: String,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgentDeliveryRecord {
-    pub message: AgentMessage,
-    pub message_id: String,
-    pub target: AgentAddress,
-    pub phase: AgentDeliveryPhase,
-    pub outcome: Option<AgentDeliveryOutcome>,
-    pub drained: bool,
-    pub reason: Option<String>,
-    pub persisted_at: DateTime<Utc>,
-    pub attempt_id: Option<String>,
-    pub attempt: u32,
-    pub claimed_at: Option<DateTime<Utc>>,
-    pub mailbox_accepted_at: Option<DateTime<Utc>>,
-    pub drained_at: Option<DateTime<Utc>>,
-    pub turn_settled_at: Option<DateTime<Utc>>,
-    pub turn_id: Option<String>,
-    pub reply_message_id: Option<String>,
-    pub next_attempt_at: Option<DateTime<Utc>>,
-}
+pub type AgentDeliveryRecord =
+    echo_agent::delivery::DeliveryRecord<AgentAddress, AgentMessage>;
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentEndpoint {
@@ -415,57 +337,4 @@ pub struct AgentEndpoint {
     pub workspace_name: String,
     pub conversation_title: Option<String>,
     pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
-enum AgentInboxEvent {
-    Persisted {
-        message: AgentMessage,
-        persisted_at: DateTime<Utc>,
-    },
-    Claimed {
-        message_id: String,
-        attempt_id: String,
-        attempt: u32,
-        claimed_at: DateTime<Utc>,
-    },
-    EffectStarted {
-        message_id: String,
-        attempt_id: String,
-        started_at: DateTime<Utc>,
-        turn_id: String,
-    },
-    MailboxAccepted {
-        message_id: String,
-        attempt_id: String,
-        accepted_at: DateTime<Utc>,
-        turn_id: String,
-    },
-    Drained {
-        message_id: String,
-        attempt_id: String,
-        drained_at: DateTime<Utc>,
-        turn_id: String,
-    },
-    Deferred {
-        message_id: String,
-        attempt_id: String,
-        deferred_at: DateTime<Utc>,
-        reason: String,
-        #[serde(default)]
-        next_attempt_at: Option<DateTime<Utc>>,
-    },
-    TurnSettled {
-        message_id: String,
-        attempt_id: String,
-        settled_at: DateTime<Utc>,
-        turn_id: Option<String>,
-        outcome: AgentDeliveryOutcome,
-        drained: bool,
-        reason: Option<String>,
-        retryable: bool,
-        next_attempt_at: Option<DateTime<Utc>>,
-        reply_message_id: Option<String>,
-    },
 }

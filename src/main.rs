@@ -313,11 +313,12 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 .configured_models
                 .iter()
                 .filter(|model| model.enabled)
-                .map(|model| {
+                .filter_map(|model| {
                     echo_agent_app_core::api::model_config::resolve_runtime_model(
                         &app_config,
                         Some(&model.id),
                     )
+                    .ok()
                 })
                 .collect(),
             runtime.browser_runtime.clone(),
@@ -534,9 +535,20 @@ mod tests {
             execution_scope: None,
         };
         let mut app_config = config::EkoConfig::default();
-        app_config.model.provider = "local-test".to_string();
-        app_config.model.name = "test-model".to_string();
-        app_config.model.base_url = Some("http://127.0.0.1:11434/v1/chat/completions".to_string());
+        app_config.model.default_model_id = Some("local-test:test-model".to_string());
+        app_config.model_providers.insert(
+            "local-test".to_string(),
+            config::ModelProviderConfig {
+                base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+                ..Default::default()
+            },
+        );
+        app_config.configured_models.push(config::ConfiguredModel {
+            id: "local-test:test-model".to_string(),
+            provider: "local-test".to_string(),
+            model: "test-model".to_string(),
+            ..Default::default()
+        });
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(runtime) => runtime,
             Err(error) => {

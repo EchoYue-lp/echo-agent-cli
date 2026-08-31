@@ -32,8 +32,10 @@ interface AgentMessageDialogProps {
 const phaseLabels: Record<Exclude<AgentDeliveryPhase, 'turn_settled'>, string> = {
   persisted: '已持久化',
   claimed: '已认领',
+  effect_started: '已开始执行',
   mailbox_accepted: '邮箱已接收',
   drained: '已进入上下文',
+  deferred: '等待重试',
 };
 
 const outcomeLabels: Record<AgentDeliveryOutcome, string> = {

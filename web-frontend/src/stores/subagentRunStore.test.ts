@@ -57,12 +57,12 @@ describe('subagentRunStore terminal result', () => {
     const run = useSubagentRunStore.getState().runs[subagentRunStoreKey('run-1', 'task-1:1')];
     expect(run?.status).toBe('timed_out');
     expect(run?.finalOutput).toBe('partial report body');
-    expect(run?.result?.summary).toBe(event.summary);
-    expect(run?.result?.artifacts[0]?.path).toBe('/tmp/report.json');
-    expect(run?.result?.artifacts[0]?.bytes).toBe(42n);
-    expect(run?.result?.verification).toEqual(event.verification);
-    expect(run?.result?.remaining_work).toEqual(event.remaining_work);
-    expect(run?.result?.touched_files).toEqual(event.touched_files);
+    expect(run?.outcome?.summary).toBe(event.summary);
+    expect(run?.outcome?.artifacts[0]?.path).toBe('/tmp/report.json');
+    expect(run?.outcome?.artifacts[0]?.bytes).toBe(42n);
+    expect(run?.outcome?.verification).toEqual(event.verification);
+    expect(run?.outcome?.remaining_work).toEqual(event.remaining_work);
+    expect(run?.outcome?.touched_files).toEqual(event.touched_files);
   });
 
   it('keeps a terminal Subagent terminal when a duplicate started event arrives', () => {
@@ -91,7 +91,7 @@ describe('subagentRunStore terminal result', () => {
     const completed =
       useSubagentRunStore.getState().runs[subagentRunStoreKey('run-merge', 'task-merge:1')];
     expect(completed?.status).toBe('completed');
-    expect(completed?.result?.summary).toBe('implementation finished');
+    expect(completed?.outcome?.summary).toBe('implementation finished');
   });
 
   it('keeps retry attempts in separate SubagentRun records', () => {
@@ -213,7 +213,7 @@ describe('subagentRunStore terminal result', () => {
           execution_id: 'run-restored:task-analysis:4:1',
           status: 'completed',
           full_output: 'CLI analysis complete',
-          result: {
+          outcome: {
             contract_version: 1,
             status: 'completed',
             summary: 'CLI analysis complete',
@@ -244,7 +244,7 @@ describe('subagentRunStore terminal result', () => {
       startedAt: Date.parse('2026-07-30T01:02:03Z'),
       finalOutput: 'CLI analysis complete',
     });
-    expect(restored?.result?.summary).toBe('CLI analysis complete');
-    expect(restored?.result?.touched_files.read).toEqual(['src/cli']);
+    expect(restored?.outcome?.summary).toBe('CLI analysis complete');
+    expect(restored?.outcome?.touched_files.read).toEqual(['src/cli']);
   });
 });

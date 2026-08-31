@@ -193,10 +193,10 @@ pub struct WorkspaceIoInvocation {
 }
 
 impl WorkspaceIoInvocation {
-    /// Rebuild the descriptor at the `task_execute` adapter boundary.
+    /// Recover the workspace scope carried by a framework tool context.
     /// Formal writer Subagents cannot call task-control tools, so this path
     /// only accepts the planning Agent's non-isolated product-data root.
-    pub(crate) fn from_task_tool_context(context: &echo_agent::tools::ToolContext) -> Option<Self> {
+    pub(crate) fn from_context(context: &echo_agent::tools::ToolContext) -> Option<Self> {
         let data_root = context.working_dir.clone()?;
         let resource_guards = context
             .resource_guards
@@ -210,7 +210,7 @@ impl WorkspaceIoInvocation {
         })
     }
 
-    pub(crate) fn from_tool_context_for_identity(
+    pub(crate) fn scoped_to_identity(
         context: &echo_agent::tools::ToolContext,
         expected: &crate::workspace::WorkspaceIoIdentity,
     ) -> Option<Self> {

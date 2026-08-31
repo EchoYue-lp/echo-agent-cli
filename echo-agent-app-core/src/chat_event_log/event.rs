@@ -111,29 +111,29 @@ struct PersistedChatEvent {
 }
 
 type StreamJournal = SegmentedFileEventJournal<PersistedChatEvent>;
-type StartedAwaiterDelivery = (
+type StartedCommandCellWatchDelivery = (
     String,
     Option<String>,
     String,
-    crate::tasks::task_runtime::command_cells::AwaiterResultAcknowledgement,
+    crate::tasks::task_runtime::command_cells::CommandCellWatchAcknowledgement,
 );
 
 #[derive(Debug, Default)]
 struct RetentionPins {
     cursor: u64,
-    pending_awaiters: HashMap<String, u64>,
-    started_awaiters: HashMap<
+    pending_command_cell_watches: HashMap<String, u64>,
+    started_command_cell_watches: HashMap<
         String,
         (
             u64,
-            crate::tasks::task_runtime::command_cells::AwaiterResultAcknowledgement,
+            crate::tasks::task_runtime::command_cells::CommandCellWatchAcknowledgement,
         ),
     >,
     active_cells: HashMap<String, u64>,
     conversation_inputs: HashMap<String, FoldedConversationInput>,
     queue_order: Vec<String>,
     queue_revision: u64,
-    awaiter_facts: HashMap<String, u64>,
+    command_cell_watch_facts: HashMap<String, u64>,
     earliest: Option<u64>,
     #[cfg(test)]
     recovered_records: usize,

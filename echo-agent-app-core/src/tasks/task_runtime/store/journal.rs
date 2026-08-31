@@ -344,10 +344,14 @@ fn prepare_revisioned_graph_commit(
     }
     if effects.reordered {
         for (position, task) in next.snapshot.tasks.iter_mut().enumerate() {
-            let mut extension: EkoTaskExtension =
-                serde_json::from_value(task.spec.extension.clone())?;
+            let mut extension: EkoTaskExtension = task
+                .spec
+                .extension_as()
+                .map_err(StoreError::InvalidPlan)?;
             extension.sort_order = i64::try_from(position).unwrap_or(i64::MAX);
-            task.spec.extension = serde_json::to_value(extension)?;
+            task.spec = task.spec.clone().with_extension(extension).map_err(|error| {
+                StoreError::InvalidPlan(format!("task extension update failed: {error}"))
+            })?;
         }
     }
     let mut specifications = Vec::with_capacity(next.snapshot.tasks.len());
@@ -359,7 +363,9 @@ fn prepare_revisioned_graph_commit(
             )));
         }
         specifications
-            .push(EkoTaskSpec::from_task_spec(task.spec.clone()).map_err(StoreError::InvalidPlan)?);
+            .push(
+                EkoTaskSpec::try_from(task.spec.clone()).map_err(StoreError::InvalidPlan)?,
+            );
     }
     if expected_revision.is_none()
         && next.snapshot.tasks.iter().any(|task| {

@@ -4,17 +4,9 @@ description: 探索用户意图、需求和设计，把想法变成完整设计�
 metadata:
   category: methodology
   source: superpowers
-  upstream-version: "6.0.3"
+  upstream-version: 6.0.3
   author: obra
-  tags: [design, planning, workflow]
-triggers:
-  - 头脑风暴
-  - 设计
-  - brainstorm
-  - 做个方案
-  - 设计一下
-  - 规划方案
-allowed-tools: []
+  tags: design, planning, workflow
 ---
 
 # Brainstorming Ideas Into Designs

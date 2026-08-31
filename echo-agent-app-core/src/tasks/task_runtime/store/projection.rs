@@ -52,8 +52,8 @@ fn apply_subagent_projection_event(
             };
             snapshot.run.status = json_string(recovered, "status")
                 .as_deref()
-                .and_then(SubagentRunStatus::from_str)
-                .unwrap_or(SubagentRunStatus::Failed);
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(SubagentStatus::Failed);
         }
     }
     let Some(execution_id) = event.step_id.clone() else {
@@ -144,23 +144,23 @@ fn apply_subagent_projection_event(
         RuntimeEventKind::SubagentReleased => {
             if let Some(status) = json_string(&event.payload, "status")
                 .as_deref()
-                .and_then(SubagentRunStatus::from_str)
+                .and_then(|value| value.parse().ok())
             {
                 snapshot.run.status = status;
             }
             if let Some(result) = event
                 .payload
-                .get("result")
+                .get("outcome")
                 .cloned()
-                .and_then(|value| serde_json::from_value::<SubagentTaskResult>(value).ok())
+                .and_then(|value| serde_json::from_value::<SubagentOutcome>(value).ok())
             {
-                snapshot.run.result = Some(result);
+                snapshot.run.outcome = Some(result);
             }
             if let Some(usage) = event
                 .payload
                 .get("usage")
                 .cloned()
-                .and_then(|value| serde_json::from_value::<SubagentRunUsage>(value).ok())
+                .and_then(|value| serde_json::from_value::<ExecutionUsage>(value).ok())
             {
                 snapshot.run.usage = usage;
             }

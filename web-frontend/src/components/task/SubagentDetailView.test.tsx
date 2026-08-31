@@ -34,11 +34,12 @@ describe('SubagentDetailView', () => {
       status: 'completed',
       startedAt: 1,
       finalOutput: `${actualResult}\n\n## Result\n\n\`\`\`json\n{"contract_version":1,"summary":"done"}\n\`\`\``,
-      result: {
+      outcome: {
         contract_version: 0,
         status: 'completed',
         summary: '见上方分析结果。',
         artifacts: [],
+        evidence: [],
         verification: [],
         remaining_work: [],
         touched_files: { read: ['Cargo.toml'], written: [] },

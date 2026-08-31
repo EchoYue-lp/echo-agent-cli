@@ -12,13 +12,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Made framework `TaskStatus` the sole PlanTask execution authority, exposed
   immutable `PlanRevision` artifacts to surfaces, and reduced Todo state to a
   read-only projection with no reverse mutation path.
+- **Skill catalog 收缩与官方标准化**: 全部捆绑 `SKILL.md` 迁移到 agentskills.io
+  官方标准字段（`allowed-tools` 为空格分隔字符串、`metadata` 仅字符串，Skill 文件不携带
+  Hook 扩展，不引入任何私有扩展命名空间）；路由改为
+  description-driven。catalog 41 → 39：删除 `using-superpowers`（重复全局选技）
+  与 `deep-research`（并入 `web-search` 深度调研模式），补强 `writing-skills` 与
+  `mcp-builder`。新增 `skills_hub::catalog_gate` 门禁测试（零违规 +
+  `BUILTIN_SKILL_NAMES` 一致）与 `skills_hub::policy_contract` 行为级契约测试
+  （disabled 全投影缺席、reload 生效、fail-closed、用户 Skill 不受误伤、同名优先级、
+  路径 canonicalize 边界）。ADR
+  [0033](docs/zh/adr/0033-skill-catalog-contraction-and-official-frontmatter.md)。
+- **Enabled Skill 运行时权威**: `enabled-skills.json` 成为 bundled Skill 的注册
+  权威（ADR
+  [0032](docs/zh/adr/0032-enabled-skill-runtime-authority.md)）；损坏配置
+  fail-closed，builtin/user Skill 来源标记区分，pooled Agent 刷新路径补齐。
 
 ### Added
 
 - **技能分类体系**: 6 个 category（methodology / development / document /
   design / research / automation），按 `skills/<category>/<name>/SKILL.md` 组织。
-- **40+ 技能资产**: superpowers 14 个方法论 + Anthropic 17 个领域技能 +
-  现有 11 个，全部移植到 `skills/<category>/` 目录。
+- **技能资产移植与收缩**: superpowers 方法论/工作流 13 个 + Anthropic 领域技能
+  15 个 + 现有技能，全部移植到 `skills/<category>/` 目录；经本轮质量收缩后
+  最终随附 39 个，见上方 Changed 条目。
 - **方法论 baseline 默认挂载**: 核心 4 个方法论（brainstorming /
   systematic-debugging / verification-before-completion / writing-plans）
   的正文在 SessionStart 时注入 system prompt。

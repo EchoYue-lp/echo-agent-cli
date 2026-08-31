@@ -1,28 +1,11 @@
 ---
 name: paper-reader
-description: >-
-  学术论文深度阅读与分析。当用户需要阅读一篇论文、理解论文内容、
-  分析论文方法论、批判性评估研究质量时激活。
-triggers:
-  - 读论文
-  - 分析论文
-  - 论文解读
-  - 读这篇
-  - paper reading
-  - paper analysis
-  - 方法论
-  - 实验结果
-allowed-tools:
-  - "read_file"
-  - "read_artifact"
-  - "apply_patch"
-  - "web_fetch"
-  - "pdf_fetch"
-  - "extract_pdf"
+description: 学术论文深度阅读与分析。当用户需要阅读一篇论文、理解论文内容、 分析论文方法论、批判性评估研究质量时激活。
+allowed-tools: read_file read_artifact apply_patch web_fetch pdf_fetch extract_pdf
 metadata:
   author: echo-agent-cli
-  version: "1.0.0"
-  tags: "paper, reading, analysis, critical"
+  version: 1.0.0
+  tags: paper, reading, analysis, critical
 ---
 
 ## 学术论文深度阅读

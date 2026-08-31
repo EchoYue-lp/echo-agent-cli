@@ -378,7 +378,7 @@ async fn task_subagent_cursor_survives_store_restart_without_stranded_boundaries
             plan_revision: 1,
             attempt: 1,
             status: "completed",
-            result: None,
+            outcome: None,
             full_output: None,
             usage: None,
             dispatch_hook: false,

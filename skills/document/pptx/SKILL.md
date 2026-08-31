@@ -1,28 +1,15 @@
 ---
 name: pptx
 description: PowerPoint 演示文稿创建、编辑和模板应用
+allowed-tools: shell read_file read_artifact apply_patch
 metadata:
   category: document
   source: anthropic
-  upstream-version: "1.0"
+  upstream-version: '1.0'
   author: anthropic
-  tags: [powerpoint, presentation, office]
-  requires-binaries: "soffice"
-  requires-python-packages: "python-pptx"
-triggers:
-  - PowerPoint
-  - pptx
-  - 演示文稿
-  - 幻灯片
-  - PPT
-allowed-tools: [shell, read_file, read_artifact, apply_patch]
-hooks:
-  UserPromptSubmit:
-    - matcher: "\\.pptx"
-      hooks:
-        - type: activate_skill
-          skill: pptx
-          reason: 检测到 .pptx 文件路径
+  tags: powerpoint, presentation, office
+  requires-binaries: soffice
+  requires-python-packages: python-pptx
 ---
 # PPTX Skill
 

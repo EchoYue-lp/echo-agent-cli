@@ -13,21 +13,10 @@
 //! Static, file-only loader: no DB, no embeddings, no recall. Query-dependent
 //! dynamic memories are handled separately by the layered memory store.
 //!
-//! ## File-name history
-//!
-//! The auto-promoted rules file was originally `AGENTS.md` (a community-standard
-//! name shared with other AI tools). It was renamed to `learned-rules.md` to
-//! make the semantic distinction explicit: this file is *written by EKO's
-//! `RulePromoter`*, not authored by the user. On first load after upgrade,
-//! `load_for` performs a one-time rename of any existing `.eko/AGENTS.md` to
-//! `.eko/learned-rules.md` so users do not lose promoted rules.
-
 use std::path::{Path, PathBuf};
 
 /// File name for auto-promoted rules (evolution system output).
 const LEARNED_RULES_FILE: &str = "learned-rules.md";
-/// Legacy file name; renamed to `LEARNED_RULES_FILE` on first load.
-const LEGACY_AGENTS_FILE: &str = "AGENTS.md";
 
 /// Layered instruction-file loader (user / repository / project / learned / local).
 pub struct InstructionProvider {
@@ -55,14 +44,10 @@ impl InstructionProvider {
     /// `MEMORY.md`. It intentionally does not consult process cwd, so exiting a
     /// workspace can remove project-local instructions deterministically.
     ///
-    /// Performs a one-time migration of any legacy `.eko/AGENTS.md` to
-    /// `.eko/learned-rules.md` (only renames if the new file does not already
-    /// exist; never overwrites user-authored content under the new name).
     pub fn load_for(working_dir: Option<&Path>) -> Self {
         let project_root = working_dir.map(|path| {
             crate::utils::find_project_root(path).unwrap_or_else(|| path.to_path_buf())
         });
-        Self::migrate_legacy_agents_file(project_root.as_deref());
         let project_level = Self::load_project_instructions(project_root.as_deref());
         let user_level = Self::load_user_instructions();
         let repository_level =
@@ -126,37 +111,6 @@ impl InstructionProvider {
             agents_level,
             hot_memory,
         })
-    }
-
-    /// One-time migration: rename `<root>/.eko/AGENTS.md` → `<root>/.eko/learned-rules.md`.
-    ///
-    /// Skipped when: no project root, legacy file absent, or new file already
-    /// exists (user may have created it manually). On any IO error the migration
-    /// is silently skipped — the legacy file remains readable via the fallback
-    /// in [`load_agents_instructions`], so no rules are lost.
-    fn migrate_legacy_agents_file(project_root: Option<&Path>) {
-        let Some(root) = project_root else {
-            return;
-        };
-        let eko_dir = root.join(".eko");
-        let legacy = eko_dir.join(LEGACY_AGENTS_FILE);
-        let new_path = eko_dir.join(LEARNED_RULES_FILE);
-        if !legacy.exists() || new_path.exists() {
-            return;
-        }
-        // rename is atomic on the same filesystem; best-effort, never fatal.
-        match std::fs::rename(&legacy, &new_path) {
-            Ok(()) => tracing::info!(
-                legacy = %legacy.display(),
-                migrated = %new_path.display(),
-                "one-time migration: renamed legacy AGENTS.md to learned-rules.md"
-            ),
-            Err(e) => tracing::warn!(
-                legacy = %legacy.display(),
-                error = %e,
-                "could not rename legacy AGENTS.md; falling back to direct read"
-            ),
-        }
     }
 
     /// Concatenate the instruction tiers and hot-layer memory into a single
@@ -307,25 +261,11 @@ impl InstructionProvider {
 
     /// Load auto-promoted rules from `<project-root>/.eko/learned-rules.md`.
     ///
-    /// Falls back to the legacy `.eko/AGENTS.md` if it still exists (e.g. when
-    /// the one-time rename failed or was skipped). Contains rules that were
-    /// automatically promoted from high-confidence memories by the evolution
-    /// system's `RulePromoter`.
+    /// Contains rules that were automatically promoted from high-confidence
+    /// memories by the evolution system's `RulePromoter`.
     fn load_agents_instructions(project_root: Option<&Path>) -> Option<String> {
         let root = project_root?;
-        let eko_dir = root.join(".eko");
-        // Prefer the new name; fall back to legacy if the migration did not run.
-        let new_path = eko_dir.join(LEARNED_RULES_FILE);
-        let path = if new_path.exists() {
-            new_path
-        } else {
-            let legacy = eko_dir.join(LEGACY_AGENTS_FILE);
-            if legacy.exists() {
-                legacy
-            } else {
-                return None;
-            }
-        };
+        let path = root.join(".eko").join(LEARNED_RULES_FILE);
         let raw = std::fs::read_to_string(path).ok()?;
         Some(crate::utils::strip_yaml_frontmatter(&raw))
     }
@@ -380,12 +320,8 @@ fn strict_learned_rules(project_root: Option<&Path>) -> std::io::Result<Option<S
     let Some(root) = project_root else {
         return Ok(None);
     };
-    let eko_dir = root.join(".eko");
-    let current = eko_dir.join(LEARNED_RULES_FILE);
-    if current.try_exists()? {
-        return strict_optional_text(Some(&current));
-    }
-    strict_optional_text(Some(&eko_dir.join(LEGACY_AGENTS_FILE)))
+    let current = root.join(".eko").join(LEARNED_RULES_FILE);
+    strict_optional_text(Some(&current))
 }
 
 fn strict_repository_instructions(
@@ -458,57 +394,6 @@ mod tests {
     }
 
     #[test]
-    fn migrate_legacy_agents_file_renames_when_new_absent() -> std::io::Result<()> {
-        let temp = tempfile::tempdir()?;
-        let root = temp.path();
-        let eko = root.join(".eko");
-        std::fs::create_dir_all(&eko)?;
-        std::fs::write(eko.join(LEGACY_AGENTS_FILE), "# legacy rules\n")?;
-
-        InstructionProvider::migrate_legacy_agents_file(Some(root));
-
-        assert!(!eko.join(LEGACY_AGENTS_FILE).exists());
-        assert!(eko.join(LEARNED_RULES_FILE).exists());
-        assert_eq!(
-            std::fs::read_to_string(eko.join(LEARNED_RULES_FILE))?,
-            "# legacy rules\n"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn migrate_legacy_agents_file_skips_when_new_exists() -> std::io::Result<()> {
-        // If the user already created learned-rules.md, the legacy file is left
-        // in place rather than clobbering their content.
-        let temp = tempfile::tempdir()?;
-        let root = temp.path();
-        let eko = root.join(".eko");
-        std::fs::create_dir_all(&eko)?;
-        std::fs::write(eko.join(LEGACY_AGENTS_FILE), "legacy")?;
-        std::fs::write(eko.join(LEARNED_RULES_FILE), "new")?;
-
-        InstructionProvider::migrate_legacy_agents_file(Some(root));
-
-        assert_eq!(
-            std::fs::read_to_string(eko.join(LEARNED_RULES_FILE))?,
-            "new"
-        );
-        assert!(eko.join(LEGACY_AGENTS_FILE).exists());
-        Ok(())
-    }
-
-    #[test]
-    fn migrate_legacy_agents_file_noop_without_legacy() -> std::io::Result<()> {
-        let temp = tempfile::tempdir()?;
-        let root = temp.path();
-        std::fs::create_dir_all(root.join(".eko"))?;
-        // No legacy file, no new file — must not create anything.
-        InstructionProvider::migrate_legacy_agents_file(Some(root));
-        assert!(!root.join(".eko").join(LEARNED_RULES_FILE).exists());
-        Ok(())
-    }
-
-    #[test]
     fn load_agents_instructions_reads_new_name() -> std::io::Result<()> {
         let temp = tempfile::tempdir()?;
         let root = temp.path();
@@ -522,17 +407,15 @@ mod tests {
     }
 
     #[test]
-    fn load_agents_instructions_falls_back_to_legacy() -> std::io::Result<()> {
-        // When migration failed or was skipped, the legacy file is still readable.
+    fn learned_rules_do_not_interpret_eko_agents_file() -> std::io::Result<()> {
         let temp = tempfile::tempdir()?;
-        let root = temp.path();
-        let eko = root.join(".eko");
+        let eko = temp.path().join(".eko");
         std::fs::create_dir_all(&eko)?;
-        // Write BOTH (simulating user manually keeping legacy); new name wins.
-        std::fs::write(eko.join(LEARNED_RULES_FILE), "NEW")?;
-        std::fs::write(eko.join(LEGACY_AGENTS_FILE), "LEGACY")?;
-        let provider = InstructionProvider::load_for(Some(root));
-        assert_eq!(provider.agents_level.as_deref(), Some("NEW"));
+        std::fs::write(eko.join("AGENTS.md"), "NOT_LEARNED_RULES")?;
+
+        let provider = InstructionProvider::load_for(Some(temp.path()));
+        assert!(provider.agents_level.is_none());
+        assert!(eko.join("AGENTS.md").exists());
         Ok(())
     }
 

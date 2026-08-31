@@ -1,37 +1,11 @@
 ---
 name: evidence-medicine
-description: >-
-  医学文献检索与循证分析。当用户需要搜索医学文献、进行系统综述、评估临床证据、
-  撰写医学论文或查阅临床试验时激活。使用 PubMed、ClinicalTrials.gov 等数据源，
-  遵循 PICO 框架和 GRADE 证据分级体系。
-triggers:
-  - 医学文献
-  - 临床研究
-  - 护理研究
-  - 临床试验
-  - 系统综述
-  - meta分析
-  - pubmed
-  - medical research
-  - clinical trial
-  - systematic review
-  - 循证医学
-  - 骨科护理
-  - 药物治疗证据
-allowed-tools:
-  - "read_file"
-  - "read_artifact"
-  - "apply_patch"
-  - "web_search"
-  - "web_fetch"
-  - "pubmed_search"
-  - "clinical_trials_search"
-  - "pdf_fetch"
-  - "bibtex_generate"
+description: 医学文献检索与循证分析。当用户需要搜索医学文献、进行系统综述、评估临床证据、 撰写医学论文或查阅临床试验时激活。使用 PubMed、ClinicalTrials.gov 等数据源， 遵循 PICO 框架和 GRADE 证据分级体系。
+allowed-tools: read_file read_artifact apply_patch web_search web_fetch pubmed_search clinical_trials_search pdf_fetch bibtex_generate
 metadata:
   author: echo-agent-cli
-  version: "1.0.0"
-  tags: "medical, evidence, pubmed, clinical, PICO, GRADE"
+  version: 1.0.0
+  tags: medical, evidence, pubmed, clinical, PICO, GRADE
 ---
 
 ## 医学文献检索与循证分析

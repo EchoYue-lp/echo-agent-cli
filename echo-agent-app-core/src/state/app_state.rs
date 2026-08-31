@@ -1356,7 +1356,7 @@ impl AppState {
         let policy_disabled = self.tool_control.snapshot()?.disabled_tools;
         let (definitions, mut disabled) = handle
             .read(|agent| {
-                let runtime = echo_agent::agent::snapshot::AgentRunSnapshot::from_agent(agent);
+                let runtime = echo_agent::agent::AgentRunSnapshot::from_agent(agent);
                 (
                     agent.tool_definitions(),
                     runtime.tools.disabled_tools.clone(),
@@ -1402,10 +1402,16 @@ impl AppState {
         match self.connection.pool.as_ref() {
             Some(pool) => pool.publish_tool_control_generation().await?,
             None => {
-                let disabled = crate::tool_control::disabled_option(&self.tool_control.snapshot()?);
+                let disabled = self.tool_control.snapshot()?.disabled_option();
                 self.connection
                     .primary_agent()
-                    .read(|agent| agent.set_disabled_tools(disabled))
+                    .write(|agent| {
+                        agent.set_disabled_tools(disabled.clone());
+                        crate::subagent_prompt::refresh_primary_system_prompt(
+                            agent,
+                            &disabled.unwrap_or_default(),
+                        );
+                    })
                     .await;
             }
         }
@@ -1421,7 +1427,14 @@ impl AppState {
             .ok_or_else(|| crate::tool_control::ToolControlError::NotRegistered {
                 name: name.to_string(),
             })?;
-        Ok(mutation.into_receipt(effective_enabled))
+        Ok(crate::tool_control::ToolControlReceipt {
+            success: true,
+            name: mutation.name,
+            policy_enabled: mutation.policy_enabled,
+            effective_enabled,
+            changed: mutation.changed,
+            revision: mutation.revision,
+        })
     }
 
     /// 运行一次 MCP 健康检查，更新 `mcp_health` 状态
@@ -1803,6 +1816,11 @@ impl AppState {
                     .write_async(|agent| {
                         Box::pin(async move {
                             agent.set_system_prompt(prompt).await;
+                            let disabled_tools = agent.disabled_tool_names();
+                            crate::subagent_prompt::refresh_primary_system_prompt(
+                                agent,
+                                &disabled_tools,
+                            );
                         })
                     })
                     .await;
@@ -1961,7 +1979,9 @@ impl AppState {
     }
 
     /// Validate both endpoints, then durably queue the message before any
-    /// target wake or Agent execution occurs.
+    /// target wake or Agent execution occurs. The shared AgentRouter facade
+    /// persists through its framework-backed DeliveryLedger; AppState remains
+    /// the EKO owner for endpoint validation and wake scheduling.
     pub async fn send_agent_message_owned(
         self: &Arc<Self>,
         message: crate::agent_router::AgentMessage,
@@ -2603,7 +2623,7 @@ impl AppState {
             settlement.map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
         match settlement.outcome {
             crate::chat_driver::TurnOutcome::Completed
-                if !in_flight.claim.message.expects_reply() =>
+                if !in_flight.claim.payload.expects_reply() =>
             {
                 self.agent_router
                     .turn_settled(
@@ -2684,7 +2704,7 @@ impl AppState {
         let Some(claim) = self.agent_router.claim_next(target).await? else {
             return Ok(true);
         };
-        if claim.message.expects_reply() {
+        if claim.payload.expects_reply() {
             self.agent_router
                 .defer(
                     &claim,
@@ -2694,7 +2714,7 @@ impl AppState {
             return Ok(false);
         }
         let agent = execution.agent();
-        let instruction = render_agent_delivery_instruction(&claim.message);
+        let instruction = render_agent_delivery_instruction(&claim.payload);
         let Some(snapshot) = exact_live_delivery_candidate(active) else {
             self.agent_router
                 .defer(
@@ -2836,7 +2856,7 @@ impl AppState {
         let Some(claim) = self.agent_router.claim_next(target).await? else {
             return Ok(true);
         };
-        let root_turn_id = claim.message.delivery_turn_id();
+        let root_turn_id = claim.payload.delivery_turn_id();
         let lease = match runtime
             .begin_turn(
                 &self.session.foreground_turns,
@@ -2876,7 +2896,7 @@ impl AppState {
             drop(lease);
             return Ok(true);
         }
-        let instruction = render_agent_delivery_instruction(&claim.message);
+        let instruction = render_agent_delivery_instruction(&claim.payload);
         let execution = match runtime.agent_for(&target.conversation_id).await {
             Ok(execution) => execution,
             Err(error) => {
@@ -2924,9 +2944,9 @@ impl AppState {
                 return Ok(true);
             }
         };
-        if claim.message.origin != crate::agent_router::AgentMessageOrigin::User
+        if claim.payload.origin != crate::agent_router::AgentMessageOrigin::User
             || matches!(
-                &claim.message.payload,
+                &claim.payload.payload,
                 crate::agent_router::AgentMessagePayload::Reply { .. }
             )
         {
@@ -3080,9 +3100,9 @@ impl AppState {
         match outcome {
             Ok(crate::chat_driver::TurnOutcome::Completed) => {
                 let reply_message_id = self
-                    .queue_agent_delivery_reply(&claim.message, capture.final_answer())
+                    .queue_agent_delivery_reply(&claim.payload, capture.final_answer())
                     .await;
-                if claim.message.expects_reply() && reply_message_id.is_none() {
+                if claim.payload.expects_reply() && reply_message_id.is_none() {
                     self.agent_router
                         .turn_settled(
                             &claim,
@@ -4274,7 +4294,11 @@ fn prepare_model_mutation(
                 .is_some_and(|runtime| runtime.id == model_id);
             let activates_upserted_model =
                 mutation.set_default || updates_active_model || became_first_default;
-            let runtime = crate::model_config::resolve_runtime_model(&config, Some(&model_id));
+            let runtime = crate::model_config::resolve_runtime_model(
+                &config,
+                Some(&model_id),
+            )
+            .map_err(|error| ModelMutationError::Validation(error.to_string()))?;
             let prepared = crate::infra::prepare_runtime_llm(&runtime)
                 .map_err(ModelMutationError::Validation)?;
             Ok(PreparedModelMutation {
@@ -4329,7 +4353,7 @@ fn prepare_model_mutation(
         }
         ModelMutationRequest::SetDefault(selector) => {
             let selected =
-                crate::model_config::resolve_runtime_model_selector(current, Some(&selector))
+                crate::model_config::resolve_runtime_model(current, Some(&selector))
                     .map_err(|error| ModelMutationError::Validation(error.to_string()))?;
             let mut config = current.clone();
             let runtime = crate::model_config::set_default_model(&mut config, &selected.id)
@@ -4493,7 +4517,7 @@ fn resolve_active_model_runtime(
     } else {
         config.model.default_model_id.as_deref()
     };
-    crate::model_config::resolve_runtime_model_selector(config, selector)
+    crate::model_config::resolve_runtime_model(config, selector)
         .map(Some)
         .map_err(|error| ModelMutationError::Validation(error.to_string()))
 }

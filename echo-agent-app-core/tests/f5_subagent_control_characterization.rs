@@ -16,8 +16,8 @@ use echo_agent_app_core::api::subagent_loader::{SubagentCatalogSnapshot, discove
 use echo_agent_app_core::api::tasks::task_runtime::task_tools::TaskCapabilityCatalog;
 use echo_agent_app_core::api::tasks::task_runtime::{
     AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPatch, TaskPlan,
-    TaskRunStatus, TaskRuntimeStore, TaskUpdateOperation, TaskUpdateRequest, apply_eko_task_update,
-    build_eko_task_revision_service, commit_eko_task_plan, task_goal_sha256,
+    TaskRunStatus, TaskRuntimeStore, TaskUpdateOperation, TaskUpdateRequest, apply_task_update,
+    build_task_revision_service, commit_task_plan, task_goal_sha256,
 };
 use echo_agent_app_core::api::workspace::registry::WorkspaceRegistry;
 
@@ -64,7 +64,7 @@ async fn fixture(
             AttendedMode::Attended,
         )
         .map_err(|error| error.to_string())?;
-    commit_eko_task_plan(store.clone(), task_plan(run_id))
+    commit_task_plan(store.clone(), task_plan(run_id))
         .await
         .map_err(|error| error.to_string())?;
     let router = Arc::new(AgentRouter::new(root.join("router")));
@@ -129,7 +129,7 @@ fn revision_service(store: Arc<TaskRuntimeStore>) -> Arc<echo_agent::tasks::Task
     let definitions = discover_subagents(None, None);
     let catalog = Arc::new(SubagentCatalogSnapshot::from_definitions(&definitions));
     let capabilities = Arc::new(TaskCapabilityCatalog::new(catalog, Vec::<String>::new()));
-    build_eko_task_revision_service(store, capabilities)
+    build_task_revision_service(store, capabilities)
 }
 
 #[tokio::test]
@@ -249,7 +249,7 @@ async fn next_attempt_guidance_is_revision_bound_and_task_update_is_cas_bound() 
     assert!(!first.duplicate);
 
     let revision_service = revision_service(store.clone());
-    let updated = apply_eko_task_update(
+    let updated = apply_task_update(
         &revision_service,
         store.clone(),
         "run-revision",
@@ -296,7 +296,7 @@ async fn next_attempt_guidance_is_revision_bound_and_task_update_is_cas_bound() 
     assert_eq!(second.status, "pending");
     assert!(!second.duplicate);
 
-    let stale_update = apply_eko_task_update(
+    let stale_update = apply_task_update(
         &revision_service,
         store.clone(),
         "run-revision",

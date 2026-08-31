@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use echo_agent::prelude::{MemoryMeta, MemorySource, MemoryType};
 
-use super::executor::TaskRuntimeBlockingAdapter;
+use super::executor::TaskRuntimeOperation;
 use super::store::TaskRuntimeStore;
 
 /// How a run's terminal memory write should be performed (B5.1).
@@ -196,7 +196,7 @@ async fn build_candidates(
         MemoryEvent::RunCompleted { run_id, goal } => {
             // Summarize canonical completed tasks into a decision/fix memory.
             let load_run_id = run_id.clone();
-            let completed = TaskRuntimeBlockingAdapter::new(store.clone())
+            let completed = TaskRuntimeOperation::new(store.clone())
                 .run("load memory candidate tasks", move |store| {
                     let tasks = store
                         .get_plan(&load_run_id)?
@@ -213,7 +213,7 @@ async fn build_candidates(
                         .map(|task| {
                             let summary = store
                                 .get_summary(&load_run_id, &task.id)?
-                                .map(|summary| summary.result.summary)
+                                .map(|summary| summary.outcome.summary)
                                 .filter(|summary| !summary.trim().is_empty())
                                 .or_else(|| fallback_summaries.get(&task.id).cloned())
                                 .unwrap_or_else(|| "(no summary)".to_string());
@@ -485,8 +485,8 @@ mod tests {
     #[tokio::test]
     async fn completed_run_memory_is_recallable_after_settlement() -> Result<(), String> {
         use echo_agent::evolution::{MemoryRecaller, ReviewConfig};
+        use echo_agent::memory::InMemoryStore;
         use echo_agent::memory::store::Store;
-        use echo_agent::workspace::state::memory::store::InMemoryStore;
 
         // Real backing store; keep a clone for direct recall.
         let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());

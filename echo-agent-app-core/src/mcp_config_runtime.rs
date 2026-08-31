@@ -361,6 +361,11 @@ impl ReconcilePlan {
         let mut disconnect = disconnect_names.into_iter().collect::<Vec<_>>();
         disconnect.sort();
         disconnect.dedup();
+        let current_names = current.mcp_servers.keys().collect::<BTreeSet<_>>();
+        // Names still present in the desired snapshot are reconciled through
+        // the framework manager's replacement/unchanged contract. Only stale
+        // names need an explicit disconnect pass.
+        disconnect.retain(|name| !current_names.contains(name));
 
         let mut connect = current
             .mcp_servers
@@ -847,51 +852,54 @@ impl McpConfigRuntime {
         reconcile_cancel: CancellationToken,
         plan: ReconcilePlan,
     ) -> bool {
-        let wait_cancel = reconcile_cancel.clone();
-        let reconcile = agent.write_async(|agent| {
+        agent.write_async(|agent| {
                 Box::pin(async move {
+                    let mut converged = true;
+                    'reconcile: {
                     for name in plan.disconnect {
                         if reconcile_cancel.is_cancelled()
                             || runtime.generation() != generation
                         {
-                            return false;
+                            converged = false;
+                            break 'reconcile;
                         }
-                        agent.disconnect_mcp(&name).await;
+                        if let Err(error) = agent.reconcile_mcp_entry(&name, None).await {
+                            tracing::warn!(server = %name, %error, "MCP user server disconnect failed");
+                        }
                     }
 
                     for (name, entry) in plan.connect {
                         if reconcile_cancel.is_cancelled()
                             || runtime.generation() != generation
                         {
-                            return false;
+                            converged = false;
+                            break 'reconcile;
                         }
-                        let server_config = match entry.to_server_config(&name) {
-                            Ok(config) => config,
-                            Err(error) => {
-                                tracing::warn!(server = %name, %error, "MCP config became invalid before reconcile");
-                                continue;
-                            }
-                        };
-                        let connect = agent.connect_mcp_from_config(server_config);
+                        let connect = agent.reconcile_mcp_entry(&name, Some(entry));
                         tokio::select! {
-                            _ = reconcile_cancel.cancelled() => return false,
+                            _ = reconcile_cancel.cancelled() => {
+                                converged = false;
+                                break 'reconcile;
+                            },
                             result = tokio::time::timeout(MCP_CONNECT_TIMEOUT, connect) => {
                                 match result {
-                                    Ok(Ok(_)) => tracing::info!(server = %name, generation, "MCP user server reconciled"),
+                                    Ok(Ok(change)) => tracing::info!(server = %name, generation, ?change, "MCP user server reconciled"),
                                     Ok(Err(error)) => tracing::warn!(server = %name, %error, "MCP user server connection failed"),
                                     Err(_) => tracing::warn!(server = %name, timeout_secs = MCP_CONNECT_TIMEOUT.as_secs(), "MCP user server connection timed out"),
                                 }
                             }
                         }
                     }
-                    true
+                    }
+                    let disabled_tools = agent.disabled_tool_names();
+                    crate::subagent_prompt::refresh_primary_system_prompt(
+                        agent,
+                        &disabled_tools,
+                    );
+                    converged
                 })
-            });
-        tokio::select! {
-            biased;
-            _ = wait_cancel.cancelled() => false,
-            converged = reconcile => converged,
-        }
+            })
+            .await
     }
 
     #[cfg(test)]
@@ -1170,7 +1178,7 @@ mod tests {
         let current = config_with("user-server", stdio_entry("python3", false));
         let plan = ReconcilePlan::between(&previous, &current);
 
-        assert_eq!(plan.disconnect, vec!["user-server".to_string()]);
+        assert!(plan.disconnect.is_empty());
         assert_eq!(plan.connect.len(), 1);
         assert_eq!(
             plan.connect.first().map(|(name, _)| name.as_str()),
@@ -1190,7 +1198,7 @@ mod tests {
         let current = previous.clone();
         let plan = ReconcilePlan::between(&previous, &current);
 
-        assert_eq!(plan.disconnect, vec!["user-server".to_string()]);
+        assert!(plan.disconnect.is_empty());
         assert_eq!(plan.connect.len(), 1);
         assert_eq!(
             plan.connect.first().map(|(name, _)| name.as_str()),

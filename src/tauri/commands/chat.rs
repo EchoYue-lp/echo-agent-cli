@@ -621,7 +621,7 @@ pub async fn send_chat_message(
     // abandon).
     let in_progress_run = if let Some(store) = scoped_runtime.task_runtime() {
         let conv_id = conversation_id.clone();
-        echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+        echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeOperation::new(store)
             .run_store("load GUI in-progress TaskRun", move |store| {
                 store.find_in_progress_run_by_conversation(&conv_id)
             })

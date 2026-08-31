@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use echo_agent::skills::dependency_probe::missing_binary_names;
+use echo_agent::skills::external::{SkillDocument, validate_skill_dir};
 use serde::{Deserialize, Serialize};
 
 /// 技能市场条目
@@ -193,14 +195,17 @@ impl SkillsHub {
 
     /// 解析技能目录
     fn parse_skill_dir(dir: &Path, skill_md: &Path) -> Option<SkillHubEntry> {
+        if !validate_skill_dir(dir).is_valid() {
+            return None;
+        }
         let content = std::fs::read_to_string(skill_md).ok()?;
-        let (frontmatter, _body, list_fields) = parse_frontmatter(&content);
-
-        let dir_name = dir.file_name()?.to_str()?.to_string();
-
-        // Extract metadata sub-map. The frontmatter parser flattens YAML
-        // nested maps: `metadata:\n  category: x` → key `category` = `x`.
-        let metadata_category = frontmatter.get("category").cloned().unwrap_or_default();
+        let document = SkillDocument::parse_at(&content, skill_md).ok()?;
+        let descriptor = document.into_descriptor();
+        let metadata_category = descriptor
+            .metadata
+            .get("category")
+            .cloned()
+            .unwrap_or_default();
         let source_record = super::install::read_source_record(dir).ok().flatten();
         let metadata_source = source_record
             .as_ref()
@@ -210,18 +215,18 @@ impl SkillsHub {
                     |subdir| format!("git:{}#{subdir}", record.repo_url),
                 )
             })
-            .or_else(|| frontmatter.get("source").cloned());
+            .or_else(|| descriptor.metadata.get("source").cloned());
         let upstream_version = source_record
             .as_ref()
             .map(|record| record.revision.chars().take(12).collect::<String>())
-            .or_else(|| frontmatter.get("upstream-version").cloned());
+            .or_else(|| descriptor.metadata.get("upstream-version").cloned());
 
         // Determine baseline status from enabled-skills.json (checked later)
         let is_baseline = match metadata_category.as_str() {
             "methodology" => {
                 // Core 4 methodology skills default to baseline
                 matches!(
-                    dir_name.as_str(),
+                    descriptor.name.as_str(),
                     "brainstorming"
                         | "systematic-debugging"
                         | "verification-before-completion"
@@ -231,119 +236,32 @@ impl SkillsHub {
             _ => false,
         };
 
-        // 探测 requires-binaries 中本机缺失的(missing_dependencies 链路)。
-        // frontmatter.get 能拿到 "soffice, pdftoppm" 这种逗号串(parse_frontmatter
-        // 已把 metadata 子映射扁平化)。inline 探测,不引入跨 crate 类型耦合。
-        let missing_dependencies = frontmatter
-            .get("requires-binaries")
-            .map(|raw| {
-                raw.split(',')
-                    .map(|s| {
-                        s.trim()
-                            .trim_matches(|c: char| c == '"' || c == '\'')
-                            .to_string()
-                    })
-                    .filter(|n| !n.is_empty() && !binary_available(n))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let missing_dependencies = missing_binary_names(&descriptor);
+
+        let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let is_builtin = canonical_dir.starts_with(super::enabled_skills::builtin_skills_root());
 
         Some(SkillHubEntry {
-            name: frontmatter.get("name").cloned().unwrap_or(dir_name),
-            description: frontmatter.get("description").cloned().unwrap_or_default(),
+            name: descriptor.name,
+            description: descriptor.description,
             path: dir.to_path_buf(),
             category: metadata_category,
             is_baseline,
-            is_builtin: true, // skills in CARGO_MANIFEST_DIR/skills are built-in
+            is_builtin,
             upstream_version,
             source: metadata_source,
-            license: frontmatter.get("license").cloned(),
-            compatibility: frontmatter.get("compatibility").cloned(),
-            version: frontmatter.get("version").cloned(),
-            author: frontmatter.get("author").cloned(),
-            tags: frontmatter
+            license: descriptor.license,
+            compatibility: descriptor.compatibility,
+            version: descriptor.metadata.get("version").cloned(),
+            author: descriptor.metadata.get("author").cloned(),
+            tags: descriptor
+                .metadata
                 .get("tags")
                 .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default(),
-            has_sandbox: frontmatter.contains_key("sandbox"),
-            depends_on: list_fields.get("depends_on").cloned().unwrap_or_default(),
+            has_sandbox: descriptor.sandbox.is_some(),
+            depends_on: descriptor.depends_on,
             missing_dependencies,
         })
     }
-}
-
-/// 探测单个二进制是否在 PATH 上(走 `which` 子进程)。
-/// 与 echo-execution/src/skills/dependency_probe.rs 的 binary_available 同实现,
-/// 此处 inline 一份避免 registry 反向依赖 echo_execution 的类型。
-fn binary_available(name: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// 简单 YAML frontmatter 解析器
-///
-/// 支持 `---` 包围的键值对，格式: `key: value`
-/// Also extracts simple YAML lists (items starting with `  - value`) into `list_fields`.
-fn parse_frontmatter(
-    content: &str,
-) -> (
-    HashMap<String, String>,
-    String,
-    HashMap<String, Vec<String>>,
-) {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        return (HashMap::new(), content.to_string(), HashMap::new());
-    }
-
-    let after_delim = &trimmed[3..];
-    let end = after_delim.find("---").unwrap_or(after_delim.len());
-    let fm_str = &after_delim[..end];
-    let body = after_delim.get(end + 3..).unwrap_or("").trim().to_string();
-
-    let mut map = HashMap::new();
-    let mut lists: HashMap<String, Vec<String>> = HashMap::new();
-    let mut current_list_key: Option<String> = None;
-
-    for line in fm_str.lines() {
-        let trimmed_line = line.trim();
-        if trimmed_line.is_empty() || trimmed_line.starts_with('#') {
-            continue;
-        }
-
-        // Check if this is a list item (starts with `- `)
-        if let Some(stripped) = trimmed_line.strip_prefix("- ") {
-            if let Some(ref key) = current_list_key {
-                let val = stripped
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string();
-                if !val.is_empty() {
-                    lists.entry(key.clone()).or_default().push(val);
-                }
-            }
-            continue;
-        }
-
-        // Regular key: value line
-        current_list_key = None;
-        if let Some((k, v)) = line.split_once(':') {
-            let key = k.trim().to_string();
-            let val = v.trim().trim_matches('"').trim_matches('\'').to_string();
-            if val.is_empty() {
-                // This might be a list key (value on subsequent lines)
-                current_list_key = Some(key.clone());
-                lists.insert(key.clone(), Vec::new());
-            } else {
-                map.insert(key, val);
-            }
-        }
-    }
-    (map, body, lists)
 }

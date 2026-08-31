@@ -18,7 +18,7 @@ struct ChannelSinkBudget {
     pending_token: String,
 }
 
-/// Ephemeral bounded adapter over the canonical journal and tool projection.
+/// Ephemeral bounded operation boundary over the canonical journal and tool projection.
 pub(super) struct ChannelSurfaceSink {
     tx: tokio::sync::mpsc::Sender<ChannelRenderEvent>,
     cancel: echo_agent::agent::CancellationToken,

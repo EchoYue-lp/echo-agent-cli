@@ -35,7 +35,7 @@ where
         + Send
         + 'static,
 {
-    echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+    echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeOperation::new(store)
         .run_store(operation, function)
         .await
         .map_err(|error| error.to_string())

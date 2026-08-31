@@ -1168,11 +1168,11 @@ mod tests {
             .task_runtime()
             .await
             .map_err(|error| error.to_string())?;
-        let adapter = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone());
+        let operation = crate::tasks::task_runtime::TaskRuntimeOperation::new(store.clone());
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let caller = tokio::spawn(async move {
-            adapter
+            operation
                 .run_owned("workspace teardown barrier", move || {
                     let _ = entered_tx.send(());
                     release_rx
@@ -1450,11 +1450,11 @@ mod tests {
             .task_runtime()
             .await
             .map_err(|error| error.to_string())?;
-        let adapter = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store);
+        let operation = crate::tasks::task_runtime::TaskRuntimeOperation::new(store);
         let debt = crate::tasks::task_runtime::StoreError::InvalidPlan(
             "terminal projection debt".to_string(),
         );
-        adapter.record_lifecycle_debt("degraded workspace fixture", &debt);
+        operation.record_lifecycle_debt("degraded workspace fixture", &debt);
 
         let first = registry
             .shutdown_and_evict_if_idle(&workspace.id)
@@ -1498,11 +1498,11 @@ mod tests {
             .task_runtime()
             .await
             .map_err(|error| error.to_string())?;
-        let adapter = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store);
+        let operation = crate::tasks::task_runtime::TaskRuntimeOperation::new(store);
         let debt = crate::tasks::task_runtime::StoreError::InvalidPlan(
             "caller-drop terminal debt".to_string(),
         );
-        adapter.record_lifecycle_debt("caller-drop workspace fixture", &debt);
+        operation.record_lifecycle_debt("caller-drop workspace fixture", &debt);
         let (entered, release) = host.park_shutdown_after_operations()?;
 
         let eviction_registry = registry.clone();

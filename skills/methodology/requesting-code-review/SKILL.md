@@ -4,16 +4,9 @@ description: 在完成任务或合并之前请求代码审查
 metadata:
   category: methodology
   source: superpowers
-  upstream-version: "6.0.3"
+  upstream-version: 6.0.3
   author: obra
-  tags: [review, quality, collaboration]
-triggers:
-  - 审查
-  - review
-  - code review
-  - 代码审查
-  - PR review
-allowed-tools: []
+  tags: review, quality, collaboration
 ---
 
 # Requesting Code Review

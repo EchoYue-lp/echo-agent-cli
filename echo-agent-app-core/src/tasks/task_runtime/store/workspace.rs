@@ -528,7 +528,7 @@ pub struct RunCancellationRegistration {
 fn validate_runtime_plan(tasks: &[PlanTask]) -> Result<(), StoreError> {
     let runtime_tasks = tasks
         .iter()
-        .map(PlanTask::to_task)
+        .map(echo_agent::tasks::Task::try_from)
         .collect::<Result<Vec<_>, _>>()
         .map_err(StoreError::InvalidPlan)?;
     echo_agent::tasks::PlanValidator::default()
@@ -537,8 +537,8 @@ fn validate_runtime_plan(tasks: &[PlanTask]) -> Result<(), StoreError> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RecoverableSubagentResult {
-    pub(crate) result: SubagentTaskResult,
+pub(crate) struct RecoverableSubagentOutcome {
+    pub(crate) outcome: SubagentOutcome,
     pub(crate) full_output: String,
 }
 
@@ -629,8 +629,11 @@ fn runtime_execution_change_event(
             after.spec.id
         )));
     }
-    let extension =
-        EkoTaskSpec::from_task_spec(after.spec.clone()).map_err(StoreError::InvalidPlan)?;
+    let extension: EkoTaskSpec = after
+        .spec
+        .clone()
+        .try_into()
+        .map_err(StoreError::InvalidPlan)?;
     let (status, status_detail) = task_status_wire(&after.execution.status);
     let now = echo_agent::utils::time::now_local().to_rfc3339();
     let started = matches!(
@@ -704,9 +707,9 @@ pub(crate) struct SubagentReleaseRecord<'a> {
     pub plan_revision: u64,
     pub attempt: u32,
     pub status: &'a str,
-    pub result: Option<&'a SubagentTaskResult>,
+    pub outcome: Option<&'a SubagentOutcome>,
     pub full_output: Option<&'a str>,
-    pub usage: Option<&'a SubagentRunUsage>,
+    pub usage: Option<&'a ExecutionUsage>,
     pub dispatch_hook: bool,
 }
 

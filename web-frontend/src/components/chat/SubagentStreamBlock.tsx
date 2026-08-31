@@ -14,9 +14,9 @@ import {
   useToolExecutionStore,
 } from '../../stores/toolExecutionStore';
 import MarkdownContent from '../common/MarkdownContent';
-import { SubagentResultView } from '../subagent/SubagentResultView';
+import { SubagentOutcomeView } from '../subagent/SubagentOutcomeView';
 import { statusLabel } from '../../utils/subagentProgress';
-import { subagentResultPresentation } from '../../utils/subagentResult';
+import { subagentOutcomePresentation } from '../../utils/subagentOutcome';
 import { InlineToolCall } from './InlineToolCall';
 
 interface SubagentStreamBlockProps {
@@ -47,7 +47,7 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
     toolExecutionIdsForOwner(state.idsByOwner, ownerKey)
   );
   const summary = toolIds.length > 0 ? `${toolIds.length} 工具` : '';
-  const presentation = subagentResultPresentation(run);
+  const presentation = subagentOutcomePresentation(run);
 
   useEffect(() => {
     if (previousStatus.current === 'running' && run.status !== 'running') {
@@ -146,8 +146,8 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
             )}
 
             {activeTab === 'result' &&
-              (run.result || presentation.text ? (
-                <SubagentResultView result={run.result} content={presentation.text} />
+              (run.outcome || presentation.text ? (
+                <SubagentOutcomeView outcome={run.outcome} content={presentation.text} />
               ) : (
                 <div className="text-[11px] text-[var(--text-tertiary)]">
                   {run.status === 'running' ? '正在等待执行结果' : '暂无结果'}

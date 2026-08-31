@@ -102,7 +102,7 @@ pub(crate) async fn drive_unattended_run(
 
 #[allow(clippy::too_many_arguments)]
 async fn drive_owned_agent_turn(
-    blocking: TaskRuntimeBlockingAdapter,
+    blocking: TaskRuntimeOperation,
     primary_agent: &crate::agent_handle::AgentHandle,
     run: &TaskRun,
     turn_id: &str,
@@ -219,7 +219,7 @@ pub async fn drive_agent_run(
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<String, ExecError> {
     let child_cancel = parent_cancel.child_token();
-    let blocking = TaskRuntimeBlockingAdapter::new(store.clone());
+    let blocking = TaskRuntimeOperation::new(store.clone());
     let admission_run_id = run_id.to_string();
     let admission_cancel = child_cancel.clone();
     let (_cancel_registration, run_for_scope) = blocking
@@ -282,7 +282,7 @@ pub async fn drive_agent_run(
                 )));
             }
         }
-        let (turn_receipt, turn_observation) = drive_owned_agent_turn(
+        let (mut turn_receipt, turn_observation) = drive_owned_agent_turn(
             blocking.clone(),
             &primary_agent,
             &run_for_scope,
@@ -334,24 +334,19 @@ pub async fn drive_agent_run(
                 "Run agent emitted typed terminal failure"
             );
         }
-        let terminal_record = super::turn_lifecycle::RunTurnTerminal {
-            turn_id: &turn_id,
-            terminal: &terminal,
-            elapsed_seconds: u64::try_from(turn_receipt.elapsed.as_millis())
-                .unwrap_or(u64::MAX)
-                .saturating_add(999)
-                / 1_000,
-            final_message_id: None,
-        };
-        let persisted =
-            super::turn_lifecycle::persist_run_turn_terminal(&blocking, run_id, &terminal_record)
-                .await
-                .map_err(ExecError::Other)?;
+        turn_receipt.outcome = terminal;
+        let persisted = super::turn_lifecycle::persist_run_turn_terminal(
+            &blocking,
+            run_id,
+            &turn_receipt,
+        )
+        .await
+        .map_err(ExecError::Other)?;
         let decision = super::turn_lifecycle::decide_after_persisted_run_turn(
             &blocking,
             &store,
             run_id,
-            &terminal_record,
+            &turn_receipt,
             persisted,
             trace_sink.as_ref(),
         )
@@ -490,7 +485,7 @@ async fn materialize_direct_completion(
 ) -> Result<(), ExecError> {
     let final_answer = observation.output;
     let load_run_id = run_id.to_string();
-    let run = TaskRuntimeBlockingAdapter::new(store.clone())
+    let run = TaskRuntimeOperation::new(store.clone())
         .run("load direct completion run", move |store| {
             store
                 .get_run(&load_run_id)?
@@ -527,13 +522,13 @@ async fn materialize_direct_completion(
             ..PlanTask::default()
         }],
     };
-    let mut framework_outcome = echo_agent::agent::subagent::parse_subagent_outcome(
+    let mut framework_outcome = echo_agent::subagent::parse_subagent_outcome(
         &final_answer,
-        echo_agent::agent::subagent::SubagentStatus::Completed,
+        echo_agent::subagent::SubagentStatus::Completed,
         Some(&format!("{run_id}:direct-answer")),
         None,
     );
-    echo_agent::agent::subagent::merge_observed_evidence(
+    echo_agent::subagent::merge_observed_evidence(
         &mut framework_outcome,
         observation.observed_evidence,
         observation.observed_artifacts,
@@ -542,13 +537,13 @@ async fn materialize_direct_completion(
         run_id: run_id.to_string(),
         task_id: task_id.to_string(),
         subagent_name: "primary-agent".to_string(),
-        result: SubagentTaskResult::from_framework_outcome(&framework_outcome),
+        outcome: framework_outcome,
         decisions: Vec::new(),
         next_implications: Vec::new(),
         suggested_tasks: Vec::new(),
         created_at: chrono::Utc::now(),
     };
-    super::revisioned_adapter::commit_eko_direct_completion(
+    super::revisioned_runtime::commit_direct_completion(
         store.clone(),
         plan,
         summary,
@@ -581,7 +576,7 @@ pub(crate) async fn drive_existing_cron_run(
     )
     .await?;
     let status_run_id = run_id.clone();
-    let status = TaskRuntimeBlockingAdapter::new(store.clone())
+    let status = TaskRuntimeOperation::new(store.clone())
         .run("load cron run outcome", move |store| {
             store
                 .get_run(&status_run_id)?

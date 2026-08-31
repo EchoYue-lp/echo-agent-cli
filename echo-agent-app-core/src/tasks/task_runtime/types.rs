@@ -1174,34 +1174,49 @@ pub struct EkoTaskSpec {
     pub sort_order: i64,
 }
 
-impl EkoTaskSpec {
-    pub(crate) fn to_task_spec(&self) -> Result<echo_agent::tasks::TaskSpec, String> {
-        let extension = serde_json::to_value(EkoTaskExtension {
-            kind: self.kind,
-            agent_role: self.agent_role.clone(),
-            domain_profile: self.domain_profile,
-            parallel_group: self.parallel_group.clone(),
-            execution_target: self.execution_target.clone(),
-            files: self.files.clone(),
-            allowed_tools: self.allowed_tools.clone(),
-            required_artifacts: self.required_artifacts.clone(),
-            execution_checks: self.execution_checks.clone(),
-            acceptance_criteria: self.acceptance_criteria.clone(),
-            sort_order: self.sort_order,
-        })
-        .map_err(|error| format!("task '{}' has invalid EKO extension: {error}", self.id))?;
-        Ok(echo_agent::tasks::TaskSpec {
-            id: self.id.clone(),
-            title: self.title.clone(),
-            description: self.description.clone(),
-            depends_on: self.depends_on.clone(),
-            max_retries: self.max_retries,
-            extension,
-        })
-    }
+impl TryFrom<&EkoTaskSpec> for echo_agent::tasks::TaskSpec {
+    type Error = String;
 
-    pub(crate) fn from_task_spec(spec: echo_agent::tasks::TaskSpec) -> Result<Self, String> {
-        let extension: EkoTaskExtension = serde_json::from_value(spec.extension)
+    fn try_from(value: &EkoTaskSpec) -> Result<Self, Self::Error> {
+        echo_agent::tasks::TaskSpec {
+            id: value.id.clone(),
+            title: value.title.clone(),
+            description: value.description.clone(),
+            depends_on: value.depends_on.clone(),
+            max_retries: value.max_retries,
+            extension: serde_json::Value::Null,
+        }
+        .with_extension(EkoTaskExtension {
+            kind: value.kind,
+            agent_role: value.agent_role.clone(),
+            domain_profile: value.domain_profile,
+            parallel_group: value.parallel_group.clone(),
+            execution_target: value.execution_target.clone(),
+            files: value.files.clone(),
+            allowed_tools: value.allowed_tools.clone(),
+            required_artifacts: value.required_artifacts.clone(),
+            execution_checks: value.execution_checks.clone(),
+            acceptance_criteria: value.acceptance_criteria.clone(),
+            sort_order: value.sort_order,
+        })
+        .map_err(|error| format!("task '{}' has invalid EKO extension: {error}", value.id))
+    }
+}
+
+impl TryFrom<EkoTaskSpec> for echo_agent::tasks::TaskSpec {
+    type Error = String;
+
+    fn try_from(value: EkoTaskSpec) -> Result<Self, Self::Error> {
+        (&value).try_into()
+    }
+}
+
+impl TryFrom<echo_agent::tasks::TaskSpec> for EkoTaskSpec {
+    type Error = String;
+
+    fn try_from(spec: echo_agent::tasks::TaskSpec) -> Result<Self, Self::Error> {
+        let extension: EkoTaskExtension = spec
+            .extension_as()
             .map_err(|error| format!("task '{}' has invalid EKO extension: {error}", spec.id))?;
         Ok(Self {
             id: spec.id,
@@ -1222,20 +1237,6 @@ impl EkoTaskSpec {
             sort_order: extension.sort_order,
         })
     }
-}
-
-/// EKO file projection of framework task execution state.
-///
-/// The shared `TaskStatus` remains authoritative and lossless. `TodoStatus` is
-/// derived only when building UI-facing plan/todo projections.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EkoTaskExecution {
-    pub task_id: String,
-    pub status: echo_agent::tasks::TaskStatus,
-    pub retry_count: u32,
-    pub failure_fingerprint: Option<String>,
-    #[serde(default)]
-    pub claim: Option<echo_agent::tasks::TaskClaim>,
 }
 
 /// Lossless EKO payload carried through the framework task extension point.
@@ -1267,18 +1268,6 @@ pub struct EkoPlanMetadata {
     pub goal_sha256: String,
 }
 
-impl EkoTaskExecution {
-    pub fn pending(task_id: impl Into<String>) -> Self {
-        Self {
-            task_id: task_id.into(),
-            status: echo_agent::tasks::TaskStatus::Pending,
-            retry_count: 0,
-            failure_fingerprint: None,
-            claim: None,
-        }
-    }
-}
-
 /// EKO's file-backed plan projection persisted in `plan.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, rename = "PlanRevision")]
@@ -1298,10 +1287,12 @@ pub struct PlanRevision {
 }
 
 /// EKO's file-backed execution projection persisted in `run-state.json`.
+/// Task execution entries are the framework `TaskExecution` values directly;
+/// EKO owns only the surrounding run and product projections.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunStateSnapshot {
     pub run: TaskRun,
-    pub tasks: Vec<EkoTaskExecution>,
+    pub tasks: Vec<echo_agent::tasks::TaskExecution>,
     /// Event-folded long-horizon control state. Absent for ordinary one-shot runs.
     #[serde(default)]
     pub continuation: Option<RunContinuationState>,
@@ -1736,7 +1727,7 @@ impl BackgroundCellState {
     }
 }
 
-/// Internal materialized adapter for one EKO specification and the framework's
+/// Internal materialized join of one EKO specification and the framework's
 /// canonical execution state. Persistence remains split between `PlanRevision`
 /// and `RunStateSnapshot`; UI callers receive `TaskSpec` plus `TodoItem`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1836,8 +1827,8 @@ impl PlanTask {
         }
     }
 
-    pub fn execution(&self) -> EkoTaskExecution {
-        EkoTaskExecution {
+    pub fn execution(&self) -> echo_agent::tasks::TaskExecution {
+        echo_agent::tasks::TaskExecution {
             task_id: self.id.clone(),
             status: self.status.clone(),
             retry_count: self.retry_count,
@@ -1846,7 +1837,7 @@ impl PlanTask {
         }
     }
 
-    pub fn from_parts(spec: EkoTaskSpec, execution: EkoTaskExecution) -> Self {
+    pub fn from_parts(spec: EkoTaskSpec, execution: echo_agent::tasks::TaskExecution) -> Self {
         Self {
             id: spec.id,
             title: spec.title,
@@ -1870,17 +1861,20 @@ impl PlanTask {
             sort_order: spec.sort_order,
         }
     }
+}
 
-    /// Convert losslessly to the framework's canonical runtime task model.
-    pub fn to_task(&self) -> Result<echo_agent::tasks::Task, String> {
+impl TryFrom<&PlanTask> for echo_agent::tasks::Task {
+    type Error = String;
+
+    fn try_from(value: &PlanTask) -> Result<Self, Self::Error> {
         Ok(echo_agent::tasks::Task {
-            spec: self.spec().to_task_spec()?,
+            spec: (&value.spec()).try_into()?,
             execution: echo_agent::tasks::TaskExecution {
-                task_id: self.id.clone(),
-                status: self.status.clone(),
-                retry_count: self.retry_count,
-                failure_fingerprint: self.failure_fingerprint.clone(),
-                claim: self.claim.clone(),
+                task_id: value.id.clone(),
+                status: value.status.clone(),
+                retry_count: value.retry_count,
+                failure_fingerprint: value.failure_fingerprint.clone(),
+                claim: value.claim.clone(),
             },
         })
     }
@@ -1897,7 +1891,7 @@ impl TryFrom<echo_agent::tasks::Task> for PlanTask {
                 spec.id, execution.task_id
             ));
         }
-        let spec = EkoTaskSpec::from_task_spec(spec)?;
+        let spec = EkoTaskSpec::try_from(spec)?;
         Ok(Self {
             id: spec.id,
             title: spec.title,
@@ -1940,27 +1934,29 @@ pub struct TaskPatch {
     pub max_retries: Option<u32>,
 }
 
-impl TaskPatch {
-    pub(crate) fn to_task_spec_patch(&self) -> echo_agent::tasks::TaskSpecPatch {
+impl TryFrom<&TaskPatch> for echo_agent::tasks::TaskSpecPatch {
+    type Error = String;
+
+    fn try_from(value: &TaskPatch) -> Result<Self, Self::Error> {
         let mut extension = serde_json::Map::new();
-        if let Some(kind) = self.kind {
+        if let Some(kind) = value.kind {
             extension.insert(
                 "kind".to_string(),
                 serde_json::Value::String(kind.as_str().to_string()),
             );
         }
-        if let Some(agent_role) = &self.agent_role {
+        if let Some(agent_role) = &value.agent_role {
             extension.insert(
                 "agent_role".to_string(),
                 serde_json::Value::String(agent_role.clone()),
             );
         }
         for (key, values) in [
-            ("files", self.files.as_ref()),
-            ("allowed_tools", self.allowed_tools.as_ref()),
-            ("required_artifacts", self.required_artifacts.as_ref()),
-            ("execution_checks", self.execution_checks.as_ref()),
-            ("acceptance_criteria", self.acceptance_criteria.as_ref()),
+            ("files", value.files.as_ref()),
+            ("allowed_tools", value.allowed_tools.as_ref()),
+            ("required_artifacts", value.required_artifacts.as_ref()),
+            ("execution_checks", value.execution_checks.as_ref()),
+            ("acceptance_criteria", value.acceptance_criteria.as_ref()),
         ] {
             if let Some(values) = values {
                 extension.insert(
@@ -1975,13 +1971,13 @@ impl TaskPatch {
                 );
             }
         }
-        echo_agent::tasks::TaskSpecPatch {
-            title: self.title.clone(),
-            description: self.description.clone(),
-            depends_on: self.depends_on.clone(),
-            max_retries: self.max_retries,
+        Ok(echo_agent::tasks::TaskSpecPatch {
+            title: value.title.clone(),
+            description: value.description.clone(),
+            depends_on: value.depends_on.clone(),
+            max_retries: value.max_retries,
             extension: (!extension.is_empty()).then_some(serde_json::Value::Object(extension)),
-        }
+        })
     }
 }
 
@@ -2015,22 +2011,24 @@ pub struct TaskUpdateRequest {
     pub operations: Vec<TaskUpdateOperation>,
 }
 
-impl TaskUpdateRequest {
-    pub(crate) fn to_task_plan_patch(&self) -> Result<echo_agent::tasks::TaskPlanPatch, String> {
-        let mut operations = Vec::with_capacity(self.operations.len());
-        for operation in &self.operations {
+impl TryFrom<&TaskUpdateRequest> for echo_agent::tasks::TaskPlanPatch {
+    type Error = String;
+
+    fn try_from(value: &TaskUpdateRequest) -> Result<Self, Self::Error> {
+        let mut operations = Vec::with_capacity(value.operations.len());
+        for operation in &value.operations {
             operations.push(match operation {
                 TaskUpdateOperation::Insert {
                     after_task_id,
                     task,
                 } => echo_agent::tasks::TaskPlanPatchOp::Insert {
                     after_task_id: after_task_id.clone(),
-                    task: task.to_task_spec()?,
+                    task: task.try_into()?,
                 },
                 TaskUpdateOperation::Update { task_id, patch } => {
                     echo_agent::tasks::TaskPlanPatchOp::Update {
                         task_id: task_id.clone(),
-                        patch: patch.to_task_spec_patch(),
+                        patch: patch.try_into()?,
                     }
                 }
                 TaskUpdateOperation::Skip { task_id } => echo_agent::tasks::TaskPlanPatchOp::Skip {
@@ -2044,10 +2042,18 @@ impl TaskUpdateRequest {
             });
         }
         Ok(echo_agent::tasks::TaskPlanPatch {
-            base_revision: self.base_revision,
-            reason: self.reason.clone(),
+            base_revision: value.base_revision,
+            reason: value.reason.clone(),
             operations,
         })
+    }
+}
+
+impl TryFrom<TaskUpdateRequest> for echo_agent::tasks::TaskPlanPatch {
+    type Error = String;
+
+    fn try_from(value: TaskUpdateRequest) -> Result<Self, Self::Error> {
+        (&value).try_into()
     }
 }
 
@@ -2208,18 +2214,9 @@ impl SubagentControlActorSource {
     }
 }
 
-/// Durable identity for one user control command and one exact task attempt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, rename = "SubagentControlIdentity")]
-pub struct SubagentControlIdentity {
-    pub run_id: String,
-    pub task_id: String,
-    pub execution_id: String,
-    #[ts(type = "number")]
-    pub plan_revision: u64,
-    pub attempt: u32,
-    pub command_id: String,
-}
+/// Framework-owned durable identity for one user command and one exact
+/// Subagent attempt. EKO adds only its product-facing receipts and policy.
+pub use echo_agent::subagent::SubagentCommandIdentity as SubagentControlIdentity;
 
 /// Whether guidance targets an already-active mailbox or one future attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -2230,50 +2227,11 @@ pub enum SubagentGuidanceKind {
     NextAttempt,
 }
 
-/// Product projection of the framework tracked receipt for one exact
-/// Subagent command. The framework remains the live authority; this value is
-/// only the durable app boundary exposed to surfaces and recovery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export, rename = "SubagentControlPhase")]
-pub enum SubagentControlPhase {
-    Persisted,
-    MailboxAccepted,
-    Drained,
-    TurnSettled,
-}
+/// Framework durable command phase for one exact Subagent command.
+pub use echo_agent::subagent::SubagentCommandPhase as SubagentControlPhase;
 
-/// Terminal outcome of the owning framework turn, when one is available.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export, rename = "SubagentControlOutcome")]
-pub enum SubagentControlOutcome {
-    Completed,
-    Failed,
-    Cancelled,
-    Dropped,
-}
-
-impl SubagentControlOutcome {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::Dropped => "dropped",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        Some(match value {
-            "completed" => Self::Completed,
-            "failed" => Self::Failed,
-            "cancelled" => Self::Cancelled,
-            "dropped" => Self::Dropped,
-            _ => return None,
-        })
-    }
-}
+/// Framework terminal outcome of the turn owning a Subagent command.
+pub use echo_agent::agent::AgentSteerTurnOutcome as SubagentControlOutcome;
 
 impl SubagentGuidanceKind {
     pub fn as_str(self) -> &'static str {
@@ -2311,318 +2269,30 @@ impl SubagentControlStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, rename = "SubagentControlReceipt")]
 pub struct SubagentControlReceipt {
+    #[ts(type = "SubagentControlIdentity")]
     pub identity: SubagentControlIdentity,
     /// True when the durable command already existed and this call replayed
     /// its authoritative receipt rather than appending a second command.
     #[serde(default)]
     pub duplicate: bool,
     pub status: SubagentControlStatus,
+    #[ts(type = "SubagentControlPhase")]
     pub phase: SubagentControlPhase,
+    #[ts(type = "SubagentControlOutcome | null")]
     pub outcome: Option<SubagentControlOutcome>,
     pub drained: Option<bool>,
     pub detail: Option<String>,
     pub framework_turn_id: Option<String>,
 }
 
-/// Lifecycle status of a [`SubagentRun`]. Mirrors the coarse states the
-/// frontend already renders for the unified subagent concept, minus the
-/// pending state (a SubagentRun only exists once dispatch has started).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export, rename = "SubagentRunStatus")]
-pub enum SubagentRunStatus {
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-    TimedOut,
-}
-
-impl SubagentRunStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SubagentRunStatus::Running => "running",
-            SubagentRunStatus::Completed => "completed",
-            SubagentRunStatus::Failed => "failed",
-            SubagentRunStatus::Cancelled => "cancelled",
-            SubagentRunStatus::TimedOut => "timed_out",
-        }
-    }
-
-    #[allow(clippy::should_implement_trait)] // inherent helper returning Option; not the FromStr trait
-    pub fn from_str(s: &str) -> Option<Self> {
-        Some(match s {
-            "running" => SubagentRunStatus::Running,
-            "completed" => SubagentRunStatus::Completed,
-            "failed" => SubagentRunStatus::Failed,
-            "cancelled" => SubagentRunStatus::Cancelled,
-            "timed_out" => SubagentRunStatus::TimedOut,
-            _ => return None,
-        })
-    }
-}
-
-impl From<echo_agent::agent::subagent::SubagentStatus> for SubagentRunStatus {
-    fn from(status: echo_agent::agent::subagent::SubagentStatus) -> Self {
-        match status {
-            echo_agent::agent::subagent::SubagentStatus::Completed => Self::Completed,
-            echo_agent::agent::subagent::SubagentStatus::Failed => Self::Failed,
-            echo_agent::agent::subagent::SubagentStatus::Cancelled => Self::Cancelled,
-            echo_agent::agent::subagent::SubagentStatus::TimedOut => Self::TimedOut,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, rename = "SubagentArtifactResult")]
-pub struct SubagentArtifactResult {
-    pub path: String,
-    pub kind: String,
-    pub bytes: Option<u64>,
-    pub sha256: Option<String>,
-    pub producer_execution_id: Option<String>,
-    pub available: bool,
-}
-
-impl From<&echo_agent::agent::subagent::SubagentArtifact> for SubagentArtifactResult {
-    fn from(artifact: &echo_agent::agent::subagent::SubagentArtifact) -> Self {
-        Self {
-            path: artifact.path.clone(),
-            kind: artifact.kind.clone(),
-            bytes: artifact.bytes,
-            sha256: artifact.sha256.clone(),
-            producer_execution_id: artifact.producer_execution_id.clone(),
-            available: artifact.available,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export, rename = "SubagentVerificationStatus")]
-pub enum SubagentVerificationStatus {
-    Passed,
-    Failed,
-    NotRun,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export, rename = "SubagentVerificationSource")]
-pub enum SubagentVerificationSource {
-    Observed,
-    Reported,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, rename = "SubagentVerificationResult")]
-pub struct SubagentVerificationResult {
-    pub check: String,
-    pub status: SubagentVerificationStatus,
-    pub details: String,
-    pub source: SubagentVerificationSource,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubagentEvidenceResult {
-    pub kind: String,
-    pub subject: String,
-    pub outcome: Option<String>,
-    pub details: String,
-    pub source: SubagentVerificationSource,
-    pub attributes: serde_json::Value,
-}
-
-impl From<&echo_agent::agent::subagent::SubagentEvidence> for SubagentEvidenceResult {
-    fn from(evidence: &echo_agent::agent::subagent::SubagentEvidence) -> Self {
-        Self {
-            kind: evidence.kind.clone(),
-            subject: evidence.subject.clone(),
-            outcome: evidence.outcome.clone(),
-            details: evidence.details.clone(),
-            source: match evidence.source {
-                echo_agent::agent::subagent::SubagentEvidenceSource::Observed => {
-                    SubagentVerificationSource::Observed
-                }
-                echo_agent::agent::subagent::SubagentEvidenceSource::Reported => {
-                    SubagentVerificationSource::Reported
-                }
-            },
-            attributes: evidence.attributes.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, rename = "SubagentTouchedFiles")]
-pub struct SubagentTouchedFiles {
-    pub read: Vec<String>,
-    pub written: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, rename = "SubagentTaskResult")]
-pub struct SubagentTaskResult {
-    pub contract_version: u32,
-    pub status: SubagentRunStatus,
-    pub summary: String,
-    pub artifacts: Vec<SubagentArtifactResult>,
-    #[serde(default)]
-    #[ts(skip)]
-    pub evidence: Vec<SubagentEvidenceResult>,
-    pub verification: Vec<SubagentVerificationResult>,
-    pub remaining_work: Vec<String>,
-    pub touched_files: SubagentTouchedFiles,
-}
-
-impl SubagentTaskResult {
-    pub fn from_framework(result: &echo_agent::agent::subagent::SubagentResult) -> Self {
-        Self::from_framework_outcome(&result.outcome)
-    }
-
-    pub fn from_framework_outcome(outcome: &echo_agent::agent::subagent::SubagentOutcome) -> Self {
-        let evidence: Vec<SubagentEvidenceResult> =
-            outcome.evidence.iter().map(Into::into).collect();
-        let verification = evidence
-            .iter()
-            .filter_map(project_verification_evidence)
-            .collect();
-        let mut touched_files = SubagentTouchedFiles::default();
-        for item in &evidence {
-            let access = match item.kind.as_str() {
-                "file_read" => Some((false, item.subject.clone())),
-                "file_write" => Some((true, item.subject.clone())),
-                "tool_result" if item.outcome.as_deref() == Some("succeeded") => {
-                    project_tool_file_access(item)
-                }
-                _ => None,
-            };
-            if let Some((write, path)) = access {
-                let target = if write {
-                    &mut touched_files.written
-                } else {
-                    &mut touched_files.read
-                };
-                if !target.iter().any(|existing| existing == &path) {
-                    target.push(path);
-                }
-            }
-        }
-        Self {
-            contract_version: outcome.contract_version,
-            status: outcome.status.into(),
-            summary: outcome.summary.clone(),
-            artifacts: outcome.artifacts.iter().map(Into::into).collect(),
-            evidence,
-            verification,
-            remaining_work: outcome.remaining_work.clone(),
-            touched_files,
-        }
-    }
-
-    pub fn terminal(
-        status: SubagentRunStatus,
-        summary: impl Into<String>,
-        remaining_work: Vec<String>,
-    ) -> Self {
-        let summary: String = summary.into().chars().take(1_200).collect();
-        let remaining_work = remaining_work
-            .into_iter()
-            .map(|item| item.chars().take(500).collect())
-            .filter(|item: &String| !item.trim().is_empty())
-            .take(64)
-            .collect();
-        Self {
-            contract_version: 2,
-            status,
-            summary,
-            artifacts: Vec::new(),
-            evidence: Vec::new(),
-            verification: Vec::new(),
-            remaining_work,
-            touched_files: SubagentTouchedFiles::default(),
-        }
-    }
-}
-
-fn project_verification_evidence(
-    evidence: &SubagentEvidenceResult,
-) -> Option<SubagentVerificationResult> {
-    let check = if evidence.kind == "verification" {
-        Some(evidence.subject.clone())
-    } else if evidence.kind == "tool_result" {
-        evidence
-            .attributes
-            .get("args")
-            .and_then(|args| verification_check_from_tool(&evidence.subject, args))
-    } else {
-        None
-    }?;
-    Some(SubagentVerificationResult {
-        check,
-        status: match evidence.outcome.as_deref() {
-            Some("passed" | "succeeded") => SubagentVerificationStatus::Passed,
-            Some("failed") => SubagentVerificationStatus::Failed,
-            _ => SubagentVerificationStatus::NotRun,
-        },
-        details: evidence.details.clone(),
-        source: evidence.source,
-    })
-}
-
-fn verification_check_from_tool(name: &str, args: &serde_json::Value) -> Option<String> {
-    let normalized = name.to_ascii_lowercase().replace('-', "_");
-    if !matches!(
-        normalized.as_str(),
-        "shell" | "bash" | "terminal" | "run_code" | "execute_command"
-    ) {
-        return None;
-    }
-    ["command", "cmd", "code", "script"]
-        .iter()
-        .find_map(|key| args.get(*key).and_then(serde_json::Value::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn project_tool_file_access(evidence: &SubagentEvidenceResult) -> Option<(bool, String)> {
-    let normalized = evidence.subject.to_ascii_lowercase().replace('-', "_");
-    let write = normalized.contains("write")
-        || normalized.contains("edit")
-        || normalized.contains("delete")
-        || normalized.contains("patch");
-    let read = normalized.contains("read")
-        || normalized.contains("search")
-        || normalized.contains("glob")
-        || normalized.contains("grep");
-    if !write && !read {
-        return None;
-    }
-    let args = evidence.attributes.get("args")?;
-    ["path", "file_path", "target", "directory"]
-        .iter()
-        .find_map(|key| args.get(*key).and_then(serde_json::Value::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|path| (write, path.to_string()))
-}
-
-/// Aggregate cost/usage for a single [`SubagentRun`].
-///
-/// All fields are `Option` because they are populated progressively: a run
-/// that just started has no usage yet. `duration_ms` is finalized on
-/// completion.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, rename = "SubagentRunUsage")]
-pub struct SubagentRunUsage {
-    /// Total wall-clock duration in milliseconds (None while running).
-    pub duration_ms: Option<u64>,
-    /// Total tokens consumed (input + output), if reported by the framework.
-    pub tokens_used: Option<u64>,
-    /// Number of ReAct iterations executed, if reported.
-    pub iterations: Option<u64>,
-}
+// TaskRuntime uses the framework result contract directly. Product code may
+// add task identity and policy around these values, but never duplicates or
+// translates the framework outcome itself.
+pub use echo_agent::runtime::ExecutionUsage;
+pub use echo_agent::subagent::{
+    SubagentArtifact, SubagentEvidence, SubagentEvidenceSource, SubagentOutcome, SubagentStatus,
+    SubagentTouchedFiles, SubagentVerification, SubagentVerificationStatus,
+};
 
 /// One subagent dispatch execution instance.
 ///
@@ -2633,7 +2303,7 @@ pub struct SubagentRunUsage {
 ///
 /// Thinking/tool/token streams are NOT persisted here (they remain an
 /// in-memory + realtime stream, matching the legacy execution behavior). Only
-/// lifecycle + usage + result are durable.
+/// lifecycle + usage + outcome are durable.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, rename = "SubagentRun")]
 pub struct SubagentRun {
@@ -2651,11 +2321,15 @@ pub struct SubagentRun {
     /// Retry ordinal (1-based; first attempt = 1).
     pub attempt: u32,
     /// Current lifecycle status.
-    pub status: SubagentRunStatus,
+    #[ts(type = "SubagentStatus")]
+    pub status: SubagentStatus,
     /// Aggregate cost. Populated progressively; finalized on completion.
-    pub usage: SubagentRunUsage,
-    /// Structured output returned to the Task (None while running).
-    pub result: Option<SubagentTaskResult>,
+    /// Framework usage snapshot; the TS wire name remains `SubagentRunUsage`.
+    #[ts(type = "SubagentRunUsage")]
+    pub usage: ExecutionUsage,
+    /// Structured outcome returned to the Task (None while running).
+    #[ts(type = "SubagentOutcome | null")]
+    pub outcome: Option<SubagentOutcome>,
 }
 
 impl SubagentRun {
@@ -2673,9 +2347,9 @@ impl SubagentRun {
             task_id: task_id.into(),
             subagent_name: subagent_name.into(),
             attempt,
-            status: SubagentRunStatus::Running,
-            usage: SubagentRunUsage::default(),
-            result: None,
+            status: SubagentStatus::Running,
+            usage: ExecutionUsage::default(),
+            outcome: None,
         }
     }
 }
@@ -2747,7 +2421,8 @@ pub struct TaskExecutionSummary {
     pub run_id: String,
     pub task_id: String,
     pub subagent_name: String,
-    pub result: SubagentTaskResult,
+    #[ts(type = "SubagentOutcome")]
+    pub outcome: SubagentOutcome,
     pub decisions: Vec<String>,
     pub next_implications: Vec<String>,
     #[serde(default)]
@@ -2755,53 +2430,6 @@ pub struct TaskExecutionSummary {
     #[serde(with = "echo_agent::utils::time::local_rfc3339")]
     #[ts(as = "String")]
     pub created_at: DateTime<Utc>,
-}
-
-impl TaskExecutionSummary {
-    /// Convert to the framework's product-neutral task summary.
-    pub fn to_runtime_summary(&self) -> echo_agent::tasks::TaskExecutionSummary {
-        echo_agent::tasks::TaskExecutionSummary {
-            run_id: self.run_id.clone(),
-            task_id: self.task_id.clone(),
-            subagent_name: self.subagent_name.clone(),
-            completed_work: if self.result.summary.trim().is_empty() {
-                Vec::new()
-            } else {
-                vec![self.result.summary.clone()]
-            },
-            decisions: self.decisions.clone(),
-            failures: if self.result.status == SubagentRunStatus::Completed {
-                self.result.remaining_work.clone()
-            } else {
-                let mut failures =
-                    vec![format!("subagent status: {}", self.result.status.as_str())];
-                failures.extend(self.result.remaining_work.clone());
-                failures
-            },
-            verification: self
-                .result
-                .verification
-                .iter()
-                .map(|item| format!("{}: {:?}", item.check, item.status))
-                .collect(),
-            next_implications: self.next_implications.clone(),
-            suggested_tasks: self
-                .suggested_tasks
-                .iter()
-                .map(SuggestedTask::to_runtime_suggested_task)
-                .collect(),
-            extension: serde_json::json!({
-                "eko": {
-                    "schema": "task_execution_summary.v1",
-                    "contract_version": self.result.contract_version,
-                    "touched_files": self.result.touched_files,
-                    "artifacts": self.result.artifacts,
-                    "evidence": self.result.evidence,
-                }
-            }),
-            created_at: self.created_at,
-        }
-    }
 }
 
 /// A bounded follow-up task proposed by a subagent. Subagents may suggest new work,
@@ -2817,50 +2445,6 @@ pub struct SuggestedTask {
     pub dependencies: Vec<String>,
     pub why_needed: String,
     pub risk: String,
-}
-
-impl SuggestedTask {
-    /// Convert to the framework's product-neutral suggested task.
-    pub fn to_runtime_suggested_task(&self) -> echo_agent::tasks::SuggestedTask {
-        echo_agent::tasks::SuggestedTask {
-            title: self.title.clone(),
-            description: self.description.clone(),
-            dependencies: self.dependencies.clone(),
-            why_needed: self.why_needed.clone(),
-            risk: self.risk.clone(),
-            extension: serde_json::json!({
-                "kind": self.kind.as_str(),
-                "agent_role": self.agent_role,
-            }),
-        }
-    }
-
-    /// Convert a framework suggestion into the EKO app type.
-    pub fn from_runtime_suggested_task(
-        task: echo_agent::tasks::SuggestedTask,
-    ) -> Result<Self, String> {
-        let kind = task
-            .extension
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .and_then(PlanTaskKind::from_str)
-            .ok_or_else(|| "suggested task extension has no valid kind".to_string())?;
-        let agent_role = task
-            .extension
-            .get("agent_role")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| "suggested task extension has no Subagent role".to_string())?;
-        Ok(Self {
-            title: task.title,
-            description: task.description,
-            kind,
-            agent_role,
-            dependencies: task.dependencies,
-            why_needed: task.why_needed,
-            risk: task.risk,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -3077,7 +2661,7 @@ mod tests {
             sort_order: 10,
         };
 
-        let runtime = task.to_task()?;
+        let runtime = echo_agent::tasks::Task::try_from(&task)?;
 
         assert_eq!(runtime.spec.id, "t1");
         assert_eq!(
@@ -3091,7 +2675,9 @@ mod tests {
             runtime.execution.failure_fingerprint.as_deref(),
             Some("failure-1")
         );
-        let extension: EkoTaskExtension = serde_json::from_value(runtime.spec.extension.clone())
+        let extension: EkoTaskExtension = runtime
+            .spec
+            .extension_as()
             .map_err(|error| error.to_string())?;
         assert_eq!(extension.kind, PlanTaskKind::Investigation);
         assert_eq!(extension.agent_role, "explorer");
@@ -3190,7 +2776,7 @@ mod tests {
                 sort_order: 11,
                 ..PlanTask::default()
             };
-            let canonical = task.to_task()?;
+            let canonical = echo_agent::tasks::Task::try_from(&task)?;
             assert_eq!(canonical.execution.status, status);
 
             // Simulate the file-backed restart boundary: the framework Task
@@ -3263,7 +2849,7 @@ mod tests {
             sort_order: 0,
         };
 
-        let framework_task = task.to_task()?;
+        let framework_task = echo_agent::tasks::Task::try_from(&task)?;
 
         assert_eq!(
             framework_task.execution.status,
@@ -3351,81 +2937,10 @@ mod tests {
     }
 
     #[test]
-    fn task_execution_summary_converts_suggestions_to_framework() -> Result<(), String> {
-        let summary = TaskExecutionSummary {
-            run_id: "r1".to_string(),
-            task_id: "t1".to_string(),
-            subagent_name: "explorer".to_string(),
-            result: SubagentTaskResult {
-                contract_version: 2,
-                status: SubagentRunStatus::Completed,
-                summary: "Read runtime".to_string(),
-                artifacts: Vec::new(),
-                evidence: Vec::new(),
-                verification: Vec::new(),
-                remaining_work: Vec::new(),
-                touched_files: SubagentTouchedFiles {
-                    read: vec!["runtime.rs".to_string()],
-                    written: Vec::new(),
-                },
-            },
-            decisions: Vec::new(),
-            next_implications: Vec::new(),
-            suggested_tasks: vec![SuggestedTask {
-                title: "Extract DAG kernel".to_string(),
-                description: "Move pure scheduling next".to_string(),
-                kind: PlanTaskKind::Implementation,
-                agent_role: "implementer".to_string(),
-                dependencies: vec!["t1".to_string()],
-                why_needed: "Scheduling is reusable".to_string(),
-                risk: "Adapter mismatch".to_string(),
-            }],
-            created_at: Utc::now(),
-        };
-
-        let runtime = summary.to_runtime_summary();
-
-        assert_eq!(runtime.task_id, "t1");
-        assert_eq!(runtime.suggested_tasks.len(), 1);
-        assert_eq!(
-            runtime
-                .extension
-                .pointer("/eko/touched_files/read/0")
-                .and_then(serde_json::Value::as_str),
-            Some("runtime.rs")
-        );
-        assert_eq!(
-            runtime
-                .suggested_tasks
-                .first()
-                .and_then(|task| task.extension.get("kind"))
-                .and_then(serde_json::Value::as_str),
-            Some("implementation")
-        );
-        let mut encoded = serde_json::to_value(&runtime).map_err(|error| error.to_string())?;
-        if let Some(extension) = encoded
-            .get_mut("extension")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            extension.insert(
-                "future_product_field".to_string(),
-                serde_json::json!({ "nested": [1, 2, 3] }),
-            );
-        }
-        let decoded: echo_agent::tasks::TaskExecutionSummary =
-            serde_json::from_value(encoded).map_err(|error| error.to_string())?;
-        assert_eq!(
-            decoded.extension.get("future_product_field"),
-            Some(&serde_json::json!({ "nested": [1, 2, 3] }))
-        );
-        Ok(())
-    }
-
-    #[test]
     fn terminal_subagent_result_bounds_utf8_failure_text() {
         let long = "中".repeat(2_000);
         let result =
-            SubagentTaskResult::terminal(SubagentRunStatus::TimedOut, long.clone(), vec![long; 70]);
+            SubagentOutcome::terminal(SubagentStatus::TimedOut, long.clone(), vec![long; 70]);
 
         assert_eq!(result.summary.chars().count(), 1_200);
         assert_eq!(result.remaining_work.len(), 64);
@@ -3439,41 +2954,44 @@ mod tests {
 
     #[test]
     fn framework_evidence_round_trips_and_projects_product_fields() {
-        let outcome = echo_agent::agent::subagent::SubagentOutcome {
+        let mut outcome = echo_agent::subagent::SubagentOutcome {
             contract_version: 2,
-            status: echo_agent::agent::subagent::SubagentStatus::Completed,
+            status: echo_agent::subagent::SubagentStatus::Completed,
             summary: "done".to_string(),
             artifacts: Vec::new(),
             evidence: vec![
-                echo_agent::agent::subagent::SubagentEvidence {
+                echo_agent::subagent::SubagentEvidence {
                     kind: "tool_result".to_string(),
                     subject: "shell".to_string(),
                     outcome: Some("succeeded".to_string()),
                     details: "ok".to_string(),
-                    source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                    source: echo_agent::subagent::SubagentEvidenceSource::Observed,
                     attributes: serde_json::json!({ "args": { "command": "cargo test" } }),
                 },
-                echo_agent::agent::subagent::SubagentEvidence {
+                echo_agent::subagent::SubagentEvidence {
                     kind: "tool_result".to_string(),
                     subject: "write_file".to_string(),
                     outcome: Some("succeeded".to_string()),
                     details: String::new(),
-                    source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                    source: echo_agent::subagent::SubagentEvidenceSource::Observed,
                     attributes: serde_json::json!({ "args": { "path": "src/lib.rs" } }),
                 },
-                echo_agent::agent::subagent::SubagentEvidence {
+                echo_agent::subagent::SubagentEvidence {
                     kind: "domain_fact".to_string(),
                     subject: "schema".to_string(),
                     outcome: Some("confirmed".to_string()),
                     details: "field-level evidence".to_string(),
-                    source: echo_agent::agent::subagent::SubagentEvidenceSource::Reported,
+                    source: echo_agent::subagent::SubagentEvidenceSource::Reported,
                     attributes: serde_json::json!({ "confidence": "high" }),
                 },
             ],
+            verification: Vec::new(),
             remaining_work: Vec::new(),
+            touched_files: echo_agent::subagent::SubagentTouchedFiles::default(),
         };
+        outcome.refresh_derived_views();
 
-        let projected = SubagentTaskResult::from_framework_outcome(&outcome);
+        let projected = outcome.clone();
 
         assert_eq!(projected.evidence.len(), outcome.evidence.len());
         assert_eq!(

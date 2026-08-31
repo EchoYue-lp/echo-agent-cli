@@ -1,33 +1,11 @@
 ---
 name: git-workflow
-description: >-
-  Git 版本控制与协作。当用户需要进行分支管理、提交代码、创建 PR/MR、
-  解决合并冲突、或执行 Git 操作时激活。
-triggers:
-  - git
-  - 分支
-  - 提交
-  - commit
-  - PR
-  - MR
-  - merge
-  - 合并
-  - 冲突
-  - branch
-  - cherry-pick
-  - rebase
-  - 版本控制
-allowed-tools:
-  - "shell"
-  - "read_file"
-  - "read_artifact"
-  - "glob"
-  - "grep"
-  - "git_*"
+description: Git 版本控制与协作。当用户需要进行分支管理、提交代码、创建 PR/MR、 解决合并冲突、或执行 Git 操作时激活。
+allowed-tools: shell read_file read_artifact glob grep git_*
 metadata:
   author: echo-agent-cli
-  version: "1.0.0"
-  tags: "git, version control, branch, merge, collaboration"
+  version: 1.0.0
+  tags: git, version control, branch, merge, collaboration
 ---
 
 ## Git 版本控制与协作

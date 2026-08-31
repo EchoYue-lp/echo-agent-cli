@@ -26,9 +26,7 @@ use echo_agent::tools::{Tool, ToolParameters, ToolResult};
 use futures::future::BoxFuture;
 use tokio::sync::Mutex as TokioMutex;
 
-use super::executor::{
-    RunOutcome, TaskRuntimeBlockingAdapter, execute_run, preflight_unattended_plan,
-};
+use super::executor::{RunOutcome, TaskRuntimeOperation, execute_run, preflight_unattended_plan};
 use super::store::{StoreError, TaskRuntimeStore};
 use super::types::{
     AttendedMode, TaskExecutionSummary, TaskRunStatus, TodoItem, UnattendedWriteMode,
@@ -303,7 +301,7 @@ impl Tool for ExecuteTaskTool {
                     "task_execute requires the committed revision.",
                 ));
             };
-            let blocking = TaskRuntimeBlockingAdapter::new(self.store.clone());
+            let blocking = TaskRuntimeOperation::new(self.store.clone());
             let admission_run_id = run_id.clone();
             let (materialized_plan, admission_run) = match blocking
                 .run("load task_execute admission", move |store| {
@@ -600,7 +598,7 @@ impl Tool for ExecuteTaskTool {
             let workspace_io = self
                 .workspace_io
                 .clone()
-                .or_else(|| crate::state::WorkspaceIoInvocation::from_task_tool_context(ctx));
+                .or_else(|| crate::state::WorkspaceIoInvocation::from_context(ctx));
             let result = super::task_tools::scoped_with_ctx_run_id(ctx, || {
                 super::task_tools::CURRENT_WORKSPACE_IO.scope(
                     workspace_io,
@@ -753,35 +751,35 @@ fn todo_summary(todo: &TodoItem) -> Option<String> {
 
 fn format_execution_summary(summary: &TaskExecutionSummary) -> String {
     let mut parts = Vec::new();
-    if !summary.result.summary.trim().is_empty() {
-        parts.push(format!("完成: {}", summary.result.summary));
+    if !summary.outcome.summary.trim().is_empty() {
+        parts.push(format!("完成: {}", summary.outcome.summary));
     }
-    if !summary.result.touched_files.read.is_empty() {
+    if !summary.outcome.touched_files.read.is_empty() {
         parts.push(format!(
             "读取: {}",
-            summary.result.touched_files.read.join(", ")
+            summary.outcome.touched_files.read.join(", ")
         ));
     }
-    if !summary.result.touched_files.written.is_empty() {
+    if !summary.outcome.touched_files.written.is_empty() {
         parts.push(format!(
             "修改: {}",
-            summary.result.touched_files.written.join(", ")
+            summary.outcome.touched_files.written.join(", ")
         ));
     }
     if !summary.decisions.is_empty() {
         parts.push(format!("决策: {}", summary.decisions.join("; ")));
     }
-    if !summary.result.remaining_work.is_empty() {
+    if !summary.outcome.remaining_work.is_empty() {
         parts.push(format!(
             "未完成: {}",
-            summary.result.remaining_work.join("; ")
+            summary.outcome.remaining_work.join("; ")
         ));
     }
-    if !summary.result.verification.is_empty() {
+    if !summary.outcome.verification.is_empty() {
         parts.push(format!(
             "验证: {}",
             summary
-                .result
+                .outcome
                 .verification
                 .iter()
                 .map(|item| format!("{}: {:?}", item.check, item.status))
@@ -816,8 +814,8 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::task_tools;
     use crate::tasks::task_runtime::types::{
-        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, SubagentRunStatus,
-        SubagentTaskResult, SubagentTouchedFiles, TaskPlan,
+        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, SubagentOutcome, SubagentStatus,
+        SubagentTouchedFiles, TaskPlan,
     };
     use echo_agent::prelude::*;
     use echo_agent::tools::ToolParameters;
@@ -1015,9 +1013,9 @@ mod tests {
                 run_id: "r1".to_string(),
                 task_id: "t1".to_string(),
                 subagent_name: "explorer".to_string(),
-                result: SubagentTaskResult {
+                outcome: SubagentOutcome {
                     contract_version: 1,
-                    status: SubagentRunStatus::Completed,
+                    status: SubagentStatus::Completed,
                     summary: "梳理 runtime、agent_pool、task_runtime 的职责".to_string(),
                     artifacts: Vec::new(),
                     evidence: Vec::new(),

@@ -699,12 +699,10 @@ impl Tool for AutoIngestResearchTool {
         Box::pin(async move {
             // Execution working_dir may be a writer worktree. Product-data
             // root comes only from this workspace-local tool descriptor.
-            let Some(workspace_io) =
-                crate::state::WorkspaceIoInvocation::from_tool_context_for_identity(
-                    context,
-                    &self.workspace_io_identity,
-                )
-            else {
+            let Some(workspace_io) = crate::state::WorkspaceIoInvocation::scoped_to_identity(
+                context,
+                &self.workspace_io_identity,
+            ) else {
                 return Ok(auto_ingest_preflight_failure(
                     self.name(),
                     "the invocation did not retain an EKO workspace lifetime receipt",
@@ -1156,12 +1154,10 @@ mod tests {
         );
 
         let identity = crate::workspace::WorkspaceIoIdentity::global(workspace.path());
-        let scope = crate::state::WorkspaceIoInvocation::from_tool_context_for_identity(
-            &context, &identity,
-        )
-        .ok_or_else(|| {
-            echo_agent::error::ReactError::Other("typed workspace receipt was lost".to_string())
-        })?;
+        let scope = crate::state::WorkspaceIoInvocation::scoped_to_identity(&context, &identity)
+            .ok_or_else(|| {
+                echo_agent::error::ReactError::Other("typed workspace receipt was lost".to_string())
+            })?;
         let filtered = scope.resource_guards();
 
         assert_eq!(filtered.len(), 1);

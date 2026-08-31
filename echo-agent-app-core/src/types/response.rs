@@ -16,15 +16,12 @@ pub enum ChatSteerPhase {
     TurnSettled,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export, rename = "ChatSteerOutcome")]
-pub enum ChatSteerOutcome {
-    Completed,
-    Failed,
-    Cancelled,
-    Dropped,
-}
+/// Framework terminal outcome of the turn that owned the active steer.
+///
+/// `ChatSteerOutcome` remains the stable EKO wire name, while its Rust value
+/// is the framework authority directly. This response has no product-specific
+/// outcome semantics that would justify a second enum or a conversion helper.
+pub use echo_agent::agent::AgentSteerTurnOutcome as ChatSteerOutcome;
 
 #[derive(Debug, Clone, Copy, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -43,6 +40,7 @@ pub struct ChatSteerReceipt {
     pub kind: ChatSteerKind,
     pub phase: Option<ChatSteerPhase>,
     pub turn_id: Option<String>,
+    #[ts(type = "ChatSteerOutcome | null")]
     pub outcome: Option<ChatSteerOutcome>,
     pub expected: Option<String>,
     pub actual: Option<String>,

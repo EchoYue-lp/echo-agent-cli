@@ -141,7 +141,7 @@ impl HookEventDispatcher {
         let sender = sender
             .as_ref()
             .ok_or_else(|| "HookEventDispatcher is shut down".to_string())?;
-        for translation in EventTranslation::from_runtime_event(event) {
+        for translation in EventTranslation::translate(event) {
             sender
                 .send(QueueCommand::Event(translation))
                 .map_err(|_| "HookEventDispatcher consumer stopped".to_string())?;
@@ -254,7 +254,7 @@ impl EventTranslation {
     /// Translate a RuntimeTaskEvent into a fireable envelope, or None if the
     /// event kind is not in the dispatch table (e.g. ToolStarted, Note,
     /// PlanRevisionCommitted — see module docs).
-    fn from_runtime_event(event: &RuntimeTaskEvent) -> Vec<Self> {
+    fn translate(event: &RuntimeTaskEvent) -> Vec<Self> {
         if event.event_type == RuntimeEventKind::PlanRevisionCommitted {
             return task_created_translations(event);
         }
@@ -565,7 +565,7 @@ mod tests {
             Some("t-1"),
             json!({"summary": "build"}),
         );
-        let translated = EventTranslation::from_runtime_event(&ev);
+        let translated = EventTranslation::translate(&ev);
         let Some(t) = translated.first() else {
             assert!(!translated.is_empty(), "TaskStarted should translate");
             return;
@@ -582,7 +582,7 @@ mod tests {
             Some("t-1"),
             json!({"status_detail": "compile error"}),
         );
-        let translated = EventTranslation::from_runtime_event(&ev);
+        let translated = EventTranslation::translate(&ev);
         assert!(matches!(
             translated.first().map(|translation| &translation.kind),
             Some(TranslatedKind::TaskCompleted {
@@ -599,7 +599,7 @@ mod tests {
             Some("t-1"),
             json!({"title": "build", "summary": "built three artifacts"}),
         );
-        let translated = EventTranslation::from_runtime_event(&ev);
+        let translated = EventTranslation::translate(&ev);
         assert!(matches!(
             translated.first().map(|translation| &translation.kind),
             Some(TranslatedKind::TaskCompleted { result, .. })
@@ -617,7 +617,7 @@ mod tests {
                 "status_detail": "cancelled with parent run"
             }),
         );
-        let translated = EventTranslation::from_runtime_event(&ev);
+        let translated = EventTranslation::translate(&ev);
         assert!(matches!(
             translated.first().map(|translation| &translation.kind),
             Some(TranslatedKind::TaskCompleted {
@@ -634,7 +634,7 @@ mod tests {
             Some("t-1"),
             json!({"status_detail": "provider deadline elapsed"}),
         );
-        let translated = EventTranslation::from_runtime_event(&event);
+        let translated = EventTranslation::translate(&event);
         assert!(matches!(
             translated.first().map(|translation| &translation.kind),
             Some(TranslatedKind::TaskCompleted {
@@ -660,7 +660,7 @@ mod tests {
                 }
             }),
         );
-        let translated = EventTranslation::from_runtime_event(&ev);
+        let translated = EventTranslation::translate(&ev);
         assert_eq!(translated.len(), 1);
         assert!(matches!(
             translated.first().map(|translation| &translation.kind),
@@ -695,7 +695,7 @@ mod tests {
                 "attempt": 3
             }),
         );
-        let translated = EventTranslation::from_runtime_event(&ev);
+        let translated = EventTranslation::translate(&ev);
         let Some(t) = translated.first() else {
             assert!(!translated.is_empty(), "SubagentReleased should translate");
             return;
@@ -721,18 +721,18 @@ mod tests {
             Some("t-1"),
             json!({"agent_name": "coder", "dispatch_hook": false}),
         );
-        assert!(EventTranslation::from_runtime_event(&ev).is_empty());
+        assert!(EventTranslation::translate(&ev).is_empty());
     }
 
     #[test]
     fn unhandled_events_skip() {
         // ToolStarted / Note and plan commits with no new nodes are skipped.
         let ev = make_event(RuntimeEventKind::ToolStarted, Some("t-1"), json!({}));
-        assert!(EventTranslation::from_runtime_event(&ev).is_empty());
+        assert!(EventTranslation::translate(&ev).is_empty());
         let ev = make_event(RuntimeEventKind::Note, None, json!({}));
-        assert!(EventTranslation::from_runtime_event(&ev).is_empty());
+        assert!(EventTranslation::translate(&ev).is_empty());
         let ev = make_event(RuntimeEventKind::PlanRevisionCommitted, None, json!({}));
-        assert!(EventTranslation::from_runtime_event(&ev).is_empty());
+        assert!(EventTranslation::translate(&ev).is_empty());
     }
 
     #[test]

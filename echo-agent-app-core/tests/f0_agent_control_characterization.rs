@@ -10,8 +10,7 @@ use std::sync::Arc;
 use echo_agent_app_core::api::agent_router::AgentAddress;
 use echo_agent_app_core::api::tasks::task_runtime::{
     AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, SubagentControlActorSource,
-    SubagentControlIdentity, SubagentControlStatus, TaskPlan, TaskRuntimeStore,
-    commit_eko_task_plan,
+    SubagentControlIdentity, SubagentControlStatus, TaskPlan, TaskRuntimeStore, commit_task_plan,
 };
 
 const AGENT_ROUTER_INBOX: &str = include_str!("../src/agent_router/inbox.rs");
@@ -70,7 +69,7 @@ async fn store_with_plan(
             AttendedMode::Attended,
         )
         .map_err(|error| error.to_string())?;
-    commit_eko_task_plan(store.clone(), plan_for(run_id, "task-1"))
+    commit_task_plan(store.clone(), plan_for(run_id, "task-1"))
         .await
         .map_err(|error| error.to_string())?;
     Ok(store)

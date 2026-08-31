@@ -539,7 +539,7 @@ impl AgentPool {
             ))),
             workspace_kind: RwLock::new(kind),
             instruction_projection: RwLock::new(self.instruction_projection.read().await.clone()),
-            tool_control: crate::tool_control::shared(&self.tool_control),
+            tool_control: Arc::clone(&self.tool_control),
             #[cfg(test)]
             llm_client_override: RwLock::new(self.llm_client_override.read().await.clone()),
         });
@@ -646,9 +646,20 @@ impl AgentPool {
         enable_background_agent: bool,
     ) -> Self {
         let mut app_config = EkoConfig::default();
-        app_config.model.provider = "test".to_string();
-        app_config.model.name = "test-model".to_string();
-        app_config.model.base_url = Some("http://127.0.0.1:11434/v1/chat/completions".to_string());
+        app_config.model.default_model_id = Some("test:test-model".to_string());
+        app_config.model_providers.insert(
+            "test".to_string(),
+            crate::config::ModelProviderConfig {
+                base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+                ..Default::default()
+            },
+        );
+        app_config.configured_models.push(crate::config::ConfiguredModel {
+            id: "test:test-model".to_string(),
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
+            ..Default::default()
+        });
         Self::new_for_test_with_config(
             &agent,
             review_integration,
@@ -1024,11 +1035,7 @@ impl AgentPool {
 
     /// Number of exact execution receipts currently retaining this pool.
     pub(crate) fn active_execution_count(&self) -> usize {
-        self.admission
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .total
+        self.admission.active_count()
     }
 
     /// Admit every existing and future pool consumer before persistence.
@@ -1197,6 +1204,11 @@ impl AgentPool {
                 .write_async(|agent| {
                     Box::pin(async move {
                         agent.set_system_prompt(system_prompt).await;
+                        let disabled_tools = agent.disabled_tool_names();
+                        crate::subagent_prompt::refresh_primary_system_prompt(
+                            agent,
+                            &disabled_tools,
+                        );
                     })
                 })
                 .await;
@@ -1214,7 +1226,7 @@ impl AgentPool {
         // Concurrent older publishers therefore observe the newest revision
         // instead of overwriting a later mutation with a stale snapshot.
         let snapshot = self.tool_control.snapshot()?;
-        let disabled = crate::tool_control::disabled_option(&snapshot);
+        let disabled = snapshot.disabled_option();
         let mut handles = agents
             .values()
             .map(|pooled| pooled.handle.clone())
@@ -1236,7 +1248,13 @@ impl AgentPool {
         for handle in handles {
             let disabled = disabled.clone();
             handle
-                .read(|agent| agent.set_disabled_tools(disabled))
+                .write(|agent| {
+                    agent.set_disabled_tools(disabled.clone());
+                    crate::subagent_prompt::refresh_primary_system_prompt(
+                        agent,
+                        &disabled.unwrap_or_default(),
+                    );
+                })
                 .await;
         }
         for consumers in model_consumers {
@@ -1252,7 +1270,7 @@ impl AgentPool {
     }
 
     pub(crate) fn tool_control(&self) -> Arc<crate::tool_control::ToolControlService> {
-        crate::tool_control::shared(&self.tool_control)
+        Arc::clone(&self.tool_control)
     }
 
     /// Propagate `working_dir` to all pooled agents.
@@ -1351,6 +1369,59 @@ impl AgentPool {
     /// Current number of agents in the pool (including background).
     pub async fn pool_size(&self) -> usize {
         self.agents.read().await.len()
+    }
+
+    /// Refresh the active builtin Skill set for this pool generation.
+    ///
+    /// Every live Agent refreshes its progressive Skill registry from the same
+    /// active builtin set. Hook registration is keyed by Skill source in the
+    /// shared registry, so re-registering an unchanged source is idempotent.
+    pub(crate) async fn reconcile_builtin_skills(
+        &self,
+        builtin_root: std::path::PathBuf,
+    ) -> Result<(), String> {
+        let primary = self.primary_agent().await.map_err(|error| error.to_string())?;
+        let primary_builtin_root = builtin_root.clone();
+        let descriptors = primary
+            .write_async(|agent| {
+                Box::pin(async move {
+                    agent
+                        .reload_skills_from_dir(primary_builtin_root)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    agent.reconcile_skill_load_policy().await;
+                    crate::runtime::configure_intent_router(agent);
+                    Ok::<_, String>(agent.skill_descriptors())
+                })
+            })
+            .await?;
+
+        let handles = self
+            .agents
+            .read()
+            .await
+            .values()
+            .map(|pooled| pooled.handle.clone())
+            .filter(|handle| !Arc::ptr_eq(handle.inner(), primary.inner()))
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let builtin_root = builtin_root.clone();
+            handle
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        agent
+                            .reload_skills_from_dir(builtin_root)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        agent.reconcile_skill_load_policy().await;
+                        crate::runtime::configure_intent_router(agent);
+                        Ok::<_, String>(())
+                    })
+                })
+                .await?;
+        }
+        self.agent_generation.write().await.skill_descriptors = descriptors;
+        Ok(())
     }
 
     /// Return the primary Agent for this pool generation.
@@ -1690,6 +1761,19 @@ impl AgentPool {
         if let Some(ref tep) = self.shared.tool_execution_pipeline {
             agent.set_tool_execution_pipeline(tep.clone());
         }
+        let skill_policy = Arc::new(crate::skills_hub::ActiveSkillLoadPolicy::new(
+            crate::data_root::user_data_path("enabled-skills.json"),
+            crate::skills_hub::builtin_skills_root(),
+            self.shared
+                .review_integration
+                .clone()
+                .map(|policy| policy as Arc<dyn echo_agent::skills::external::SkillLoadPolicy>),
+        ));
+        agent.set_skill_load_policy(Some(skill_policy));
+        agent
+            .reload_skills_from_dir(crate::skills_hub::builtin_skills_root())
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let conversation_store = self
             .conversation_store_override
             .read()
@@ -1709,7 +1793,6 @@ impl AgentPool {
             let layer_manager = memory_generation.layer_manager()?;
             agent.install_memory_layer_manager(layer_manager);
             agent.set_memory_trigger_sink(Some(review_integration.clone()));
-            agent.set_skill_load_policy(Some(review_integration.clone()));
             agent.set_skill_curator(Some(review_integration.curator()));
             let mut projector = crate::turn_context::EkoContextProjector::new(
                 crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
@@ -1720,7 +1803,7 @@ impl AgentPool {
                 self.shared.command_cell_runtime.clone(),
                 self.shared.execution_scope.clone(),
             ) {
-                projector = projector.with_awaiter_results(command_cells, execution_scope);
+                projector = projector.with_command_cell_watches(command_cells, execution_scope);
             }
             agent.set_pre_model_context_projector(Some(Arc::new(projector)));
         }
@@ -1733,14 +1816,16 @@ impl AgentPool {
             .tool_control
             .snapshot()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let disabled_tools = crate::tool_control::disabled_option(&tool_control);
+        let disabled_tools = tool_control.disabled_option();
         agent.set_disabled_tools(disabled_tools.clone());
         model_consumers.apply_disabled_tools(disabled_tools).await;
 
         // 3. Install the exact plugin generation committed by PluginRuntime.
         let agent_generation = self.agent_generation.read().await.clone();
         for desc in &agent_generation.skill_descriptors {
-            agent.skill_registry_mut().register_descriptor(desc.clone());
+            if !crate::skills_hub::is_builtin_skill_path(&desc.location) {
+                agent.skill_registry_mut().register_descriptor(desc.clone());
+            }
         }
         register_plugin_agents(&mut agent, &agent_generation.plugin_agents)
             .await
@@ -1785,7 +1870,12 @@ impl AgentPool {
         if self.shared.tool_manager.is_none()
             && let Some(store) = self.shared.task_runtime_store.as_ref()
         {
-            crate::tasks::task_runtime::register_task_tools_on_agent(&handle, store.clone()).await;
+            crate::tasks::task_runtime::register_task_tools_on_agent(
+                &handle,
+                store.clone(),
+                model_consumers.subagent_catalog(),
+            )
+            .await;
         }
 
         // TaskRuntime's formal Subagents are created by the framework registry,

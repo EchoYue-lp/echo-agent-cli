@@ -16,7 +16,7 @@ use state::{TauriBridgeSupervisor, TauriState};
 use std::sync::Arc;
 use tauri::Emitter;
 
-fn task_id_from_subagent_execution_id(execution_id: &str, run_id: &str) -> Option<String> {
+fn task_id_for_execution(execution_id: &str, run_id: &str) -> Option<String> {
     let scoped = execution_id.strip_prefix(run_id)?.strip_prefix(':')?;
     let mut parts = scoped.rsplitn(3, ':');
     let attempt = parts.next()?;
@@ -97,8 +97,8 @@ fn resolve_gui_subagent_projection_address(
     })
 }
 
-fn framework_subagent_event_needs_app_projection(agent: &str, run_id: Option<&str>) -> bool {
-    agent != "awaiter" && run_id.is_none()
+fn framework_subagent_event_needs_app_projection(_agent: &str, run_id: Option<&str>) -> bool {
+    run_id.is_none()
 }
 
 pub fn build_tauri_app(
@@ -484,7 +484,7 @@ pub fn build_tauri_app(
                         };
                         match event {
                             Ok(event) => {
-                                use echo_agent::agent::subagent::SubagentEvent;
+                                use echo_agent::subagent::SubagentEvent;
                                 if let SubagentEvent::DispatchStarted {
                                     execution_id: Some(execution_id),
                                     conversation_id,
@@ -629,14 +629,19 @@ pub fn build_tauri_app(
                                         run_id.as_deref(),
                                     ) => {
                                         let tool_status = match *status {
-                                            echo_agent::agent::subagent::SubagentStatus::Cancelled => {
+                                            echo_agent::subagent::SubagentStatus::Cancelled => {
                                                 echo_agent_app_core::api::tool_execution::ToolExecutionStatus::Cancelled
                                             }
-                                            echo_agent::agent::subagent::SubagentStatus::TimedOut => {
+                                            echo_agent::subagent::SubagentStatus::TimedOut => {
                                                 echo_agent_app_core::api::tool_execution::ToolExecutionStatus::TimedOut
                                             }
-                                            echo_agent::agent::subagent::SubagentStatus::Completed
-                                            | echo_agent::agent::subagent::SubagentStatus::Failed => {
+                                            echo_agent::subagent::SubagentStatus::Completed
+                                            | echo_agent::subagent::SubagentStatus::Failed => {
+                                                echo_agent_app_core::api::tool_execution::ToolExecutionStatus::Unknown
+                                            }
+                                            // A failed terminal event should never carry Running,
+                                            // but keep the bridge exhaustive and fail-safe if it does.
+                                            echo_agent::subagent::SubagentStatus::Running => {
                                                 echo_agent_app_core::api::tool_execution::ToolExecutionStatus::Unknown
                                             }
                                         };
@@ -734,11 +739,10 @@ pub fn build_tauri_app(
                                             tokens_used,
                                             iterations,
                                             output,
-                                            result,
+                                            outcome,
                                             execution_id,
                                             run_id,
                                         } => {
-                                            let projected_result = echo_agent_app_core::api::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(result);
                                             (
                                                 "completed",
                                                 execution_id.clone(),
@@ -749,13 +753,13 @@ pub fn build_tauri_app(
                                                     "tokens_used": tokens_used,
                                                     "iteration_count": iterations,
                                                     "output": output.clone(),
-                                                    "terminal_status": result.status.as_str(),
-                                                    "contract_version": result.contract_version,
-                                                    "summary": result.summary.clone(),
-                                                    "artifacts": projected_result.artifacts,
-                                                    "verification": projected_result.verification,
-                                                    "remaining_work": projected_result.remaining_work,
-                                                    "touched_files": projected_result.touched_files,
+                                                    "terminal_status": outcome.status.as_str(),
+                                                    "contract_version": outcome.contract_version,
+                                                    "summary": outcome.summary.clone(),
+                                                    "artifacts": outcome.artifacts.clone(),
+                                                    "verification": outcome.verification(),
+                                                    "remaining_work": outcome.remaining_work.clone(),
+                                                    "touched_files": outcome.touched_files(),
                                                 }),
                                             )
                                         },
@@ -764,11 +768,10 @@ pub fn build_tauri_app(
                                             agent,
                                             error,
                                             status,
-                                            result,
+                                            outcome,
                                             execution_id,
                                             run_id,
                                         } => {
-                                            let projected_result = echo_agent_app_core::api::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(result);
                                             (
                                                 status.as_str(),
                                                 execution_id.clone(),
@@ -777,36 +780,35 @@ pub fn build_tauri_app(
                                                 serde_json::json!({
                                                     "error": error.clone(),
                                                     "terminal_status": status.as_str(),
-                                                    "contract_version": result.contract_version,
-                                                    "summary": result.summary.clone(),
-                                                    "artifacts": projected_result.artifacts,
-                                                    "verification": projected_result.verification,
-                                                    "remaining_work": projected_result.remaining_work,
-                                                    "touched_files": projected_result.touched_files,
+                                                    "contract_version": outcome.contract_version,
+                                                    "summary": outcome.summary.clone(),
+                                                    "artifacts": outcome.artifacts.clone(),
+                                                    "verification": outcome.verification(),
+                                                    "remaining_work": outcome.remaining_work.clone(),
+                                                    "touched_files": outcome.touched_files(),
                                                 }),
                                             )
                                         },
                                         SubagentEvent::DispatchCancelled {
                                             parent: _,
                                             agent,
-                                            result,
+                                            outcome,
                                             execution_id,
                                             run_id,
                                         } => {
-                                            let projected_result = echo_agent_app_core::api::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(result);
                                             (
                                                 "cancelled",
                                                 execution_id.clone(),
                                                 run_id.clone(),
                                                 agent.clone(),
                                                 serde_json::json!({
-                                                    "terminal_status": result.status.as_str(),
-                                                    "contract_version": result.contract_version,
-                                                    "summary": result.summary.clone(),
-                                                    "artifacts": projected_result.artifacts,
-                                                    "verification": projected_result.verification,
-                                                    "remaining_work": projected_result.remaining_work,
-                                                    "touched_files": projected_result.touched_files,
+                                                    "terminal_status": outcome.status.as_str(),
+                                                    "contract_version": outcome.contract_version,
+                                                    "summary": outcome.summary.clone(),
+                                                    "artifacts": outcome.artifacts.clone(),
+                                                    "verification": outcome.verification(),
+                                                    "remaining_work": outcome.remaining_work.clone(),
+                                                    "touched_files": outcome.touched_files(),
                                                 }),
                                             )
                                         },
@@ -874,7 +876,7 @@ pub fn build_tauri_app(
                                 let task_id_owned: Option<String> =
                                     execution_id.as_deref().and_then(|execution_id| {
                                         run_id.as_deref().and_then(|run_id| {
-                                            task_id_from_subagent_execution_id(execution_id, run_id)
+                                            task_id_for_execution(execution_id, run_id)
                                         })
                                     });
                                 let subagent_run_id_owned: String = execution_id
@@ -904,7 +906,7 @@ pub fn build_tauri_app(
                                     if let Some(store) = task_runtime_store.as_ref()
                                     {
                                         let lookup_run_id = run_id.to_string();
-                                        if let Ok(Some(run)) = echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone())
+                                        if let Ok(Some(run)) = echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeOperation::new(store.clone())
                                             .run_store("project Tauri TaskRun identity", move |store| store.get_run(&lookup_run_id))
                                             .await
                                         {
@@ -970,7 +972,7 @@ pub fn build_tauri_app(
 mod tests {
     use super::{
         framework_subagent_event_needs_app_projection, resolve_gui_subagent_projection_address,
-        task_id_from_subagent_execution_id,
+        task_id_for_execution,
     };
 
     #[test]
@@ -982,21 +984,18 @@ mod tests {
         assert!(framework_subagent_event_needs_app_projection(
             "explorer", None
         ));
-        assert!(!framework_subagent_event_needs_app_projection(
-            "awaiter", None
-        ));
     }
 
     #[test]
     fn execution_attempt_keeps_full_identity_and_extracts_only_the_task_join_key() {
         let execution_id = "run-1:phase:task-1:7:2";
         assert_eq!(
-            task_id_from_subagent_execution_id(execution_id, "run-1").as_deref(),
+            task_id_for_execution(execution_id, "run-1").as_deref(),
             Some("phase:task-1")
         );
         assert_eq!(execution_id, "run-1:phase:task-1:7:2");
-        assert!(task_id_from_subagent_execution_id("phase:task-1", "run-1").is_none());
-        assert!(task_id_from_subagent_execution_id("run-2:phase:task-1:7:2", "run-1").is_none());
+        assert!(task_id_for_execution("phase:task-1", "run-1").is_none());
+        assert!(task_id_for_execution("run-2:phase:task-1:7:2", "run-1").is_none());
     }
 
     #[test]

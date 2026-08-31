@@ -21,12 +21,12 @@ use echo_agent_app_core::api::config;
 use echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface;
 use echo_agent_app_core::api::prepared_turn::{PreparedUserTurn, UserTurnInput};
 use echo_agent_app_core::api::runtime::{AgentRuntime, ApplicationServices};
-use echo_agent_app_core::api::tasks::task_runtime::command_cells::AwaiterWatchReceipt;
+use echo_agent_app_core::api::tasks::task_runtime::command_cells::CommandCellWatchReceipt;
 use echo_agent_app_core::api::tasks::task_runtime::store::RunTurnClaimOutcome;
 use echo_agent_app_core::api::tasks::task_runtime::{
     AttendedMode, DomainProfile, ExecutionMode, PlanTask, RunTurnOrigin, RunTurnStatus,
     SubagentControlActorSource, SubagentControlIdentity, SubagentControlService, TaskPlan,
-    TaskRunStatus, TurnVisibility, commit_eko_task_plan, process_execution_resource_snapshot,
+    TaskRunStatus, TurnVisibility, commit_task_plan, process_execution_resource_snapshot,
     task_goal_sha256,
 };
 use echo_agent_app_core::api::workspace::{WorkspaceExecutionScope, WorkspaceKind};
@@ -38,8 +38,8 @@ const WORKSPACE_COUNT: usize = 3;
 const CONVERSATIONS_PER_WORKSPACE: usize = 3;
 const CELL_WAVE_SECONDS: u64 = 60;
 const RESTART_COUNT: u64 = 2;
-const AWAITER_COMMAND_SECONDS: u64 = 60;
-const AWAITER_READY_WAIT: Duration = Duration::from_secs(120);
+const COMMAND_CELL_WATCH_SECONDS: u64 = 60;
+const COMMAND_CELL_WATCH_READY_WAIT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Parser)]
 #[command(name = "lh6-product-soak")]
@@ -181,7 +181,7 @@ struct Ledger {
     provider_turns: u64,
     provider_failures: u64,
     command_cells: u64,
-    awaiter_ready: u64,
+    command_cell_watch_ready: u64,
     hitl_responses: u64,
     controlled_restarts: u64,
     provider_retry_injections: u64,
@@ -223,7 +223,7 @@ impl Ledger {
             provider_turns: 0,
             provider_failures: 0,
             command_cells: 0,
-            awaiter_ready: 0,
+            command_cell_watch_ready: 0,
             hitl_responses: 0,
             controlled_restarts: 0,
             provider_retry_injections: 0,
@@ -340,7 +340,8 @@ impl ChatSink for MetricsSink {
                 AgentEvent::ToolResult { name, result, .. }
                     if name == "watch_cell"
                         && result.success
-                        && serde_json::from_str::<AwaiterWatchReceipt>(&result.output).is_ok() =>
+                        && serde_json::from_str::<CommandCellWatchReceipt>(&result.output)
+                            .is_ok() =>
                 {
                     metrics.typed_watch_receipts = metrics.typed_watch_receipts.saturating_add(1);
                 }
@@ -387,7 +388,8 @@ async fn main() -> Result<()> {
     let mut app_config = config::load_config(Some(&config_path));
     config::apply_env_overrides(&mut app_config);
     let runtime_model =
-        echo_agent_app_core::api::model_config::resolve_runtime_model(&app_config, None);
+        echo_agent_app_core::api::model_config::resolve_runtime_model(&app_config, None)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let mut ledger = Ledger::new(
         tier,
         cli_commit,
@@ -521,8 +523,8 @@ async fn main() -> Result<()> {
     ensure!(ledger.duplicate_terminal_failures == 0);
     ensure!(ledger.resource_failures == 0);
     ensure!(
-        ledger.awaiter_ready >= 2,
-        "fewer than two Awaiter results were observed"
+        ledger.command_cell_watch_ready >= 2,
+        "fewer than two CommandCellWatch results were observed"
     );
     ensure!(
         ledger.hitl_responses >= 2,
@@ -646,11 +648,17 @@ async fn run_provider_wave(
     context: &ProductContext,
     addresses: &[Address],
     wave: u64,
-    require_awaiter: bool,
+    require_command_cell_watch: bool,
     ledger: &mut Ledger,
 ) -> Result<()> {
     let futures = addresses.iter().enumerate().map(|(index, address)| {
-        drive_one(context, address, index, wave, require_awaiter && index == 0)
+        drive_one(
+            context,
+            address,
+            index,
+            wave,
+            require_command_cell_watch && index == 0,
+        )
     });
     let joined = futures::future::join_all(futures);
     tokio::pin!(joined);
@@ -669,7 +677,9 @@ async fn run_provider_wave(
                 ledger.terminal_events = ledger
                     .terminal_events
                     .saturating_add(evidence.terminal_events);
-                ledger.awaiter_ready = ledger.awaiter_ready.saturating_add(evidence.awaiter_ready);
+                ledger.command_cell_watch_ready = ledger
+                    .command_cell_watch_ready
+                    .saturating_add(evidence.command_cell_watch_ready);
                 match evidence.surface {
                     ForegroundTurnSurface::Gui => {
                         ledger.surface_counts.gui = ledger.surface_counts.gui.saturating_add(1)
@@ -700,7 +710,7 @@ async fn run_provider_wave(
 struct TurnEvidence {
     surface: ForegroundTurnSurface,
     terminal_events: u64,
-    awaiter_ready: u64,
+    command_cell_watch_ready: u64,
 }
 
 async fn drive_one(
@@ -708,7 +718,7 @@ async fn drive_one(
     address: &Address,
     index: usize,
     wave: u64,
-    require_awaiter: bool,
+    require_command_cell_watch: bool,
 ) -> Result<TurnEvidence> {
     let scoped = context
         .services
@@ -748,9 +758,9 @@ async fn drive_one(
         Some(address.conversation_id.clone()),
         turn_id.clone(),
     );
-    let prompt = if require_awaiter {
+    let prompt = if require_command_cell_watch {
         format!(
-            "LH6 acceptance wave {wave}. Use shell with background=true to run exactly `sleep {AWAITER_COMMAND_SECONDS}; printf LH6_CELL_{wave}`. Immediately call watch_cell for that cell. While it runs, compute 17*19, then report the typed cell terminal phase and exit code after the Awaiter result."
+            "LH6 acceptance wave {wave}. Use shell with background=true to run exactly `sleep {COMMAND_CELL_WATCH_SECONDS}; printf LH6_CELL_{wave}`. Immediately call watch_cell for that cell. While it runs, compute 17*19, then report the typed cell terminal phase and exit code after the deterministic command-cell-watch result."
         )
     } else {
         format!(
@@ -790,7 +800,7 @@ async fn drive_one(
     ensure!(matches!(outcome, TurnOutcome::Completed));
     drop(pool_execution);
 
-    if require_awaiter {
+    if require_command_cell_watch {
         let typed_watch_receipts = metrics
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -799,7 +809,7 @@ async fn drive_one(
             typed_watch_receipts == 1,
             "watch_cell did not return exactly one successful typed receipt"
         );
-        tokio::time::timeout(AWAITER_READY_WAIT, async {
+        tokio::time::timeout(COMMAND_CELL_WATCH_READY_WAIT, async {
             loop {
                 let replay = context
                     .services
@@ -814,7 +824,7 @@ async fn drive_one(
                     )
                     .map_err(|error| anyhow!(error.to_string()))?;
                 if replay.events.iter().any(|event| {
-                    matches!(event.payload, ChatDriverEvent::AwaiterResultReady { .. })
+                    matches!(event.payload, ChatDriverEvent::CommandCellWatchReady { .. })
                 }) {
                     return Ok::<(), anyhow::Error>(());
                 }
@@ -824,8 +834,8 @@ async fn drive_one(
         .await
         .map_err(|_| {
             anyhow!(
-                "successful watch_cell receipt did not publish Awaiter Ready within {} seconds",
-                AWAITER_READY_WAIT.as_secs()
+                "successful watch_cell receipt did not publish CommandCellWatch Ready within {} seconds",
+                COMMAND_CELL_WATCH_READY_WAIT.as_secs()
             )
         })??;
     }
@@ -851,14 +861,14 @@ async fn drive_one(
         .iter()
         .filter(|event| event.root_turn_id == turn_id)
         .collect::<Vec<_>>();
-    let durable_awaiter_ready = current_turn_events
+    let durable_command_cell_watch_ready = current_turn_events
         .iter()
-        .filter(|event| matches!(event.payload, ChatDriverEvent::AwaiterResultReady { .. }))
+        .filter(|event| matches!(event.payload, ChatDriverEvent::CommandCellWatchReady { .. }))
         .count();
-    if require_awaiter {
+    if require_command_cell_watch {
         ensure!(
-            durable_awaiter_ready == 1,
-            "watch_cell did not publish exactly one durable Awaiter Ready fact"
+            durable_command_cell_watch_ready == 1,
+            "watch_cell did not publish exactly one durable CommandCellWatch Ready fact"
         );
     }
     ensure!(
@@ -875,7 +885,8 @@ async fn drive_one(
     Ok(TurnEvidence {
         surface: foreground_surface,
         terminal_events: snapshot.terminal_events,
-        awaiter_ready: u64::try_from(durable_awaiter_ready).unwrap_or(u64::MAX),
+        command_cell_watch_ready: u64::try_from(durable_command_cell_watch_ready)
+            .unwrap_or(u64::MAX),
     })
 }
 
@@ -987,7 +998,7 @@ async fn inject_control_events(
             "task",
             AttendedMode::Attended,
         )?;
-        commit_eko_task_plan(
+        commit_task_plan(
             store.clone(),
             TaskPlan {
                 plan_id: "lh6-control-plan".to_string(),
@@ -1270,7 +1281,7 @@ mod tests {
             "provider_turns",
             "provider_failures",
             "command_cells",
-            "awaiter_ready",
+            "command_cell_watch_ready",
             "hitl_responses",
             "controlled_restarts",
             "provider_retry_injections",

@@ -50,7 +50,8 @@ impl TaskCapabilityCatalog {
         &self,
         task: &echo_agent::tasks::TaskSpec,
     ) -> std::result::Result<(), String> {
-        let extension: EkoTaskExtension = serde_json::from_value(task.extension.clone())
+        let extension: EkoTaskExtension = task
+            .extension_as()
             .map_err(|error| format!("task '{}' has invalid EKO extension: {error}", task.id))?;
         if !self.subagents.contains(&extension.agent_role) {
             let mut available = self
@@ -121,11 +122,10 @@ tokio::task_local! {
 /// Run `f` with run_id, cancel, delegate_depth, and trace_sink available to all
 /// task tools.
 ///
-/// Called by the executor before dispatching task work. Replaces the old
-/// [`with_run_id`] which only scoped the run_id. Delegate depth starts at 0
-/// and is incremented by the L3 nesting layer (Task 6).
+/// Called by the executor before dispatching task work. Delegate depth starts
+/// at 0 and is incremented by the nested delegation layer.
 ///
-/// (stage4 P4.1) `cache_user_id` is no longer threaded here — tools/LLM calls
+/// `cache_user_id` is not threaded here; tools and LLM calls
 /// read the single source via `infra::load_or_create_cache_user_id()` instead.
 pub async fn with_run_context<F, R>(
     run_id: String,
@@ -151,7 +151,8 @@ where
         .await
 }
 
-/// Legacy wrapper — keeps old callers compiling. Prefer [`with_run_context`].
+/// Test helper for installing only a run id around one future.
+#[cfg(test)]
 pub async fn with_run_id<F, R>(run_id: String, f: F) -> R
 where
     F: std::future::Future<Output = R>,
@@ -220,7 +221,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = R>,
 {
-    let workspace_io = crate::state::WorkspaceIoInvocation::from_task_tool_context(ctx);
+    let workspace_io = crate::state::WorkspaceIoInvocation::from_context(ctx);
     let scoped_run_id = ctx
         .run_id
         .clone()
@@ -390,10 +391,7 @@ mod task_create_tests {
     }
 
     fn task_service(store: Arc<TaskRuntimeStore>) -> Arc<echo_agent::tasks::TaskRevisionService> {
-        super::super::revisioned_adapter::build_eko_task_revision_service(
-            store,
-            test_capabilities(),
-        )
+        super::super::revisioned_runtime::build_task_revision_service(store, test_capabilities())
     }
 
     fn one_task_params(task: serde_json::Value) -> ToolParameters {
@@ -1156,7 +1154,7 @@ impl CheckRunStatusTool {
             None => return Ok(ToolResult::error("no TaskRuntimeStore available")),
         };
         let lookup_run_id = run_id.clone();
-        match super::executor::TaskRuntimeBlockingAdapter::new(store)
+        match super::executor::TaskRuntimeOperation::new(store)
             .run_store("check TaskRun status tool", move |store| {
                 store.get_run(&lookup_run_id)
             })
@@ -1219,7 +1217,7 @@ impl CancelRunTool {
             None => return Ok(ToolResult::error("no TaskRuntimeStore available")),
         };
         let cancel_run_id = run_id.clone();
-        match super::executor::TaskRuntimeBlockingAdapter::new(store)
+        match super::executor::TaskRuntimeOperation::new(store)
             .run_store("cancel TaskRun tool", move |store| {
                 store.request_cancel(&cancel_run_id)
             })

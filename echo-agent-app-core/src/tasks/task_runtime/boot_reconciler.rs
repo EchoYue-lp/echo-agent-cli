@@ -80,7 +80,7 @@ impl TaskRunBootReconciler {
                         }
                         let result =
                             match store.upgrade() {
-                                Some(store) => super::TaskRuntimeBlockingAdapter::new(store)
+                                Some(store) => super::TaskRuntimeOperation::new(store)
                                     .run_store("recover TaskRuntime at boot", |store| {
                                         store.recover_incomplete()
                                     })
@@ -138,7 +138,7 @@ impl TaskRunBootReconciler {
             .store
             .upgrade()
             .ok_or_else(|| "TaskRuntimeStore was released before candidate listing".to_string())?;
-        super::TaskRuntimeBlockingAdapter::new(store)
+        super::TaskRuntimeOperation::new(store)
             .run_store("list boot recovery candidates", |store| {
                 store.list_runs_in(&[TaskRunStatus::Paused])
             })
@@ -158,7 +158,7 @@ impl TaskRunBootReconciler {
             .upgrade()
             .ok_or_else(|| "TaskRuntimeStore was released before boot admission".to_string())?;
         let run_id = run_id.to_string();
-        super::TaskRuntimeBlockingAdapter::new(store)
+        super::TaskRuntimeOperation::new(store)
             .run_store("decide boot auto-resume admission", move |store| {
                 store.boot_auto_resume_decision(&run_id, launcher_ready, interactive_owner_ready)
             })
@@ -198,7 +198,7 @@ impl TaskRunBootReconciler {
         }
         let run_id = run_id.to_string();
         let admitted_run_id = run_id.clone();
-        let outcome = super::TaskRuntimeBlockingAdapter::new(store)
+        let outcome = super::TaskRuntimeOperation::new(store)
             .run_store("commit boot auto-resume admission", move |store| {
                 store.resume_task_run_after_boot(
                     &admitted_run_id,

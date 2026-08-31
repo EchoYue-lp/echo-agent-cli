@@ -1,29 +1,11 @@
 ---
 name: web-search
-description: >-
-  互联网信息检索与验证。当用户需要搜索网页信息、查时事新闻、验证事实、
-  获取在线资料时激活。支持多源交叉验证和来源可信度评估。
-triggers:
-  - 上网查
-  - 网上搜索
-  - 最新新闻
-  - 搜索网页
-  - search web
-  - look up
-  - fact check
-  - 事实核查
-  - 网络调研
-allowed-tools:
-  - "web_search"
-  - "web_fetch"
-  - "web_extract"
-  - "read_file"
-  - "read_artifact"
-  - "apply_patch"
+description: 互联网信息检索、验证与深度调研。当用户需要搜索网页信息、查时事新闻、验证事实、获取在线资料、做多源交叉验证或生成带引用的综合报告时激活。支持来源可信度评估与按结论综合。
+allowed-tools: web_search web_fetch web_extract read_file read_artifact apply_patch
 metadata:
   author: echo-agent-cli
-  version: "1.0.0"
-  tags: "web, search, research, verification"
+  version: 1.1.0
+  tags: web, search, research, verification, report
 ---
 
 ## 互联网信息检索
@@ -43,6 +25,15 @@ metadata:
 4. **验证** → 对中央结论、数字、日期、人物/机构状态和高风险信息做来源核对；识别转载和循环引用
 5. **结构化输出** → 综合成清晰的回答，标注每条信息的来源 URL
 
+### 深度调研模式
+
+当答案依赖多个来源、证据相互冲突、或需要可复现的检索轨迹时（一个权威来源能直接回答的事实问题不要用这个模式）：
+
+- **先定义调研边界**：问题、受众、要做的决策、时效性、司法/领域范围，以及"什么算充分证据"。
+- **按结论分解，而不是按来源**：把问题拆成独立的主张或不确定性，并行检索各条线索；优先一手权威来源，二手来源用于发现背景与分歧。
+- **引用前读原文**：记录发布/更新日期、范围、方法论、利益冲突，以及它是否直接支持该主张。
+- **按结论综合**：区分共识、分歧、推断和未知；写明局限与反证。先给被支持的结论，再给关键证据和来源链接，最后说明检索范围与未解决的缺口。
+
 ### 工具策略
 - `web_search` — 主搜索工具，支持多引擎（DuckDuckGo/Brave/Tavily）
 - `web_fetch` — 获取网页全文，用于深入阅读重要来源
@@ -54,6 +45,6 @@ metadata:
 - 标注了信息的时效性
 - 如果搜索结果不充分，如实告知用户
 - 搜索结果摘要不是最终证据；重要结论应打开并阅读对应页面
-- 当核心问题已有充分证据时停止，不为增加篇幅继续检索
+- 当核心问题已有充分证据时停止，不为增加篇幅继续检索；只有缺少关键事实或用户明确要求穷尽时才扩展检索
 
 如需来源可信度评估标准，使用 `read_skill_resource("web-search", "references/source_evaluation.md")`。

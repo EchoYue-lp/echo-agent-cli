@@ -1,0 +1,350 @@
+{
+  "schemaVersion": 1,
+  "authority": "zh is the editorial source; en is a reviewed semantic translation. Every migrated entry removes its legacy root source after parity passes.",
+  "entries": [
+    {
+      "legacyPath": "MASTER-PLAN.md",
+      "targetPath": "project-status.md",
+      "kind": "project-status",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "README.md",
+      "targetPath": "README.md",
+      "kind": "index",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": false
+    },
+    {
+      "legacyPath": "adr/0001-agent-collaboration.md",
+      "targetPath": "adr/0001-agent-collaboration.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0002-codex-tool-capability-catalog.md",
+      "targetPath": "adr/0002-codex-tool-capability-catalog.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0003-claude-code-capability-catalog.md",
+      "targetPath": "adr/0003-claude-code-capability-catalog.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0004-application-lifecycle-supervisor.md",
+      "targetPath": "adr/0004-application-lifecycle-supervisor.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0005-foreground-continuation-owner.md",
+      "targetPath": "adr/0005-foreground-continuation-owner.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0006-scoped-product-data-io.md",
+      "targetPath": "adr/0006-scoped-product-data-io.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0007-taskruntime-agent-turn-authority.md",
+      "targetPath": "adr/0007-taskruntime-agent-turn-authority.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0008-taskruntime-bounded-query-projections.md",
+      "targetPath": "adr/0008-taskruntime-bounded-query-projections.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0009-taskruntime-async-io-and-ipc-boundary.md",
+      "targetPath": "adr/0009-taskruntime-async-io-and-ipc-boundary.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0010-channel-scope-parity.md",
+      "targetPath": "adr/0010-channel-scope-parity.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0011-boot-inbox-recovery-authority.md",
+      "targetPath": "adr/0011-boot-inbox-recovery-authority.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0012-extension-control-authority.md",
+      "targetPath": "adr/0012-extension-control-authority.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0013-subagent-control-receipt-projection.md",
+      "targetPath": "adr/0013-subagent-control-receipt-projection.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0014-durable-conversation-input-ingress.md",
+      "targetPath": "adr/0014-durable-conversation-input-ingress.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0015-task-graph-status-authority.md",
+      "targetPath": "adr/0015-task-graph-status-authority.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0016-agent-control-tools.md",
+      "targetPath": "adr/0016-agent-control-tools.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0017-f6-cursor-recovery-surface-parity.md",
+      "targetPath": "adr/0017-f6-cursor-recovery-surface-parity.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0018-typed-tool-artifact-projection.md",
+      "targetPath": "adr/0018-typed-tool-artifact-projection.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0019-unified-application-services-composition.md",
+      "targetPath": "adr/0019-unified-application-services-composition.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0020-interactive-tool-control-authority.md",
+      "targetPath": "adr/0020-interactive-tool-control-authority.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0021-canonical-taskrun-dependency-graph.md",
+      "targetPath": "adr/0021-canonical-taskrun-dependency-graph.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0022-framework-prepared-plugin-generations.md",
+      "targetPath": "adr/0022-framework-prepared-plugin-generations.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0023-repl-output-surface-pruning.md",
+      "targetPath": "adr/0023-repl-output-surface-pruning.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0024-generation-bound-hot-memory-projection.md",
+      "targetPath": "adr/0024-generation-bound-hot-memory-projection.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0025-app-core-global-modularization.md",
+      "targetPath": "adr/0025-app-core-global-modularization.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0026-typed-agent-router-ledger.md",
+      "targetPath": "adr/0026-typed-agent-router-ledger.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0027-framework-native-domain-values.md",
+      "targetPath": "adr/0027-framework-native-domain-values.md",
+      "kind": "adr",
+      "sourceLanguage": "en",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0028-current-product-schema-authority.md",
+      "targetPath": "adr/0028-current-product-schema-authority.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0029-framework-native-agent-and-model-config.md",
+      "targetPath": "adr/0029-framework-native-agent-and-model-config.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0030-unified-subagent-prompt-architecture.md",
+      "targetPath": "adr/0030-unified-subagent-prompt-architecture.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0031-deterministic-command-cell-watch.md",
+      "targetPath": "adr/0031-deterministic-command-cell-watch.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0032-enabled-skill-runtime-authority.md",
+      "targetPath": "adr/0032-enabled-skill-runtime-authority.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0033-skill-catalog-contraction-and-official-frontmatter.md",
+      "targetPath": "adr/0033-skill-catalog-contraction-and-official-frontmatter.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "architecture.md",
+      "targetPath": "architecture/overview.md",
+      "kind": "architecture",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "architecture/providers.md",
+      "targetPath": "architecture/providers.md",
+      "kind": "architecture",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "architecture/runtime-task-service.md",
+      "targetPath": "architecture/runtime.md",
+      "kind": "architecture",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "configuration.md",
+      "targetPath": "configuration.md",
+      "kind": "reference",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "features.md",
+      "targetPath": "features.md",
+      "kind": "reference",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "getting-started.md",
+      "targetPath": "getting-started.md",
+      "kind": "reference",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "persistence.md",
+      "targetPath": "architecture/persistence.md",
+      "kind": "architecture",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "skill-sync.md",
+      "targetPath": "operations/skill-sync.md",
+      "kind": "operations",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    }
+  ]
+}

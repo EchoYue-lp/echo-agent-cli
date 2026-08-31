@@ -1,49 +1,11 @@
 ---
 name: coding
-description: >-
-  编程与软件工程。当用户需要编写代码、调试问题、重构代码、
-  代码审查或解决编程相关任务时激活。
-triggers:
-  - 写代码
-  - 编程
-  - 调试
-  - 重构
-  - bug
-  - 报错
-  - 代码审查
-  - code review
-  - debug
-  - refactor
-  - stack trace
-  - 编译错误
-  - 单元测试
-  - 写个
-  - 写一段
-  - 写脚本
-  - 写函数
-  - 写类
-  - 实现
-allowed-tools:
-  - "shell"
-  - "run_code"
-  - "read_file"
-  - "read_artifact"
-  - "apply_patch"
-  - "glob"
-  - "grep"
-  - "list_dir"
-  - "diff"
-  - "repo_map"
-  - "code_search"
-  - "git_*"
-  - "task_create"
-  - "task_update"
-  - "task_list"
-  - "task_execute"
+description: 编程与软件工程。当用户需要编写代码、调试问题、重构代码、 代码审查或解决编程相关任务时激活。
+allowed-tools: shell run_code read_file read_artifact apply_patch glob grep list_dir diff repo_map code_search git_* task_create task_update task_list task_execute
 metadata:
   author: echo-agent-cli
-  version: "1.0.0"
-  tags: "coding, programming, debug, refactor, software"
+  version: 1.0.0
+  tags: coding, programming, debug, refactor, software
 ---
 
 ## 编程与软件工程

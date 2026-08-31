@@ -1,17 +1,13 @@
 ---
 name: subagent-driven-development
 description: 使用独立子代理逐任务执行实施计划，任务间审查
+allowed-tools: shell read_artifact task_create task_update task_list task_execute
 metadata:
   category: development
   source: superpowers
-  upstream-version: "6.0.3"
+  upstream-version: 6.0.3
   author: obra
-  tags: [subagent, plan-execution, review]
-triggers:
-  - 子代理
-  - subagent
-  - 逐任务
-allowed-tools: [shell, read_artifact, task_create, task_update, task_list, task_execute]
+  tags: subagent, plan-execution, review
 ---
 
 # Subagent-Driven Development

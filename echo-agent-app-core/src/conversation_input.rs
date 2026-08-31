@@ -138,26 +138,13 @@ pub enum ConversationInputPhase {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
-#[ts(export, rename = "ConversationInputOutcome")]
-#[serde(rename_all = "snake_case")]
-pub enum ConversationInputOutcome {
-    Completed,
-    Failed,
-    Cancelled,
-    Dropped,
-}
-
-impl From<echo_agent::agent::AgentSteerTurnOutcome> for ConversationInputOutcome {
-    fn from(value: echo_agent::agent::AgentSteerTurnOutcome) -> Self {
-        match value {
-            echo_agent::agent::AgentSteerTurnOutcome::Completed => Self::Completed,
-            echo_agent::agent::AgentSteerTurnOutcome::Failed => Self::Failed,
-            echo_agent::agent::AgentSteerTurnOutcome::Cancelled => Self::Cancelled,
-            echo_agent::agent::AgentSteerTurnOutcome::Dropped => Self::Dropped,
-        }
-    }
-}
+/// Framework terminal outcome of the turn that owns a conversation input.
+///
+/// The application keeps `ConversationInputOutcome` as a domain-facing name
+/// for its persisted and TypeScript wire projection, but the Rust value is the
+/// framework authority directly. There is no second EKO outcome enum or
+/// lossy conversion at this boundary.
+pub use echo_agent::agent::AgentSteerTurnOutcome as ConversationInputOutcome;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export, rename = "ConversationInputPayload")]
@@ -204,6 +191,7 @@ pub struct ConversationInputReceipt {
     pub attempt: Option<u32>,
     pub attempt_id: Option<String>,
     pub turn_id: Option<String>,
+    #[ts(type = "ConversationInputOutcome | null")]
     pub outcome: Option<ConversationInputOutcome>,
     pub drained: bool,
     pub reason: Option<String>,
@@ -274,6 +262,7 @@ pub enum ConversationInputFact {
     },
     TurnSettled {
         attempt: ConversationInputAttempt,
+        #[ts(type = "ConversationInputOutcome")]
         outcome: ConversationInputOutcome,
         drained: bool,
         #[ts(type = "number")]
@@ -604,10 +593,7 @@ impl ConversationInputService {
                         return Err(self.observer_failure(attempt, true, error).await);
                     }
                 }
-                match self
-                    .turn_settled(attempt.clone(), outcome.into(), drained)
-                    .await
-                {
+                match self.turn_settled(attempt.clone(), outcome, drained).await {
                     Ok(receipt) => Ok(receipt),
                     Err(error) => Err(self.observer_failure(attempt, drained, error).await),
                 }
@@ -677,10 +663,7 @@ impl ConversationInputService {
                                 return Err(self.observer_failure(attempt, true, error).await);
                             }
                         }
-                        match self
-                            .turn_settled(attempt.clone(), outcome.into(), drained)
-                            .await
-                        {
+                        match self.turn_settled(attempt.clone(), outcome, drained).await {
                             Ok(receipt) => Ok(receipt),
                             Err(error) => Err(self.observer_failure(attempt, drained, error).await),
                         }
@@ -718,10 +701,7 @@ impl ConversationInputService {
                         return Err(self.observer_failure(attempt, true, error).await);
                     }
                 }
-                match self
-                    .turn_settled(attempt.clone(), outcome.into(), drained)
-                    .await
-                {
+                match self.turn_settled(attempt.clone(), outcome, drained).await {
                     Ok(receipt) => Ok(receipt),
                     Err(error) => Err(self.observer_failure(attempt, drained, error).await),
                 }

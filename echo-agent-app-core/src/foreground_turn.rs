@@ -11,11 +11,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use echo_agent::agent::{AgentEvent, AgentHandle, CancellationToken};
+use echo_agent::runtime::TurnReceipt;
 use tokio::sync::watch;
 
-use crate::chat_driver::{
-    ChatDriverEvent, ChatSink, ChatTurnOutcome, TurnOutcome, drive_chat, drive_chat_turn,
-};
+use crate::chat_driver::{ChatDriverEvent, ChatSink, TurnOutcome, drive_chat, drive_chat_turn};
 use crate::chat_resources::ChatResources;
 use crate::prepared_turn::PreparedUserTurn;
 
@@ -263,10 +262,10 @@ impl ForegroundTurnProgress {
         &self,
         resources: Arc<ChatResources>,
         execute: Execute,
-    ) -> Result<ChatTurnOutcome, String>
+    ) -> Result<TurnReceipt, String>
     where
         Execute: FnOnce(Arc<ChatResources>) -> ExecuteFuture,
-        ExecuteFuture: std::future::Future<Output = Result<ChatTurnOutcome, String>>,
+        ExecuteFuture: std::future::Future<Output = Result<TurnReceipt, String>>,
     {
         let cancel = self.cancellation_token();
         let delivery = Arc::new(DownstreamDeliveryState::default());
@@ -306,7 +305,7 @@ impl ForegroundTurnProgress {
             return result;
         }
         result.map(|mut outcome| {
-            outcome.terminal = TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+            outcome.outcome = TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
                 "downstream_disconnect",
                 "chat event consumer closed before terminal delivery",
             ));
@@ -1631,7 +1630,7 @@ pub async fn drive_foreground_chat_with_input_observer(
                 Some(input_observer),
             )
             .await
-            .map(|outcome| outcome.terminal)
+            .map(|receipt| receipt.outcome)
         })
         .await;
     let settlement = lease
@@ -1664,7 +1663,7 @@ where
                 Some(input_observer),
             )
             .await
-            .map(|outcome| outcome.terminal)
+            .map(|receipt| receipt.outcome)
         })
         .await;
     let settlement = lease
@@ -1687,7 +1686,7 @@ pub async fn drive_foreground_chat_turn(
         run_foreground_chat_with(&lease, resources, |controlled_resources| async move {
             drive_chat_turn(agent, turn, controlled_resources, Some(binding))
                 .await
-                .map(|outcome| outcome.terminal)
+                .map(|receipt| receipt.outcome)
         })
         .await;
     let settlement = lease
@@ -1773,7 +1772,7 @@ where
                 binding,
             )
             .await
-            .map(|outcome| outcome.terminal)
+            .map(|receipt| receipt.outcome)
         })
         .await;
     match lease

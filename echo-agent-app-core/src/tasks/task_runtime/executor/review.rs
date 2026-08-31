@@ -8,7 +8,7 @@ async fn execute_runtime_plan<W: TaskDispatcher + 'static>(
     parent_cancel: CancellationToken,
     trace_sink: Option<ExecSink>,
 ) -> Result<RunOutcome, ExecError> {
-    let blocking = TaskRuntimeBlockingAdapter::new(store.clone());
+    let blocking = TaskRuntimeOperation::new(store.clone());
     let controller = Arc::new(EkoRuntimeDagController {
         store,
         blocking: blocking.clone(),
@@ -82,7 +82,7 @@ async fn execute_runtime_plan<W: TaskDispatcher + 'static>(
 async fn integrate_reviewed_task<W: TaskDispatcher + 'static>(
     dispatcher: Arc<W>,
     store: Arc<TaskRuntimeStore>,
-    blocking: TaskRuntimeBlockingAdapter,
+    blocking: TaskRuntimeOperation,
     run_id: &str,
     task: &PlanTask,
     execution_id: &str,
@@ -138,7 +138,7 @@ enum ReviewGateOutcome {
 /// (when available) against the domain checklist. Applies the circuit
 /// breaker on NeedsFix/Blocked outcomes.
 async fn run_review_gate(
-    blocking: TaskRuntimeBlockingAdapter,
+    blocking: TaskRuntimeOperation,
     reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
     run_id: &str,
     task: &PlanTask,

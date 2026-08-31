@@ -48,9 +48,6 @@ const BUILTIN_SUBAGENT_FILES: &[(&str, &str)] = &[
         "general-purpose",
         include_str!("subagents/coding/general-purpose.md"),
     ),
-    // Low-intensity waiting subagent: watches exactly one background command
-    // cell via the `wait` long-poll loop until it reaches a terminal state.
-    ("awaiter", include_str!("subagents/coding/awaiter.md")),
     // Sprint 10: data/research subagents — per-subagent tmpdir workspace
     // (workspace:true → isolate_workspace) for disjoint output artifacts.
     ("data-shaper", include_str!("subagents/data/data-shaper.md")),
@@ -120,7 +117,7 @@ struct SubagentFrontmatter {
     #[serde(default)]
     team_subagents: Vec<String>,
     /// Per-subagent execution timeout in seconds (0/None = framework default).
-    /// Used by long-running roles such as the awaiter watching background cells.
+    /// Used by long-running custom roles.
     #[serde(default)]
     timeout_secs: Option<u64>,
     /// Per-subagent reasoning-depth spec (`ThinkingConfig::parse_spec` syntax:
@@ -151,7 +148,7 @@ pub struct SubagentDefinition {
     /// Sprint 11: if Some, this subagent is a team-mode dispatcher (not a
     /// normal subagent). The registration path sets `execution_mode = Team` and
     /// attaches this TeamSpec. manager + subagent team members are name-references.
-    pub team: Option<echo_agent::agent::subagent::TeamSpec>,
+    pub team: Option<echo_agent::subagent::TeamSpec>,
     /// Whether this subagent may receive the framework `agent_tool` and spawn
     /// child subagents. Defaults false.
     pub can_delegate: bool,
@@ -196,35 +193,6 @@ impl SubagentCatalogSnapshot {
                     readonly: definition.readonly,
                     can_delegate: definition.can_delegate,
                     isolation: subagent_isolation(definition).to_string(),
-                })
-                .collect(),
-        }
-    }
-
-    pub fn from_registered(
-        definitions: &[echo_agent::agent::subagent::SubagentDefinition],
-    ) -> Self {
-        Self {
-            entries: definitions
-                .iter()
-                .map(|definition| {
-                    let readonly = definition
-                        .tags
-                        .iter()
-                        .any(|tag| tag == "capability:readonly" || tag == "readonly");
-                    let isolation = definition
-                        .tags
-                        .iter()
-                        .find_map(|tag| tag.strip_prefix("isolation:"))
-                        .unwrap_or("context")
-                        .to_string();
-                    SubagentCatalogEntry {
-                        name: definition.name.clone(),
-                        description: definition.description.clone(),
-                        readonly,
-                        can_delegate: definition.can_delegate,
-                        isolation,
-                    }
                 })
                 .collect(),
         }
@@ -487,11 +455,11 @@ pub fn parse_subagent_md(
                 "subagent `{name}`: team_strategy set but team_subagents empty"
             ));
         }
-        Some(echo_agent::agent::subagent::TeamSpec {
-            strategy: echo_agent::agent::subagent::TeamStrategy::ManagerSubagent,
+        Some(echo_agent::subagent::TeamSpec {
+            strategy: echo_agent::subagent::TeamStrategy::ManagerSubagent,
             manager,
             subagents: fm.team_subagents.clone(),
-            config: echo_agent::agent::subagent::team::TeamConfig::default(),
+            config: echo_agent::subagent::TeamConfig::default(),
         })
     } else {
         None
@@ -625,7 +593,7 @@ mod tests {
         // Per-subagent thinking/timeout frontmatter: explicit values pass
         // through as specs (parsed by infra at registration); empty/whitespace
         // thinking normalizes to None (inherit parent generation).
-        let md = "---\nname: awaiter\ndescription: \"x\"\nreadonly: true\nmodel: fast\nmax_turns: 64\ntimeout_secs: 90000\nthinking: low\nis_background: true\n---\nbody";
+        let md = "---\nname: long-review\ndescription: \"x\"\nreadonly: true\nmodel: fast\nmax_turns: 64\ntimeout_secs: 90000\nthinking: low\nis_background: true\n---\nbody";
         let def = parse_subagent_md(md, None)?;
         assert_eq!(def.timeout_secs, Some(90000));
         assert_eq!(def.thinking.as_deref(), Some("low"));
@@ -639,26 +607,6 @@ mod tests {
             None,
         )?;
         assert_eq!(blank.thinking, None, "whitespace-only thinking → None");
-        Ok(())
-    }
-
-    #[test]
-    fn builtin_awaiter_frontmatter_declares_waiting_role() -> TestResult {
-        // The builtin awaiter role must parse with the per-subagent
-        // thinking/timeout/model/background wiring the infra path expects.
-        let defs = discover_subagents(None, None);
-        let awaiter = defs
-            .iter()
-            .find(|d| d.name == "awaiter")
-            .ok_or_else(|| "builtin awaiter.md must load".to_string())?;
-        assert!(awaiter.readonly);
-        assert!(awaiter.is_background);
-        assert_eq!(awaiter.model.as_deref(), Some("fast"));
-        assert_eq!(awaiter.max_turns, Some(64));
-        assert_eq!(awaiter.timeout_secs, Some(90000));
-        assert_eq!(awaiter.thinking.as_deref(), Some("low"));
-        assert!(awaiter.tags.contains(&"readonly".to_string()));
-        assert!(awaiter.tags.contains(&"background".to_string()));
         Ok(())
     }
 
@@ -731,8 +679,7 @@ mod tests {
         // The compiled-in defaults must all parse without error — guards
         // against a corrupt source .md slipping through. Sprint 9 added a
         // writer subagent (implementer); Sprint 10 added data subagents
-        // (data-shaper, analyst); Phase 1 added general-purpose; the awaiter
-        // role added per-subagent thinking/timeout wiring.
+        // (data-shaper, analyst); Phase 1 added general-purpose.
         let defs = discover_subagents(None, None);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
@@ -744,7 +691,6 @@ mod tests {
                 "summarizer",
                 "implementer",
                 "general-purpose",
-                "awaiter",
                 "data-shaper",
                 "analyst"
             ]
@@ -861,7 +807,7 @@ team_subagents: [\"explorer\", \"summarizer\"]\n\
         );
         assert_eq!(
             spec.strategy,
-            echo_agent::agent::subagent::TeamStrategy::ManagerSubagent
+            echo_agent::subagent::TeamStrategy::ManagerSubagent
         );
         Ok(())
     }
@@ -1000,10 +946,10 @@ team_subagents: [\"explorer\", \"summarizer\"]\n\
     #[test]
     fn nonexistent_scope_dirs_are_silently_skipped() {
         // Neither scope dir exists → only builtins returned, no panic.
-        // 4 readonly + 1 writer + 1 general-purpose + awaiter + 2 data = 9 builtins.
+        // 4 readonly + 1 writer + 1 general-purpose + 2 data = 8 builtins.
         let fake_root = PathBuf::from("/nonexistent/definitely/not/here");
         let defs = discover_subagents(Some(&fake_root), Some(&fake_root));
-        assert_eq!(defs.len(), 9);
+        assert_eq!(defs.len(), 8);
     }
 
     #[test]

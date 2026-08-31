@@ -6,7 +6,7 @@
 #[allow(clippy::too_many_arguments)] // store + semaphores + locks + sinks all thread through
 async fn execute_task(
     store: Arc<TaskRuntimeStore>,
-    blocking: TaskRuntimeBlockingAdapter,
+    blocking: TaskRuntimeOperation,
     primary_agent: crate::agent_handle::AgentHandle,
     write_sem: Arc<Semaphore>,
     shell_sem: Arc<Semaphore>,
@@ -299,8 +299,6 @@ async fn execute_task(
         &task,
         &dep_summaries,
         delegation_policy.can_delegate(),
-        parent_goal.as_deref(),
-        workspace_root.as_deref(),
     )
     .to_value()
     .map_err(|error| {
@@ -309,6 +307,16 @@ async fn execute_task(
             format!("failed to serialize Subagent prompt payload: {error}"),
         )
     })?;
+    let prompt_context = echo_agent::subagent::SubagentTaskContext {
+        task_title: Some(task.title.clone()),
+        user_goal: parent_goal,
+        workspace: workspace_root,
+        files: task.files.clone(),
+        execution_checks: task.execution_checks.clone(),
+        acceptance_criteria: task.acceptance_criteria.clone(),
+        required_artifacts: task.required_artifacts.clone(),
+        constraints: Vec::new(),
+    };
     let task_input = if task.description.trim().is_empty() {
         task.title.clone()
     } else {
@@ -448,6 +456,7 @@ async fn execute_task(
             &task.agent_role,
             &task_input,
             prompt_payload.clone(),
+            prompt_context.clone(),
             task.allowed_tools.clone(),
             task_cancel.clone(),
             delegation_policy,
@@ -469,11 +478,11 @@ async fn execute_task(
                     agent_role = %task.agent_role,
                     output_chars = sub_result.output.chars().count(),
                     iterations = sub_result.iterations,
-                    usage_reported = sub_result.usage.is_some(),
+                    usage_reported = sub_result.llm_usage.is_some(),
                     terminal_status = ?sub_result.outcome.status,
                     "task_runtime: read-only subagent settled"
                 );
-                finalize_framework_subagent_result(
+                finalize_subagent_execution(
                     blocking.clone(),
                     &run_id,
                     &execution_id,
@@ -510,6 +519,7 @@ async fn execute_task(
             &task.agent_role,
             &task_input,
             prompt_payload.clone(),
+            prompt_context.clone(),
             task.allowed_tools.clone(),
             task_cancel.clone(),
             delegation_policy,
@@ -532,11 +542,11 @@ async fn execute_task(
                     output_chars = sub_result.output.chars().count(),
                     summary_chars = sub_result.outcome.summary.chars().count(),
                     iterations = sub_result.iterations,
-                    usage_reported = sub_result.usage.is_some(),
+                    usage_reported = sub_result.llm_usage.is_some(),
                     terminal_status = ?sub_result.outcome.status,
                     "task_runtime: writer subagent settled"
                 );
-                finalize_framework_subagent_result(
+                finalize_subagent_execution(
                     blocking.clone(),
                     &run_id,
                     &execution_id,
@@ -552,16 +562,19 @@ async fn execute_task(
         }
     } else {
         let compiler = crate::subagent_prompt::EkoSubagentPromptCompiler;
-        let compiled = compiler.compile_primary_invocation(&SubagentPromptInput {
+        let compiled = compiler.compile_primary_invocation(&SubagentInvocation {
             agent_name: "primary",
             task: &task_input,
-            mode: echo_agent::agent::subagent::ExecutionMode::Sync,
+            mode: echo_agent::subagent::ExecutionMode::Sync,
             transfer_policy: ContextTransferPolicy::Fresh,
-            parent_context: None,
-            inherit_history: None,
+            history: &[],
+            history_limit: None,
+            current_message: None,
+            context: &prompt_context,
+            capability_override: None,
             payload: Some(&prompt_payload),
-            constraints: &[],
         });
+        let compiled_task = compiled.task_input();
         emit_primary_subagent_isolation_observed(
             trace_sink.as_ref(),
             &workspace_id,
@@ -577,7 +590,7 @@ async fn execute_task(
             &run_id,
             &task,
             &execution_id,
-            &compiled.task_input,
+            &compiled_task,
             task_cancel.clone(),
             trace_sink.clone(),
             workspace_io,
@@ -590,7 +603,7 @@ async fn execute_task(
             // The parent consumes the bounded structured summary; extract
             // suggested_tasks from the full output because that optional block
             // appears before the terminal ## Result contract.
-            let suggested_tasks = extract_suggested_tasks_from_subagent_output(&full_output);
+            let suggested_tasks = parse_suggested_tasks(&full_output);
             let parent_facing = task_result.summary.trim().to_string();
             tracing::info!(
                 run_id = %run_id,
@@ -607,7 +620,7 @@ async fn execute_task(
             let persisted_task_title = task.title.clone();
             let persisted_result = task_result.clone();
             let persisted_output = full_output.clone();
-            let persisted_usage = usage.durable.clone();
+            let persisted_usage = usage.clone();
             let suggestion_note = (!suggested_tasks.is_empty()).then(|| {
                 let titles = suggested_tasks
                     .iter()
@@ -637,7 +650,7 @@ async fn execute_task(
                         plan_revision: claim_revision,
                         attempt,
                         status: persisted_result.status.as_str(),
-                        result: Some(&persisted_result),
+                        outcome: Some(&persisted_result),
                         full_output: Some(&persisted_output),
                         usage: Some(&persisted_usage),
                         dispatch_hook: dispatch_hooks_from_runtime,
@@ -674,7 +687,7 @@ async fn execute_task(
                 "verification": &task_result.verification,
                 "remaining_work": &task_result.remaining_work,
                 "touched_files": &task_result.touched_files,
-                "usage": &usage.durable,
+                "usage": &usage,
             });
             emit_exec(
                 trace_sink.as_ref(),
@@ -691,7 +704,7 @@ async fn execute_task(
             );
             Ok(TaskDispatchSuccess {
                 task_id,
-                result: task_result,
+                outcome: task_result,
                 full_output,
                 suggested_tasks,
             })
@@ -702,7 +715,7 @@ async fn execute_task(
             let usage = failure.usage;
             let agent_failure = failure.agent_failure;
             let mut task_result =
-                SubagentTaskResult::terminal(status, message.clone(), vec![message.clone()]);
+                SubagentOutcome::terminal(status, message.clone(), vec![message.clone()]);
             if let Some(agent_failure) = agent_failure.as_ref() {
                 attach_agent_failure_evidence(&mut task_result, agent_failure);
             }
@@ -713,7 +726,7 @@ async fn execute_task(
             let persisted_task_title = task.title.clone();
             let persisted_result = task_result.clone();
             let persisted_message = message.clone();
-            let persisted_usage = usage.as_ref().map(|value| value.durable.clone());
+            let persisted_usage = usage.clone();
             if let Err(error) = blocking
                 .run("persist failed Subagent boundary", move |store| {
                     store.record_subagent_released(SubagentReleaseRecord {
@@ -725,7 +738,7 @@ async fn execute_task(
                         plan_revision: claim_revision,
                         attempt,
                         status: status.as_str(),
-                        result: Some(&persisted_result),
+                        outcome: Some(&persisted_result),
                         full_output: Some(&persisted_message),
                         usage: persisted_usage.as_ref(),
                         dispatch_hook: dispatch_hooks_from_runtime,
@@ -740,7 +753,7 @@ async fn execute_task(
                     "failed to persist Subagent terminal boundary"
                 );
             }
-            if status == SubagentRunStatus::Cancelled {
+            if status == SubagentStatus::Cancelled {
                 tracing::info!(
                     run_id = %run_id,
                     task_id = %task_id,
@@ -770,7 +783,7 @@ async fn execute_task(
                 "verification": &task_result.verification,
                 "remaining_work": &task_result.remaining_work,
                 "touched_files": &task_result.touched_files,
-                "usage": usage.as_ref().map(|value| &value.durable),
+                "usage": usage.as_ref(),
                 "agent_failure": &agent_failure,
             });
             emit_exec(
@@ -802,12 +815,6 @@ async fn execute_task(
 const MAX_SUGGESTED_TASKS_PER_SUBAGENT: usize = 5;
 
 #[derive(Debug, serde::Deserialize)]
-struct SuggestedTaskEnvelope {
-    #[serde(default)]
-    suggested_tasks: Vec<RawSuggestedTask>,
-}
-
-#[derive(Debug, serde::Deserialize)]
 struct RawSuggestedTask {
     title: Option<String>,
     description: Option<String>,
@@ -819,16 +826,19 @@ struct RawSuggestedTask {
     risk: Option<String>,
 }
 
-fn extract_suggested_tasks_from_subagent_output(text: &str) -> Vec<SuggestedTask> {
+fn parse_suggested_tasks(text: &str) -> Vec<SuggestedTask> {
     let mut out = Vec::new();
-    for candidate in suggested_task_json_candidates(text) {
-        let Ok(envelope) = serde_json::from_str::<SuggestedTaskEnvelope>(&candidate) else {
+    for object in echo_agent::subagent::parse_json_objects(text) {
+        let Some(values) = object.get("suggested_tasks").and_then(|value| value.as_array()) else {
             continue;
         };
-        for raw in envelope.suggested_tasks {
+        for value in values {
             if out.len() >= MAX_SUGGESTED_TASKS_PER_SUBAGENT {
                 return out;
             }
+            let Ok(raw) = serde_json::from_value::<RawSuggestedTask>(value.clone()) else {
+                continue;
+            };
             let Some(task) = normalize_suggested_task(raw) else {
                 continue;
             };
@@ -839,20 +849,6 @@ fn extract_suggested_tasks_from_subagent_output(text: &str) -> Vec<SuggestedTask
         }
     }
     out
-}
-
-fn suggested_task_json_candidates(text: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-    for block in text.split("```json").skip(1) {
-        if let Some(json) = block.split("```").next() {
-            candidates.push(json.trim().to_string());
-        }
-    }
-    let trimmed = text.trim();
-    if trimmed.starts_with('{') {
-        candidates.push(trimmed.to_string());
-    }
-    candidates
 }
 
 fn normalize_suggested_task(raw: RawSuggestedTask) -> Option<SuggestedTask> {
@@ -915,13 +911,13 @@ fn collect_dependency_summaries(
                     // the truncated todo text for tasks that predate put_summary.
                     let structured = store.get_summary(run_id, &dependency.id)?.map(|s| {
                         let mut parts: Vec<String> = Vec::new();
-                        if !s.result.summary.trim().is_empty() {
-                            parts.push(format!("完成: {}", s.result.summary));
+                        if !s.outcome.summary.trim().is_empty() {
+                            parts.push(format!("完成: {}", s.outcome.summary));
                         }
-                        if !s.result.touched_files.written.is_empty() {
+                        if !s.outcome.touched_files.written.is_empty() {
                             parts.push(format!(
                                 "修改文件: {}",
-                                s.result.touched_files.written.join(", ")
+                                s.outcome.touched_files.written.join(", ")
                             ));
                         }
                         if !s.decisions.is_empty() {
@@ -1123,17 +1119,19 @@ async fn run_readonly_subagent(
     role: &str,
     task_input: &str,
     prompt_payload: serde_json::Value,
+    prompt_context: echo_agent::subagent::SubagentTaskContext,
     allowed_tools: Vec<String>,
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
     trace_sink: Option<ExecSink>,
-    attempt_identity: echo_agent::agent::subagent::SubagentAttemptIdentity,
+    attempt_identity: echo_agent::subagent::SubagentAttemptIdentity,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
-) -> Result<echo_agent::agent::subagent::SubagentResult, ExecutionFailure> {
+) -> Result<echo_agent::subagent::SubagentResult, ExecutionFailure> {
     primary_agent
         .read_async(|agent| {
             let task_input = task_input.to_string();
             let prompt_payload = prompt_payload.clone();
+            let prompt_context = prompt_context.clone();
             let role = role.to_string();
             let run_id = run_id.to_string();
             let execution_id = execution_id.to_string();
@@ -1167,11 +1165,12 @@ async fn run_readonly_subagent(
                         runtime_context,
                         Some(allowed_tools),
                         Some(prompt_payload),
+                        Some(prompt_context),
                         attempt_identity,
                     )
                     .await
                     .map_err(|error| {
-                        ExecutionFailure::from_react(error, "subagent dispatch failed")
+                        ExecutionFailure::with_react_error(error, "subagent dispatch failed")
                     })
             })
         })
@@ -1218,20 +1217,21 @@ fn exec_trace_sink_to_core(trace_sink: Option<ExecSink>) -> Option<echo_agent::t
 #[allow(clippy::result_large_err)]
 async fn run_writer_subagent(
     primary_agent: &crate::agent_handle::AgentHandle,
-    blocking: TaskRuntimeBlockingAdapter,
+    blocking: TaskRuntimeOperation,
     run_id: &str,
     execution_id: &str,
     isolation_id: &str,
     role: &str,
     task_input: &str,
     prompt_payload: serde_json::Value,
+    prompt_context: echo_agent::subagent::SubagentTaskContext,
     allowed_tools: Vec<String>,
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
     trace_sink: Option<ExecSink>,
-    attempt_identity: echo_agent::agent::subagent::SubagentAttemptIdentity,
+    attempt_identity: echo_agent::subagent::SubagentAttemptIdentity,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
-) -> Result<echo_agent::agent::subagent::SubagentResult, ExecutionFailure> {
+) -> Result<echo_agent::subagent::SubagentResult, ExecutionFailure> {
     // Rebuild a multimodal Message when the run carries user attachments, so
     // the writer Subagent sees the same images/files as the primary agent would
     // (parity with the main-agent task path in this executor authority).
@@ -1260,6 +1260,7 @@ async fn run_writer_subagent(
         .read_async(|agent| {
             let task_input = task_input.to_string();
             let prompt_payload = prompt_payload.clone();
+            let prompt_context = prompt_context.clone();
             let role = role.to_string();
             let run_id = run_id.to_string();
             let execution_id = execution_id.to_string();
@@ -1296,6 +1297,7 @@ async fn run_writer_subagent(
                             runtime_context,
                             Some(allowed_tools.clone()),
                             Some(prompt_payload.clone()),
+                            Some(prompt_context.clone()),
                             attempt_identity,
                         )
                         .await
@@ -1310,12 +1312,13 @@ async fn run_writer_subagent(
                             runtime_context,
                             Some(allowed_tools),
                             Some(prompt_payload),
+                            Some(prompt_context),
                             attempt_identity,
                         )
                         .await
                 }
                 .map_err(|error| {
-                    ExecutionFailure::from_react(error, "writer subagent dispatch failed")
+                    ExecutionFailure::with_react_error(error, "writer subagent dispatch failed")
                 })
             })
         })
@@ -1411,7 +1414,7 @@ fn file_access_from_agent_tool(name: &str, args: &serde_json::Value) -> Option<(
 #[allow(clippy::result_large_err)]
 async fn run_main_agent_task(
     primary_agent: &crate::agent_handle::AgentHandle,
-    blocking: TaskRuntimeBlockingAdapter,
+    blocking: TaskRuntimeOperation,
     run_id: &str,
     task: &PlanTask,
     execution_id: &str,
@@ -1419,7 +1422,7 @@ async fn run_main_agent_task(
     cancel: CancellationToken,
     trace_sink: Option<ExecSink>,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
-) -> Result<(SubagentTaskResult, String, TaskExecutionUsage), ExecutionFailure> {
+) -> Result<(SubagentOutcome, String, ExecutionUsage), ExecutionFailure> {
     let run_id = run_id.to_string();
     let execution_id = execution_id.to_string();
 
@@ -1497,7 +1500,7 @@ async fn run_main_agent_task(
                 };
                 let event_identity = echo_agent::agent::EventIdentity::from_invocation(&invocation)
                     .map_err(|error| {
-                        ExecutionFailure::from_react(error, "invalid task event identity")
+                        ExecutionFailure::with_react_error(error, "invalid task event identity")
                     })?;
                 let replay_safe_tools = agent
                     .tool_names()
@@ -1520,7 +1523,7 @@ async fn run_main_agent_task(
                 .cancel(cancel)
                 .invocation(invocation);
                 let receipt = AgentTurnDriver.drive(agent, request, &sink).await;
-                let usage = TaskExecutionUsage::from_turn_receipt(&receipt);
+                let usage = receipt.usage();
                 let observation = sink.finish(receipt.final_answer.as_deref());
 
                 match receipt.outcome {
@@ -1530,26 +1533,26 @@ async fn run_main_agent_task(
                     }
                     TurnOutcome::Failed(failure) => {
                         let message = failure.message.clone();
-                        return Err(ExecutionFailure::from_agent_failure(&failure, message)
+                        return Err(ExecutionFailure::with_agent_failure(&failure, message)
                             .with_usage(usage));
                     }
                 }
 
                 let working_dir = agent.working_dir();
-                let mut outcome = echo_agent::agent::subagent::parse_subagent_outcome(
+                let mut outcome = echo_agent::subagent::parse_subagent_outcome(
                     &observation.output,
-                    echo_agent::agent::subagent::SubagentStatus::Completed,
+                    echo_agent::subagent::SubagentStatus::Completed,
                     Some(&execution_id),
                     working_dir.as_deref(),
                 );
-                echo_agent::agent::subagent::merge_observed_evidence(
+                echo_agent::subagent::merge_observed_evidence(
                     &mut outcome,
                     observation.observed_evidence,
                     observation.observed_artifacts,
                 );
                 let duration_run_id = run_id.clone();
                 let duration_execution_id = execution_id.clone();
-                let duration_ms = usage.duration_ms();
+                let duration_ms = usage.duration_millis();
                 blocking
                     .run("persist primary Subagent duration", move |store| {
                         store.account_subagent_usage(
@@ -1569,7 +1572,7 @@ async fn run_main_agent_task(
                         .with_usage(usage.clone())
                     })?;
                 Ok((
-                    SubagentTaskResult::from_framework_outcome(&outcome),
+                    outcome,
                     observation.output,
                     usage,
                 ))

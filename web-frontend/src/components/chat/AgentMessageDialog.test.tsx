@@ -175,14 +175,31 @@ describe('AgentMessageDialog', () => {
   it('renders only canonical delivery phases and typed terminal outcomes', async () => {
     const base = {
       message_id: 'message-phase',
-      target: {
+      route: {
         workspace_id: 'target-workspace',
         conversation_id: 'target-conversation',
       },
+      payload: {
+        message_id: 'message-phase',
+        from: null,
+        to: {
+          workspace_id: 'target-workspace',
+          conversation_id: 'target-conversation',
+        },
+        payload: { kind: 'text', text: 'message-phase' },
+        correlation_id: null,
+        causation_id: null,
+        origin: 'user',
+        created_at: '2026-08-21T00:00:00Z',
+      },
+      metadata: {},
+      correlation_id: null,
+      causation_id: null,
       persisted_at: '2026-08-21T00:00:00Z',
       attempt_id: 'attempt-1',
       attempt: 1,
       claimed_at: '2026-08-21T00:00:01Z',
+      effect_started_at: null,
       mailbox_accepted_at: null,
       drained_at: null,
       turn_settled_at: null,
@@ -190,6 +207,8 @@ describe('AgentMessageDialog', () => {
       reply_message_id: null,
       next_attempt_at: null,
       reason: null,
+      terminal: false,
+      retained_bytes: 0,
     };
     mocks.status.mockResolvedValue({
       count: 2,
@@ -211,6 +230,7 @@ describe('AgentMessageDialog', () => {
           drained_at: '2026-08-21T00:00:03Z',
           turn_settled_at: '2026-08-21T00:00:04Z',
           reason: 'cancelled by owner',
+          terminal: true,
         },
       ],
     });

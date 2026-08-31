@@ -4,17 +4,9 @@ description: 多步任务先规划再执行——为多步实现任务编写全�
 metadata:
   category: methodology
   source: superpowers
-  upstream-version: "6.0.3"
+  upstream-version: 6.0.3
   author: obra
-  tags: [planning, implementation, architecture]
-triggers:
-  - 计划
-  - plan
-  - 规划
-  - 实施方案
-  - 实现计划
-  - 怎么实现
-allowed-tools: []
+  tags: planning, implementation, architecture
 ---
 
 # Writing Plans

@@ -238,7 +238,6 @@ fn tui_log_path() -> std::path::PathBuf {
             let state_dir = crate::workspace::layout::WorkspaceLayout::state_dir(current);
             if state_dir.exists()
                 || crate::workspace::layout::WorkspaceLayout::manifest(current).exists()
-                || crate::workspace::layout::WorkspaceLayout::legacy_manifest(current).exists()
             {
                 let dir = state_dir.join("logs");
                 let _ = std::fs::create_dir_all(&dir);

@@ -1,31 +1,11 @@
 ---
 name: data-visualization
-description: >-
-  数据可视化与图表制作。当用户需要制作图表、可视化数据趋势、
-  创建仪表盘或选择合适的图表类型时激活。
-triggers:
-  - 图表
-  - 可视化
-  - 柱状图
-  - 折线图
-  - 饼图
-  - 散点图
-  - chart
-  - plot
-  - visualization
-  - 画图
-  - 画个图
-allowed-tools:
-  - "shell"
-  - "run_code"
-  - "read_file"
-  - "read_artifact"
-  - "apply_patch"
-  - "generate_chart"
+description: 数据可视化与图表制作。当用户需要制作图表、可视化数据趋势、 创建仪表盘或选择合适的图表类型时激活。
+allowed-tools: shell run_code read_file read_artifact apply_patch generate_chart
 metadata:
   author: echo-agent-cli
-  version: "1.0.0"
-  tags: "visualization, chart, plot, dashboard, graphics"
+  version: 1.0.0
+  tags: visualization, chart, plot, dashboard, graphics
 ---
 
 ## 数据可视化与图表制作

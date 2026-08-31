@@ -1008,7 +1008,7 @@ M0-M8 实现与开发期验收全部完成。未勾选的长时项由项目 Fina
 | M5   | Complete    | TaskRuntime boot recovery + orphan chat/HITL durable terminal repair | Pending | N/A | boot recovery suite、GUI orphan reconciliation、HITL exact identity green | 无 live lease 的 stream 不再假恢复 | N/A |
 | M6   | Complete    | scoped aggregate deletion + idle-proof host shutdown/evict | Pending | N/A | busy reject/idle evict、same-id workspace isolation green | 删除前先 settle owners | N/A |
 | M7   | Complete    | AgentRouter Claimed/Injected/Delivered + persisted retry/reply | Pending | N/A | live cancel、cold reply、restart、three-inbox tests green | Delivered 延后到 transcript/reply safe point | N/A |
-| M8   | Complete | process governor + shared surface identity/projection | `b125d9d`/`0782a8c`/`cd52171` | `afdf3b1` | full Rust/GUI/frontend；3x3 smoke；36-turn real probe | 修复 Agent 全局许可、artifact finalize、Awaiter failure journal | N/A |
+| M8   | Complete / observer superseded by ADR 0031 | shared surface identity/projection；command observation 现由 framework deterministic watcher 负责 | `b125d9d`/`0782a8c`/`cd52171` | `afdf3b1` | 历史 full Rust/GUI/frontend、3x3 smoke 与 36-turn probe 绑定旧 revision；当前静态门禁见 project status | 保留 artifact finalize 与 durable Ready/ack；删除旧 Awaiter/provider failure journal | ADR 0031 |
 
 状态只能是 `Pending`、`In progress`、`Blocked`、`Complete`。只有本阶段验收和所有适用
 门禁全绿才能标 Complete。框架无改动必须明确写 `N/A`，不能把应用 commit 误记为框架

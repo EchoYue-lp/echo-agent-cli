@@ -2,7 +2,7 @@
 //!
 //! File, research, and analysis stores intentionally remain simple
 //! filesystem-backed domain modules. Async surfaces must enter them through
-//! this adapter so blocking filesystem work cannot occupy Tokio workers.
+//! this boundary so blocking filesystem work cannot occupy Tokio runtime threads.
 
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;

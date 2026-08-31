@@ -1765,10 +1765,11 @@ mod tests {
         let echo_dir = temp.path().join("workspace-a/.eko");
         let store = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
         let integration = ReviewIntegration::new(ReviewConfig::default(), echo_dir.clone(), store);
-        let mut descriptor = echo_agent::skills::external::parse_skill_md(
+        let mut descriptor = echo_agent::skills::external::SkillDocument::parse(
             "---\nname: test-skill\ndescription: test skill\n---\nbody",
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        .into_descriptor();
 
         descriptor.location = echo_dir.join("skills/_drafts/test-skill/SKILL.md");
         assert!(!echo_agent::skills::external::SkillLoadPolicy::allows(
@@ -1805,10 +1806,11 @@ mod tests {
 
         let store = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
         let integration = ReviewIntegration::new(ReviewConfig::default(), echo_dir.clone(), store);
-        let mut descriptor = echo_agent::skills::external::parse_skill_md(
+        let mut descriptor = echo_agent::skills::external::SkillDocument::parse(
             "---\nname: test-skill\ndescription: test skill\n---\nbody",
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        .into_descriptor();
         descriptor.location = echo_dir.join("skills/test-skill/SKILL.md");
 
         assert!(!echo_agent::skills::external::SkillLoadPolicy::allows(

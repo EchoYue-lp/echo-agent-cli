@@ -738,7 +738,9 @@ impl echo_agent_app_core::api::chat_driver::ChatSink for ReplChatSink {
             return false;
         }
         if let Some(projection) =
-            echo_agent_app_core::api::tasks::task_runtime::project_awaiter_surface_event(&event)
+            echo_agent_app_core::api::tasks::task_runtime::project_command_cell_watch_surface_event(
+                &event,
+            )
         {
             return self.output.emit(projection.display_message());
         }
@@ -827,11 +829,11 @@ impl echo_agent_app_core::api::chat_driver::ChatSink for ReplChatSink {
                     cell.cell_id, cell.phase
                 ))
             }
-            echo_agent_app_core::api::chat_driver::ChatDriverEvent::AwaiterResultReady { .. }
-            | echo_agent_app_core::api::chat_driver::ChatDriverEvent::AwaiterResultDeliveryStarted {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::CommandCellWatchReady { .. }
+            | echo_agent_app_core::api::chat_driver::ChatDriverEvent::CommandCellWatchDeliveryStarted {
                 ..
             }
-            | echo_agent_app_core::api::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged {
+            | echo_agent_app_core::api::chat_driver::ChatDriverEvent::CommandCellWatchAcknowledged {
                 ..
             } => true,
             echo_agent_app_core::api::chat_driver::ChatDriverEvent::ContextCompressed {

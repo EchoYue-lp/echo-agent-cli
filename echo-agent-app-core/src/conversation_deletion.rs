@@ -770,7 +770,7 @@ impl ConversationDeletionService {
         if let Some(store) = task_runtime {
             quiesce_task_runs(&store, &conversation_id).await?;
             let remove_id = conversation_id.clone();
-            crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+            crate::tasks::task_runtime::TaskRuntimeOperation::new(store)
                 .run_store("remove conversation TaskRuns", move |store| {
                     store.remove_conversation(&remove_id)
                 })
@@ -1334,7 +1334,7 @@ async fn quiesce_task_runs(
     conversation_id: &str,
 ) -> Result<(), ConversationDeletionError> {
     let conversation_id = conversation_id.to_string();
-    let runs = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone())
+    let runs = crate::tasks::task_runtime::TaskRuntimeOperation::new(store.clone())
         .run_store("cancel conversation TaskRuns", move |store| {
             let runs = store.list_runs_for_conversation(&conversation_id)?;
             for run in &runs {

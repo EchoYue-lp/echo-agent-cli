@@ -145,8 +145,10 @@ impl WorkspaceRegistry {
 
         // 如果目录已存在且有清单文件，拒绝覆盖
         let manifest = WorkspaceLayout::manifest(&root);
-        let legacy_manifest = WorkspaceLayout::legacy_manifest(&root);
-        if manifest.exists() || legacy_manifest.exists() {
+        // The retired root marker is checked only to prevent overwriting an
+        // existing user directory. It is never read as a workspace authority.
+        let retired_manifest = root.join(".workspace.json");
+        if manifest.exists() || retired_manifest.exists() {
             anyhow::bail!("Directory already contains a workspace: {}", root.display());
         }
 
@@ -214,7 +216,7 @@ impl WorkspaceRegistry {
             anyhow::bail!("Workspace '{}' not found at {:?}", id, root);
         }
 
-        let manifest_path = WorkspaceLayout::existing_manifest(&root);
+        let manifest_path = WorkspaceLayout::manifest(&root);
         let data = fs::read_to_string(&manifest_path)?;
         let mut workspace: Workspace = serde_json::from_str(&data)?;
         workspace.refresh_product_data_generation();
@@ -230,7 +232,7 @@ impl WorkspaceRegistry {
 
     /// 列出所有工作区，按最后活跃时间降序排列。
     ///
-    /// 同时扫描索引文件和基础目录（兼容旧的无索引工作区）。
+    /// 同时扫描索引文件和基础目录，索引可由当前 manifest 重建。
     pub fn list(&self) -> anyhow::Result<Vec<Workspace>> {
         let mut workspaces = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
@@ -239,7 +241,7 @@ impl WorkspaceRegistry {
         let index = self.load_index();
         for (id_str, root_str) in &index.entries {
             let root = PathBuf::from(root_str);
-            let manifest = WorkspaceLayout::existing_manifest(&root);
+            let manifest = WorkspaceLayout::manifest(&root);
             if manifest.exists()
                 && let Ok(data) = fs::read_to_string(&manifest)
                 && let Ok(mut ws) = serde_json::from_str::<Workspace>(&data)
@@ -257,14 +259,14 @@ impl WorkspaceRegistry {
             );
         }
 
-        // 2. 扫描基础目录（兼容旧的无索引工作区）
+        // 2. 扫描基础目录以重建缺失的索引投影。
         if let Ok(entries) = fs::read_dir(&self.base_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if !path.is_dir() {
                     continue;
                 }
-                let manifest = WorkspaceLayout::existing_manifest(&path);
+                let manifest = WorkspaceLayout::manifest(&path);
                 if !manifest.exists() {
                     continue;
                 }
@@ -313,8 +315,7 @@ impl WorkspaceRegistry {
             // 在基础目录下 → 整个删除
             // 二次确认：确保路径确实是工作区目录（包含 manifest）
             let manifest = WorkspaceLayout::manifest(&canonical_root);
-            let legacy_manifest = WorkspaceLayout::legacy_manifest(&canonical_root);
-            if !manifest.exists() && !legacy_manifest.exists() {
+            if !manifest.exists() {
                 anyhow::bail!(
                     "拒绝删除：'{}' 不是一个有效的工作区目录（缺少 manifest 文件）",
                     canonical_root.display()
@@ -326,24 +327,6 @@ impl WorkspaceRegistry {
             let state_dir = WorkspaceLayout::state_dir(&root);
             if state_dir.exists() {
                 fs::remove_dir_all(&state_dir).ok();
-            }
-            let legacy_manifest = WorkspaceLayout::legacy_manifest(&root);
-            if legacy_manifest.exists() {
-                fs::remove_file(&legacy_manifest).ok();
-            }
-            // 清理旧版本在 root 下直接创建的系统子目录（新版已移入 .eko/）。
-            for subdir in [
-                "sessions",
-                "conversations",
-                "memory",
-                "tasks",
-                "traces",
-                "uploads",
-            ] {
-                let dir = root.join(subdir);
-                if dir.exists() {
-                    fs::remove_dir_all(&dir).ok();
-                }
             }
         }
 
@@ -412,11 +395,11 @@ impl WorkspaceRegistry {
         None
     }
 
-    /// 通过向上遍历目录查找 `.eko/workspace.json` 或旧版 `.workspace.json` 来检测工作区。
+    /// 通过向上遍历目录查找 `.eko/workspace.json` 来检测工作区。
     pub fn detect_from_manifest(cwd: &Path) -> Option<Workspace> {
         let mut current = cwd.to_path_buf();
         loop {
-            let manifest = WorkspaceLayout::existing_manifest(&current);
+            let manifest = WorkspaceLayout::manifest(&current);
             if manifest.exists()
                 && let Ok(data) = fs::read_to_string(&manifest)
                 && let Ok(ws) = serde_json::from_str::<Workspace>(&data)
@@ -526,7 +509,30 @@ mod tests {
         // Should appear in list
         let list = registry.list()?;
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].name, "my-project");
+        let listed = list
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("custom workspace was not listed"))?;
+        assert_eq!(listed.name, "my-project");
+        Ok(())
+    }
+
+    #[test]
+    fn retired_manifest_only_blocks_overwrite() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let base = tmp.path().join("base");
+        let custom = tmp.path().join("existing-project");
+        fs::create_dir_all(&custom)?;
+        let retired = custom.join(".workspace.json");
+        fs::write(&retired, "{}")?;
+        let registry = WorkspaceRegistry::with_base_dir(base)?;
+
+        assert!(
+            registry
+                .create_at("existing-project", WorkspaceKind::General, custom.clone())
+                .is_err()
+        );
+        assert!(retired.exists());
+        assert!(WorkspaceRegistry::detect_from_manifest(&custom).is_none());
         Ok(())
     }
 

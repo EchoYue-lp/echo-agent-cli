@@ -16,7 +16,7 @@ use echo_agent_app_core::api::tasks::task_runtime::store::{
 use echo_agent_app_core::api::tasks::task_runtime::{
     Artifact, ArtifactKind, AttendedMode, BootAutoResumeOutcome, DomainProfile, ExecutionMode,
     PlanTask, PlanTaskKind, RunPauseReason, RunTurnOrigin, RunTurnStatus, TaskPlan,
-    TaskRunResumeIdentity, TaskRunStatus, TaskRuntimeStore, TurnVisibility, commit_eko_task_plan,
+    TaskRunResumeIdentity, TaskRunStatus, TaskRuntimeStore, TurnVisibility, commit_task_plan,
     task_goal_sha256,
 };
 use serde::{Deserialize, Serialize};
@@ -386,7 +386,7 @@ async fn open_runtime(task_root: &Path, ledger: &mut SoakLedger) -> Result<Arc<T
         )?;
     }
     if store.get_plan(&ledger.run_id)?.is_none() {
-        commit_eko_task_plan(store.clone(), soak_plan(&ledger.run_id))
+        commit_task_plan(store.clone(), soak_plan(&ledger.run_id))
             .await
             .map_err(|error| anyhow!("commit soak plan: {error}"))?;
     }

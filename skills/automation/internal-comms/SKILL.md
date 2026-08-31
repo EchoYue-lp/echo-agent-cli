@@ -4,16 +4,9 @@ description: 撰写内部沟通文档——状态报告、项目更新、周报�
 metadata:
   category: automation
   source: anthropic
-  upstream-version: "1.0"
+  upstream-version: '1.0'
   author: anthropic
-  tags: [communication, writing, status-report]
-triggers:
-  - 周报
-  - 状态报告
-  - 项目更新
-  - 内部沟通
-  - status report
-allowed-tools: []
+  tags: communication, writing, status-report
 ---
 # Internal Communications
 
@@ -30,3 +23,12 @@ Produce communication that helps a specific internal audience understand status,
 ## Quality Check
 
 Verify names, numbers, dates, links, confidentiality, and action ownership. Remove filler, vague status words, and unsupported optimism. Return the finished communication, plus a short list of unresolved placeholders only when required inputs are missing.
+
+## Workflow
+
+1. Identify the audience, decision or action, reporting period, owner, and sensitivity level.
+2. Separate verified facts from interpretation, risks, decisions, and requests for help.
+3. Put the outcome and next action first; use a timeline or table only when it improves scanning.
+4. Run the quality check against the source notes and leave unresolved fields explicit.
+
+Never manufacture a metric, deadline, owner, customer impact, or executive position to make the update sound complete.

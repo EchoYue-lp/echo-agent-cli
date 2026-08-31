@@ -15,9 +15,11 @@ async fn replace_agent_plugin_generation(
                     agent.unregister_skills_by_source(&repair.source).await;
                 }
                 for descriptor in &candidate.skill_descriptors {
-                    agent
-                        .skill_registry_mut()
-                        .register_descriptor(descriptor.clone());
+                    if !crate::skills_hub::is_builtin_skill_path(&descriptor.location) {
+                        agent
+                            .skill_registry_mut()
+                            .register_descriptor(descriptor.clone());
+                    }
                 }
                 if let Err(error) = register_plugin_agents(agent, &candidate.plugin_agents).await {
                     remove_agent_plugin_generation(agent, &candidate).await;
@@ -25,9 +27,11 @@ async fn replace_agent_plugin_generation(
                         agent.unregister_skills_by_source(&repair.source).await;
                     }
                     for descriptor in &previous.skill_descriptors {
-                        agent
-                            .skill_registry_mut()
-                            .register_descriptor(descriptor.clone());
+                        if !crate::skills_hub::is_builtin_skill_path(&descriptor.location) {
+                            agent
+                                .skill_registry_mut()
+                                .register_descriptor(descriptor.clone());
+                        }
                     }
                     let restore_error = register_plugin_agents(agent, &previous.plugin_agents)
                         .await
@@ -54,16 +58,18 @@ async fn replace_agent_plugin_generation(
 }
 
 pub(crate) async fn remove_agent_plugin_generation(
-    agent: &mut echo_agent::agent::react::ReactAgent,
+    agent: &mut echo_agent::agent::ReactAgent,
     generation: &AgentPluginGeneration,
 ) {
     for plugin_agent in &generation.plugin_agents {
         let _ = agent.unregister_subagent(plugin_agent.name()).await;
     }
     for descriptor in &generation.skill_descriptors {
-        agent
-            .skill_registry_mut()
-            .remove_descriptor(&descriptor.name);
+        if !crate::skills_hub::is_builtin_skill_path(&descriptor.location) {
+            agent
+                .skill_registry_mut()
+                .remove_descriptor(&descriptor.name);
+        }
     }
 }
 

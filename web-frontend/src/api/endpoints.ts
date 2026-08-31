@@ -13,6 +13,7 @@ import type {
   SnapshotInfo,
   ConfigInfo,
   PermissionRule,
+  PermissionRuleInput,
   AuditLog,
   SandboxStatus,
   SandboxConfig,
@@ -154,8 +155,7 @@ function executeSkillCommand(
 }
 
 export type BrowserExtensionDisposition =
-  | { status: 'settled'; message: string }
-  | { status: 'pending'; message: string };
+  { status: 'settled'; message: string } | { status: 'pending'; message: string };
 
 export function browserExtensionDisposition(
   receipt: ExtensionCommandReceipt
@@ -503,12 +503,12 @@ export const permissionsApi = {
     isTauri()
       ? apiInvoke<PermissionRule[]>('list_permission_rules')
       : get<PermissionRule[]>('/permissions/rules'),
-  addRule: (rule: Omit<PermissionRule, 'priority'>) =>
+  addRule: (rule: PermissionRuleInput) =>
     isTauri()
       ? apiInvoke<PermissionRule>('add_permission_rule', {
-          matcher: rule.name,
-          behavior: rule.effect,
-          source: 'manual',
+          matcher: rule.matcher,
+          behavior: rule.behavior,
+          source: rule.source ?? 'manual',
         })
       : post<PermissionRule>('/permissions/rules', rule),
   removeRule: (name: string) =>
@@ -1651,14 +1651,7 @@ export interface CitationAuditReport {
 }
 
 export type ReviewExportFormat =
-  | 'markdown'
-  | 'pdf'
-  | 'docx'
-  | 'json'
-  | 'csv'
-  | 'bibtex'
-  | 'ris'
-  | 'all';
+  'markdown' | 'pdf' | 'docx' | 'json' | 'csv' | 'bibtex' | 'ris' | 'all';
 export interface ReviewExportArtifact {
   review_id: string;
   format: Exclude<ReviewExportFormat, 'all'>;
@@ -1920,24 +1913,33 @@ export interface AgentEndpoint {
   updated_at: string;
 }
 
+export type AgentMessagePayload = { kind: 'text'; text: string } | { kind: 'reply'; text: string };
+
+export interface AgentMessage {
+  message_id: string;
+  from: AgentAddress | null;
+  to: AgentAddress;
+  payload: AgentMessagePayload;
+  correlation_id: string | null;
+  causation_id: string | null;
+  origin: 'user' | 'agent' | 'system';
+  created_at: string;
+}
+
 export type AgentDeliveryPhase =
   | 'persisted'
   | 'claimed'
+  | 'effect_started'
   | 'mailbox_accepted'
   | 'drained'
+  | 'deferred'
   | 'turn_settled';
 
 export type AgentDeliveryOutcome =
-  | 'completed'
-  | 'failed'
-  | 'cancelled'
-  | 'dropped'
-  | 'outcome_unknown';
+  'completed' | 'failed' | 'cancelled' | 'dropped' | 'outcome_unknown';
 
 export type AgentDeliveryDurability =
-  | { status: 'unconfirmed' }
-  | { status: 'confirmed' }
-  | { status: 'degraded'; error: string };
+  { status: 'unconfirmed' } | { status: 'confirmed' } | { status: 'degraded'; error: string };
 
 export interface AgentDeliveryReceipt {
   message_id: string;
@@ -1953,7 +1955,11 @@ export interface AgentDeliveryReceipt {
 
 export interface AgentDeliveryRecord {
   message_id: string;
-  target: AgentAddress;
+  route: AgentAddress;
+  payload: AgentMessage;
+  metadata: Record<string, string>;
+  correlation_id: string | null;
+  causation_id: string | null;
   phase: AgentDeliveryPhase;
   outcome: AgentDeliveryOutcome | null;
   drained: boolean;
@@ -1962,12 +1968,15 @@ export interface AgentDeliveryRecord {
   attempt_id: string | null;
   attempt: number;
   claimed_at: string | null;
+  effect_started_at: string | null;
   mailbox_accepted_at: string | null;
   drained_at: string | null;
   turn_settled_at: string | null;
   turn_id: string | null;
   reply_message_id: string | null;
   next_attempt_at: string | null;
+  terminal: boolean;
+  retained_bytes: number;
 }
 
 export interface AgentGroupMember {

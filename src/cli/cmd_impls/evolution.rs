@@ -3,8 +3,8 @@
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use std::sync::Arc;
 
-use echo_agent::workspace::state::profiles::{AgentProfile, ProfileStore, UserProfile};
-use echo_agent::workspace::state::skill_telemetry::SkillTelemetryStore;
+use echo_agent::profiles::{AgentProfile, ProfileStore, UserProfile};
+use echo_agent::skill_telemetry::{SkillTelemetry, SkillTelemetryStore};
 
 async fn evolution_control(
     ctx: &CommandContext,
@@ -361,7 +361,7 @@ async fn cmd_skill_review(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
     CommandOutcome::Continue
 }
 
-fn print_skill_review(t: &echo_agent::workspace::state::skill_telemetry::SkillTelemetry) {
+fn print_skill_review(t: &SkillTelemetry) {
     println!("\n=== Skill Review: {} ===", t.skill_name);
     println!(
         "Activations: {}  |  Success: {:.0}%  |  Avg Duration: {}ms",

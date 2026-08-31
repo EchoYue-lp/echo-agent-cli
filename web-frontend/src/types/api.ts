@@ -66,17 +66,10 @@ export type ChatRunStatus =
   | 'cancelled';
 
 export type ToolExecutionStatus =
-  | 'running'
-  | 'succeeded'
-  | 'failed'
-  | 'cancelled'
-  | 'timed_out'
-  | 'interrupted'
-  | 'unknown';
+  'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out' | 'interrupted' | 'unknown';
 
 export type ToolExecutionOwner =
-  | { kind: 'chat'; message_id: string }
-  | { kind: 'subagent'; subagent_run_id: string };
+  { kind: 'chat'; message_id: string } | { kind: 'subagent'; subagent_run_id: string };
 
 export type ToolFailureCategory =
   | 'invalid_arguments'
@@ -88,11 +81,7 @@ export type ToolFailureCategory =
   | 'partial_side_effect';
 
 export type ToolRecoveryAction =
-  | 'correct_arguments'
-  | 'retry'
-  | 'restore_then_retry'
-  | 'verify_then_retry'
-  | 'stop';
+  'correct_arguments' | 'retry' | 'restore_then_retry' | 'verify_then_retry' | 'stop';
 
 export interface ToolFailure {
   category: ToolFailureCategory;
@@ -104,10 +93,7 @@ export interface ToolFailure {
 }
 
 export type ToolInvocationRewrite =
-  | 'intervention_redirect'
-  | 'intervention_arguments'
-  | 'pre_tool_use_hook'
-  | 'approval';
+  'intervention_redirect' | 'intervention_arguments' | 'pre_tool_use_hook' | 'approval';
 
 export interface ToolInvocation {
   requested_name: string;
@@ -360,20 +346,18 @@ export type ChatDriverEvent =
     }
   | { source: 'command_cell_started'; event: { cell: BackgroundCellState } }
   | { source: 'command_cell_settled'; event: { cell: BackgroundCellState } }
-  | { source: 'awaiter_result_ready'; event: { result: AwaiterResult } }
+  | { source: 'command_cell_watch_ready'; event: { result: CommandCellWatchResult } }
   | {
-      source: 'awaiter_result_delivery_started';
-      event: { acknowledgement: AwaiterResultAcknowledgement };
+      source: 'command_cell_watch_delivery_started';
+      event: { acknowledgement: CommandCellWatchAcknowledgement };
     }
   | {
-      source: 'awaiter_result_acknowledged';
-      event: { acknowledgement: AwaiterResultAcknowledgement };
+      source: 'command_cell_watch_acknowledged';
+      event: { acknowledgement: CommandCellWatchAcknowledgement };
     };
 
-export interface AwaiterWatchReceipt {
+export interface CommandCellWatchReceipt {
   execution_id: string;
-  control_task_id: string;
-  attempt: number;
   watch_generation: number;
   cell_id: string;
   workspace_id: string;
@@ -385,18 +369,18 @@ export interface AwaiterWatchReceipt {
   settled_at: string | null;
 }
 
-export interface AwaiterResult {
-  receipt: AwaiterWatchReceipt;
+export interface CommandCellWatchResult {
+  receipt: CommandCellWatchReceipt;
   cell: BackgroundCellState;
-  awaiter_status: 'completed' | 'failed' | 'cancelled' | 'timed_out';
-  awaiter_summary: string | null;
 }
 
-export interface AwaiterResultAcknowledgement {
+export interface CommandCellWatchAcknowledgement {
   execution_id: string;
-  attempt: number;
   watch_generation: number;
   cell_id: string;
+  workspace_id: string;
+  conversation_id: string;
+  root_turn_id: string;
   acknowledged_turn_id: string;
   outcome: 'drained' | 'outcome_unknown';
 }
@@ -428,11 +412,7 @@ export interface ChatEventReplay {
 export type TauriSkillInfo = ExtensionSkillEntry;
 
 export type SkillUpdateState =
-  | 'up_to_date'
-  | 'update_available'
-  | 'local_changes'
-  | 'untracked'
-  | 'error';
+  'up_to_date' | 'update_available' | 'local_changes' | 'untracked' | 'error';
 
 export interface SkillUpdateStatus {
   name: string;
@@ -510,11 +490,35 @@ export interface SnapshotInfo {
   created_at: number;
 }
 
+export type PermissionRuleMatcher =
+  | { type: 'tool'; name: string }
+  | { type: 'pattern'; pattern: string }
+  | { type: 'permission'; permission: 'Read' | 'Write' | 'Network' | 'Execute' | 'Sensitive' }
+  | { type: 'all' };
+
+export type PermissionRuleBehavior =
+  { type: 'allow' } | { type: 'deny'; reason: string } | { type: 'ask'; suggestions: string[] };
+
+export type PermissionRuleSource =
+  | 'default'
+  | 'localsettings'
+  | 'projectsettings'
+  | 'usersettings'
+  | 'managed'
+  | 'cliarg'
+  | 'session';
+
 export interface PermissionRule {
-  name: string;
-  tool_pattern: string;
-  effect: 'allow' | 'deny' | 'ask';
-  priority: number;
+  matcher: PermissionRuleMatcher;
+  behavior: PermissionRuleBehavior;
+  source: PermissionRuleSource;
+  description?: string | null;
+}
+
+export interface PermissionRuleInput {
+  matcher: string;
+  behavior: 'allow' | 'deny' | 'ask';
+  source?: string;
 }
 
 export interface AuditLog {
@@ -918,8 +922,7 @@ export interface MemoryConflictProposal {
 }
 
 export type EvidenceAction =
-  | { kind: 'save_memory' }
-  | { kind: 'merge_memories'; proposal: MemoryConflictProposal };
+  { kind: 'save_memory' } | { kind: 'merge_memories'; proposal: MemoryConflictProposal };
 
 export type EvidenceTarget =
   | { kind: 'memory'; key: string }

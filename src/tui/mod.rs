@@ -2047,10 +2047,7 @@ pub async fn run_tui(
     app.context_snapshot.context_window_size = app.context_window_size;
     app.tool_count = agent.read(|value| value.tool_names().len()).await;
     app.permission_mode = agent
-        .read(|value| {
-            echo_agent_app_core::api::permission::permission_mode_id(value.get_permission_mode())
-                .to_string()
-        })
+        .read(|value| value.get_permission_mode().id().to_string())
         .await;
     app.max_display_chars = tui_config.max_display_chars;
     app.pending_approval = Some(tui_pending);

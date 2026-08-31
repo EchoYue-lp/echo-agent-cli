@@ -348,10 +348,7 @@ impl AgentRouter {
         let next_attempt_at = retry_deadline(claim.attempt);
         self.settle_claim(
             claim,
-            ClaimSettlement::Deferred {
-                reason: reason.into(),
-                next_attempt_at,
-            },
+            DeliveryTransition::deferred(reason, next_attempt_at),
         )
         .await
     }
@@ -363,9 +360,7 @@ impl AgentRouter {
     ) -> Result<AgentDeliveryReceipt, AgentRouterError> {
         self.settle_claim(
             claim,
-            ClaimSettlement::EffectStarted {
-                turn_id: turn_id.into(),
-            },
+            DeliveryTransition::effect_started(turn_id),
         )
         .await
     }
@@ -377,9 +372,7 @@ impl AgentRouter {
     ) -> Result<AgentDeliveryReceipt, AgentRouterError> {
         self.settle_claim(
             claim,
-            ClaimSettlement::MailboxAccepted {
-                turn_id: turn_id.into(),
-            },
+            DeliveryTransition::mailbox_accepted(turn_id),
         )
         .await
     }
@@ -391,9 +384,7 @@ impl AgentRouter {
     ) -> Result<AgentDeliveryReceipt, AgentRouterError> {
         self.settle_claim(
             claim,
-            ClaimSettlement::Drained {
-                turn_id: turn_id.into(),
-            },
+            DeliveryTransition::drained(turn_id),
         )
         .await
     }
@@ -414,7 +405,7 @@ impl AgentRouter {
         let next_attempt_at = retryable.then(|| retry_deadline(claim.attempt));
         self.settle_claim(
             claim,
-            ClaimSettlement::TurnSettled {
+            DeliveryTransition::settled(DeliverySettlement {
                 turn_id,
                 outcome,
                 drained: Some(drained),
@@ -422,7 +413,7 @@ impl AgentRouter {
                 retryable,
                 next_attempt_at,
                 reply_message_id,
-            },
+            }),
         )
         .await
     }
@@ -462,7 +453,7 @@ impl AgentRouter {
                 path: authority.directory.clone(),
                 message: "Agent inbox authority is closed".to_string(),
             })?;
-            Ok(state.journal.last_sequence())
+            Ok(state.framework.journal.last_sequence())
         })
         .await
         .map_err(|error| AgentRouterError::Task(error.to_string()))?
@@ -493,6 +484,7 @@ impl AgentRouter {
             let mut phases = Vec::new();
             loop {
                 let records = state
+                    .framework
                     .journal
                     .replay_after(after, 256)
                     .map_err(|error| journal_error(&authority.directory, error))?;
@@ -502,25 +494,25 @@ impl AgentRouter {
                 for record in records {
                     after = record.sequence;
                     let (event_message_id, phase) = match record.event.as_ref() {
-                        AgentInboxEvent::Persisted { message, .. } => {
-                            (message.message_id.as_str(), "persisted")
+                        DeliveryEvent::Persisted { envelope, .. } => {
+                            (envelope.message_id.as_str(), "persisted")
                         }
-                        AgentInboxEvent::Claimed { message_id, .. } => {
+                        DeliveryEvent::Claimed { message_id, .. } => {
                             (message_id.as_str(), "claimed")
                         }
-                        AgentInboxEvent::EffectStarted { message_id, .. } => {
+                        DeliveryEvent::EffectStarted { message_id, .. } => {
                             (message_id.as_str(), "effect_started")
                         }
-                        AgentInboxEvent::MailboxAccepted { message_id, .. } => {
+                        DeliveryEvent::MailboxAccepted { message_id, .. } => {
                             (message_id.as_str(), "mailbox_accepted")
                         }
-                        AgentInboxEvent::Drained { message_id, .. } => {
+                        DeliveryEvent::Drained { message_id, .. } => {
                             (message_id.as_str(), "drained")
                         }
-                        AgentInboxEvent::Deferred { message_id, .. } => {
+                        DeliveryEvent::Deferred { message_id, .. } => {
                             (message_id.as_str(), "deferred")
                         }
-                        AgentInboxEvent::TurnSettled { message_id, .. } => {
+                        DeliveryEvent::TurnSettled { message_id, .. } => {
                             (message_id.as_str(), "turn_settled")
                         }
                     };
@@ -538,12 +530,12 @@ impl AgentRouter {
     async fn settle_claim(
         &self,
         claim: &AgentDeliveryClaim,
-        settlement: ClaimSettlement,
+        transition: DeliveryTransition,
     ) -> Result<AgentDeliveryReceipt, AgentRouterError> {
         let root = self.root.clone();
         let inboxes = Arc::clone(&self.inboxes);
         let claim = claim.clone();
-        tokio::task::spawn_blocking(move || settle_claim_sync(&root, &inboxes, &claim, settlement))
+        tokio::task::spawn_blocking(move || settle_claim_sync(&root, &inboxes, &claim, transition))
             .await
             .map_err(|error| AgentRouterError::Task(error.to_string()))?
     }

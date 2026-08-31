@@ -1,30 +1,11 @@
 ---
 name: doc-writing
-description: >-
-  文档与报告撰写。当用户需要撰写报告、技术文档、文章、邮件、
-  提案或其他结构化文本时激活。
-triggers:
-  - 写报告
-  - 写文档
-  - 写文章
-  - 撰写
-  - 写邮件
-  - 写方案
-  - write report
-  - write document
-  - draft
-  - 起草
-  - 写总结
-allowed-tools:
-  - "read_file"
-  - "read_artifact"
-  - "apply_patch"
-  - "web_search"
-  - "web_fetch"
+description: 文档与报告撰写。当用户需要撰写报告、技术文档、文章、邮件、 提案或其他结构化文本时激活。
+allowed-tools: read_file read_artifact apply_patch web_search web_fetch
 metadata:
   author: echo-agent-cli
-  version: "1.0.0"
-  tags: "writing, document, report, article, draft"
+  version: 1.0.0
+  tags: writing, document, report, article, draft
 ---
 
 ## 文档与报告撰写

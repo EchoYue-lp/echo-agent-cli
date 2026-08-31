@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use crate::agent_handle::AgentHandle;
+use crate::subagent_loader::SubagentCatalogSnapshot;
 use crate::tasks::task_runtime::store::TaskRuntimeStore;
 use crate::tasks::task_runtime::task_execute_tool::ExecuteTaskTool;
 use crate::tasks::task_runtime::task_tools::{
@@ -27,17 +28,11 @@ use crate::tasks::task_runtime::task_tools::{
 pub async fn task_revision_service_for_agent(
     agent_handle: &AgentHandle,
     store: Arc<TaskRuntimeStore>,
+    subagent_catalog: Arc<SubagentCatalogSnapshot>,
 ) -> Arc<echo_agent::tasks::TaskRevisionService> {
     let tool_names = agent_handle.read(|agent| agent.tool_names()).await;
-    let registry = agent_handle
-        .read(|agent| agent.subagent_registry().clone())
-        .await;
-    let registered_subagents = registry.list_available().await;
-    let subagent_catalog = Arc::new(
-        crate::subagent_loader::SubagentCatalogSnapshot::from_registered(&registered_subagents),
-    );
     let capabilities = Arc::new(TaskCapabilityCatalog::new(subagent_catalog, tool_names));
-    super::revisioned_adapter::build_eko_task_revision_service(store, capabilities)
+    super::revisioned_runtime::build_task_revision_service(store, capabilities)
 }
 
 /// Register the task-management tools + `task_execute` (with store) on
@@ -45,21 +40,15 @@ pub async fn task_revision_service_for_agent(
 pub async fn register_task_tools_on_agent(
     agent_handle: &AgentHandle,
     store: Arc<TaskRuntimeStore>,
+    subagent_catalog: Arc<SubagentCatalogSnapshot>,
 ) {
     let tool_names = agent_handle.read(|agent| agent.tool_names()).await;
-    let registry = agent_handle
-        .read(|agent| agent.subagent_registry().clone())
-        .await;
-    let registered_subagents = registry.list_available().await;
-    let subagent_catalog = Arc::new(
-        crate::subagent_loader::SubagentCatalogSnapshot::from_registered(&registered_subagents),
-    );
     let capabilities = Arc::new(TaskCapabilityCatalog::new(
         subagent_catalog.clone(),
         tool_names,
     ));
     let revision_service =
-        super::revisioned_adapter::build_eko_task_revision_service(store.clone(), capabilities);
+        super::revisioned_runtime::build_task_revision_service(store.clone(), capabilities);
     let added = agent_handle
         .write(|agent| {
             echo_agent::tasks::register_task_tools(agent, revision_service);
@@ -100,6 +89,15 @@ pub async fn register_task_tools_on_agent(
         );
     }
 
+    agent_handle
+        .write(|agent| {
+            crate::subagent_prompt::refresh_primary_system_prompt(
+                agent,
+                &crate::tool_exposure::disabled_tools(),
+            );
+        })
+        .await;
+
     // A one-node task graph and a dependency DAG share this execution path.
     // `agent_tool` remains only for ephemeral side work with no TaskRun.
 
@@ -129,6 +127,11 @@ pub async fn register_task_tools_on_agent(
         Ok(false) => {}
         Err(error) => tracing::warn!(%error, "HookEventDispatcher was not attached"),
     }
+}
+
+pub fn default_subagent_catalog() -> Arc<SubagentCatalogSnapshot> {
+    let definitions = crate::subagent_loader::discover_subagents(None, None);
+    Arc::new(SubagentCatalogSnapshot::from_definitions(&definitions))
 }
 
 /// Rebind the shared `task_execute` entry after the AgentPool is wrapped in an
@@ -174,7 +177,7 @@ mod tests {
         }
 
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        register_task_tools_on_agent(&handle, store).await;
+        register_task_tools_on_agent(&handle, store, default_subagent_catalog()).await;
 
         let after = handle.read(|agent| agent.tool_names()).await;
         for expected in ["task_create", "task_update", "task_list", "task_execute"] {

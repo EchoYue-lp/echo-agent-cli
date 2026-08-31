@@ -44,10 +44,10 @@ enum CompletionAssessment {
 /// it as a failure. A plain-text summary is still legitimate execution
 /// evidence as long as execution_checks (which are shell commands) are
 /// empty or actually observed.
-fn assess_task_execution(task: &PlanTask, result: &SubagentTaskResult) -> CompletionAssessment {
+fn assess_task_execution(task: &PlanTask, result: &SubagentOutcome) -> CompletionAssessment {
     // 1. Real execution failure: non-completed status, empty summary,
     //    self-reported remaining work, or self-reported failed verification.
-    if result.status != SubagentRunStatus::Completed {
+    if result.status != SubagentStatus::Completed {
         return CompletionAssessment::ExecutionFailed {
             reason: format!("terminal status is {}", result.status.as_str()),
         };
@@ -77,7 +77,7 @@ fn assess_task_execution(task: &PlanTask, result: &SubagentTaskResult) -> Comple
     let mut missing_checks = Vec::new();
     for required in &task.execution_checks {
         let matched = result.verification.iter().any(|verification| {
-            verification.source == SubagentVerificationSource::Observed
+            verification.source == SubagentEvidenceSource::Observed
                 && verification.status == SubagentVerificationStatus::Passed
                 && verification_matches(required, &verification.check)
         });
@@ -127,13 +127,13 @@ fn assess_task_execution(task: &PlanTask, result: &SubagentTaskResult) -> Comple
 /// EKO additionally holds one process-wide permit across all workspace runs.
 trait TaskDispatcher: Send + Sync {
     /// Execute `task` for `run_id`. Success carries both the bounded structured
-    /// result and the complete model output. The former feeds parent summaries;
+    /// outcome and the complete model output. The former feeds parent summaries;
     /// the latter is the evidence reviewed against acceptance criteria.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)] // product resource limits + locks are the application dispatch contract
     fn dispatch(
         &self,
         store: Arc<TaskRuntimeStore>,
-        blocking: TaskRuntimeBlockingAdapter,
+        blocking: TaskRuntimeOperation,
         context: echo_agent::tasks::TaskSubagentContext,
         claim: echo_agent::tasks::TaskClaim,
         task: PlanTask,
@@ -150,7 +150,7 @@ trait TaskDispatcher: Send + Sync {
     fn integrate(
         &self,
         _store: Arc<TaskRuntimeStore>,
-        _blocking: TaskRuntimeBlockingAdapter,
+        _blocking: TaskRuntimeOperation,
         _run_id: String,
         _task: PlanTask,
         _execution_id: String,
@@ -179,7 +179,7 @@ struct RealTaskDispatcher {
 
 async fn resolve_task_execution_agent(
     store: &TaskRuntimeStore,
-    blocking: &TaskRuntimeBlockingAdapter,
+    blocking: &TaskRuntimeOperation,
     run_id: &str,
     task: &PlanTask,
     local_agent: crate::agent_handle::AgentHandle,
@@ -227,7 +227,7 @@ impl TaskDispatcher for RealTaskDispatcher {
     fn dispatch(
         &self,
         store: Arc<TaskRuntimeStore>,
-        blocking: TaskRuntimeBlockingAdapter,
+        blocking: TaskRuntimeOperation,
         context: echo_agent::tasks::TaskSubagentContext,
         claim: echo_agent::tasks::TaskClaim,
         task: PlanTask,
@@ -298,7 +298,7 @@ impl TaskDispatcher for RealTaskDispatcher {
     fn integrate(
         &self,
         store: Arc<TaskRuntimeStore>,
-        blocking: TaskRuntimeBlockingAdapter,
+        blocking: TaskRuntimeOperation,
         run_id: String,
         task: PlanTask,
         execution_id: String,
@@ -490,7 +490,7 @@ impl TaskDispatcher for RealTaskDispatcher {
 #[derive(Debug, Clone)]
 struct TaskDispatchSuccess {
     task_id: String,
-    result: SubagentTaskResult,
+    outcome: SubagentOutcome,
     full_output: String,
     suggested_tasks: Vec<SuggestedTask>,
 }
@@ -498,7 +498,7 @@ struct TaskDispatchSuccess {
 fn task_execution_summary_candidate(
     run_id: &str,
     task: &PlanTask,
-    result: SubagentTaskResult,
+    outcome: SubagentOutcome,
     suggested_tasks: Vec<SuggestedTask>,
     decisions: Vec<String>,
 ) -> TaskExecutionSummary {
@@ -506,7 +506,7 @@ fn task_execution_summary_candidate(
         run_id: run_id.to_string(),
         task_id: task.id.clone(),
         subagent_name: task.agent_role.clone(),
-        result,
+        outcome,
         decisions,
         next_implications: Vec::new(),
         suggested_tasks,
@@ -514,71 +514,24 @@ fn task_execution_summary_candidate(
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct TaskExecutionUsage {
-    durable: SubagentRunUsage,
-    input_tokens: u64,
-    output_tokens: u64,
-}
-
-impl TaskExecutionUsage {
-    fn from_framework(result: &echo_agent::agent::subagent::SubagentResult) -> Self {
-        let duration_ms = u64::try_from(result.duration.as_millis()).unwrap_or(u64::MAX);
-        let iterations = u64::try_from(result.iterations).unwrap_or(u64::MAX);
-        let input_tokens = result
-            .usage
-            .as_ref()
-            .map(|usage| usage.prompt_tokens)
-            .unwrap_or(0);
-        let output_tokens = result
-            .usage
-            .as_ref()
-            .map(|usage| usage.completion_tokens)
-            .unwrap_or(0);
-        Self {
-            durable: SubagentRunUsage {
-                duration_ms: Some(duration_ms),
-                tokens_used: result
-                    .usage
-                    .as_ref()
-                    .map(|usage| usage.prompt_tokens.saturating_add(usage.completion_tokens)),
-                iterations: Some(iterations),
-            },
-            input_tokens,
-            output_tokens,
-        }
-    }
-
-    fn duration_ms(&self) -> u64 {
-        self.durable.duration_ms.unwrap_or(0)
-    }
-
-    fn from_turn_receipt(receipt: &TurnReceipt) -> Self {
-        let duration_ms = u64::try_from(receipt.elapsed.as_millis()).unwrap_or(u64::MAX);
-        Self {
-            durable: SubagentRunUsage {
-                duration_ms: Some(duration_ms),
-                tokens_used: (receipt.llm_calls > 0).then(|| {
-                    receipt
-                        .prompt_tokens
-                        .saturating_add(receipt.completion_tokens)
-                }),
-                iterations: None,
-            },
-            input_tokens: receipt.prompt_tokens,
-            output_tokens: receipt.completion_tokens,
-        }
-    }
-}
-
 #[allow(clippy::result_large_err)]
-async fn finalize_framework_subagent_result(
-    blocking: TaskRuntimeBlockingAdapter,
+async fn finalize_subagent_execution(
+    blocking: TaskRuntimeOperation,
     run_id: &str,
     execution_id: &str,
-    result: echo_agent::agent::subagent::SubagentResult,
-) -> Result<(SubagentTaskResult, String, TaskExecutionUsage), ExecutionFailure> {
-    let usage = TaskExecutionUsage::from_framework(&result);
+    execution: echo_agent::subagent::SubagentResult,
+) -> Result<(SubagentOutcome, String, ExecutionUsage), ExecutionFailure> {
+    let usage = execution.usage();
+    let input_tokens = execution
+        .llm_usage
+        .as_ref()
+        .map(|reported| reported.prompt_tokens)
+        .unwrap_or(0);
+    let output_tokens = execution
+        .llm_usage
+        .as_ref()
+        .map(|reported| reported.completion_tokens)
+        .unwrap_or(0);
     let usage_run_id = run_id.to_string();
     let usage_execution_id = execution_id.to_string();
     let persisted_usage = usage.clone();
@@ -588,9 +541,9 @@ async fn finalize_framework_subagent_result(
                 &usage_run_id,
                 &usage_execution_id,
                 "framework_dispatch_total",
-                persisted_usage.input_tokens,
-                persisted_usage.output_tokens,
-                persisted_usage.duration_ms(),
+                input_tokens,
+                output_tokens,
+                persisted_usage.duration_millis(),
             )
         })
         .await
@@ -600,12 +553,12 @@ async fn finalize_framework_subagent_result(
             ))
             .with_usage(usage.clone())
         })?;
-    if result.outcome.status != echo_agent::agent::subagent::SubagentStatus::Completed {
-        let status = result.outcome.status.into();
-        let message = if result.outcome.summary.trim().is_empty() {
-            result.output
+    if execution.outcome.status != echo_agent::subagent::SubagentStatus::Completed {
+        let status = execution.outcome.status;
+        let message = if execution.outcome.summary.trim().is_empty() {
+            execution.output
         } else {
-            result.outcome.summary
+            execution.outcome.summary
         };
         return Err(ExecutionFailure {
             status,
@@ -614,22 +567,21 @@ async fn finalize_framework_subagent_result(
             agent_failure: None,
         });
     }
-    let task_result = SubagentTaskResult::from_framework(&result);
-    Ok((task_result, result.output, usage))
+    Ok((execution.outcome, execution.output, usage))
 }
 
 #[derive(Debug, Clone)]
 struct ExecutionFailure {
-    status: SubagentRunStatus,
+    status: SubagentStatus,
     message: String,
-    usage: Option<TaskExecutionUsage>,
+    usage: Option<ExecutionUsage>,
     agent_failure: Option<echo_agent::error::AgentFailure>,
 }
 
 impl ExecutionFailure {
     fn failed(message: impl Into<String>) -> Self {
         Self {
-            status: SubagentRunStatus::Failed,
+            status: SubagentStatus::Failed,
             message: message.into(),
             usage: None,
             agent_failure: None,
@@ -638,22 +590,22 @@ impl ExecutionFailure {
 
     fn cancelled(message: impl Into<String>) -> Self {
         Self {
-            status: SubagentRunStatus::Cancelled,
+            status: SubagentStatus::Cancelled,
             message: message.into(),
             usage: None,
             agent_failure: None,
         }
     }
 
-    fn from_agent_failure(
+    fn with_agent_failure(
         failure: &echo_agent::error::AgentFailure,
         message: impl Into<String>,
     ) -> Self {
         let status = match failure.terminal_kind {
-            echo_agent::error::AgentTerminalKind::Cancelled => SubagentRunStatus::Cancelled,
-            echo_agent::error::AgentTerminalKind::TimedOut => SubagentRunStatus::TimedOut,
+            echo_agent::error::AgentTerminalKind::Cancelled => SubagentStatus::Cancelled,
+            echo_agent::error::AgentTerminalKind::TimedOut => SubagentStatus::TimedOut,
             echo_agent::error::AgentTerminalKind::Failed
-            | echo_agent::error::AgentTerminalKind::PermissionDenied => SubagentRunStatus::Failed,
+            | echo_agent::error::AgentTerminalKind::PermissionDenied => SubagentStatus::Failed,
         };
         Self {
             status,
@@ -663,17 +615,17 @@ impl ExecutionFailure {
         }
     }
 
-    fn from_react(error: echo_agent::error::ReactError, context: &str) -> Self {
-        let status = echo_agent::agent::subagent::subagent_status_from_error(&error).into();
+    fn with_react_error(error: echo_agent::error::ReactError, context: &str) -> Self {
+        let status = echo_agent::subagent::subagent_status_from_error(&error);
         Self {
             status,
             message: format!("{context}: {error}"),
             usage: None,
-            agent_failure: Some(echo_agent::error::AgentFailure::from_react_error(&error)),
+            agent_failure: Some(echo_agent::error::AgentFailure::from(&error)),
         }
     }
 
-    fn with_usage(mut self, usage: TaskExecutionUsage) -> Self {
+    fn with_usage(mut self, usage: ExecutionUsage) -> Self {
         self.usage = Some(usage);
         self
     }
@@ -686,10 +638,10 @@ impl std::fmt::Display for ExecutionFailure {
 }
 
 fn attach_agent_failure_evidence(
-    result: &mut SubagentTaskResult,
+    result: &mut SubagentOutcome,
     failure: &echo_agent::error::AgentFailure,
 ) {
-    result.evidence.push(SubagentEvidenceResult {
+    result.evidence.push(SubagentEvidence {
         kind: "agent_failure".to_string(),
         subject: failure.code.clone(),
         outcome: Some(
@@ -702,7 +654,7 @@ fn attach_agent_failure_evidence(
             .to_string(),
         ),
         details: failure.message.chars().take(1_200).collect(),
-        source: SubagentVerificationSource::Observed,
+        source: SubagentEvidenceSource::Observed,
         attributes: serde_json::to_value(failure).unwrap_or(serde_json::Value::Null),
     });
 }
@@ -768,12 +720,12 @@ impl EkoAgentTurnContext {
 }
 
 struct PrimaryTaskTurnPersistence {
-    blocking: TaskRuntimeBlockingAdapter,
+    blocking: TaskRuntimeOperation,
     replay_safe_tools: HashSet<String>,
 }
 
 struct RunTurnPersistence {
-    blocking: TaskRuntimeBlockingAdapter,
+    blocking: TaskRuntimeOperation,
     turn_id: String,
 }
 
@@ -783,19 +735,20 @@ struct EkoAgentTurnState {
     in_thinking: bool,
     pending_verification: HashMap<String, String>,
     pending_file_access: HashMap<String, (bool, String)>,
-    observed_evidence: Vec<echo_agent::agent::subagent::SubagentEvidence>,
-    observed_artifacts: Vec<echo_agent::agent::subagent::SubagentArtifact>,
+    observed_evidence: Vec<echo_agent::subagent::SubagentEvidence>,
+    observed_artifacts: Vec<echo_agent::subagent::SubagentArtifact>,
     mutating_tool_observed: bool,
 }
 
 struct EkoAgentTurnObservation {
     output: String,
-    observed_evidence: Vec<echo_agent::agent::subagent::SubagentEvidence>,
-    observed_artifacts: Vec<echo_agent::agent::subagent::SubagentArtifact>,
+    observed_evidence: Vec<echo_agent::subagent::SubagentEvidence>,
+    observed_artifacts: Vec<echo_agent::subagent::SubagentArtifact>,
     mutating_tool_observed: bool,
 }
 
-/// The sole EKO adapter below [`AgentTurnDriver`] for TaskRuntime-owned turns.
+/// The sole EKO integration below [`AgentTurnDriver`] for TaskRuntime-owned
+/// turns.
 ///
 /// Framework code owns stream startup, envelope sequencing, exact terminal
 /// detection, typed failures, cancellation, and provider-reported receipt
@@ -814,7 +767,7 @@ impl EkoAgentTurnSink {
     fn for_run(
         run: &TaskRun,
         turn_id: &str,
-        blocking: TaskRuntimeBlockingAdapter,
+        blocking: TaskRuntimeOperation,
         mutating_tools: HashSet<String>,
         trace_sink: Option<ExecSink>,
     ) -> Self {
@@ -835,7 +788,7 @@ impl EkoAgentTurnSink {
         run: &TaskRun,
         task: &PlanTask,
         execution_id: &str,
-        blocking: TaskRuntimeBlockingAdapter,
+        blocking: TaskRuntimeOperation,
         replay_safe_tools: HashSet<String>,
         trace_sink: Option<ExecSink>,
     ) -> Self {
@@ -1090,7 +1043,7 @@ impl EventSink for EkoAgentTurnSink {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if let Some(check) = state.pending_verification.remove(&call_id) {
                         state.observed_evidence.push(
-                            echo_agent::agent::subagent::SubagentEvidence {
+                            echo_agent::subagent::SubagentEvidence {
                                 kind: "verification".to_string(),
                                 subject: check,
                                 outcome: Some(if result.success {
@@ -1100,7 +1053,7 @@ impl EventSink for EkoAgentTurnSink {
                                 }),
                                 details: result_text.chars().take(500).collect(),
                                 source:
-                                    echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                                    echo_agent::subagent::SubagentEvidenceSource::Observed,
                                 attributes: serde_json::Value::Null,
                             },
                         );
@@ -1109,13 +1062,13 @@ impl EventSink for EkoAgentTurnSink {
                         && let Some((write, path)) = state.pending_file_access.remove(&call_id)
                     {
                         state.observed_evidence.push(
-                            echo_agent::agent::subagent::SubagentEvidence {
+                            echo_agent::subagent::SubagentEvidence {
                                 kind: if write { "file_write" } else { "file_read" }.to_string(),
                                 subject: path,
                                 outcome: Some("succeeded".to_string()),
                                 details: String::new(),
                                 source:
-                                    echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                                    echo_agent::subagent::SubagentEvidenceSource::Observed,
                                 attributes: serde_json::Value::Null,
                             },
                         );
@@ -1124,7 +1077,7 @@ impl EventSink for EkoAgentTurnSink {
                     }
                     if let Some(artifact) = result.artifact.as_ref() {
                         state.observed_artifacts.push(
-                            echo_agent::agent::subagent::SubagentArtifact {
+                            echo_agent::subagent::SubagentArtifact {
                                 path: artifact.path.to_string_lossy().to_string(),
                                 kind: "tool_log".to_string(),
                                 bytes: Some(artifact.artifact_bytes),
@@ -1233,7 +1186,7 @@ impl EventSink for EkoAgentTurnSink {
 #[derive(Debug, Clone)]
 struct TaskDispatchFailure {
     task_id: String,
-    status: SubagentRunStatus,
+    status: SubagentStatus,
     message: String,
     agent_failure: Option<echo_agent::error::AgentFailure>,
 }
@@ -1242,7 +1195,7 @@ impl TaskDispatchFailure {
     fn failed(task_id: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             task_id: task_id.into(),
-            status: SubagentRunStatus::Failed,
+            status: SubagentStatus::Failed,
             message: message.into(),
             agent_failure: None,
         }
@@ -1251,7 +1204,7 @@ impl TaskDispatchFailure {
     fn cancelled(task_id: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             task_id: task_id.into(),
-            status: SubagentRunStatus::Cancelled,
+            status: SubagentStatus::Cancelled,
             message: message.into(),
             agent_failure: None,
         }
@@ -1269,15 +1222,15 @@ impl TaskDispatchFailure {
     fn into_react(self) -> echo_agent::error::ReactError {
         use echo_agent::error::AgentError;
         match self.status {
-            SubagentRunStatus::Cancelled => {
+            SubagentStatus::Cancelled => {
                 echo_agent::error::ReactError::Agent(Box::new(AgentError::Cancelled(self.message)))
             }
-            SubagentRunStatus::TimedOut => {
+            SubagentStatus::TimedOut => {
                 echo_agent::error::ReactError::Agent(Box::new(AgentError::Timeout(self.message)))
             }
-            SubagentRunStatus::Running
-            | SubagentRunStatus::Completed
-            | SubagentRunStatus::Failed => echo_agent::error::ReactError::Other(self.message),
+            SubagentStatus::Running
+            | SubagentStatus::Completed
+            | SubagentStatus::Failed => echo_agent::error::ReactError::Other(self.message),
         }
     }
 }
@@ -1308,7 +1261,7 @@ fn select_ownership_safe_wave(ready: Vec<PlanTask>) -> Vec<PlanTask> {
 
 struct EkoRuntimeDagController<W: TaskDispatcher> {
     store: Arc<TaskRuntimeStore>,
-    blocking: TaskRuntimeBlockingAdapter,
+    blocking: TaskRuntimeOperation,
     dispatcher: Arc<W>,
     reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
     write_sem: Arc<Semaphore>,
@@ -1322,7 +1275,7 @@ struct EkoRuntimeDagController<W: TaskDispatcher> {
 }
 
 #[derive(Clone)]
-pub struct TaskRuntimeBlockingAdapter {
+pub struct TaskRuntimeOperation {
     store: Arc<TaskRuntimeStore>,
     supervisor: Arc<TaskRuntimeOperationSupervisor>,
 }
@@ -1456,7 +1409,7 @@ impl TaskRuntimeOperationSupervisor {
     }
 }
 
-impl TaskRuntimeBlockingAdapter {
+impl TaskRuntimeOperation {
     pub fn new(store: Arc<TaskRuntimeStore>) -> Self {
         let supervisor = store.operation_supervisor();
         Self { store, supervisor }
@@ -1506,7 +1459,7 @@ impl TaskRuntimeBlockingAdapter {
             .await
             .map_err(|error| {
                 StoreError::InvalidPlan(format!(
-                    "TaskRuntime blocking adapter closed during {operation}: {error}"
+                    "TaskRuntime operation closed during {operation}: {error}"
                 ))
             })?;
         let receipt = self.supervisor.register(operation)?;
@@ -1773,8 +1726,8 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         let recovery_attempt = claim.attempt;
         let recovery = self
             .blocking
-            .run("load recoverable Subagent result", move |store| {
-                store.recoverable_subagent_result_for_attempt(
+            .run("load recoverable Subagent outcome", move |store| {
+                store.recoverable_subagent_outcome_for_attempt(
                     &recovery_run_id,
                     &recovery_task_id,
                     &recovery_execution_id,
@@ -1789,26 +1742,26 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     run_id = %context.run_id,
                     task_id = %task.id,
                     execution_id,
-                    "task_runtime: reusing durable Subagent result after restart"
+                    "task_runtime: reusing durable Subagent outcome after restart"
                 );
                 let note_run_id = context.run_id.clone();
                 let note_task_id = task.id.clone();
                 if let Err(error) = self
                     .blocking
-                    .run("note recovered Subagent result", move |store| {
+                    .run("note recovered Subagent outcome", move |store| {
                         store.note(
                             &note_run_id,
                             Some(&note_task_id),
-                            "reused completed Subagent result; continuing at review boundary",
+                            "reused completed Subagent outcome; continuing at review boundary",
                         )
                     })
                     .await
                 {
-                    tracing::warn!(run_id = %context.run_id, task_id = %task.id, %error, "failed to note recovered Subagent result");
+                    tracing::warn!(run_id = %context.run_id, task_id = %task.id, %error, "failed to note recovered Subagent outcome");
                 }
                 return Ok(TaskDispatchSuccess {
                     task_id: task.id,
-                    result: recovered.result,
+                    outcome: recovered.outcome,
                     full_output: recovered.full_output,
                     suggested_tasks: Vec::new(),
                 });
@@ -1818,7 +1771,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                 run_id = %context.run_id,
                 task_id = %task.id,
                 %error,
-                "failed to inspect durable Subagent result; dispatching normally"
+                "failed to inspect durable Subagent outcome; dispatching normally"
             ),
         }
 
@@ -1879,18 +1832,18 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     .as_ref()
                     .map(|failure| match failure.terminal_kind {
                         echo_agent::error::AgentTerminalKind::Cancelled => {
-                            echo_agent::agent::subagent::SubagentStatus::Cancelled
+                            echo_agent::subagent::SubagentStatus::Cancelled
                         }
                         echo_agent::error::AgentTerminalKind::TimedOut => {
-                            echo_agent::agent::subagent::SubagentStatus::TimedOut
+                            echo_agent::subagent::SubagentStatus::TimedOut
                         }
                         echo_agent::error::AgentTerminalKind::Failed
                         | echo_agent::error::AgentTerminalKind::PermissionDenied => {
-                            echo_agent::agent::subagent::SubagentStatus::Failed
+                            echo_agent::subagent::SubagentStatus::Failed
                         }
                     })
                     .unwrap_or_else(|| {
-                        echo_agent::agent::subagent::subagent_status_from_error(&error)
+                        echo_agent::subagent::subagent_status_from_error(&error)
                     });
                 let request = if let Some(failure) = typed_failure.as_ref().filter(|failure| {
                     failure.retryable
@@ -1911,24 +1864,29 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     }
                 } else {
                     match status {
-                        echo_agent::agent::subagent::SubagentStatus::Cancelled => {
+                        echo_agent::subagent::SubagentStatus::Running => {
+                            echo_agent::tasks::RuntimeTaskResolutionRequest::Failed {
+                                error: message.clone(),
+                            }
+                        }
+                        echo_agent::subagent::SubagentStatus::Cancelled => {
                             echo_agent::tasks::RuntimeTaskResolutionRequest::Cancelled
                         }
-                        echo_agent::agent::subagent::SubagentStatus::TimedOut => {
+                        echo_agent::subagent::SubagentStatus::TimedOut => {
                             echo_agent::tasks::RuntimeTaskResolutionRequest::TimedOut {
                                 error: format!("Subagent timed out: {message}"),
                             }
                         }
-                        echo_agent::agent::subagent::SubagentStatus::Completed
-                        | echo_agent::agent::subagent::SubagentStatus::Failed => {
+                        echo_agent::subagent::SubagentStatus::Completed
+                        | echo_agent::subagent::SubagentStatus::Failed => {
                             echo_agent::tasks::RuntimeTaskResolutionRequest::Failed {
                                 error: message.clone(),
                             }
                         }
                     }
                 };
-                let mut result = SubagentTaskResult::terminal(
-                    status.into(),
+                let mut result = SubagentOutcome::terminal(
+                    status,
                     message.clone(),
                     vec![message.clone()],
                 );
@@ -1957,7 +1915,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
 
         let TaskDispatchSuccess {
             task_id,
-            mut result,
+            mut outcome,
             full_output,
             suggested_tasks,
         } = dispatched;
@@ -1968,7 +1926,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             )));
         }
 
-        match assess_task_execution(&task, &result) {
+        match assess_task_execution(&task, &outcome) {
             CompletionAssessment::ExecutionFailed { reason } => {
                 self.stage_resolution_metadata(
                     &claim.claim_id,
@@ -1977,7 +1935,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                         execution_summary: Some(task_execution_summary_candidate(
                             run_id,
                             &task,
-                            result,
+                            outcome,
                             suggested_tasks,
                             vec![format!("execution failed: {reason}")],
                         )),
@@ -2009,7 +1967,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                         execution_summary: Some(task_execution_summary_candidate(
                             run_id,
                             &task,
-                            result,
+                            outcome,
                             suggested_tasks,
                             vec![reason.clone()],
                         )),
@@ -2033,7 +1991,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                         error: "dispatch completed after its claim was superseded".to_string(),
                     });
                 }
-                let summary = result.summary.clone();
+                let summary = outcome.summary.clone();
                 let review_output = if full_output.trim().is_empty() {
                     summary.as_str()
                 } else {
@@ -2070,7 +2028,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                             execution_summary: Some(task_execution_summary_candidate(
                                 run_id,
                                 &task,
-                                result,
+                                outcome,
                                 suggested_tasks,
                                 vec![reason.clone()],
                             )),
@@ -2110,12 +2068,12 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                 {
                     Ok((completion_summary, changed_files)) => {
                         if !changed_files.is_empty() {
-                            result.touched_files.written = changed_files;
+                            outcome.touched_files.written = changed_files;
                         }
                         let execution_summary = task_execution_summary_candidate(
                             run_id,
                             &task,
-                            result,
+                            outcome,
                             suggested_tasks,
                             vec![completion_summary.clone()],
                         );
@@ -2133,9 +2091,9 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     }
                     Err(error) => {
                         let error = format!("worktree integration failed: {error}");
-                        result.status = SubagentRunStatus::Failed;
-                        if !result.remaining_work.contains(&error) {
-                            result.remaining_work.push(error.clone());
+                        outcome.status = SubagentStatus::Failed;
+                        if !outcome.remaining_work.contains(&error) {
+                            outcome.remaining_work.push(error.clone());
                         }
                         self.stage_resolution_metadata(
                             &claim.claim_id,
@@ -2144,7 +2102,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                                 execution_summary: Some(task_execution_summary_candidate(
                                     run_id,
                                     &task,
-                                    result,
+                                    outcome,
                                     suggested_tasks,
                                     vec![error.clone()],
                                 )),
@@ -2178,12 +2136,12 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             .as_ref()
             .map(|summary| {
                 serde_json::json!({
-                    "terminal_status": summary.result.status.as_str(),
-                    "summary": &summary.result.summary,
-                    "artifacts": &summary.result.artifacts,
-                    "verification": &summary.result.verification,
-                    "remaining_work": &summary.result.remaining_work,
-                    "touched_files": &summary.result.touched_files,
+                    "terminal_status": summary.outcome.status.as_str(),
+                    "summary": &summary.outcome.summary,
+                    "artifacts": &summary.outcome.artifacts,
+                    "verification": &summary.outcome.verification,
+                    "remaining_work": &summary.outcome.remaining_work,
+                    "touched_files": &summary.outcome.touched_files,
                     "agent_failure": &product.typed_terminal,
                 })
             })

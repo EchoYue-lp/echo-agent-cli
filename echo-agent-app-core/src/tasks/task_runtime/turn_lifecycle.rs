@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
-use echo_agent::runtime::TurnOutcome;
+use echo_agent::runtime::{TurnOutcome, TurnReceipt};
 
-use super::executor::{ExecEvent, ExecSink, TaskRuntimeBlockingAdapter};
+use super::executor::{ExecEvent, ExecSink, TaskRuntimeOperation};
 use super::store::{ProviderRetryDisposition, RunTurnCompletion, TaskRuntimeStore};
 use super::types::{RunPauseReason, RunTurnStatus, RuntimeEventKind, TaskRunStatus};
 
@@ -25,24 +25,17 @@ pub(crate) enum PreDriverRejection {
     Admission,
 }
 
-pub(crate) struct RunTurnTerminal<'a> {
-    pub turn_id: &'a str,
-    pub terminal: &'a TurnOutcome,
-    pub elapsed_seconds: u64,
-    pub final_message_id: Option<&'a str>,
-}
-
 pub(crate) struct PersistedRunTurn {
     continuation: super::types::RunContinuationState,
     error_fingerprint: Option<String>,
 }
 
 pub(crate) async fn persist_run_turn_terminal(
-    blocking: &TaskRuntimeBlockingAdapter,
+    blocking: &TaskRuntimeOperation,
     run_id: &str,
-    terminal: &RunTurnTerminal<'_>,
+    terminal: &TurnReceipt,
 ) -> Result<PersistedRunTurn, String> {
-    let (status, error_fingerprint) = match terminal.terminal {
+    let (status, error_fingerprint) = match &terminal.outcome {
         TurnOutcome::Completed => (RunTurnStatus::Ended, None),
         TurnOutcome::Cancelled => (RunTurnStatus::Cancelled, Some("cancelled".to_string())),
         TurnOutcome::Failed(failure) => (
@@ -50,14 +43,17 @@ pub(crate) async fn persist_run_turn_terminal(
             Some(agent_failure_fingerprint(failure)),
         ),
     };
-    let agent_failure = match terminal.terminal {
+    let agent_failure = match &terminal.outcome {
         TurnOutcome::Failed(failure) => Some(failure.clone()),
         TurnOutcome::Completed | TurnOutcome::Cancelled => None,
     };
     let run_id = run_id.to_string();
     let turn_id = terminal.turn_id.to_string();
-    let elapsed_seconds = terminal.elapsed_seconds;
-    let final_message_id = terminal.final_message_id.map(str::to_string);
+    let elapsed_seconds = terminal
+        .elapsed
+        .as_secs()
+        .saturating_add(u64::from(terminal.elapsed.subsec_nanos() > 0));
+    let final_message_id = terminal.final_message_id.as_ref().map(ToString::to_string);
     let persisted_fingerprint = error_fingerprint.clone();
     let continuation = blocking
         .run_store("persist RunTurn terminal", move |store| {
@@ -84,7 +80,7 @@ pub(crate) async fn persist_run_turn_terminal(
 fn decide_after_persisted_run_turn_sync(
     store: &Arc<TaskRuntimeStore>,
     run_id: &str,
-    terminal: &RunTurnTerminal<'_>,
+    terminal: &TurnReceipt,
     persisted: PersistedRunTurn,
     trace_sink: Option<&ExecSink>,
 ) -> Result<RunTurnDecision, String> {
@@ -104,7 +100,7 @@ fn decide_after_persisted_run_turn_sync(
         }
         return Ok(RunTurnDecision::Stop);
     }
-    if let TurnOutcome::Failed(failure) = terminal.terminal
+    if let TurnOutcome::Failed(failure) = &terminal.outcome
         && failure.retryable
         && failure.category == echo_agent::error::AgentFailureCategory::Llm
     {
@@ -120,7 +116,7 @@ fn decide_after_persisted_run_turn_sync(
             })
             .map_err(|error| error.to_string());
     }
-    if run.status == TaskRunStatus::Completed && matches!(terminal.terminal, TurnOutcome::Completed)
+    if run.status == TaskRunStatus::Completed && matches!(terminal.outcome, TurnOutcome::Completed)
     {
         if let Some(trace_sink) = trace_sink {
             trace_sink(ExecEvent::run(
@@ -137,7 +133,7 @@ fn decide_after_persisted_run_turn_sync(
         return Ok(RunTurnDecision::Stop);
     }
 
-    match terminal.terminal {
+    match &terminal.outcome {
         TurnOutcome::Cancelled => {
             store
                 .transition_run(run_id, TaskRunStatus::Cancelled)
@@ -256,18 +252,15 @@ fn decide_after_persisted_run_turn_sync(
 }
 
 pub(crate) async fn decide_after_persisted_run_turn(
-    blocking: &TaskRuntimeBlockingAdapter,
+    blocking: &TaskRuntimeOperation,
     store: &Arc<TaskRuntimeStore>,
     run_id: &str,
-    terminal: &RunTurnTerminal<'_>,
+    terminal: &TurnReceipt,
     persisted: PersistedRunTurn,
     trace_sink: Option<&ExecSink>,
 ) -> Result<RunTurnDecision, String> {
     let run_id = run_id.to_string();
-    let owned_terminal = terminal.terminal.clone();
-    let owned_turn_id = terminal.turn_id.to_string();
-    let elapsed_seconds = terminal.elapsed_seconds;
-    let owned_final_message_id = terminal.final_message_id.map(str::to_string);
+    let owned_terminal = terminal.clone();
     let trace_sink = trace_sink.cloned();
     let store = Arc::clone(store);
     blocking
@@ -275,12 +268,7 @@ pub(crate) async fn decide_after_persisted_run_turn(
             decide_after_persisted_run_turn_sync(
                 &store,
                 &run_id,
-                &RunTurnTerminal {
-                    turn_id: &owned_turn_id,
-                    terminal: &owned_terminal,
-                    elapsed_seconds,
-                    final_message_id: owned_final_message_id.as_deref(),
-                },
+                &owned_terminal,
                 persisted,
                 trace_sink.as_ref(),
             )
@@ -291,10 +279,10 @@ pub(crate) async fn decide_after_persisted_run_turn(
 }
 
 pub(crate) async fn finalize_run_turn(
-    blocking: &TaskRuntimeBlockingAdapter,
+    blocking: &TaskRuntimeOperation,
     store: &Arc<TaskRuntimeStore>,
     run_id: &str,
-    terminal: &RunTurnTerminal<'_>,
+    terminal: &TurnReceipt,
     trace_sink: Option<&ExecSink>,
 ) -> Result<RunTurnDecision, String> {
     let persisted = persist_run_turn_terminal(blocking, run_id, terminal).await?;
@@ -302,7 +290,7 @@ pub(crate) async fn finalize_run_turn(
 }
 
 pub(crate) async fn reject_before_driver_start(
-    blocking: &TaskRuntimeBlockingAdapter,
+    blocking: &TaskRuntimeOperation,
     store: &Arc<TaskRuntimeStore>,
     run_id: &str,
     turn_id: &str,
@@ -310,25 +298,18 @@ pub(crate) async fn reject_before_driver_start(
     rejection: PreDriverRejection,
 ) -> Result<(), String> {
     let terminal = match rejection {
-        PreDriverRejection::Cancelled => TurnOutcome::Cancelled,
-        PreDriverRejection::Shutdown => TurnOutcome::Failed(
+        PreDriverRejection::Cancelled => TurnReceipt::cancelled(turn_id),
+        PreDriverRejection::Shutdown => TurnReceipt::failed(
+            turn_id,
             echo_agent::error::AgentFailure::message("runtime_shutdown", detail),
         ),
-        PreDriverRejection::Admission => TurnOutcome::Failed(
+        PreDriverRejection::Admission => TurnReceipt::failed(
+            turn_id,
             echo_agent::error::AgentFailure::message("continuation_admission", detail),
         ),
     };
-    persist_run_turn_terminal(
-        blocking,
-        run_id,
-        &RunTurnTerminal {
-            turn_id,
-            terminal: &terminal,
-            elapsed_seconds: 0,
-            final_message_id: None,
-        },
-    )
-    .await?;
+    let terminal = terminal.map_err(|error| error.to_string())?;
+    persist_run_turn_terminal(blocking, run_id, &terminal).await?;
 
     let run_id = run_id.to_string();
     let cleanup_run_id = run_id.clone();

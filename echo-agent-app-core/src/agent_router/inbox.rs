@@ -48,12 +48,26 @@ pub enum AgentRouterError {
     AppendIdentityConflict { batch_id: String, detail: String },
 }
 
-type AgentInboxReducer =
-    CheckpointedReducer<SegmentedFileEventJournal<AgentInboxEvent>, AgentInboxProjection>;
+type FrameworkDeliveryEvent =
+    echo_agent::delivery::DeliveryEvent<AgentAddress, AgentMessage>;
+type FrameworkDeliveryProjection =
+    echo_agent::delivery::DeliveryLedgerProjection<AgentAddress, AgentMessage>;
+type FrameworkDeliveryJournal =
+    echo_agent::state::journal::SegmentedFileEventJournal<FrameworkDeliveryEvent>;
+type FrameworkDeliveryLedger = echo_agent::delivery::DeliveryLedger<
+    FrameworkDeliveryJournal,
+    AgentAddress,
+    AgentMessage,
+>;
 
 struct AgentInboxAuthorityState {
-    journal: Arc<SegmentedFileEventJournal<AgentInboxEvent>>,
-    reducer: AgentInboxReducer,
+    framework: AgentFrameworkState,
+}
+
+struct AgentFrameworkState {
+    journal: Arc<FrameworkDeliveryJournal>,
+    ledger: FrameworkDeliveryLedger,
+    checkpoint_path: PathBuf,
     durability_debt: Option<String>,
 }
 
