@@ -242,7 +242,9 @@ export function ProviderPanel() {
         base_url: providerForm.baseUrl.trim(),
         api_key: providerForm.apiKey.trim() || undefined,
         api_key_env: current?.api_key_env ?? undefined,
-        requires_api_key: false,
+        // Preserve the stored auth contract: editing a provider that requires
+        // an API key must not silently drop its missing-key preflight check.
+        requires_api_key: current?.requires_api_key ?? false,
         default_api_protocol: current?.default_api_protocol ?? 'chat_completions',
       });
       await reload();

@@ -1834,6 +1834,31 @@ impl AppState {
         }
     }
 
+    /// Publish the ReAct loop ceiling (EKO `0` = unlimited sentinel) to the
+    /// process primary/pool and every loaded workspace pool, so a saved
+    /// `max_iterations` actually reaches the agents the user is talking to.
+    pub async fn apply_max_iterations_to_agents(&self, eko_value: usize) {
+        match self.connection.pool.as_ref() {
+            Some(pool) => pool.apply_max_iterations(eko_value).await,
+            None => {
+                let resolved = crate::infra::resolved_max_iterations(eko_value);
+                self.connection
+                    .primary_agent()
+                    .write(|agent| {
+                        if agent.config().get_max_iterations() != resolved
+                            && let Err(error) = agent.set_max_iterations(resolved)
+                        {
+                            tracing::warn!(%error, "rejected max_iterations publication");
+                        }
+                    })
+                    .await;
+            }
+        }
+        for (_, runtime) in self.workspace.runtimes.loaded_execution_runtimes().await {
+            runtime.pool().apply_max_iterations(eko_value).await;
+        }
+    }
+
     /// Discover persisted conversation addresses from the existing workspace
     /// registry and per-workspace ConversationStores.
     pub async fn discover_agent_endpoints(

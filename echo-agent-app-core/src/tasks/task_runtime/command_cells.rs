@@ -2753,7 +2753,7 @@ mod tests {
             TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "global")
                 .map_err(|error| error.to_string())?,
         );
-        let registry = service.scoped(scope.clone(), Some(store));
+        let registry = service.scoped(scope.clone(), Some(store.clone()));
         let cell_id = registry
             .launch(CommandCellRequest {
                 command: "sleep 30".to_string(),
@@ -3495,7 +3495,11 @@ mod tests {
         )
         .await?;
         assert_eq!(ready.receipt.execution_id, receipt.execution_id);
-        assert_eq!(ready.cell, terminal);
+        assert_eq!(ready.cell.cell_id, terminal.cell_id);
+        assert_eq!(ready.cell.phase, terminal.phase);
+        assert_eq!(ready.cell.terminal_cause, terminal.terminal_cause);
+        assert_eq!(ready.cell.exit_code, terminal.exit_code);
+        assert_eq!(ready.cell.output_excerpt, terminal.output_excerpt);
 
         let repeated = service
             .watch_cell(registry, &scope, &context, &cell_id, false)

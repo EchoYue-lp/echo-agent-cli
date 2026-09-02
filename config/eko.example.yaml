@@ -34,9 +34,6 @@ agent:
   name: "echo-assistant"                              # Agent 名称
   system_prompt: "You are EKO, the user's local personal AI workbench. Work as a capable, evidence-driven collaborator across software, research, data, documents, and long-running tasks. Move authorized work to a verified result while respecting the user's instructions, workspace, and control over external side effects."  # 稳定身份；详细执行合同由应用层 PromptAssembler 注入
   max_iterations: 0            # ReAct 最大迭代次数（0 = 无限制，直到任务完成或用户取消）
-  enable_tools: true          # 启用工具调用
-  enable_memory: true         # 启用记忆
-  enable_human_in_loop: true  # 启用人工介入
   memory_path: "~/.eko/store.json"  # 记忆存储路径
   tool_timeout_ms: 120000     # 单次工具调用超时（毫秒）
   max_tool_output_tokens: 8000 # 单个工具结果进入模型上下文的 Token 上限

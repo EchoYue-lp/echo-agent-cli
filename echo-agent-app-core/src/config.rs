@@ -25,7 +25,8 @@ pub struct EkoConfig {
     pub configured_models: Vec<ConfiguredModel>,
     #[serde(
         default = "default_eko_agent_settings",
-        deserialize_with = "deserialize_eko_agent_settings"
+        deserialize_with = "deserialize_eko_agent_settings",
+        serialize_with = "serialize_eko_agent_settings"
     )]
     pub agent: AgentSettings,
     pub mcp: McpYamlConfig,
@@ -80,10 +81,35 @@ where
     D: serde::Deserializer<'de>,
 {
     let patch = serde_json::Value::deserialize(deserializer)?;
+    if let Some(fields) = patch.as_object() {
+        for removed in ["enable_tools", "enable_memory", "enable_human_in_loop"] {
+            if fields.contains_key(removed) {
+                return Err(serde::de::Error::custom(format!(
+                    "agent.{removed} is not configurable in EKO"
+                )));
+            }
+        }
+    }
     let mut merged =
         serde_json::to_value(default_eko_agent_settings()).map_err(serde::de::Error::custom)?;
     merge_config_value(&mut merged, patch);
     serde_json::from_value(merged).map_err(serde::de::Error::custom)
+}
+
+fn serialize_eko_agent_settings<S>(
+    settings: &AgentSettings,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let mut value = serde_json::to_value(settings).map_err(serde::ser::Error::custom)?;
+    if let Some(fields) = value.as_object_mut() {
+        for removed in ["enable_tools", "enable_memory", "enable_human_in_loop"] {
+            fields.remove(removed);
+        }
+    }
+    value.serialize(serializer)
 }
 
 fn merge_config_value(target: &mut serde_json::Value, patch: serde_json::Value) {
@@ -436,6 +462,24 @@ mod tests {
         assert!(parsed.agent.enable_tools);
         assert!(parsed.agent.enable_memory);
         assert_eq!(parsed.agent.system_prompt, DEFAULT_EKO_SYSTEM_PROMPT);
+        Ok(())
+    }
+
+    #[test]
+    fn eko_rejects_removed_capability_switches() {
+        for field in ["enable_tools", "enable_memory", "enable_human_in_loop"] {
+            let yaml = format!("agent:\n  {field}: false\n");
+            assert!(serde_yaml::from_str::<EkoConfig>(&yaml).is_err());
+        }
+    }
+
+    #[test]
+    fn eko_does_not_serialize_removed_capability_switches() -> Result<(), String> {
+        let yaml =
+            serde_yaml::to_string(&EkoConfig::default()).map_err(|error| error.to_string())?;
+        for field in ["enable_tools", "enable_memory", "enable_human_in_loop"] {
+            assert!(!yaml.contains(field));
+        }
         Ok(())
     }
 }

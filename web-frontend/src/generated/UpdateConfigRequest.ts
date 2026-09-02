@@ -7,4 +7,9 @@ export type UpdateConfigRequest = {
   model: string | null;
   system_prompt: string | null;
   token_limit: number | null;
+  /**
+   * ReAct loop ceiling for the running agents (EKO `0` = unlimited
+   * sentinel; resolved before reaching the framework).
+   */
+  max_iterations: number | null;
 };

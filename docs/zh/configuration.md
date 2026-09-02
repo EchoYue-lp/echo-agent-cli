@@ -54,9 +54,6 @@ configured_models:
 agent:
   name: "echo-assistant"
   max_iterations: 0
-  enable_tools: true
-  enable_memory: true
-  enable_human_in_loop: true
   tool_timeout_ms: 120000
   max_tool_output_tokens: 8000
   token_limit: 0
@@ -140,6 +137,9 @@ configured_models:
 ```
 
 ## Agent 与压缩
+
+工具、workspace memory 与 human-loop 是 EKO 固定启用的完整 Agent 能力；EKO YAML 不接受
+framework 通用的 `enable_tools`、`enable_memory`、`enable_human_in_loop` 开关。
 
 | 字段                     | 含义                                                         |
 | ------------------------ | ------------------------------------------------------------ |

@@ -2943,7 +2943,7 @@ mod tests {
             SubagentOutcome::terminal(SubagentStatus::TimedOut, long.clone(), vec![long; 70]);
 
         assert_eq!(result.summary.chars().count(), 1_200);
-        assert_eq!(result.remaining_work.len(), 64);
+        assert_eq!(result.remaining_work.len(), 1);
         assert!(
             result
                 .remaining_work

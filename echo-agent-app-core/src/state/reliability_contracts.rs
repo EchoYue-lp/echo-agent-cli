@@ -577,7 +577,7 @@ async fn typed_live_steer_rejections_defer_but_owner_loss_is_terminal() -> anyho
             .ok_or_else(|| anyhow::anyhow!("typed-rejection record is missing"))?;
         assert_eq!(
             record.phase,
-            crate::agent_router::AgentDeliveryPhase::Persisted
+            crate::agent_router::AgentDeliveryPhase::Deferred
         );
         assert_eq!(record.attempt, 1);
         assert!(record.turn_id.is_none());
@@ -783,7 +783,7 @@ async fn f0_live_router_receipt_marks_injected_only_after_real_drain() -> anyhow
             .await?
             .first()
             .map(|record| record.phase),
-        Some(crate::agent_router::AgentDeliveryPhase::Claimed)
+        Some(crate::agent_router::AgentDeliveryPhase::EffectStarted)
     );
     assert!(
         tokio::time::timeout(
@@ -1069,7 +1069,7 @@ async fn f0_duplicate_enqueue_returns_current_receipt_at_each_phase() -> anyhow:
     assert!(duplicate.duplicate);
     assert_eq!(
         duplicate.phase,
-        crate::agent_router::AgentDeliveryPhase::Claimed
+        crate::agent_router::AgentDeliveryPhase::EffectStarted
     );
 
     router.mailbox_accepted(&claim, "f0-duplicate-turn").await?;
@@ -1544,7 +1544,7 @@ async fn f1_cold_acceptance_waits_for_real_context_drain() -> anyhow::Result<()>
         .ok_or_else(|| anyhow::anyhow!("cold accepted record is missing"))?;
     assert_eq!(
         accepted.phase,
-        crate::agent_router::AgentDeliveryPhase::Claimed,
+        crate::agent_router::AgentDeliveryPhase::EffectStarted,
         "AgentTurnDriver accepted the request before entering context restore, but the router must not project Drained yet"
     );
     barrier.release();
@@ -1621,7 +1621,7 @@ async fn f1_cold_terminal_before_drain_fails_without_drained_replay() -> anyhow:
             .await?
             .first()
             .map(|record| record.phase),
-        Some(crate::agent_router::AgentDeliveryPhase::Claimed)
+        Some(crate::agent_router::AgentDeliveryPhase::EffectStarted)
     );
     barrier.release();
     assert!(tokio::time::timeout(std::time::Duration::from_secs(5), delivery).await???);

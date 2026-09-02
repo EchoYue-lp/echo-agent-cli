@@ -118,6 +118,7 @@ describe('ProviderPanel', () => {
         expect.objectContaining({
           id: provider.id,
           api_key_env: provider.api_key_env,
+          requires_api_key: true,
         })
       )
     );

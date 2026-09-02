@@ -8,6 +8,7 @@ mod llm_config_tests {
     use crate::model_config::ModelRuntimeConfig;
     use echo_agent::agent::Agent;
     use echo_agent::llm::LlmApiProtocol;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn agent_boots_without_a_configured_provider() -> Result<(), String> {
@@ -24,6 +25,20 @@ mod llm_config_tests {
         assert!(created.agent.model_name().is_empty());
         assert!(created.agent.llm_config().is_none());
         assert!(created.agent.llm_client().is_none());
+        let parent_store = created
+            .agent
+            .store()
+            .cloned()
+            .ok_or_else(|| "primary Agent has no memory store".to_string())?;
+        let inherited = created
+            .model_consumers
+            .inherited_handle_for_test("reviewer")
+            .ok_or_else(|| "reviewer Subagent is missing".to_string())?;
+        let inherited_store = inherited
+            .read(|agent| agent.store().cloned())
+            .await
+            .ok_or_else(|| "reviewer Subagent has no memory store".to_string())?;
+        assert!(Arc::ptr_eq(&parent_store, &inherited_store));
         Ok(())
     }
 
@@ -482,6 +497,7 @@ mod resolve_subagent_model_tests {
             test_command_cells()?,
             Arc::new(crate::analysis_runtime::AnalyticsRuntime::default()),
             true,
+            None,
         )?;
 
         assert!(subagent.sandbox_manager().is_some());
@@ -527,6 +543,7 @@ mod resolve_subagent_model_tests {
             test_command_cells()?,
             Arc::new(crate::analysis_runtime::AnalyticsRuntime::default()),
             true,
+            None,
         )?;
         let result = subagent
             .tool_manager()
@@ -566,6 +583,7 @@ mod resolve_subagent_model_tests {
             test_command_cells()?,
             Arc::new(crate::analysis_runtime::AnalyticsRuntime::default()),
             true,
+            None,
         )?;
 
         assert!(
@@ -601,6 +619,7 @@ mod resolve_subagent_model_tests {
             Arc::new(SubagentRegistry::new()),
             None,
             test_command_cells()?,
+            None,
         )?;
         assert_eq!(subagent.thinking(), Some(&low));
 
@@ -624,6 +643,7 @@ mod resolve_subagent_model_tests {
             Arc::new(SubagentRegistry::new()),
             None,
             test_command_cells()?,
+            None,
         )?;
         assert!(plain.thinking().is_none());
         Ok(())
@@ -652,6 +672,7 @@ mod resolve_subagent_model_tests {
             Arc::new(SubagentRegistry::new()),
             None,
             test_command_cells()?,
+            None,
         )?;
         let readonly_names = readonly.tool_names();
         for expected in ["wait", "stop_cell", "list_cells"] {
@@ -683,6 +704,44 @@ mod resolve_subagent_model_tests {
                 echo_agent::llm::ThinkingLevel::Low
             ))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn readonly_subagent_uses_the_injected_workspace_memory_store()
+    -> echo_agent::error::Result<()> {
+        let memory_store: Arc<dyn echo_agent::memory::Store> =
+            Arc::new(echo_agent::memory::InMemoryStore::new());
+        let subagent = build_readonly_subagent_agent(
+            "reader",
+            "inspect files",
+            "test-model",
+            None,
+            None,
+            None,
+            None,
+            8_192,
+            None,
+            30_000,
+            1_024,
+            "test-cache-user",
+            1,
+            false,
+            Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler)
+                as Arc<dyn SubagentPromptCompiler>,
+            Arc::new(SubagentRegistry::new()),
+            None,
+            test_command_cells()?,
+            Some(memory_store.clone()),
+        )?;
+
+        let installed = subagent
+            .store()
+            .ok_or_else(|| echo_agent::error::ReactError::Other("memory store missing".to_string()))?;
+        assert!(Arc::ptr_eq(installed, &memory_store));
+        for tool in ["remember", "recall", "search_memory", "forget"] {
+            assert!(subagent.tool_names().iter().any(|name| name == tool));
+        }
         Ok(())
     }
 }

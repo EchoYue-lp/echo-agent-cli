@@ -42,6 +42,11 @@ by framework ADR 0021 and EKO ADR 0027.
 7. Runtime mirror fields are deleted from the tracked schema and maintained
    `config/eko.example.yaml`. Ignored/local configuration files remain
    user-owned and are not modified by repository cleanup.
+8. EKO is a complete Agent surface, so tools, workspace memory, and human-loop
+   support are fixed product capabilities rather than user-disableable Agent
+   settings. The application keeps the framework `AgentSettings` value in
+   memory, but rejects and does not serialize `enable_tools`, `enable_memory`,
+   or `enable_human_in_loop` in the EKO YAML boundary.
 
 ## Alternatives Considered
 
@@ -63,3 +68,5 @@ by framework ADR 0021 and EKO ADR 0027.
 - GUI, TUI, CLI/JSONL, channels, Cron, and future pooled Agents consume the same
   typed resolver and error contract.
 - The YAML schema changes during development; no compatibility mirror remains.
+- Generic framework consumers retain the three capability switches; only the
+  EKO product schema fixes them on.

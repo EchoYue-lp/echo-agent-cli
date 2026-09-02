@@ -4,8 +4,5 @@ export type AgentUpdate = {
   name: string | null;
   system_prompt: string | null;
   max_iterations: number | null;
-  enable_tools: boolean | null;
-  enable_memory: boolean | null;
-  enable_human_in_loop: boolean | null;
   memory_path: string | null;
 };

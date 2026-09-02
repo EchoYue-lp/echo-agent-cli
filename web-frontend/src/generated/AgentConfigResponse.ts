@@ -5,8 +5,6 @@ export type AgentConfigResponse = {
   system_prompt: string;
   max_iterations: number;
   token_limit: number;
-  enable_memory: boolean;
-  enable_human_loop: boolean;
   session_id: string | null;
   /**
    * 可用的模型列表

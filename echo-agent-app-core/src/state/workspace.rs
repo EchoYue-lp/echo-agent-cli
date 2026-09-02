@@ -533,6 +533,21 @@ impl ScopedChatRuntime {
     pub fn primary_agent(&self) -> AgentHandle {
         self.primary_agent.clone()
     }
+
+    /// Publish a reasoning-depth selection to this scope's conversation
+    /// Agents. With an active pool the publication covers every live and
+    /// future pooled Agent plus inheriting Subagents; without one it targets
+    /// the primary Agent.
+    pub async fn apply_thinking(&self, thinking: Option<echo_agent::llm::ThinkingConfig>) {
+        match self.pool.clone() {
+            Some(pool) => pool.apply_thinking(thinking).await,
+            None => {
+                self.primary_agent
+                    .write(|agent| agent.set_thinking(thinking))
+                    .await;
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

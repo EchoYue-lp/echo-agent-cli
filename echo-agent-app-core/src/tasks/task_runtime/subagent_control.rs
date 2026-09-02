@@ -1987,6 +1987,24 @@ mod tests {
             })
         }
 
+        fn execute_stream_message_with_cancel<'a>(
+            &'a self,
+            _message: echo_agent::prelude::Message,
+            _cancel: echo_agent::agent::CancellationToken,
+        ) -> futures::future::BoxFuture<
+            'a,
+            echo_agent::error::Result<
+                futures::stream::BoxStream<
+                    'a,
+                    echo_agent::error::Result<echo_agent::agent::AgentEvent>,
+                >,
+            >,
+        > {
+            Box::pin(async {
+                Ok(Box::pin(futures::stream::pending()) as futures::stream::BoxStream<'a, _>)
+            })
+        }
+
         fn steer_input(
             &self,
             expected_turn_id: Option<&str>,

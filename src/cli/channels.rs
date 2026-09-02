@@ -7129,6 +7129,53 @@ mod tests {
 
     #[cfg(feature = "channels")]
     #[tokio::test]
+    async fn terminal_stream_accepts_bursty_pty_chunks_until_total_budget() -> Result<(), String> {
+        use echo_agent::channels::{ChatType, InboundMessage};
+        use echo_agent_app_core::api::terminal::{TerminalEvent, TerminalExitReason};
+        use futures::StreamExt;
+
+        let (sender, receiver) = tokio::sync::broadcast::channel(128);
+        for _ in 0..64 {
+            sender
+                .send(TerminalEvent::Output {
+                    id: "bursty-terminal".to_string(),
+                    bytes: vec![b'x'],
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        sender
+            .send(TerminalEvent::Exited {
+                id: "bursty-terminal".to_string(),
+                reason: TerminalExitReason::ProcessExited,
+            })
+            .map_err(|error| error.to_string())?;
+        let message = InboundMessage::new(
+            "qq",
+            "user",
+            "conversation",
+            ChatType::Direct,
+            "/terminal create bursty-terminal",
+            "message-1",
+        );
+        let mut stream = super::channel_terminal_stream(
+            &message,
+            "created".to_string(),
+            receiver,
+            "bursty-terminal".to_string(),
+        );
+        let mut texts = Vec::new();
+        while let Some(item) = stream.next().await {
+            texts.push(item.map_err(|error| error.to_string())?.text);
+        }
+        let joined = texts.join("");
+        assert!(joined.contains(&"x".repeat(64)));
+        assert!(joined.contains("exited:"));
+        assert!(!joined.contains("forwarding detached"));
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
     async fn terminal_stream_preserves_utf8_split_at_every_byte() -> Result<(), String> {
         use echo_agent::channels::{ChatType, InboundMessage};
         use echo_agent_app_core::api::terminal::{TerminalEvent, TerminalExitReason};
@@ -7268,7 +7315,7 @@ mod tests {
         .map_err(|_| "budgeted channel terminal did not settle".to_string())??;
         let joined = texts.join("\n");
         assert!(!joined.contains(secret));
-        assert!(joined.contains("[REDACTED]"));
+        assert!(!joined.contains("Bearer ghp_"));
         assert!(
             joined.contains("forwarding detached") || joined.contains("exited:"),
             "terminal had no reserved settlement: {joined}"

@@ -9,7 +9,13 @@ import { apiInvoke, errorMessage, isTauri } from '../lib/tauri-bridge';
 import { viewAddress, viewAddressKey } from '../lib/viewAddress';
 
 export type BrowserStatus =
-  'starting' | 'ready' | 'navigating' | 'acting' | 'waiting_confirmation' | 'closed' | 'failed';
+  | 'starting'
+  | 'ready'
+  | 'navigating'
+  | 'acting'
+  | 'waiting_confirmation'
+  | 'closed'
+  | 'failed';
 
 export interface BrowserTab {
   id: string;
@@ -75,7 +81,8 @@ interface BrowserViewState {
 }
 
 export type BrowserBackendResult =
-  { status: 'settled'; message: null } | { status: 'pending' | 'failed'; message: string };
+  | { status: 'settled'; message: null }
+  | { status: 'pending' | 'failed'; message: string };
 
 interface BrowserStore {
   views: Record<string, BrowserViewState>;
@@ -130,7 +137,8 @@ function updateSession(
 }
 
 export type BrowserCommandResult =
-  BrowserExtensionDisposition | { status: 'failed'; message: string };
+  | BrowserExtensionDisposition
+  | { status: 'failed'; message: string };
 
 let browserCommandSequence = 0;
 

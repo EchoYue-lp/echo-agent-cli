@@ -44,8 +44,6 @@ fn full_config_response(cfg: &echo_agent_app_core::api::config::EkoConfig) -> Fu
             system_prompt: cfg.agent.system_prompt.clone(),
             max_iterations: cfg.agent.max_iterations,
             token_limit,
-            enable_memory: cfg.agent.enable_memory,
-            enable_human_loop: cfg.agent.enable_human_in_loop,
             session_id: None,
             available_models,
         },
@@ -89,8 +87,6 @@ fn build_agent_config_response(
         system_prompt: agent.system_prompt().to_string(),
         max_iterations: display_max_iterations(agent.config().get_max_iterations()),
         token_limit: agent.config().get_token_limit(),
-        enable_memory: agent.config().is_memory_enabled(),
-        enable_human_loop: agent.config().is_human_in_loop_enabled(),
         session_id: agent.config().get_session_id().map(|s| s.to_string()),
         available_models,
     }
@@ -145,6 +141,16 @@ pub async fn update_config(
             .apply_system_prompt_to_agents(system_prompt)
             .await;
         tracing::info!("系统提示词已更新");
+    }
+
+    // Sync the loop ceiling to every running agent (primary + pools). The
+    // EKO `0` = unlimited sentinel is resolved inside the publication.
+    if let Some(max_iterations) = req.max_iterations {
+        state
+            .app_state
+            .apply_max_iterations_to_agents(max_iterations)
+            .await;
+        tracing::info!(max_iterations, "max_iterations 已同步到运行中的 Agent");
     }
 
     let available_models = {
@@ -204,15 +210,6 @@ pub async fn update_full_config(
                 }
                 if let Some(v) = a.max_iterations {
                     cfg.agent.max_iterations = v;
-                }
-                if let Some(v) = a.enable_tools {
-                    cfg.agent.enable_tools = v;
-                }
-                if let Some(v) = a.enable_memory {
-                    cfg.agent.enable_memory = v;
-                }
-                if let Some(v) = a.enable_human_in_loop {
-                    cfg.agent.enable_human_in_loop = v;
                 }
                 if let Some(v) = a.memory_path {
                     cfg.agent.memory_path = v;
@@ -292,6 +289,13 @@ pub async fn update_full_config(
     state
         .app_state
         .apply_system_prompt_to_agents(system_prompt)
+        .await;
+    // `max_iterations` rides the same authoritative transaction: persist to
+    // YAML above, then publish the resolved ceiling to the running agents so
+    // the saved value is actually enforced without a restart.
+    state
+        .app_state
+        .apply_max_iterations_to_agents(config.agent.max_iterations)
         .await;
     tracing::info!("配置已同步到 Agent");
 

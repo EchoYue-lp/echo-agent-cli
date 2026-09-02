@@ -409,8 +409,10 @@ fn validate_plugin_name(name: &str) -> anyhow::Result<()> {
 }
 
 fn write_scaffold(directory: &Path, name: &str) -> anyhow::Result<()> {
+    let skill_name = format!("{name}-example");
+    let skill_directory = format!("skills/{skill_name}");
     let children = [
-        "skills/example",
+        skill_directory.as_str(),
         "agents",
         "hooks",
         "themes",
@@ -434,9 +436,9 @@ fn write_scaffold(directory: &Path, name: &str) -> anyhow::Result<()> {
         serde_json::to_string_pretty(&manifest)?,
     )?;
     std::fs::write(
-        directory.join("skills/example/SKILL.md"),
+        directory.join(&skill_directory).join("SKILL.md"),
         format!(
-            "---\nname: {name}-example\ndescription: Example skill\n---\nUse this skill for {name} tasks.\n"
+            "---\nname: {skill_name}\ndescription: Example skill\n---\nUse this skill for {name} tasks.\n"
         ),
     )?;
     std::fs::write(

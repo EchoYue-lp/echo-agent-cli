@@ -734,7 +734,7 @@ struct EkoAgentTurnState {
     output: String,
     in_thinking: bool,
     pending_verification: HashMap<String, String>,
-    pending_file_access: HashMap<String, (bool, String)>,
+    pending_file_access: HashMap<String, (String, serde_json::Value)>,
     observed_evidence: Vec<echo_agent::subagent::SubagentEvidence>,
     observed_artifacts: Vec<echo_agent::subagent::SubagentArtifact>,
     mutating_tool_observed: bool,
@@ -979,8 +979,10 @@ impl EventSink for EkoAgentTurnSink {
                     if let Some(check) = verification_check_from_agent_tool(&name, &args) {
                         state.pending_verification.insert(call_id.clone(), check);
                     }
-                    if let Some(access) = file_access_from_agent_tool(&name, &args) {
-                        state.pending_file_access.insert(call_id.clone(), access);
+                    if file_access_from_agent_tool(&name, &args).is_some() {
+                        state
+                            .pending_file_access
+                            .insert(call_id.clone(), (name.clone(), args.clone()));
                     }
                 }
                 if let Some(primary_task) = self.primary_task.as_ref() {
@@ -1059,17 +1061,18 @@ impl EventSink for EkoAgentTurnSink {
                         );
                     }
                     if result.success
-                        && let Some((write, path)) = state.pending_file_access.remove(&call_id)
+                        && let Some((tool_name, args)) =
+                            state.pending_file_access.remove(&call_id)
                     {
                         state.observed_evidence.push(
                             echo_agent::subagent::SubagentEvidence {
-                                kind: if write { "file_write" } else { "file_read" }.to_string(),
-                                subject: path,
+                                kind: "tool_result".to_string(),
+                                subject: tool_name,
                                 outcome: Some("succeeded".to_string()),
                                 details: String::new(),
                                 source:
                                     echo_agent::subagent::SubagentEvidenceSource::Observed,
-                                attributes: serde_json::Value::Null,
+                                attributes: serde_json::json!({ "args": args }),
                             },
                         );
                     } else {

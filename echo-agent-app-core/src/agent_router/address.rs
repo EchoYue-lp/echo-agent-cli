@@ -12,10 +12,9 @@ use std::sync::Mutex as StdMutex;
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use echo_agent::retry::RetryPolicy;
-#[cfg(test)]
 use echo_agent::delivery::DeliveryEvent;
 use echo_agent::delivery::{DeliveryLedgerError, DeliverySettlement, DeliveryTransition};
+use echo_agent::retry::RetryPolicy;
 use echo_agent::state::journal::{
     CheckpointApplyStatus, CheckpointStore, CheckpointedApplyError,
     EventJournal, FileCheckpointStore, JournalBatchAppendError,

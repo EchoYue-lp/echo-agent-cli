@@ -32,6 +32,9 @@ model 时，runtime resolver 还能从 mirror 合成一个模型。
    `default_model_id`。
 7. tracked schema 与维护中的 `config/eko.example.yaml` 删除 runtime mirror 字段；被忽略的
    本地配置继续属于用户，不由仓库清理修改。
+8. EKO 是完整 Agent surface，因此工具、workspace memory 与 human-loop 是固定产品能力，
+   不是可由用户关闭的 Agent 配置。应用内存中仍直接使用 framework `AgentSettings`，但 EKO
+   YAML 边界拒绝且不序列化 `enable_tools`、`enable_memory`、`enable_human_in_loop`。
 
 ## 备选方案
 
@@ -47,3 +50,4 @@ model 时，runtime resolver 还能从 mirror 合成一个模型。
 - 模型选择、provider credential 与 runtime validation 各自只有一个明确来源。
 - GUI、TUI、CLI/JSONL、channel、Cron 与未来 pooled Agent 共用同一个 typed resolver/error。
 - YAML schema 在开发期直接变化，不保留 compatibility mirror。
+- framework 的其它复用方仍保留三个通用能力开关；只有 EKO 产品 schema 固定启用它们。

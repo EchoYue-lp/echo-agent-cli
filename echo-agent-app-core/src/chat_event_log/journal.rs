@@ -576,7 +576,11 @@ impl ChatEventLog {
     ) -> Result<Vec<crate::tasks::task_runtime::command_cells::CommandCellWatchResult>, ChatEventLogError>
     {
         let mut pending = Vec::new();
-        for stream in self.enumerate_streams()? {
+        // Enumeration is only a workspace/conversation filter; a corrupt
+        // unrelated stream must not block this conversation's pending
+        // watches. Strictness for the target stream itself is enforced by
+        // pending_command_cell_watches when it replays that stream.
+        for stream in self.enumerate_streams_isolated()? {
             if stream.first.workspace_id == workspace_id
                 && stream.first.conversation_id.as_deref() == Some(conversation_id)
             {
@@ -600,7 +604,10 @@ impl ChatEventLog {
         &self,
     ) -> Result<Vec<StartedCommandCellWatchDelivery>, ChatEventLogError> {
         let mut started = Vec::new();
-        for stream in self.enumerate_streams()? {
+        // Boot recovery must stay per-stream isolated: one corrupt chat
+        // directory may not strand every other conversation's started
+        // CommandCellWatch in `unreconciled`.
+        for stream in self.enumerate_streams_isolated()? {
             let Some(cached) = self.stream_journal(&stream.stream_id, false)? else {
                 continue;
             };

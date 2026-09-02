@@ -1181,7 +1181,7 @@ mod tests {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "started recovery missing".to_string())?;
         assert_eq!(in_flight.claim.attempt_id, claim.attempt_id);
-        assert_eq!(in_flight.phase, AgentDeliveryPhase::Claimed);
+        assert_eq!(in_flight.phase, AgentDeliveryPhase::EffectStarted);
         assert!(in_flight.effect_started);
         assert_eq!(in_flight.turn_id, "actual-active-turn");
         restarted

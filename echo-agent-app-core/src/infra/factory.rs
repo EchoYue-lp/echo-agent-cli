@@ -71,7 +71,7 @@ fn resolved_max_tool_output_tokens(configured: usize) -> usize {
 /// represents an effectively unlimited ReAct loop. The framework builder
 /// rejects zero, while EKO configuration intentionally documents zero as
 /// "until completion or cancellation".
-fn resolved_max_iterations(configured: usize) -> usize {
+pub(crate) fn resolved_max_iterations(configured: usize) -> usize {
     if configured == 0 {
         usize::MAX
     } else {
@@ -383,6 +383,23 @@ impl AgentModelConsumers {
         generation.temperature = None;
         generation.max_tokens = None;
         generation.thinking = None;
+    }
+
+    /// Republish the parent's reasoning-depth knob.
+    ///
+    /// Inherit-binding Subagents have no `thinking` of their own: update the
+    /// shared generation (read by every future fork build) and the live
+    /// registered handles. Fixed bindings keep their registration-time value.
+    pub(crate) async fn apply_thinking(&self, thinking: Option<echo_agent::llm::ThinkingConfig>) {
+        self.inherited_generation.write().await.thinking = thinking.clone();
+        for inherited in self.inherited_factories.iter() {
+            let thinking = thinking.clone();
+            let _updated = inherited.handle.try_write(|agent| {
+                    if agent.thinking() != thinking.as_ref() {
+                        agent.set_thinking(thinking);
+                    }
+                });
+        }
     }
 
     #[cfg(test)]
@@ -750,9 +767,28 @@ pub async fn create_agent_with_diagnostics(
     // inject our store instead of the auto-FileStore (see ReactAgentBuilder::build).
     // On failure we leave `.enable_memory()` in effect so the framework still
     // wires its default store — memory stays usable, just not project-scoped.
+    // The same store handle is threaded into every default Subagent below:
+    // Subagents must share the workspace memory instead of each opening the
+    // framework default at an empty `memory_path` (which always fails its
+    // authority lease and logs "authority path has no parent" per Subagent).
     let memory_workspace_root = params.working_dir.as_deref().map(std::path::Path::new);
+    #[cfg(not(test))]
     let (memory_store_path, _) = resolve_memory_store_paths(memory_workspace_root);
-    if let Some(store) = create_memory_store_at(&memory_store_path) {
+    #[cfg(not(test))]
+    let subagent_memory_store = create_memory_store_at(&memory_store_path);
+    // Tests without an explicit workspace need no durable side effect. Tests
+    // that exercise workspace persistence pass a TempDir-backed working_dir
+    // and continue to use the real FileStore path inside that owned scope.
+    #[cfg(test)]
+    let subagent_memory_store: Option<Arc<dyn echo_agent::memory::Store>> =
+        match memory_workspace_root {
+            Some(root) => {
+                let (memory_store_path, _) = resolve_memory_store_paths(Some(root));
+                create_memory_store_at(&memory_store_path)
+            }
+            None => Some(Arc::new(echo_agent::memory::InMemoryStore::new())),
+        };
+    if let Some(store) = subagent_memory_store.clone() {
         builder = builder.store(store);
     }
 
@@ -764,7 +800,10 @@ pub async fn create_agent_with_diagnostics(
         builder = builder.react_checkpoint_interval(interval);
     }
 
-    // Initialize JSONL run store for trace persistence (before build)
+    // Initialize JSONL run store for production trace persistence. Unit tests
+    // that need a RunStore inject one explicitly; ordinary Agent-construction
+    // tests must not create durable files outside their fixture.
+    #[cfg(not(test))]
     {
         let run_dir = crate::data_root::user_data_path("runs");
         match JsonlRunStore::new(&run_dir) {
@@ -798,11 +837,15 @@ pub async fn create_agent_with_diagnostics(
     // Reuse one canonical checkpoint store for ReAct and compiled team task
     // graphs. A caller-provided store is authoritative; otherwise EKO installs
     // its durable file-backed default. Without a conversation id the framework
-    // has no checkpoint key, so the default store remains inert.
+    // has no checkpoint key, so the default store remains inert. Tests only
+    // use a caller-provided state store and otherwise stay in memory.
+    #[cfg(not(test))]
     let state_store = params
         .state_store
         .clone()
         .or_else(create_runtime_state_store);
+    #[cfg(test)]
+    let state_store = params.state_store.clone();
     let builder = if let Some(state_store) = state_store {
         builder.state_store(state_store)
     } else {
@@ -813,6 +856,10 @@ pub async fn create_agent_with_diagnostics(
         tracing::error!("Failed to build agent: {e}");
         format!("Failed to initialize agent: {e}. Please check your configuration and try again.")
     })?;
+    // The built parent is the memory authority. This also preserves memory in
+    // the fallback path where the workspace FileStore could not be opened and
+    // the framework installed its configured default store instead.
+    let subagent_memory_store = agent.store().cloned();
     install_eko_shell_policy(&mut agent, sandbox_manager.clone(), command_cells.clone());
     agent
         .tool_manager()
@@ -900,6 +947,7 @@ pub async fn create_agent_with_diagnostics(
         command_cells.clone(),
         script_execution_profile_resolver,
         run_code_available,
+        subagent_memory_store,
     )
     .await;
     crate::tasks::task_runtime::command_cells::install_watch_cell_tool(
@@ -995,6 +1043,7 @@ async fn register_default_subagents(
     command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
     script_execution_profile_resolver: Arc<dyn echo_agent::tools::ScriptExecutionProfileResolver>,
     run_code_available: bool,
+    memory_store: Option<Arc<dyn echo_agent::memory::Store>>,
 ) -> AgentModelConsumers {
     let tool_output_artifacts = agent.tool_output_artifacts();
     tracing::info!(
@@ -1061,6 +1110,7 @@ async fn register_default_subagents(
                 subagent_registry.clone(),
                 browser_runtime.clone(),
                 command_cells.clone(),
+                memory_store.clone(),
             )
         } else {
             build_writer_subagent_agent(
@@ -1085,6 +1135,7 @@ async fn register_default_subagents(
                 command_cells.clone(),
                 script_execution_profile_resolver.clone(),
                 run_code_available,
+                memory_store.clone(),
             )
         };
         match build_result {
@@ -1202,6 +1253,7 @@ async fn register_default_subagents(
                 let factory_tool_output_artifacts = tool_output_artifacts.clone();
                 let factory_prompt_compiler = prompt_compiler.clone();
                 let factory_subagent_registry = subagent_registry.clone();
+                let factory_memory_store = memory_store.clone();
                 let factory_disabled_tools = Arc::clone(&disabled_tools_projection);
                 let fork_factory = Arc::new(FnAgentFactory::new(
                     move || -> BoxFuture<'static, echo_agent::error::Result<Box<dyn Agent>>> {
@@ -1216,6 +1268,7 @@ async fn register_default_subagents(
                         let tool_output_artifacts = factory_tool_output_artifacts.clone();
                         let prompt_compiler = factory_prompt_compiler.clone();
                         let subagent_registry = factory_subagent_registry.clone();
+                        let memory_store = factory_memory_store.clone();
                         let disabled_tools = Arc::clone(&factory_disabled_tools);
                         Box::pin(async move {
                             let model_generation = model_binding.snapshot().await;
@@ -1248,6 +1301,7 @@ async fn register_default_subagents(
                                     subagent_registry,
                                     browser_runtime,
                                     command_cells,
+                                    memory_store,
                                 )?
                             } else {
                                 build_writer_subagent_agent(
@@ -1272,6 +1326,7 @@ async fn register_default_subagents(
                                     command_cells,
                                     script_execution_profile_resolver,
                                     run_code_available,
+                                    memory_store,
                                 )?
                             };
                             let disabled_tools: std::collections::HashSet<String> = disabled_tools
@@ -1429,6 +1484,7 @@ fn build_writer_subagent_agent(
     command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
     script_execution_profile_resolver: Arc<dyn echo_agent::tools::ScriptExecutionProfileResolver>,
     run_code_available: bool,
+    memory_store: Option<Arc<dyn echo_agent::memory::Store>>,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     // Mirror build_readonly_subagent_agent, but OMIT `.readonly_tools()` → the
     // default `readonly_tools: false` triggers `register_all_tools`, giving the
@@ -1442,7 +1498,6 @@ fn build_writer_subagent_agent(
         .system_prompt(prompt)
         .enable_tools()
         // NO .readonly_tools() → full tool set (write capability).
-        .enable_memory()
         .enable_cot()
         .token_limit(token_limit)
         .visibility_horizon(eko_visibility_horizon(token_limit))
@@ -1457,6 +1512,13 @@ fn build_writer_subagent_agent(
         // 与主智能体共享同一进程级 registry；cell 自身通过同一个 sandbox
         // executor 执行，不会从前台策略静默降级为宿主机直连。
         .command_cells(command_cells.clone());
+
+    // Share the parent's workspace memory store. Without one the Subagent
+    // runs without memory tools — the framework default would open an empty
+    // `memory_path` that always fails its authority lease.
+    if let Some(store) = memory_store {
+        builder = builder.store(store);
+    }
 
     if max_iterations > 0 {
         builder = builder.max_iterations(max_iterations);
@@ -1480,9 +1542,12 @@ fn build_writer_subagent_agent(
         );
         builder = builder.llm_config(config);
     } else {
-        tracing::warn!(
+        // No model configured is a supported first-run state; the parent
+        // already emits the single "Starting without an LLM" INFO. Keep this
+        // per-subagent note at debug so N subagents don't spam WARN for it.
+        tracing::debug!(
             subagent_name = name,
-            "writer subagent: NO LlmConfig injected — will fall back to env vars / models.yaml"
+            "writer subagent: no LlmConfig — will follow the first configured model"
         );
     }
 
@@ -1552,6 +1617,7 @@ fn build_readonly_subagent_agent(
     subagent_registry: Arc<echo_agent::subagent::SubagentRegistry>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
+    memory_store: Option<Arc<dyn echo_agent::memory::Store>>,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     let mut builder = ReactAgentBuilder::new()
         .model(model)
@@ -1559,7 +1625,6 @@ fn build_readonly_subagent_agent(
         .system_prompt(prompt)
         .enable_tools()
         .readonly_tools() // SA-2: physical enforcement — no shell/write tools
-        .enable_memory()
         .enable_cot()
         .token_limit(token_limit)
         .visibility_horizon(eko_visibility_horizon(token_limit))
@@ -1573,6 +1638,13 @@ fn build_readonly_subagent_agent(
         // Read-only Subagents cannot launch shell work, but may inspect command
         // cells already owned by their invocation scope.
         .command_cells(command_cells);
+
+    // Share the parent's workspace memory store. Without one the Subagent
+    // runs without memory tools — the framework default would open an empty
+    // `memory_path` that always fails its authority lease.
+    if let Some(store) = memory_store {
+        builder = builder.store(store);
+    }
 
     if max_iterations > 0 {
         builder = builder.max_iterations(max_iterations);
@@ -1596,9 +1668,11 @@ fn build_readonly_subagent_agent(
         );
         builder = builder.llm_config(config);
     } else {
-        tracing::warn!(
+        // No model configured is a supported first-run state; see the writer
+        // builder note — keep the per-subagent line at debug.
+        tracing::debug!(
             subagent_name = name,
-            "subagent: NO LlmConfig injected — will fall back to env vars / models.yaml"
+            "subagent: no LlmConfig — will follow the first configured model"
         );
     }
 

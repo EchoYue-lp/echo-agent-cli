@@ -58,6 +58,9 @@ unknown fields in this section are rejected.
 
 The `agent` section deserializes directly into framework `AgentSettings`. EKO
 supplies product defaults but does not maintain a parallel Agent settings DTO.
+Tools, workspace memory, and human-loop support are fixed EKO capabilities;
+the EKO YAML schema therefore does not accept the framework's generic
+`enable_tools`, `enable_memory`, or `enable_human_in_loop` switches.
 
 ## Agent and Compression
 

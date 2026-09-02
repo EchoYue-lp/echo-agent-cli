@@ -14,6 +14,8 @@ import {
 } from 'lucide-react';
 import { Card } from '../common/Card';
 import { permissionsApi, providerApi } from '../../api/endpoints';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { workspaceIdForView } from '../../lib/viewAddress';
 import { useUiStore } from '../../stores/uiStore';
 import { useToastStore } from '../../stores/toastStore';
 import { useChatStore, cacheHitRate } from '../../stores/chatStore';
@@ -319,6 +321,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const [paletteSelectedIndex, setPaletteSelectedIndex] = useState(0);
   const [configuredModels, setConfiguredModels] = useState<ConfiguredModel[]>([]);
+  const [modelsLoaded, setModelsLoaded] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [switchingModelId, setSwitchingModelId] = useState<string | null>(null);
   const [permissionMode, setPermissionMode] = useState('default');
@@ -329,7 +332,11 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   const [switchingThinking, setSwitchingThinking] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const thinkingPublicationRef = useRef<string | null>(null);
   const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
+  // Reasoning-depth publication is workspace-scoped: it must reach the pooled
+  // conversation Agents of the active workspace, not just the process primary.
+  const currentWorkspaceId = useWorkspaceStore((state) => workspaceIdForView(state.current?.id));
   const activeModel = configuredModels.find((model) => model.is_default);
   const visibleModels = configuredModels.filter((model) => model.enabled);
   const displayModel = activeModel ?? visibleModels[0] ?? null;
@@ -348,6 +355,8 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
       setConfiguredModels(res.models);
     } catch (e) {
       console.error('[ChatInput] Failed to load configured models:', e);
+    } finally {
+      setModelsLoaded(true);
     }
   }, []);
 
@@ -436,16 +445,30 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   );
 
   useEffect(() => {
-    if (thinkingLevels.some((level) => level.id === thinkingLevel)) return;
-    setThinkingLevel('auto');
-    setThinkingMenuOpen(false);
-    try {
-      localStorage.setItem(THINKING_STORAGE_KEY, 'auto');
-    } catch {
-      /* ignore persistence failure */
+    if (!modelsLoaded) return;
+
+    let effectiveLevel = thinkingLevel;
+    if (!thinkingLevels.some((level) => level.id === thinkingLevel)) {
+      effectiveLevel = 'auto';
+      setThinkingLevel(effectiveLevel);
+      setThinkingMenuOpen(false);
+      try {
+        localStorage.setItem(THINKING_STORAGE_KEY, effectiveLevel);
+      } catch {
+        /* ignore persistence failure */
+      }
     }
-    void providerApi.setThinking('auto');
-  }, [thinkingLevel, thinkingLevels]);
+
+    const publicationKey = JSON.stringify([currentWorkspaceId, effectiveLevel]);
+    if (thinkingPublicationRef.current === publicationKey) return;
+    thinkingPublicationRef.current = publicationKey;
+    void providerApi.setThinking(effectiveLevel, currentWorkspaceId).catch((error) => {
+      if (thinkingPublicationRef.current === publicationKey) {
+        thinkingPublicationRef.current = null;
+      }
+      console.error('[ChatInput] Failed to apply thinking level:', error);
+    });
+  }, [thinkingLevel, thinkingLevels, currentWorkspaceId, modelsLoaded]);
 
   // The backend returns only the levels verified for the active model.
   const switchThinkingLevel = useCallback(
@@ -453,7 +476,8 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
       if (level === thinkingLevel || switchingThinking) return;
       setSwitchingThinking(true);
       try {
-        await providerApi.setThinking(level);
+        await providerApi.setThinking(level, currentWorkspaceId);
+        thinkingPublicationRef.current = JSON.stringify([currentWorkspaceId, level]);
         setThinkingLevel(level);
         try {
           localStorage.setItem(THINKING_STORAGE_KEY, level);
@@ -467,7 +491,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
         setSwitchingThinking(false);
       }
     },
-    [thinkingLevel, switchingThinking]
+    [thinkingLevel, switchingThinking, currentWorkspaceId]
   );
 
   // Auto-resize textarea

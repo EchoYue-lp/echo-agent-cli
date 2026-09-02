@@ -120,7 +120,6 @@ fn enqueue_sync(
         });
     }
 
-    let persisted_at = Utc::now();
     let event = authority.with_ledger(|ledger| {
         ledger
             .prepare_enqueue(DeliveryEnvelope::new(
@@ -133,6 +132,15 @@ fn enqueue_sync(
                 message: error.to_string(),
             })
     })?;
+    let persisted_at = match &event {
+        DeliveryEvent::Persisted { persisted_at, .. } => *persisted_at,
+        _ => {
+            return Err(AgentRouterError::Corrupt {
+                path: authority.directory.clone(),
+                message: "prepared enqueue did not return a persisted event".to_string(),
+            });
+        }
+    };
     let durability = authority.append(event)?;
     Ok(AgentDeliveryReceipt {
         message_id: message.message_id,
@@ -155,7 +163,6 @@ fn same_logical_message(left: &AgentMessage, right: &AgentMessage) -> bool {
         && left.correlation_id == right.correlation_id
         && left.causation_id == right.causation_id
         && left.origin == right.origin
-        && left.created_at == right.created_at
 }
 
 fn pending_sync(

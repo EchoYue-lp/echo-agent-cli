@@ -426,9 +426,6 @@ fn fixture_config(root: &IsolatedRoot, endpoint: &str) -> Result<PathBuf> {
     let yaml = format!(
         r#"model:
   default_model_id: fixture:fixture-model
-  provider: fixture
-  name: fixture-model
-  max_tokens: 128
 model_providers:
   fixture:
     name: Fixture
@@ -450,9 +447,6 @@ agent:
   name: fixture-agent
   system_prompt: Return the requested result.
   max_iterations: 3
-  enable_tools: true
-  enable_memory: false
-  enable_human_in_loop: false
   compress_strategy: ""
 logging:
   level: error

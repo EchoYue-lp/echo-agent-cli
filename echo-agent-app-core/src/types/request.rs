@@ -61,6 +61,9 @@ pub struct UpdateConfigRequest {
     pub model: Option<String>,
     pub system_prompt: Option<String>,
     pub token_limit: Option<usize>,
+    /// ReAct loop ceiling for the running agents (EKO `0` = unlimited
+    /// sentinel; resolved before reaching the framework).
+    pub max_iterations: Option<usize>,
 }
 
 /// PUT /api/config/full — 完整配置更新
@@ -88,9 +91,6 @@ pub struct AgentUpdate {
     pub name: Option<String>,
     pub system_prompt: Option<String>,
     pub max_iterations: Option<usize>,
-    pub enable_tools: Option<bool>,
-    pub enable_memory: Option<bool>,
-    pub enable_human_in_loop: Option<bool>,
     pub memory_path: Option<String>,
 }
 

@@ -1084,8 +1084,19 @@ Read the runtime path and found one missing branch.
             .ok_or_else(|| "direct completion summary missing".to_string())?;
         assert!(
             summary.outcome.evidence.iter().any(|evidence| {
-                evidence.kind == "file_read" && evidence.subject == "README.md"
+                evidence.kind == "tool_result"
+                    && evidence.subject == "read_file"
+                    && evidence
+                        .attributes
+                        .get("args")
+                        .and_then(|args| args.get("path"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("README.md")
             })
+        );
+        assert_eq!(
+            summary.outcome.touched_files.read,
+            vec!["README.md".to_string()]
         );
         let report = store
             .completion_gate_report(&run_id)

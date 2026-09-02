@@ -620,7 +620,6 @@ impl ChannelAnsiStripper {
 const CHANNEL_TERMINAL_MAX_EVENTS: usize = 512;
 const CHANNEL_TERMINAL_MAX_BYTES: usize = 512 * 1024;
 const CHANNEL_TERMINAL_MAX_SECONDS: u64 = 10 * 60;
-const CHANNEL_TERMINAL_MAX_EVENTS_PER_SECOND: usize = 32;
 
 pub(super) fn channel_terminal_stream(
     message: &echo_agent::channels::InboundMessage,
@@ -644,8 +643,6 @@ pub(super) fn channel_terminal_stream(
             channel_transport_chunk_bytes(&draft_channel_id),
         );
         let mut ansi = ChannelAnsiStripper::default();
-        let mut rate_started = tokio::time::Instant::now();
-        let mut rate_events = 0_usize;
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_secs(CHANNEL_TERMINAL_MAX_SECONDS);
         if accepted_bytes > CHANNEL_TERMINAL_MAX_BYTES {
@@ -672,15 +669,12 @@ pub(super) fn channel_terminal_stream(
                 Ok(echo_agent_app_core::api::terminal::TerminalEvent::Output { id, bytes })
                     if id == terminal_id =>
                 {
-                    let now = tokio::time::Instant::now();
-                    if now.duration_since(rate_started) >= std::time::Duration::from_secs(1) {
-                        rate_started = now;
-                        rate_events = 0;
-                    }
-                    rate_events = rate_events.saturating_add(1);
                     accepted_events = accepted_events.saturating_add(1);
-                    if rate_events > CHANNEL_TERMINAL_MAX_EVENTS_PER_SECOND
-                        || accepted_events > CHANNEL_TERMINAL_MAX_EVENTS
+                    // PTY chunk boundaries are scheduler-dependent, so an
+                    // events-per-second limit can detach a tiny fast command
+                    // before its exit receipt. Total events, bytes, and wall
+                    // time remain bounded independently of chunking.
+                    if accepted_events > CHANNEL_TERMINAL_MAX_EVENTS
                         || bytes.len()
                             > CHANNEL_TERMINAL_MAX_BYTES.saturating_sub(accepted_bytes)
                     {

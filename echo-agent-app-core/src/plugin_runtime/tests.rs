@@ -2,7 +2,6 @@
 mod tests {
     use super::*;
     use echo_agent::agent::ReactAgentBuilder;
-    use echo_agent::intent::IntentClassifier;
     use echo_agent::testing::MockLlmClient;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -66,10 +65,11 @@ mod tests {
 
     fn write_fixture_at(plugin: PathBuf, name: &str) -> Result<PathBuf, String> {
         PluginRuntimeService::scaffold(&plugin, name).map_err(|error| error.to_string())?;
+        let skill_name = format!("{name}-example");
         std::fs::write(
-            plugin.join("skills/example/SKILL.md"),
+            plugin.join("skills").join(&skill_name).join("SKILL.md"),
             format!(
-                "---\nname: {name}-example\ndescription: Example skill for route {name} work and related tasks.\n---\nUse this skill for {name} tasks.\n"
+                "---\nname: {skill_name}\ndescription: Example skill for route {name} work and related tasks.\n---\nUse this skill for {name} tasks.\n"
             ),
         )
         .map_err(|error| error.to_string())?;
@@ -249,18 +249,9 @@ done
             .await;
         let registry = handle.read(|agent| agent.subagent_registry().clone()).await;
         let has_subagent = registry.contains(&subagent).await;
-        let classifier = handle.write(crate::runtime::configure_intent_router).await;
-        let routed_skill = match classifier
-            .classify(&format!("route {plugin} work"), &[])
-            .await
-        {
-            echo_agent::intent::Intent::SkillRequired { skill_name, .. } => Some(skill_name),
-            _ => None,
-        };
-        let has_route = routed_skill.as_deref() == Some(skill.as_str());
-        if has_skill != expected || has_subagent != expected || has_route != expected {
+        if has_skill != expected || has_subagent != expected {
             return Err(format!(
-                "agent plugin generation mismatch for {plugin}: skill={has_skill}, subagent={has_subagent}, route={routed_skill:?}, expected={expected}"
+                "agent plugin generation mismatch for {plugin}: skill={has_skill}, subagent={has_subagent}, expected={expected}"
             ));
         }
         Ok(())
@@ -1559,7 +1550,7 @@ done
         PluginRuntimeService::scaffold(&plugin, "scaffolded").map_err(|error| error.to_string())?;
         for expected_file in [
             "plugin.json",
-            "skills/example/SKILL.md",
+            "skills/scaffolded-example/SKILL.md",
             "agents/example.md",
             "hooks/hooks.yaml",
             "mcp.json",
@@ -1616,7 +1607,7 @@ done
         )
         .map_err(|error| error.to_string())?;
         std::fs::write(
-            plugin.join("skills/example/SKILL.md"),
+            plugin.join("skills/invalid-components-example/SKILL.md"),
             "This file has no frontmatter.\n",
         )
         .map_err(|error| error.to_string())?;

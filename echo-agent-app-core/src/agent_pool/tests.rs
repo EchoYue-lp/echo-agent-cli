@@ -1219,6 +1219,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thinking_applies_to_primary_existing_future_and_inherited_subagents() -> TestResult {
+        let pool = create_test_pool(3, false).await?;
+        let existing = pool
+            .acquire("thinking-existing")
+            .await
+            .map_err(|error| error.to_string())?;
+        let thinking = Some(echo_agent::llm::ThinkingConfig::Level(
+            echo_agent::llm::ThinkingLevel::High,
+        ));
+
+        pool.apply_thinking(thinking.clone()).await;
+
+        for handle in [
+            pool.primary_agent()
+                .await
+                .map_err(|error| error.to_string())?,
+            existing.agent(),
+        ] {
+            assert_eq!(handle.read(|agent| agent.thinking().cloned()).await, thinking);
+        }
+        let future = pool
+            .acquire("thinking-future")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            future.agent().read(|agent| agent.thinking().cloned()).await,
+            thinking
+        );
+        let agents = pool.agents.read().await;
+        for key in ["thinking-existing", "thinking-future"] {
+            let inherited = agents
+                .get(key)
+                .and_then(|pooled| {
+                    pooled
+                        .model_consumers
+                        .inherited_handle_for_test("reviewer")
+                })
+                .ok_or_else(|| format!("{key} has no inherited Subagent"))?;
+            assert_eq!(inherited.read(|agent| agent.thinking().cloned()).await, thinking);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thinking_and_iteration_publication_do_not_wait_for_busy_agents() -> TestResult {
+        let pool = create_test_pool(3, false).await?;
+        let existing = pool
+            .acquire("busy-config")
+            .await
+            .map_err(|error| error.to_string())?;
+        let handle = existing.agent();
+        let busy = handle.inner().read().await;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.apply_thinking(Some(echo_agent::llm::ThinkingConfig::Level(
+                echo_agent::llm::ThinkingLevel::Low,
+            ))),
+        )
+        .await
+        .map_err(|_| "thinking publication waited for a busy agent".to_string())?;
+        tokio::time::timeout(Duration::from_secs(1), pool.apply_max_iterations(0))
+            .await
+            .map_err(|_| "max_iterations publication waited for a busy agent".to_string())?;
+        drop(busy);
+
+        let refreshed = pool
+            .acquire("busy-config")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            refreshed
+                .agent()
+                .read(|agent| agent.thinking().cloned())
+                .await,
+            Some(echo_agent::llm::ThinkingConfig::Level(
+                echo_agent::llm::ThinkingLevel::Low
+            ))
+        );
+        assert_eq!(
+            refreshed
+                .agent()
+                .read(|agent| agent.config().get_max_iterations())
+                .await,
+            usize::MAX
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn max_iterations_applies_to_primary_existing_and_future_agents() -> TestResult {
+        let pool = create_test_pool(3, false).await?;
+        let existing = pool
+            .acquire("iterations-existing")
+            .await
+            .map_err(|error| error.to_string())?;
+
+        pool.apply_max_iterations(37).await;
+
+        for handle in [
+            pool.primary_agent()
+                .await
+                .map_err(|error| error.to_string())?,
+            existing.agent(),
+        ] {
+            assert_eq!(
+                handle
+                    .read(|agent| agent.config().get_max_iterations())
+                    .await,
+                37
+            );
+        }
+        let future = pool
+            .acquire("iterations-future")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            future
+                .agent()
+                .read(|agent| agent.config().get_max_iterations())
+                .await,
+            37
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn tool_control_generation_reaches_primary_existing_and_future_agents() -> TestResult {
         let pool = create_test_pool(3, false).await?;
         let existing = pool

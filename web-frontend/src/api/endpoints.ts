@@ -2,7 +2,15 @@ import { get, post, put, del } from './client';
 import { isTauri, apiInvoke } from '../lib/tauri-bridge';
 // A-tier types that have identical generated counterparts — import from
 // generated to eliminate the same-name duplication (6-10).
-import type { SessionInfo, ContextStats, ToolControlReceipt, ToolInfo } from '../generated';
+import type {
+  SessionInfo,
+  ContextStats,
+  ToolControlReceipt,
+  ToolInfo,
+  AgentConfigResponse,
+  FullConfigResponse,
+  UpdateConfigRequest,
+} from '../generated';
 import type {
   TauriSkillInfo,
   TauriMcpServerInfo,
@@ -11,7 +19,6 @@ import type {
   ReflectionReceipt,
   NamespacesResponse,
   SnapshotInfo,
-  ConfigInfo,
   PermissionRule,
   PermissionRuleInput,
   AuditLog,
@@ -24,7 +31,6 @@ import type {
   ConversationListItem,
   ConversationRecord,
   SavedMessage,
-  FullConfigResponse,
   FullConfigUpdateRequest,
   CuratorStatus,
   CuratorTransition,
@@ -155,7 +161,8 @@ function executeSkillCommand(
 }
 
 export type BrowserExtensionDisposition =
-  { status: 'settled'; message: string } | { status: 'pending'; message: string };
+  | { status: 'settled'; message: string }
+  | { status: 'pending'; message: string };
 
 export function browserExtensionDisposition(
   receipt: ExtensionCommandReceipt
@@ -475,19 +482,20 @@ export const autoMemoryApi = {
 };
 
 export const configApi = {
-  get: () => (isTauri() ? apiInvoke<ConfigInfo>('get_config') : get<ConfigInfo>('/config')),
-  update: (cfg: Partial<ConfigInfo>) =>
+  get: () =>
+    isTauri() ? apiInvoke<AgentConfigResponse>('get_config') : get<AgentConfigResponse>('/config'),
+  update: (cfg: Partial<UpdateConfigRequest>) =>
     isTauri()
-      ? apiInvoke<ConfigInfo>('update_config', { req: cfg })
-      : put<ConfigInfo>('/config', cfg),
+      ? apiInvoke<AgentConfigResponse>('update_config', { req: cfg })
+      : put<AgentConfigResponse>('/config', cfg),
   getFull: () =>
     isTauri()
       ? apiInvoke<FullConfigResponse>('get_full_config')
       : get<FullConfigResponse>('/config/full'),
-  updateFull: (cfg: Partial<FullConfigUpdateRequest>, _signal?: AbortSignal) =>
+  updateFull: (cfg: Partial<FullConfigUpdateRequest>, signal?: AbortSignal) =>
     isTauri()
-      ? apiInvoke<FullConfigResponse>('update_full_config', { req: cfg })
-      : put<FullConfigResponse>('/config/full', cfg, _signal),
+      ? apiInvoke<FullConfigResponse>('update_full_config', { req: cfg }, signal)
+      : put<FullConfigResponse>('/config/full', cfg, signal),
 };
 
 export const permissionsApi = {
@@ -1651,7 +1659,14 @@ export interface CitationAuditReport {
 }
 
 export type ReviewExportFormat =
-  'markdown' | 'pdf' | 'docx' | 'json' | 'csv' | 'bibtex' | 'ris' | 'all';
+  | 'markdown'
+  | 'pdf'
+  | 'docx'
+  | 'json'
+  | 'csv'
+  | 'bibtex'
+  | 'ris'
+  | 'all';
 export interface ReviewExportArtifact {
   review_id: string;
   format: Exclude<ReviewExportFormat, 'all'>;
@@ -1936,10 +1951,16 @@ export type AgentDeliveryPhase =
   | 'turn_settled';
 
 export type AgentDeliveryOutcome =
-  'completed' | 'failed' | 'cancelled' | 'dropped' | 'outcome_unknown';
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'dropped'
+  | 'outcome_unknown';
 
 export type AgentDeliveryDurability =
-  { status: 'unconfirmed' } | { status: 'confirmed' } | { status: 'degraded'; error: string };
+  | { status: 'unconfirmed' }
+  | { status: 'confirmed' }
+  | { status: 'degraded'; error: string };
 
 export interface AgentDeliveryReceipt {
   message_id: string;
@@ -2277,10 +2298,15 @@ export const providerApi = {
           baseUrl: req.base_url,
         })
       : post<TestConnectionResponse>('/providers/test', req),
-  /** Set one centrally verified thinking level for the active model. */
-  setThinking: (spec: string) =>
+  /** Set one centrally verified thinking level for the active model.
+   * `workspaceId` routes the publication to that workspace's agent pool —
+   * the Agents GUI conversations actually run on. */
+  setThinking: (spec: string, workspaceId?: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; spec: string; applied: boolean }>('set_thinking', { spec })
+      ? apiInvoke<{ success: boolean; spec: string; applied: boolean }>('set_thinking', {
+          spec,
+          workspaceId,
+        })
       : post<{ success: boolean; spec: string; applied: boolean }>('/models/thinking', { spec }),
 };
 

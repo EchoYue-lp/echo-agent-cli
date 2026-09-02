@@ -25,6 +25,11 @@ pub struct AgentPool {
     /// Working directory applied to existing and future pooled agents.
     working_dir: RwLock<Option<std::path::PathBuf>>,
     permission_mode: RwLock<PermissionMode>,
+    /// Workspace-scoped reasoning-depth publication. Mirrors
+    /// `permission_mode`: applied to existing and future pooled agents (and
+    /// their inheriting Subagents) so `set_thinking` reaches the exact
+    /// conversation Agent instead of only the bootstrap primary.
+    thinking_override: RwLock<Option<echo_agent::llm::ThinkingConfig>>,
     /// Exact plugin generation projected into existing and future agents.
     agent_generation: RwLock<AgentPluginGeneration>,
     /// Cancellation token for the cleanup monitor task.
@@ -419,6 +424,7 @@ impl AgentPool {
             app_config: RwLock::new(runtime.session_app_config.clone()),
             working_dir: RwLock::new(working_dir),
             permission_mode: RwLock::new(PermissionMode::Default),
+            thinking_override: RwLock::new(None),
             agent_generation: RwLock::new(AgentPluginGeneration::new(
                 0,
                 skill_descriptors,
@@ -529,6 +535,7 @@ impl AgentPool {
             app_config: RwLock::new(self.app_config.read().await.clone()),
             working_dir: RwLock::new(Some(root.clone())),
             permission_mode: RwLock::new(*self.permission_mode.read().await),
+            thinking_override: RwLock::new(self.thinking_override.read().await.clone()),
             agent_generation: RwLock::new(authority_plugin_generation.clone()),
             cleanup_cancel: CancellationToken::new(),
             cleanup_handle: Mutex::new(None),
@@ -704,6 +711,7 @@ impl AgentPool {
             app_config: RwLock::new(app_config),
             working_dir: RwLock::new(None),
             permission_mode: RwLock::new(PermissionMode::Default),
+            thinking_override: RwLock::new(None),
             agent_generation: RwLock::new(AgentPluginGeneration::default()),
             cleanup_cancel: CancellationToken::new(),
             cleanup_handle: Mutex::new(None),
@@ -777,9 +785,21 @@ impl AgentPool {
         if let Some(existing) = agents.get_mut(conversation_id) {
             existing.last_used = Instant::now();
             let permission_mode = *self.permission_mode.read().await;
+            let thinking_override = self.thinking_override.read().await.clone();
+            let max_iterations = crate::infra::resolved_max_iterations(
+                self.app_config.read().await.agent.max_iterations,
+            );
             let _updated = existing.handle.try_write(|agent| {
                 if agent.get_permission_mode() != permission_mode {
                     agent.set_permission_mode(permission_mode);
+                }
+                if agent.thinking() != thinking_override.as_ref() {
+                    agent.set_thinking(thinking_override);
+                }
+                if agent.config().get_max_iterations() != max_iterations
+                    && let Err(error) = agent.set_max_iterations(max_iterations)
+                {
+                    tracing::warn!(%error, "AgentPool: rejected deferred max_iterations publication");
                 }
             });
             let handle = existing.handle.clone();
@@ -1212,6 +1232,76 @@ impl AgentPool {
                     })
                 })
                 .await;
+        }
+    }
+
+    /// Publish the reasoning-depth knob to the primary, every existing pooled
+    /// Agent, the creation template used for future pool admissions, and every
+    /// Subagent generation that inherits the parent's thinking.
+    pub async fn apply_thinking(&self, thinking: Option<echo_agent::llm::ThinkingConfig>) {
+        *self.thinking_override.write().await = thinking.clone();
+
+        let agents = self.agents.read().await;
+        let mut handles = agents
+            .values()
+            .map(|pooled| pooled.handle.clone())
+            .collect::<Vec<_>>();
+        let mut model_consumers = agents
+            .values()
+            .map(|pooled| pooled.model_consumers.clone())
+            .collect::<Vec<_>>();
+        drop(agents);
+        if let Some(primary) = self.primary_agent.read().await.clone()
+            && !handles
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate.inner(), primary.inner()))
+        {
+            handles.push(primary);
+        }
+        if let Some(primary_consumers) = self.primary_model_consumers.read().await.clone() {
+            model_consumers.push(primary_consumers);
+        }
+        for handle in handles {
+            let thinking = thinking.clone();
+            let _updated = handle.try_write(|agent| {
+                    if agent.thinking() != thinking.as_ref() {
+                        agent.set_thinking(thinking);
+                    }
+                });
+        }
+        for consumers in model_consumers {
+            consumers.apply_thinking(thinking.clone()).await;
+        }
+    }
+
+    /// Publish the ReAct loop ceiling to the primary and every existing pooled
+    /// Agent. The EKO sentinel value is also stored in the pool's config
+    /// template so future admissions resolve the same ceiling.
+    pub async fn apply_max_iterations(&self, eko_value: usize) {
+        self.app_config.write().await.agent.max_iterations = eko_value;
+        let resolved = crate::infra::resolved_max_iterations(eko_value);
+
+        let agents = self.agents.read().await;
+        let mut handles = agents
+            .values()
+            .map(|pooled| pooled.handle.clone())
+            .collect::<Vec<_>>();
+        drop(agents);
+        if let Some(primary) = self.primary_agent.read().await.clone()
+            && !handles
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate.inner(), primary.inner()))
+        {
+            handles.push(primary);
+        }
+        for handle in handles {
+            let _updated = handle.try_write(|agent| {
+                    if agent.config().get_max_iterations() != resolved
+                        && let Err(error) = agent.set_max_iterations(resolved)
+                    {
+                        tracing::warn!(%error, "AgentPool: rejected max_iterations publication");
+                    }
+                });
         }
     }
 
@@ -1812,6 +1902,9 @@ impl AgentPool {
         }
         let permission_mode = *self.permission_mode.read().await;
         agent.set_permission_mode(permission_mode);
+        let thinking_override = self.thinking_override.read().await.clone();
+        agent.set_thinking(thinking_override.clone());
+        model_consumers.apply_thinking(thinking_override).await;
         let tool_control = self
             .tool_control
             .snapshot()

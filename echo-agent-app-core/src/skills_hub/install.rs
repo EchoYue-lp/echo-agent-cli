@@ -702,17 +702,19 @@ mod tests {
 
     #[test]
     fn source_record_hash_detects_local_changes() -> Result<(), String> {
-        let source = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let source_parent = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let source = source_parent.path().join("demo");
+        std::fs::create_dir_all(&source).map_err(|error| error.to_string())?;
         let root = tempfile::tempdir().map_err(|error| error.to_string())?;
         std::fs::write(
-            source.path().join("SKILL.md"),
+            source.join("SKILL.md"),
             "---\nname: demo\ndescription: Demo Skill\n---\n\n# Skill\n",
         )
         .map_err(|error| error.to_string())?;
         let destination = root.path().join("demo");
         let now = Utc::now().to_rfc3339();
         replace_skill_directory(
-            source.path(),
+            &source,
             &destination,
             Some(SkillSourceRecord {
                 repo_url: "https://example.com/demo.git".to_string(),
@@ -741,17 +743,19 @@ mod tests {
         assert!(!untracked_result.success);
         assert!(!untracked_result.retryable);
 
-        let source = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let source_parent = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let source = source_parent.path().join("local-change");
+        std::fs::create_dir_all(&source).map_err(|error| error.to_string())?;
         let root = tempfile::tempdir().map_err(|error| error.to_string())?;
         std::fs::write(
-            source.path().join("SKILL.md"),
+            source.join("SKILL.md"),
             "---\nname: local-change\ndescription: Local change Skill\n---\n\n# Original\n",
         )
         .map_err(|error| error.to_string())?;
         let destination = root.path().join("local-change");
         let now = Utc::now().to_rfc3339();
         replace_skill_directory(
-            source.path(),
+            &source,
             &destination,
             Some(SkillSourceRecord {
                 repo_url: "https://example.com/local-change.git".to_string(),

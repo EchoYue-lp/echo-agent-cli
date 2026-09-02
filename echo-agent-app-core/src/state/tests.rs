@@ -2009,6 +2009,7 @@ mod workspace_transition_tests {
             .reply_message_id
             .clone()
             .ok_or_else(|| "correlated reply was not queued".to_string())?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let source_record = loop {
             let record = state
                 .agent_router
@@ -2310,7 +2311,7 @@ mod workspace_transition_tests {
                 .into_iter()
                 .any(|record| {
                     record.message_id == "busy-fifo"
-                        && record.phase == crate::agent_router::AgentDeliveryPhase::Persisted
+                        && record.phase == crate::agent_router::AgentDeliveryPhase::Deferred
                         && record.attempt > 0
                 });
             if deferred {

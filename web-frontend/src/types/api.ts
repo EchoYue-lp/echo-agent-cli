@@ -66,10 +66,17 @@ export type ChatRunStatus =
   | 'cancelled';
 
 export type ToolExecutionStatus =
-  'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out' | 'interrupted' | 'unknown';
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'timed_out'
+  | 'interrupted'
+  | 'unknown';
 
 export type ToolExecutionOwner =
-  { kind: 'chat'; message_id: string } | { kind: 'subagent'; subagent_run_id: string };
+  | { kind: 'chat'; message_id: string }
+  | { kind: 'subagent'; subagent_run_id: string };
 
 export type ToolFailureCategory =
   | 'invalid_arguments'
@@ -81,7 +88,11 @@ export type ToolFailureCategory =
   | 'partial_side_effect';
 
 export type ToolRecoveryAction =
-  'correct_arguments' | 'retry' | 'restore_then_retry' | 'verify_then_retry' | 'stop';
+  | 'correct_arguments'
+  | 'retry'
+  | 'restore_then_retry'
+  | 'verify_then_retry'
+  | 'stop';
 
 export interface ToolFailure {
   category: ToolFailureCategory;
@@ -93,7 +104,10 @@ export interface ToolFailure {
 }
 
 export type ToolInvocationRewrite =
-  'intervention_redirect' | 'intervention_arguments' | 'pre_tool_use_hook' | 'approval';
+  | 'intervention_redirect'
+  | 'intervention_arguments'
+  | 'pre_tool_use_hook'
+  | 'approval';
 
 export interface ToolInvocation {
   requested_name: string;
@@ -412,7 +426,11 @@ export interface ChatEventReplay {
 export type TauriSkillInfo = ExtensionSkillEntry;
 
 export type SkillUpdateState =
-  'up_to_date' | 'update_available' | 'local_changes' | 'untracked' | 'error';
+  | 'up_to_date'
+  | 'update_available'
+  | 'local_changes'
+  | 'untracked'
+  | 'error';
 
 export interface SkillUpdateStatus {
   name: string;
@@ -497,7 +515,9 @@ export type PermissionRuleMatcher =
   | { type: 'all' };
 
 export type PermissionRuleBehavior =
-  { type: 'allow' } | { type: 'deny'; reason: string } | { type: 'ask'; suggestions: string[] };
+  | { type: 'allow' }
+  | { type: 'deny'; reason: string }
+  | { type: 'ask'; suggestions: string[] };
 
 export type PermissionRuleSource =
   | 'default'
@@ -530,15 +550,9 @@ export interface AuditLog {
   reason?: string;
 }
 
-export interface ConfigInfo {
-  model: string;
-  system_prompt: string;
-  max_iterations: number;
-  max_tokens: number;
-  enable_tools: boolean;
-  enable_memory: boolean;
-  enable_human_in_loop: boolean;
-}
+// AgentConfigResponse (configApi.get / update 的返回) 与 FullConfigResponse
+// (configApi.getFull / updateFull 的返回) 一律使用 src/generated 里的
+// ts-rs 生成类型，不再手写镜像，防止字段漂移。
 
 // ── 附件类型 ──
 
@@ -696,40 +710,8 @@ export interface SandboxExecuteResult {
 // ── Context info ── (reuses ContextStats)
 
 // ── Full Config types ──
-
-export interface FullConfigResponse {
-  model: {
-    provider: string;
-    name: string;
-    has_auth_token: boolean;
-    base_url: string | null;
-    max_tokens: number | null;
-    temperature: number | null;
-  };
-  agent: {
-    model: string;
-    system_prompt: string;
-    max_iterations: number;
-    token_limit: number;
-    enable_tools: boolean;
-    enable_memory: boolean;
-    enable_human_loop: boolean;
-    session_id: string | null;
-    available_models: string[];
-  };
-  mcp: { config_path: string | null };
-  channels: {
-    qq: { enabled: boolean; app_id: string };
-    feishu: { enabled: boolean; app_id: string; mode: string };
-    session: {
-      timeout_minutes: number;
-      reset_keywords: string[];
-      reset_commands: string[];
-    };
-  };
-  server: { host: string; port: number };
-  logging: { level: string };
-}
+// 响应类型使用 src/generated/FullConfigResponse；此处只保留请求侧的
+// partial-edit 草稿类型（可选字段准确对应后端 Option 字段的缺省语义）。
 
 export interface FullConfigUpdateRequest {
   model?: {
@@ -740,9 +722,6 @@ export interface FullConfigUpdateRequest {
     name?: string;
     system_prompt?: string;
     max_iterations?: number;
-    enable_tools?: boolean;
-    enable_memory?: boolean;
-    enable_human_in_loop?: boolean;
     memory_path?: string;
   };
   mcp?: { config_path?: string };
@@ -922,7 +901,8 @@ export interface MemoryConflictProposal {
 }
 
 export type EvidenceAction =
-  { kind: 'save_memory' } | { kind: 'merge_memories'; proposal: MemoryConflictProposal };
+  | { kind: 'save_memory' }
+  | { kind: 'merge_memories'; proposal: MemoryConflictProposal };
 
 export type EvidenceTarget =
   | { kind: 'memory'; key: string }

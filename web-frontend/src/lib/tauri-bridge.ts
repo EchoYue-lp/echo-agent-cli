@@ -160,15 +160,47 @@ export const system = {
 /**
  * Generic Tauri IPC invoke for API endpoints.
  * Use this in endpoints.ts to replace HTTP calls with Tauri commands.
+ *
+ * `signal` bounds the caller's wait: IPC itself cannot be aborted mid-flight,
+ * but the returned promise settles as soon as the signal fires so the UI can
+ * leave its "saving…" state instead of hanging forever. The native command
+ * remains responsible for completing its own atomic transaction.
  */
-export async function apiInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+export async function apiInvoke<T>(
+  command: string,
+  args?: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<T> {
   if (!isTauri()) {
     throw new Error('apiInvoke requires Tauri environment');
   }
-  try {
-    return await invoke<T>(command, args);
-  } catch (error) {
+  const invocation = invoke<T>(command, args).catch((error) => {
     throw new Error(errorMessage(error));
+  });
+  if (!signal) {
+    return invocation;
+  }
+  let onAbort: (() => void) | null = null;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => {
+      reject(
+        signal.reason instanceof Error
+          ? signal.reason
+          : new DOMException('The operation was aborted', 'AbortError')
+      );
+    };
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+  try {
+    return await Promise.race([invocation, aborted]);
+  } finally {
+    if (onAbort) {
+      signal.removeEventListener('abort', onAbort);
+    }
   }
 }
 

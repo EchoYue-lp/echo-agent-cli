@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
 import { configApi } from '../../api/endpoints';
-import type { ConfigInfo, FullConfigResponse, FullConfigUpdateRequest } from '../../types/api';
+import type { AgentConfigResponse, FullConfigResponse } from '../../generated';
+import type { FullConfigUpdateRequest } from '../../types/api';
 
 export function ConfigPanel() {
-  const [agentConfig, setAgentConfig] = useState<ConfigInfo | null>(null);
+  const [agentConfig, setAgentConfig] = useState<AgentConfigResponse | null>(null);
   const [fullConfig, setFullConfig] = useState<FullConfigResponse | null>(null);
   const [edit, setEdit] = useState<FullConfigUpdateRequest>({});
   const [dirty, setDirty] = useState(false);
@@ -41,28 +42,19 @@ export function ConfigPanel() {
     const timeout = setTimeout(() => controller.abort(), 15_000);
 
     try {
-      // Persist all changes to YAML config file (syncs model + system_prompt to agent)
+      // Persist all changes to YAML config file. The backend transaction also
+      // syncs system_prompt and max_iterations to the running agents (primary
+      // + pools), so no second update_config round-trip is needed here.
       const updatedFull = await configApi.updateFull(edit, controller.signal);
       setFullConfig(updatedFull);
       setEdit({});
       setDirty(false);
 
-      // If max_iterations changed, also sync to the running agent
-      // (update_full_config only syncs model + system_prompt, not max_iterations)
-      if (edit.agent?.max_iterations != null || edit.agent?.system_prompt != null) {
-        try {
-          const agentUpdate: Partial<ConfigInfo> = {};
-          if (edit.agent?.system_prompt != null) {
-            agentUpdate.system_prompt = edit.agent.system_prompt;
-          }
-          if (edit.agent?.max_iterations != null) {
-            agentUpdate.max_iterations = edit.agent.max_iterations;
-          }
-          const updatedAgent = await configApi.update(agentUpdate);
-          setAgentConfig(updatedAgent);
-        } catch (e) {
-          console.error('Failed to sync to running agent:', e);
-        }
+      // Refresh the running-agent projection (configApi.get) for display.
+      try {
+        setAgentConfig(await configApi.get());
+      } catch (e) {
+        console.error('[ConfigPanel] failed to refresh running agent config:', e);
       }
 
       setMessage('已保存');

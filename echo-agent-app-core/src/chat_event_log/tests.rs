@@ -1157,6 +1157,106 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn command_cell_watch_recovery_ignores_unrelated_corrupt_stream() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("events");
+        let log = Arc::new(
+            ChatEventLog::open(&root, ChatEventRetention::default())
+                .map_err(|error| error.to_string())?,
+        );
+        let result = command_cell_watch();
+        let acknowledgement = CommandCellWatchAcknowledgement {
+            execution_id: result.receipt.execution_id.clone(),
+            watch_generation: result.receipt.watch_generation,
+            cell_id: result.receipt.cell_id.clone(),
+            workspace_id: result.receipt.workspace_id.clone(),
+            conversation_id: result.receipt.conversation_id.clone(),
+            root_turn_id: result.receipt.root_turn_id.clone(),
+            acknowledged_turn_id: "recovery-turn".to_string(),
+            outcome: crate::tasks::task_runtime::command_cells::CommandCellWatchDeliveryOutcome::OutcomeUnknown,
+        };
+        for event in [
+            ChatDriverEvent::CommandCellWatchReady {
+                result: Box::new(result),
+            },
+            ChatDriverEvent::CommandCellWatchDeliveryStarted {
+                acknowledgement: acknowledgement.clone(),
+            },
+        ] {
+            log.append(
+                "workspace-1",
+                Some("conversation-1"),
+                "turn-1",
+                event,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let corrupt = root.join("sha256_unrelated_corrupt_stream");
+        fs::create_dir_all(&corrupt).map_err(|error| error.to_string())?;
+        fs::write(
+            corrupt.join("00000000000000000001.jsonl"),
+            b"not a framework journal record\n",
+        )
+        .map_err(|error| error.to_string())?;
+
+        assert_eq!(
+            log.settle_all_started_command_cell_watch_deliveries_async()
+                .await
+                .map_err(|error| error.to_string())?,
+            1
+        );
+        let replay = log
+            .replay(
+                "workspace-1",
+                Some("conversation-1"),
+                "turn-1",
+                0,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.payload,
+            ChatDriverEvent::CommandCellWatchAcknowledged { acknowledgement: actual }
+                if actual == &acknowledgement
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn conversation_watch_scan_ignores_unrelated_corrupt_stream() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("events");
+        let log = ChatEventLog::open(&root, ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        let expected = command_cell_watch();
+        log.append(
+            "workspace-1",
+            Some("conversation-1"),
+            "turn-1",
+            ChatDriverEvent::CommandCellWatchReady {
+                result: Box::new(expected.clone()),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let corrupt = root.join("sha256_unrelated_corrupt_stream");
+        fs::create_dir_all(&corrupt).map_err(|error| error.to_string())?;
+        fs::write(
+            corrupt.join("00000000000000000001.jsonl"),
+            b"not a framework journal record\n",
+        )
+        .map_err(|error| error.to_string())?;
+
+        assert_eq!(
+            log.pending_command_cell_watches_for_conversation(
+                "workspace-1",
+                "conversation-1"
+            )
+            .map_err(|error| error.to_string())?,
+            vec![expected]
+        );
+        Ok(())
+    }
+
     #[test]
     fn swapped_real_stream_directories_fail_selected_identity_validation() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
@@ -1328,7 +1428,7 @@ mod tests {
                 log.append(
                     "workspace-1",
                     Some("conversation-1"),
-                    &format!("root-{index}"),
+                    "turn-1",
                     ChatDriverEvent::CommandCellWatchReady {
                         result: Box::new(result),
                     },
@@ -1361,7 +1461,7 @@ mod tests {
         );
         assert_eq!(
             second
-                .pending_command_cell_watches("workspace-1", "conversation-1", "ignored")
+                .pending_command_cell_watches("workspace-1", "conversation-1", "turn-1")
                 .map_err(|error| error.to_string())?
                 .len(),
             32

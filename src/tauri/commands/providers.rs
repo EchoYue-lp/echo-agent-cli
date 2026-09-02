@@ -280,15 +280,21 @@ async fn set_default_model_inner(
     }))
 }
 
-/// Dynamically set the thinking-depth for the active agent at runtime.
+/// Dynamically set the thinking-depth for the active agents at runtime.
 ///
 /// This is a per-session control. The requested value must be one of the
 /// centrally resolved effective levels for the active runtime model; `auto`
 /// always resets to the model default.
+///
+/// `workspace_id` routes the publication to the workspace's agent pool — the
+/// Agents GUI conversations actually run on. A pool-wide publication covers
+/// every live and future conversation Agent of that workspace plus their
+/// inheriting Subagents; without it we fall back to the process primary.
 #[tauri::command]
 pub async fn set_thinking(
     state: tauri::State<'_, crate::tauri::TauriState>,
     spec: String,
+    workspace_id: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     let requested = spec.trim().to_ascii_lowercase();
     let available = {
@@ -316,16 +322,31 @@ pub async fn set_thinking(
     };
     let applied = cfg.is_some();
 
-    state
-        .app_state
-        .connection
-        .agent
-        .write_async(|agent| {
-            Box::pin(async move {
-                agent.set_thinking(cfg);
-            })
-        })
-        .await;
+    match workspace_id
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+    {
+        Some(workspace_id) => {
+            let scoped_runtime = state
+                .app_state
+                .chat_runtime_for_scope(&workspace_id)
+                .await
+                .map_err(|error| IpcError::Validation(error.to_string()))?;
+            scoped_runtime.apply_thinking(cfg).await;
+        }
+        None => {
+            state
+                .app_state
+                .connection
+                .agent
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        agent.set_thinking(cfg);
+                    })
+                })
+                .await;
+        }
+    }
 
     Ok(serde_json::json!({
         "success": true,

@@ -155,8 +155,6 @@ pub struct AgentConfigResponse {
     pub system_prompt: String,
     pub max_iterations: usize,
     pub token_limit: usize,
-    pub enable_memory: bool,
-    pub enable_human_loop: bool,
     pub session_id: Option<String>,
     /// 可用的模型列表
     pub available_models: Vec<String>,
