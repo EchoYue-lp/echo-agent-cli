@@ -2386,7 +2386,7 @@ async fn persist_terminal_with_retry(
                     operation_artifact_sha256.as_deref(),
                     operation_call_id.as_deref(),
                 )?;
-                super::continuation::wake_after_cell_terminal(&store, &operation_run_id);
+                super::continuation::wake_deferred_when_runtime_quiet(&store, &operation_run_id);
                 Ok(())
             })
             .await

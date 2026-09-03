@@ -1242,10 +1242,13 @@ pub(crate) fn shutdown(store: &TaskRuntimeStore) {
     }
 }
 
-/// A completed cell is a concrete wake-up, not a reason to spin model turns.
-/// Only a Running run that explicitly deferred for cells is resumed here;
-/// user-paused and recovery-paused runs remain under user control.
-pub(crate) fn wake_after_cell_terminal(store: &Arc<TaskRuntimeStore>, run_id: &str) {
+/// A completed background cell or a settled plan task is a concrete wake-up,
+/// not a reason to spin model turns. Only a Running run that explicitly
+/// deferred (for active cells or in-flight subagent work) is resumed here,
+/// and only once the runtime is quiet — no active background cells and no
+/// Running plan tasks. User-paused and recovery-paused runs remain under
+/// user control.
+pub(crate) fn wake_deferred_when_runtime_quiet(store: &Arc<TaskRuntimeStore>, run_id: &str) {
     let Ok(cells) = store.list_background_cells(run_id) else {
         return;
     };
@@ -1260,7 +1263,9 @@ pub(crate) fn wake_after_cell_terminal(store: &Arc<TaskRuntimeStore>, run_id: &s
         .ok()
         .flatten()
         .is_some_and(|snapshot| {
+            let tasks_running = snapshot.tasks.iter().any(|task| task.status.is_running());
             snapshot.run.status == TaskRunStatus::Running
+                && !tasks_running
                 && snapshot
                     .continuation
                     .is_some_and(|continuation| continuation.enabled && continuation.deferred)
@@ -1269,7 +1274,7 @@ pub(crate) fn wake_after_cell_terminal(store: &Arc<TaskRuntimeStore>, run_id: &s
         return;
     }
     if let Err(error) = store.set_continuation_deferred(run_id, false) {
-        tracing::warn!(run_id, %error, "failed to clear cell continuation deferral");
+        tracing::warn!(run_id, %error, "failed to clear continuation deferral");
         return;
     }
     runtime_for(store).wake(run_id);

@@ -77,12 +77,26 @@ pub(crate) async fn persist_run_turn_terminal(
     })
 }
 
+/// Which turn-end settlement semantics apply after a RunTurn persists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurnEndPolicy {
+    /// Ordinary chat-driver turn (ADR 0035): a run that never committed a
+    /// plan revision settles Completed at turn end instead of entering
+    /// continuation or the policy failure path.
+    ChatTurn,
+    /// Executor/policy-driven run (`drive_agent_run`, `RunPlanPolicy`):
+    /// RequirePlan / RepeatedBlocker / failed-without-plan semantics are
+    /// unchanged and a missing plan is never treated as a trivial settle.
+    PolicyDriven,
+}
+
 fn decide_after_persisted_run_turn_sync(
     store: &Arc<TaskRuntimeStore>,
     run_id: &str,
     terminal: &TurnReceipt,
     persisted: PersistedRunTurn,
     trace_sink: Option<&ExecSink>,
+    turn_end_policy: TurnEndPolicy,
 ) -> Result<RunTurnDecision, String> {
     let run = store
         .get_run(run_id)
@@ -169,6 +183,35 @@ fn decide_after_persisted_run_turn_sync(
             return Ok(RunTurnDecision::Stop);
         }
         TurnOutcome::Completed => {}
+    }
+
+    // ADR 0035: an eagerly bound chat run that never committed a plan
+    // revision is a self-contained conversational turn. Settle it as
+    // Completed right away so trivial turns cannot enter the continuation
+    // loop; structural fact (no plan), never a route string. Only the chat
+    // driver qualifies — policy-driven runs keep RequirePlan semantics.
+    if turn_end_policy == TurnEndPolicy::ChatTurn
+        && store
+            .get_plan(run_id)
+            .map_err(|error| error.to_string())?
+            .is_none()
+    {
+        store
+            .transition_run(run_id, TaskRunStatus::Completed)
+            .map_err(|error| error.to_string())?;
+        if let Some(trace_sink) = trace_sink {
+            trace_sink(ExecEvent::run(
+                run.workspace_id.clone(),
+                run.conversation_id.clone(),
+                run_id.to_string(),
+                RuntimeEventKind::RunCompleted,
+                serde_json::json!({
+                    "status": "completed",
+                    "settlement": "no_plan_trivial_turn",
+                }),
+            ));
+        }
+        return Ok(RunTurnDecision::Stop);
     }
 
     if persisted
@@ -258,6 +301,7 @@ pub(crate) async fn decide_after_persisted_run_turn(
     terminal: &TurnReceipt,
     persisted: PersistedRunTurn,
     trace_sink: Option<&ExecSink>,
+    turn_end_policy: TurnEndPolicy,
 ) -> Result<RunTurnDecision, String> {
     let run_id = run_id.to_string();
     let owned_terminal = terminal.clone();
@@ -271,6 +315,7 @@ pub(crate) async fn decide_after_persisted_run_turn(
                 &owned_terminal,
                 persisted,
                 trace_sink.as_ref(),
+                turn_end_policy,
             )
             .map_err(super::store::StoreError::InvalidPlan)
         })
@@ -284,9 +329,19 @@ pub(crate) async fn finalize_run_turn(
     run_id: &str,
     terminal: &TurnReceipt,
     trace_sink: Option<&ExecSink>,
+    turn_end_policy: TurnEndPolicy,
 ) -> Result<RunTurnDecision, String> {
     let persisted = persist_run_turn_terminal(blocking, run_id, terminal).await?;
-    decide_after_persisted_run_turn(blocking, store, run_id, terminal, persisted, trace_sink).await
+    decide_after_persisted_run_turn(
+        blocking,
+        store,
+        run_id,
+        terminal,
+        persisted,
+        trace_sink,
+        turn_end_policy,
+    )
+    .await
 }
 
 pub(crate) async fn reject_before_driver_start(

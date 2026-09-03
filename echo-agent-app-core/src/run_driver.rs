@@ -202,15 +202,16 @@ async fn drive_run_async_inner(
     })?;
 
     let load_run_id = payload.run_id.clone();
-    let run =
-        TaskRuntimeOperation::new(payload.store.clone())
-            .run("load final supervised run status", move |store| {
-                store.get_run(&load_run_id)?.ok_or(
-                    crate::tasks::task_runtime::StoreError::RunNotFound(load_run_id),
-                )
-            })
-            .await
-            .map_err(|error| format!("read final run status failed: {error}"))?;
+    let (run, has_plan) = TaskRuntimeOperation::new(payload.store.clone())
+        .run("load final supervised run status", move |store| {
+            let run = store.get_run(&load_run_id)?.ok_or(
+                crate::tasks::task_runtime::StoreError::RunNotFound(load_run_id.clone()),
+            )?;
+            let has_plan = store.get_plan(&load_run_id)?.is_some();
+            Ok((run, has_plan))
+        })
+        .await
+        .map_err(|error| format!("read final run status failed: {error}"))?;
     let outcome = match run.status {
         TaskRunStatus::Completed => RunOutcome::Completed,
         TaskRunStatus::Cancelled => RunOutcome::Cancelled,
@@ -231,16 +232,23 @@ async fn drive_run_async_inner(
         }
     };
 
-    let memory_event = match &outcome {
-        RunOutcome::Completed => Some(MemoryEvent::RunCompleted {
-            run_id: payload.run_id.clone(),
-            goal: run.goal.clone(),
-        }),
-        RunOutcome::Cancelled => Some(MemoryEvent::RunCancelledByUser {
-            run_id: payload.run_id.clone(),
-            goal: run.goal.clone(),
-        }),
-        RunOutcome::Failed { .. } | RunOutcome::Paused { .. } => None,
+    // ADR 0035: eagerly bound runs that never committed a plan revision are
+    // conversational turns — their terminal outcome is not durable task
+    // memory and must not pollute long-term recall.
+    let memory_event = if !has_plan {
+        None
+    } else {
+        match &outcome {
+            RunOutcome::Completed => Some(MemoryEvent::RunCompleted {
+                run_id: payload.run_id.clone(),
+                goal: run.goal.clone(),
+            }),
+            RunOutcome::Cancelled => Some(MemoryEvent::RunCancelledByUser {
+                run_id: payload.run_id.clone(),
+                goal: run.goal.clone(),
+            }),
+            RunOutcome::Failed { .. } | RunOutcome::Paused { .. } => None,
+        }
     };
     if let Some(event) = memory_event {
         crate::tasks::task_runtime::memory_bridge::write_memory_candidate_dispatch(

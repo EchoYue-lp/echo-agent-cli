@@ -2821,12 +2821,36 @@ impl AppState {
         match agent
             .steer_input_tracked(
                 Some(&snapshot.active_turn_id),
-                echo_agent::llm::types::Message::user(instruction),
+                echo_agent::llm::types::Message::user(instruction.clone()),
             )
             .await
         {
             Ok(mut receipt) => {
                 let turn_id = receipt.turn_id().to_string();
+                // ADR 0035: anchor incremental user constraints in the run
+                // journal so they survive context compression alongside the
+                // Goal. Best-effort — unknown runs are skipped, and a failure
+                // here must not fail the steer delivery itself.
+                if let Some(steer_store) = runtime.task_runtime() {
+                    let steer_turn_id = snapshot.active_turn_id.clone();
+                    let steer_text = instruction.clone();
+                    let steer_result = crate::tasks::task_runtime::TaskRuntimeOperation::new(
+                        steer_store,
+                    )
+                    .run_store("record run steer constraint", move |store| {
+                        store.record_run_steer(
+                            &crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(
+                                &steer_turn_id,
+                            ),
+                            &steer_turn_id,
+                            &steer_text,
+                        )
+                    })
+                    .await;
+                    if let Err(error) = steer_result {
+                        tracing::debug!(%error, "steer constraint was not bound to a TaskRun");
+                    }
+                }
                 self.agent_router
                     .mailbox_accepted(&claim, turn_id.clone())
                     .await?;

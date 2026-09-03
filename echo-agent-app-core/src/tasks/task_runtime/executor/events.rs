@@ -351,6 +351,7 @@ pub async fn drive_agent_run(
             &turn_receipt,
             persisted,
             trace_sink.as_ref(),
+            super::turn_lifecycle::TurnEndPolicy::PolicyDriven,
         )
         .await
         .map_err(ExecError::Other)?;

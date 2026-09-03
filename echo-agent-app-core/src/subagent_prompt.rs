@@ -39,7 +39,7 @@ const SUBAGENT_COMMUNICATION_PROTOCOL: &str = r#"## Subagent Protocol
 - Validate material outputs when tools allow; if validation cannot run, state the reason and remaining risk in the result contract."#;
 
 const SUBAGENT_RESULT_QUALITY_POLICY: &str = r#"## Result Quality
-Put the complete user-facing deliverable in the final answer before `## Result`. The JSON `summary` must also be self-contained because the parent may consume it without the reasoning trace. Never use referential placeholders such as "see above", "as described above", "见上方", or "如上" as the final answer or summary."#;
+Put the complete user-facing deliverable in the final answer before `## Result`. The JSON `summary` must also be self-contained because the parent may consume it without the reasoning trace. Never use referential placeholders such as "see above", "as described above", "见上方", or "如上" as the final answer or summary. Cite key evidence by artifact reference (file path, plus command or sha256 when applicable) instead of paraphrasing it — the parent reads the reference, not the original tool output."#;
 
 const PRIMARY_TASK_RUNTIME_POLICY: &str = r#"## TaskRuntime Assignment Mode
 The assignment, follow-up suggestion, result-quality, and Result Contract rules below apply only when the current invocation contains a `[task_context]` block. Ordinary chat replies keep the primary Agent's normal response contract."#;

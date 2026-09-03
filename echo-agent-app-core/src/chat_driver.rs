@@ -4,9 +4,10 @@
 //! channel / GUI: it takes a [`PreparedUserTurn`] (instruction + input
 //! resources, with long pastes spilled to a user-input artifact), collapses it
 //! into one `Message` via [`PreparedUserTurn::to_message`], and streams the
-//! agent's ReAct reply through a surface-specific `ChatSink`. Explicit
-//! TaskRun submission/resume owns formal run creation; an ordinary chat turn
-//! stays run-less until a task tool creates a formal run.
+//! agent's ReAct reply through a surface-specific `ChatSink`. Every turn
+//! eagerly drives its own TaskRun (ADR 0035): the default binding carries the
+//! turn-derived formal run id, so ordinary chat shares the same admission,
+//! projection, and recovery semantics as explicit task submission/resume.
 //!
 //! Multimodal (images/files) is delivered via the turn's inline resources; the
 //! old `(&str, Option<&Message>)` pair has been replaced by the single
@@ -313,8 +314,8 @@ fn duration_seconds_rounded_up(duration: std::time::Duration) -> u64 {
 /// Wraps `message` (plus optional `multimodal`) into one `Message`, streams the
 /// agent's reply through `sink`, and returns. No route pre-judgment; the
 /// turn id is the shared context anchor for task tools and forked subagents.
-/// Explicit TaskRun bindings are created by task submission/resume paths; an
-/// ordinary chat turn remains run-less until a task tool creates a formal run.
+/// Every turn eagerly drives its own `taskrun:<turn_id>` TaskRun (ADR 0035);
+/// explicit bindings from task submission/resume paths pin an existing run.
 ///
 /// ## turn/run identity
 ///
@@ -557,14 +558,29 @@ async fn prepare_chat_execution(
     } else {
         res.root_message_id.clone()
     };
-    let binding = binding.unwrap_or_else(|| RunTurnBinding {
-        run_id: None,
+    // ADR 0035: every turn eagerly drives its own TaskRun. The default
+    // binding carries the turn-derived formal run id so ordinary chat goes
+    // through the same admission, projection, and recovery semantics as
+    // explicit task/resume turns; a run that never commits a plan revision
+    // settles as Completed at turn end instead of entering continuation.
+    // A store-less degraded execution (task runtime not yet bound) physically
+    // cannot own a TaskRun and keeps the legacy unbound path.
+    let mut binding = binding.unwrap_or_else(|| RunTurnBinding {
+        run_id: res.store.is_some().then(|| {
+            crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&default_turn_id)
+        }),
         turn_id: default_turn_id.clone(),
         root_message_id: default_turn_id,
         origin: RunTurnOrigin::User,
         transcript_visibility: TurnVisibility::Visible,
         expected_resume: None,
     });
+    // Normalize any caller-supplied run-less binding the same way so no
+    // store-backed turn can execute outside the unified runtime (ADR 0035).
+    if binding.run_id.is_none() && res.store.is_some() {
+        binding.run_id =
+            Some(crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&binding.turn_id));
+    }
     if binding.turn_id.trim().is_empty() || binding.root_message_id.trim().is_empty() {
         return Err("RunTurn binding requires non-empty turn and root message ids".to_string());
     }
@@ -586,9 +602,9 @@ async fn prepare_chat_execution(
     let formal_run_id = binding.run_id.clone().unwrap_or_else(|| {
         crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id)
     });
-    // Every turn that can reach task_create/task_execute is registered before
-    // memory admission. An explicit binding owns the run driver; an ordinary
-    // run-less turn can still create and supervise a formal TaskRun lazily.
+    // Every turn registers its run driver before memory admission; with the
+    // eager default binding (ADR 0035) every ordinary turn owns a formal
+    // TaskRun from the first model boundary.
     let mut task_driver_registration = match res.store.as_ref() {
         Some(store) => {
             let admission = store
@@ -597,12 +613,9 @@ async fn prepare_chat_execution(
             let generation = store
                 .lease_active_workspace_generation()
                 .map_err(|error| format!("task runtime generation admission failed: {error}"))?;
-            let registration = if drives_task_run {
-                store.register_run_driver::<TurnReceipt>(admission, generation)
-            } else {
-                store.register_optional_run_driver::<TurnReceipt>(admission, generation)
-            }
-            .map_err(|error| format!("chat driver registration failed: {error}"))?;
+            let registration = store
+                .register_run_driver::<TurnReceipt>(admission, generation)
+                .map_err(|error| format!("chat driver registration failed: {error}"))?;
             Some(registration)
         }
         None if drives_task_run => {
@@ -1074,7 +1087,12 @@ async fn finalize_run_turn(
 ) -> Result<crate::tasks::task_runtime::turn_lifecycle::RunTurnDecision, String> {
     let blocking = crate::tasks::task_runtime::TaskRuntimeOperation::new(store.clone());
     crate::tasks::task_runtime::turn_lifecycle::finalize_run_turn(
-        &blocking, store, run_id, outcome, trace_sink,
+        &blocking,
+        store,
+        run_id,
+        outcome,
+        trace_sink,
+        crate::tasks::task_runtime::turn_lifecycle::TurnEndPolicy::ChatTurn,
     )
     .await
 }
@@ -2130,14 +2148,12 @@ mod tests {
         fn event_count(&self) -> usize {
             self.events.lock().unwrap_or_else(|e| e.into_inner()).len()
         }
-        fn has_run_identity(&self) -> bool {
-            self.events
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .iter()
-                .any(|event| event.run_id.is_some())
-        }
-        fn has_valid_contract(&self, conversation_id: &str, turn_id: &str) -> bool {
+        fn has_valid_contract(
+            &self,
+            conversation_id: &str,
+            turn_id: &str,
+            expected_run_id: &str,
+        ) -> bool {
             let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
             let terminal_count = events
                 .iter()
@@ -2148,7 +2164,10 @@ mod tests {
                     && event.sequence == (index as u64).saturating_add(1)
                     && event.conversation_id.as_ref().map(|id| id.as_str()) == Some(conversation_id)
                     && event.turn_id.as_str() == turn_id
-                    && event.run_id.is_none()
+                    && event
+                        .run_id
+                        .as_ref()
+                        .is_some_and(|id| id.as_str() == expected_run_id)
                     && !event.event_id.as_str().is_empty()
             }) && terminal_count == 1
         }
@@ -2947,10 +2966,13 @@ mod tests {
         winner
             .await
             .map_err(|error| format!("winner task failed: {error}"))??;
+        // ADR 0035: a completed turn on a run that never committed a plan
+        // settles as Completed at turn end (previously it spun continuation
+        // turns until RepeatedBlocker paused the run).
         wait_for_run_status(
             &store,
             "claim-race-run",
-            crate::tasks::task_runtime::TaskRunStatus::Paused,
+            crate::tasks::task_runtime::TaskRunStatus::Completed,
         )
         .await?;
         Ok(())
@@ -3173,11 +3195,16 @@ mod tests {
         assert_eq!(unchanged_starts.len(), 3);
         let auto_derived =
             crate::tasks::task_runtime::task_tools::formal_run_id_for_turn("auto-resume-message");
-        assert!(
-            store
-                .get_run(&auto_derived)
-                .map_err(|error| error.to_string())?
-                .is_none()
+        // ADR 0035: the ordinary turn now eagerly drives its own TaskRun and
+        // settles it Completed without a plan; the existing goal run above is
+        // untouched.
+        let auto_run = store
+            .get_run(&auto_derived)
+            .map_err(|error| error.to_string())?
+            .ok_or("ordinary auto-resume reply turn should eagerly create a TaskRun")?;
+        assert_eq!(
+            auto_run.status,
+            crate::tasks::task_runtime::types::TaskRunStatus::Completed
         );
         Ok(())
     }
@@ -3648,24 +3675,36 @@ mod tests {
             chat_sink.event_count()
         );
         assert!(
-            chat_sink.has_valid_contract("c1", turn_id),
+            chat_sink.has_valid_contract(
+                "c1",
+                turn_id,
+                &crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(turn_id)
+            ),
             "drive_chat should preserve version, identity, sequence, and exactly one terminal"
+        );
+        // ADR 0035: an ordinary chat turn eagerly drives its own TaskRun and,
+        // with no plan revision ever committed, settles it as Completed at
+        // turn end instead of entering the continuation loop.
+        let formal_run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(turn_id);
+        let settled_run = store
+            .get_run(&formal_run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("ordinary chat should eagerly create a TaskRun")?;
+        assert_eq!(
+            settled_run.status,
+            crate::tasks::task_runtime::types::TaskRunStatus::Completed
         );
         assert!(
             store
-                .get_run(&crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(turn_id),)
+                .get_plan(&formal_run_id)
                 .map_err(|error| error.to_string())?
                 .is_none(),
-            "ordinary chat must not create a TaskRun"
-        );
-        assert!(
-            !chat_sink.has_run_identity(),
-            "ordinary Auto chat events must not claim a nonexistent TaskRun"
+            "ordinary chat must not synthesize a plan"
         );
         let shutdown_result = store.shutdown_run_drivers().await;
         assert!(
             shutdown_result.is_ok(),
-            "optional no-run driver should settle normally: {shutdown_result:?}"
+            "eager chat run driver should settle normally: {shutdown_result:?}"
         );
         assert_eq!(store.active_run_driver_count().unwrap_or_default(), 0);
         Ok(())
@@ -3822,12 +3861,12 @@ mod tests {
         store
             .create_run(
                 &run_id,
-                "default",
+                "test",
                 "c1",
                 turn_id,
                 DomainProfile::General,
                 "boundary goal",
-                "complex_runtime",
+                "agent_task_plan",
                 AttendedMode::Attended,
             )
             .map_err(|error| error.to_string())?;
@@ -3869,25 +3908,23 @@ mod tests {
             human_loop_provider: None,
         });
 
-        let driver_error = drive_chat(&agent, &make_turn("continue"), res)
-            .await
-            .err()
-            .ok_or_else(|| {
-                "projection fixture left a Pending TaskRun but the driver reported success"
-                    .to_string()
-            })?;
-        if !driver_error.contains("non-terminal status pending") {
-            return Err(format!(
-                "projection fixture returned an unexpected driver error: {driver_error}"
-            ));
-        }
+        // ADR 0035: the ordinary turn eagerly claims this pre-seeded run (its
+        // identity matches the turn-derived formal run) and drives it to a
+        // successful completion; the old "abandoned Pending run fails" path no
+        // longer exists because no turn executes outside the runtime.
+        let outcome = drive_chat(&agent, &make_turn("continue"), res).await?;
+        assert_eq!(outcome, echo_agent::runtime::TurnOutcome::Completed);
         let settled_run = store
             .get_run(&run_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "projection fixture run disappeared during settlement".to_string())?;
-        if settled_run.status != crate::tasks::task_runtime::TaskRunStatus::Failed {
+        if matches!(
+            settled_run.status,
+            crate::tasks::task_runtime::TaskRunStatus::Failed
+                | crate::tasks::task_runtime::TaskRunStatus::Cancelled
+        ) {
             return Err(format!(
-                "projection fixture did not durably fail its abandoned run: {:?}",
+                "projection fixture run was not driven to a healthy state: {:?}",
                 settled_run.status
             ));
         }

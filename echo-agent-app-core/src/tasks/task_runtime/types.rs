@@ -519,6 +519,9 @@ pub enum RuntimeEventKind {
     RunCreated,
     /// The user explicitly replaced the sole authoritative TaskRun Goal.
     RunGoalUpdated,
+    /// A user steer landed in a run-bound turn — an incremental constraint
+    /// that must survive context compression alongside the Goal.
+    RunSteerRecorded,
     /// Existing evidence was detached from an older Goal revision.
     RequirementEvidenceInvalidated,
     /// Unchanged evidence was explicitly rebound after a Goal-aware plan update.
@@ -627,6 +630,7 @@ impl RuntimeEventKind {
         match self {
             RunCreated => "run_created",
             RunGoalUpdated => "run_goal_updated",
+            RunSteerRecorded => "run_steer_recorded",
             RequirementEvidenceInvalidated => "requirement_evidence_invalidated",
             RequirementEvidenceRevalidated => "requirement_evidence_revalidated",
             RequirementSkipped => "requirement_skipped",
@@ -729,6 +733,7 @@ impl RuntimeEventKind {
         Some(match s {
             "run_created" => RunCreated,
             "run_goal_updated" => RunGoalUpdated,
+            "run_steer_recorded" => RunSteerRecorded,
             "requirement_evidence_invalidated" => RequirementEvidenceInvalidated,
             "requirement_evidence_revalidated" => RequirementEvidenceRevalidated,
             "requirement_skipped" => RequirementSkipped,
@@ -1305,6 +1310,11 @@ pub struct RunStateSnapshot {
     /// Event-folded background command cells owned by this run.
     #[serde(default)]
     pub background_cells: Vec<BackgroundCellState>,
+    /// Event-folded recent user steers (incremental constraints) recorded for
+    /// run-bound turns. Bounded to the most recent entries; each entry keeps
+    /// its turn id so the capsule can attribute the constraint.
+    #[serde(default)]
+    pub recent_constraints: Vec<RecordedUserSteer>,
     /// Last authoritative journal sequence folded into this snapshot. This is
     /// the optimistic-concurrency epoch for queued resume actions.
     #[serde(default)]
@@ -1313,6 +1323,13 @@ pub struct RunStateSnapshot {
     /// fold. It is not a second authority and is intentionally not a UI wire.
     #[serde(default)]
     pub(crate) event_index: RunStateEventIndex,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordedUserSteer {
+    pub turn_id: String,
+    pub text: String,
+    pub recorded_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -3097,6 +3114,7 @@ mod tests {
             tasks: Vec::new(),
             continuation: None,
             background_cells: Vec::new(),
+            recent_constraints: Vec::new(),
             journal_sequence: 7,
             event_index: RunStateEventIndex::default(),
         };

@@ -1987,7 +1987,7 @@ mod workspace_transition_tests {
             .await
             .map_err(|error| error.to_string())?;
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let target_record = loop {
             let record = state
                 .agent_router
@@ -2026,7 +2026,7 @@ mod workspace_transition_tests {
             .reply_message_id
             .clone()
             .ok_or_else(|| "correlated reply was not queued".to_string())?;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let source_record = loop {
             let record = state
                 .agent_router
@@ -2255,7 +2255,10 @@ mod workspace_transition_tests {
             .send_agent_message_owned(live_message)
             .await
             .map_err(|error| error.to_string())?;
-        let live_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Wall-clock budget must tolerate full-suite parallel load: the
+        // steered target turn settles in seconds when idle but can exceed a
+        // tight 5s deadline while other test binaries compete for cores.
+        let live_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let live_record = loop {
             let record = state
                 .agent_router
@@ -2318,7 +2321,7 @@ mod workspace_transition_tests {
             .send_agent_message_owned(busy_message)
             .await
             .map_err(|error| error.to_string())?;
-        let defer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let defer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let deferred = state
                 .agent_router
@@ -2347,7 +2350,7 @@ mod workspace_transition_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         busy_lease.settle(crate::chat_driver::TurnOutcome::Completed);
-        let resume_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let resume_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let resumed_record = loop {
             let record = state
                 .agent_router

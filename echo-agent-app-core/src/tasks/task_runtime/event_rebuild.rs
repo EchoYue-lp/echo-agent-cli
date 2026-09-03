@@ -21,11 +21,14 @@ use super::types::{
     ActiveSubagentBoundary, ActiveToolBoundary, Artifact, ArtifactKind, AttendedMode,
     BackgroundCellArtifactStatus, BackgroundCellPhase, BackgroundCellState,
     BackgroundCellTerminalCause, BlockerAudit, DomainProfile, ExecutionMode, PlanRevision,
-    PlanTask, ProviderRetryState, RecoveryBlocker, ReviewOutcome, ReviewResult,
+    PlanTask, ProviderRetryState, RecordedUserSteer, RecoveryBlocker, ReviewOutcome, ReviewResult,
     RunContinuationState, RunPause, RunPauseReason, RunStateEventIndex, RunStateSnapshot,
     RunTurnOrigin, RunTurnStatus, RunTurnSummary, RuntimeEventKind, RuntimeTaskEvent,
     TaskExecutionSummary, TaskPlan, TaskRun, TaskRunStatus, TurnVisibility,
 };
+
+/// How many recent user steers the fold keeps for the recovery capsule.
+const MAX_RECORDED_STEERS: usize = 8;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct TodoRuntimeProjection {
@@ -181,6 +184,8 @@ pub struct RebuiltPlan {
     #[serde(default)]
     pub continuation: Option<RunContinuationState>,
     #[serde(default)]
+    pub recent_constraints: Vec<RecordedUserSteer>,
+    #[serde(default)]
     pub(crate) event_index: RunStateEventIndex,
 }
 
@@ -206,6 +211,7 @@ impl RebuiltPlan {
             tasks: self.tasks.iter().map(PlanTask::execution).collect(),
             continuation: self.continuation.clone(),
             background_cells: self.background_cells.clone(),
+            recent_constraints: self.recent_constraints.clone(),
             journal_sequence,
             event_index: self.event_index.clone(),
         }
@@ -234,6 +240,8 @@ pub(crate) struct EventFoldState {
     background_cells: std::collections::BTreeMap<String, BackgroundCellState>,
     #[serde(default)]
     continuation: Option<RunContinuationState>,
+    #[serde(default)]
+    recent_constraints: Vec<RecordedUserSteer>,
     #[serde(default)]
     started_turns: std::collections::BTreeSet<String>,
     #[serde(default)]
@@ -304,6 +312,7 @@ impl EventFoldState {
             tasks,
             background_cells,
             continuation,
+            recent_constraints,
             started_turns,
             accounted_usage,
             accounted_compactions,
@@ -404,6 +413,18 @@ impl EventFoldState {
                         json_string(&ev.payload, "continuation_deferred_reason");
                     completion.requirement_skips.clear();
                     completion.revalidations.clear();
+                }
+                K::RunSteerRecorded => {
+                    if let Some(text) = json_string(&ev.payload, "text") {
+                        recent_constraints.push(RecordedUserSteer {
+                            turn_id: json_string(&ev.payload, "turn_id").unwrap_or_default(),
+                            text,
+                            recorded_at: ev.timestamp,
+                        });
+                        // Bounded fold: keep the most recent constraints only.
+                        let excess = recent_constraints.len().saturating_sub(MAX_RECORDED_STEERS);
+                        recent_constraints.drain(0..excess);
+                    }
                 }
                 K::RunStatusChanged => {
                     if let Some(r) = run.as_mut() {
@@ -1167,6 +1188,7 @@ impl EventFoldState {
             tasks: self.tasks.clone(),
             background_cells: self.background_cells.values().cloned().collect(),
             continuation: self.continuation.clone(),
+            recent_constraints: self.recent_constraints.clone(),
             event_index: RunStateEventIndex {
                 started_turns: self.started_turns.clone(),
                 accounted_usage: self.accounted_usage.clone(),

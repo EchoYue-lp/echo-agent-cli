@@ -1,3 +1,7 @@
+/// Goals longer than this spill the full text to `objective.md` next to the
+/// journal; in-context projections stay bounded and point at the artifact.
+const OBJECTIVE_ARTIFACT_SPILL_CHARS: usize = 8_000;
+
 impl TaskRuntimeStore {
     /// Phase-one process shutdown: close driver admission and broadcast every
     /// accepted driver cancellation without awaiting settlement.
@@ -817,28 +821,13 @@ impl TaskRuntimeStore {
     where
         T: Send + 'static,
     {
-        self.register_run_driver_with_requirement(admission, generation_lease, true)
-    }
-
-    /// Register a turn driver whose TaskRun is created lazily by `task_create`.
-    /// A Chat/Auto turn that never creates a run settles successfully, while a
-    /// lazily-created run remains subject to the same durable terminal contract.
-    pub(crate) fn register_optional_run_driver<T>(
-        self: &std::sync::Arc<Self>,
-        admission: RunDriverAdmissionReservation,
-        generation_lease: WorkspaceGenerationLease,
-    ) -> Result<RegisteredRunDriver<T>, StoreError>
-    where
-        T: Send + 'static,
-    {
-        self.register_run_driver_with_requirement(admission, generation_lease, false)
+        self.register_run_driver_with_requirement(admission, generation_lease)
     }
 
     fn register_run_driver_with_requirement<T>(
         self: &std::sync::Arc<Self>,
         mut admission: RunDriverAdmissionReservation,
         generation_lease: WorkspaceGenerationLease,
-        run_required: bool,
     ) -> Result<RegisteredRunDriver<T>, StoreError>
     where
         T: Send + 'static,
@@ -966,11 +955,15 @@ impl TaskRuntimeStore {
                 if should_settle {
                     let settlement = match &result {
                         Ok(_) => operation_store
-                            .confirm_run_settled(&operation_run_id, run_required),
+                            .confirm_run_settled(&operation_run_id),
                         Err(error) => match operation_store.get_run(&operation_run_id) {
-                            Ok(None) if !run_required => Ok(()),
+                            // A missing run shares the terminal-settlement
+                            // path: finalize pushes a durable settlement debt
+                            // (with the shutdown-aware target) instead of
+                            // silently passing.
                             Ok(Some(run)) if run.status == TaskRunStatus::Paused => Ok(()),
-                            Ok(_) => {
+                            Err(read_error) => Err(read_error),
+                            _ => {
                                 let target = if driver_cancel.is_cancelled() {
                                     TaskRunStatus::Cancelled
                                 } else {
@@ -986,7 +979,6 @@ impl TaskRuntimeStore {
                                     )
                                     .map(|_| ())
                             }
-                            Err(read_error) => Err(read_error),
                         },
                     };
                     if let Err(settlement_error) = settlement {
@@ -1335,13 +1327,9 @@ impl TaskRuntimeStore {
         Ok((preparation, waiter))
     }
 
-    fn confirm_run_settled(&self, run_id: &str, run_required: bool) -> Result<(), StoreError> {
+    fn confirm_run_settled(&self, run_id: &str) -> Result<(), StoreError> {
         let Some(run) = self.get_run(run_id)? else {
-            return if run_required {
-                Err(StoreError::RunNotFound(run_id.to_string()))
-            } else {
-                Ok(())
-            };
+            return Err(StoreError::RunNotFound(run_id.to_string()));
         };
         if matches!(
             run.status,
@@ -1649,7 +1637,50 @@ impl TaskRuntimeStore {
                     "created_at": echo_agent::utils::time::to_local(run.created_at).to_rfc3339(),
                 }),
             ))?;
+            self.spill_objective_artifact_if_bounded(run_id, goal);
             Ok(run)
+        })
+    }
+
+    /// Write the full objective next to the journal when a Goal exceeds the
+    /// in-context contract bound. Best-effort derived view; the journal stays
+    /// authoritative.
+    fn spill_objective_artifact_if_bounded(&self, run_id: &str, goal: &str) {
+        if goal.chars().count() <= OBJECTIVE_ARTIFACT_SPILL_CHARS {
+            return;
+        }
+        if let Err(error) = self.shadow.write_objective_artifact(run_id, goal) {
+            tracing::warn!(run_id, %error, "objective artifact spill failed");
+        }
+    }
+
+    /// Path of the spilled objective artifact for a run, when one exists.
+    pub fn objective_artifact_path(&self, run_id: &str) -> Option<std::path::PathBuf> {
+        self.shadow.objective_artifact_path(run_id)
+    }
+
+    /// Anchor an incremental user constraint (steer) in the run journal so it
+    /// survives context compression alongside the Goal. Best-effort by design:
+    /// callers skip unknown runs instead of failing the steer delivery.
+    pub fn record_run_steer(
+        &self,
+        run_id: &str,
+        turn_id: &str,
+        text: &str,
+    ) -> Result<(), StoreError> {
+        let _operation = self.shadow_operation()?;
+        self.with_run_lock(run_id, || {
+            self.get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let bounded: String = text.chars().take(2_000).collect();
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
+                run_id,
+                None,
+                Some(turn_id),
+                RuntimeEventKind::RunSteerRecorded,
+                serde_json::json!({ "turn_id": turn_id, "text": bounded }),
+            ))?;
+            Ok(())
         })
     }
 
@@ -1796,6 +1827,7 @@ impl TaskRuntimeStore {
                 ));
             }
             self.commit_runtime_events(run_id, events)?;
+            self.spill_objective_artifact_if_bounded(run_id, new_goal);
             self.get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))
         })
@@ -4173,6 +4205,14 @@ impl TaskRuntimeStore {
                 })
                 .collect::<Vec<_>>();
             let plan = self.get_plan(&run.run_id)?;
+            // ADR 0035: an eagerly bound conversational run that never
+            // committed a plan revision has no resumable work — settle it as
+            // Cancelled(Interrupted) instead of entering the BootRecovery
+            // pause/auto-resume adjudication.
+            if plan.is_none() {
+                self.transition_run(&run.run_id, TaskRunStatus::Cancelled)?;
+                return Ok(true);
+            }
             let active_subagents = self.active_subagent_boundaries(&run.run_id)?;
             let active_tools = self.active_tool_boundaries(&run.run_id)?;
             let running_task_ids = state

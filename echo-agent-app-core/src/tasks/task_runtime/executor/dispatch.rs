@@ -2150,6 +2150,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             })
             .unwrap_or_else(|| serde_json::json!({}));
         let run_id = run_id.to_string();
+        let wake_run_id = run_id.clone();
         let task_id = runtime_task.spec.id.clone();
         let agent_role = Self::plan_task(runtime_task)?.agent_role;
         let claim = claim.clone();
@@ -2198,6 +2199,14 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     committed_payload,
                 )
                 .with_agent(agent_role),
+            );
+            // A settled plan task is a concrete wake-up: if the run deferred
+            // its continuation (active cells or in-flight subagent work) and
+            // the runtime is now quiet, resume the next RunTurn instead of
+            // waiting for the last background cell.
+            crate::tasks::task_runtime::continuation::wake_deferred_when_runtime_quiet(
+                &self.store,
+                &wake_run_id,
             );
         }
         Ok(outcome)

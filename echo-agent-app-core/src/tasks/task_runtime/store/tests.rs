@@ -1896,7 +1896,10 @@ mod tests {
             .map_err(|error| error.to_string())?
             .err()
             .ok_or_else(|| "first driver failure was not reported".to_string())?;
-        assert!(first_error.contains("terminal settlement failed"));
+        assert!(
+            first_error.contains("terminal settlement failed"),
+            "actual first_error: {first_error}"
+        );
         assert_eq!(store.active_run_driver_receipt_count()?, 1);
 
         let shutdown_error = store
@@ -3225,7 +3228,7 @@ mod tests {
                 None,
                 Some("call-1"),
             )?;
-            super::super::continuation::wake_after_cell_terminal(&terminal_store, "r1");
+            super::super::continuation::wake_deferred_when_runtime_quiet(&terminal_store, "r1");
             Ok::<(), StoreError>(())
         });
 
@@ -3243,6 +3246,56 @@ mod tests {
             .and_then(|state| state.continuation)
             .ok_or_else(|| "continuation missing".to_string())?;
         assert!(!continuation.deferred);
+        Ok(())
+    }
+
+    #[test]
+    fn quiet_wake_holds_deferral_while_plan_tasks_are_running() -> Result<(), String> {
+        let store = std::sync::Arc::new(fresh().map_err(|error| error.to_string())?);
+        seed_plan(&store).map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation("r1", true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        store
+            .set_task_status(
+                "r1",
+                "t1",
+                echo_agent::tasks::TaskStatus::Running,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .set_continuation_deferred("r1", true)
+            .map_err(|error| error.to_string())?;
+
+        // In-flight subagent work keeps the deferral even when no background
+        // cell is active — the wake must not resume a turn mid-execution.
+        super::super::continuation::wake_deferred_when_runtime_quiet(&store, "r1");
+        let held = store
+            .get_run_state("r1")
+            .map_err(|error| error.to_string())?
+            .and_then(|state| state.continuation)
+            .ok_or_else(|| "continuation missing".to_string())?;
+        assert!(held.deferred, "running plan task must hold the deferral");
+
+        // Once the task settles the same wake clears the deferral.
+        store
+            .set_task_status(
+                "r1",
+                "t1",
+                echo_agent::tasks::TaskStatus::Completed,
+                None,
+                Some("done"),
+            )
+            .map_err(|error| error.to_string())?;
+        super::super::continuation::wake_deferred_when_runtime_quiet(&store, "r1");
+        let cleared = store
+            .get_run_state("r1")
+            .map_err(|error| error.to_string())?
+            .and_then(|state| state.continuation)
+            .ok_or_else(|| "continuation missing".to_string())?;
+        assert!(!cleared.deferred, "settled task with no cells must wake the run");
         Ok(())
     }
 

@@ -228,9 +228,15 @@ pub fn build_runtime_goal_contract(store: &TaskRuntimeStore, run_id: &str) -> Op
             .map(|revision| revision.to_string())
             .unwrap_or_else(|| "none".to_string()),
         if objective_truncated {
-            " (bounded here; recover the full referenced objective artifact before acting)"
+            let artifact = store
+                .objective_artifact_path(run_id)
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unavailable".to_string());
+            format!(
+                " (bounded here; recover the full objective artifact before acting: {artifact})"
+            )
         } else {
-            ""
+            String::new()
         },
         objective,
         continuation.tokens_used,
@@ -257,6 +263,7 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
     let state = store.get_run_state(run_id).ok().flatten()?;
     let run = state.run;
     let continuation = state.continuation;
+    let recent_constraints = state.recent_constraints;
     let plan = store.get_plan(run_id).unwrap_or_default();
     let todos = store.list_todos(run_id).unwrap_or_default();
     let cells = store.list_background_cells(run_id).unwrap_or_default();
@@ -268,6 +275,7 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
     let has_runtime_todos = todos.iter().any(|todo| !todo.task_id.trim().is_empty());
     if !has_plan_tasks
         && !has_runtime_todos
+        && recent_constraints.is_empty()
         && cells.is_empty()
         && continuation.as_ref().is_none_or(|state| !state.enabled)
     {
@@ -290,6 +298,14 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
         run.domain_profile.as_str(),
         truncate_chars(&run.goal, MAX_GOAL_CHARS),
     ));
+    if run.goal.chars().count() > MAX_GOAL_CHARS
+        && let Some(artifact) = store.objective_artifact_path(run_id)
+    {
+        out.push_str(&format!(
+            "Full objective artifact: {}\n",
+            artifact.display()
+        ));
+    }
     if let Some(continuation) = continuation {
         out.push_str(&format!(
             "Continuation: active_turn={}, last_turn={}, turns_next={}, tokens_used={}, token_budget={}, tokens_remaining={}, time_used_seconds={}, time_budget_seconds={}, time_remaining_seconds={}, compactions={}, deferred={}, pause={}\n",
@@ -345,6 +361,18 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
         ));
         push_short_list(&mut out, "Assumptions", &plan.assumptions, 3, 120);
         push_short_list(&mut out, "Risks", &plan.risks, 3, 120);
+    }
+
+    // ADR 0035: incremental user constraints recorded via run steers are as
+    // binding as the Goal — surface them in the compression-safe capsule so
+    // narrowed context cannot silently drop them.
+    if !recent_constraints.is_empty() {
+        out.push_str("Recent user constraints:\n");
+        for steer in recent_constraints.iter().rev().take(4) {
+            let text: String = steer.text.chars().take(200).collect();
+            out.push_str(&format!("- (turn {}) {text}\n", steer.turn_id));
+        }
+        out.push('\n');
     }
 
     push_task_group(
@@ -793,6 +821,89 @@ mod tests {
         if build_runtime_recovery_capsule(&store, "r2").is_some() {
             return Err("ordinary chat run should not get a capsule".to_string());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn recorded_user_steer_survives_into_recovery_capsule() -> Result<(), String> {
+        let store =
+            TaskRuntimeStore::new_in_memory().map_err(|err| format!("seed store failed: {err}"))?;
+        let _run = store
+            .create_run(
+                "r3",
+                "default",
+                "c1",
+                "m3",
+                DomainProfile::General,
+                "升级依赖并修复测试",
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )
+            .map_err(|err| format!("seed create_run failed: {err}"))?;
+        store
+            .configure_run_continuation("r3", true, false, None, None)
+            .map_err(|err| format!("configure continuation failed: {err}"))?;
+        store
+            .record_run_steer("r3", "turn-1", "不要引入新依赖,优先修改现有实现")
+            .map_err(|err| format!("record steer failed: {err}"))?;
+        let capsule = build_runtime_recovery_capsule(&store, "r3")
+            .ok_or_else(|| "capsule should be built after a recorded steer".to_string())?;
+        if !capsule.contains("Recent user constraints") || !capsule.contains("不要引入新依赖")
+        {
+            return Err("capsule missing the recorded user constraint".to_string());
+        }
+        // The journal fold keeps the constraint across a rebuild.
+        let folded = store
+            .get_run_state("r3")
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "run state missing".to_string())?;
+        assert_eq!(folded.recent_constraints.len(), 1);
+        assert_eq!(folded.recent_constraints[0].turn_id, "turn-1");
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_goal_spills_objective_artifact_and_points_at_it() -> Result<(), String> {
+        let store =
+            TaskRuntimeStore::new_in_memory().map_err(|err| format!("seed store failed: {err}"))?;
+        let long_goal: String =
+            "跨窗口目标: ".to_string() + &std::iter::repeat_n('目', 9_000).collect::<String>();
+        let _run = store
+            .create_run(
+                "r4",
+                "default",
+                "c1",
+                "m4",
+                DomainProfile::General,
+                &long_goal,
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )
+            .map_err(|err| format!("seed create_run failed: {err}"))?;
+        store
+            .configure_run_continuation("r4", true, false, None, None)
+            .map_err(|err| format!("configure continuation failed: {err}"))?;
+        let artifact = store
+            .objective_artifact_path("r4")
+            .ok_or("oversized goal should spill an objective artifact")?;
+        assert_eq!(
+            std::fs::read_to_string(&artifact).map_err(|err| err.to_string())?,
+            long_goal,
+            "spilled artifact must hold the full objective verbatim"
+        );
+        let contract = build_runtime_goal_contract(&store, "r4")
+            .ok_or_else(|| "goal contract should be built".to_string())?;
+        if !contract.contains("objective artifact before acting")
+            || !contract.contains("objective.md")
+        {
+            return Err("goal contract should point at the spilled objective artifact".to_string());
+        }
+        let capsule = build_runtime_recovery_capsule(&store, "r4")
+            .ok_or_else(|| "capsule should be built".to_string())?;
+        assert!(
+            capsule.contains("Full objective artifact:"),
+            "capsule should point at the spilled objective artifact"
+        );
         Ok(())
     }
 

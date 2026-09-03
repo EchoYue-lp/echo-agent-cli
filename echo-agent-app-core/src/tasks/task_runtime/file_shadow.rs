@@ -794,6 +794,30 @@ impl FileTaskShadow {
         Ok(())
     }
 
+    /// Spill the full objective text for Goals that exceed the in-context
+    /// contract bound, so the truncated projection can point at a concrete
+    /// recoverable file instead of asking the model to guess. Derived view:
+    /// the journal remains the Goal authority.
+    pub(crate) fn write_objective_artifact(
+        &self,
+        run_id: &str,
+        goal: &str,
+    ) -> Result<std::path::PathBuf, ShadowError> {
+        let dir = self.root().join(run_id);
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| ShadowError::Io(format!("objective artifact dir: {error}")))?;
+        let path = dir.join("objective.md");
+        std::fs::write(&path, goal)
+            .map_err(|error| ShadowError::Io(format!("objective artifact write: {error}")))?;
+        Ok(path)
+    }
+
+    /// Path of the spilled objective artifact, when one exists.
+    pub(crate) fn objective_artifact_path(&self, run_id: &str) -> Option<std::path::PathBuf> {
+        let path = self.root().join(run_id).join("objective.md");
+        path.is_file().then_some(path)
+    }
+
     #[cfg(test)]
     pub(crate) fn rewrite_plan_with_stats(
         &self,
