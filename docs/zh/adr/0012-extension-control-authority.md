@@ -2,7 +2,9 @@
 
 ## 状态
 
-已采纳，2026-08-25；已实现，2026-08-26。
+已采纳，2026-08-25；已实现，2026-08-26。Skill durable settlement 状态机部分已由
+[ADR 0036](./0036-skill-policy-simplification.md) 取代；统一 Extension authority、mutation
+互斥和多 surface 共享合同仍保留。
 
 ## 背景
 

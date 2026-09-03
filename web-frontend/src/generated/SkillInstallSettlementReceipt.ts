@@ -3,6 +3,7 @@ import type { SkillSyncReceipt } from './SkillSyncReceipt';
 
 export type SkillInstallSettlementReceipt = {
   name: string;
+  installed_names: Array<string>;
   path: string;
   source: string;
   revision: string | null;

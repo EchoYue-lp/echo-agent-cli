@@ -30,7 +30,7 @@ export const WORKSPACE_KINDS: WorkspaceKindMeta[] = [
     value: 'code',
     label: '代码项目',
     icon: Code,
-    desc: '自动激活 coding、git-workflow 技能',
+    desc: '注入代码项目行为并激活 git-workflow 技能',
     color: '#6366f1',
   },
   {
@@ -44,7 +44,7 @@ export const WORKSPACE_KINDS: WorkspaceKindMeta[] = [
     value: 'research',
     label: '学术研究',
     icon: GraduationCap,
-    desc: '自动激活 paper-search、paper-reader、doc-writing 技能',
+    desc: '自动激活 paper-search、paper-reader 技能',
     color: '#10b981',
   },
   {

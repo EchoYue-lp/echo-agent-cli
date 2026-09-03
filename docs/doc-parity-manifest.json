@@ -283,6 +283,30 @@
       "legacyRemoved": true
     },
     {
+      "legacyPath": "adr/0034-full-direction-agent-communication-matrix.md",
+      "targetPath": "adr/0034-full-direction-agent-communication-matrix.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0035-conversation-archive-projection.md",
+      "targetPath": "adr/0035-conversation-archive-projection.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0036-skill-policy-simplification.md",
+      "targetPath": "adr/0036-skill-policy-simplification.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
       "legacyPath": "architecture.md",
       "targetPath": "architecture/overview.md",
       "kind": "architecture",

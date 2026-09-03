@@ -221,20 +221,8 @@ impl SkillsHub {
             .map(|record| record.revision.chars().take(12).collect::<String>())
             .or_else(|| descriptor.metadata.get("upstream-version").cloned());
 
-        // Determine baseline status from enabled-skills.json (checked later)
-        let is_baseline = match metadata_category.as_str() {
-            "methodology" => {
-                // Core 4 methodology skills default to baseline
-                matches!(
-                    descriptor.name.as_str(),
-                    "brainstorming"
-                        | "systematic-debugging"
-                        | "verification-before-completion"
-                        | "writing-plans"
-                )
-            }
-            _ => false,
-        };
+        let is_baseline = metadata_category == "methodology"
+            && super::enabled_skills::DEFAULT_BASELINE_SKILLS.contains(&descriptor.name.as_str());
 
         let missing_dependencies = missing_binary_names(&descriptor);
 

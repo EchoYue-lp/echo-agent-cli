@@ -46,9 +46,9 @@ Hooks/Webhooks, Plugins, and Skills.
 
 `ExtensionControlService` is the EKO mutation admission for Skills, Plugins,
 MCP, Hooks, LSP, and Browser. It delegates to specialist owners and does not
-create a second registry, manager, or store. Durable desired state, typed
-settlement, repair debt, and captured workspace identity are shared across GUI,
-TUI, CLI/JSONL, and channels.
+create a second registry, manager, or store. Skill enablement uses one atomic
+flat policy and immediate typed reconciliation; captured workspace identity and
+the same command authority are shared across GUI, TUI, CLI/JSONL, and channels.
 
 ## Professional Workbenches
 

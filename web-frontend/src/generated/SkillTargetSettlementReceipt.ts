@@ -4,7 +4,6 @@ import type { SkillTargetSettlementStatus } from './SkillTargetSettlementStatus'
 export type SkillTargetSettlementReceipt = {
   target: string;
   workspace_generation: string;
-  specialist_generation: string;
   status: SkillTargetSettlementStatus;
   changed_entries: Array<string>;
   error: string | null;

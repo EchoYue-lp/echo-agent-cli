@@ -22,9 +22,15 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Debug)]
 pub(crate) struct InstallResult {
     pub name: String,
+    pub installed_names: Vec<String>,
     pub path: PathBuf,
     pub source: String,
     pub revision: Option<String>,
+}
+
+struct PluginSkillPackage {
+    name: String,
+    skill_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +78,180 @@ pub(crate) fn install_from_local(
     source: &Path,
     hub: &mut SkillsHub,
 ) -> Result<InstallResult, String> {
+    // Agent Plugins 1.0 留口:标准插件包(plugin.json)安装其 skills/ 子目录。
+    if let Some(package) = plugin_skill_package(source)? {
+        return install_plugin_skill_package(source, package, hub, None);
+    }
+    install_single_skill_dir(source, hub, None)
+}
+
+/// 探测 Agent Plugins 1.0 标准包布局。
+///
+/// 返回 `None` 表示不是插件包(按普通 skill 目录处理);返回 `Some(dirs)`
+/// 表示应安装 `skills/` 下各含 SKILL.md 的子目录。包内若带 `mcp.json`
+/// (MCP server 配置)则报错提示暂不支持——当前留口只覆盖 skills 面。
+fn plugin_skill_package(root: &Path) -> Result<Option<PluginSkillPackage>, String> {
+    if !root.join("plugin.json").is_file() {
+        return Ok(None);
+    }
+    let manifest = echo_agent::plugin::PluginManifest::from_file(&root.join("plugin.json"))?;
+    let manifest_errors = manifest
+        .validate()
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if !manifest_errors.is_empty() {
+        return Err(format!(
+            "Agent Plugins manifest 校验失败: {}",
+            manifest_errors.join("; ")
+        ));
+    }
+    if root.join("mcp.json").is_file() {
+        return Err(
+            "该 Agent Plugins 包包含 mcp.json(MCP server 配置),EKO 暂不支持安装插件包的 MCP 面,请单独安装其中的 skills".to_string(),
+        );
+    }
+    let skills_root = root.join("skills");
+    let mut dirs = Vec::new();
+    let entries = std::fs::read_dir(&skills_root)
+        .map_err(|error| format!("读取插件包 skills 目录失败: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("读取插件包目录项失败: {error}"))?;
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            && entry.path().join("SKILL.md").is_file()
+        {
+            dirs.push(entry.path());
+        }
+    }
+    if dirs.is_empty() {
+        return Err("插件包 skills/ 目录下没有包含 SKILL.md 的子目录".to_string());
+    }
+    dirs.sort();
+    for dir in &dirs {
+        validate_skill_dir(dir)?;
+    }
+    Ok(Some(PluginSkillPackage {
+        name: manifest.name,
+        skill_dirs: dirs,
+    }))
+}
+
+fn install_plugin_skill_package(
+    source_root: &Path,
+    package: PluginSkillPackage,
+    hub: &mut SkillsHub,
+    source_record: Option<SkillSourceRecord>,
+) -> Result<InstallResult, String> {
+    let parent = hub.root();
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("创建技能根目录失败 {}: {error}", parent.display()))?;
+    let destination = parent.join(&package.name);
+    if destination.exists() {
+        let empty = destination
+            .read_dir()
+            .map_err(|error| format!("读取现有插件包目标目录失败: {error}"))?
+            .next()
+            .is_none();
+        if !empty {
+            return Err(format!(
+                "插件包目标目录 '{}' 已存在；请先显式卸载，避免覆盖未归属内容",
+                package.name
+            ));
+        }
+        std::fs::remove_dir(&destination)
+            .map_err(|error| format!("清理空插件包目标目录失败: {error}"))?;
+    }
+    for source in &package.skill_dirs {
+        let skill_name = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| "无法获取插件 Skill 目录名".to_string())?;
+        if let Some(existing) = hub.get(skill_name)
+            && !existing.path.starts_with(&destination)
+        {
+            return Err(format!(
+                "插件 Skill '{skill_name}' 与现有目录 {} 冲突",
+                existing.path.display()
+            ));
+        }
+    }
+    let nonce = uuid::Uuid::new_v4();
+    let staging = parent.join(format!(".{}.staging-{nonce}", package.name));
+    std::fs::create_dir_all(&staging)
+        .map_err(|error| format!("创建插件 Skill staging 失败: {error}"))?;
+
+    let prepared = (|| {
+        let mut results = Vec::with_capacity(package.skill_dirs.len());
+        for source in package.skill_dirs {
+            let skill_name = source
+                .file_name()
+                .and_then(OsStr::to_str)
+                .ok_or_else(|| "无法获取插件 Skill 目录名".to_string())?
+                .to_string();
+            let staged_skill = staging.join(&skill_name);
+            copy_dir_recursive(&source, &staged_skill)
+                .map_err(|error| format!("复制插件 Skill 到 staging 失败: {error}"))?;
+
+            let mut record = source_record.clone();
+            if let Some(record) = record.as_mut() {
+                let mut subdir = record
+                    .subdir
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_default();
+                subdir.push("skills");
+                subdir.push(&skill_name);
+                record.subdir = Some(subdir.to_string_lossy().replace('\\', "/"));
+                record.content_hash = hash_skill_dir(&staged_skill)?;
+                write_source_record(&staged_skill, record)?;
+            }
+            let source_label = record.as_ref().map_or_else(
+                || format!("local:{}", source.display()),
+                |record| git_source_label(&record.repo_url, record.subdir.as_deref()),
+            );
+            results.push(InstallResult {
+                name: skill_name.clone(),
+                installed_names: vec![skill_name],
+                path: destination.join(
+                    source
+                        .file_name()
+                        .ok_or_else(|| "无法获取插件 Skill 目录名".to_string())?,
+                ),
+                source: source_label,
+                revision: record.map(|record| record.revision),
+            });
+        }
+        Ok::<_, String>(results)
+    })();
+
+    let mut results = match prepared {
+        Ok(results) => results,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    };
+    commit_staged_directory(&staging, &destination, "安装插件 Skill 包")?;
+    hub.refresh();
+
+    let installed_names = results
+        .iter()
+        .map(|result| result.name.clone())
+        .collect::<Vec<_>>();
+    let mut primary = results
+        .drain(..)
+        .next()
+        .ok_or_else(|| format!("插件包 {} 中没有可安装的 skill", source_root.display()))?;
+    primary.installed_names = installed_names;
+    Ok(primary)
+}
+
+/// 单个 skill 目录的安装核心(本地与 git 共用)。
+fn install_single_skill_dir(
+    source: &Path,
+    hub: &mut SkillsHub,
+    record: Option<SkillSourceRecord>,
+) -> Result<InstallResult, String> {
     validate_skill_dir(source)?;
     let skill_name = source
         .file_name()
@@ -79,11 +259,12 @@ pub(crate) fn install_from_local(
         .ok_or_else(|| "无法获取目录名".to_string())?
         .to_string();
     let dest = hub.root().join(&skill_name);
-    replace_skill_directory(source, &dest, None)?;
+    replace_skill_directory(source, &dest, record)?;
     hub.refresh();
 
     Ok(InstallResult {
-        name: skill_name,
+        name: skill_name.clone(),
+        installed_names: vec![skill_name],
         path: dest,
         source: format!("local:{}", source.display()),
         revision: None,
@@ -100,13 +281,6 @@ pub(crate) async fn install_from_git(
     validate_subdir(subdir)?;
     let checkout = clone_repository(repo_url).await?;
     let revision = git_revision(checkout.path()).await?;
-    let source_dir = locate_skill_dir(checkout.path(), subdir)?;
-    let skill_name = source_dir
-        .file_name()
-        .and_then(OsStr::to_str)
-        .ok_or_else(|| "无法获取技能目录名".to_string())?
-        .to_string();
-    let dest = hub.root().join(&skill_name);
     let now = Utc::now().to_rfc3339();
     let record = SkillSourceRecord {
         repo_url: repo_url.to_string(),
@@ -116,11 +290,27 @@ pub(crate) async fn install_from_git(
         installed_at: now.clone(),
         synced_at: now,
     };
+    // Agent Plugins 1.0 留口:仓库根是 plugin.json 标准包时安装其 skills/ 面。
+    let package_root = subdir.map_or_else(
+        || checkout.path().to_path_buf(),
+        |subdir| checkout.path().join(subdir),
+    );
+    if let Some(package) = plugin_skill_package(&package_root)? {
+        return install_plugin_skill_package(&package_root, package, hub, Some(record));
+    }
+    let source_dir = locate_skill_dir(checkout.path(), subdir)?;
+    let skill_name = source_dir
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| "无法获取技能目录名".to_string())?
+        .to_string();
+    let dest = hub.root().join(&skill_name);
     replace_skill_directory(&source_dir, &dest, Some(record))?;
     hub.refresh();
 
     Ok(InstallResult {
-        name: skill_name,
+        name: skill_name.clone(),
+        installed_names: vec![skill_name],
         path: dest,
         source: git_source_label(repo_url, subdir),
         revision: Some(revision),
@@ -138,6 +328,14 @@ pub(crate) fn uninstall(name: &str, hub: &mut SkillsHub) -> Result<bool, String>
         return Ok(false);
     }
     std::fs::remove_dir_all(&path).map_err(|e| format!("删除技能目录失败: {e}"))?;
+    if let Some(parent) = path.parent()
+        && parent != hub.root()
+        && parent
+            .read_dir()
+            .is_ok_and(|mut entries| entries.next().is_none())
+    {
+        std::fs::remove_dir(parent).map_err(|error| format!("清理空插件包目录失败: {error}"))?;
+    }
 
     hub.refresh();
     Ok(true)
@@ -441,10 +639,9 @@ fn replace_skill_directory(
         .ok_or_else(|| "无法获取技能目标目录名".to_string())?;
     let nonce = uuid::Uuid::new_v4();
     let staging = parent.join(format!(".{name}.staging-{nonce}"));
-    let backup = parent.join(format!(".{name}.backup-{nonce}"));
 
     if let Err(error) = copy_dir_recursive(source, &staging) {
-        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_dir_all(staging);
         return Err(format!("复制技能到 staging 失败: {error}"));
     }
     if let Some(mut record) = source_record {
@@ -461,23 +658,35 @@ fn replace_skill_directory(
         }
     }
 
+    commit_staged_directory(&staging, destination, "安装技能")
+}
+
+fn commit_staged_directory(staging: &Path, destination: &Path, action: &str) -> Result<(), String> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("目标目录没有父目录: {}", destination.display()))?;
+    let name = destination
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| "无法获取目标目录名".to_string())?;
+    let backup = parent.join(format!(".{name}.backup-{}", uuid::Uuid::new_v4()));
     if destination.exists() {
         std::fs::rename(destination, &backup)
-            .map_err(|error| format!("备份现有技能失败: {error}"))?;
+            .map_err(|error| format!("{action}备份现有目录失败: {error}"))?;
     }
-    if let Err(error) = std::fs::rename(&staging, destination) {
+    if let Err(error) = std::fs::rename(staging, destination) {
         let restore_error = backup
             .exists()
             .then(|| std::fs::rename(&backup, destination).err())
             .flatten();
-        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_dir_all(staging);
         if let Some(restore_error) = restore_error {
             return Err(format!(
-                "安装技能 staging 失败: {error}; 恢复旧技能也失败: {restore_error}; 备份保留在 {}",
+                "{action} staging 失败: {error}; 恢复旧目录也失败: {restore_error}; 备份保留在 {}",
                 backup.display()
             ));
         }
-        return Err(format!("安装技能 staging 失败: {error}"));
+        return Err(format!("{action} staging 失败: {error}"));
     }
     if backup.exists() {
         let _ = std::fs::remove_dir_all(backup);
@@ -700,6 +909,245 @@ fn git_source_label(repo_url: &str, subdir: Option<&str>) -> String {
 mod tests {
     use super::*;
 
+    fn write_skill(dir: &Path, name: &str) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Demo {name}\n---\n\n# {name}\n"),
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn agent_plugins_package_installs_its_skills_face() -> Result<(), String> {
+        let plugin = tempfile::tempdir().map_err(|e| e.to_string())?;
+        std::fs::write(
+            plugin.path().join("plugin.json"),
+            format!(
+                r#"{{"$schema":"{}","name":"demo-plugin","version":"1.0.0"}}"#,
+                echo_agent::plugin::AGENT_PLUGIN_SCHEMA_V1
+            ),
+        )
+        .map_err(|e| e.to_string())?;
+        write_skill(&plugin.path().join("skills/alpha"), "alpha")?;
+        write_skill(&plugin.path().join("skills/beta"), "beta")?;
+        std::fs::create_dir_all(plugin.path().join("skills/not-a-skill"))
+            .map_err(|e| e.to_string())?;
+
+        let root = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let mut hub = SkillsHub::with_root(root.path().to_path_buf());
+        let installed = install_from_local(plugin.path(), &mut hub)?;
+        assert_eq!(installed.name, "alpha");
+        assert_eq!(
+            installed.installed_names,
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert!(root.path().join("demo-plugin/alpha/SKILL.md").is_file());
+        assert!(root.path().join("demo-plugin/beta/SKILL.md").is_file());
+        assert!(!root.path().join("demo-plugin/not-a-skill").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn agent_plugins_mcp_face_reports_unsupported() -> Result<(), String> {
+        let plugin = tempfile::tempdir().map_err(|e| e.to_string())?;
+        std::fs::write(
+            plugin.path().join("plugin.json"),
+            format!(
+                r#"{{"$schema":"{}","name":"demo-plugin"}}"#,
+                echo_agent::plugin::AGENT_PLUGIN_SCHEMA_V1
+            ),
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::write(plugin.path().join("mcp.json"), "{}").map_err(|e| e.to_string())?;
+        write_skill(&plugin.path().join("skills/alpha"), "alpha")?;
+
+        let root = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let mut hub = SkillsHub::with_root(root.path().to_path_buf());
+        let error = install_from_local(plugin.path(), &mut hub)
+            .err()
+            .ok_or_else(|| "mcp.json plugin face was accepted".to_string())?;
+        assert!(error.contains("mcp.json"));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_agent_plugins_manifest_is_rejected_before_copy() -> Result<(), String> {
+        let plugin = tempfile::tempdir().map_err(|error| error.to_string())?;
+        std::fs::write(plugin.path().join("plugin.json"), r#"{"name":"INVALID"}"#)
+            .map_err(|error| error.to_string())?;
+        write_skill(&plugin.path().join("skills/alpha"), "alpha")?;
+
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let mut hub = SkillsHub::with_root(root.path().to_path_buf());
+        let error = install_from_local(plugin.path(), &mut hub)
+            .err()
+            .ok_or_else(|| "invalid plugin manifest was accepted".to_string())?;
+        assert!(error.contains("plugin.json") || error.contains("manifest"));
+        assert!(hub.list().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_plugin_skill_leaves_existing_catalog_untouched() -> Result<(), String> {
+        let plugin = tempfile::tempdir().map_err(|error| error.to_string())?;
+        std::fs::write(
+            plugin.path().join("plugin.json"),
+            format!(
+                r#"{{"$schema":"{}","name":"demo-plugin"}}"#,
+                echo_agent::plugin::AGENT_PLUGIN_SCHEMA_V1
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        write_skill(&plugin.path().join("skills/alpha"), "alpha")?;
+        write_skill(&plugin.path().join("skills/beta"), "wrong-name")?;
+
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let mut hub = SkillsHub::with_root(root.path().to_path_buf());
+        let error = install_from_local(plugin.path(), &mut hub)
+            .err()
+            .ok_or_else(|| "invalid plugin Skill was accepted".to_string())?;
+        assert!(error.contains("校验"));
+        assert!(hub.list().is_empty());
+        assert!(!root.path().join("demo-plugin").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_skill_name_collision_does_not_overwrite_existing_skill() -> Result<(), String> {
+        let plugin = tempfile::tempdir().map_err(|error| error.to_string())?;
+        std::fs::write(
+            plugin.path().join("plugin.json"),
+            format!(
+                r#"{{"$schema":"{}","name":"demo-plugin"}}"#,
+                echo_agent::plugin::AGENT_PLUGIN_SCHEMA_V1
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        write_skill(&plugin.path().join("skills/alpha"), "alpha")?;
+
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        write_skill(&root.path().join("alpha"), "alpha")?;
+        let original = std::fs::read_to_string(root.path().join("alpha/SKILL.md"))
+            .map_err(|error| error.to_string())?;
+        let mut hub = SkillsHub::with_root(root.path().to_path_buf());
+        let error = install_from_local(plugin.path(), &mut hub)
+            .err()
+            .ok_or_else(|| "conflicting plugin Skill was accepted".to_string())?;
+        assert!(error.contains("冲突"));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("alpha/SKILL.md"))
+                .map_err(|error| error.to_string())?,
+            original
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn existing_plugin_named_group_is_never_replaced_without_ownership() -> Result<(), String> {
+        let plugin = tempfile::tempdir().map_err(|error| error.to_string())?;
+        std::fs::write(
+            plugin.path().join("plugin.json"),
+            format!(
+                r#"{{"$schema":"{}","name":"demo-plugin"}}"#,
+                echo_agent::plugin::AGENT_PLUGIN_SCHEMA_V1
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        write_skill(&plugin.path().join("skills/alpha"), "alpha")?;
+
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let existing = root.path().join("demo-plugin/legacy");
+        write_skill(&existing, "legacy")?;
+        let original = std::fs::read_to_string(existing.join("SKILL.md"))
+            .map_err(|error| error.to_string())?;
+        let mut hub = SkillsHub::with_root(root.path().to_path_buf());
+        let error = install_from_local(plugin.path(), &mut hub)
+            .err()
+            .ok_or_else(|| "existing plugin-named group was overwritten".to_string())?;
+        assert!(error.contains("已存在"));
+        assert_eq!(
+            std::fs::read_to_string(existing.join("SKILL.md")).map_err(|error| error.to_string())?,
+            original
+        );
+        assert!(!root.path().join("demo-plugin/alpha").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_package_can_reinstall_after_all_children_are_uninstalled() -> Result<(), String> {
+        let plugin = tempfile::tempdir().map_err(|error| error.to_string())?;
+        std::fs::write(
+            plugin.path().join("plugin.json"),
+            format!(
+                r#"{{"$schema":"{}","name":"demo-plugin"}}"#,
+                echo_agent::plugin::AGENT_PLUGIN_SCHEMA_V1
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        write_skill(&plugin.path().join("skills/alpha"), "alpha")?;
+        write_skill(&plugin.path().join("skills/beta"), "beta")?;
+
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let mut hub = SkillsHub::with_root(root.path().to_path_buf());
+        install_from_local(plugin.path(), &mut hub)?;
+        assert!(uninstall("alpha", &mut hub)?);
+        assert!(uninstall("beta", &mut hub)?);
+        assert!(!root.path().join("demo-plugin").exists());
+
+        let reinstalled = install_from_local(plugin.path(), &mut hub)?;
+        assert_eq!(
+            reinstalled.installed_names,
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn git_plugin_records_each_skill_subdirectory() -> Result<(), String> {
+        let plugin = tempfile::tempdir().map_err(|error| error.to_string())?;
+        std::fs::write(
+            plugin.path().join("plugin.json"),
+            format!(
+                r#"{{"$schema":"{}","name":"demo-plugin"}}"#,
+                echo_agent::plugin::AGENT_PLUGIN_SCHEMA_V1
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        write_skill(&plugin.path().join("skills/alpha"), "alpha")?;
+        write_skill(&plugin.path().join("skills/beta"), "beta")?;
+        let package = plugin_skill_package(plugin.path())?
+            .ok_or_else(|| "plugin package was not detected".to_string())?;
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let mut hub = SkillsHub::with_root(root.path().to_path_buf());
+        let now = Utc::now().to_rfc3339();
+        install_plugin_skill_package(
+            plugin.path(),
+            package,
+            &mut hub,
+            Some(SkillSourceRecord {
+                repo_url: "https://example.com/demo.git".to_string(),
+                subdir: None,
+                revision: "abc123".to_string(),
+                content_hash: String::new(),
+                installed_at: now.clone(),
+                synced_at: now,
+            }),
+        )?;
+
+        for name in ["alpha", "beta"] {
+            let entry = hub
+                .get(name)
+                .ok_or_else(|| format!("installed plugin Skill '{name}' missing"))?;
+            let record = read_source_record(&entry.path)?
+                .ok_or_else(|| format!("source record for '{name}' missing"))?;
+            assert_eq!(
+                record.subdir.as_deref(),
+                Some(format!("skills/{name}").as_str())
+            );
+        }
+        Ok(())
+    }
     #[test]
     fn source_record_hash_detects_local_changes() -> Result<(), String> {
         let source_parent = tempfile::tempdir().map_err(|error| error.to_string())?;

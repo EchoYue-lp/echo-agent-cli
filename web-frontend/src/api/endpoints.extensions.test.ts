@@ -162,6 +162,30 @@ describe('typed Extension IPC adapters', () => {
     }
   });
 
+  it('routes Skill activation to the exact current conversation', async () => {
+    bridge.apiInvoke.mockImplementation(async (_command: string, args: any) => ({
+      extension: 'skills',
+      meta: {
+        ...meta,
+        request_id: args.request.request_id,
+        operation_id: args.request.operation_id,
+      },
+      receipt: { action: 'activated', name: 'git-workflow' },
+    }));
+
+    await skillsApi.activate(requestScope, 'conversation-current', 'git-workflow');
+
+    expect(bridge.apiInvoke).toHaveBeenCalledWith(
+      'execute_extension_command',
+      expect.objectContaining({
+        conversationId: 'conversation-current',
+        request: expect.objectContaining({
+          command: { action: 'activate', name: 'git-workflow' },
+        }),
+      })
+    );
+  });
+
   it('rejects failed and degraded Browser receipts instead of dropping status', () => {
     for (const status of ['failed', 'degraded'] as const) {
       const receipt: ExtensionCommandReceipt = {

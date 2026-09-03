@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted, 2026-08-25. Implemented, 2026-08-26.
+Accepted, 2026-08-25. Implemented, 2026-08-26. The Skill durable-settlement
+state machine is superseded by [ADR 0036](./0036-skill-policy-simplification.md);
+the single Extension authority, mutation mutex, and shared-surface contract remain.
 
 ## Context
 

@@ -4064,10 +4064,8 @@ impl AppState {
                 None
             }
             Ok(skill_receipt) => Some(format!(
-                "skill desired generation {} remains {:?} at settled generation {}: {}",
-                skill_receipt.desired_generation,
+                "skill runtime reconciliation remains {:?}: {}",
                 skill_receipt.status,
-                skill_receipt.settled_generation,
                 skill_receipt
                     .target_receipts
                     .iter()

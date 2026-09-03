@@ -149,9 +149,10 @@ function newExtensionIdentity(): string {
 
 function executeSkillCommand(
   requestScope: ExtensionRequestScope,
-  command: SkillCommand
+  command: SkillCommand,
+  conversationId = 'gui-settings-skills'
 ): Promise<ExtensionCommandReceipt> {
-  return extensionApi.execute(requestScope, 'gui-settings-skills', {
+  return extensionApi.execute(requestScope, conversationId, {
     request_id: newExtensionIdentity(),
     operation_id: newExtensionIdentity(),
     scope: requestScope,
@@ -292,6 +293,8 @@ export const skillsApi = {
     executeSkillCommand(requestScope, { action: 'enable', name }),
   disable: (requestScope: ExtensionRequestScope, name: string) =>
     executeSkillCommand(requestScope, { action: 'disable', name }),
+  activate: (requestScope: ExtensionRequestScope, conversationId: string, name: string) =>
+    executeSkillCommand(requestScope, { action: 'activate', name }, conversationId),
   refresh: (requestScope: ExtensionRequestScope) =>
     executeSkillCommand(requestScope, { action: 'refresh' }),
   upload: (rootDir: string, files: { path: string; content: string }[]) =>

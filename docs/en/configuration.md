@@ -110,7 +110,8 @@ EKO reads the repository-standard root-to-working-directory chain of
 Plugins live in user or project plugin roots. User Skills live in
 `~/.eko/skills/`; desired enablement is stored in
 `~/.eko/enabled-skills.json`. Install, enable, disable, and upstream sync use
-durable-first typed receipts. See [Skill operations](./operations/skill-sync.md).
+an atomic flat policy plus immediate typed runtime reconciliation. See
+[Skill operations](./operations/skill-sync.md).
 
 ## Channels and Environment
 

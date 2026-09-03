@@ -8,6 +8,7 @@ export type SkillCommand =
   | { action: 'uninstall'; name: string }
   | { action: 'enable'; name: string }
   | { action: 'disable'; name: string }
+  | { action: 'activate'; name: string }
   | { action: 'refresh' }
   | { action: 'check_updates'; target: string | null }
   | { action: 'sync'; target: string | null; force: boolean };

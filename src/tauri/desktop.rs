@@ -145,6 +145,25 @@ async fn run_desktop() -> anyhow::Result<()> {
     app_config.mcp.config_path = configured_mcp_path;
     infra::init_logging(&app_config.logging.level);
 
+    // Resolve bundled resources through Tauri's platform authority before
+    // app-core loads any Agent. On macOS this is Contents/Resources; Linux and
+    // Windows use their own bundle layouts. A source-tree run has no copied
+    // skills at that location and deliberately falls back to the dev root.
+    let tauri_context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+    match tauri::utils::platform::resource_dir(tauri_context.package_info(), &tauri::Env::default())
+    {
+        Ok(resource_dir) => {
+            let configured = echo_agent_app_core::api::skills_hub::configure_bundled_skills_root(
+                resource_dir.join("skills"),
+            )
+            .map_err(anyhow::Error::msg)?;
+            tracing::debug!(configured, path = %resource_dir.display(), "Resolved Tauri resource directory");
+        }
+        Err(error) => {
+            tracing::debug!(%error, "Tauri resource directory unavailable; using source-tree Skill root");
+        }
+    }
+
     // ── Bootstrap Agent Runtime (shared TUI/GUI initialization) ──
     let params = infra::AgentCreateParams {
         model: args.model.clone(),
@@ -203,7 +222,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         runtime.browser_runtime.clone(),
         bridge_supervisor.clone(),
     )
-    .run(tauri::generate_context!());
+    .run(tauri_context);
 
     let primary_error = tauri_result
         .err()

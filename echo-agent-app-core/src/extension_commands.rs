@@ -185,15 +185,36 @@ impl ExtensionCommand {
 #[ts(export)]
 pub enum SkillCommand {
     List,
-    Search { query: String },
-    Info { name: String },
-    Install { source: String },
-    Uninstall { name: String },
-    Enable { name: String },
-    Disable { name: String },
+    Search {
+        query: String,
+    },
+    Info {
+        name: String,
+    },
+    Install {
+        source: String,
+    },
+    Uninstall {
+        name: String,
+    },
+    Enable {
+        name: String,
+    },
+    Disable {
+        name: String,
+    },
+    /// User-invoked activation in the exact current conversation Agent.
+    Activate {
+        name: String,
+    },
     Refresh,
-    CheckUpdates { target: Option<String> },
-    Sync { target: Option<String>, force: bool },
+    CheckUpdates {
+        target: Option<String>,
+    },
+    Sync {
+        target: Option<String>,
+        force: bool,
+    },
 }
 
 /// Framework-owned plugin installation scope retained under the stable EKO
@@ -536,6 +557,10 @@ fn parse_skill_command(input: &str) -> Result<SkillCommand, ExtensionCommandPars
             name: required_argument(ExtensionKind::Skills, rest, "/skills disable <name>")?
                 .to_string(),
         }),
+        "activate" => Ok(SkillCommand::Activate {
+            name: required_argument(ExtensionKind::Skills, rest, "/skills activate <name>")?
+                .to_string(),
+        }),
         "refresh" => Ok(SkillCommand::Refresh),
         "check-updates" | "check" => Ok(SkillCommand::CheckUpdates {
             target: (!rest.is_empty() && !matches!(rest, "all" | "*")).then(|| rest.to_string()),
@@ -555,7 +580,7 @@ fn parse_skill_command(input: &str) -> Result<SkillCommand, ExtensionCommandPars
             Ok(SkillCommand::Sync { target, force })
         }
         _ => Err(error(
-            "/skills [list|search|info|install|uninstall|enable|disable|refresh|check-updates|sync]",
+            "/skills [list|search|info|install|uninstall|enable|disable|activate|refresh|check-updates|sync]",
         )),
     }
 }
@@ -1117,8 +1142,8 @@ fn render_skill_command(receipt: Option<&SkillCommandReceipt>, lines: &mut Vec<S
         },
         Some(SkillCommandReceipt::Installed { settlement }) => {
             lines.push(format!(
-                "Installed skill '{}' from {} at {} revision={}",
-                settlement.name,
+                "Installed skills '{}' from {} at {} revision={}",
+                settlement.installed_names.join(", "),
                 settlement.source,
                 settlement.path.display(),
                 settlement.revision.as_deref().unwrap_or("none"),
@@ -1141,6 +1166,11 @@ fn render_skill_command(receipt: Option<&SkillCommandReceipt>, lines: &mut Vec<S
         Some(SkillCommandReceipt::Disabled { settlement }) => {
             lines.push("Skill disablement submitted.".to_string());
             render_skill_settlement(settlement, lines);
+        }
+        Some(SkillCommandReceipt::Activated { name }) => {
+            lines.push(format!(
+                "Skill '{name}' activated in the current conversation."
+            ));
         }
         Some(SkillCommandReceipt::Refreshed { settlement }) => {
             lines.push("Skill policy refreshed.".to_string());
@@ -1189,23 +1219,15 @@ fn render_skill_entry(entry: &ExtensionSkillEntry) -> String {
 
 fn render_skill_settlement(receipt: &SkillSyncReceipt, lines: &mut Vec<String>) {
     lines.push(format!(
-        "  settlement={:?} operation_id={} committed_file_path={} content_identity={} generation={}/{} durable_committed={} idempotent={}",
-        receipt.status,
-        receipt.operation_id,
-        receipt.committed_file_path.display(),
-        receipt.content_identity,
-        receipt.settled_generation,
-        receipt.desired_generation,
-        receipt.durable_committed,
-        receipt.idempotent,
+        "  settlement={:?} operation_id={} idempotent={}",
+        receipt.status, receipt.operation_id, receipt.idempotent,
     ));
     lines.extend(receipt.target_receipts.iter().map(|target| {
         format!(
-            "  target={} status={:?} workspace_generation={} specialist_generation={} changed_entries={} error={}",
+            "  target={} status={:?} workspace_generation={} changed_entries={} error={}",
             target.target,
             target.status,
             target.workspace_generation,
-            target.specialist_generation,
             if target.changed_entries.is_empty() {
                 "none".to_string()
             } else {
@@ -1214,45 +1236,6 @@ fn render_skill_settlement(receipt: &SkillSyncReceipt, lines: &mut Vec<String>) 
             target.error.as_deref().unwrap_or("none"),
         )
     }));
-    if let Some(debt) = receipt.repair_debt.as_ref() {
-        lines.push(format!(
-            "  repair_debt generation={} attempts={} content_identity={}",
-            debt.generation, debt.attempts, debt.content_identity,
-        ));
-        lines.extend(
-            debt.target_failures
-                .iter()
-                .map(|failure| {
-                    format!(
-                        "  repair_target target={} component={} expected_generation={} observed_generation={} retryable={} reason={}",
-                        failure.target,
-                        failure.component,
-                        failure.expected_generation,
-                        failure
-                            .observed_generation
-                            .map_or_else(|| "none".to_string(), |generation| generation.to_string()),
-                        failure.retryable,
-                        failure.reason,
-                    )
-                }),
-        );
-        lines.extend(
-            debt.artifact_removals
-                .iter()
-                .map(|name| format!("  repair_artifact_removal={name}")),
-        );
-        lines.extend(debt.artifact_syncs.iter().map(|pending| {
-            format!(
-                "  repair_artifact_sync={} force={}",
-                pending.name, pending.force
-            )
-        }));
-        lines.extend(
-            debt.artifact_enablements
-                .iter()
-                .map(|name| format!("  repair_artifact_enablement={name}")),
-        );
-    }
 }
 
 fn render_plugin_command(receipt: Option<&PluginCommandReceipt>, lines: &mut Vec<String>) {
@@ -1548,6 +1531,9 @@ pub enum SkillCommandReceipt {
     },
     Disabled {
         settlement: SkillSyncReceipt,
+    },
+    Activated {
+        name: String,
     },
     Refreshed {
         settlement: SkillSyncReceipt,
@@ -2003,7 +1989,15 @@ async fn dispatch_owned(
         };
     match request.command {
         ExtensionCommand::Skills(command) => {
-            dispatch_skill(&state, Some(&runtime), identity, scope, command).await
+            dispatch_skill(
+                &state,
+                Some(&runtime),
+                identity,
+                scope,
+                conversation_id,
+                command,
+            )
+            .await
         }
         ExtensionCommand::Plugins(command) => {
             dispatch_plugin(&state, Some(&runtime), identity, scope, command).await
@@ -2082,6 +2076,7 @@ async fn dispatch_skill(
     runtime: Option<&ScopedChatRuntime>,
     identity: ExtensionCommandIdentity,
     scope: ExtensionRequestScope,
+    conversation_id: &str,
     command: SkillCommand,
 ) -> ExtensionCommandReceipt {
     let result = match command {
@@ -2145,6 +2140,33 @@ async fn dispatch_skill(
             .await
             .map(|settlement| SkillCommandReceipt::Disabled { settlement })
             .map_err(anyhow::Error::new),
+        SkillCommand::Activate { name } => match runtime {
+            None => Err(anyhow::anyhow!(
+                "skill activation requires an active chat runtime"
+            )),
+            Some(runtime) => {
+                if conversation_id.trim().is_empty() {
+                    Err(anyhow::anyhow!(
+                        "skill activation requires a current conversation"
+                    ))
+                } else {
+                    match runtime.agent_for(conversation_id).await {
+                        Ok(lease) => lease
+                            .agent()
+                            .write_async(|value| {
+                                let name = name.clone();
+                                Box::pin(async move { value.activate_skill(&name).await })
+                            })
+                            .await
+                            .map(|()| SkillCommandReceipt::Activated { name })
+                            .map_err(anyhow::Error::new),
+                        Err(error) => Err(anyhow::anyhow!(
+                            "current conversation Agent is unavailable: {error}"
+                        )),
+                    }
+                }
+            }
+        },
         SkillCommand::Refresh => state
             .extension_control
             .refresh_enabled_skills_with_operation(state, &identity.operation_id)
@@ -2198,11 +2220,11 @@ fn skill_receipt_status(receipt: &SkillCommandReceipt) -> ExtensionCommandStatus
         SkillCommandReceipt::Listed { .. }
         | SkillCommandReceipt::Searched { .. }
         | SkillCommandReceipt::Info { .. }
+        | SkillCommandReceipt::Activated { .. }
         | SkillCommandReceipt::UpdatesChecked { .. } => None,
     };
     match settlement.map(|settlement| &settlement.status) {
         Some(SkillSettlementStatus::Settled) | None => ExtensionCommandStatus::Settled,
-        Some(SkillSettlementStatus::Committed) => ExtensionCommandStatus::Committed,
         Some(SkillSettlementStatus::Degraded) => ExtensionCommandStatus::Degraded,
     }
 }
@@ -3101,23 +3123,14 @@ mod tests {
     fn skill_sync_receipt(status: SkillSettlementStatus) -> SkillSyncReceipt {
         SkillSyncReceipt {
             operation_id: "operation-skill-status".to_string(),
-            committed_file_path: std::path::PathBuf::from("enabled-skills.json"),
-            content_identity: "content-skill-status".to_string(),
-            desired_generation: 2,
-            settled_generation: 1,
-            durable_committed: true,
             idempotent: false,
             status,
             target_receipts: Vec::new(),
-            repair_debt: None,
         }
     }
 
     #[test]
-    fn skill_receipt_status_preserves_committed_settled_and_degraded() {
-        let committed = SkillCommandReceipt::Enabled {
-            settlement: skill_sync_receipt(SkillSettlementStatus::Committed),
-        };
+    fn skill_receipt_status_preserves_settled_and_degraded() {
         let settled = SkillCommandReceipt::Enabled {
             settlement: skill_sync_receipt(SkillSettlementStatus::Settled),
         };
@@ -3125,10 +3138,6 @@ mod tests {
             settlement: skill_sync_receipt(SkillSettlementStatus::Degraded),
         };
 
-        assert_eq!(
-            skill_receipt_status(&committed),
-            ExtensionCommandStatus::Committed
-        );
         assert_eq!(
             skill_receipt_status(&settled),
             ExtensionCommandStatus::Settled
@@ -3272,59 +3281,31 @@ mod tests {
     }
 
     #[test]
-    fn skill_debt_display_and_wire_contract_are_structured() -> Result<(), String> {
+    fn skill_settlement_display_and_wire_contract_are_structured() -> Result<(), String> {
         let receipt = SkillSyncReceipt {
             operation_id: "operation-skill-1".to_string(),
-            committed_file_path: std::path::PathBuf::from("/tmp/enabled-skills.json"),
-            content_identity: "content-2".to_string(),
-            desired_generation: 2,
-            settled_generation: 1,
-            durable_committed: true,
             idempotent: false,
             status: SkillSettlementStatus::Degraded,
             target_receipts: vec![crate::extension_control::SkillTargetSettlementReceipt {
                 target: "workspace-a".to_string(),
                 workspace_generation: "workspace-generation-a".to_string(),
-                specialist_generation: 1,
                 status: crate::extension_control::SkillTargetSettlementStatus::Degraded,
                 changed_entries: Vec::new(),
                 error: Some("fanout failed".to_string()),
             }],
-            repair_debt: Some(crate::skills_hub::enabled_skills::SkillRepairDebt {
-                generation: 2,
-                content_identity: "content-2".to_string(),
-                attempts: 1,
-                target_failures: vec![crate::skills_hub::enabled_skills::SkillRepairTargetDebt {
-                    target: "workspace-a".to_string(),
-                    component: "runtime_fanout".to_string(),
-                    expected_generation: 2,
-                    observed_generation: Some(1),
-                    reason: "fanout failed".to_string(),
-                    retryable: true,
-                }],
-                artifact_removals: Vec::new(),
-                artifact_syncs: Vec::new(),
-                artifact_enablements: Vec::new(),
-            }),
         };
         let mut lines = Vec::new();
         render_skill_settlement(&receipt, &mut lines);
         let display = lines.join("\n");
-        assert!(display.contains("committed_file_path=/tmp/enabled-skills.json"));
-        assert!(display.contains("component=runtime_fanout"));
-        assert!(display.contains("expected_generation=2 observed_generation=1"));
+        assert!(display.contains("settlement=Degraded operation_id=operation-skill-1"));
+        assert!(display.contains("target=workspace-a"));
+        assert!(display.contains("error=fanout failed"));
         let value = serde_json::to_value(&receipt).map_err(|error| error.to_string())?;
         assert_eq!(
             value
-                .pointer("/repair_debt/target_failures/0/expected_generation")
+                .pointer("/target_receipts/0/target")
                 .and_then(serde_json::Value::as_str),
-            Some("2")
-        );
-        assert_eq!(
-            value
-                .pointer("/repair_debt/target_failures/0/observed_generation")
-                .and_then(serde_json::Value::as_str),
-            Some("1")
+            Some("workspace-a")
         );
         Ok(())
     }
