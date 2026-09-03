@@ -96,8 +96,10 @@ type WorkspaceSettlementHandle =
 pub struct WorkspaceState {
     /// Authoritative focused host (`None` means global default paths).
     current: RwLock<Option<Arc<crate::workspace::runtime::WorkspaceRuntimeHost>>>,
-    /// Process-level owner for every loaded workspace host.
-    runtimes: Arc<crate::workspace::runtime::WorkspaceRuntimeRegistry>,
+    /// Process-level owner for every loaded workspace host. Cross-workspace
+    /// `agent_spawn` / `agent_handoff` open target hosts through this
+    /// registry (pub(crate) — see those call sites).
+    pub(crate) runtimes: Arc<crate::workspace::runtime::WorkspaceRuntimeRegistry>,
     /// Stable global conversation owners restored when workspace focus exits.
     global_conversation: ConversationStorageBinding,
     /// 工作区注册表。

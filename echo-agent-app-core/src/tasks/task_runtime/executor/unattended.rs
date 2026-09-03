@@ -58,6 +58,11 @@ async fn execute_task(
         }
     }
 
+    // Application uplink for this run's Subagents: routes reports/escalations
+    // into the TaskRuntime journal (blocking escalations pause the run) and
+    // sibling messages into the exact-attempt control plane.
+    let dispatch_uplink = super::uplink::eko_uplink_sink(Arc::clone(&store));
+
     // Create a child cancellation token for THIS task and register it with the
     // store. remove_task / update_task can cancel it to stop this Subagent
     // promptly without cancelling sibling tasks. child_token() means run-level
@@ -468,6 +473,8 @@ async fn execute_task(
                 )
             })?,
             workspace_io.clone(),
+            dispatch_uplink.clone(),
+            claim.revision,
         )
         .await;
         match dispatch_result {
@@ -531,6 +538,8 @@ async fn execute_task(
                 )
             })?,
             workspace_io.clone(),
+            dispatch_uplink.clone(),
+            claim.revision,
         )
         .await;
         match dispatch_result {
@@ -1126,6 +1135,8 @@ async fn run_readonly_subagent(
     trace_sink: Option<ExecSink>,
     attempt_identity: echo_agent::subagent::SubagentAttemptIdentity,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
+    uplink: echo_agent::tools::SubagentUplinkFn,
+    plan_revision: u64,
 ) -> Result<echo_agent::subagent::SubagentResult, ExecutionFailure> {
     primary_agent
         .read_async(|agent| {
@@ -1154,6 +1165,13 @@ async fn run_readonly_subagent(
                     trace_sink: core_trace_sink,
                     delegation_policy: Some(delegation_policy),
                     resource_guards,
+                    subagent_lineage: Some(echo_agent::tools::SubagentLineage {
+                        agent_name: Some(role.clone()),
+                        run_id: Some(run_id.clone()),
+                        plan_revision: Some(plan_revision),
+                        ..Default::default()
+                    }),
+                    uplink: Some(uplink),
                 });
                 agent
                     .delegate_to_agent_attempt_with_prompt_payload(
@@ -1231,6 +1249,8 @@ async fn run_writer_subagent(
     trace_sink: Option<ExecSink>,
     attempt_identity: echo_agent::subagent::SubagentAttemptIdentity,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
+    uplink: echo_agent::tools::SubagentUplinkFn,
+    plan_revision: u64,
 ) -> Result<echo_agent::subagent::SubagentResult, ExecutionFailure> {
     // Rebuild a multimodal Message when the run carries user attachments, so
     // the writer Subagent sees the same images/files as the primary agent would
@@ -1284,6 +1304,13 @@ async fn run_writer_subagent(
                     trace_sink: core_trace_sink,
                     delegation_policy: Some(delegation_policy),
                     resource_guards,
+                    subagent_lineage: Some(echo_agent::tools::SubagentLineage {
+                        agent_name: Some(role.clone()),
+                        run_id: Some(run_id.clone()),
+                        plan_revision: Some(plan_revision),
+                        ..Default::default()
+                    }),
+                    uplink: Some(uplink),
                 });
                 if let Some(msg) = run_message {
                     agent
@@ -1490,6 +1517,8 @@ async fn run_main_agent_task(
                         trace_sink: exec_trace_sink_to_core(trace_sink.clone()),
                         delegation_policy: None,
                         resource_guards: Vec::new(),
+                        subagent_lineage: None,
+                        uplink: None,
                     }),
                     working_dir,
                     cancel: None,

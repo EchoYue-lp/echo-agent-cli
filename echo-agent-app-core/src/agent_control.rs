@@ -51,6 +51,13 @@ pub struct ConversationTarget {
     pub workspace_generation: Option<String>,
 }
 
+impl ConversationTarget {
+    fn into_address(self) -> crate::agent_router::AgentAddress {
+        let workspace = crate::workspace::WorkspaceId::from_raw(self.workspace_id);
+        crate::agent_router::AgentAddress::new(workspace, self.conversation_id)
+    }
+}
+
 /// One exact PlanTask execution attempt. This is intentionally not a
 /// conversation address and cannot be used with Conversation operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -129,6 +136,10 @@ pub struct AgentListRequest {
     pub scope: AgentListScope,
     #[serde(default)]
     pub workspace_id: Option<String>,
+    /// Optional collaboration-group filter: only conversations that are the
+    /// leader or a member of this group are returned.
+    #[serde(default)]
+    pub group_id: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default = "default_list_limit")]
@@ -349,6 +360,47 @@ fn runtime_control_error(error: StoreError, target: &TaskSubagentTarget) -> Agen
     }
 }
 
+fn group_brief(group: &crate::agent_router::AgentGroup) -> Value {
+    json!({
+        "group_id": group.group_id,
+        "name": group.name,
+        "leader": {
+            "workspace_id": group.leader.workspace_id.as_str(),
+            "conversation_id": group.leader.conversation_id,
+        },
+        "members": group.members.iter().map(|member| json!({
+            "workspace_id": member.address.workspace_id.as_str(),
+            "conversation_id": member.address.conversation_id,
+            "subagent_role": member.subagent_role,
+            "label": member.label,
+        })).collect::<Vec<_>>(),
+        "created_at": group.created_at.to_rfc3339(),
+        "updated_at": group.updated_at.to_rfc3339(),
+    })
+}
+
+/// Application operations backing `agent_spawn` / `agent_resume` /
+/// `agent_handoff`. Implemented by AppState-backed wiring because these
+/// operations open workspace hosts and drive chat runtimes — capabilities
+/// `AgentControlService` deliberately does not own (thin-service rule from
+/// ADR 0016). Every call returns a bounded JSON value for the model.
+pub trait AgentControlAppOps: Send + Sync {
+    fn spawn_conversation(
+        &self,
+        request: AgentSpawnRequest,
+    ) -> futures::future::BoxFuture<'static, Result<Value, AgentControlError>>;
+
+    fn resume_target(
+        &self,
+        request: AgentResumeRequest,
+    ) -> futures::future::BoxFuture<'static, Result<Value, AgentControlError>>;
+
+    fn handoff_conversation(
+        &self,
+        request: AgentHandoffRequest,
+    ) -> futures::future::BoxFuture<'static, Result<Value, AgentControlError>>;
+}
+
 /// Routing service shared by all model invocations and all surfaces.
 #[derive(Clone)]
 pub struct AgentControlService {
@@ -360,6 +412,9 @@ pub struct AgentControlService {
     delivery_wake: Option<DeliveryWake>,
     conversation_store: Option<Arc<dyn ConversationStore>>,
     conversation_workspace_id: Option<String>,
+    /// Optional application operations (spawn/resume/handoff). When absent
+    /// those tools fail closed with `app_ops_unavailable`.
+    app_ops: Option<Arc<dyn AgentControlAppOps>>,
 }
 
 impl AgentControlService {
@@ -377,6 +432,7 @@ impl AgentControlService {
             delivery_wake: None,
             conversation_store: None,
             conversation_workspace_id: None,
+            app_ops: None,
         }
     }
 
@@ -398,6 +454,12 @@ impl AgentControlService {
     ) -> Self {
         self.conversation_store = Some(store);
         self.conversation_workspace_id = Some(workspace_id);
+        self
+    }
+
+    /// Attach application operations for spawn/resume/handoff.
+    pub fn with_app_ops(mut self, ops: Arc<dyn AgentControlAppOps>) -> Self {
+        self.app_ops = Some(ops);
         self
     }
 
@@ -484,11 +546,154 @@ impl AgentControlService {
             .map_err(|error| AgentControlError::Runtime(error.to_string()))
     }
 
+    /// Create a new conversation Agent (application-backed).
+    pub async fn spawn(&self, request: AgentSpawnRequest) -> Result<Value, AgentControlError> {
+        let ops = self
+            .app_ops
+            .clone()
+            .ok_or_else(|| AgentControlError::Runtime("app_ops_unavailable".to_string()))?;
+        ops.spawn_conversation(request).await
+    }
+
+    /// Wake an idle conversation or resume its paused TaskRun.
+    pub async fn resume(&self, request: AgentResumeRequest) -> Result<Value, AgentControlError> {
+        let ops = self
+            .app_ops
+            .clone()
+            .ok_or_else(|| AgentControlError::Runtime("app_ops_unavailable".to_string()))?;
+        ops.resume_target(request).await
+    }
+
+    /// Migrate one conversation to another workspace host.
+    pub async fn handoff(&self, request: AgentHandoffRequest) -> Result<Value, AgentControlError> {
+        let ops = self
+            .app_ops
+            .clone()
+            .ok_or_else(|| AgentControlError::Runtime("app_ops_unavailable".to_string()))?;
+        ops.handoff_conversation(request).await
+    }
+
+    /// Collaboration-group CRUD over the persistent router authority.
+    pub async fn group(&self, request: AgentGroupToolRequest) -> Result<Value, AgentControlError> {
+        match request.action {
+            AgentGroupAction::List => {
+                let limit = if request.limit == 0 {
+                    32
+                } else {
+                    request.limit.min(64)
+                };
+                let groups = self
+                    .router
+                    .list_groups()
+                    .await
+                    .map_err(|error| AgentControlError::Runtime(error.to_string()))?;
+                let truncated = groups.len() > limit;
+                let groups: Vec<Value> = groups
+                    .into_iter()
+                    .take(limit)
+                    .map(|group| group_brief(&group))
+                    .collect();
+                Ok(Value::Object(
+                    [
+                        ("count".to_string(), Value::from(groups.len())),
+                        ("groups".to_string(), Value::Array(groups)),
+                        ("truncated".to_string(), Value::Bool(truncated)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ))
+            }
+            AgentGroupAction::Create => {
+                let name = request
+                    .name
+                    .ok_or_else(|| AgentControlError::Invalid("create requires name".into()))?;
+                let leader = request
+                    .leader
+                    .ok_or_else(|| AgentControlError::Invalid("create requires leader".into()))?;
+                let members = request
+                    .members
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(AgentGroupMemberInput::into_member)
+                    .collect::<Vec<_>>();
+                let group = self
+                    .router
+                    .create_group(name, leader.into_address(), members)
+                    .await
+                    .map_err(|error| AgentControlError::Invalid(error.to_string()))?;
+                Ok(group_brief(&group))
+            }
+            AgentGroupAction::Update => {
+                let group_id = request
+                    .group_id
+                    .clone()
+                    .ok_or_else(|| AgentControlError::Invalid("update requires group_id".into()))?;
+                let name = request
+                    .name
+                    .ok_or_else(|| AgentControlError::Invalid("update requires name".into()))?;
+                let leader = request
+                    .leader
+                    .ok_or_else(|| AgentControlError::Invalid("update requires leader".into()))?;
+                let members = request
+                    .members
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(AgentGroupMemberInput::into_member)
+                    .collect::<Vec<_>>();
+                let group = self
+                    .router
+                    .update_group(group_id, name, leader.into_address(), members)
+                    .await
+                    .map_err(|error| AgentControlError::Invalid(error.to_string()))?;
+                Ok(group_brief(&group))
+            }
+            AgentGroupAction::Delete => {
+                let group_id = request
+                    .group_id
+                    .clone()
+                    .ok_or_else(|| AgentControlError::Invalid("delete requires group_id".into()))?;
+                let deleted = self
+                    .router
+                    .delete_group(&group_id)
+                    .await
+                    .map_err(|error| AgentControlError::Invalid(error.to_string()))?;
+                Ok(Value::Object(
+                    [
+                        ("group_id".to_string(), Value::String(group_id)),
+                        ("deleted".to_string(), Value::Bool(deleted)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ))
+            }
+        }
+    }
+
     pub async fn list(
         &self,
         request: AgentListRequest,
     ) -> Result<AgentListResponse, AgentControlError> {
         let limit = request.limit.clamp(1, MAX_LIST_LIMIT);
+        let group_members: Option<std::collections::HashSet<AgentAddress>> =
+            match request.group_id.as_deref() {
+                Some(group_id) if !group_id.trim().is_empty() => {
+                    let group = self
+                        .router
+                        .list_groups()
+                        .await
+                        .map_err(|error| AgentControlError::Runtime(error.to_string()))?
+                        .into_iter()
+                        .find(|group| group.group_id == group_id)
+                        .ok_or_else(|| {
+                            AgentControlError::Invalid(format!("unknown agent group {group_id}"))
+                        })?;
+                    let mut members: std::collections::HashSet<AgentAddress> =
+                        group.members.iter().map(|m| m.address.clone()).collect();
+                    members.insert(group.leader);
+                    Some(members)
+                }
+                _ => None,
+            };
         let mut entries = Vec::new();
         let include_conversations = matches!(
             request.scope,
@@ -538,6 +743,12 @@ impl AgentControlService {
                     .workspace_id
                     .as_deref()
                     .is_some_and(|workspace| workspace != address.workspace_id.as_str())
+                {
+                    continue;
+                }
+                if group_members
+                    .as_ref()
+                    .is_some_and(|members| !members.contains(&address))
                 {
                     continue;
                 }
@@ -1658,6 +1869,10 @@ enum AgentControlOperation {
     Followup,
     Wait,
     Interrupt,
+    Spawn,
+    Resume,
+    Handoff,
+    Group,
 }
 
 struct AgentControlTool {
@@ -1678,6 +1893,10 @@ impl AgentControlTool {
             AgentControlOperation::Followup => "agent_followup",
             AgentControlOperation::Wait => "agent_wait",
             AgentControlOperation::Interrupt => "agent_interrupt",
+            AgentControlOperation::Spawn => "agent_spawn",
+            AgentControlOperation::Resume => "agent_resume",
+            AgentControlOperation::Handoff => "agent_handoff",
+            AgentControlOperation::Group => "agent_group",
         }
     }
 }
@@ -1703,6 +1922,18 @@ impl Tool for AgentControlTool {
                 "Wait on existing event cursors for mailbox, Subagent terminal, or needs-attention events."
             }
             AgentControlOperation::Interrupt => "Interrupt one exact active TaskSubagent attempt.",
+            AgentControlOperation::Spawn => {
+                "Create a new conversation Agent in the current or any registered workspace, with an optional first message and cold-start first turn."
+            }
+            AgentControlOperation::Resume => {
+                "Wake an idle conversation with a follow-up, or resume the paused TaskRun bound to a conversation."
+            }
+            AgentControlOperation::Handoff => {
+                "Migrate one conversation Agent to another workspace host in this process: settle its active turn, copy the transcript, retire the source, optionally deliver a follow-up."
+            }
+            AgentControlOperation::Group => {
+                "Manage long-lived collaboration groups (create / list / update / delete) over existing conversation Agents."
+            }
         }
     }
 
@@ -1748,6 +1979,7 @@ impl Tool for AgentControlTool {
                 "properties": {
                     "scope":{"type":"string","enum":["all","conversation","task_subagent"]},
                     "workspace_id":{"type":"string"},
+                    "group_id":{"type":"string","description":"Only conversations in this collaboration group."},
                     "status":{"type":"string"},
                     "limit":{"type":"integer","minimum":1,"maximum":32}
                 },
@@ -1791,6 +2023,63 @@ impl Tool for AgentControlTool {
                     "command_id":{"type":"string","minLength":1,"maxLength":128}
                 },
                 "required":["target","reason","command_id"],
+                "additionalProperties":false
+            }),
+            AgentControlOperation::Spawn => json!({
+                "type":"object",
+                "properties": {
+                    "goal":{"type":"string","minLength":1,"maxLength":MAX_TEXT_CHARS},
+                    "title":{"type":"string","minLength":1,"maxLength":160},
+                    "workspace_id":{"type":"string"},
+                    "first_message":{"type":"string","minLength":1,"maxLength":MAX_TEXT_CHARS},
+                    "start":{"type":"boolean"}
+                },
+                "required":["goal"],
+                "additionalProperties":false
+            }),
+            AgentControlOperation::Resume => json!({
+                "type":"object",
+                "properties": {
+                    "workspace_id":{"type":"string"},
+                    "conversation_id":{"type":"string"},
+                    "resume_policy":{"type":"string","enum":["followup","task_run"]},
+                    "run_id":{"type":"string","description":"Paused TaskRun id; required when resume_policy is task_run."},
+                    "text":{"type":"string","minLength":1,"maxLength":MAX_TEXT_CHARS}
+                },
+                "required":["workspace_id","conversation_id"],
+                "additionalProperties":false
+            }),
+            AgentControlOperation::Handoff => json!({
+                "type":"object",
+                "properties": {
+                    "workspace_id":{"type":"string"},
+                    "conversation_id":{"type":"string"},
+                    "destination_workspace_id":{"type":"string"},
+                    "follow_up":{"type":"string","minLength":1,"maxLength":MAX_TEXT_CHARS}
+                },
+                "required":["workspace_id","conversation_id","destination_workspace_id"],
+                "additionalProperties":false
+            }),
+            AgentControlOperation::Group => json!({
+                "type":"object",
+                "properties": {
+                    "action":{"type":"string","enum":["list","create","update","delete"]},
+                    "group_id":{"type":"string"},
+                    "name":{"type":"string","minLength":1,"maxLength":160},
+                    "leader":conversation_target_schema,
+                    "members":{"type":"array","minItems":1,"maxItems":32,"items":{
+                        "type":"object",
+                        "required":["workspace_id","conversation_id","subagent_role"],
+                        "properties":{
+                            "workspace_id":{"type":"string"},
+                            "conversation_id":{"type":"string"},
+                            "subagent_role":{"type":"string","minLength":1,"maxLength":128},
+                            "label":{"type":"string","maxLength":160}
+                        },
+                        "additionalProperties":false
+                    }}
+                },
+                "required":["action"],
                 "additionalProperties":false
             }),
         }
@@ -1849,6 +2138,38 @@ impl Tool for AgentControlTool {
                         Err(error) => Err(error),
                     }
                 }
+                AgentControlOperation::Spawn => {
+                    let request = serde_json::from_value::<AgentSpawnRequest>(value)
+                        .map_err(|error| AgentControlError::Invalid(error.to_string()));
+                    match request {
+                        Ok(request) => operation_result(self.service.spawn(request).await),
+                        Err(error) => Err(error),
+                    }
+                }
+                AgentControlOperation::Resume => {
+                    let request = serde_json::from_value::<AgentResumeRequest>(value)
+                        .map_err(|error| AgentControlError::Invalid(error.to_string()));
+                    match request {
+                        Ok(request) => operation_result(self.service.resume(request).await),
+                        Err(error) => Err(error),
+                    }
+                }
+                AgentControlOperation::Handoff => {
+                    let request = serde_json::from_value::<AgentHandoffRequest>(value)
+                        .map_err(|error| AgentControlError::Invalid(error.to_string()));
+                    match request {
+                        Ok(request) => operation_result(self.service.handoff(request).await),
+                        Err(error) => Err(error),
+                    }
+                }
+                AgentControlOperation::Group => {
+                    let request = serde_json::from_value::<AgentGroupToolRequest>(value)
+                        .map_err(|error| AgentControlError::Invalid(error.to_string()));
+                    match request {
+                        Ok(request) => operation_result(self.service.group(request).await),
+                        Err(error) => Err(error),
+                    }
+                }
             };
             match result {
                 Ok(result) => Ok(result),
@@ -1861,6 +2182,99 @@ impl Tool for AgentControlTool {
 #[derive(Debug, Deserialize)]
 struct InspectToolRequest {
     target: AgentTarget,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentSpawnRequest {
+    /// Goal for the new conversation Agent (also becomes its first message).
+    pub goal: String,
+    /// Optional conversation title. Defaults to a bounded goal preview.
+    pub title: Option<String>,
+    /// Target workspace id. Defaults to the service's bound workspace.
+    pub workspace_id: Option<String>,
+    /// Optional first message body; defaults to the goal text.
+    pub first_message: Option<String>,
+    /// When true, start the first turn immediately (cold delivery).
+    #[serde(default = "default_true")]
+    pub start: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentResumeRequest {
+    /// Conversation to wake (follow-up delivery), or a TaskRun-bearing
+    /// conversation whose paused run should resume.
+    pub workspace_id: String,
+    pub conversation_id: String,
+    /// `followup` (default) queues a follow-up message; `task_run` resumes a
+    /// paused TaskRun bound to this conversation.
+    #[serde(default)]
+    pub resume_policy: AgentResumePolicy,
+    /// Required with `task_run`: the exact paused run to resume.
+    pub run_id: Option<String>,
+    /// Optional instruction text (follow-up message or run resume note).
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentResumePolicy {
+    #[default]
+    Followup,
+    TaskRun,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentGroupToolRequest {
+    pub action: AgentGroupAction,
+    pub group_id: Option<String>,
+    pub name: Option<String>,
+    pub leader: Option<ConversationTarget>,
+    pub members: Option<Vec<AgentGroupMemberInput>>,
+    #[serde(default)]
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentGroupAction {
+    List,
+    Create,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentGroupMemberInput {
+    pub workspace_id: String,
+    pub conversation_id: String,
+    pub subagent_role: String,
+    pub label: Option<String>,
+}
+
+impl AgentGroupMemberInput {
+    fn into_member(self) -> crate::agent_router::AgentGroupMember {
+        crate::agent_router::AgentGroupMember {
+            address: {
+                let workspace = crate::workspace::WorkspaceId::from_raw(self.workspace_id);
+                crate::agent_router::AgentAddress::new(workspace, self.conversation_id)
+            },
+            subagent_role: self.subagent_role,
+            label: self.label,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentHandoffRequest {
+    pub workspace_id: String,
+    pub conversation_id: String,
+    pub destination_workspace_id: String,
+    /// Optional follow-up message delivered in the destination workspace.
+    pub follow_up: Option<String>,
 }
 
 /// Register all six control tools on the existing shared ToolManager. The
@@ -1877,6 +2291,10 @@ pub async fn register_agent_control_tools_on_agent(
         AgentControlOperation::Followup,
         AgentControlOperation::Wait,
         AgentControlOperation::Interrupt,
+        AgentControlOperation::Spawn,
+        AgentControlOperation::Resume,
+        AgentControlOperation::Handoff,
+        AgentControlOperation::Group,
     ];
     let added = agent_handle
         .write(|agent| {
@@ -1889,6 +2307,10 @@ pub async fn register_agent_control_tools_on_agent(
                     AgentControlOperation::Followup => "agent_followup",
                     AgentControlOperation::Wait => "agent_wait",
                     AgentControlOperation::Interrupt => "agent_interrupt",
+                    AgentControlOperation::Spawn => "agent_spawn",
+                    AgentControlOperation::Resume => "agent_resume",
+                    AgentControlOperation::Handoff => "agent_handoff",
+                    AgentControlOperation::Group => "agent_group",
                 };
                 if replace_existing
                     && agent
@@ -2112,6 +2534,7 @@ mod tests {
         let listed = service
             .list(AgentListRequest {
                 scope: AgentListScope::Conversation,
+                group_id: None,
                 workspace_id: None,
                 status: None,
                 limit: 8,
@@ -2288,6 +2711,7 @@ mod tests {
         let listed = service
             .list(AgentListRequest {
                 scope: AgentListScope::TaskSubagent,
+                group_id: None,
                 workspace_id: Some("global".to_string()),
                 status: None,
                 limit: 1,
@@ -2739,6 +3163,7 @@ mod tests {
         let listed = service
             .list(AgentListRequest {
                 scope: AgentListScope::Conversation,
+                group_id: None,
                 workspace_id: None,
                 status: None,
                 limit: 8,

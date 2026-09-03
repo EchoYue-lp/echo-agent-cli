@@ -1524,6 +1524,8 @@ async fn drive_chat_inner(
                 trace_sink: Some(framework_trace_sink_for(&sink)),
                 delegation_policy: None,
                 resource_guards: Vec::new(),
+                subagent_lineage: None,
+                uplink: None,
             }),
             working_dir,
             cancel: None,

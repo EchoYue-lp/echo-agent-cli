@@ -1,5 +1,6 @@
 ---
 name: explorer
+can_delegate: true
 description: "探索与事实定位：快速查明代码入口、调用链、配置、数据来源、文献证据或失败现场；适合边界清晰且检索噪声高的调查。"
 readonly: true
 model: fast

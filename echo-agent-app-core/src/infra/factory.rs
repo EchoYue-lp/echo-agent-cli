@@ -1498,6 +1498,7 @@ fn build_writer_subagent_agent(
         .system_prompt(prompt)
         .enable_tools()
         // NO .readonly_tools() → full tool set (write capability).
+        .register_subagent_message_tools()
         .enable_cot()
         .token_limit(token_limit)
         .visibility_horizon(eko_visibility_horizon(token_limit))
@@ -1625,6 +1626,9 @@ fn build_readonly_subagent_agent(
         .system_prompt(prompt)
         .enable_tools()
         .readonly_tools() // SA-2: physical enforcement — no shell/write tools
+        // In-tree communication tools: report/escalate to the run driver and
+        // queue-only sibling messaging (uplink read from ToolContext).
+        .register_subagent_message_tools()
         .enable_cot()
         .token_limit(token_limit)
         .visibility_horizon(eko_visibility_horizon(token_limit))

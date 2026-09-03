@@ -50,6 +50,12 @@ pub struct AppState {
     /// Delivery wake callback shared by global and workspace Agent control
     /// tools after the AppState Arc has been published.
     agent_control_wake: Arc<std::sync::OnceLock<crate::agent_control::DeliveryWake>>,
+    /// Application operations (spawn/resume/handoff) for the agent control
+    /// plane. Set once on the first Arc-backed registration; the shared
+    /// ToolManager then exposes them to every pooled conversation Agent.
+    agent_control_ops: Arc<
+        std::sync::OnceLock<Arc<dyn crate::agent_control::AgentControlAppOps>>,
+    >,
     /// Owned lifetime for asynchronous inbox consumers.
     pub agent_deliveries: Arc<crate::agent_router::AgentDeliverySupervisor>,
     /// Product projections that must be retired before workspace metadata can
@@ -258,6 +264,7 @@ impl AppState {
             browser_runtime: None,
             agent_router: crate::agent_router::AgentRouter::at_default_root(),
             agent_control_wake: Arc::new(std::sync::OnceLock::new()),
+            agent_control_ops: Arc::new(std::sync::OnceLock::new()),
             agent_deliveries: Arc::new(crate::agent_router::AgentDeliverySupervisor::default()),
             workspace_delete_hook: None,
         })
@@ -2049,6 +2056,10 @@ impl AppState {
                 .map_err(|error| error.to_string())
         });
         let _ = self.agent_control_wake.set(Arc::clone(&wake));
+        let _ = self
+            .agent_control_ops
+            .set(Arc::new(AppStateAgentControlOps::new(self))
+                as Arc<dyn crate::agent_control::AgentControlAppOps>);
         self.register_agent_control_tools_with_wake(
             agent,
             task_runtime,
@@ -2074,6 +2085,10 @@ impl AppState {
         .with_delivery_wake(wake);
         let service = match conversation_store {
             Some(store) => service.with_conversation_store(store, workspace_id),
+            None => service,
+        };
+        let service = match self.agent_control_ops.get() {
+            Some(ops) => service.with_app_ops(Arc::clone(ops)),
             None => service,
         };
         let service = Arc::new(service);
@@ -4545,4 +4560,388 @@ fn resolve_active_model_runtime(
     crate::model_config::resolve_runtime_model(config, selector)
         .map(Some)
         .map_err(|error| ModelMutationError::Validation(error.to_string()))
+}
+
+// ── Agent control application operations (spawn / resume / handoff) ──
+// Implements `AgentControlAppOps` for the six-tool plane's newer siblings.
+// Kept inside app_state.rs because these operations open workspace hosts and
+// drive pooled chat runtimes — AppState-private machinery that the thin
+// AgentControlService must not own (ADR 0016 layering).
+
+struct AppStateAgentControlOps {
+    state: std::sync::Weak<AppState>,
+}
+
+impl AppStateAgentControlOps {
+    fn new(state: &Arc<AppState>) -> Self {
+        Self {
+            state: Arc::downgrade(state),
+        }
+    }
+
+    /// Resolve the conversation store for a workspace id: the current
+    /// workspace uses its live runtime; other ids open the registered host.
+    async fn conversation_store_for(
+        state: &Arc<AppState>,
+        workspace_id: &str,
+    ) -> Result<(Arc<dyn echo_agent::memory::ConversationStore>, bool), crate::agent_control::AgentControlError>
+    {
+        let current = state
+            .current_chat_runtime_inner()
+            .await
+            .map_err(|error| {
+                crate::agent_control::AgentControlError::Runtime(error.to_string())
+            })?;
+        let current_id = current.execution_scope().workspace_id();
+        if workspace_id == current_id {
+            let store = current.conversation_store().ok_or_else(|| {
+                crate::agent_control::AgentControlError::Runtime(
+                    "current workspace has no conversation store".to_string(),
+                )
+            })?;
+            return Ok((store, true));
+        }
+        // Cross-workspace: resolve the registered workspace and open its host.
+        let workspace = state
+            .workspace
+            .registry
+            .list()
+            .map_err(|error| crate::agent_control::AgentControlError::Invalid(error.to_string()))?
+            .into_iter()
+            .find(|workspace| workspace.id.as_str() == workspace_id)
+            .ok_or_else(|| {
+                crate::agent_control::AgentControlError::Invalid(format!(
+                    "workspace '{workspace_id}' is not registered"
+                ))
+            })?;
+        let host = state
+            .workspace
+            .runtimes
+            .get_or_open(workspace)
+            .await
+            .map_err(|error| {
+                crate::agent_control::AgentControlError::Runtime(error.to_string())
+            })?;
+        let store = host.resources().conversation_store();
+        Ok((store, false))
+    }
+}
+
+impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
+    fn spawn_conversation(
+        &self,
+        request: crate::agent_control::AgentSpawnRequest,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<serde_json::Value, crate::agent_control::AgentControlError>,
+    > {
+        let weak = self.state.clone();
+        Box::pin(async move {
+            let state = weak
+                .upgrade()
+                .ok_or_else(|| {
+                    crate::agent_control::AgentControlError::Runtime(
+                        "app state unavailable".to_string(),
+                    )
+                })?;
+            let workspace_id = match request.workspace_id.as_deref() {
+                Some(id) if !id.trim().is_empty() => id.to_string(),
+                _ => state
+                    .current_chat_runtime_inner()
+                    .await
+                    .map_err(|error| {
+                        crate::agent_control::AgentControlError::Runtime(error.to_string())
+                    })?
+                    .execution_scope()
+                    .workspace_id()
+                    .to_string(),
+            };
+            let (store, _) =
+                Self::conversation_store_for(&state, &workspace_id).await?;
+            let conversation_id = format!("spawn-{}", uuid::Uuid::new_v4().as_simple());
+            let title = request
+                .title
+                .clone()
+                .unwrap_or_else(|| request.goal.chars().take(80).collect());
+            let conversation = store
+                .create_conversation(echo_agent::memory::NewConversation {
+                    conversation_id: conversation_id.clone(),
+                    user_id: "eko".to_string(),
+                    agent_type: None,
+                    title: Some(title),
+                })
+                .await
+                .map_err(|error| {
+                    crate::agent_control::AgentControlError::Runtime(error.to_string())
+                })?;
+            let address = crate::agent_router::AgentAddress::new(
+                crate::workspace::WorkspaceId::from_raw(workspace_id.clone()),
+                conversation.conversation_id.clone(),
+            );
+            let mut started = false;
+            if request.start {
+                let text = request
+                    .first_message
+                    .clone()
+                    .unwrap_or_else(|| request.goal.clone());
+                let message = crate::agent_router::AgentMessage::agent_text(None, address.clone(), text);
+                state
+                    .send_agent_message_owned(message)
+                    .await
+                    .map_err(|error| {
+                        crate::agent_control::AgentControlError::Runtime(error.to_string())
+                    })?;
+                started = true;
+            }
+            Ok(serde_json::json!({
+                "workspace_id": workspace_id,
+                "conversation_id": conversation.conversation_id,
+                "started": started,
+            }))
+        })
+    }
+
+    fn resume_target(
+        &self,
+        request: crate::agent_control::AgentResumeRequest,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<serde_json::Value, crate::agent_control::AgentControlError>,
+    > {
+        let weak = self.state.clone();
+        Box::pin(async move {
+            let state = weak
+                .upgrade()
+                .ok_or_else(|| {
+                    crate::agent_control::AgentControlError::Runtime(
+                        "app state unavailable".to_string(),
+                    )
+                })?;
+            let address = crate::agent_router::AgentAddress::new(
+                crate::workspace::WorkspaceId::from_raw(request.workspace_id.clone()),
+                request.conversation_id.clone(),
+            );
+            match request.resume_policy {
+                crate::agent_control::AgentResumePolicy::Followup => {
+                    let text = request.text.unwrap_or_else(|| {
+                        "请继续之前的工作:汇报当前状态并接着推进。".to_string()
+                    });
+                    let message =
+                        crate::agent_router::AgentMessage::agent_text(None, address.clone(), text);
+                    state
+                        .send_agent_message_owned(message)
+                        .await
+                        .map_err(|error| {
+                            crate::agent_control::AgentControlError::Runtime(error.to_string())
+                        })?;
+                    Ok(serde_json::json!({
+                        "workspace_id": request.workspace_id,
+                        "conversation_id": request.conversation_id,
+                        "policy": "followup",
+                        "queued": true,
+                    }))
+                }
+                crate::agent_control::AgentResumePolicy::TaskRun => {
+                    let run_id = request.run_id.clone().ok_or_else(|| {
+                        crate::agent_control::AgentControlError::Invalid(
+                            "task_run resume requires run_id".to_string(),
+                        )
+                    })?;
+                    // Resolve the workspace-scoped task runtime and pooled
+                    // conversation agent, then relaunch the paused run.
+                    let runtime = state
+                        .current_chat_runtime_inner()
+                        .await
+                        .map_err(|error| {
+                            crate::agent_control::AgentControlError::Runtime(error.to_string())
+                        })?;
+                    if runtime.execution_scope().workspace_id()
+                        != request.workspace_id.as_str()
+                    {
+                        return Err(crate::agent_control::AgentControlError::Invalid(format!(
+                            "task_run resume is bound to the current workspace ({}); target {} requires a handoff or direct workspace focus",
+                            runtime.execution_scope().workspace_id(),
+                            request.workspace_id
+                        )));
+                    }
+                    let store = runtime.task_runtime().ok_or_else(|| {
+                        crate::agent_control::AgentControlError::Runtime(
+                            "workspace has no TaskRuntimeStore".to_string(),
+                        )
+                    })?;
+                    let probe_run_id = run_id.clone();
+                    let pool = runtime.pool().ok_or_else(|| {
+                        crate::agent_control::AgentControlError::Runtime(
+                            "workspace has no AgentPool".to_string(),
+                        )
+                    })?;
+                    let pool_execution = pool
+                        .acquire(&request.conversation_id)
+                        .await
+                        .map_err(|error| {
+                            crate::agent_control::AgentControlError::Runtime(error.to_string())
+                        })?;
+                    let run_state = crate::tasks::task_runtime::executor::TaskRuntimeOperation::new(
+                        Arc::clone(&store),
+                    )
+                    .run_store("load resume run state", move |store| {
+                        store.get_run_state(&probe_run_id)
+                    })
+                    .await
+                    .map_err(|error| {
+                        crate::agent_control::AgentControlError::Runtime(error.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        crate::agent_control::AgentControlError::Invalid(format!(
+                            "run {run_id} not found"
+                        ))
+                    })?;
+                    let expected =
+                        crate::tasks::task_runtime::types::TaskRunResumeIdentity::capture(
+                            &run_state,
+                        );
+                    let launch = crate::tasks::task_runtime::launch_planned_run_resume(
+                        store,
+                        expected,
+                        pool_execution.agent().clone(),
+                        Some(pool_execution),
+                        runtime.review_integration(),
+                        None,
+                        echo_agent::agent::CancellationToken::new(),
+                        None,
+                    )
+                    .await
+                    .map_err(|error| {
+                        crate::agent_control::AgentControlError::Runtime(error.to_string())
+                    })?;
+                    if let Some(text) = request.text {
+                        let note = crate::agent_router::AgentMessage::agent_text(
+                            None,
+                            address,
+                            text,
+                        );
+                        let _ = state.send_agent_message_owned(note).await;
+                    }
+                    Ok(serde_json::json!({
+                        "workspace_id": request.workspace_id,
+                        "conversation_id": request.conversation_id,
+                        "run_id": run_id,
+                        "policy": "task_run",
+                        "launched": true,
+                        "launch_run_id": launch.run_id,
+                    }))
+                }
+            }
+        })
+    }
+
+    fn handoff_conversation(
+        &self,
+        request: crate::agent_control::AgentHandoffRequest,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<serde_json::Value, crate::agent_control::AgentControlError>,
+    > {
+        let weak = self.state.clone();
+        Box::pin(async move {
+            let state = weak
+                .upgrade()
+                .ok_or_else(|| {
+                    crate::agent_control::AgentControlError::Runtime(
+                        "app state unavailable".to_string(),
+                    )
+                })?;
+            if request.workspace_id == request.destination_workspace_id {
+                return Err(crate::agent_control::AgentControlError::Invalid(
+                    "destination workspace must differ from the source".to_string(),
+                ));
+            }
+            let (source_store, _) =
+                Self::conversation_store_for(&state, &request.workspace_id).await?;
+            let (destination_store, _) = Self::conversation_store_for(
+                &state,
+                &request.destination_workspace_id,
+            )
+            .await?;
+            let conversation = source_store
+                .get_conversation(&request.conversation_id)
+                .await
+                .map_err(|error| {
+                    crate::agent_control::AgentControlError::Runtime(error.to_string())
+                })?
+                .ok_or_else(|| {
+                    crate::agent_control::AgentControlError::Invalid(format!(
+                        "conversation '{}' does not exist in workspace '{}'",
+                        request.conversation_id, request.workspace_id
+                    ))
+                })?;
+            let messages = source_store
+                .get_messages(&request.conversation_id)
+                .await
+                .map_err(|error| {
+                    crate::agent_control::AgentControlError::Runtime(error.to_string())
+                })?;
+            // 1. Recreate the conversation (same id) in the destination store.
+            destination_store
+                .create_conversation(echo_agent::memory::NewConversation {
+                    conversation_id: conversation.conversation_id.clone(),
+                    user_id: conversation.user_id.clone(),
+                    agent_type: conversation.agent_type.clone(),
+                    title: conversation.title.clone(),
+                })
+                .await
+                .map_err(|error| {
+                    crate::agent_control::AgentControlError::Runtime(error.to_string())
+                })?;
+            // 2. Copy the transcript verbatim.
+            destination_store
+                .save_messages(&conversation.conversation_id, &messages)
+                .await
+                .map_err(|error| {
+                    crate::agent_control::AgentControlError::Runtime(error.to_string())
+                })?;
+            // 3. Retire the source: pooled agent first (in-memory context),
+            //    then the durable transcript.
+            if request.workspace_id
+                == state
+                    .current_chat_runtime_inner()
+                    .await
+                    .map(|runtime| runtime.execution_scope().workspace_id().to_string())
+                    .unwrap_or_default()
+                && let Some(pool) =
+                    state.current_chat_runtime_inner().await.ok().and_then(|r| r.pool())
+            {
+                let _ = pool
+                    .retire_conversation_and_wait(&request.conversation_id)
+                    .await;
+            }
+            source_store
+                .delete_conversation(&request.conversation_id)
+                .await
+                .map_err(|error| {
+                    crate::agent_control::AgentControlError::Runtime(error.to_string())
+                })?;
+            // 4. Optional follow-up in the destination workspace.
+            let new_address = crate::agent_router::AgentAddress::new(
+                crate::workspace::WorkspaceId::from_raw(
+                    request.destination_workspace_id.clone(),
+                ),
+                request.conversation_id.clone(),
+            );
+            let mut follow_up_delivered = false;
+            if let Some(text) = request.follow_up {
+                let message =
+                    crate::agent_router::AgentMessage::agent_text(None, new_address, text);
+                let _ = state.send_agent_message_owned(message).await;
+                follow_up_delivered = true;
+            }
+            Ok(serde_json::json!({
+                "workspace_id": request.destination_workspace_id,
+                "source_workspace_id": request.workspace_id,
+                "conversation_id": request.conversation_id,
+                "messages_migrated": messages.len(),
+                "follow_up_delivered": follow_up_delivered,
+            }))
+        })
+    }
 }

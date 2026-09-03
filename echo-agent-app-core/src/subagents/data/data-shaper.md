@@ -1,5 +1,6 @@
 ---
 name: data-shaper
+can_delegate: true
 description: "数据整形：对原始数据做画像、schema 对齐、清洗和可复现导出，保留原始输入并产出带质量记录的独立数据文件。"
 workspace: true
 tags: ["data"]

@@ -33,8 +33,18 @@ pub struct TaskCapabilityCatalog {
 }
 
 impl TaskCapabilityCatalog {
-    const TASK_CONTROL_TOOLS: [&'static str; 4] =
-        ["task_create", "task_update", "task_list", "task_execute"];
+    const TASK_CONTROL_TOOLS: [&'static str; 8] = [
+        "task_create",
+        "task_update",
+        "task_list",
+        "task_execute",
+        // 会话面控制工具同样禁止委派给子智能体:spawn/group 会创建并行执行
+        // 面,resume/handoff 迁移宿主——它们属于主 Agent 的编排职责。
+        "agent_spawn",
+        "agent_group",
+        "agent_resume",
+        "agent_handoff",
+    ];
 
     pub fn new(
         subagents: Arc<SubagentCatalogSnapshot>,
@@ -734,6 +744,34 @@ mod task_create_tests {
                 "kind": "investigation",
                 "subagent": "explorer",
                 "allowed_tools": ["task_update"]
+            }))),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("cannot delegate task-control tool")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_create_rejects_agent_plane_control_tools_in_subagent_allowlist()
+    -> std::result::Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let tool = FrameworkTaskCreateTool::new(task_service(store));
+        let result = with_run_id(
+            "run_forbidden_spawn".to_string(),
+            tool.execute(one_task_params(serde_json::json!({
+                "id": "bad-spawn",
+                "title": "Bad spawn",
+                "description": "Attempt to delegate agent-plane control",
+                "kind": "investigation",
+                "subagent": "explorer",
+                "allowed_tools": ["agent_spawn"]
             }))),
         )
         .await

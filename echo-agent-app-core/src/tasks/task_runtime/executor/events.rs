@@ -166,6 +166,8 @@ async fn drive_owned_agent_turn(
                     trace_sink: core_trace_sink,
                     delegation_policy: None,
                     resource_guards: Vec::new(),
+                    subagent_lineage: None,
+                    uplink: None,
                 }),
                 working_dir,
                 cancel: None,

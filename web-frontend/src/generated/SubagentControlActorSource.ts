@@ -3,4 +3,4 @@
 /**
  * Product surface that issued an explicit Subagent control command.
  */
-export type SubagentControlActorSource = 'gui' | 'tui' | 'cli' | 'channel';
+export type SubagentControlActorSource = 'gui' | 'tui' | 'cli' | 'channel' | 'peer';

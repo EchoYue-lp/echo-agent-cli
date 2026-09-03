@@ -1012,6 +1012,13 @@ EKO 可以提供以下模型工具；工具名是功能设计，最终 wire name
 这些工具应返回短摘要和稳定 receipt；大结果通过 artifact/reference/cursor 读取，不直接
 塞回协调 Agent 的上下文。
 
+> 实现状态(2026-09-02,ADR 0034):本节九个设计工具已全部落地——六件套
+> (`agent_list/inspect/message/followup/wait/interrupt`)见 ADR 0016;
+> `agent_spawn/agent_resume/agent_handoff/agent_group` 见 ADR 0034(其中
+> `agent_spawn` 的 worktree 隔离参数与 `agent_handoff` 的跨宿主形态收敛为
+> 后续增量)。子智能体平面的全方向上行/兄弟通信由框架 ADR 0027 与应用
+> `tasks/task_runtime/uplink.rs` 提供。
+
 ### 7.5 协调策略
 
 EKO 默认采用“模型决策 + 运行时约束”的混合方式：

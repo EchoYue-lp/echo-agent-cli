@@ -860,6 +860,20 @@ team_subagents: [\"explorer\", \"summarizer\"]\n\
     }
 
     #[test]
+    fn builtin_roles_all_delegate_capable() -> TestResult {
+        // 全方向通信矩阵:每个内置角色都可派发自己的子智能体(NestedDelegation
+        // 深度由框架 policy 兜底),不再有只能被动接受派发的角色。
+        for (name, md) in BUILTIN_SUBAGENT_FILES {
+            let def = parse_subagent_md(md, None)?;
+            assert!(
+                def.can_delegate,
+                "builtin role {name} must declare can_delegate"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn parse_can_delegate_frontmatter() -> TestResult {
         let md = "---\nname: manager\ndescription: \"d\"\ncan_delegate: true\n---\nbody";
         let def = parse_subagent_md(md, None)?;

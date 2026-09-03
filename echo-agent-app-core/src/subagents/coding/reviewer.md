@@ -1,5 +1,6 @@
 ---
 name: reviewer
+can_delegate: true
 description: "审查与反证：寻找会导致错误行为、错误结论、数据损失、证据失真或缺失验证的具体问题；适合 code review、方法审查和安全/证据检查。"
 readonly: true
 tags: ["readonly", "parallel"]

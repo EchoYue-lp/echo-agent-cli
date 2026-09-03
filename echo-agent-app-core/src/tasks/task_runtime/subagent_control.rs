@@ -31,6 +31,12 @@ impl ActiveSubagentControlTarget {
     pub(super) fn belongs_to_run(&self, run_id: &str) -> bool {
         self.identity.run_id == run_id
     }
+
+    /// Durable control identity of the live attempt (run/task/execution/
+    /// revision/attempt, without a command id — callers mint one per command).
+    pub(super) fn control_identity(&self) -> SubagentControlIdentity {
+        self.identity.clone()
+    }
 }
 
 /// Removes only the exact route registered for this physical execution.

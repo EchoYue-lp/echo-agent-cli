@@ -1,5 +1,6 @@
 ---
 name: analyst
+can_delegate: true
 description: "数据分析：基于明确问题执行统计、建模或可视化，检查假设与不确定性，并产出可复现的指标、图表和简报。"
 workspace: true
 tags: ["data"]

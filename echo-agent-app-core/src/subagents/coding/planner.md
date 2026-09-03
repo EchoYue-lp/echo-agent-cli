@@ -1,5 +1,6 @@
 ---
 name: planner
+can_delegate: true
 description: "方案设计：把已知目标和证据转成可执行、可验证的步骤与依赖；适合测试策略、复现路径、迁移方案和研究交付规划。"
 readonly: true
 tags: ["readonly", "parallel"]

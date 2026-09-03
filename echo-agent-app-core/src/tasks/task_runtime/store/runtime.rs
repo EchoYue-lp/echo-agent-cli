@@ -2736,6 +2736,20 @@ impl TaskRuntimeStore {
     /// Pause an actively driven run. The status changes first, then the same
     /// run-scoped token used for cancellation stops in-flight Subagents. The
     /// executor observes the durable Paused status and leaves the run resumable.
+    /// Resolve the durable control identity of the currently active
+    /// execution under `execution_id`, if any. Used by the Subagent uplink to
+    /// address sibling attempts without knowing their task/attempt fields.
+    pub fn active_control_identity(
+        &self,
+        execution_id: &str,
+    ) -> Option<crate::tasks::task_runtime::types::SubagentControlIdentity> {
+        self.active_subagent_controls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(execution_id)
+            .map(|target| target.control_identity())
+    }
+
     pub fn request_pause(&self, run_id: &str) -> Result<bool, StoreError> {
         self.request_pause_with_reason(run_id, RunPauseReason::User, None)
     }

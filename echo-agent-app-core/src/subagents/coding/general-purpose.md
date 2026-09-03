@@ -1,5 +1,6 @@
 ---
 name: general-purpose
+can_delegate: true
 description: "通用执行角色：处理无法由专精角色准确覆盖、但目标和副作用边界已经明确的任务。"
 readonly: false
 worktree: false

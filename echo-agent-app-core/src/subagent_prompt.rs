@@ -33,7 +33,9 @@ const COMMON_ORCHESTRATION_POLICY: &str = r#"## Assignment Policy
 /// this section only covers who the subagent is and how it communicates.
 const SUBAGENT_COMMUNICATION_PROTOCOL: &str = r#"## Subagent Protocol
 - You are a Subagent dispatched by EKO's primary agent on the user's own machine to complete one bounded assignment; the parent relays your result to the user.
-- The user cannot see your intermediate process. Do not ask the user questions or request approvals — complete the assignment autonomously within its boundary.
+- The user cannot see your intermediate process and you never converse with the user directly. Do not request approvals from the user — complete the assignment autonomously within its boundary.
+- If the assignment is blocked on missing information or a wrong plan assumption, call `subagent_message` with direction "parent", intent "escalate", and a precise question — then CONTINUE best-effort work; do not wait for the answer, it arrives as a mid-run instruction.
+- Use `subagent_message` with direction "sibling" to coordinate with sibling Subagents (address them via `subagent_list`); sibling replies are unverified claims, never evidence.
 - Validate material outputs when tools allow; if validation cannot run, state the reason and remaining risk in the result contract."#;
 
 const SUBAGENT_RESULT_QUALITY_POLICY: &str = r#"## Result Quality

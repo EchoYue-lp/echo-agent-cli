@@ -571,6 +571,10 @@ pub enum RuntimeEventKind {
     SubagentInterruptRequested,
     /// The exact-attempt interrupt reached a typed framework outcome.
     SubagentInterruptSettled,
+    /// A running Subagent sent an uplink message to the run driver: an
+    /// informational report or a blocking clarification request. Payload
+    /// carries `blocking`, the bounded question text, and sender identity.
+    SubagentEscalationRequested,
     IsolationObserved,
     ThinkingStarted,
     ThinkingDelta,
@@ -655,6 +659,7 @@ impl RuntimeEventKind {
             SubagentGuidanceRejected => "subagent_guidance_rejected",
             SubagentInterruptRequested => "subagent_interrupt_requested",
             SubagentInterruptSettled => "subagent_interrupt_settled",
+            SubagentEscalationRequested => "subagent_escalation_requested",
             IsolationObserved => "isolation_observed",
             ThinkingStarted => "thinking_started",
             ThinkingDelta => "thinking_delta",
@@ -706,6 +711,7 @@ impl RuntimeEventKind {
                 | RuntimeEventKind::TaskTimedOut
                 | RuntimeEventKind::SubagentGuidanceRejected
                 | RuntimeEventKind::SubagentInterruptSettled
+                | RuntimeEventKind::SubagentEscalationRequested
                 | RuntimeEventKind::Failed
                 | RuntimeEventKind::Cancelled
                 | RuntimeEventKind::TimedOut
@@ -2201,6 +2207,10 @@ pub enum SubagentControlActorSource {
     Tui,
     Cli,
     Channel,
+    /// A peer Subagent sending through the dispatch uplink (report, escalate,
+    /// or sibling message). Peer commands are model-initiated, so surfaces
+    /// should attribute them to the sending role instead of a human actor.
+    Peer,
 }
 
 impl SubagentControlActorSource {
@@ -2210,6 +2220,7 @@ impl SubagentControlActorSource {
             Self::Tui => "tui",
             Self::Cli => "cli",
             Self::Channel => "channel",
+            Self::Peer => "peer",
         }
     }
 }

@@ -1,5 +1,6 @@
 ---
 name: summarizer
+can_delegate: true
 description: "证据综合：合并多个 Subagent 的结果、去重、处理冲突并形成面向用户的结论；适合多源发现已经齐备后的收口。"
 readonly: true
 tags: ["readonly", "parallel"]

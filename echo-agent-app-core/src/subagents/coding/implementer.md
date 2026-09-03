@@ -1,5 +1,6 @@
 ---
 name: implementer
+can_delegate: true
 description: "代码实现：完成边界明确的功能、修复或重构，并提供可审查 diff 与验证证据；不适合需求仍未澄清的开放式探索。"
 readonly: false
 worktree: true

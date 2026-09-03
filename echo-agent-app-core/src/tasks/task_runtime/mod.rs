@@ -69,6 +69,7 @@ pub mod task_execute_tool;
 pub mod task_tools;
 pub(crate) mod turn_lifecycle;
 pub mod types;
+pub mod uplink;
 pub mod worktree;
 
 pub use boot_reconciler::{TaskRunBootOutcome, TaskRunBootReconciler};
