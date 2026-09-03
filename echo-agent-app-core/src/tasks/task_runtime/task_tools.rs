@@ -175,6 +175,13 @@ pub(crate) fn current_run_id() -> Option<String> {
     CURRENT_RUN_ID.try_with(|cell| cell.clone()).ok()
 }
 
+pub(crate) fn current_trace_sink() -> Option<TraceSink> {
+    CURRENT_TRACE_SINK
+        .try_with(|sink| sink.clone())
+        .ok()
+        .flatten()
+}
+
 pub(crate) fn current_workspace_io() -> Option<crate::state::WorkspaceIoInvocation> {
     CURRENT_WORKSPACE_IO.try_with(Clone::clone).ok().flatten()
 }
@@ -442,6 +449,13 @@ mod task_create_tests {
         );
         let tool = FrameworkTaskCreateTool::new(task_service(store.clone()));
         let run_id = "run_task_create_bootstrap";
+        let trace_events = Arc::new(std::sync::Mutex::new(Vec::<ExecEvent>::new()));
+        let captured_events = trace_events.clone();
+        let trace_sink: TraceSink = Arc::new(move |event| {
+            if let Ok(mut events) = captured_events.lock() {
+                events.push(event);
+            }
+        });
         let params = one_task_params(serde_json::json!({
             "id": "architecture-review",
             "title": "分析当前项目架构",
@@ -449,9 +463,14 @@ mod task_create_tests {
             "kind": "read_only_review"
         }));
 
-        let result = with_run_id(run_id.to_string(), tool.execute(params))
-            .await
-            .map_err(|e| e.to_string())?;
+        let result = with_run_context(
+            run_id.to_string(),
+            tokio_util::sync::CancellationToken::new(),
+            Some(trace_sink),
+            tool.execute(params),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         if !result.success {
             return Err(format!("task_create failed: {:?}", result.error));
         }
@@ -472,6 +491,23 @@ mod task_create_tests {
                 result.output
             ));
         }
+        let events = trace_events
+            .lock()
+            .map_err(|_| "task_create trace event lock is poisoned".to_string())?;
+        let plan_committed = events.iter().find(|event| {
+            event.scope == super::super::executor::ExecEventScope::Run
+                && event.event == RuntimeEventKind::PlanRevisionCommitted
+        });
+        let plan_committed = plan_committed
+            .ok_or_else(|| "task_create did not project its committed plan".to_string())?;
+        assert_eq!(plan_committed.run_id, run_id);
+        assert_eq!(
+            plan_committed
+                .payload
+                .get("revision")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
 
         let events = store.list_events(run_id, 0).map_err(|e| e.to_string())?;
         let first = events

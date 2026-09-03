@@ -3334,6 +3334,56 @@ mod tests {
     }
 
     #[test]
+    fn continuation_claim_rechecks_runtime_activity_after_quiet_wake() -> Result<(), String> {
+        let store = std::sync::Arc::new(fresh().map_err(|error| error.to_string())?);
+        seed_plan(&store).map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation("r1", true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        store
+            .set_continuation_deferred("r1", true)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            store
+                .resume_deferred_continuation_if_quiet("r1")
+                .map_err(|error| error.to_string())?,
+            "quiet wake should clear the initial deferral"
+        );
+
+        // Model the forward race: task activity appears after eligibility
+        // observed quiet but before the next continuation claims its RunTurn.
+        store
+            .set_task_status(
+                "r1",
+                "t1",
+                echo_agent::tasks::TaskStatus::Running,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        let claim = store
+            .claim_run_turn(
+                "r1",
+                "raced-continuation",
+                RunTurnOrigin::Continuation,
+                TurnVisibility::Internal,
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            claim,
+            RunTurnClaimOutcome::NotSubmitted(ContinuationNotSubmittedReason::Deferred)
+        );
+        let snapshot = store
+            .get_run_state("r1")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "quiet-wake race snapshot disappeared".to_string())?;
+        assert!(snapshot
+            .continuation
+            .is_some_and(|continuation| continuation.deferred && continuation.active_turn.is_none()));
+        Ok(())
+    }
+
+    #[test]
     fn cell_terminal_retry_uses_the_exact_checkpointed_terminal_fact() -> Result<(), StoreError> {
         let store = fresh()?;
         seed_plan(&store)?;
@@ -4358,6 +4408,13 @@ mod tests {
             },
         )?;
         assert!(progressed.blocker_audit.is_none());
+        store.set_task_status(
+            "r1",
+            "t1",
+            echo_agent::tasks::TaskStatus::Completed,
+            Some("code_reviewer"),
+            Some("review completed"),
+        )?;
 
         for (turn_id, fingerprint, expected) in [
             ("provider-a", "provider_a", 1_u32),

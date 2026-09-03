@@ -3,6 +3,7 @@ import type {
   BackgroundCellState,
   ConnectMcpRequest,
   ExtensionSkillEntry,
+  ForegroundTurnSnapshot,
   RuntimeEventKind,
   RunContinuationState,
   SkillArtifactSyncReceipt,
@@ -165,6 +166,16 @@ const runtimeEventVariants = [
   'run_cancelled',
 ] satisfies RuntimeEventKind[];
 
+const activeForegroundTurn = {
+  workspace_id: 'workspace-a',
+  surface: 'gui',
+  conversation_id: 'conversation-a',
+  root_turn_id: 'root-turn-a',
+  active_turn_id: 'continuation-turn-a',
+  run_id: 'task-run-a',
+  cancellation_requested: false,
+} satisfies ForegroundTurnSnapshot;
+
 const serializedBackgroundCell = {
   cell_id: 'cell-1',
   name: 'test suite',
@@ -290,6 +301,8 @@ describe('Rust serialization contracts', () => {
     expect(runtimeEventVariants).toContain('artifact_produced');
     expect(runtimeEventVariants).toContain('background_cell_finished');
     expect(runtimeEventVariants).toContain('run_turn_usage_accounted');
+    expect(activeForegroundTurn.run_id).toBe('task-run-a');
+    expectTypeOf(activeForegroundTurn).toMatchTypeOf<ForegroundTurnSnapshot>();
     expect(serializedBackgroundCell.finished_at).toBeNull();
     expect(serializedContinuation.pause?.reason).toBe('repeated_blocker');
     expect(serializedContinuation.time_budget_seconds).toBe(7_200);

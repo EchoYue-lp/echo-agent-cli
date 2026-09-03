@@ -1578,6 +1578,7 @@ impl AppChannelMessageHandler {
             }
         };
         let dispatched_input_id = projection.receipt.identity.input_id.clone();
+        let steer_text = projection.payload.text.clone();
         let settlement_waiter = match self.foreground_turns.settlement_waiter_scoped(
             &workspace_id,
             ForegroundTurnSurface::Channel,
@@ -1660,7 +1661,6 @@ impl AppChannelMessageHandler {
             }
         };
         let agent = execution.agent();
-        let steer_text = turn.instruction.clone();
         let message = match turn.to_message() {
             Ok(message) => message,
             Err(error) => {

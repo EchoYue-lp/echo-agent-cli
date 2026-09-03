@@ -16,5 +16,11 @@ export type ForegroundTurnSnapshot = {
    * Current framework turn identity used for exact steer/cancel requests.
    */
   active_turn_id: string;
+  /**
+   * Exact TaskRun currently driven by the active framework turn. Surfaces
+   * use this binding for durable steer facts instead of deriving a run id
+   * from a continuation turn id.
+   */
+  run_id: string | null;
   cancellation_requested: boolean;
 };

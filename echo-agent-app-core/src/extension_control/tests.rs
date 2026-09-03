@@ -1173,7 +1173,12 @@ mod tests {
             Some("receipt-plugin")
         );
         assert_eq!(receipt.target_receipts.len(), 2);
-        assert_eq!(receipt.status, PluginSettlementStatus::Settled);
+        assert_eq!(
+            receipt.status,
+            PluginSettlementStatus::Settled,
+            "plugin install settlement degraded: {:?}",
+            receipt.target_receipts
+        );
         for target in &receipt.target_receipts {
             assert!(!target.workspace_generation.is_empty());
             assert!(!target.previous_prepared_generation.is_empty());

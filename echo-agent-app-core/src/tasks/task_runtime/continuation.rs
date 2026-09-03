@@ -9,7 +9,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 
 use echo_agent::agent::{AgentHandle, CancellationToken};
-use echo_agent::runtime::TurnReceipt;
 use futures::FutureExt;
 
 use crate::chat_resources::ChatResources;
@@ -573,7 +572,20 @@ impl TaskContinuationRuntime {
             )
             .await;
             match result {
-                Ok(outcome) => terminal = outcome.outcome,
+                Ok(crate::chat_driver::RunTurnDriveOutcome::Driven(outcome)) => {
+                    terminal = outcome.outcome;
+                }
+                Ok(crate::chat_driver::RunTurnDriveOutcome::Deferred) => {
+                    self.finish_dispatch(
+                        &run_id,
+                        dispatch_generation,
+                        false,
+                        ContinuationCompletionReason::Deferred,
+                        terminal,
+                        completion_tx,
+                    );
+                    return;
+                }
                 Err(error) => {
                     tracing::warn!(run_id, %error, "long-horizon continuation turn failed");
                     let terminal = if dispatch_cancel.is_cancelled() {
@@ -850,7 +862,7 @@ async fn drive_continuation_turn(
     run_id: String,
     binding: RunTurnBinding,
     cancel: CancellationToken,
-) -> Result<TurnReceipt, String> {
+) -> Result<crate::chat_driver::RunTurnDriveOutcome, String> {
     let turn_id = binding.turn_id.clone();
     let resources = Arc::new(ChatResources {
         execution_scope: launcher.resources.execution_scope.clone(),
@@ -878,7 +890,7 @@ async fn drive_continuation_turn(
                 .conv_id
                 .clone()
                 .unwrap_or_else(|| format!("__continuation__:{run_id}"));
-            crate::chat_driver::drive_pooled_chat_turn(
+            crate::chat_driver::drive_pooled_chat_continuation_turn(
                 pool,
                 &pool_key,
                 move |agent| async move {
@@ -909,11 +921,11 @@ async fn drive_continuation_turn(
                     })
                     .await;
             }
-            crate::chat_driver::drive_chat_turn(
+            crate::chat_driver::drive_chat_continuation_turn(
                 &launcher.fallback_agent,
                 &turn,
                 resources,
-                Some(binding),
+                binding,
             )
             .await
         }

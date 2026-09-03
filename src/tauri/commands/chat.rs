@@ -1047,6 +1047,7 @@ pub async fn steer_chat_message(
             return Err(IpcError::Validation(format!("{error}{suffix}")));
         }
     };
+    let steer_text = queued.payload.text.clone();
     let steer_message = match prepared.to_message() {
         Ok(message) => message,
         Err(error) => {
@@ -1254,7 +1255,7 @@ pub async fn steer_chat_message(
                 &workspace_id,
                 &conversation_id,
                 &expected_turn_id,
-                &prepared.instruction,
+                &steer_text,
             )
             .await
     {

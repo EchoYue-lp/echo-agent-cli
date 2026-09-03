@@ -64,14 +64,16 @@ provenance 和 plan policy,不能从 route 文本或 plan 是否存在猜测。
    `Completed + Stop`;orchestrated run 继续遵守 `RequirePlan/AllowDirect`;
 3. **噪音治理以 provenance 门控**:无 plan conversation run 不生成 progress.md 账本、
    `RunCancelledByUser` 不写长期记忆(`RunCompleted` 已有 completed-tasks 门控
-   天然安全),GUI task query 也排除该投影;conversation run 一旦提交 plan,立即按正式任务显示;
+   天然安全),GUI task query 也排除该投影;conversation run 一旦提交 plan,由
+   `PlanRevisionCommitted` execution projection 立即激活正式任务显示;
 4. **boot 恢复归类**:active conversation turn 原子结算为
    `Cancelled(Interrupted)`;已经持久化 `RunTurnFinished` 的 settlement debt 补为
    `Completed`;planless orchestrated run 保留 `Paused(BootRecovery)`;
 5. **死代码清理**:run-less else 分支与 `register_optional_run_driver` 随之删除。
 6. **用户 steer**:foreground owner 保存 exact `run_id`;GUI/TUI/CLI/channel 与
-   AgentRouter 的 user-authored live delivery 共用 app-core 记录入口。Agent-origin message
-   不伪装成 user constraint。
+   AgentRouter 的 user-authored live delivery共用 app-core 记录入口,在
+   `PreparedUserTurn` 重写前读取原始用户文本,再按 journal retention 进行 UTF-8 安全的
+   2000 字符有界持久化。Agent-origin message 不伪装成 user constraint。
 7. **quiet wake**:active task/cell 检查与 `RunContinuationResumed` 在同一 run lock 内提交;
    continuation eligibility 发现新 activity 时重新持久化 deferred。
 8. **长 Goal artifact**:使用原子写,文件名绑定 goal revision 与 SHA-256,读取时复核 digest。

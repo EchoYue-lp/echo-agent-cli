@@ -12,12 +12,14 @@ use echo_agent::tasks::{
 };
 use echo_agent::tools::ToolContext;
 
-use super::executor::TaskRuntimeOperation;
+use super::executor::{ExecEvent, TaskRuntimeOperation};
 use super::profiles::default_subagent_for;
 use super::store::{InitialRunTriggerMetadata, StoreError, TaskRuntimeStore};
-use super::task_tools::{TaskCapabilityCatalog, current_run_id, formal_run_id_for_turn};
+use super::task_tools::{
+    TaskCapabilityCatalog, current_run_id, current_trace_sink, formal_run_id_for_turn,
+};
 use super::types::{
-    AttendedMode, DomainProfile, EkoPlanMetadata, EkoTaskExtension, PlanTaskKind,
+    AttendedMode, DomainProfile, EkoPlanMetadata, EkoTaskExtension, PlanTaskKind, RuntimeEventKind,
     TaskExecutionSummary, TaskExecutionTarget, TaskRun, TaskUpdateRequest,
 };
 
@@ -145,6 +147,36 @@ impl RevisionedTaskStore for EkoTaskGraphStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(scope_id);
+        if let Some(trace_sink) = current_trace_sink() {
+            let event_run_id = scope_id.to_string();
+            match self
+                .blocking
+                .run_store("load committed task graph trace identity", move |store| {
+                    store.get_run(&event_run_id)
+                })
+                .await
+            {
+                Ok(Some(run)) => trace_sink(ExecEvent::run(
+                    run.workspace_id,
+                    run.conversation_id,
+                    run.run_id,
+                    RuntimeEventKind::PlanRevisionCommitted,
+                    serde_json::json!({
+                        "revision": committed.snapshot.revision,
+                        "task_count": committed.snapshot.tasks.len(),
+                    }),
+                )),
+                Ok(None) => {
+                    tracing::warn!(
+                        run_id = scope_id,
+                        "committed task graph lost its trace identity"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(run_id = scope_id, %error, "committed task graph trace projection failed");
+                }
+            }
+        }
         Ok(committed)
     }
 }

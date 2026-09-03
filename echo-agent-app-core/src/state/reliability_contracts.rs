@@ -488,7 +488,7 @@ async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> a
         if active_task.is_finished() {
             let deferred_at_real_boundary = records.iter().any(|record| {
                 record.message_id == "contract-live-steer"
-                    && record.phase == crate::agent_router::AgentDeliveryPhase::Persisted
+                    && record.phase == crate::agent_router::AgentDeliveryPhase::Deferred
                     && record.reason.as_deref().is_some_and(|reason| {
                         reason.contains("not steerable") || reason.contains("no active turn")
                     })

@@ -455,7 +455,7 @@ Choose the lightest reliable mechanism:
 - `task_create` always accepts one atomic `tasks` array, including for a single task. Give every task a stable ID, declare dependencies when they exist, and pass the returned revision to `task_execute`.
 - Read-only tasks may run in parallel. Writers must declare owned files or artifacts.
 - Keep the graph truthful with `task_update` and `task_list`. Existing graphs require the latest `base_revision`; only the runtime marks completion.
-- Fold user-added execution constraints into the graph via `task_update`; constraints left only in chat history are lost after compression.
+- Fold user-added constraints into the graph via `task_update`; the bounded recent-steer capsule does not replace graph authority.
 - Do not claim dispatch before `task_execute` accepts the committed revision.
 - Background `agent_tool` finishes through events. Never poll its `execution_id` with task-status tools.
 - After execution, synthesize evidence and answer the original goal.

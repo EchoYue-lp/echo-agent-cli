@@ -4904,6 +4904,35 @@ impl TaskRuntimeStore {
             let snapshot = self
                 .get_run_state(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let runtime_active = snapshot
+                .background_cells
+                .iter()
+                .any(BackgroundCellState::is_active)
+                || snapshot.tasks.iter().any(|task| task.status.is_running());
+            if matches!(origin, RunTurnOrigin::Continuation | RunTurnOrigin::Recovery)
+                && runtime_active
+                && snapshot
+                    .continuation
+                    .as_ref()
+                    .is_some_and(|state| state.enabled)
+            {
+                let continuation = snapshot.continuation.as_ref();
+                if continuation.is_some_and(|state| !state.deferred) {
+                    self.commit_runtime_event(RuntimeJournalEvent::for_append(
+                        run_id,
+                        None,
+                        None,
+                        RuntimeEventKind::RunContinuationDeferred,
+                        serde_json::json!({
+                            "deferred": true,
+                            "reason": "runtime_active_at_claim",
+                        }),
+                    ))?;
+                }
+                return Ok(RunTurnClaimOutcome::NotSubmitted(
+                    ContinuationNotSubmittedReason::Deferred,
+                ));
+            }
             let event = match self.prepare_run_turn_start(
                 run_id,
                 turn_id,

@@ -189,6 +189,7 @@ describe('useTauriChat foreground turn recovery', () => {
     conversation_id: 'conversation-before-remount',
     root_turn_id: 'root-turn-before-remount',
     active_turn_id: 'continuation-turn-before-remount',
+    run_id: null,
     cancellation_requested: false,
   };
 
@@ -576,6 +577,41 @@ describe('useTauriChat foreground turn recovery', () => {
     expect(hook.result.current.queuedInputs.map((item) => item.id)).toEqual([
       'wait-for-turn-terminal',
     ]);
+    hook.unmount();
+  });
+
+  it('loads the task UI when an eager conversation run commits a plan', async () => {
+    const conversationId = 'conversation-plan-committed';
+    useConversationStore.setState({ activeId: conversationId });
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return queuedFrontier;
+      return { success: true };
+    });
+    const loadByConversation = vi
+      .spyOn(useTaskRuntimeStore.getState(), 'loadByConversation')
+      .mockResolvedValue();
+
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(mocks.listeners.has('execution://event')).toBe(true));
+
+    act(() => {
+      mocks.listeners.get('execution://event')?.({
+        payload: {
+          kind: 'run',
+          event: 'plan_revision_committed',
+          workspace_id: 'global',
+          conversation_id: conversationId,
+          run_id: 'taskrun:conversation-plan-committed',
+        },
+      });
+    });
+
+    await waitFor(() => {
+      expect(loadByConversation).toHaveBeenCalledWith('global', conversationId);
+    });
+    loadByConversation.mockRestore();
     hook.unmount();
   });
 

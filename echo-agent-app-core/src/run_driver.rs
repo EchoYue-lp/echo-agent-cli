@@ -29,7 +29,9 @@ use crate::tasks::task_runtime::executor::{
 };
 use crate::tasks::task_runtime::memory_bridge::{MemoryEvent, MemoryPolicy};
 use crate::tasks::task_runtime::store::TaskRuntimeStore;
-use crate::tasks::task_runtime::types::{RunPlanPolicy, TaskRunStatus, UnattendedWriteMode};
+use crate::tasks::task_runtime::types::{
+    RunPlanPolicy, TaskRunExecutionProfile, TaskRunStatus, UnattendedWriteMode,
+};
 
 /// Fully-owned payload for driving a Run in the background or foreground.
 ///
@@ -202,13 +204,19 @@ async fn drive_run_async_inner(
     })?;
 
     let load_run_id = payload.run_id.clone();
-    let (run, has_plan) = TaskRuntimeOperation::new(payload.store.clone())
+    let (run, has_plan, execution_profile) = TaskRuntimeOperation::new(payload.store.clone())
         .run("load final supervised run status", move |store| {
             let run = store.get_run(&load_run_id)?.ok_or(
                 crate::tasks::task_runtime::StoreError::RunNotFound(load_run_id.clone()),
             )?;
             let has_plan = store.get_plan(&load_run_id)?.is_some();
-            Ok((run, has_plan))
+            let execution_profile = store
+                .get_run_state(&load_run_id)?
+                .map(|snapshot| snapshot.execution_profile)
+                .ok_or(crate::tasks::task_runtime::StoreError::RunNotFound(
+                    load_run_id,
+                ))?;
+            Ok((run, has_plan, execution_profile))
         })
         .await
         .map_err(|error| format!("read final run status failed: {error}"))?;
@@ -232,10 +240,11 @@ async fn drive_run_async_inner(
         }
     };
 
-    // ADR 0037: eagerly bound runs that never committed a plan revision are
-    // conversational turns — their terminal outcome is not durable task
-    // memory and must not pollute long-term recall.
-    let memory_event = if !has_plan {
+    // ADR 0037: only a planless conversation turn is task-memory noise.
+    // Orchestrated AllowDirect runs may legitimately remain planless until
+    // cancellation, while a conversation run that committed a plan is a
+    // durable task outcome.
+    let memory_event = if suppress_terminal_task_memory(execution_profile, has_plan) {
         None
     } else {
         match &outcome {
@@ -260,6 +269,13 @@ async fn drive_run_async_inner(
         .await;
     }
     Ok(outcome)
+}
+
+fn suppress_terminal_task_memory(
+    execution_profile: TaskRunExecutionProfile,
+    has_plan: bool,
+) -> bool {
+    execution_profile.is_conversation_turn() && !has_plan
 }
 
 async fn settle_driver_error(
@@ -327,6 +343,22 @@ mod tests {
             "unattended run retained an interactive HITL provider"
         );
         Ok(())
+    }
+
+    #[test]
+    fn terminal_memory_noise_gate_uses_typed_run_provenance() {
+        assert!(suppress_terminal_task_memory(
+            TaskRunExecutionProfile::conversation_turn(),
+            false
+        ));
+        assert!(!suppress_terminal_task_memory(
+            TaskRunExecutionProfile::conversation_turn(),
+            true
+        ));
+        assert!(!suppress_terminal_task_memory(
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            false
+        ));
     }
 
     #[tokio::test]

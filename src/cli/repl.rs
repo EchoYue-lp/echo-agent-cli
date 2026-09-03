@@ -2291,6 +2291,7 @@ async fn route_active_input(
             return ActiveInputDisposition::Queued;
         }
     };
+    let steer_text = durable_input.message.clone();
     let spill_dir = echo_agent_app_core::api::prepared_turn::resolve_user_input_spill_dir(Some(
         active.execution_root.as_path(),
     ));
@@ -2328,7 +2329,6 @@ async fn route_active_input(
             return ActiveInputDisposition::Queued;
         }
     };
-    let steer_text = prepared.instruction.clone();
     let resources = ReplProjectionResources::new(
         prepared,
         spill_dir,

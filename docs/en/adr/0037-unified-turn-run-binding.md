@@ -36,11 +36,13 @@ Choose option 2:
 - Boot recovery atomically cancels an interrupted conversation turn, completes a persisted
   turn-settlement debt, and pauses an interrupted orchestrated run.
 - The foreground owner carries the exact run id so GUI, TUI, CLI, channel, and user-authored live
-  Agent deliveries record steers against the same journal. Agent-authored messages are not user
+  Agent deliveries read the original user text before `PreparedUserTurn` rewriting, then apply the
+  journal's UTF-8-safe 2,000-character retention bound. Agent-authored messages are not user
   constraints.
 - Quiet runtime observation and continuation resume are committed under one run lock.
 - Oversized Goal artifacts use atomic writes, revision/hash-bound names, and digest validation.
-- Planless conversation runs remain in the journal but are excluded from the task UI projection.
+- Planless conversation runs remain in the journal but are excluded from the task UI projection;
+  `PlanRevisionCommitted` activates the task UI when such a run publishes a plan.
 
 ## Trade-offs
 

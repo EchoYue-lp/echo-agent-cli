@@ -360,12 +360,39 @@ pub async fn drive_chat_turn_with_input_observer(
     binding: Option<RunTurnBinding>,
     input_observer: Option<InputReceiptObserver>,
 ) -> Result<TurnReceipt, String> {
+    match drive_chat_turn_dispatch(agent, turn, res, binding, input_observer).await? {
+        RunTurnDriveOutcome::Driven(receipt) => Ok(receipt),
+        RunTurnDriveOutcome::Deferred => {
+            Err("RunTurn continuation deferred before model execution".to_string())
+        }
+    }
+}
+
+pub(crate) async fn drive_chat_continuation_turn(
+    agent: &AgentHandle,
+    turn: &crate::prepared_turn::PreparedUserTurn,
+    res: std::sync::Arc<crate::chat_resources::ChatResources>,
+    binding: RunTurnBinding,
+) -> Result<RunTurnDriveOutcome, String> {
+    drive_chat_turn_dispatch(agent, turn, res, Some(binding), None).await
+}
+
+async fn drive_chat_turn_dispatch(
+    agent: &AgentHandle,
+    turn: &crate::prepared_turn::PreparedUserTurn,
+    res: std::sync::Arc<crate::chat_resources::ChatResources>,
+    binding: Option<RunTurnBinding>,
+    input_observer: Option<InputReceiptObserver>,
+) -> Result<RunTurnDriveOutcome, String> {
     wait_for_previous_continuation_driver(&res, binding.as_ref()).await?;
     match prepare_chat_execution(turn, res, binding).await? {
         ChatExecutionPreparation::Ready(prepared) => {
-            drive_prepared_chat(agent.clone(), turn, *prepared, None, input_observer).await
+            drive_prepared_chat(agent.clone(), turn, *prepared, None, input_observer)
+                .await
+                .map(RunTurnDriveOutcome::Driven)
         }
-        ChatExecutionPreparation::Settled(outcome) => Ok(outcome),
+        ChatExecutionPreparation::Settled(outcome) => Ok(RunTurnDriveOutcome::Driven(outcome)),
+        ChatExecutionPreparation::Deferred => Ok(RunTurnDriveOutcome::Deferred),
     }
 }
 
@@ -405,11 +432,50 @@ where
     Configure: FnOnce(AgentHandle) -> ConfigureFuture,
     ConfigureFuture: std::future::Future<Output = Result<(), String>>,
 {
-    let binding = binding.into();
+    match drive_pooled_chat_turn_dispatch(pool, pool_key, configure, turn, res, binding.into())
+        .await?
+    {
+        RunTurnDriveOutcome::Driven(receipt) => Ok(receipt),
+        RunTurnDriveOutcome::Deferred => {
+            Err("RunTurn continuation deferred before model execution".to_string())
+        }
+    }
+}
+
+pub(crate) async fn drive_pooled_chat_continuation_turn<Configure, ConfigureFuture>(
+    pool: std::sync::Arc<crate::agent_pool::AgentPool>,
+    pool_key: &str,
+    configure: Configure,
+    turn: &crate::prepared_turn::PreparedUserTurn,
+    res: std::sync::Arc<crate::chat_resources::ChatResources>,
+    binding: RunTurnBinding,
+) -> Result<RunTurnDriveOutcome, String>
+where
+    Configure: FnOnce(AgentHandle) -> ConfigureFuture,
+    ConfigureFuture: std::future::Future<Output = Result<(), String>>,
+{
+    drive_pooled_chat_turn_dispatch(pool, pool_key, configure, turn, res, Some(binding)).await
+}
+
+async fn drive_pooled_chat_turn_dispatch<Configure, ConfigureFuture>(
+    pool: std::sync::Arc<crate::agent_pool::AgentPool>,
+    pool_key: &str,
+    configure: Configure,
+    turn: &crate::prepared_turn::PreparedUserTurn,
+    res: std::sync::Arc<crate::chat_resources::ChatResources>,
+    binding: Option<RunTurnBinding>,
+) -> Result<RunTurnDriveOutcome, String>
+where
+    Configure: FnOnce(AgentHandle) -> ConfigureFuture,
+    ConfigureFuture: std::future::Future<Output = Result<(), String>>,
+{
     wait_for_previous_continuation_driver(&res, binding.as_ref()).await?;
     let prepared = match prepare_chat_execution(turn, res, binding).await? {
         ChatExecutionPreparation::Ready(prepared) => prepared,
-        ChatExecutionPreparation::Settled(outcome) => return Ok(outcome),
+        ChatExecutionPreparation::Settled(outcome) => {
+            return Ok(RunTurnDriveOutcome::Driven(outcome));
+        }
+        ChatExecutionPreparation::Deferred => return Ok(RunTurnDriveOutcome::Deferred),
     };
     let acquire_cancel = prepared.cancel.clone();
     let execution = match tokio::select! {
@@ -445,7 +511,9 @@ where
         prepared.reject_before_driver_start(&error).await?;
         return Err(error);
     }
-    drive_prepared_chat(agent, turn, *prepared, Some(execution), None).await
+    drive_prepared_chat(agent, turn, *prepared, Some(execution), None)
+        .await
+        .map(RunTurnDriveOutcome::Driven)
 }
 
 async fn wait_for_previous_continuation_driver(
@@ -472,6 +540,13 @@ async fn wait_for_previous_continuation_driver(
 enum ChatExecutionPreparation {
     Ready(Box<PreparedChatExecution>),
     Settled(TurnReceipt),
+    Deferred,
+}
+
+#[derive(Debug)]
+pub(crate) enum RunTurnDriveOutcome {
+    Driven(TurnReceipt),
+    Deferred,
 }
 
 struct PreparedChatExecution {
@@ -768,8 +843,17 @@ async fn prepare_chat_execution(
         match claim {
             crate::tasks::task_runtime::store::RunTurnClaimOutcome::Started(_) => {}
             crate::tasks::task_runtime::store::RunTurnClaimOutcome::NotSubmitted(reason) => {
+                let deferred = reason
+                    == crate::tasks::task_runtime::store::ContinuationNotSubmittedReason::Deferred
+                    && matches!(
+                        origin,
+                        RunTurnOrigin::Continuation | RunTurnOrigin::Recovery
+                    );
                 if let Some(registration) = task_driver_registration.take() {
                     registration.reject(format!("RunTurn was not submitted: {reason:?}"));
+                }
+                if deferred {
+                    return Ok(ChatExecutionPreparation::Deferred);
                 }
                 return Err(format!("RunTurn was not submitted: {reason:?}"));
             }
@@ -3002,6 +3086,125 @@ mod tests {
             crate::tasks::task_runtime::TaskRunStatus::Completed,
         )
         .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn continuation_drive_returns_deferred_when_task_activity_wins_claim()
+    -> Result<(), String> {
+        use echo_agent::agent::CancellationToken;
+        use std::sync::Arc;
+
+        let store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        let run_id = "continuation-claim-activity";
+        store
+            .create_run(
+                run_id,
+                "test",
+                "continuation-claim-conversation",
+                "continuation-claim-root",
+                crate::tasks::task_runtime::DomainProfile::General,
+                "continue after task activity",
+                "agent_task_plan",
+                crate::tasks::task_runtime::AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .attach_plan_for_test(&crate::tasks::task_runtime::TaskPlan {
+                plan_id: "continuation-claim-plan".to_string(),
+                run_id: run_id.to_string(),
+                revision: 1,
+                domain_profile: crate::tasks::task_runtime::DomainProfile::General,
+                goal_revision: 1,
+                goal_sha256: crate::tasks::task_runtime::task_goal_sha256(
+                    "continue after task activity",
+                ),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: crate::tasks::task_runtime::ExecutionMode::Sequential,
+                tasks: vec![crate::tasks::task_runtime::PlanTask {
+                    id: "active-task".to_string(),
+                    title: "Active task".to_string(),
+                    ..Default::default()
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(run_id, crate::tasks::task_runtime::TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation(run_id, true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        store
+            .set_task_status(
+                run_id,
+                "active-task",
+                echo_agent::tasks::TaskStatus::Running,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink: Arc::new(MockChatSink::default()),
+            webhook_emitter: None,
+            conv_id: Some("continuation-claim-conversation".to_string()),
+            root_message_id: "continuation-claim-turn".to_string(),
+            attachments: Vec::new(),
+            cancel: CancellationToken::new(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let agent = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .llm_client(Arc::new(echo_agent::testing::MockLlmClient::new()))
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let outcome = drive_chat_continuation_turn(
+            &agent,
+            &make_turn("continue"),
+            resources,
+            RunTurnBinding {
+                run_id: Some(run_id.to_string()),
+                turn_id: "continuation-claim-turn".to_string(),
+                root_message_id: "continuation-claim-root".to_string(),
+                origin: RunTurnOrigin::Continuation,
+                transcript_visibility: TurnVisibility::Internal,
+                expected_resume: None,
+            },
+        )
+        .await?;
+        assert!(matches!(outcome, RunTurnDriveOutcome::Deferred));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if store.active_run_driver_count().unwrap_or(usize::MAX) == 0
+                    && store
+                        .active_run_driver_receipt_count()
+                        .unwrap_or(usize::MAX)
+                        == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "deferred continuation did not release driver admission".to_string())?;
+        let snapshot = store
+            .get_run_state(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "deferred continuation run disappeared".to_string())?;
+        assert!(snapshot.continuation.is_some_and(
+            |continuation| continuation.deferred && continuation.active_turn.is_none()
+        ));
         Ok(())
     }
 

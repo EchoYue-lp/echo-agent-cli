@@ -1847,6 +1847,7 @@ async fn steer_conversation_input_projection(
     let spill_dir = echo_agent_app_core::api::prepared_turn::resolve_user_input_spill_dir(Some(
         execution_root.as_path(),
     ));
+    let steer_text = projection.payload.text.clone();
     let prepared = echo_agent_app_core::api::prepared_turn::PreparedUserTurn::build(
         echo_agent_app_core::api::prepared_turn::UserTurnInput {
             text: &projection.payload.text,
@@ -1858,7 +1859,6 @@ async fn steer_conversation_input_projection(
     )
     .map_err(|error| error.to_string())?;
     let message = prepared.to_message().map_err(|error| error.to_string())?;
-    let steer_text = prepared.instruction.clone();
     let agent = app
         .active_turn_agent
         .as_ref()

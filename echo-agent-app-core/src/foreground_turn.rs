@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use echo_agent::agent::{AgentEvent, AgentHandle, CancellationToken};
-use echo_agent::runtime::TurnReceipt;
 use tokio::sync::watch;
 
 use crate::chat_driver::{ChatDriverEvent, ChatSink, TurnOutcome, drive_chat, drive_chat_turn};
@@ -278,10 +277,11 @@ impl ForegroundTurnProgress {
         &self,
         resources: Arc<ChatResources>,
         execute: Execute,
-    ) -> Result<TurnReceipt, String>
+    ) -> Result<crate::chat_driver::RunTurnDriveOutcome, String>
     where
         Execute: FnOnce(Arc<ChatResources>) -> ExecuteFuture,
-        ExecuteFuture: std::future::Future<Output = Result<TurnReceipt, String>>,
+        ExecuteFuture:
+            std::future::Future<Output = Result<crate::chat_driver::RunTurnDriveOutcome, String>>,
     {
         let cancel = self.cancellation_token();
         let delivery = Arc::new(DownstreamDeliveryState::default());
@@ -320,12 +320,17 @@ impl ForegroundTurnProgress {
         if !delivery.terminal_delivery_failed() {
             return result;
         }
-        result.map(|mut outcome| {
-            outcome.outcome = TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
-                "downstream_disconnect",
-                "chat event consumer closed before terminal delivery",
-            ));
-            outcome
+        result.map(|outcome| match outcome {
+            crate::chat_driver::RunTurnDriveOutcome::Driven(mut receipt) => {
+                receipt.outcome = TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+                    "downstream_disconnect",
+                    "chat event consumer closed before terminal delivery",
+                ));
+                crate::chat_driver::RunTurnDriveOutcome::Driven(receipt)
+            }
+            crate::chat_driver::RunTurnDriveOutcome::Deferred => {
+                crate::chat_driver::RunTurnDriveOutcome::Deferred
+            }
         })
     }
 }

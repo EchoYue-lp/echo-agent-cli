@@ -389,8 +389,12 @@ export function useTauriChat() {
           if (payload.event === 'started' && tool.owner.kind === 'chat') {
             useChatStore.getState().recordToolStart(tool.owner.message_id, tool.id);
           }
-        } else if (kind === 'run' && payload.event === 'run_started') {
-          // 正式 plan / 自主 run 通过 run_started 事件激活右侧面板。
+        } else if (
+          kind === 'run' &&
+          (payload.event === 'run_started' || payload.event === 'plan_revision_committed')
+        ) {
+          // run_started covers orchestrated runs; plan_revision_committed
+          // promotes an eager conversation run into the task UI.
           useTaskRuntimeStore
             .getState()
             .loadByConversation(workspaceId, conversationId)
