@@ -561,7 +561,53 @@ pub async fn list_conversations(
         "[list_conversations] returning {} conversations",
         list.len()
     );
-    serde_json::to_value(&list).map_err(|e| IpcError::Internal(e.to_string()))
+    let archived_ids = state
+        .app_state
+        .archived_conversation_ids(&workspace_id)
+        .map_err(IpcError::Internal)?;
+    let archived_ids: std::collections::HashSet<&str> =
+        archived_ids.iter().map(String::as_str).collect();
+    let list = list
+        .into_iter()
+        .map(|item| {
+            let archived = archived_ids.contains(item.conversation_id.as_str());
+            serde_json::json!({
+                "id": item.id,
+                "conversation_id": item.conversation_id,
+                "title": item.title,
+                "message_count": item.message_count,
+                "created_at": item.created_at,
+                "updated_at": item.updated_at,
+                "archived": archived,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_value(list).map_err(|e| IpcError::Internal(e.to_string()))
+}
+
+/// Set the EKO visibility state for one exact workspace conversation.
+#[tauri::command]
+pub async fn set_conversation_archived(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    id: String,
+    archived: bool,
+) -> Result<serde_json::Value, IpcError> {
+    let store = scoped_store(&state, &workspace_id).await?;
+    store
+        .get_conversation(&id)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?
+        .ok_or_else(|| IpcError::NotFound(format!("Conversation '{id}' not found")))?;
+    state
+        .app_state
+        .set_conversation_archived(&workspace_id, &id, archived)
+        .map_err(IpcError::Internal)?;
+    Ok(serde_json::json!({
+        "success": true,
+        "conversation_id": id,
+        "archived": archived,
+    }))
 }
 
 #[tauri::command]
@@ -863,6 +909,14 @@ pub async fn delete_conversation(
         .delete_conversation_scoped(&workspace_id, &id)
         .await
         .map_err(|e| IpcError::Internal(e.to_string()))?;
+    if let Err(error) = state
+        .app_state
+        .set_conversation_archived(&workspace_id, &id, false)
+    {
+        // Transcript deletion already committed. A stale archive marker is
+        // harmless and will be ignored when the conversation is listed.
+        tracing::warn!(workspace_id, conversation_id = %id, %error, "failed to remove conversation archive marker after deletion");
+    }
     Ok(serde_json::json!({
         "success": true,
         "conversation_id": receipt.conversation_id,
@@ -970,6 +1024,25 @@ pub async fn search_conversations(
         .search_conversations(&query, limit.unwrap_or(20))
         .await
         .map_err(|e| IpcError::Internal(format!("search_conversations error: {e}")))?;
-
-    serde_json::to_value(&results).map_err(|e| IpcError::Internal(e.to_string()))
+    let archived_ids = state
+        .app_state
+        .archived_conversation_ids(&workspace_id)
+        .map_err(IpcError::Internal)?;
+    let archived_ids: std::collections::HashSet<&str> =
+        archived_ids.iter().map(String::as_str).collect();
+    let results = results
+        .into_iter()
+        .map(|item| {
+            serde_json::json!({
+                "id": item.id,
+                "conversation_id": item.conversation_id,
+                "title": item.title,
+                "message_count": item.message_count,
+                "created_at": item.created_at,
+                "updated_at": item.updated_at,
+                "archived": archived_ids.contains(item.conversation_id.as_str()),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_value(results).map_err(|e| IpcError::Internal(e.to_string()))
 }

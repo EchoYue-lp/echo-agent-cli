@@ -697,6 +697,13 @@ export const conversationApi = {
           resumed?: boolean;
           cleanup_pending?: boolean;
         }>(`/conversations/${id}`),
+  setArchived: (workspaceId: string, id: string, archived: boolean) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; conversation_id: string; archived: boolean }>(
+          'set_conversation_archived',
+          { workspaceId, id, archived }
+        )
+      : Promise.reject(new Error('会话归档管理仅支持桌面模式')),
   export: (workspaceId: string, id: string) =>
     isTauri()
       ? apiInvoke<{ format: string; content: string; id: string }>('export_conversation', {

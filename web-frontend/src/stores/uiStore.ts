@@ -12,6 +12,7 @@ export type SettingsTabId =
   | 'config'
   | 'providers'
   | 'sessions'
+  | 'archives'
   | 'audit'
   | 'sandbox'
   | 'observability'

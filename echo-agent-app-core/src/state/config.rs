@@ -328,6 +328,8 @@ pub struct ConversationStorageBinding {
 
 pub struct StorageState {
     pub conversation: Arc<RwLock<ConversationStorageBinding>>,
+    /// EKO-owned visibility projection shared by GUI/TUI/channel surfaces.
+    pub conversation_archive: Arc<crate::conversation_archive::ConversationArchiveStore>,
     pub tool_executions: Arc<crate::tool_execution::ToolExecutionRepository>,
     /// Bounded ordinary-chat replay stream. Formal task history remains owned
     /// by TaskRuntimeStore; long-term transcript remains ConversationStore.

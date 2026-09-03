@@ -388,6 +388,8 @@ namespace 或组件路径声明。旧 `.echo-plugin/manifest.yaml` 不再支持�
 | ------------------- | ------- | --------------------------------------------- |
 | `/checkpoint`       | `/save` | 强制保存当前 runtime checkpoint               |
 | `/sessions [query]` | `ss`    | 从 canonical ConversationStore 列出或搜索会话 |
+| `/archive-session <conversation-id>` |       | 归档会话（从当前列表隐藏） |
+| `/restore-session <conversation-id>` |       | 恢复已归档会话 |
 | `/export`           |         | 导出会话                                      |
 | `/profile`          | `prof`  | 配置档案管理                                  |
 | `/verbose`          |         | 切换详细模式                                  |

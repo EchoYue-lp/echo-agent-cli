@@ -11,7 +11,7 @@ import { type ReactNode, type HTMLAttributes } from 'react';
  *
  * Three variants cover the three recipes that were duplicated across the codebase:
  *  - `elevated` — a content card (border + primary bg). Replaces the
- *    `rounded-lg border bg-primary` recipe in ProviderPanel / SubagentCard / etc.
+ *    `rounded-lg border bg-primary` recipe in ProviderPanel / etc.
  *  - `flat` — a nested sub-card / tile (secondary bg, no border). Replaces the
  *    `rounded-md bg-secondary` metric-tile / icon-tile recipe.
  *  - `overlay` — a floating layer (border + primary bg + shadow). Replaces the

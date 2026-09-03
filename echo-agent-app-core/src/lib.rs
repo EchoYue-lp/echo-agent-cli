@@ -14,6 +14,7 @@ pub(crate) mod config;
 pub(crate) mod config_discovery;
 pub(crate) mod config_watcher;
 pub(crate) mod context_window;
+pub(crate) mod conversation_archive;
 pub(crate) mod conversation_deletion;
 pub(crate) mod conversation_input;
 pub(crate) mod conversation_projection;

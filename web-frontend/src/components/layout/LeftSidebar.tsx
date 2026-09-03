@@ -13,6 +13,7 @@ import {
   ChevronDown,
   ChevronRight,
   Loader2,
+  Archive,
 } from 'lucide-react';
 import { BrandIcon } from '../common/BrandIcon';
 import { useUiStore } from '../../stores/uiStore';
@@ -31,6 +32,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const theme = useUiStore((s) => s.theme);
   const toggleTheme = useUiStore((s) => s.toggleTheme);
   const openSettings = useUiStore((s) => s.openSettings);
+  const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
   const toggleTerminal = useUiStore((s) => s.toggleTerminal);
 
   const workspaces = useWorkspaceStore((s) => s.workspaces);
@@ -43,6 +45,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const isConvLoading = useConversationStore((s) => s.isLoading);
   const loadConversation = useConversationStore((s) => s.loadConversation);
   const startNewConversation = useConversationStore((s) => s.startNew);
+  const archiveConversation = useConversationStore((s) => s.archiveConversation);
 
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -95,6 +98,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
     ? workspaces.filter((w) => w.name.toLowerCase().includes(searchQuery.toLowerCase()))
     : workspaces;
   const isSearchingContent = searchQuery.trim().length > 0;
+  const visibleSearchResults = searchResults.filter((conversation) => !conversation.archived);
 
   const handleSwitch = async (ws: Workspace) => {
     if (current?.id === ws.id) {
@@ -151,6 +155,15 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
     await loadConversation(convId);
   };
 
+  const handleArchiveConversation = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await archiveConversation(id);
+    } catch (error) {
+      console.error('Archive conversation failed:', error);
+    }
+  };
+
   const getKindIcon = (kind: { type: string }) => {
     const k = getWorkspaceKind(kind.type);
     const Icon = k.icon;
@@ -158,10 +171,15 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   };
 
   // Conversations are loaded from the active workspace-scoped store after switchWorkspace.
+  const filteredConversations = conversations.filter((conversation) => !conversation.archived);
   const visibleConvs = current
-    ? conversations.slice(0, showAllConvs ? conversations.length : MAX_RECENT_CONVERSATIONS)
+    ? filteredConversations.slice(
+        0,
+        showAllConvs ? filteredConversations.length : MAX_RECENT_CONVERSATIONS
+      )
     : [];
-  const hasMoreConvs = current && !showAllConvs && conversations.length > MAX_RECENT_CONVERSATIONS;
+  const hasMoreConvs =
+    current && !showAllConvs && filteredConversations.length > MAX_RECENT_CONVERSATIONS;
 
   return (
     <div className="flex h-full flex-col bg-[var(--bg-sidebar)] text-[var(--text-secondary)]">
@@ -238,7 +256,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       {isSearchingContent && (
         <div className="border-b border-[var(--border-primary)] px-2 pb-2">
           <div className="px-1 py-1 text-[10px] font-semibold uppercase text-[var(--text-tertiary)]">
-            搜索结果 ({searchResults.length})
+            搜索结果 ({visibleSearchResults.length})
           </div>
           {isSearching && (
             <div className="flex items-center gap-2 px-2 py-3">
@@ -246,14 +264,14 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
               <span className="text-[11px] text-[var(--text-tertiary)]">搜索中...</span>
             </div>
           )}
-          {!isSearching && searchResults.length === 0 && (
+          {!isSearching && visibleSearchResults.length === 0 && (
             <div className="px-2 py-3 text-center">
               <Search size={16} className="mx-auto mb-1 text-[var(--text-tertiary)]" />
               <p className="text-[11px] text-[var(--text-tertiary)]">未找到匹配的对话</p>
             </div>
           )}
           {!isSearching &&
-            searchResults.map((conv) => (
+            visibleSearchResults.map((conv) => (
               <div
                 key={conv.conversation_id}
                 role="button"
@@ -375,6 +393,24 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
               {/* Expanded conversations */}
               {isExpanded && (
                 <div className="ml-7 border-l border-[var(--border-primary)] pb-1 pl-2">
+                  <div className="mb-1 flex items-center justify-between px-2 py-1">
+                    <span className="text-[10px] font-medium text-[var(--text-tertiary)]">
+                      最近会话
+                    </span>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openSettings();
+                        setActiveSettingsTab('archives');
+                      }}
+                      className="flex items-center gap-1 rounded-md px-1.5 py-1 text-[10px] text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                      title="管理已归档会话"
+                    >
+                      <Archive size={11} />
+                      管理归档
+                    </button>
+                  </div>
                   {isConvLoading && visibleConvs.length === 0 && (
                     <div className="flex items-center gap-2 py-2 px-1">
                       <Loader2 size={12} className="animate-spin text-[var(--text-tertiary)]" />
@@ -391,35 +427,46 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                   {visibleConvs.map((conv) => (
                     <div
                       key={conv.id}
-                      role="button"
-                      tabIndex={0}
-                      className={`cursor-pointer rounded-md px-2 py-1.5 text-[12px] transition-colors
+                      className={`group relative rounded-md text-[12px] transition-colors
                         ${
                           activeConvId === conv.id
                             ? 'bg-[var(--bg-sidebar-active)] font-medium text-[var(--text-primary)]'
                             : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
                         }`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleSelectConv(conv.id);
-                      }}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter' || event.key === ' ') {
-                          event.preventDefault();
-                          event.stopPropagation();
-                          handleSelectConv(conv.id);
-                        }
-                      }}
                     >
-                      <div className="flex items-center gap-1.5">
-                        <MessageSquare size={11} className="shrink-0 text-[var(--text-tertiary)]" />
-                        <span className="truncate">{conv.title || '新对话'}</span>
-                      </div>
-                      {conv.messageCount > 0 && (
-                        <div className="mt-0.5 text-[10px] text-[var(--text-tertiary)] pl-[17px]">
-                          {conv.messageCount} 条消息
+                      <button
+                        type="button"
+                        aria-label={`打开会话 ${conv.title || '新对话'}`}
+                        className="block w-full cursor-pointer px-2 py-1.5 pr-10 text-left"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void handleSelectConv(conv.id);
+                        }}
+                      >
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <MessageSquare
+                            size={11}
+                            className="shrink-0 text-[var(--text-tertiary)]"
+                          />
+                          <span className="min-w-0 flex-1 truncate">{conv.title || '新对话'}</span>
                         </div>
-                      )}
+                        {conv.messageCount > 0 && (
+                          <div className="mt-0.5 pl-[17px] text-[10px] text-[var(--text-tertiary)]">
+                            {conv.messageCount} 条消息
+                          </div>
+                        )}
+                      </button>
+                      <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                        <button
+                          type="button"
+                          onClick={(e) => handleArchiveConversation(conv.id, e)}
+                          className="rounded p-1 text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                          title="归档会话"
+                          aria-label={`归档会话 ${conv.title || '新对话'}`}
+                        >
+                          <Archive size={11} />
+                        </button>
+                      </div>
                     </div>
                   ))}
 
@@ -433,7 +480,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                         }}
                         className="text-[11px] text-[var(--accent)] cursor-pointer hover:underline"
                       >
-                        查看更多 ({conversations.length - MAX_RECENT_CONVERSATIONS})...
+                        查看更多 ({filteredConversations.length - MAX_RECENT_CONVERSATIONS})...
                       </button>
                     </div>
                   )}

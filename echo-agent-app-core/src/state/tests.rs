@@ -198,6 +198,8 @@ mod model_mutation_tests {
         let pool = Arc::new(
             crate::agent_pool::AgentPool::for_model_mutation_test(&primary, session_config).await,
         );
+        pool.set_primary_model_consumers_for_test(primary_consumers.clone())
+            .await;
         let existing_lease = pool
             .acquire("existing")
             .await
@@ -434,6 +436,21 @@ mod model_mutation_tests {
             .as_ref()
             .and_then(|consumers| consumers.inherited_handle_for_test("general-purpose"))
             .ok_or_else(|| "inherit-parent handle was not retained".to_string())
+    }
+
+    #[tokio::test]
+    async fn production_pool_does_not_reenter_primary_model_lock() -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            fixture.state.set_default_model_owned(MODEL_B),
+        )
+        .await
+        .map_err(|_| "production pool model publication deadlocked on the primary Agent".to_string())?
+        .map_err(|error| error.to_string())?;
+
+        assert_eq!(receipt.model_id, MODEL_B);
+        assert_full_generation(&fixture, MODEL_B, "runtime-b", ENDPOINT_B, WINDOW_B).await
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from 'react';
+import { memo, useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
@@ -13,29 +13,30 @@ import {
   toolExecutionOwnerKey,
   useToolExecutionStore,
 } from '../../stores/toolExecutionStore';
-import MarkdownContent from '../common/MarkdownContent';
+import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
+import { useRightWorkspaceStore } from '../../stores/rightWorkspaceStore';
 import { SubagentOutcomeView } from '../subagent/SubagentOutcomeView';
 import { statusLabel } from '../../utils/subagentProgress';
 import { subagentOutcomePresentation } from '../../utils/subagentOutcome';
-import { InlineToolCall } from './InlineToolCall';
 
 interface SubagentStreamBlockProps {
   run: SubagentRunState;
   taskTitle?: string;
 }
 
-type SubagentTab = 'task' | 'process' | 'result';
-
+/**
+ * One-line subagent row in the main chat stream (Claude Code Task-tool shape).
+ *
+ * The row itself is a status line; clicking it opens the full timeline —
+ * task prompt + tool calls + result, rendered with the same components as the
+ * main agent — in the right workspace panel. The chevron only toggles an
+ * inline result peek, so the chat stream stays a flat timeline.
+ */
 export const SubagentStreamBlock = memo(function SubagentStreamBlock({
   run,
   taskTitle,
 }: SubagentStreamBlockProps) {
-  const [expanded, setExpanded] = useState(run.status === 'running');
-  const [activeTab, setActiveTab] = useState<SubagentTab>(
-    run.status === 'running' ? 'process' : 'result'
-  );
-  const previousStatus = useRef(run.status);
-  const userControlledExpansion = useRef(false);
+  const [expanded, setExpanded] = useState(false);
   const ownerKey = toolExecutionOwnerKey(
     {
       kind: 'subagent',
@@ -49,17 +50,9 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
   const summary = toolIds.length > 0 ? `${toolIds.length} 工具` : '';
   const presentation = subagentOutcomePresentation(run);
 
-  useEffect(() => {
-    if (previousStatus.current === 'running' && run.status !== 'running') {
-      setActiveTab('result');
-      if (!userControlledExpansion.current) setExpanded(false);
-    }
-    previousStatus.current = run.status;
-  }, [run.status]);
-
-  const toggleExpanded = () => {
-    userControlledExpansion.current = true;
-    setExpanded((value) => !value);
+  const openDetail = () => {
+    useSubagentDetailStore.getState().selectSubagent(run.runId, run.subagentRunId);
+    useRightWorkspaceStore.getState().openWorkspace();
   };
 
   const statusIcon =
@@ -74,20 +67,21 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
     );
 
   return (
-    <div className="my-0.5 border-l border-[var(--border-primary)] pl-3">
+    <div className="my-0.5 min-w-0">
       <div className="flex w-full items-center gap-1.5 text-[12px]">
         <button
           type="button"
-          onClick={toggleExpanded}
+          onClick={() => setExpanded((value) => !value)}
           className="shrink-0 text-[var(--text-tertiary)]"
-          aria-label={expanded ? '折叠 subagent' : '展开 subagent'}
+          aria-label={expanded ? '折叠结果摘要' : '展开结果摘要'}
         >
           {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
         </button>
         <button
           type="button"
-          onClick={toggleExpanded}
-          className="flex min-w-0 flex-1 items-center gap-1.5 px-1 py-0.5 text-left hover:bg-[var(--bg-hover)]"
+          onClick={openDetail}
+          className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 py-0.5 text-left hover:bg-[var(--bg-hover)]"
+          title="在右侧边栏查看完整执行过程"
         >
           {statusIcon}
           <span className="shrink-0 font-medium text-[var(--text-primary)]">Subagent</span>
@@ -101,59 +95,19 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
       </div>
 
       {expanded && (
-        <div className="ml-4 mt-1.5 min-w-0">
-          <div className="flex h-8 items-end gap-1 border-b border-[var(--border-primary)]">
-            {(
-              [
-                ['task', '提示词 / 任务'],
-                ['process', '执行过程'],
-                ['result', '结果'],
-              ] as const
-            ).map(([id, label]) => (
-              <button
-                key={id}
-                type="button"
-                onClick={() => setActiveTab(id)}
-                className="h-8 border-b-2 px-2 text-[10px] font-medium"
-                style={{
-                  borderColor: activeTab === id ? 'var(--accent)' : 'transparent',
-                  color: activeTab === id ? 'var(--text-primary)' : 'var(--text-tertiary)',
-                }}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-
-          <div className="min-w-0 py-2">
-            {activeTab === 'task' &&
-              (run.task ? (
-                <MarkdownContent content={run.task} className="text-sm" />
-              ) : (
-                <div className="text-[11px] text-[var(--text-tertiary)]">暂无任务输入</div>
-              ))}
-
-            {activeTab === 'process' && (
-              <div className="space-y-1">
-                {toolIds.length === 0 ? (
-                  <div className="text-[11px] text-[var(--text-tertiary)]">暂无工具执行</div>
-                ) : (
-                  toolIds.map((toolId, index) => (
-                    <InlineToolCall key={toolId} toolId={toolId} index={index} />
-                  ))
-                )}
-              </div>
-            )}
-
-            {activeTab === 'result' &&
-              (run.outcome || presentation.text ? (
-                <SubagentOutcomeView outcome={run.outcome} content={presentation.text} />
-              ) : (
-                <div className="text-[11px] text-[var(--text-tertiary)]">
-                  {run.status === 'running' ? '正在等待执行结果' : '暂无结果'}
-                </div>
-              ))}
-          </div>
+        <div className="ml-5 mt-1 min-w-0 pl-2">
+          {run.outcome || presentation.text ? (
+            <SubagentOutcomeView
+              outcome={run.outcome}
+              content={presentation.text}
+              maxHeight={200}
+            />
+          ) : (
+            <div className="flex items-center gap-1.5 py-0.5 text-[11px] text-[var(--text-tertiary)]">
+              {run.status === 'running' && <Loader2 size={11} className="animate-spin" />}
+              {run.status === 'running' ? '正在执行，点击标题行查看实时过程' : '暂无结果'}
+            </div>
+          )}
         </div>
       )}
     </div>

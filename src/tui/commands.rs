@@ -66,6 +66,8 @@ pub enum SlashCommand {
     Resume,
     Fork,
     Rename,
+    ArchiveSession,
+    RestoreSession,
     DeleteSession,
     Compact,
     Copy,
@@ -166,6 +168,8 @@ impl SlashCommand {
             Self::Resume => "Resume a persisted conversation",
             Self::Fork => "Fork the current conversation",
             Self::Rename => "Rename the current conversation",
+            Self::ArchiveSession => "Archive a persisted conversation",
+            Self::RestoreSession => "Restore an archived conversation",
             Self::DeleteSession => "Delete a persisted conversation",
             Self::Compact => "Compress context window",
             Self::Copy => "Copy the last response to clipboard (or Ctrl+Y)",
@@ -257,6 +261,8 @@ impl SlashCommand {
             | Self::Resume
             | Self::Fork
             | Self::Rename
+            | Self::ArchiveSession
+            | Self::RestoreSession
             | Self::DeleteSession
             | Self::Compact
             | Self::Copy
@@ -385,6 +391,7 @@ impl SlashCommand {
             Self::Resume => "<conversation-id>",
             Self::Fork => "[title]",
             Self::Rename => "<title>",
+            Self::ArchiveSession | Self::RestoreSession => "<conversation-id>",
             Self::DeleteSession => "<conversation-id>",
             Self::OpenArtifact => "[call-id|path]",
             Self::Workspace => crate::cli::cmd_impls::workspace::WORKSPACE_SUBCOMMAND_USAGE,
@@ -460,6 +467,20 @@ mod tests {
         assert_eq!(retry.usage(), "<task-id> [run-id]");
         assert_eq!(skip.category(), Category::Coding);
         assert_eq!(recovery.usage(), "[run-id]");
+        Ok(())
+    }
+
+    #[test]
+    fn conversation_visibility_commands_are_first_class_session_actions() -> Result<(), String> {
+        let archive = "archive-session"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        let restore = "restore-session"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(archive.category(), Category::Session);
+        assert_eq!(restore.category(), Category::Session);
+        assert_eq!(archive.usage(), "<conversation-id>");
         Ok(())
     }
 

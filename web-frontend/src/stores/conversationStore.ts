@@ -6,7 +6,7 @@ import { useToolExecutionStore } from './toolExecutionStore';
 import { useSubagentRunStore } from './subagentRunStore';
 import { useTaskRuntimeStore } from './taskRuntimeStore';
 import { GLOBAL_WORKSPACE_ID } from '../lib/viewAddress';
-import type { ChatMessage, ExecutionStep, SavedMessage } from '../types/api';
+import type { ChatMessage, ConversationListItem, ExecutionStep, SavedMessage } from '../types/api';
 
 let loadGeneration = 0;
 let loadingConversationId: string | null = null;
@@ -22,6 +22,21 @@ export interface ConversationMeta {
   updatedAt: number;
   /** Workspace this conversation belongs to */
   workspaceId?: string;
+  /** Archived in EKO's workspace-scoped conversation projection. */
+  archived?: boolean;
+}
+
+function conversationMeta(item: ConversationListItem, workspaceId: string): ConversationMeta {
+  return {
+    id: item.conversation_id,
+    title: item.title ?? '',
+    lastMessage: '',
+    messageCount: item.message_count,
+    createdAt: new Date(item.created_at).getTime(),
+    updatedAt: new Date(item.updated_at).getTime(),
+    workspaceId,
+    archived: item.archived ?? false,
+  };
 }
 
 interface ConversationState {
@@ -29,6 +44,8 @@ interface ConversationState {
   workspaceId: string;
   /** All conversations sorted by updatedAt desc */
   conversations: ConversationMeta[];
+  /** Conversation ids archived locally for the active workspace. */
+  archivedConversationIds: string[];
   /** Currently active conversation ID */
   activeId: string | null;
   /** Increments for every explicit new-chat action, including null -> null transitions. */
@@ -46,8 +63,12 @@ interface ConversationState {
   loadConversation: (id: string) => Promise<void>;
   /** Branch the canonical transcript immediately before one user turn. */
   branchCurrent: (userTurnIndex: number) => Promise<{ id: string; targetContent: string }>;
+  /** Archive a conversation in the active workspace projection. */
+  archiveConversation: (id: string) => Promise<void>;
+  /** Restore an archived conversation. */
+  restoreConversation: (id: string) => Promise<void>;
   /** Delete a conversation */
-  deleteConversation: (id: string) => void;
+  deleteConversation: (id: string) => Promise<void>;
   /** Rename a conversation */
   renameConversation: (id: string, title: string) => void;
   /** Start a brand new chat */
@@ -215,6 +236,7 @@ export function restoredMessageId(
 export const useConversationStore = create<ConversationState>((set, get) => ({
   workspaceId: GLOBAL_WORKSPACE_ID,
   conversations: [],
+  archivedConversationIds: [],
   activeId: null,
   newConversationEpoch: 0,
   isLoading: false,
@@ -229,17 +251,12 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       if (import.meta.env.DEV)
         console.debug('[conversationStore] init: loaded', items.length, 'conversations');
       const metas: ConversationMeta[] = items
-        .map((item) => ({
-          id: item.conversation_id,
-          title: item.title ?? '',
-          lastMessage: '',
-          messageCount: item.message_count,
-          createdAt: new Date(item.created_at).getTime(),
-          updatedAt: new Date(item.updated_at).getTime(),
-          workspaceId,
-        }))
+        .map((item) => conversationMeta(item, workspaceId))
         .sort((a, b) => b.updatedAt - a.updatedAt);
-      set({ conversations: metas });
+      set({
+        conversations: metas,
+        archivedConversationIds: metas.filter((item) => item.archived).map((item) => item.id),
+      });
     } catch (e) {
       console.error('[conversationStore] init FAILED:', e);
       if (generation === loadGeneration && get().workspaceId === workspaceId) {
@@ -254,6 +271,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     set((state) => ({
       workspaceId,
       conversations: [],
+      archivedConversationIds: [],
       activeId: null,
       newConversationEpoch: state.newConversationEpoch + 1,
       isLoading: false,
@@ -303,17 +321,12 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       if (import.meta.env.DEV)
         console.debug('[saveCurrent] refreshed list:', items.length, 'conversations');
       const metas: ConversationMeta[] = items
-        .map((item) => ({
-          id: item.conversation_id,
-          title: item.title ?? '',
-          lastMessage: '',
-          messageCount: item.message_count,
-          createdAt: new Date(item.created_at).getTime(),
-          updatedAt: new Date(item.updated_at).getTime(),
-          workspaceId,
-        }))
+        .map((item) => conversationMeta(item, workspaceId))
         .sort((a, b) => b.updatedAt - a.updatedAt);
-      set({ conversations: metas });
+      set({
+        conversations: metas,
+        archivedConversationIds: metas.filter((item) => item.archived).map((item) => item.id),
+      });
     } catch (e) {
       console.error('[saveCurrent] refresh FAILED:', e);
     }
@@ -435,6 +448,32 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     return { id: result.id, targetContent: result.target_content };
   },
 
+  archiveConversation: async (id: string) => {
+    const workspaceId = get().workspaceId;
+    await conversationApi.setArchived(workspaceId, id, true);
+    const archivedIds = new Set(get().archivedConversationIds);
+    archivedIds.add(id);
+    set((state) => ({
+      archivedConversationIds: [...archivedIds],
+      conversations: state.conversations.map((conversation) =>
+        conversation.id === id ? { ...conversation, archived: true } : conversation
+      ),
+    }));
+  },
+
+  restoreConversation: async (id: string) => {
+    const workspaceId = get().workspaceId;
+    await conversationApi.setArchived(workspaceId, id, false);
+    const archivedIds = new Set(get().archivedConversationIds);
+    archivedIds.delete(id);
+    set((state) => ({
+      archivedConversationIds: [...archivedIds],
+      conversations: state.conversations.map((conversation) =>
+        conversation.id === id ? { ...conversation, archived: false } : conversation
+      ),
+    }));
+  },
+
   deleteConversation: async (id: string) => {
     // P1-12: 此前 catch 吞错后仍执行本地删除 → 后端还在但前端已移除,
     // 刷新后数据"恢复"又"丢失", 体验混乱。改为 API 失败则不更新本地 + 报错。
@@ -455,10 +494,13 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     }
 
     const wasActive = get().activeId === id;
+    const archivedIds = new Set(get().archivedConversationIds);
+    archivedIds.delete(id);
     set((s) => {
       const conversations = s.conversations.filter((c) => c.id !== id);
       return {
         conversations,
+        archivedConversationIds: [...archivedIds],
         activeId: s.activeId === id ? null : s.activeId,
       };
     });

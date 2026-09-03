@@ -102,6 +102,9 @@ export interface ExecutionEvent {
 export interface SubagentRunState {
   subagentRunId: string;
   runId: string;
+  /** Workspace captured from the lifecycle event; controls must target this
+   * run's immutable workspace instead of the currently focused TaskRun. */
+  workspaceId?: string;
   taskId?: string;
   planRevision?: number;
   attempt?: number;
@@ -480,6 +483,7 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
       const run: SubagentRunState = prev ?? {
         subagentRunId: id,
         runId: ev.run_id,
+        workspaceId: ev.workspace_id,
         taskId: ev.task_id,
         planRevision: ev.plan_revision,
         attempt: ev.attempt,
@@ -509,6 +513,7 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
       const outcome = terminalOutcome(ev, newStatus) ?? run.outcome;
       const next: SubagentRunState = {
         ...run,
+        workspaceId: ev.workspace_id || run.workspaceId,
         // Preserve any field present on the event (overwrites prev).
         taskId: ev.task_id ?? run.taskId,
         planRevision: ev.plan_revision ?? run.planRevision,

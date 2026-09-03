@@ -1058,6 +1058,23 @@ impl AgentPool {
         self.admission.active_count()
     }
 
+    /// Whether this pool owns the model consumers for its primary Agent.
+    ///
+    /// The process-global pool is also the publication owner for the primary
+    /// Agent. Callers that coordinate several pools must not prepare that
+    /// primary a second time while this pool retains its write guard.
+    pub(crate) async fn owns_primary_model_consumers(&self) -> bool {
+        self.primary_model_consumers.read().await.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_primary_model_consumers_for_test(
+        &self,
+        consumers: infra::AgentModelConsumers,
+    ) {
+        *self.primary_model_consumers.write().await = Some(consumers);
+    }
+
     /// Admit every existing and future pool consumer before persistence.
     pub(crate) async fn prepare_model_publication(
         &self,

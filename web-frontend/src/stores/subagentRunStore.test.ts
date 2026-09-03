@@ -235,6 +235,7 @@ describe('subagentRunStore terminal result', () => {
       ];
     expect(restored).toMatchObject({
       runId: 'run-restored',
+      workspaceId: 'workspace-1',
       taskId: 'task-analysis',
       agent: 'explorer',
       task: '分析 CLI 目录与入口',

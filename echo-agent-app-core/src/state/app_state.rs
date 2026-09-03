@@ -164,6 +164,10 @@ impl AppState {
             },
             storage: StorageState {
                 conversation: conversation_binding,
+                conversation_archive: Arc::new(
+                    crate::conversation_archive::ConversationArchiveStore::at_default_path()
+                        .map_err(anyhow::Error::msg)?,
+                ),
                 tool_executions: {
                     let root = crate::tool_execution::ToolExecutionRepository::default_root();
                     let repository =
@@ -456,6 +460,15 @@ impl AppState {
                 .into_iter()
                 .map(|(_, runtime)| runtime.pool()),
         );
+        // The process-global pool owns the primary Agent's model consumers in
+        // production. Its prepared pool publication already retains the
+        // primary Agent write guard, so preparing the same Agent again here
+        // would wait forever on that guard. Lightweight test pools may omit
+        // those consumers; retain the direct publication fallback for them.
+        let primary_owned_by_global_pool = match self.connection.pool.as_ref() {
+            Some(pool) => pool.owns_primary_model_consumers().await,
+            None => false,
+        };
         let _foreground = if mutation.activated || mutation.deactivated {
             Some(
                 self.session
@@ -508,28 +521,32 @@ impl AppState {
         } else {
             Vec::new()
         };
-        let primary_publication = match (runtime.as_ref(), prepared.as_ref()) {
-            (Some(runtime), Some(prepared)) => {
-                let consumers = self.connection.model_consumers.clone().ok_or_else(|| {
-                    ModelMutationError::Publication(
-                        "primary model consumers are unavailable".to_string(),
+        let primary_publication = if primary_owned_by_global_pool {
+            None
+        } else {
+            match (runtime.as_ref(), prepared.as_ref()) {
+                (Some(runtime), Some(prepared)) => {
+                    let consumers = self.connection.model_consumers.clone().ok_or_else(|| {
+                        ModelMutationError::Publication(
+                            "primary model consumers are unavailable".to_string(),
+                        )
+                    })?;
+                    Some(
+                        crate::infra::prepare_agent_model_publication(
+                            &self.connection.agent,
+                            consumers,
+                            runtime,
+                            prepared,
+                            crate::infra::effective_token_limit(&mutation.config, Some(runtime)),
+                        )
+                        .await
+                        .map_err(ModelMutationError::Publication)?,
                     )
-                })?;
-                Some(
-                    crate::infra::prepare_agent_model_publication(
-                        &self.connection.agent,
-                        consumers,
-                        runtime,
-                        prepared,
-                        crate::infra::effective_token_limit(&mutation.config, Some(runtime)),
-                    )
-                    .await
-                    .map_err(ModelMutationError::Publication)?,
-                )
+                }
+                _ => None,
             }
-            _ => None,
         };
-        let primary_deactivation = if mutation.deactivated {
+        let primary_deactivation = if mutation.deactivated && !primary_owned_by_global_pool {
             let consumers = self.connection.model_consumers.clone().ok_or_else(|| {
                 ModelMutationError::Publication(
                     "primary model consumers are unavailable".to_string(),
@@ -713,6 +730,23 @@ impl AppState {
     /// Return the conversation store from the currently published workspace binding.
     pub async fn conversation_store(&self) -> Option<Arc<dyn ConversationStore>> {
         self.storage.conversation.read().await.store.clone()
+    }
+
+    /// Return archived conversation ids for one workspace projection.
+    pub fn archived_conversation_ids(&self, workspace_id: &str) -> Result<Vec<String>, String> {
+        self.storage.conversation_archive.archived_ids(workspace_id)
+    }
+
+    /// Update one conversation's EKO visibility projection.
+    pub fn set_conversation_archived(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        archived: bool,
+    ) -> Result<(), String> {
+        self.storage
+            .conversation_archive
+            .set_archived(workspace_id, conversation_id, archived)
     }
 
     /// Create a conversation under the same identity lock used by aggregate deletion.

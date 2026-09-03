@@ -7,6 +7,8 @@ const mocks = vi.hoisted(() => ({
   branchConversation: vi.fn(),
   listConversations: vi.fn(),
   updateConversation: vi.fn(),
+  deleteConversation: vi.fn(),
+  setArchived: vi.fn(),
   resetSession: vi.fn(),
 }));
 
@@ -17,7 +19,8 @@ vi.mock('../api/endpoints', () => ({
     get: mocks.getConversation,
     save: vi.fn(),
     update: mocks.updateConversation,
-    delete: vi.fn(),
+    delete: mocks.deleteConversation,
+    setArchived: mocks.setArchived,
     restore: mocks.restoreConversation,
     branch: mocks.branchConversation,
   },
@@ -42,6 +45,11 @@ beforeEach(() => {
   mocks.restoreConversation.mockResolvedValue(undefined);
   mocks.listConversations.mockResolvedValue([]);
   mocks.updateConversation.mockResolvedValue(undefined);
+  mocks.setArchived.mockResolvedValue({
+    success: true,
+    conversation_id: 'conversation-1',
+    archived: false,
+  });
   mocks.branchConversation.mockResolvedValue({
     success: true,
     id: 'branch-1',
@@ -56,6 +64,7 @@ beforeEach(() => {
     newConversationEpoch: 0,
     isLoading: false,
     conversations: [],
+    archivedConversationIds: [],
   });
 });
 
@@ -184,5 +193,54 @@ describe('conversation message identity', () => {
     expect(mocks.branchConversation).toHaveBeenCalledWith('global', 'conversation-1', 2);
     expect(result).toEqual({ id: 'branch-1', targetContent: 'canonical user prompt' });
     expect(useConversationStore.getState().activeId).toBe('branch-1');
+  });
+
+  it('archives and restores conversations through the workspace-scoped application API', async () => {
+    useConversationStore.setState({
+      workspaceId: 'workspace-1',
+      conversations: [
+        {
+          id: 'conversation-1',
+          title: 'First',
+          lastMessage: '',
+          messageCount: 2,
+          createdAt: 1,
+          updatedAt: 2,
+          workspaceId: 'workspace-1',
+        },
+      ],
+    });
+
+    await useConversationStore.getState().archiveConversation('conversation-1');
+    expect(useConversationStore.getState().conversations[0]?.archived).toBe(true);
+    expect(mocks.setArchived).toHaveBeenCalledWith('workspace-1', 'conversation-1', true);
+
+    await useConversationStore.getState().restoreConversation('conversation-1');
+    expect(useConversationStore.getState().conversations[0]?.archived).toBe(false);
+    expect(mocks.setArchived).toHaveBeenLastCalledWith('workspace-1', 'conversation-1', false);
+  });
+
+  it('deletes through the backend before removing the local conversation projection', async () => {
+    mocks.deleteConversation.mockResolvedValueOnce({ cleanup_pending: false });
+    useConversationStore.setState({
+      workspaceId: 'workspace-1',
+      activeId: null,
+      conversations: [
+        {
+          id: 'conversation-1',
+          title: 'First',
+          lastMessage: '',
+          messageCount: 2,
+          createdAt: 1,
+          updatedAt: 2,
+          workspaceId: 'workspace-1',
+        },
+      ],
+    });
+
+    await useConversationStore.getState().deleteConversation('conversation-1');
+
+    expect(mocks.deleteConversation).toHaveBeenCalledWith('workspace-1', 'conversation-1');
+    expect(useConversationStore.getState().conversations).toEqual([]);
   });
 });

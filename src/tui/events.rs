@@ -4597,6 +4597,17 @@ async fn handle_slash_command(
                 Ok(items) => items
                     .into_iter()
                     .map(|item| {
+                        let archived = app
+                            .app_state
+                            .as_ref()
+                            .and_then(|state| {
+                                state
+                                    .archived_conversation_ids(
+                                        app.workspace_execution_scope.workspace_id(),
+                                    )
+                                    .ok()
+                            })
+                            .is_some_and(|ids| ids.iter().any(|id| id == &item.conversation_id));
                         let marker = if app.conversation_id.as_deref()
                             == Some(item.conversation_id.as_str())
                         {
@@ -4605,7 +4616,8 @@ async fn handle_slash_command(
                             " "
                         };
                         format!(
-                            "{} {}  {:>4} messages  {}",
+                            "{}{} {}  {:>4} messages  {}",
+                            if archived { "[archived] " } else { "" },
                             marker,
                             item.conversation_id,
                             item.message_count,
@@ -4667,6 +4679,43 @@ async fn handle_slash_command(
                 },
             });
         }
+        Some(SlashCommand::ArchiveSession | SlashCommand::RestoreSession) => {
+            let id = args.trim();
+            let archived = matches!(slash_cmd, Some(SlashCommand::ArchiveSession));
+            let result = match app.app_state.as_ref() {
+                _ if id.is_empty() => Err(format!(
+                    "Usage: /{} <conversation-id>",
+                    if archived {
+                        "archive-session"
+                    } else {
+                        "restore-session"
+                    }
+                )),
+                Some(app_state) => match app.conversation_store.as_ref() {
+                    None => Err("Conversation persistence is unavailable".to_string()),
+                    Some(store) => match store.get_conversation(id).await {
+                        Err(error) => Err(error.to_string()),
+                        Ok(None) => Err(format!("Conversation '{id}' was not found")),
+                        Ok(Some(_)) => app_state
+                            .set_conversation_archived(
+                                app.workspace_execution_scope.workspace_id(),
+                                id,
+                                archived,
+                            )
+                            .map_err(|error| error.to_string()),
+                    },
+                },
+                None => Err("Conversation persistence is unavailable".to_string()),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: match result {
+                    Ok(()) if archived => format!("Archived conversation: {id}"),
+                    Ok(()) => format!("Restored conversation: {id}"),
+                    Err(error) => error,
+                },
+            });
+        }
         Some(SlashCommand::DeleteSession) => {
             let id = args.trim();
             let result = match app.app_state.as_ref() {
@@ -4674,7 +4723,13 @@ async fn handle_slash_command(
                 Some(app_state) => app_state
                     .delete_conversation_owned(id)
                     .await
-                    .map(|_| ())
+                    .map(|_| {
+                        let _ = app_state.set_conversation_archived(
+                            app.workspace_execution_scope.workspace_id(),
+                            id,
+                            false,
+                        );
+                    })
                     .map_err(|error| error.to_string()),
                 None => Err("Conversation persistence is unavailable".to_string()),
             };

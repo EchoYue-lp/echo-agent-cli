@@ -16,6 +16,10 @@ projections, review/worktree behavior, and product presentation.
 - Framework `FileConversationStore` is the conversation authority; EKO adds
   workspace binding and UI projection.
 
+Archived conversations are hidden from the active sidebar and managed from
+Settings -> Project data -> Archives. Restore is reversible; permanent
+deletion uses the existing aggregate conversation deletion path.
+
 ## Tasks and Subagents
 
 The product model is `TaskRun -> PlanTask -> SubagentRun`. The task tools use a

@@ -24,6 +24,26 @@ describe('SubagentDetailView', () => {
     expect(html).toContain('aria-label="Queue guidance for next attempt"');
   });
 
+  it('shows task, execution and result as one stream without tabs', () => {
+    const run: SubagentRunState = {
+      subagentRunId: 'task-1:1',
+      runId: 'run-1',
+      taskId: 'task-1',
+      agent: 'explorer',
+      task: '重构支付模块并补齐退款边界单测',
+      status: 'running',
+      startedAt: 1,
+      events: [],
+    };
+
+    const html = renderToStaticMarkup(<SubagentDetailView run={run} onBack={() => undefined} />);
+
+    // Task prompt renders inline (main-chat user-bubble style), no tab shell.
+    expect(html).toContain('重构支付模块并补齐退款边界单测');
+    expect(html).not.toContain('提示词 / 任务');
+    expect(html).not.toContain('aria-pressed');
+  });
+
   it('shows the complete terminal output without protocol metadata', () => {
     const actualResult = '# Complete architecture report\n\n' + 'User-facing details. '.repeat(12);
     const run: SubagentRunState = {
@@ -31,6 +51,7 @@ describe('SubagentDetailView', () => {
       runId: 'run-1',
       taskId: 'task-1',
       agent: 'explorer',
+      task: '重构支付模块并补齐退款边界单测',
       status: 'completed',
       startedAt: 1,
       finalOutput: `${actualResult}\n\n## Result\n\n\`\`\`json\n{"contract_version":1,"summary":"done"}\n\`\`\``,
@@ -51,6 +72,8 @@ describe('SubagentDetailView', () => {
 
     expect(html).toContain('Complete architecture report');
     expect(html).toContain('User-facing details');
+    // The task prompt stays visible alongside the terminal output.
+    expect(html).toContain('重构支付模块并补齐退款边界单测');
     expect(html).not.toContain('见上方分析结果');
     expect(html).not.toContain('## Result');
     expect(html).not.toContain('Cargo.toml');

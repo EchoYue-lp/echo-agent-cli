@@ -8,10 +8,9 @@ import { useTauriChat } from '../../hooks/useTauriChat';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { useConversationStore } from '../../stores/conversationStore';
 import { useToastStore } from '../../stores/toastStore';
-import { subagentRunStoreKey, useSubagentRunStore } from '../../stores/subagentRunStore';
+import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
-import { SubagentDetailView } from '../task/SubagentDetailView';
 import { FailureToast } from './FailureToast';
 import { CornerUpLeft, GripVertical, MessagesSquare, PanelRightOpen, X } from 'lucide-react';
 import { AgentMessageDialog } from './AgentMessageDialog';
@@ -37,14 +36,7 @@ export function ChatPanel() {
   const currentWorkspace = useWorkspaceStore((s) => s.current);
   const rightWorkspace = useRightWorkspaceStore();
   const todoCount = useTaskRuntimeStore((state) => state.todos.length);
-  const subagentRuns = useSubagentRunStore((s) => s.runs);
-  const selectedSubagentRef = useSubagentDetailStore((s) => s.selected);
   const closeSubagentDetail = useSubagentDetailStore((s) => s.close);
-  const selectedSubagent = selectedSubagentRef
-    ? subagentRuns[
-        subagentRunStoreKey(selectedSubagentRef.runId, selectedSubagentRef.subagentRunId)
-      ]
-    : undefined;
 
   // ── 按需卡片状态 ──
   const [failureToastDismissed, setFailureToastDismissed] = useState(false);
@@ -225,157 +217,151 @@ export function ChatPanel() {
           </button>
         </div>
       </div>
-      {selectedSubagent ? (
-        <div className="min-h-0 flex-1">
-          <SubagentDetailView run={selectedSubagent} onBack={closeSubagentDetail} />
-        </div>
-      ) : (
-        <div
-          ref={scrollRef}
-          className="min-h-0 flex-1 overflow-y-auto"
-          onScroll={handleScroll}
-          role="log"
-          aria-live="polite"
-          aria-label="消息列表"
-        >
-          {messages.length === 0 ? (
-            <WelcomeScreen onSuggestionClick={handleSuggestionClick} />
-          ) : (
-            <div className="mx-auto w-full max-w-[980px] px-4 sm:px-6 lg:px-8">
-              <div className="space-y-1 pb-6 pt-5">
-                {messages.map((msg, idx) => {
-                  const prevMsg = idx > 0 ? messages[idx - 1] : null;
-                  const showSeparator =
-                    idx === 0 ||
-                    (prevMsg &&
-                      msg.timestamp &&
-                      prevMsg.timestamp &&
-                      msg.timestamp - prevMsg.timestamp > 300000);
+      <div
+        ref={scrollRef}
+        className="min-h-0 flex-1 overflow-y-auto"
+        onScroll={handleScroll}
+        role="log"
+        aria-live="polite"
+        aria-label="消息列表"
+      >
+        {messages.length === 0 ? (
+          <WelcomeScreen onSuggestionClick={handleSuggestionClick} />
+        ) : (
+          <div className="mx-auto w-full max-w-[980px] px-4 sm:px-6 lg:px-8">
+            <div className="space-y-1 pb-6 pt-5">
+              {messages.map((msg, idx) => {
+                const prevMsg = idx > 0 ? messages[idx - 1] : null;
+                const showSeparator =
+                  idx === 0 ||
+                  (prevMsg &&
+                    msg.timestamp &&
+                    prevMsg.timestamp &&
+                    msg.timestamp - prevMsg.timestamp > 300000);
 
-                  return (
-                    <div key={msg.id}>
-                      {showSeparator && idx > 0 && (
-                        <div className="flex items-center gap-3 py-4">
-                          <div
-                            className="h-px flex-1"
-                            style={{
-                              background:
-                                'linear-gradient(to right, transparent, var(--border-primary), transparent)',
-                            }}
-                          />
-                          <span
-                            className="text-xs text-[var(--text-tertiary)]"
-                            style={{ fontVariantNumeric: 'tabular-nums' }}
-                          >
-                            {new Date(msg.timestamp).toLocaleTimeString([], {
-                              hour: '2-digit',
-                              minute: '2-digit',
-                            })}
-                          </span>
-                          <div
-                            className="h-px flex-1"
-                            style={{
-                              background:
-                                'linear-gradient(to right, transparent, var(--border-primary), transparent)',
-                            }}
-                          />
-                        </div>
-                      )}
-                      <MessageBubble
-                        message={msg}
-                        onRegenerate={handleRegenerate}
-                        onEditAndResend={handleEditAndResend}
-                      />
-                    </div>
-                  );
-                })}
-
-                {isStreaming &&
-                  !messages.some(
-                    (m) =>
-                      m.isStreaming &&
-                      (m.content || (m.thinkingSegments && m.thinkingSegments.length > 0))
-                  ) && (
-                    <div className="flex items-center gap-3 px-1 py-3">
-                      <div className="spinner" />
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-xs text-[var(--text-tertiary)] animate-breathe">
-                          {runStatusLabel(runStatus, true)}
+                return (
+                  <div key={msg.id}>
+                    {showSeparator && idx > 0 && (
+                      <div className="flex items-center gap-3 py-4">
+                        <div
+                          className="h-px flex-1"
+                          style={{
+                            background:
+                              'linear-gradient(to right, transparent, var(--border-primary), transparent)',
+                          }}
+                        />
+                        <span
+                          className="text-xs text-[var(--text-tertiary)]"
+                          style={{ fontVariantNumeric: 'tabular-nums' }}
+                        >
+                          {new Date(msg.timestamp).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
                         </span>
-                        <span className="flex gap-0.5">
-                          <span
-                            className="h-1 w-1 rounded-full bg-[var(--accent)] animate-bounce"
-                            style={{ animationDelay: '0ms' }}
-                          />
-                          <span
-                            className="h-1 w-1 rounded-full bg-[var(--accent)] animate-bounce"
-                            style={{ animationDelay: '150ms' }}
-                          />
-                          <span
-                            className="h-1 w-1 rounded-full bg-[var(--accent)] animate-bounce"
-                            style={{ animationDelay: '300ms' }}
-                          />
-                        </span>
+                        <div
+                          className="h-px flex-1"
+                          style={{
+                            background:
+                              'linear-gradient(to right, transparent, var(--border-primary), transparent)',
+                          }}
+                        />
                       </div>
+                    )}
+                    <MessageBubble
+                      message={msg}
+                      onRegenerate={handleRegenerate}
+                      onEditAndResend={handleEditAndResend}
+                    />
+                  </div>
+                );
+              })}
+
+              {isStreaming &&
+                !messages.some(
+                  (m) =>
+                    m.isStreaming &&
+                    (m.content || (m.thinkingSegments && m.thinkingSegments.length > 0))
+                ) && (
+                  <div className="flex items-center gap-3 px-1 py-3">
+                    <div className="spinner" />
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs text-[var(--text-tertiary)] animate-breathe">
+                        {runStatusLabel(runStatus, true)}
+                      </span>
+                      <span className="flex gap-0.5">
+                        <span
+                          className="h-1 w-1 rounded-full bg-[var(--accent)] animate-bounce"
+                          style={{ animationDelay: '0ms' }}
+                        />
+                        <span
+                          className="h-1 w-1 rounded-full bg-[var(--accent)] animate-bounce"
+                          style={{ animationDelay: '150ms' }}
+                        />
+                        <span
+                          className="h-1 w-1 rounded-full bg-[var(--accent)] animate-bounce"
+                          style={{ animationDelay: '300ms' }}
+                        />
+                      </span>
                     </div>
-                  )}
-
-                {isCancelled && (
-                  <div className="flex items-center gap-3 py-3">
-                    <div
-                      className="h-px flex-1"
-                      style={{
-                        background:
-                          'linear-gradient(to right, transparent, var(--border-primary), transparent)',
-                      }}
-                    />
-                    <span className="text-xs text-[var(--text-tertiary)] italic">已停止响应</span>
-                    <div
-                      className="h-px flex-1"
-                      style={{
-                        background:
-                          'linear-gradient(to right, transparent, var(--border-primary), transparent)',
-                      }}
-                    />
                   </div>
                 )}
 
-                {pendingHitlRequest?.kind === 'input' && (
-                  <div className="py-2">
-                    <InputCard
-                      prompt={pendingHitlRequest.prompt}
-                      onSubmit={(text) => sendInput(pendingHitlRequest.requestId, text)}
-                    />
-                  </div>
-                )}
+              {isCancelled && (
+                <div className="flex items-center gap-3 py-3">
+                  <div
+                    className="h-px flex-1"
+                    style={{
+                      background:
+                        'linear-gradient(to right, transparent, var(--border-primary), transparent)',
+                    }}
+                  />
+                  <span className="text-xs text-[var(--text-tertiary)] italic">已停止响应</span>
+                  <div
+                    className="h-px flex-1"
+                    style={{
+                      background:
+                        'linear-gradient(to right, transparent, var(--border-primary), transparent)',
+                    }}
+                  />
+                </div>
+              )}
 
-                {pendingHitlRequest?.kind === 'selection' && (
-                  <div className="py-2">
-                    <SelectionCard
-                      prompt={pendingHitlRequest.prompt}
-                      options={pendingHitlRequest.options}
-                      taskId={pendingHitlRequest.taskId}
-                      phase={pendingHitlRequest.phase}
-                      context={pendingHitlRequest.context}
-                      onSelect={(selection, instructions) =>
-                        sendSelection(pendingHitlRequest.requestId, selection, instructions)
-                      }
-                    />
-                  </div>
-                )}
+              {pendingHitlRequest?.kind === 'input' && (
+                <div className="py-2">
+                  <InputCard
+                    prompt={pendingHitlRequest.prompt}
+                    onSubmit={(text) => sendInput(pendingHitlRequest.requestId, text)}
+                  />
+                </div>
+              )}
 
-                {/* Failure toast (spec §3.4) */}
-                {!failureToastDismissed && (
-                  <div className="py-1">
-                    <FailureToast onDismiss={() => setFailureToastDismissed(true)} />
-                  </div>
-                )}
-              </div>
-              <div ref={bottomRef} className="h-1" />
+              {pendingHitlRequest?.kind === 'selection' && (
+                <div className="py-2">
+                  <SelectionCard
+                    prompt={pendingHitlRequest.prompt}
+                    options={pendingHitlRequest.options}
+                    taskId={pendingHitlRequest.taskId}
+                    phase={pendingHitlRequest.phase}
+                    context={pendingHitlRequest.context}
+                    onSelect={(selection, instructions) =>
+                      sendSelection(pendingHitlRequest.requestId, selection, instructions)
+                    }
+                  />
+                </div>
+              )}
+
+              {/* Failure toast (spec §3.4) */}
+              {!failureToastDismissed && (
+                <div className="py-1">
+                  <FailureToast onDismiss={() => setFailureToastDismissed(true)} />
+                </div>
+              )}
             </div>
-          )}
-        </div>
-      )}
+            <div ref={bottomRef} className="h-1" />
+          </div>
+        )}
+      </div>
 
       <div className="shrink-0 bg-[linear-gradient(to_top,var(--bg-chat)_72%,transparent)]">
         {pendingHitlRequest?.kind === 'approval' && (

@@ -674,6 +674,7 @@ export interface ConversationListItem {
   message_count: number;
   created_at: string;
   updated_at: string;
+  archived?: boolean;
 }
 
 // ── Sandbox types ──

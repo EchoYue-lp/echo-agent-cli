@@ -20,7 +20,10 @@ import AnalysisPanel from '../analysis/AnalysisPanel';
 import { PaperPanel } from '../papers/PaperPanel';
 import { AutomationPanel } from '../automation/AutomationPanel';
 import { RightRail } from './RightRail';
+import { SubagentDetailView } from '../task/SubagentDetailView';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { subagentRunStoreKey, useSubagentRunStore } from '../../stores/subagentRunStore';
+import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
 import { productDataScope, productDataScopeKey } from '../../lib/productDataScope';
 
 export function RightWorkspace() {
@@ -49,6 +52,17 @@ export function RightWorkspace() {
       window.removeEventListener('resize', resize);
     };
   }, [setWidth]);
+
+  // Subagent detail takes over the panel body (navigation-stack semantics):
+  // back returns to the previously active tab. The tab header stays clickable.
+  const selectedSubagentRef = useSubagentDetailStore((s) => s.selected);
+  const closeSubagentDetail = useSubagentDetailStore((s) => s.close);
+  const subagentRuns = useSubagentRunStore((s) => s.runs);
+  const selectedSubagent = selectedSubagentRef
+    ? subagentRuns[
+        subagentRunStoreKey(selectedSubagentRef.runId, selectedSubagentRef.subagentRunId)
+      ]
+    : undefined;
 
   if (!store.open) return null;
 
@@ -126,7 +140,9 @@ export function RightWorkspace() {
         </header>
 
         <div className="min-h-0 flex-1">
-          {store.activeTab === 'tasks' ? (
+          {selectedSubagent ? (
+            <SubagentDetailView run={selectedSubagent} onBack={closeSubagentDetail} />
+          ) : store.activeTab === 'tasks' ? (
             <RightRail />
           ) : store.activeTab === 'analysis' ? (
             <AnalysisPanel key={productScopeKey} />

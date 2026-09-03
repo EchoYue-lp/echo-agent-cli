@@ -4,6 +4,7 @@ import {
   X,
   Settings,
   Save,
+  Archive,
   ShieldCheck,
   Minimize2,
   Wrench,
@@ -27,6 +28,7 @@ import {
 import { useUiStore, type SettingsTabId } from '../../stores/uiStore';
 import { ConfigPanel } from '../config/ConfigPanel';
 import { SessionsPanel } from '../sessions/SessionsPanel';
+import { ArchivedConversationsPanel } from '../sessions/ArchivedConversationsPanel';
 import { AuditPanel } from '../audit/AuditPanel';
 import { CompressPanel } from '../compress/CompressPanel';
 import { ToolsPanel } from '../tools/ToolsPanel';
@@ -92,6 +94,27 @@ const settingsGroups: SettingsGroup[] = [
       { id: 'mcp', label: 'MCP', icon: Globe, maturity: 'core', description: '本地扩展服务连接' },
       { id: 'lsp', label: 'LSP', icon: Code2, maturity: 'core', description: '项目语言服务' },
       {
+        id: 'skills',
+        label: '技能',
+        icon: BookOpen,
+        maturity: 'core',
+        description: '可加载的能力包',
+      },
+      {
+        id: 'plugins',
+        label: '插件',
+        icon: Package,
+        maturity: 'core',
+        description: '本地插件市场',
+      },
+      {
+        id: 'hooks',
+        label: 'Hooks',
+        icon: Webhook,
+        maturity: 'core',
+        description: '事件钩子来源与规则',
+      },
+      {
         id: 'observability',
         label: '运行观测',
         icon: Activity,
@@ -113,6 +136,13 @@ const settingsGroups: SettingsGroup[] = [
         icon: Save,
         maturity: 'live',
         description: '会话历史与恢复',
+      },
+      {
+        id: 'archives',
+        label: '归档',
+        icon: Archive,
+        maturity: 'live',
+        description: '恢复或永久删除归档会话',
       },
     ],
   },
@@ -165,27 +195,6 @@ const settingsGroups: SettingsGroup[] = [
         description: '并行开发工作区',
       },
       {
-        id: 'skills',
-        label: '技能',
-        icon: BookOpen,
-        maturity: 'advanced',
-        description: '可加载的能力包',
-      },
-      {
-        id: 'plugins',
-        label: '插件',
-        icon: Package,
-        maturity: 'advanced',
-        description: '本地插件市场',
-      },
-      {
-        id: 'hooks',
-        label: 'Hooks',
-        icon: Webhook,
-        maturity: 'advanced',
-        description: '事件钩子来源与规则',
-      },
-      {
         id: 'scheduler',
         label: '定时任务',
         icon: Timer,
@@ -221,6 +230,7 @@ const panels: Record<SettingsTabId, React.FC> = {
   config: ConfigPanel,
   providers: ProviderPanel,
   sessions: SessionsPanel,
+  archives: ArchivedConversationsPanel,
   audit: AuditPanel,
   sandbox: SandboxPanel,
   observability: ObservabilityPanel,
@@ -255,6 +265,9 @@ function SettingsOverview() {
         settingsGroups[0].items.find((item) => item.id === 'providers') ?? overviewItem,
         settingsGroups[0].items.find((item) => item.id === 'tools') ?? overviewItem,
         settingsGroups[0].items.find((item) => item.id === 'mcp') ?? overviewItem,
+        settingsGroups[0].items.find((item) => item.id === 'skills') ?? overviewItem,
+        settingsGroups[0].items.find((item) => item.id === 'plugins') ?? overviewItem,
+        settingsGroups[0].items.find((item) => item.id === 'hooks') ?? overviewItem,
       ],
     },
     {
@@ -270,9 +283,8 @@ function SettingsOverview() {
       title: '高级扩展',
       icon: Sparkles,
       items: [
-        settingsGroups[3].items.find((item) => item.id === 'skills') ?? overviewItem,
-        settingsGroups[3].items.find((item) => item.id === 'plugins') ?? overviewItem,
         settingsGroups[3].items.find((item) => item.id === 'scheduler') ?? overviewItem,
+        settingsGroups[3].items.find((item) => item.id === 'evolution') ?? overviewItem,
       ],
     },
   ];
