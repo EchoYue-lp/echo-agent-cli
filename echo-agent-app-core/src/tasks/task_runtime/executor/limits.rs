@@ -313,21 +313,21 @@ pub enum RunOutcome {
     },
 }
 
-pub struct PlannedRunResumeLaunch {
+pub struct TaskRunResumeLaunch {
     pub run_id: String,
     completion: tokio::sync::oneshot::Receiver<Result<RunOutcome, String>>,
 }
 
-impl PlannedRunResumeLaunch {
+impl TaskRunResumeLaunch {
     pub async fn wait(self) -> Result<RunOutcome, String> {
         self.completion
             .await
-            .map_err(|error| format!("planned resume completion channel closed: {error}"))?
+            .map_err(|error| format!("TaskRun resume completion channel closed: {error}"))?
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn launch_planned_run_resume(
+pub async fn launch_task_run_resume(
     store: Arc<TaskRuntimeStore>,
     expected: TaskRunResumeIdentity,
     primary_agent: crate::agent_handle::AgentHandle,
@@ -336,13 +336,13 @@ pub async fn launch_planned_run_resume(
     trace_sink: Option<ExecSink>,
     cancel: CancellationToken,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
-) -> Result<PlannedRunResumeLaunch, StoreError> {
+) -> Result<TaskRunResumeLaunch, StoreError> {
     let run_id = expected.run_id.clone();
     let admission = store.reserve_run_driver_admission(run_id.clone(), cancel.clone())?;
     let generation_lease = store.lease_active_workspace_generation()?;
     let registration = store.register_run_driver::<RunOutcome>(admission, generation_lease)?;
     TaskRuntimeOperation::new(store.clone())
-        .run_owned("prepare exact planned resume", move || {
+        .run_owned("prepare exact TaskRun resume", move || {
             let mut registration = registration;
             let memory_generation = match review_integration
                 .as_ref()
@@ -357,13 +357,19 @@ pub async fn launch_planned_run_resume(
                     return Err(error);
                 }
             };
-            if store.get_plan(&run_id)?.is_none() {
+            let snapshot = store
+                .get_run_state(&run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.clone()))?;
+            let has_plan = store.get_plan(&run_id)?.is_some();
+            if !has_plan && snapshot.execution_profile.plan_policy == RunPlanPolicy::RequirePlan {
                 let error = StoreError::InvalidPlan(format!(
                     "run {run_id} has no persisted plan to resume"
                 ));
                 registration.reject(error.to_string());
                 return Err(error);
             }
+            let execution_profile = snapshot.execution_profile;
+            let run_goal = snapshot.run.goal;
             if let Err(error) = store.resume_task_run_expected(&expected) {
                 let detail = error.to_string();
                 if matches!(error, StoreError::ResumeOutcomeUnknown { .. }) {
@@ -384,37 +390,96 @@ pub async fn launch_planned_run_resume(
                     if let Some(execution) = pool_execution {
                         receipt_owner.retain(execution);
                     }
-                    let run_store = primary_agent.read(|agent| agent.run_store().cloned()).await;
-                    let reviewer_llm = primary_agent
-                        .read(|agent| agent.llm_client().cloned())
-                        .await;
-                    execute_run(
-                        preparation_store,
-                        Some(primary_agent),
-                        reviewer_llm,
-                        memory_generation,
-                        run_store,
-                        trace_sink,
+                    if has_plan {
+                        let run_store = primary_agent.read(|agent| agent.run_store().cloned()).await;
+                        let reviewer_llm = primary_agent
+                            .read(|agent| agent.llm_client().cloned())
+                            .await;
+                        return execute_run(
+                            preparation_store,
+                            Some(primary_agent),
+                            reviewer_llm,
+                            memory_generation,
+                            run_store,
+                            trace_sink,
+                            &preparation_run_id,
+                            cancel,
+                            super::memory_bridge::MemoryPolicy::BestEffortSettled,
+                            workspace_io,
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                    }
+
+                    drive_agent_run(
+                        preparation_store.clone(),
+                        primary_agent,
                         &preparation_run_id,
+                        "task_run_resume",
+                        &preparation_run_id,
+                        &run_goal,
                         cancel,
-                        super::memory_bridge::MemoryPolicy::BestEffortSettled,
+                        UnattendedWriteMode::Disabled,
+                        execution_profile.plan_policy,
+                        trace_sink,
                         workspace_io,
                     )
                     .await
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                    let outcome_run_id = preparation_run_id.clone();
+                    let run = TaskRuntimeOperation::new(preparation_store.clone())
+                        .run("load resumed direct run outcome", move |store| {
+                            store
+                                .get_run(&outcome_run_id)?
+                                .ok_or(StoreError::RunNotFound(outcome_run_id))
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let outcome = match run.status {
+                        TaskRunStatus::Completed => RunOutcome::Completed,
+                        TaskRunStatus::Cancelled => RunOutcome::Cancelled,
+                        TaskRunStatus::Paused => RunOutcome::Paused {
+                            failed_task_id: None,
+                            error: "agent-driven run paused".to_string(),
+                        },
+                        TaskRunStatus::Failed => RunOutcome::Failed {
+                            failed_task_id: None,
+                            error: "agent-driven run failed".to_string(),
+                        },
+                        status => {
+                            return Err(format!(
+                                "resumed direct run {} ended in non-terminal status {}",
+                                preparation_run_id,
+                                status.as_str()
+                            ));
+                        }
+                    };
+                    if matches!(outcome, RunOutcome::Completed | RunOutcome::Cancelled) {
+                        let event = if matches!(outcome, RunOutcome::Completed) {
+                            super::memory_bridge::MemoryEvent::RunCompleted {
+                                run_id: preparation_run_id.clone(),
+                                goal: run.goal,
+                            }
+                        } else {
+                            super::memory_bridge::MemoryEvent::RunCancelledByUser {
+                                run_id: preparation_run_id.clone(),
+                                goal: run.goal,
+                            }
+                        };
+                        super::memory_bridge::write_memory_candidate_dispatch(
+                            super::memory_bridge::MemoryPolicy::BestEffortSettled,
+                            memory_generation.as_ref(),
+                            &preparation_store,
+                            event,
+                        )
+                        .await;
+                    }
+                    Ok(outcome)
                 },
             );
-            Ok(PlannedRunResumeLaunch { run_id, completion })
+            Ok(TaskRunResumeLaunch { run_id, completion })
         })
         .await
-}
-
-/// Whether an Agent-driven Run must materialize a formal plan before it may
-/// complete. This is prompt/execution policy, not a TaskRun lifecycle state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunPlanPolicy {
-    RequirePlan,
-    AllowDirect,
 }
 
 /// Workspace-mutating tools that an unattended primary Agent must not call

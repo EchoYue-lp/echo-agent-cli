@@ -25,11 +25,11 @@ use echo_agent::human_loop::HumanLoopProvider;
 
 use crate::agent_pool::AgentPool;
 use crate::tasks::task_runtime::executor::{
-    ExecSink, RunOutcome, RunPlanPolicy, TaskRuntimeOperation, drive_agent_run,
+    ExecSink, RunOutcome, TaskRuntimeOperation, drive_agent_run,
 };
 use crate::tasks::task_runtime::memory_bridge::{MemoryEvent, MemoryPolicy};
 use crate::tasks::task_runtime::store::TaskRuntimeStore;
-use crate::tasks::task_runtime::types::{TaskRunStatus, UnattendedWriteMode};
+use crate::tasks::task_runtime::types::{RunPlanPolicy, TaskRunStatus, UnattendedWriteMode};
 
 /// Fully-owned payload for driving a Run in the background or foreground.
 ///
@@ -232,7 +232,7 @@ async fn drive_run_async_inner(
         }
     };
 
-    // ADR 0035: eagerly bound runs that never committed a plan revision are
+    // ADR 0037: eagerly bound runs that never committed a plan revision are
     // conversational turns — their terminal outcome is not durable task
     // memory and must not pollute long-term recall.
     let memory_event = if !has_plan {

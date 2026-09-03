@@ -363,7 +363,7 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
         push_short_list(&mut out, "Risks", &plan.risks, 3, 120);
     }
 
-    // ADR 0035: incremental user constraints recorded via run steers are as
+    // ADR 0037: incremental user constraints recorded via run steers are as
     // binding as the Goal — surface them in the compression-safe capsule so
     // narrowed context cannot silently drop them.
     if !recent_constraints.is_empty() {
@@ -894,7 +894,7 @@ mod tests {
         let contract = build_runtime_goal_contract(&store, "r4")
             .ok_or_else(|| "goal contract should be built".to_string())?;
         if !contract.contains("objective artifact before acting")
-            || !contract.contains("objective.md")
+            || !contract.contains("objective-r1-")
         {
             return Err("goal contract should point at the spilled objective artifact".to_string());
         }
@@ -904,6 +904,15 @@ mod tests {
             capsule.contains("Full objective artifact:"),
             "capsule should point at the spilled objective artifact"
         );
+        echo_agent::utils::fs::atomic_write(&artifact, b"stale objective")
+            .map_err(|error| error.to_string())?;
+        assert!(
+            store.objective_artifact_path("r4").is_none(),
+            "a digest-mismatched objective artifact must not be exposed"
+        );
+        let degraded_contract = build_runtime_goal_contract(&store, "r4")
+            .ok_or_else(|| "goal contract should survive artifact degradation".to_string())?;
+        assert!(degraded_contract.contains("unavailable"));
         Ok(())
     }
 

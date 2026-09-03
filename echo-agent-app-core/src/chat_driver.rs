@@ -5,7 +5,7 @@
 //! resources, with long pastes spilled to a user-input artifact), collapses it
 //! into one `Message` via [`PreparedUserTurn::to_message`], and streams the
 //! agent's ReAct reply through a surface-specific `ChatSink`. Every turn
-//! eagerly drives its own TaskRun (ADR 0035): the default binding carries the
+//! eagerly drives its own TaskRun (ADR 0037): the default binding carries the
 //! turn-derived formal run id, so ordinary chat shares the same admission,
 //! projection, and recovery semantics as explicit task submission/resume.
 //!
@@ -314,21 +314,21 @@ fn duration_seconds_rounded_up(duration: std::time::Duration) -> u64 {
 /// Wraps `message` (plus optional `multimodal`) into one `Message`, streams the
 /// agent's reply through `sink`, and returns. No route pre-judgment; the
 /// turn id is the shared context anchor for task tools and forked subagents.
-/// Every turn eagerly drives its own `taskrun:<turn_id>` TaskRun (ADR 0035);
+/// Every turn eagerly drives its own `taskrun:<turn_id>` TaskRun (ADR 0037);
 /// explicit bindings from task submission/resume paths pin an existing run.
 ///
 /// ## turn/run identity
 ///
-/// 普通 chat 轮次使用 `res.root_message_id` 作 turn_id。Task tools
-/// 从该 turn_id 派生独立的 `taskrun:<turn_id>`，并创建正式 TaskRun。这样
+/// 普通 chat 轮次使用 `res.root_message_id` 作 turn_id,并从该 turn_id
+/// 派生 `taskrun:<turn_id>`。Task tools 在同一 run 内提交正式 plan。这样
 /// 主 agent 在 ReAct 循环里调
 /// `task_create` / `task_execute` / `create_complex_task` 等依赖
 /// `require_run_id()` 的工具时,能从 task_local 读到 run_id,不再被
 /// `"no active run — run_id not set in context"` 提前拒绝(对齐 Claude Code
 /// 的无门槛只读 dispatch)。
 ///
-/// turn_id 进入 Agent ExternalRunContext；普通聊天不写 TaskRuntimeStore。
-/// `create_complex_task` 和 inline/formal plan 各自拥有真正的 run_id。
+/// turn_id 与 exact run_id 一起进入 Agent ExternalRunContext。独立的
+/// `create_complex_task` 仍拥有自己的 orchestrated run_id。
 pub async fn drive_chat(
     agent: &AgentHandle,
     turn: &crate::prepared_turn::PreparedUserTurn,
@@ -558,7 +558,7 @@ async fn prepare_chat_execution(
     } else {
         res.root_message_id.clone()
     };
-    // ADR 0035: every turn eagerly drives its own TaskRun. The default
+    // ADR 0037: every turn eagerly drives its own TaskRun. The default
     // binding carries the turn-derived formal run id so ordinary chat goes
     // through the same admission, projection, and recovery semantics as
     // explicit task/resume turns; a run that never commits a plan revision
@@ -576,7 +576,7 @@ async fn prepare_chat_execution(
         expected_resume: None,
     });
     // Normalize any caller-supplied run-less binding the same way so no
-    // store-backed turn can execute outside the unified runtime (ADR 0035).
+    // store-backed turn can execute outside the unified runtime (ADR 0037).
     if binding.run_id.is_none() && res.store.is_some() {
         binding.run_id =
             Some(crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&binding.turn_id));
@@ -603,7 +603,7 @@ async fn prepare_chat_execution(
         crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id)
     });
     // Every turn registers its run driver before memory admission; with the
-    // eager default binding (ADR 0035) every ordinary turn owns a formal
+    // eager default binding (ADR 0037) every ordinary turn owns a formal
     // TaskRun from the first model boundary.
     let mut task_driver_registration = match res.store.as_ref() {
         Some(store) => {
@@ -977,7 +977,7 @@ struct RegisteredTurnDriver {
 
 async fn drive_registered_turn(driver: RegisteredTurnDriver) -> Result<TurnReceipt, String> {
     if let Some(progress) = driver.foreground_progress.as_ref() {
-        progress.advance(&driver.binding.turn_id);
+        progress.bind_run_turn(&driver.run_id, &driver.binding.turn_id);
     }
     let result = crate::tasks::task_runtime::task_tools::with_run_context(
         driver.run_id.clone(),
@@ -1048,7 +1048,11 @@ fn ensure_bound_task_run(
 ) -> Result<(), crate::tasks::task_runtime::StoreError> {
     use crate::tasks::task_runtime::{AttendedMode, DomainProfile, TaskRunStatus};
 
-    let run = store.create_run_for_active_workspace(
+    let execution_profile = store
+        .get_run_state(run_id)?
+        .map(|snapshot| snapshot.execution_profile)
+        .unwrap_or_else(crate::tasks::task_runtime::TaskRunExecutionProfile::conversation_turn);
+    let run = store.create_run_for_active_workspace_with_profile(
         run_id,
         conversation_id.unwrap_or("message:task"),
         turn_id,
@@ -1056,6 +1060,7 @@ fn ensure_bound_task_run(
         goal,
         "agent_task_plan",
         AttendedMode::Attended,
+        execution_profile,
     )?;
     if !attachments.is_empty() {
         store.set_run_attachments(run_id, attachments)?;
@@ -1086,13 +1091,34 @@ async fn finalize_run_turn(
     trace_sink: Option<&crate::tasks::task_runtime::task_tools::TraceSink>,
 ) -> Result<crate::tasks::task_runtime::turn_lifecycle::RunTurnDecision, String> {
     let blocking = crate::tasks::task_runtime::TaskRuntimeOperation::new(store.clone());
+    let policy_run_id = run_id.to_string();
+    let turn_end_policy = blocking
+        .run_store("load RunTurn end policy", move |store| {
+            let profile = store
+                .get_run_state(&policy_run_id)?
+                .map(|snapshot| snapshot.execution_profile)
+                .ok_or_else(|| {
+                    crate::tasks::task_runtime::StoreError::RunNotFound(policy_run_id.clone())
+                })?;
+            Ok(
+                if profile.provenance
+                    == crate::tasks::task_runtime::TaskRunProvenance::ConversationTurn
+                {
+                    crate::tasks::task_runtime::turn_lifecycle::TurnEndPolicy::ConversationTurn
+                } else {
+                    crate::tasks::task_runtime::turn_lifecycle::TurnEndPolicy::PolicyDriven
+                },
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())?;
     crate::tasks::task_runtime::turn_lifecycle::finalize_run_turn(
         &blocking,
         store,
         run_id,
         outcome,
         trace_sink,
-        crate::tasks::task_runtime::turn_lifecycle::TurnEndPolicy::ChatTurn,
+        turn_end_policy,
     )
     .await
 }
@@ -2868,7 +2894,7 @@ mod tests {
                 .map_err(|error| error.to_string())?,
         );
         store
-            .create_run(
+            .create_run_with_profile(
                 "claim-race-run",
                 "test",
                 "claim-race-conversation",
@@ -2877,6 +2903,7 @@ mod tests {
                 "preserve the winner",
                 "agent_task_plan",
                 crate::tasks::task_runtime::AttendedMode::Attended,
+                crate::tasks::task_runtime::TaskRunExecutionProfile::conversation_turn(),
             )
             .map_err(|error| error.to_string())?;
         store
@@ -2966,7 +2993,7 @@ mod tests {
         winner
             .await
             .map_err(|error| format!("winner task failed: {error}"))??;
-        // ADR 0035: a completed turn on a run that never committed a plan
+        // ADR 0037: a completed turn on a run that never committed a plan
         // settles as Completed at turn end (previously it spun continuation
         // turns until RepeatedBlocker paused the run).
         wait_for_run_status(
@@ -3195,7 +3222,7 @@ mod tests {
         assert_eq!(unchanged_starts.len(), 3);
         let auto_derived =
             crate::tasks::task_runtime::task_tools::formal_run_id_for_turn("auto-resume-message");
-        // ADR 0035: the ordinary turn now eagerly drives its own TaskRun and
+        // ADR 0037: the ordinary turn now eagerly drives its own TaskRun and
         // settles it Completed without a plan; the existing goal run above is
         // untouched.
         let auto_run = store
@@ -3682,7 +3709,7 @@ mod tests {
             ),
             "drive_chat should preserve version, identity, sequence, and exactly one terminal"
         );
-        // ADR 0035: an ordinary chat turn eagerly drives its own TaskRun and,
+        // ADR 0037: an ordinary chat turn eagerly drives its own TaskRun and,
         // with no plan revision ever committed, settles it as Completed at
         // turn end instead of entering the continuation loop.
         let formal_run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(turn_id);
@@ -3701,6 +3728,12 @@ mod tests {
                 .is_none(),
             "ordinary chat must not synthesize a plan"
         );
+        let execution_profile = store
+            .get_run_state(&formal_run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "ordinary chat run state disappeared".to_string())?
+            .execution_profile;
+        assert!(execution_profile.is_conversation_turn());
         let shutdown_result = store.shutdown_run_drivers().await;
         assert!(
             shutdown_result.is_ok(),
@@ -3859,7 +3892,7 @@ mod tests {
                 .map_err(|error| error.to_string())?,
         );
         store
-            .create_run(
+            .create_run_with_profile(
                 &run_id,
                 "test",
                 "c1",
@@ -3868,6 +3901,7 @@ mod tests {
                 "boundary goal",
                 "agent_task_plan",
                 AttendedMode::Attended,
+                crate::tasks::task_runtime::TaskRunExecutionProfile::conversation_turn(),
             )
             .map_err(|error| error.to_string())?;
         store
@@ -3908,7 +3942,7 @@ mod tests {
             human_loop_provider: None,
         });
 
-        // ADR 0035: the ordinary turn eagerly claims this pre-seeded run (its
+        // ADR 0037: the ordinary turn eagerly claims this pre-seeded run (its
         // identity matches the turn-derived formal run) and drives it to a
         // successful completion; the old "abandoned Pending run fails" path no
         // longer exists because no turn executes outside the runtime.

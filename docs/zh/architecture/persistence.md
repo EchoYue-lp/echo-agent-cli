@@ -13,9 +13,12 @@
 
 `Store` 是重载名称，不表示这些类型共享同一数据模型。讨论状态时必须带领域限定，例如“memory Store”“conversation Store”“TaskRuntime journal”或“trace RunStore”。
 
-## 正式任务：Journal 是事实权威
+## Turn 与正式任务:TaskRuntime Journal 是事实权威
 
-`TaskRuntimeStore` 是 EKO 正式任务的应用门面。实际事件权威由 `RunAuthority` 管理，它是对 framework `FileEventJournal + FileCheckpointStore + CheckpointedReducer` 的薄适配。
+`TaskRuntimeStore` 是 EKO turn-run 与正式任务的应用门面。每个 store-backed turn 都急切
+绑定 TaskRun;`TaskRunExecutionProfile` 区分内部 conversation-turn journal 与应投影到任务
+界面的 orchestrated run。实际事件权威由 `RunAuthority` 管理，它是对 framework
+`FileEventJournal + FileCheckpointStore + CheckpointedReducer` 的薄适配。
 
 ```text
 TaskRuntime mutation
@@ -36,7 +39,7 @@ RunAuthority
 
 关键不变量：
 
-1. 每次正式任务状态变化先提交到 `events.jsonl`。
+1. 每次 turn、正式任务与 user-steer 状态变化先提交到 `events.jsonl`。
 2. sequence、batch identity、重放、crash-tail repair 和 checkpoint recovery 使用 framework Journal 原语。
 3. `EventFoldState` 从事件生成任务、plan、todo、usage、continuation 和恢复相关投影。
 4. `checkpoint.json` 保存已 fold sequence 和 `EventFoldState`，损坏或落后时从 Journal 重建。
@@ -71,7 +74,9 @@ artifact/review history segment 和 history cursor 同样可以删除重建；�
 
 ## 普通聊天：独立的 Chat Journal
 
-普通 Chat 不创建正式 TaskRun 时，使用 `ChatEventLog` 保存 GUI、TUI、CLI、channel 和 boot recovery 消费的有序产品事件流。
+普通 Chat 同时使用 `ChatEventLog` 保存 GUI、TUI、CLI、channel 和 boot recovery 消费的
+有序交付事件流。它也拥有一个 conversation provenance 的 TaskRun,用于 Goal、steer、
+continuation 与恢复;无 plan conversation run 不进入任务 UI。
 
 职责分层如下：
 
@@ -82,7 +87,9 @@ artifact/review history segment 和 history cursor 同样可以删除重建；�
 
 Journal append 是 surface 交付边界。surface 接收 journaled event，而不是各自建立不可重放的后端事实源。
 
-`ChatEventLog` 与 TaskRuntime `events.jsonl` 的作用域不同：前者服务普通聊天产品流，后者服务正式 TaskRun。不能把二者合并为一个进程全局 Journal，也不能让其中一个替代另一个。
+`ChatEventLog` 与 TaskRuntime `events.jsonl` 的事实不同:前者负责输入/输出交付与 surface
+重放,后者负责 turn-run Goal、约束和执行状态。二者可以关联同一 turn,但不能合并为进程
+全局 Journal,也不能互相替代。完整决策见 [ADR 0037](../adr/0037-unified-turn-run-binding.md)。
 
 ## ReAct Checkpoint 与 ConversationStore
 

@@ -1027,6 +1027,22 @@ async fn continuation_eligibility(
     store: &Arc<TaskRuntimeStore>,
     run_id: &str,
 ) -> ContinuationEligibility {
+    let activity_run_id = run_id.to_string();
+    let runtime_active = super::executor::TaskRuntimeOperation::new(store.clone())
+        .run_store("defer active continuation runtime", move |store| {
+            store.defer_continuation_if_runtime_active(&activity_run_id)
+        })
+        .await;
+    let runtime_active = match runtime_active {
+        Ok(runtime_active) => runtime_active,
+        Err(error) => {
+            tracing::warn!(run_id, %error, "continuation activity could not be inspected");
+            return ContinuationEligibility::Stop;
+        }
+    };
+    if runtime_active {
+        return ContinuationEligibility::Deferred;
+    }
     let lookup_run_id = run_id.to_string();
     let Ok(Some(snapshot)) = super::executor::TaskRuntimeOperation::new(store.clone())
         .run_store("load continuation eligibility", move |store| {
@@ -1249,35 +1265,11 @@ pub(crate) fn shutdown(store: &TaskRuntimeStore) {
 /// Running plan tasks. User-paused and recovery-paused runs remain under
 /// user control.
 pub(crate) fn wake_deferred_when_runtime_quiet(store: &Arc<TaskRuntimeStore>, run_id: &str) {
-    let Ok(cells) = store.list_background_cells(run_id) else {
-        return;
-    };
-    if cells
-        .iter()
-        .any(super::types::BackgroundCellState::is_active)
-    {
-        return;
+    match store.resume_deferred_continuation_if_quiet(run_id) {
+        Ok(true) => runtime_for(store).wake(run_id),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(run_id, %error, "failed to clear continuation deferral"),
     }
-    let is_deferred = store
-        .get_run_state(run_id)
-        .ok()
-        .flatten()
-        .is_some_and(|snapshot| {
-            let tasks_running = snapshot.tasks.iter().any(|task| task.status.is_running());
-            snapshot.run.status == TaskRunStatus::Running
-                && !tasks_running
-                && snapshot
-                    .continuation
-                    .is_some_and(|continuation| continuation.enabled && continuation.deferred)
-        });
-    if !is_deferred {
-        return;
-    }
-    if let Err(error) = store.set_continuation_deferred(run_id, false) {
-        tracing::warn!(run_id, %error, "failed to clear continuation deferral");
-        return;
-    }
-    runtime_for(store).wake(run_id);
 }
 
 #[cfg(test)]

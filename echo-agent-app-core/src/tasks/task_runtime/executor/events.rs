@@ -56,7 +56,7 @@ pub(crate) fn create_unattended_run(
     let conversation_id = format!("{source_kind}:{source_id}:{fire_id}");
 
     // 1. Create the run in Pending, attended_mode = Unattended.
-    store.create_run_for_active_workspace(
+    store.create_run_for_active_workspace_with_profile(
         run_id,
         &conversation_id,
         "", // root_message_id — no chat message for unattended run
@@ -64,6 +64,7 @@ pub(crate) fn create_unattended_run(
         prompt,
         "parallel_readonly_delegation",
         AttendedMode::Unattended,
+        TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
     )?;
     store.configure_run_continuation(run_id, true, true, None, None)?;
 

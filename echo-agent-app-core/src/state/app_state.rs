@@ -2827,29 +2827,17 @@ impl AppState {
         {
             Ok(mut receipt) => {
                 let turn_id = receipt.turn_id().to_string();
-                // ADR 0035: anchor incremental user constraints in the run
-                // journal so they survive context compression alongside the
-                // Goal. Best-effort — unknown runs are skipped, and a failure
-                // here must not fail the steer delivery itself.
-                if let Some(steer_store) = runtime.task_runtime() {
-                    let steer_turn_id = snapshot.active_turn_id.clone();
-                    let steer_text = instruction.clone();
-                    let steer_result = crate::tasks::task_runtime::TaskRuntimeOperation::new(
-                        steer_store,
-                    )
-                    .run_store("record run steer constraint", move |store| {
-                        store.record_run_steer(
-                            &crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(
-                                &steer_turn_id,
-                            ),
-                            &steer_turn_id,
-                            &steer_text,
+                if claim.payload.origin == crate::agent_router::AgentMessageOrigin::User
+                    && let Err(error) = self
+                        .record_user_steer_for_active_turn(
+                            target.workspace_id.as_str(),
+                            &target.conversation_id,
+                            &snapshot.active_turn_id,
+                            claim.payload.text(),
                         )
-                    })
-                    .await;
-                    if let Err(error) = steer_result {
-                        tracing::debug!(%error, "steer constraint was not bound to a TaskRun");
-                    }
+                        .await
+                {
+                    tracing::debug!(%error, "user steer constraint was not bound to a TaskRun");
                 }
                 self.agent_router
                     .mailbox_accepted(&claim, turn_id.clone())
@@ -2943,6 +2931,49 @@ impl AppState {
                 Ok(true)
             }
         }
+    }
+
+    /// Record one accepted user-authored steer against the exact foreground
+    /// TaskRun binding. The foreground owner is the identity authority for
+    /// ordinary, resumed, and internal continuation turns.
+    pub async fn record_user_steer_for_active_turn(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        active_turn_id: &str,
+        text: &str,
+    ) -> Result<bool, String> {
+        if text.trim().is_empty() {
+            return Ok(false);
+        }
+        let snapshots = self
+            .session
+            .foreground_turns
+            .snapshots_for_conversation_scoped(workspace_id, conversation_id)
+            .map_err(|error| error.to_string())?;
+        let run_id = snapshots
+            .iter()
+            .find(|snapshot| snapshot.active_turn_id == active_turn_id)
+            .and_then(|snapshot| snapshot.run_id.clone());
+        let Some(run_id) = run_id else {
+            return Ok(false);
+        };
+        let runtime = self
+            .chat_runtime_for_scope(workspace_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(store) = runtime.task_runtime() else {
+            return Ok(false);
+        };
+        let turn_id = active_turn_id.to_string();
+        let text = text.to_string();
+        crate::tasks::task_runtime::TaskRuntimeOperation::new(store)
+            .run_store("record user steer constraint", move |store| {
+                store.record_run_steer(&run_id, &turn_id, &text)
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(true)
     }
 
     async fn deliver_agent_message_cold(
@@ -4856,7 +4887,7 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                         crate::tasks::task_runtime::types::TaskRunResumeIdentity::capture(
                             &run_state,
                         );
-                    let launch = crate::tasks::task_runtime::launch_planned_run_resume(
+                    let launch = crate::tasks::task_runtime::launch_task_run_resume(
                         store,
                         expected,
                         pool_execution.agent().clone(),

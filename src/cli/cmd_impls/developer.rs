@@ -164,8 +164,11 @@ mod tests {
             writer,
         ));
         let mut bytes = Vec::new();
+        // Wall-clock budget must tolerate full-suite parallel load; the
+        // observer settles in milliseconds when idle but can exceed a tight
+        // 5s deadline while other test binaries compete for cores.
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
             reader.read_to_end(&mut bytes),
         )
         .await

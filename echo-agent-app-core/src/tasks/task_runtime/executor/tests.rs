@@ -2285,7 +2285,7 @@ Read the runtime path and found one missing branch.
                 .map_err(|error| error.to_string())?,
         );
 
-        let error = launch_planned_run_resume(
+        let error = launch_task_run_resume(
             store.clone(),
             expected.clone(),
             agent,
@@ -2327,7 +2327,7 @@ Read the runtime path and found one missing branch.
                 .build()
                 .map_err(|error| error.to_string())?,
         );
-        let running_error = launch_planned_run_resume(
+        let running_error = launch_task_run_resume(
             store.clone(),
             expected,
             running_agent,
@@ -2356,6 +2356,73 @@ Read the runtime path and found one missing branch.
                 .ok_or_else(|| "Running planned resume run disappeared".to_string())?
                 .status,
             TaskRunStatus::Running
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_run_resume_preserves_allow_direct_completion() -> Result<(), String> {
+        use echo_agent::testing::MockLlmClient;
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        store
+            .create_run_with_profile(
+                "direct-resume",
+                "test",
+                "direct-resume-conversation",
+                "direct-resume-root",
+                DomainProfile::General,
+                "inspect and report",
+                "agent_autonomous",
+                AttendedMode::Attended,
+                TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation("direct-resume", true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("direct-resume", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("direct-resume", TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
+        let snapshot = store
+            .get_run_state("direct-resume")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "direct resume snapshot missing".to_string())?;
+        let expected = TaskRunResumeIdentity::capture(&snapshot);
+        let agent = crate::agent_handle::AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("direct-resume")
+                .llm_client(Arc::new(
+                    MockLlmClient::new()
+                        .with_model_name("direct-resume")
+                        .with_response("direct evidence-backed result"),
+                ))
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+
+        let launch = launch_task_run_resume(
+            store.clone(),
+            expected,
+            agent,
+            None,
+            None,
+            None,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        assert!(matches!(launch.wait().await?, RunOutcome::Completed));
+        assert!(
+            store
+                .get_plan("direct-resume")
+                .map_err(|error| error.to_string())?
+                .is_some(),
+            "direct resume must materialize completion evidence"
         );
         Ok(())
     }

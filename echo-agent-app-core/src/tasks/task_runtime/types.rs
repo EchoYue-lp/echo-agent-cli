@@ -849,6 +849,54 @@ pub struct TaskRun {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Immutable product provenance for a TaskRun. This is deliberately separate
+/// from `route`: route is diagnostic text, while provenance controls recovery
+/// and surface projection without reviving a string-based interaction mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRunProvenance {
+    ConversationTurn,
+    #[default]
+    Orchestrated,
+}
+
+/// Whether an orchestrated primary Agent may complete read-only work directly
+/// or must first materialize a revisioned plan. It is execution policy, not a
+/// TaskRun lifecycle state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunPlanPolicy {
+    #[default]
+    RequirePlan,
+    AllowDirect,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRunExecutionProfile {
+    pub provenance: TaskRunProvenance,
+    pub plan_policy: RunPlanPolicy,
+}
+
+impl TaskRunExecutionProfile {
+    pub const fn conversation_turn() -> Self {
+        Self {
+            provenance: TaskRunProvenance::ConversationTurn,
+            plan_policy: RunPlanPolicy::AllowDirect,
+        }
+    }
+
+    pub const fn orchestrated(plan_policy: RunPlanPolicy) -> Self {
+        Self {
+            provenance: TaskRunProvenance::Orchestrated,
+            plan_policy,
+        }
+    }
+
+    pub const fn is_conversation_turn(self) -> bool {
+        matches!(self.provenance, TaskRunProvenance::ConversationTurn)
+    }
+}
+
 /// Immutable TaskRun identity captured when a surface queues a resume turn.
 ///
 /// A later lookup must match every field and remain paused. This prevents a
@@ -864,6 +912,7 @@ pub struct TaskRunResumeIdentity {
     pub goal_revision: u64,
     pub journal_sequence: u64,
     pub continuation_enabled: bool,
+    pub execution_profile: TaskRunExecutionProfile,
 }
 
 impl TaskRunResumeIdentity {
@@ -881,7 +930,12 @@ impl TaskRunResumeIdentity {
                 .continuation
                 .as_ref()
                 .is_some_and(|continuation| continuation.enabled),
+            execution_profile: snapshot.execution_profile,
         }
+    }
+
+    pub const fn uses_conversation_driver(&self) -> bool {
+        self.continuation_enabled && self.execution_profile.is_conversation_turn()
     }
 
     pub fn validate_resumable(&self, snapshot: &RunStateSnapshot) -> Result<(), String> {
@@ -915,6 +969,9 @@ impl TaskRunResumeIdentity {
             != self.continuation_enabled
         {
             changed.push("continuation_enabled");
+        }
+        if snapshot.execution_profile != self.execution_profile {
+            changed.push("execution_profile");
         }
         if !changed.is_empty() {
             return Err(format!(
@@ -1315,6 +1372,11 @@ pub struct RunStateSnapshot {
     /// its turn id so the capsule can attribute the constraint.
     #[serde(default)]
     pub recent_constraints: Vec<RecordedUserSteer>,
+    /// Immutable run provenance and direct-completion policy folded from the
+    /// RunCreated event. Missing historical fields default to orchestrated /
+    /// require-plan, which is fail-closed for recovery.
+    #[serde(default)]
+    pub execution_profile: TaskRunExecutionProfile,
     /// Last authoritative journal sequence folded into this snapshot. This is
     /// the optimistic-concurrency epoch for queued resume actions.
     #[serde(default)]
@@ -3115,6 +3177,7 @@ mod tests {
             continuation: None,
             background_cells: Vec::new(),
             recent_constraints: Vec::new(),
+            execution_profile: TaskRunExecutionProfile::default(),
             journal_sequence: 7,
             event_index: RunStateEventIndex::default(),
         };

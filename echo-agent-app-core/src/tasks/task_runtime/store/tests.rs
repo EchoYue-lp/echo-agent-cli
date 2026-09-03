@@ -2968,6 +2968,37 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn task_ui_query_skips_planless_conversation_run() -> Result<(), String> {
+        let store = fresh().map_err(|error| error.to_string())?;
+        seed_plan(&store).map_err(|error| error.to_string())?;
+        let conversation_id = store
+            .get_run("r1")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "seeded plan run disappeared".to_string())?
+            .conversation_id;
+        store
+            .create_run_with_profile(
+                "taskrun:new-chat",
+                "test",
+                &conversation_id,
+                "new-chat",
+                DomainProfile::General,
+                "hello",
+                "agent_task_plan",
+                AttendedMode::Attended,
+                TaskRunExecutionProfile::conversation_turn(),
+            )
+            .map_err(|error| error.to_string())?;
+
+        let visible = store
+            .latest_task_ui_run_for_conversation(&conversation_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "formal task run should remain visible".to_string())?;
+        assert_eq!(visible.run_id, "r1");
+        Ok(())
+    }
+
     fn seed_plan(s: &TaskRuntimeStore) -> Result<(), StoreError> {
         s.create_run(
             "r1",
@@ -3265,9 +3296,12 @@ mod tests {
                 None,
             )
             .map_err(|error| error.to_string())?;
-        store
-            .set_continuation_deferred("r1", true)
-            .map_err(|error| error.to_string())?;
+        assert!(
+            store
+                .defer_continuation_if_runtime_active("r1")
+                .map_err(|error| error.to_string())?,
+            "new runtime activity must restore continuation deferral"
+        );
 
         // In-flight subagent work keeps the deferral even when no background
         // cell is active — the wake must not resume a turn mid-execution.
@@ -4500,6 +4534,218 @@ mod tests {
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
         assert_eq!(task.status, TodoStatus::Completed);
         assert_eq!(task.summary.as_deref(), Some("verified"));
+        Ok(())
+    }
+
+    #[test]
+    fn boot_recovery_settles_planless_conversation_turn_without_deadlock() -> Result<(), String> {
+        let store = std::sync::Arc::new(fresh().map_err(|error| error.to_string())?);
+        store
+            .create_run_with_profile(
+                "taskrun:conversation-before-restart",
+                "test",
+                "conversation-before-restart",
+                "conversation-before-restart",
+                DomainProfile::General,
+                "answer the user",
+                "agent_task_plan",
+                AttendedMode::Attended,
+                TaskRunExecutionProfile::conversation_turn(),
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation(
+                "taskrun:conversation-before-restart",
+                true,
+                false,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(
+                "taskrun:conversation-before-restart",
+                TaskRunStatus::Running,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .claim_run_turn(
+                "taskrun:conversation-before-restart",
+                "conversation-before-restart",
+                RunTurnOrigin::User,
+                TurnVisibility::Visible,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .record_background_cell_started(
+                "taskrun:conversation-before-restart",
+                "conversation-cell",
+                "long-running command",
+                "command-hash",
+                Some("conversation-before-restart"),
+                None,
+                Some("conversation-call"),
+            )
+            .map_err(|error| error.to_string())?;
+
+        let recovery_store = store.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let _recovery = std::thread::spawn(move || {
+            let _sent = result_tx.send(recovery_store.recover_incomplete());
+        });
+        let recovered = result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .map_err(|error| format!("planless conversation recovery did not settle: {error}"))?
+            .map_err(|error| error.to_string())?;
+        assert_eq!(recovered, 1);
+        let snapshot = store
+            .get_run_state("taskrun:conversation-before-restart")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "recovered conversation run disappeared".to_string())?;
+        assert_eq!(snapshot.run.status, TaskRunStatus::Cancelled);
+        assert!(
+            snapshot
+                .continuation
+                .as_ref()
+                .is_some_and(|continuation| continuation.active_turn.is_none())
+        );
+        let cell = snapshot
+            .background_cells
+            .first()
+            .ok_or_else(|| "recovered conversation cell disappeared".to_string())?;
+        assert_eq!(cell.phase, BackgroundCellPhase::Failed);
+        assert_eq!(
+            cell.terminal_cause,
+            Some(BackgroundCellTerminalCause::Interrupted)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn boot_recovery_preserves_planless_orchestrated_run() -> Result<(), String> {
+        let store = fresh().map_err(|error| error.to_string())?;
+        store
+            .create_run_with_profile(
+                "direct-run-before-restart",
+                "test",
+                "background:direct-before-restart",
+                "",
+                DomainProfile::General,
+                "complete direct read-only work",
+                "agent_autonomous",
+                AttendedMode::Unattended,
+                TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation(
+                "direct-run-before-restart",
+                true,
+                true,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("direct-run-before-restart", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+
+        let store = std::sync::Arc::new(store);
+        let recovery_store = store.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let _recovery = std::thread::spawn(move || {
+            let _sent = result_tx.send(recovery_store.recover_incomplete());
+        });
+        let recovered = result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .map_err(|error| format!("planless orchestrated recovery did not settle: {error}"))?
+            .map_err(|error| error.to_string())?;
+        assert_eq!(recovered, 1);
+        let snapshot = store
+            .get_run_state("direct-run-before-restart")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "recovered orchestrated run disappeared".to_string())?;
+        assert_eq!(snapshot.run.status, TaskRunStatus::Paused);
+        assert_eq!(
+            snapshot
+                .continuation
+                .and_then(|continuation| continuation.pause)
+                .map(|pause| pause.reason),
+            Some(RunPauseReason::BootRecovery)
+        );
+        assert!(matches!(
+            store
+                .boot_auto_resume_decision("direct-run-before-restart", true, false)
+                .map_err(|error| error.to_string())?,
+            BootAutoResumeDecision::Ready { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn boot_recovery_completes_finished_planless_conversation_settlement_debt()
+    -> Result<(), String> {
+        let store = fresh().map_err(|error| error.to_string())?;
+        store
+            .create_run_with_profile(
+                "taskrun:finished-before-settlement",
+                "test",
+                "finished-before-settlement",
+                "finished-before-settlement",
+                DomainProfile::General,
+                "answer the user",
+                "agent_task_plan",
+                AttendedMode::Attended,
+                TaskRunExecutionProfile::conversation_turn(),
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation(
+                "taskrun:finished-before-settlement",
+                true,
+                false,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(
+                "taskrun:finished-before-settlement",
+                TaskRunStatus::Running,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .claim_run_turn(
+                "taskrun:finished-before-settlement",
+                "finished-before-settlement",
+                RunTurnOrigin::User,
+                TurnVisibility::Visible,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .finish_run_turn(
+                "taskrun:finished-before-settlement",
+                RunTurnCompletion {
+                    turn_id: "finished-before-settlement",
+                    status: RunTurnStatus::Ended,
+                    elapsed_seconds: 1,
+                    final_message_id: Some("answer-1"),
+                    error_fingerprint: None,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+
+        assert_eq!(store.recover_incomplete().map_err(|error| error.to_string())?, 1);
+        let snapshot = store
+            .get_run_state("taskrun:finished-before-settlement")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "settlement-debt run disappeared".to_string())?;
+        assert_eq!(snapshot.run.status, TaskRunStatus::Completed);
+        assert!(
+            snapshot
+                .continuation
+                .is_some_and(|continuation| continuation.active_turn.is_none())
+        );
         Ok(())
     }
 

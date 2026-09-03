@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **统一 turn-run 绑定与长程恢复**:每个 store-backed turn 急切绑定内部 TaskRun；
+  typed provenance 区分 conversation 与 orchestrated direct run，boot recovery 和
+  quiet-wake 使用原子 journal 决策，GUI/TUI/CLI/channel user steer 记录到 exact run，
+  planless conversation run 不进入任务 UI，长 Goal artifact 按 revision/SHA-256 原子发布。
+  ADR [0037](docs/zh/adr/0037-unified-turn-run-binding.md)。
+
 - **Skill 系统重构（2026-09）**:
   - 用户可调用 Skill：TUI 新增 `/skill <name> [instructions]`（激活 + 可选引导输入），GUI Settings 的 Skills 面板新增"在当前会话激活"；framework `activate_skill` 对未安装/被禁用 skill 从静默返回改为显式报错。
   - 内置目录收敛 39 → 24：删除通用能力型（coding/translation/doc-writing/web-search，行为准则由基础 prompt 承担）与 vendored Anthropic 示例 11 个（design/automation/research，可经 SkillsHub 安装）；默认启用 8 → 5；methodology baseline 常驻注入 4 → 1（仅 verification-before-completion）。

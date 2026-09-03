@@ -150,6 +150,7 @@ const streamingEvents = [
 
 const runtimeEventVariants = [
   'run_started',
+  'run_steer_recorded',
   'task_completed',
   'subagent_assigned',
   'artifact_produced',

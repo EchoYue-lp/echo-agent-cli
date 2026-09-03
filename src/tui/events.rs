@@ -1858,6 +1858,7 @@ async fn steer_conversation_input_projection(
     )
     .map_err(|error| error.to_string())?;
     let message = prepared.to_message().map_err(|error| error.to_string())?;
+    let steer_text = prepared.instruction.clone();
     let agent = app
         .active_turn_agent
         .as_ref()
@@ -1922,6 +1923,17 @@ async fn steer_conversation_input_projection(
     .await
     {
         Ok(()) => {
+            if let Err(error) = app_state
+                .record_user_steer_for_active_turn(
+                    &address.workspace_id,
+                    &address.conversation_id,
+                    &attempt.turn_id,
+                    &steer_text,
+                )
+                .await
+            {
+                tracing::debug!(%error, "TUI user steer was not bound to its TaskRun");
+            }
             app.status_msg = format!(
                 "Input {} accepted for observation",
                 projection.receipt.identity.input_id
@@ -3263,22 +3275,20 @@ async fn send_to_agent(
     if let Some(expected) = planned_resume {
         let trace_sink = echo_agent_app_core::api::chat_driver::subagent_trace_sink_for(&res.sink);
         let result = match res.store.clone() {
-            Some(store) => {
-                echo_agent_app_core::api::tasks::task_runtime::launch_planned_run_resume(
-                    store,
-                    expected,
-                    agent.clone(),
-                    Some(pool_execution),
-                    res.review_integration.clone(),
-                    Some(trace_sink),
-                    lease.cancellation_token(),
-                    res.workspace_io_receipt
-                        .as_ref()
-                        .map(|receipt| receipt.invocation()),
-                )
-                .await
-                .map_err(|error| error.to_string())
-            }
+            Some(store) => echo_agent_app_core::api::tasks::task_runtime::launch_task_run_resume(
+                store,
+                expected,
+                agent.clone(),
+                Some(pool_execution),
+                res.review_integration.clone(),
+                Some(trace_sink),
+                lease.cancellation_token(),
+                res.workspace_io_receipt
+                    .as_ref()
+                    .map(|receipt| receipt.invocation()),
+            )
+            .await
+            .map_err(|error| error.to_string()),
             None => Err("TaskRuntime store is unavailable".to_string()),
         };
         let outcome = match result {
@@ -5998,10 +6008,11 @@ async fn handle_slash_command(
                             );
                         }
                     };
-                    if resume_state
-                        .continuation
-                        .as_ref()
-                        .is_some_and(|continuation| continuation.enabled)
+                    if resume_state.execution_profile.is_conversation_turn()
+                        && resume_state
+                            .continuation
+                            .as_ref()
+                            .is_some_and(|continuation| continuation.enabled)
                     {
                         match dispatch_turn(
                             app,
@@ -7655,6 +7666,7 @@ mod tests {
                     goal_revision: 1,
                     journal_sequence: 7,
                     continuation_enabled: true,
+                    execution_profile: echo_agent_app_core::api::tasks::task_runtime::TaskRunExecutionProfile::conversation_turn(),
                 },
                 is_continuation: true,
             }),
@@ -7932,6 +7944,7 @@ mod tests {
             conversation_id: address.conversation_id.clone(),
             root_turn_id: "root-a".to_string(),
             active_turn_id: "active-a".to_string(),
+            run_id: Some("run-a".to_string()),
             cancellation_requested: false,
         };
         let stale = ForegroundTurnSnapshot {
@@ -8172,7 +8185,7 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("let _pool_execution").next())
             .unwrap_or_default();
-        assert!(resume.contains("launch_planned_run_resume"));
+        assert!(resume.contains("launch_task_run_resume"));
         assert!(!resume.contains("drive_foreground_chat_with_ingress"));
         assert!(!resume.contains("ConversationInput"));
     }

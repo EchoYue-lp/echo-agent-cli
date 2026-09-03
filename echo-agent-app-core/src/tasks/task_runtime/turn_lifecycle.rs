@@ -80,10 +80,10 @@ pub(crate) async fn persist_run_turn_terminal(
 /// Which turn-end settlement semantics apply after a RunTurn persists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TurnEndPolicy {
-    /// Ordinary chat-driver turn (ADR 0035): a run that never committed a
+    /// Eager conversation turn (ADR 0037): a run that never committed a
     /// plan revision settles Completed at turn end instead of entering
     /// continuation or the policy failure path.
-    ChatTurn,
+    ConversationTurn,
     /// Executor/policy-driven run (`drive_agent_run`, `RunPlanPolicy`):
     /// RequirePlan / RepeatedBlocker / failed-without-plan semantics are
     /// unchanged and a missing plan is never treated as a trivial settle.
@@ -185,12 +185,12 @@ fn decide_after_persisted_run_turn_sync(
         TurnOutcome::Completed => {}
     }
 
-    // ADR 0035: an eagerly bound chat run that never committed a plan
+    // ADR 0037: an eagerly bound chat run that never committed a plan
     // revision is a self-contained conversational turn. Settle it as
     // Completed right away so trivial turns cannot enter the continuation
     // loop; structural fact (no plan), never a route string. Only the chat
     // driver qualifies — policy-driven runs keep RequirePlan semantics.
-    if turn_end_policy == TurnEndPolicy::ChatTurn
+    if turn_end_policy == TurnEndPolicy::ConversationTurn
         && store
             .get_plan(run_id)
             .map_err(|error| error.to_string())?

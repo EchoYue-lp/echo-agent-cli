@@ -2245,6 +2245,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         let payload = serde_json::json!({ "summary": &summary });
         let agent_role = Self::plan_task(runtime_task)?.agent_role;
         let run_id = run_id.to_string();
+        let wake_run_id = run_id.clone();
         let task_id = runtime_task.spec.id.clone();
         let claim = claim.clone();
         let (outcome, run) = self
@@ -2275,6 +2276,10 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     payload,
                 )
                 .with_agent(agent_role),
+            );
+            crate::tasks::task_runtime::continuation::wake_deferred_when_runtime_quiet(
+                &self.store,
+                &wake_run_id,
             );
         }
         Ok(outcome)
@@ -2322,11 +2327,17 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         disposition: echo_agent::tasks::RuntimeInterruptionDisposition,
     ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeInterruptionSettlementOutcome> {
         let run_id = run_id.to_string();
-        self.blocking
+        let wake_run_id = run_id.clone();
+        let outcome = self.blocking
             .run("settle runtime task interruption", move |store| {
                 store.settle_runtime_task_interruption(&run_id, expected_revision, disposition)
             })
-            .await
+            .await?;
+        crate::tasks::task_runtime::continuation::wake_deferred_when_runtime_quiet(
+            &self.store,
+            &wake_run_id,
+        );
+        Ok(outcome)
     }
 
     async fn note_stalled(&self, run_id: &str, reason: &str) -> echo_agent::error::Result<()> {

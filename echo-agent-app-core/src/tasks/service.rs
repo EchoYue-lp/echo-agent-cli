@@ -284,7 +284,7 @@ impl BackgroundTaskService {
             .run_owned("prepare background TaskRun", move || {
                 let mut registration = registration;
                 registration.mark_preparation_started();
-                if let Err(error) = preparation_store.create_run_for_active_workspace(
+                if let Err(error) = preparation_store.create_run_for_active_workspace_with_profile(
                     &preparation_run_id,
                     &preparation_conversation_id,
                     "",
@@ -292,6 +292,9 @@ impl BackgroundTaskService {
                     &preparation_goal,
                     &preparation_kind,
                     AttendedMode::Unattended,
+                    super::task_runtime::TaskRunExecutionProfile::orchestrated(
+                        super::task_runtime::RunPlanPolicy::AllowDirect,
+                    ),
                 ) {
                     registration.fail_preparation(error.to_string());
                     return Err(error);

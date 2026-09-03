@@ -508,6 +508,22 @@ async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> a
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
+    let task_store = runtime
+        .task_runtime()
+        .ok_or_else(|| anyhow::anyhow!("target runtime has no TaskRuntimeStore"))?;
+    let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(
+        "active-target-turn",
+    );
+    let recorded = crate::tasks::task_runtime::TaskRuntimeOperation::new(task_store)
+        .run_store("load live user steer contract", move |store| {
+            store.get_run_state(&run_id)
+        })
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("target conversation run disappeared"))?;
+    assert!(recorded.recent_constraints.iter().any(|constraint| {
+        constraint.turn_id == "active-target-turn" && constraint.text == "Steer it"
+    }));
+
     let waiter = state.session.foreground_turns.request_root_cancel_scoped(
         target.workspace_id.as_str(),
         crate::foreground_turn::ForegroundTurnSurface::Gui,
@@ -637,6 +653,7 @@ fn live_delivery_requires_one_unambiguous_foreground_snapshot() {
         conversation_id: "conversation".to_string(),
         root_turn_id: "stale-root".to_string(),
         active_turn_id: "stale-turn".to_string(),
+        run_id: None,
         cancellation_requested: false,
     };
     let exact = crate::foreground_turn::ForegroundTurnSnapshot {
@@ -645,6 +662,7 @@ fn live_delivery_requires_one_unambiguous_foreground_snapshot() {
         conversation_id: "conversation".to_string(),
         root_turn_id: "exact-root".to_string(),
         active_turn_id: "exact-turn".to_string(),
+        run_id: Some("exact-run".to_string()),
         cancellation_requested: false,
     };
     let active = vec![stale, exact.clone()];

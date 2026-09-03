@@ -22,9 +22,9 @@ use std::sync::Arc;
 
 use crate::subagent_loader::SubagentCatalogSnapshot;
 
-use super::executor::{ExecEvent, RunOutcome, RunPlanPolicy};
+use super::executor::{ExecEvent, RunOutcome};
 use super::profiles::ProfileTemplate;
-use super::types::{DomainProfile, EkoTaskExtension};
+use super::types::{DomainProfile, EkoTaskExtension, RunPlanPolicy};
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskCapabilityCatalog {
@@ -1048,7 +1048,7 @@ impl CreateComplexTaskTool {
             }
         };
         registration.mark_preparation_started();
-        if let Err(e) = store.create_run_for_active_workspace(
+        if let Err(e) = store.create_run_for_active_workspace_with_profile(
             &run_id,
             &conv,
             &res.root_message_id,
@@ -1056,6 +1056,7 @@ impl CreateComplexTaskTool {
             &goal,
             "agent_autonomous",
             attended,
+            super::types::TaskRunExecutionProfile::orchestrated(plan_policy),
         ) {
             registration.fail_preparation(e.to_string());
             return Ok(ToolResult::error(format!("Failed to create run: {e}")));

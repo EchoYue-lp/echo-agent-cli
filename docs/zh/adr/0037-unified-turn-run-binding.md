@@ -1,4 +1,4 @@
-# ADR 0035:统一 turn-run 绑定——每个轮次驱动一个 TaskRun
+# ADR 0037:统一 turn-run 绑定,每个轮次驱动一个 TaskRun
 
 - Status: Accepted
 - Date: 2026-09-03
@@ -18,7 +18,7 @@ run;只有 task tool 或明确 scheduler/background trigger 创建/绑定 TaskRu
   调用 `task_create` 时才懒升级为正式 run;此前与之后的轮次都运行在 TaskRuntime
   之外。
 
-长程任务审计发现三个结构性缝隙,全部源于 run-less 状态:
+长程任务审计发现三个结构性缺口,全部源于 run-less 状态:
 
 1. **裸对话无 goal 锚**:run-less 轮没有 `[eko_run_goal_contract]` 投影,早期用户
    意图滑出 SlidingWindow(40) 后只剩启发式记忆晋升兜底,压缩后不可恢复;
@@ -30,7 +30,18 @@ run;只有 task tool 或明确 scheduler/background trigger 创建/绑定 TaskRu
 "一套运行时"的产品定位下,run-less 轮本质上是第二条(更弱的)执行路径——它不是
 功能差异,而是保护覆盖率的空洞。
 
-## 候选方案
+## 业界参考与候选方案
+
+本决策复用交互收敛计划对 Codex Thread/Turn/Item、Claude Code queued
+message/task list 与后台任务的调研。Claude Code 会把运行中消息在工具结束后送入同一
+turn,或在当前 turn 结束后作为下一 turn;task checklist 与后台执行视图彼此独立。
+这些实现支持“统一 turn driver、消息可 steer/queue、plan 是 artifact”,但没有提供
+“缺少 plan 就能反推 run 类型”的依据。因此 EKO 的 TaskRun 产品投影必须保存明确的
+provenance 和 plan policy,不能从 route 文本或 plan 是否存在猜测。
+
+- Claude Code: <https://code.claude.com/docs/en/interactive-mode#queue-messages-while-claude-works>
+- 仓库调研快照:[Codex 能力目录](./0002-codex-tool-capability-catalog.md)、
+  [Claude Code 能力目录](./0003-claude-code-capability-catalog.md)。
 
 - **A. 补丁式保护**:为 run-less 轮启用框架的 VisibilityHorizon Global Objective
   或 IncrementalSummary durable anchors,让原始意图在压缩中幸存。
@@ -45,18 +56,25 @@ run;只有 task tool 或明确 scheduler/background trigger 创建/绑定 TaskRu
 
 采用 **方案 B**,并遵循以下约束:
 
-1. **结构事实判定,不用 route 字符串**:"琐碎轮次"由"该 run 从未提交过 plan
-   revision"(`store.get_plan(run_id) == None`)判定,收敛计划"不通过
-   `route=chat|task|auto` 字符串决定行为"的禁令继续有效;
-2. **结算规则**:`TurnOutcome::Completed` 且无 plan → run 直接 `Completed` +
-   `RunTurnDecision::Stop`,不配置续跑,规避闲聊轮被 continuation 接管空转;
-3. **噪音治理以同一结构事实门控**:无 plan 的 run 不生成 progress.md 账本、
+1. **Typed provenance,不用 route 字符串**:`RunCreated` 保存
+   `TaskRunExecutionProfile { provenance, plan_policy }`。只有
+   `ConversationTurn + no plan` 是琐碎对话;`Orchestrated + AllowDirect` 在执行和恢复中
+   可以合法地暂时没有 plan;
+2. **结算规则**:`ConversationTurn` 的 `TurnOutcome::Completed` 且无 plan时,run 直接
+   `Completed + Stop`;orchestrated run 继续遵守 `RequirePlan/AllowDirect`;
+3. **噪音治理以 provenance 门控**:无 plan conversation run 不生成 progress.md 账本、
    `RunCancelledByUser` 不写长期记忆(`RunCompleted` 已有 completed-tasks 门控
-   天然安全);任务列表 `list_unified` 的 `background:` 会话前缀过滤天然排除
-   chat run,无需新增过滤;
-4. **boot 恢复归类**:崩溃时滞留 Running 的无 plan run 直接结算
-   `Cancelled(Interrupted)`,不进 `Paused(BootRecovery)` 裁决;
+   天然安全),GUI task query 也排除该投影;conversation run 一旦提交 plan,立即按正式任务显示;
+4. **boot 恢复归类**:active conversation turn 原子结算为
+   `Cancelled(Interrupted)`;已经持久化 `RunTurnFinished` 的 settlement debt 补为
+   `Completed`;planless orchestrated run 保留 `Paused(BootRecovery)`;
 5. **死代码清理**:run-less else 分支与 `register_optional_run_driver` 随之删除。
+6. **用户 steer**:foreground owner 保存 exact `run_id`;GUI/TUI/CLI/channel 与
+   AgentRouter 的 user-authored live delivery 共用 app-core 记录入口。Agent-origin message
+   不伪装成 user constraint。
+7. **quiet wake**:active task/cell 检查与 `RunContinuationResumed` 在同一 run lock 内提交;
+   continuation eligibility 发现新 activity 时重新持久化 deferred。
+8. **长 Goal artifact**:使用原子写,文件名绑定 goal revision 与 SHA-256,读取时复核 digest。
 
 ## 取舍
 
@@ -70,13 +88,15 @@ run;只有 task tool 或明确 scheduler/background trigger 创建/绑定 TaskRu
 ## 影响范围
 
 - `chat_driver.rs`(默认 binding、run-less 分支删除);
-- `tasks/task_runtime/turn_lifecycle.rs`(无 plan 结算);
+- `tasks/task_runtime/turn_lifecycle.rs`(provenance-aware 结算);
 - `tasks/task_runtime/ledger.rs`、`memory_bridge.rs`(噪音门控);
-- `tasks/task_runtime/store/runtime.rs`(boot 恢复归类、`register_optional_run_driver`
-  删除);
+- `tasks/task_runtime/store/runtime.rs`(typed provenance、原子 boot/quiet-wake、artifact,
+  `register_optional_run_driver` 删除);
+- `foreground_turn.rs` 与五个 surface adapter(exact run steer binding);
+- `web-frontend` generated contract 与 task UI query;
 - 顶层 `docs/2026-08-26-agent-interaction-convergence-plan.md` Iteration 4 修订。
 
 ## 关联
 
-- 后续阶段(同分支):subagent 终态唤醒轮次(泛化 `wake_after_cell_terminal`)、
+- 同分支后续实现:Subagent 终态唤醒轮次(泛化 `wake_after_cell_terminal`)、
   `RunSteerRecorded` 中途约束锚定、TaskExecutionSummary 引用化与 goal 超长落盘。

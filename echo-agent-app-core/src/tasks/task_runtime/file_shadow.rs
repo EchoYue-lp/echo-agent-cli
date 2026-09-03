@@ -801,21 +801,32 @@ impl FileTaskShadow {
     pub(crate) fn write_objective_artifact(
         &self,
         run_id: &str,
+        goal_revision: u64,
+        goal_sha256: &str,
         goal: &str,
     ) -> Result<std::path::PathBuf, ShadowError> {
         let dir = self.root().join(run_id);
         std::fs::create_dir_all(&dir)
             .map_err(|error| ShadowError::Io(format!("objective artifact dir: {error}")))?;
-        let path = dir.join("objective.md");
-        std::fs::write(&path, goal)
+        let path = dir.join(format!("objective-r{goal_revision}-{goal_sha256}.md"));
+        echo_agent::utils::fs::atomic_write(&path, goal.as_bytes())
             .map_err(|error| ShadowError::Io(format!("objective artifact write: {error}")))?;
         Ok(path)
     }
 
     /// Path of the spilled objective artifact, when one exists.
-    pub(crate) fn objective_artifact_path(&self, run_id: &str) -> Option<std::path::PathBuf> {
-        let path = self.root().join(run_id).join("objective.md");
-        path.is_file().then_some(path)
+    pub(crate) fn objective_artifact_path(
+        &self,
+        run_id: &str,
+        goal_revision: u64,
+        goal_sha256: &str,
+    ) -> Option<std::path::PathBuf> {
+        let path = self
+            .root()
+            .join(run_id)
+            .join(format!("objective-r{goal_revision}-{goal_sha256}.md"));
+        let content = std::fs::read_to_string(&path).ok()?;
+        (super::types::task_goal_sha256(&content) == goal_sha256).then_some(path)
     }
 
     #[cfg(test)]

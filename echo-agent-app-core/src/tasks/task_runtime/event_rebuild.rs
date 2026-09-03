@@ -24,7 +24,8 @@ use super::types::{
     PlanTask, ProviderRetryState, RecordedUserSteer, RecoveryBlocker, ReviewOutcome, ReviewResult,
     RunContinuationState, RunPause, RunPauseReason, RunStateEventIndex, RunStateSnapshot,
     RunTurnOrigin, RunTurnStatus, RunTurnSummary, RuntimeEventKind, RuntimeTaskEvent,
-    TaskExecutionSummary, TaskPlan, TaskRun, TaskRunStatus, TurnVisibility,
+    TaskExecutionSummary, TaskPlan, TaskRun, TaskRunExecutionProfile, TaskRunStatus,
+    TurnVisibility,
 };
 
 /// How many recent user steers the fold keeps for the recovery capsule.
@@ -186,6 +187,8 @@ pub struct RebuiltPlan {
     #[serde(default)]
     pub recent_constraints: Vec<RecordedUserSteer>,
     #[serde(default)]
+    pub execution_profile: TaskRunExecutionProfile,
+    #[serde(default)]
     pub(crate) event_index: RunStateEventIndex,
 }
 
@@ -212,6 +215,7 @@ impl RebuiltPlan {
             continuation: self.continuation.clone(),
             background_cells: self.background_cells.clone(),
             recent_constraints: self.recent_constraints.clone(),
+            execution_profile: self.execution_profile,
             journal_sequence,
             event_index: self.event_index.clone(),
         }
@@ -242,6 +246,8 @@ pub(crate) struct EventFoldState {
     continuation: Option<RunContinuationState>,
     #[serde(default)]
     recent_constraints: Vec<RecordedUserSteer>,
+    #[serde(default)]
+    execution_profile: TaskRunExecutionProfile,
     #[serde(default)]
     started_turns: std::collections::BTreeSet<String>,
     #[serde(default)]
@@ -313,6 +319,7 @@ impl EventFoldState {
             background_cells,
             continuation,
             recent_constraints,
+            execution_profile,
             started_turns,
             accounted_usage,
             accounted_compactions,
@@ -391,6 +398,11 @@ impl EventFoldState {
                         created_at: parse_event_dt(p, "created_at", ev.timestamp),
                         updated_at: ev.timestamp,
                     });
+                    *execution_profile = p
+                        .get("execution_profile")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .unwrap_or_default();
                 }
                 K::RunGoalUpdated => {
                     if let Some(r) = run.as_mut()
@@ -1189,6 +1201,7 @@ impl EventFoldState {
             background_cells: self.background_cells.values().cloned().collect(),
             continuation: self.continuation.clone(),
             recent_constraints: self.recent_constraints.clone(),
+            execution_profile: self.execution_profile,
             event_index: RunStateEventIndex {
                 started_turns: self.started_turns.clone(),
                 accounted_usage: self.accounted_usage.clone(),
@@ -1451,6 +1464,12 @@ fn apply_boot_recovery(
         return;
     };
     let state = continuation.get_or_insert_with(RunContinuationState::default);
+    let target = event
+        .payload
+        .get("to")
+        .and_then(serde_json::Value::as_str)
+        .and_then(TaskRunStatus::from_str)
+        .unwrap_or(TaskRunStatus::Paused);
     if let Some(turn_id) = recovery
         .get("active_turn")
         .and_then(|value| value.get("turn_id"))
@@ -1459,14 +1478,18 @@ fn apply_boot_recovery(
         && state.active_turn.as_ref().map(|turn| turn.turn_id.as_str()) == Some(turn_id)
         && let Some(mut turn) = state.active_turn.take()
     {
-        turn.status = RunTurnStatus::Failed;
+        turn.status = if target == TaskRunStatus::Cancelled {
+            RunTurnStatus::Cancelled
+        } else {
+            RunTurnStatus::Failed
+        };
         turn.ended_at = Some(event.timestamp);
         turn.elapsed_seconds = 0;
         turn.final_message_id = None;
         turn.error_fingerprint = Some("process_interrupted".to_string());
         state.last_turn = Some(turn);
     }
-    state.pause = Some(RunPause {
+    state.pause = (target == TaskRunStatus::Paused).then(|| RunPause {
         reason: RunPauseReason::BootRecovery,
         detail: recovery
             .get("pause")

@@ -100,7 +100,7 @@ fn channel_resume_dispatch(
     continuation_enabled: bool,
     turn_id: &str,
 ) -> ChannelResumeDispatch {
-    if continuation_enabled {
+    if continuation_enabled && expected.uses_conversation_driver() {
         ChannelResumeDispatch::Continuation(
             echo_agent_app_core::api::tasks::task_runtime::RunTurnBinding::resume_expected(
                 expected, turn_id,
@@ -1660,6 +1660,7 @@ impl AppChannelMessageHandler {
             }
         };
         let agent = execution.agent();
+        let steer_text = turn.instruction.clone();
         let message = match turn.to_message() {
             Ok(message) => message,
             Err(error) => {
@@ -1737,6 +1738,19 @@ impl AppChannelMessageHandler {
         let steer = agent
             .steer_input_tracked(Some(&active_agent_turn_id), message)
             .await;
+        if steer.is_ok()
+            && let Err(error) = self
+                .app_state
+                .record_user_steer_for_active_turn(
+                    &workspace_id,
+                    conv,
+                    &active_agent_turn_id,
+                    &steer_text,
+                )
+                .await
+        {
+            tracing::debug!(%error, "channel user steer was not bound to its TaskRun");
+        }
         drop(execution);
         let _ = steer_tx.send(steer);
         let observed = drain_rx.await.map_err(|error| error.to_string())?;
@@ -4682,7 +4696,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                                 );
                             let launch = match res.store.clone() {
                             Some(store) => {
-                                echo_agent_app_core::api::tasks::task_runtime::launch_planned_run_resume(
+                                echo_agent_app_core::api::tasks::task_runtime::launch_task_run_resume(
                                     store,
                                     expected,
                                     agent,
@@ -5791,6 +5805,7 @@ mod tests {
             goal_revision: 3,
             journal_sequence: 11,
             continuation_enabled: true,
+            execution_profile: echo_agent_app_core::api::tasks::task_runtime::TaskRunExecutionProfile::conversation_turn(),
         };
         assert!(matches!(
             super::channel_resume_dispatch(identity.clone(), false, "surface-turn"),
@@ -6609,6 +6624,7 @@ mod tests {
             conversation_id: "conversation-a".to_string(),
             root_turn_id: "root-turn".to_string(),
             active_turn_id: "continuation-turn".to_string(),
+            run_id: Some("conversation-run".to_string()),
             cancellation_requested: false,
         };
         assert!(super::channel_snapshot_matches_root(&snapshot, "root-turn"));
@@ -6632,6 +6648,7 @@ mod tests {
             conversation_id: "sender-conversation".to_string(),
             root_turn_id: "gui-root".to_string(),
             active_turn_id: "gui-root".to_string(),
+            run_id: None,
             cancellation_requested: false,
         };
         let extraction = ForegroundTurnSnapshot {
@@ -6640,6 +6657,7 @@ mod tests {
             conversation_id: "sender-conversation".to_string(),
             root_turn_id: "extract-root".to_string(),
             active_turn_id: "extract-root".to_string(),
+            run_id: None,
             cancellation_requested: false,
         };
         let resolved = super::channel_snapshot_for_conversation(

@@ -295,7 +295,7 @@ pub async fn latest_task_run_for_conversation(
     let (_runtime, store) = task_runtime_for_workspace(&state, &workspace_id).await?;
     let lookup_conversation_id = conversation_id.clone();
     let run = task_runtime_io(&store, "load latest conversation TaskRun", move |store| {
-        store.latest_run_for_conversation(&lookup_conversation_id)
+        store.latest_task_ui_run_for_conversation(&lookup_conversation_id)
     })
     .await?;
     if let Some(run) = run.as_ref() {
@@ -506,11 +506,13 @@ pub async fn resume_task_run(
         store.get_run_state(&state_run_id)
     })
     .await?;
-    if run_state
-        .as_ref()
-        .and_then(|snapshot| snapshot.continuation.as_ref())
-        .is_some_and(|continuation| continuation.enabled)
-    {
+    if run_state.as_ref().is_some_and(|snapshot| {
+        snapshot.execution_profile.is_conversation_turn()
+            && snapshot
+                .continuation
+                .as_ref()
+                .is_some_and(|continuation| continuation.enabled)
+    }) {
         return resume_continuation_run(&state, app, runtime, store, run_id, run_state).await;
     }
     let conversation_id = run_state
@@ -555,7 +557,7 @@ pub async fn resume_task_run(
     let trace_sink: echo_agent_app_core::api::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
         execution_projector.emit(ev);
     });
-    let launch = match echo_agent_app_core::api::tasks::task_runtime::launch_planned_run_resume(
+    let launch = match echo_agent_app_core::api::tasks::task_runtime::launch_task_run_resume(
         store,
         expected_resume,
         primary_agent,

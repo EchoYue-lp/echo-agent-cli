@@ -1247,6 +1247,19 @@ pub async fn steer_chat_message(
     let steer_result = agent
         .steer_input_tracked(Some(&expected_turn_id), steer_message)
         .await;
+    if steer_result.is_ok()
+        && let Err(error) = state
+            .app_state
+            .record_user_steer_for_active_turn(
+                &workspace_id,
+                &conversation_id,
+                &expected_turn_id,
+                &prepared.instruction,
+            )
+            .await
+    {
+        tracing::debug!(%error, "GUI user steer was not bound to its TaskRun");
+    }
     if steer_tx.send(steer_result).is_err() {
         let reason = "tracked steer observer ended before receipt handoff".to_string();
         let recovery = service

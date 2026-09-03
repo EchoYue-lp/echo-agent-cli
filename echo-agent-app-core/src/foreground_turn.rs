@@ -68,6 +68,10 @@ pub struct ForegroundTurnSnapshot {
     pub root_turn_id: String,
     /// Current framework turn identity used for exact steer/cancel requests.
     pub active_turn_id: String,
+    /// Exact TaskRun currently driven by the active framework turn. Surfaces
+    /// use this binding for durable steer facts instead of deriving a run id
+    /// from a continuation turn id.
+    pub run_id: Option<String>,
     pub cancellation_requested: bool,
 }
 
@@ -137,6 +141,7 @@ struct ActiveForegroundTurn {
     key: ForegroundTurnKey,
     root_turn_id: String,
     active_agent_turn_id: Mutex<String>,
+    active_run_id: Mutex<Option<String>>,
     cancel: CancellationToken,
     settlement_tx: watch::Sender<Option<ForegroundTurnSettlement>>,
     terminal_debt_tx: watch::Sender<Option<ForegroundTerminalDebt>>,
@@ -191,6 +196,11 @@ impl ActiveForegroundTurn {
             conversation_id: self.key.conversation_id.clone(),
             root_turn_id: self.root_turn_id.clone(),
             active_turn_id: self.active_agent_turn_id(),
+            run_id: self
+                .active_run_id
+                .lock()
+                .map(|run_id| run_id.clone())
+                .unwrap_or_else(|poisoned| poisoned.into_inner().clone()),
             cancellation_requested: self.cancel.is_cancelled(),
         }
     }
@@ -239,8 +249,8 @@ tokio::task_local! {
 pub(crate) struct ForegroundTurnProgress(Arc<ActiveForegroundTurn>);
 
 impl ForegroundTurnProgress {
-    pub(crate) fn advance(&self, turn_id: &str) {
-        if turn_id.trim().is_empty() {
+    pub(crate) fn bind_run_turn(&self, run_id: &str, turn_id: &str) {
+        if run_id.trim().is_empty() || turn_id.trim().is_empty() {
             return;
         }
         let mut current = self
@@ -249,6 +259,12 @@ impl ForegroundTurnProgress {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *current = turn_id.to_string();
+        let mut current_run = self
+            .0
+            .active_run_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current_run = Some(run_id.to_string());
     }
 
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
@@ -624,6 +640,7 @@ impl ForegroundTurnControl {
             key: key.clone(),
             root_turn_id: turn_id.clone(),
             active_agent_turn_id: Mutex::new(turn_id),
+            active_run_id: Mutex::new(None),
             cancel,
             settlement_tx,
             terminal_debt_tx,
@@ -2390,6 +2407,7 @@ mod tests {
                 conversation_id: "conversation".to_string(),
                 root_turn_id: "gui-turn".to_string(),
                 active_turn_id: "gui-turn".to_string(),
+                run_id: None,
                 cancellation_requested: false,
             }]
         );
@@ -2607,12 +2625,13 @@ mod tests {
             .scope(Arc::clone(&lease.entry), async {
                 current_foreground_progress()
                     .ok_or(ForegroundTurnError::StateUnavailable)?
-                    .advance("continuation-turn");
+                    .bind_run_turn("continuation-run", "continuation-turn");
                 let snapshot = control
                     .snapshot(ForegroundTurnSurface::Gui, "conversation")
                     .ok_or(ForegroundTurnError::StateUnavailable)?;
                 assert_eq!(snapshot.root_turn_id, "root-turn");
                 assert_eq!(snapshot.active_turn_id, "continuation-turn");
+                assert_eq!(snapshot.run_id.as_deref(), Some("continuation-run"));
                 assert!(matches!(
                     control
                         .request_cancel(ForegroundTurnSurface::Gui, "conversation", "root-turn",),
@@ -2643,7 +2662,7 @@ mod tests {
             .await?;
 
         tokio::spawn(async move {
-            progress.advance("continuation-turn");
+            progress.bind_run_turn("continuation-run", "continuation-turn");
         })
         .await
         .map_err(|error| ForegroundTurnError::DriverSettlement(error.to_string()))?;
@@ -2652,6 +2671,7 @@ mod tests {
             .ok_or(ForegroundTurnError::StateUnavailable)?;
         assert_eq!(snapshot.root_turn_id, "root-turn");
         assert_eq!(snapshot.active_turn_id, "continuation-turn");
+        assert_eq!(snapshot.run_id.as_deref(), Some("continuation-run"));
         lease.settle(TurnOutcome::Completed);
         Ok(())
     }
@@ -2665,7 +2685,7 @@ mod tests {
             .scope(Arc::clone(&lease.entry), async {
                 current_foreground_progress()
                     .ok_or(ForegroundTurnError::StateUnavailable)?
-                    .advance("continuation-turn");
+                    .bind_run_turn("continuation-run", "continuation-turn");
                 assert!(matches!(
                     control.request_root_cancel(
                         ForegroundTurnSurface::Gui,

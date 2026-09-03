@@ -1513,9 +1513,33 @@ impl TaskRuntimeStore {
         route: &str,
         attended_mode: AttendedMode,
     ) -> Result<TaskRun, StoreError> {
+        self.create_run_for_active_workspace_with_profile(
+            run_id,
+            conversation_id,
+            root_message_id,
+            domain_profile,
+            goal,
+            route,
+            attended_mode,
+            TaskRunExecutionProfile::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_run_for_active_workspace_with_profile(
+        &self,
+        run_id: &str,
+        conversation_id: &str,
+        root_message_id: &str,
+        domain_profile: DomainProfile,
+        goal: &str,
+        route: &str,
+        attended_mode: AttendedMode,
+        execution_profile: TaskRunExecutionProfile,
+    ) -> Result<TaskRun, StoreError> {
         let _operation = self.shadow_operation()?;
         let workspace_id = self.active_workspace_id();
-        self.create_run(
+        self.create_run_with_profile(
             run_id,
             &workspace_id,
             conversation_id,
@@ -1524,6 +1548,7 @@ impl TaskRuntimeStore {
             goal,
             route,
             attended_mode,
+            execution_profile,
         )
     }
 
@@ -1589,14 +1614,45 @@ impl TaskRuntimeStore {
         route: &str,
         attended_mode: AttendedMode,
     ) -> Result<TaskRun, StoreError> {
+        self.create_run_with_profile(
+            run_id,
+            workspace_id,
+            conversation_id,
+            root_message_id,
+            domain_profile,
+            goal,
+            route,
+            attended_mode,
+            TaskRunExecutionProfile::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_run_with_profile(
+        &self,
+        run_id: &str,
+        workspace_id: &str,
+        conversation_id: &str,
+        root_message_id: &str,
+        domain_profile: DomainProfile,
+        goal: &str,
+        route: &str,
+        attended_mode: AttendedMode,
+        execution_profile: TaskRunExecutionProfile,
+    ) -> Result<TaskRun, StoreError> {
         self.with_run_lock(run_id, || {
             if let Some(existing) = self.get_run(run_id)? {
+                let existing_profile = self
+                    .get_run_state(run_id)?
+                    .map(|snapshot| snapshot.execution_profile)
+                    .unwrap_or_default();
                 if existing.workspace_id != workspace_id
                     || existing.conversation_id != conversation_id
                     || existing.root_message_id != root_message_id
                     || existing.domain_profile != domain_profile
                     || existing.route != route
                     || existing.attended_mode != attended_mode
+                    || existing_profile != execution_profile
                 {
                     return Err(StoreError::InvalidPlan(format!(
                         "TaskRun '{run_id}' already exists with a different immutable identity"
@@ -1635,9 +1691,15 @@ impl TaskRuntimeStore {
                     "route": run.route,
                     "attended_mode": attended_mode.as_str(),
                     "created_at": echo_agent::utils::time::to_local(run.created_at).to_rfc3339(),
+                    "execution_profile": execution_profile,
                 }),
             ))?;
-            self.spill_objective_artifact_if_bounded(run_id, goal);
+            self.spill_objective_artifact_if_bounded(
+                run_id,
+                run.goal_revision,
+                &run.goal_sha256,
+                goal,
+            );
             Ok(run)
         })
     }
@@ -1645,18 +1707,29 @@ impl TaskRuntimeStore {
     /// Write the full objective next to the journal when a Goal exceeds the
     /// in-context contract bound. Best-effort derived view; the journal stays
     /// authoritative.
-    fn spill_objective_artifact_if_bounded(&self, run_id: &str, goal: &str) {
+    fn spill_objective_artifact_if_bounded(
+        &self,
+        run_id: &str,
+        goal_revision: u64,
+        goal_sha256: &str,
+        goal: &str,
+    ) {
         if goal.chars().count() <= OBJECTIVE_ARTIFACT_SPILL_CHARS {
             return;
         }
-        if let Err(error) = self.shadow.write_objective_artifact(run_id, goal) {
+        if let Err(error) =
+            self.shadow
+                .write_objective_artifact(run_id, goal_revision, goal_sha256, goal)
+        {
             tracing::warn!(run_id, %error, "objective artifact spill failed");
         }
     }
 
     /// Path of the spilled objective artifact for a run, when one exists.
     pub fn objective_artifact_path(&self, run_id: &str) -> Option<std::path::PathBuf> {
-        self.shadow.objective_artifact_path(run_id)
+        let run = self.get_run(run_id).ok().flatten()?;
+        self.shadow
+            .objective_artifact_path(run_id, run.goal_revision, &run.goal_sha256)
     }
 
     /// Anchor an incremental user constraint (steer) in the run journal so it
@@ -1827,7 +1900,12 @@ impl TaskRuntimeStore {
                 ));
             }
             self.commit_runtime_events(run_id, events)?;
-            self.spill_objective_artifact_if_bounded(run_id, new_goal);
+            self.spill_objective_artifact_if_bounded(
+                run_id,
+                new_goal_revision,
+                &new_goal_sha256,
+                new_goal,
+            );
             self.get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))
         })
@@ -2303,10 +2381,11 @@ impl TaskRuntimeStore {
                 )));
             }
         }
-        let plan = self
-            .get_plan(run_id)?
-            .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
-        validate_plan_goal_binding(&run, &plan)?;
+        match self.get_plan(run_id)? {
+            Some(plan) => validate_plan_goal_binding(&run, &plan)?,
+            None if snapshot.execution_profile.plan_policy == RunPlanPolicy::AllowDirect => {}
+            None => return Err(StoreError::PlanNotFound(run_id.to_string())),
+        }
         if let Some(continuation) = snapshot.continuation {
             if continuation.active_turn.is_some() {
                 return Err(StoreError::InvalidPlan(format!(
@@ -2486,9 +2565,11 @@ impl TaskRuntimeStore {
         let run = self
             .get_run(run_id)?
             .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
-        let state = self
+        let snapshot = self
             .get_run_state(run_id)?
-            .and_then(|snapshot| snapshot.continuation);
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        let execution_profile = snapshot.execution_profile;
+        let state = snapshot.continuation;
         let plan = self.get_plan(run_id)?;
         let mut blockers = Vec::new();
         if run.status != TaskRunStatus::Paused {
@@ -2521,6 +2602,7 @@ impl TaskRuntimeStore {
             blockers.push(BootAutoResumeBlocker::WorkspaceMismatch);
         }
         match plan.as_ref() {
+            None if execution_profile.plan_policy == RunPlanPolicy::AllowDirect => {}
             None => blockers.push(BootAutoResumeBlocker::PlanUnavailable),
             Some(plan)
                 if plan.goal_revision != run.goal_revision
@@ -3192,6 +3274,7 @@ impl TaskRuntimeStore {
                         "attended_mode": run.attended_mode.as_str(),
                         "attachments": run.attachments,
                         "created_at": echo_agent::utils::time::to_local(run.created_at).to_rfc3339(),
+                        "execution_profile": TaskRunExecutionProfile::default(),
                     }),
                     timestamp,
                 ),
@@ -3892,6 +3975,32 @@ impl TaskRuntimeStore {
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
+    /// Latest run that belongs in the task UI. Eager conversation runs remain
+    /// journaled but stay out of the complex-task projection until they commit
+    /// a real plan; orchestrated direct runs remain visible without a plan.
+    pub fn latest_task_ui_run_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TaskRun>, StoreError> {
+        let runs = self
+            .file_store()?
+            .list_runs()
+            .map_err(|error| StoreError::InvalidPlan(format!("file read: {error}")))?;
+        for run in runs
+            .into_iter()
+            .filter(|run| run.conversation_id == conversation_id)
+        {
+            let profile = self
+                .get_run_state(&run.run_id)?
+                .map(|snapshot| snapshot.execution_profile)
+                .unwrap_or_default();
+            if !profile.is_conversation_turn() || self.get_plan(&run.run_id)?.is_some() {
+                return Ok(Some(run));
+            }
+        }
+        Ok(None)
+    }
+
     /// Find an in-progress (Running or Paused) run for a conversation, if any.
     /// Used by the interrupt-detection logic: if a user sends a new message
     /// while a run is still executing, the system should prompt them rather
@@ -4205,16 +4314,27 @@ impl TaskRuntimeStore {
                 })
                 .collect::<Vec<_>>();
             let plan = self.get_plan(&run.run_id)?;
-            // ADR 0035: an eagerly bound conversational run that never
-            // committed a plan revision has no resumable work — settle it as
-            // Cancelled(Interrupted) instead of entering the BootRecovery
-            // pause/auto-resume adjudication.
-            if plan.is_none() {
-                self.transition_run(&run.run_id, TaskRunStatus::Cancelled)?;
-                return Ok(true);
-            }
             let active_subagents = self.active_subagent_boundaries(&run.run_id)?;
             let active_tools = self.active_tool_boundaries(&run.run_id)?;
+            let conversational_without_plan = plan.is_none()
+                && state.execution_profile.provenance == TaskRunProvenance::ConversationTurn;
+            let completed_turn_waiting_for_settlement = conversational_without_plan
+                && active_turn.is_none()
+                && orphan_cells.is_empty()
+                && active_subagents.is_empty()
+                && active_tools.is_empty()
+                && state
+                    .continuation
+                    .as_ref()
+                    .and_then(|continuation| continuation.last_turn.as_ref())
+                    .is_some_and(|turn| turn.status == RunTurnStatus::Ended);
+            let recovery_target = if completed_turn_waiting_for_settlement {
+                TaskRunStatus::Completed
+            } else if conversational_without_plan {
+                TaskRunStatus::Cancelled
+            } else {
+                TaskRunStatus::Paused
+            };
             let running_task_ids = state
                 .tasks
                 .iter()
@@ -4333,15 +4453,19 @@ impl TaskRuntimeStore {
                 RuntimeEventKind::RunStatusChanged,
                 serde_json::json!({
                     "from": TaskRunStatus::Running.as_str(),
-                    "to": TaskRunStatus::Paused.as_str(),
+                    "to": recovery_target.as_str(),
                     "recovery": {
                         "kind": "boot_recovery",
-                        "message": "recovered from running (interrupted by process restart)",
+                        "message": if completed_turn_waiting_for_settlement {
+                            "completed conversational turn settlement recovered after process restart"
+                        } else {
+                            "recovered from running (interrupted by process restart)"
+                        },
                         "active_turn": active_turn,
-                        "pause": {
+                        "pause": (recovery_target == TaskRunStatus::Paused).then(|| serde_json::json!({
                             "reason": RunPauseReason::BootRecovery.as_str(),
                             "detail": "the application process ended while this run was active",
-                        },
+                        })),
                         "cells": orphan_cells,
                         "tasks": recovered_tasks,
                         "subagents": recovered_subagents,
@@ -4349,6 +4473,16 @@ impl TaskRuntimeStore {
                     },
                 }),
             );
+            let mut recovery_events = vec![recovery_event];
+            if recovery_target == TaskRunStatus::Cancelled {
+                recovery_events.push(RuntimeJournalEvent::for_append(
+                    &run.run_id,
+                    None,
+                    None,
+                    RuntimeEventKind::RunCancelled,
+                    serde_json::json!({ "reason": "process_interrupted" }),
+                ));
+            }
             #[cfg(test)]
             let inject_projection_degradation = self
                 .fail_next_recovery_projection
@@ -4358,7 +4492,7 @@ impl TaskRuntimeStore {
             let receipt = if inject_projection_degradation {
                 let committed = self
                     .shadow
-                    .append_event_batch(&run.run_id, vec![recovery_event])?;
+                    .append_event_batch(&run.run_id, recovery_events)?;
                 let sequence = i64::try_from(committed.apply.last_sequence).map_err(|_| {
                     StoreError::InvalidPlan("TaskRuntime sequence exceeds EKO cursor".to_string())
                 })?;
@@ -4373,13 +4507,14 @@ impl TaskRuntimeStore {
                     },
                 )
             } else {
-                self.commit_runtime_events_with_receipt(&run.run_id, vec![recovery_event])?
+                self.commit_runtime_events_with_receipt(&run.run_id, recovery_events)?
             };
             self.observe_projection_receipt(&run.run_id, &receipt);
             tracing::info!(
                 run_id = %run.run_id,
                 from = %run.status.as_str(),
-                "recovered interrupted run -> Paused at boot"
+                to = %recovery_target.as_str(),
+                "recovered interrupted run at boot"
             );
             Ok(true)
         })
@@ -5271,6 +5406,79 @@ impl TaskRuntimeStore {
                 serde_json::json!({ "deferred": deferred }),
             ))?;
             Ok(())
+        })
+    }
+
+    /// Atomically clear a deferred continuation only when no task or command
+    /// cell is active. Every producer of those facts uses the same run lock, so
+    /// terminal settlement cannot observe a mixed runtime generation.
+    pub(crate) fn resume_deferred_continuation_if_quiet(
+        &self,
+        run_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.with_run_lock(run_id, || {
+            let snapshot = self
+                .get_run_state(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let runtime_active = snapshot
+                .background_cells
+                .iter()
+                .any(BackgroundCellState::is_active)
+                || snapshot.tasks.iter().any(|task| task.status.is_running());
+            let resumable = snapshot.run.status == TaskRunStatus::Running
+                && !runtime_active
+                && snapshot
+                    .continuation
+                    .is_some_and(|continuation| continuation.enabled && continuation.deferred);
+            if !resumable {
+                return Ok(false);
+            }
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunContinuationResumed,
+                serde_json::json!({ "deferred": false, "reason": "runtime_quiet" }),
+            ))?;
+            Ok(true)
+        })
+    }
+
+    /// Atomically preserve deferral when execution activity appears before a
+    /// queued continuation claims its next RunTurn.
+    pub(crate) fn defer_continuation_if_runtime_active(
+        &self,
+        run_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.with_run_lock(run_id, || {
+            let snapshot = self
+                .get_run_state(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let runtime_active = snapshot
+                .background_cells
+                .iter()
+                .any(BackgroundCellState::is_active)
+                || snapshot.tasks.iter().any(|task| task.status.is_running());
+            if !runtime_active || snapshot.run.status != TaskRunStatus::Running {
+                return Ok(false);
+            }
+            let continuation = snapshot.continuation.unwrap_or_default();
+            if !continuation.enabled {
+                return Ok(false);
+            }
+            if !continuation.deferred {
+                self.commit_runtime_event(RuntimeJournalEvent::for_append(
+                    run_id,
+                    None,
+                    None,
+                    RuntimeEventKind::RunContinuationDeferred,
+                    serde_json::json!({
+                        "deferred": true,
+                        "reason": "runtime_active",
+                    }),
+                ))?;
+            }
+            Ok(true)
         })
     }
 

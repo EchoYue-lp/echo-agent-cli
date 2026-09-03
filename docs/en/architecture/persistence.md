@@ -48,11 +48,17 @@ workspace creation; it is never parsed or migrated.
   segmented journal primitive.
 - EKO `TaskRuntimeStore` owns the file-backed event journal and projections for
   TaskRun, PlanRevision, Todo, recovery, and workspace supervision.
+- Every store-backed turn eagerly owns a TaskRun. Typed execution provenance
+  distinguishes an internal conversation-turn journal from an orchestrated run;
+  a conversation run enters the task UI only after it commits a plan.
 - Tool invocation and artifact projections retain typed framework
   `ToolResult.artifact` values; local paths are never treated as terminal truth.
 
 These authorities are complementary. A checkpoint is not a transcript, a Todo
 projection is not a task graph, and a frontend store is not durable state.
+`ChatEventLog` owns surface delivery/replay while TaskRuntime owns the associated
+Goal, user constraints, execution, and recovery facts. See
+[ADR 0037](../adr/0037-unified-turn-run-binding.md).
 
 ## Recovery and Retention
 

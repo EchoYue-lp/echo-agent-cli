@@ -2328,6 +2328,7 @@ async fn route_active_input(
             return ActiveInputDisposition::Queued;
         }
     };
+    let steer_text = prepared.instruction.clone();
     let resources = ReplProjectionResources::new(
         prepared,
         spill_dir,
@@ -2345,6 +2346,17 @@ async fn route_active_input(
     .await;
     match observed {
         Ok(true) => {
+            if let Err(error) = app_state
+                .record_user_steer_for_active_turn(
+                    &active.workspace_id,
+                    &active.conversation_id,
+                    &active_turn_id,
+                    &steer_text,
+                )
+                .await
+            {
+                tracing::debug!(%error, "CLI user steer was not bound to its TaskRun");
+            }
             output.print_info(&format!("Guidance accepted for turn {active_turn_id}"));
             ActiveInputDisposition::Steered
         }
@@ -2593,7 +2605,7 @@ async fn prepare_repl_turn_start(
         if let Err(detail) = validation {
             return Err(settle_repl_start_failure(lease, "task_run_resume", detail).await);
         }
-        resume.continuation_enabled
+        resume.uses_conversation_driver()
     } else {
         false
     };
@@ -2730,7 +2742,7 @@ fn spawn_prepared_repl_turn(
                     echo_agent_app_core::api::chat_driver::subagent_trace_sink_for(&resources.sink);
                 let launch = match resources.store.clone() {
                     Some(store) => {
-                        echo_agent_app_core::api::tasks::task_runtime::launch_planned_run_resume(
+                        echo_agent_app_core::api::tasks::task_runtime::launch_task_run_resume(
                             store,
                             resume,
                             agent_owned,
@@ -3322,6 +3334,7 @@ mod tests {
             goal_revision: 4,
             journal_sequence: 9,
             continuation_enabled: true,
+            execution_profile: echo_agent_app_core::api::tasks::task_runtime::TaskRunExecutionProfile::conversation_turn(),
         };
         let binding = repl_taskrun_resume_binding(resume.clone(), "taskrun-active");
         assert_eq!(binding.origin, RunTurnOrigin::Resume);
