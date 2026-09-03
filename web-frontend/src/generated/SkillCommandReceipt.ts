@@ -15,6 +15,7 @@ export type SkillCommandReceipt =
   | { action: 'uninstalled'; settlement: SkillUninstallSettlementReceipt }
   | { action: 'enabled'; settlement: SkillSyncReceipt }
   | { action: 'disabled'; settlement: SkillSyncReceipt }
+  | { action: 'activated'; name: string }
   | { action: 'refreshed'; settlement: SkillSyncReceipt }
   | { action: 'updates_checked'; updates: BoundedItems<SkillUpdateProjection> }
   | { action: 'synced'; settlement: SkillArtifactSyncReceipt };

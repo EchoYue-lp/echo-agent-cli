@@ -4932,6 +4932,45 @@ async fn handle_slash_command(
                 }
             }
         }
+        Some(SlashCommand::Skill) => {
+            let trimmed = args.trim();
+            if trimmed.is_empty() {
+                push_system_message(app, "Usage: /skill <skill-name> [instructions]".to_string());
+                return;
+            }
+            let mut skill_parts = trimmed.splitn(2, ' ');
+            let skill_name = skill_parts.next().unwrap_or_default().to_string();
+            let instructions = skill_parts.next().unwrap_or_default().trim().to_string();
+            let activation = agent
+                .write_async(|value| {
+                    let name = skill_name.clone();
+                    Box::pin(async move { value.activate_skill(&name).await })
+                })
+                .await;
+            match activation {
+                Ok(()) => {
+                    if instructions.is_empty() {
+                        push_system_message(
+                            app,
+                            format!("Skill '{skill_name}' activated in this conversation."),
+                        );
+                    } else {
+                        let prompt = format!(
+                            "Use skill '{skill_name}' to complete the following: {instructions}"
+                        );
+                        if let Err(e) =
+                            submit_tui_conversation_input(app, agent, agent_tx, prompt, Vec::new())
+                                .await
+                        {
+                            push_system_message(app, format!("Failed to send: {e}"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    push_system_message(app, format!("Cannot activate skill '{skill_name}': {e}"));
+                }
+            }
+        }
         Some(
             command @ (SlashCommand::Skills
             | SlashCommand::Mcp

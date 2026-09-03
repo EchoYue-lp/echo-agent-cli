@@ -5,19 +5,15 @@
 // and surface-neutral receipts so GUI, TUI, CLI and channels cannot each
 // invent a second lifecycle.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::hook_config_loader::{HookConfigLoader, HooksLoadResult};
-use crate::skills_hub::enabled_skills::{
-    EnabledSkillsConfig, SkillArtifactSyncDebt, SkillEnableEntry, SkillOperationIdentity,
-    SkillRepairDebt, SkillRepairTargetDebt,
-};
+use crate::skills_hub::enabled_skills::{EnabledSkillsConfig, SkillEnableEntry};
 use crate::skills_hub::{SkillHubEntry, SkillsHub};
 use crate::state::{
     AppState, ExtensionRuntimeTargets, McpHealthStatus, ScopedChatRuntime, ScopedExtensionControl,
@@ -150,19 +146,10 @@ struct CuratedSkillArtifactCommit {
     idempotent: bool,
 }
 
-struct AdmittedSkillMutation {
-    operation_id: String,
-    command_identity: String,
-    name: String,
-    enabled: bool,
-    artifact_name: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "SkillSettlementStatus")]
 pub enum SkillSettlementStatus {
-    Committed,
     Settled,
     Degraded,
 }
@@ -181,34 +168,25 @@ pub enum SkillTargetSettlementStatus {
 pub struct SkillTargetSettlementReceipt {
     pub target: String,
     pub workspace_generation: String,
-    #[serde(with = "crate::skills_hub::enabled_skills::u64_string")]
-    #[ts(type = "string")]
-    pub specialist_generation: u64,
     pub status: SkillTargetSettlementStatus,
     pub changed_entries: Vec<String>,
     pub error: Option<String>,
 }
 
 /// Surface-neutral result of one durable skill policy mutation or repair pass.
+///
+/// 2026-09 简化(取代 ADR 0032 的 durable 状态机):不再携带
+/// generation/content_identity/repair_debt 等崩溃恢复对账字段,只报告
+/// 本次操作对各运行时目标的即时结果。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 #[ts(export, rename = "SkillSyncReceipt")]
 pub struct SkillSyncReceipt {
     pub operation_id: String,
-    #[ts(type = "string")]
-    pub committed_file_path: PathBuf,
-    pub content_identity: String,
-    #[serde(with = "crate::skills_hub::enabled_skills::u64_string")]
-    #[ts(type = "string")]
-    pub desired_generation: u64,
-    #[serde(with = "crate::skills_hub::enabled_skills::u64_string")]
-    #[ts(type = "string")]
-    pub settled_generation: u64,
-    pub durable_committed: bool,
+    /// 本次操作是否未改变任何状态(重复开关同一个 skill 等)。
     pub idempotent: bool,
     pub status: SkillSettlementStatus,
     pub target_receipts: Vec<SkillTargetSettlementReceipt>,
-    pub repair_debt: Option<SkillRepairDebt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
@@ -216,6 +194,7 @@ pub struct SkillSyncReceipt {
 #[ts(export, rename = "SkillInstallSettlementReceipt")]
 pub struct SkillInstallSettlementReceipt {
     pub name: String,
+    pub installed_names: Vec<String>,
     pub path: PathBuf,
     pub source: String,
     pub revision: Option<String>,
@@ -279,13 +258,6 @@ impl SkillSyncReceipt {
 pub enum SkillMutationError {
     #[error("Skill mutation admission failed: {0}")]
     Admission(String),
-    #[error(
-        "Skill operation '{operation_id}' conflicts with committed content '{committed_content_identity}'"
-    )]
-    OperationConflict {
-        operation_id: String,
-        committed_content_identity: String,
-    },
     #[error("Skill mutation failed before durable commit: {0}")]
     BeforeCommit(String),
     #[error("Skill settlement task failed: {0}")]

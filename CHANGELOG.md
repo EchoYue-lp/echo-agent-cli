@@ -9,23 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Skill 系统重构（2026-09）**:
+  - 用户可调用 Skill：TUI 新增 `/skill <name> [instructions]`（激活 + 可选引导输入），GUI Settings 的 Skills 面板新增"在当前会话激活"；framework `activate_skill` 对未安装/被禁用 skill 从静默返回改为显式报错。
+  - 内置目录收敛 39 → 24：删除通用能力型（coding/translation/doc-writing/web-search，行为准则由基础 prompt 承担）与 vendored Anthropic 示例 11 个（design/automation/research，可经 SkillsHub 安装）；默认启用 8 → 5；methodology baseline 常驻注入 4 → 1（仅 verification-before-completion）。
+  - 打包修复：builtin skills 根从编译期 `CARGO_MANIFEST_DIR` 改为运行时解析（`$EKO_SKILLS_ROOT` → Tauri bundle resources → 源码树），`tauri.conf.json` 增加 `bundle.resources`，修复安装态应用丢失全部内置 skill 的问题。
+  - durable 管制机器移除（约 3000 行）：`enabled-skills.json` 保留平铺 `{category, enabled, baseline}` + 原子写，删除 generation CAS / operation identity / repair debt；坏配置回退默认启用集（fail-closed → fail-open）。ADR [0036](docs/zh/adr/0036-skill-policy-simplification.md)（取代 [0032](docs/zh/adr/0032-enabled-skill-runtime-authority.md) 的结算部分）。
+  - Agent Plugins 1.0 留口：`install` 复用 framework manifest validator 识别
+    `plugin.json` 标准包，原子安装并启用其全部 `skills/` 子目录，为每项保留精确 Git
+    subdir；含 `mcp.json` 的包明确提示暂不支持。
+
 - Made framework `TaskStatus` the sole PlanTask execution authority, exposed
   immutable `PlanRevision` artifacts to surfaces, and reduced Todo state to a
   read-only projection with no reverse mutation path.
 - **Skill catalog 收缩与官方标准化**: 全部捆绑 `SKILL.md` 迁移到 agentskills.io
   官方标准字段（`allowed-tools` 为空格分隔字符串、`metadata` 仅字符串，Skill 文件不携带
   Hook 扩展，不引入任何私有扩展命名空间）；路由改为
-  description-driven。catalog 41 → 39：删除 `using-superpowers`（重复全局选技）
-  与 `deep-research`（并入 `web-search` 深度调研模式），补强 `writing-skills` 与
-  `mcp-builder`。新增 `skills_hub::catalog_gate` 门禁测试（零违规 +
+  description-driven。catalog 先从 41 → 39 删除 `using-superpowers` 与
+  `deep-research`，随后按本节顶部重构收敛到 24。新增 `skills_hub::catalog_gate` 门禁测试（零违规 +
   `BUILTIN_SKILL_NAMES` 一致）与 `skills_hub::policy_contract` 行为级契约测试
-  （disabled 全投影缺席、reload 生效、fail-closed、用户 Skill 不受误伤、同名优先级、
+  （disabled 全投影缺席、reload 生效、fail-open、用户 Skill 不受误伤、同名优先级、
   路径 canonicalize 边界）。ADR
   [0033](docs/zh/adr/0033-skill-catalog-contraction-and-official-frontmatter.md)。
 - **Enabled Skill 运行时权威**: `enabled-skills.json` 成为 bundled Skill 的注册
   权威（ADR
   [0032](docs/zh/adr/0032-enabled-skill-runtime-authority.md)）；损坏配置
-  fail-closed，builtin/user Skill 来源标记区分，pooled Agent 刷新路径补齐。
+  fail-open，builtin/user Skill 来源标记区分，pooled Agent 刷新路径补齐。
 
 ### Added
 
@@ -33,10 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   design / research / automation），按 `skills/<category>/<name>/SKILL.md` 组织。
 - **技能资产移植与收缩**: superpowers 方法论/工作流 13 个 + Anthropic 领域技能
   15 个 + 现有技能，全部移植到 `skills/<category>/` 目录；经本轮质量收缩后
-  最终随附 39 个，见上方 Changed 条目。
-- **方法论 baseline 默认挂载**: 核心 4 个方法论（brainstorming /
-  systematic-debugging / verification-before-completion / writing-plans）
-  的正文在 SessionStart 时注入 system prompt。
+  最终随附 24 个，见上方 Changed 条目。
+- **方法论 baseline 默认挂载**: `verification-before-completion` 的正文在
+  primary 与 pooled conversation Agent 创建时注入 system prompt。
 - **enabled-skills.json 配置管理**: `EnabledSkillsConfig` 模块，管理技能
   启用状态和 baseline 标记，默认配置自动生成并落盘。
 - **TriggerSupervisor bootstrap 装配**: 用 TriggerSupervisor（Keyword +
@@ -49,7 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **eval match_fn 修真**: 用 `KeywordClassifier` 替代 `String::contains`
   字符串匹配，F1 度量反映生产路由效果。`load_skill_triggers` 支持
   category 子目录扫描。
-- **文档**: Skill 分类与上游同步说明现统一维护在 `docs/skill-sync.md`。
+- **文档**: Skill 分类与上游同步说明现统一维护在
+  `docs/{zh,en}/operations/skill-sync.md`。
 
 ### Changed
 

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted (partially superseded: the durable settlement machinery is replaced by [ADR 0036](./0036-skill-policy-simplification.md); the enabled-skills.json runtime-authority stance is retained)
 
 ## Context
 

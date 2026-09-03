@@ -15,6 +15,7 @@ import {
   ChevronRight,
   FolderOpen,
   Loader2,
+  Play,
   Power,
   Search,
   Star,
@@ -24,6 +25,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { useToastStore } from '../../stores/toastStore';
+import { useConversationStore } from '../../stores/conversationStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { fileSystem, isTauri } from '../../lib/tauri-bridge';
 
@@ -58,6 +60,7 @@ export function skillCommandReceipt(receipt: ExtensionCommandReceipt): SkillComm
 
 export function SkillsPanel() {
   const workspace = useWorkspaceStore((state) => state.current);
+  const conversationId = useConversationStore((state) => state.activeId);
   const requestScope = useMemo(() => extensionRequestScope(workspace), [workspace]);
   const [skills, setSkills] = useState<TauriSkillInfo[]>([]);
   const [skillsOmitted, setSkillsOmitted] = useState(0);
@@ -161,13 +164,7 @@ export function SkillsPanel() {
       return;
     }
 
-    if (receipt.status === 'committed') {
-      addToast('info', `${action}已写入持久配置，运行时仍在结算`, 8000);
-      return;
-    }
-
-    const repair = receipt.repair_debt ? '，已记录自动修复任务' : '';
-    addToast('warning', `${action}已写入持久配置，但部分运行时目标未完成${repair}`, 8000);
+    addToast('warning', `${action}已写入持久配置，但部分运行时目标未完成`, 8000);
   };
 
   const loadPath = async (path: string) => {
@@ -185,7 +182,7 @@ export function SkillsPanel() {
       showSettlement(
         '技能安装',
         command.settlement.settlement,
-        `已安装并启用 ${command.settlement.name}`
+        `已安装并启用 ${command.settlement.installed_names.join('、')}`
       );
     } catch (e: any) {
       const msg = e?.message || String(e);
@@ -240,6 +237,28 @@ export function SkillsPanel() {
       );
     } catch (e: any) {
       addToast('error', `禁用技能失败: ${e?.message || String(e)}`);
+    } finally {
+      setBusySkill(null);
+    }
+  };
+
+  const activateSkill = async (name: string) => {
+    if (busySkill || !conversationId) return;
+    const expectedConversationId = conversationId;
+    setBusySkill(name);
+    try {
+      const result = await skillsApi.activate(requestScope, expectedConversationId, name);
+      assertActiveScope(requestScope);
+      if (useConversationStore.getState().activeId !== expectedConversationId) {
+        throw new Error('Current conversation changed before Skill activation settled');
+      }
+      const command = skillCommandReceipt(result);
+      if (command.action !== 'activated') {
+        throw new Error(`Unexpected Skill receipt '${command.action}' after activate`);
+      }
+      addToast('success', `已在当前会话激活技能 ${name}`);
+    } catch (e: any) {
+      addToast('error', `激活技能失败: ${e?.message || String(e)}`);
     } finally {
       setBusySkill(null);
     }
@@ -595,6 +614,18 @@ export function SkillsPanel() {
                       )}
                       {sk.loaded ? '禁用' : '启用'}
                     </button>
+                    {sk.loaded && (
+                      <button
+                        onClick={() => void activateSkill(sk.name)}
+                        disabled={Boolean(busySkill) || !conversationId}
+                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border transition-opacity disabled:opacity-50"
+                        style={{ borderColor: s.border, color: s.accent }}
+                        title={conversationId ? '在当前会话激活' : '请先进入一个会话'}
+                        aria-label={`在当前会话激活技能 ${sk.name}`}
+                      >
+                        <Play size={11} />
+                      </button>
+                    )}
                     {!sk.is_builtin && (
                       <button
                         onClick={() => void uninstallSkill(sk.name)}

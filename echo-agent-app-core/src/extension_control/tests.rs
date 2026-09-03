@@ -4,12 +4,29 @@ mod tests {
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::testing::MockLlmClient;
 
+    async fn skill_projection_present(
+        agent: &crate::agent_handle::AgentHandle,
+        name: &str,
+    ) -> bool {
+        context_projection_present(agent, format!("echo-agent:skill:{name}")).await
+    }
+
+    async fn context_projection_present(
+        agent: &crate::agent_handle::AgentHandle,
+        marker: String,
+    ) -> bool {
+        agent
+            .read_async(|agent| {
+                Box::pin(async move { agent.context().lock().await.has_projection(&marker) })
+            })
+            .await
+    }
+
     struct FanoutFixture {
         temp: tempfile::TempDir,
         state: Arc<AppState>,
         seed_pool: Arc<crate::agent_pool::AgentPool>,
         workspaces: Vec<crate::workspace::Workspace>,
-        enabled_config_path: PathBuf,
     }
 
     async fn fanout_fixture(workspace_count: usize) -> Result<FanoutFixture, String> {
@@ -118,7 +135,6 @@ mod tests {
             state,
             seed_pool,
             workspaces,
-            enabled_config_path,
         })
     }
 
@@ -548,6 +564,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_policy_does_not_block_the_next_skill_mutation() -> Result<(), String> {
+        let fixture = fanout_fixture(0).await?;
+        let config_path = fixture.temp.path().join("enabled-skills.json");
+        std::fs::write(&config_path, "{ malformed").map_err(|error| error.to_string())?;
+
+        let receipt = fixture
+            .state
+            .extension_control
+            .enable_skill(&fixture.state, "fanout-skill")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(receipt.status, SkillSettlementStatus::Settled);
+        let config = EnabledSkillsConfig::load(&config_path).map_err(|error| error.to_string())?;
+        assert!(config.is_enabled("fanout-skill"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_is_not_idempotent_when_runtime_entries_are_reloaded() -> Result<(), String> {
+        let fixture = fanout_fixture(0).await?;
+        fixture
+            .state
+            .extension_control
+            .enable_skill(&fixture.state, "fanout-skill")
+            .await
+            .map_err(|error| error.to_string())?;
+        let receipt = fixture
+            .state
+            .extension_control
+            .refresh_enabled_skills(&fixture.state)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(!receipt.idempotent);
+        assert!(
+            receipt
+                .target_receipts
+                .iter()
+                .any(|target| target.changed_entries.iter().any(|name| name == "fanout-skill"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn baseline_projection_tracks_enablement_on_primary_and_existing_pool_agents()
+    -> Result<(), String> {
+        let fixture = fanout_fixture(0).await?;
+        let pooled = fixture
+            .seed_pool
+            .acquire("baseline-conversation")
+            .await
+            .map_err(|error| error.to_string())?;
+        let pooled_agent = pooled.agent();
+        drop(pooled);
+        let marker = "eko:methodology-baseline".to_string();
+
+        fixture
+            .state
+            .extension_control
+            .disable_skill(&fixture.state, "verification-before-completion")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            !context_projection_present(
+                &fixture.state.connection.primary_agent(),
+                marker.clone()
+            )
+            .await
+        );
+        assert!(!context_projection_present(&pooled_agent, marker.clone()).await);
+
+        fixture
+            .state
+            .extension_control
+            .enable_skill(&fixture.state, "verification-before-completion")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            context_projection_present(
+                &fixture.state.connection.primary_agent(),
+                marker.clone()
+            )
+            .await
+        );
+        assert!(context_projection_present(&pooled_agent, marker.clone()).await);
+
+        fixture
+            .state
+            .extension_control
+            .disable_skill(&fixture.state, "verification-before-completion")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            !context_projection_present(&fixture.state.connection.primary_agent(), marker.clone())
+                .await
+        );
+        assert!(!context_projection_present(&pooled_agent, marker).await);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn list_projection_reads_loaded_state_from_agent_descriptors() -> Result<(), String> {
         let fixture = fanout_fixture(0).await?;
         fixture
@@ -571,774 +687,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operation_and_content_identity_are_idempotent_and_conflicts_fail_closed()
-    -> Result<(), String> {
-        let fixture = fanout_fixture(1).await?;
-        let service = Arc::clone(&fixture.state.extension_control);
-        let first = service
-            .set_skill_enabled_with_operation(
-                &fixture.state,
-                "operation-enable",
-                "fanout-skill",
-                true,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        std::fs::write(
-            fixture.temp.path().join("skills/fanout-skill/SKILL.md"),
-            "---\nname: fanout-skill\ndescription: changed after operation\n---\nchanged",
-        )
-        .map_err(|error| error.to_string())?;
-        let changed_content = service
-            .refresh_enabled_skills(&fixture.state)
-            .await
-            .map_err(|error| error.to_string())?;
-        assert!(changed_content.desired_generation > first.desired_generation);
-        let repeated = service
-            .set_skill_enabled_with_operation(
-                &fixture.state,
-                "operation-enable",
-                "fanout-skill",
-                true,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        assert!(repeated.idempotent);
-        assert_eq!(
-            repeated.desired_generation,
-            changed_content.desired_generation
-        );
-
-        let same_content = service
-            .set_skill_enabled_with_operation(
-                &fixture.state,
-                "operation-same-content",
-                "fanout-skill",
-                true,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        assert!(same_content.idempotent);
-        assert_eq!(
-            same_content.desired_generation,
-            changed_content.desired_generation
-        );
-
-        let conflict = service
-            .set_skill_enabled_with_operation(
-                &fixture.state,
-                "operation-enable",
-                "fanout-skill",
-                false,
-            )
-            .await
-            .err()
-            .ok_or_else(|| "same operation with different content was accepted".to_string())?;
-        assert!(matches!(
-            conflict,
-            SkillMutationError::OperationConflict { .. }
-        ));
-        let config = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        assert!(
-            config
-                .skills
-                .get("fanout-skill")
-                .is_some_and(|entry| entry.enabled)
-        );
-        assert_eq!(
-            config.desired_generation,
-            changed_content.desired_generation
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn caller_drop_does_not_cancel_accepted_skill_settlement() -> Result<(), String> {
-        let fixture = fanout_fixture(1).await?;
-        let state = Arc::clone(&fixture.state);
-        let admission = Arc::clone(&state.extension_control);
-        let service = Arc::clone(&admission);
-        let mutation = admission.mutation.lock().await;
-        let caller = tokio::spawn(async move {
-            service
-                .set_skill_enabled_with_operation(
-                    &state,
-                    "caller-drop-operation",
-                    "fanout-skill",
-                    true,
-                )
-                .await
-        });
-        let shutdown = begin_shutdown_after_extension_admission(&fixture.state).await?;
-        caller.abort();
-        drop(mutation);
-        shutdown.await.map_err(|error| error.to_string())??;
-        let config = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        assert_eq!(config.desired_generation, config.settled_generation);
-        assert!(config.repair_debt.is_none());
-        assert!(
-            config
-                .skills
-                .get("fanout-skill")
-                .is_some_and(|entry| entry.enabled)
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reopened_service_replays_durable_repair_debt() -> Result<(), String> {
-        let fixture = fanout_fixture(1).await?;
-        fixture
-            .state
-            .extension_control
-            .enable_skill(&fixture.state, "fanout-skill")
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut config = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        config.settled_generation = config.desired_generation.saturating_sub(1);
-        config.set_repair_debt(SkillRepairDebt {
-            generation: config.desired_generation,
-            content_identity: config.content_identity.clone(),
-            attempts: 1,
-            target_failures: vec![SkillRepairTargetDebt {
-                target: "workspace-0".to_string(),
-                component: "runtime_fanout".to_string(),
-                expected_generation: config.desired_generation,
-                observed_generation: None,
-                reason: "simulated restart debt".to_string(),
-                retryable: true,
-            }],
-            artifact_removals: Vec::new(),
-            artifact_syncs: Vec::new(),
-            artifact_enablements: Vec::new(),
-        });
-        config
-            .save(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-
-        let reopened = Arc::new(ExtensionControlService::with_enabled_config_path(
-            fixture.enabled_config_path.clone(),
-        ));
-        let receipt = reopened
-            .reconcile_enabled_skills_on_load(&fixture.state)
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(receipt.status, SkillSettlementStatus::Settled);
-        let repaired = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        assert_eq!(repaired.desired_generation, repaired.settled_generation);
-        assert!(repaired.repair_debt.is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reopened_service_replays_artifact_removal_debt() -> Result<(), String> {
-        let fixture = fanout_fixture(1).await?;
-        fixture
-            .state
-            .extension_control
-            .refresh_enabled_skills(&fixture.state)
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut config = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        config.set_repair_debt(SkillRepairDebt {
-            generation: config.desired_generation,
-            content_identity: config.content_identity.clone(),
-            attempts: 1,
-            target_failures: vec![SkillRepairTargetDebt {
-                target: "skill-artifact:fanout-skill".to_string(),
-                component: "artifact".to_string(),
-                expected_generation: config.desired_generation,
-                observed_generation: None,
-                reason: "simulated".to_string(),
-                retryable: true,
-            }],
-            artifact_removals: vec!["fanout-skill".to_string()],
-            artifact_syncs: Vec::new(),
-            artifact_enablements: Vec::new(),
-        });
-        config
-            .save(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        let reopened = Arc::new(ExtensionControlService::with_enabled_config_path(
-            fixture.enabled_config_path.clone(),
-        ));
-        let receipt = reopened
-            .reconcile_enabled_skills_on_load(&fixture.state)
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(receipt.status, SkillSettlementStatus::Settled);
-        assert!(!fixture.temp.path().join("skills/fanout-skill").exists());
-        let repaired = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        assert!(repaired.repair_debt.is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn terminal_artifact_sync_failure_does_not_create_replay_debt() -> Result<(), String> {
-        let fixture = fanout_fixture(1).await?;
-        let receipt = fixture
-            .state
-            .extension_control
-            .sync_skills_with_operation(
-                &fixture.state,
-                "sync-operation",
-                Some("fanout-skill"),
-                false,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(receipt.settlement.operation_id, "sync-operation");
-        assert_eq!(receipt.settlement.status, SkillSettlementStatus::Degraded);
-        assert!(receipt.results.iter().any(|result| !result.success));
-        let committed = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        assert!(committed.repair_debt.is_none());
-        let duplicate = fixture
-            .state
-            .extension_control
-            .sync_skills_with_operation(
-                &fixture.state,
-                "sync-operation",
-                Some("fanout-skill"),
-                false,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        assert!(duplicate.results.is_empty());
-        assert_eq!(duplicate.settlement.status, SkillSettlementStatus::Settled);
-        let conflict = fixture
-            .state
-            .extension_control
-            .sync_skills_with_operation(
-                &fixture.state,
-                "sync-operation",
-                Some("fanout-skill"),
-                true,
-            )
-            .await
-            .err()
-            .ok_or_else(|| "conflicting sync operation was accepted".to_string())?;
-        assert!(
-            conflict
-                .to_string()
-                .contains("conflicts with committed content")
-        );
-
-        let mut legacy_debt = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        legacy_debt.set_repair_debt(SkillRepairDebt {
-            generation: legacy_debt.desired_generation,
-            content_identity: legacy_debt.content_identity.clone(),
-            attempts: 1,
-            target_failures: vec![SkillRepairTargetDebt {
-                target: "skill-artifact-sync:fanout-skill".to_string(),
-                component: "artifact_sync".to_string(),
-                expected_generation: legacy_debt.desired_generation,
-                observed_generation: None,
-                reason: "legacy untracked sync debt".to_string(),
-                retryable: true,
-            }],
-            artifact_removals: Vec::new(),
-            artifact_syncs: vec![SkillArtifactSyncDebt {
-                name: "fanout-skill".to_string(),
-                force: false,
-            }],
-            artifact_enablements: Vec::new(),
-        });
-        legacy_debt
-            .save(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        let reopened = Arc::new(ExtensionControlService::with_enabled_config_path(
-            fixture.enabled_config_path.clone(),
-        ));
-        let replayed = reopened
-            .reconcile_enabled_skills_on_load(&fixture.state)
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(replayed.status, SkillSettlementStatus::Degraded);
-        let after_replay = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        assert!(after_replay.repair_debt.is_none());
-        let next_mutation = reopened
-            .refresh_enabled_skills(&fixture.state)
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(next_mutation.status, SkillSettlementStatus::Settled);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn installed_artifact_enablement_debt_replays_after_restart() -> Result<(), String> {
-        let fixture = fanout_fixture(1).await?;
-        let flow = fixture
-            .state
-            .session
-            .product_data_io
-            .begin_owned_flow("test installed artifact repair debt")
-            .map_err(|error| error.to_string())?;
-        record_install_repair_debt(
-            &fixture.state,
-            &flow,
-            fixture.enabled_config_path.clone(),
-            "fanout-skill",
-            "simulated policy commit failure",
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        flow.settle(Some("simulated policy commit failure".to_string()));
-        let committed = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        assert!(committed.repair_debt.as_ref().is_some_and(|debt| {
-            debt.artifact_enablements
-                .iter()
-                .any(|name| name == "fanout-skill")
-        }));
-
-        let reopened = Arc::new(ExtensionControlService::with_enabled_config_path(
-            fixture.enabled_config_path.clone(),
-        ));
-        let replayed = reopened
-            .reconcile_enabled_skills_on_load(&fixture.state)
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(replayed.status, SkillSettlementStatus::Settled);
-        let repaired = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        assert!(
-            repaired
-                .skills
-                .get("fanout-skill")
-                .is_some_and(|entry| entry.enabled)
-        );
-        assert!(repaired.repair_debt.is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn enabled_skill_content_change_advances_generation_on_refresh() -> Result<(), String> {
-        let fixture = fanout_fixture(1).await?;
-        let first = fixture
-            .state
-            .extension_control
-            .enable_skill(&fixture.state, "fanout-skill")
-            .await
-            .map_err(|error| error.to_string())?;
-        std::fs::write(
-            fixture.temp.path().join("skills/fanout-skill/SKILL.md"),
-            "---\nname: fanout-skill\ndescription: changed fixture\n---\nchanged",
-        )
-        .map_err(|error| error.to_string())?;
-        let refreshed = fixture
-            .state
-            .extension_control
-            .refresh_enabled_skills(&fixture.state)
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(
-            refreshed.desired_generation,
-            first.desired_generation.saturating_add(1)
-        );
-        assert_eq!(refreshed.status, SkillSettlementStatus::Settled);
-        assert_ne!(refreshed.content_identity, first.content_identity);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stale_generation_cas_cannot_overwrite_newer_durable_policy() -> Result<(), String> {
-        let fixture = fanout_fixture(1).await?;
-        fixture
-            .state
-            .extension_control
-            .enable_skill(&fixture.state, "fanout-skill")
-            .await
-            .map_err(|error| error.to_string())?;
-        let stale = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        let newer = fixture
-            .state
-            .extension_control
-            .disable_skill(&fixture.state, "fanout-skill")
-            .await
-            .map_err(|error| error.to_string())?;
-        let flow = fixture
-            .state
-            .session
-            .product_data_io
-            .begin_owned_flow("test stale skill settlement")
-            .map_err(|error| error.to_string())?;
-        let stale_receipt = settle_skill_generation(
-            &flow,
-            fixture.enabled_config_path.clone(),
-            stale,
-            "stale-operation".to_string(),
-            false,
-            true,
-            Vec::new(),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        flow.settle(None);
-        assert_eq!(stale_receipt.status, SkillSettlementStatus::Degraded);
-        let durable = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        assert_eq!(durable.desired_generation, newer.desired_generation);
-        assert_eq!(durable.content_identity, newer.content_identity);
-        assert!(
-            durable
-                .skills
-                .get("fanout-skill")
-                .is_some_and(|entry| !entry.enabled)
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stale_generation_is_rejected_before_runtime_fanout() -> Result<(), String> {
-        let fixture = fanout_fixture(1).await?;
-        fixture
-            .state
-            .extension_control
-            .enable_skill(&fixture.state, "fanout-skill")
-            .await
-            .map_err(|error| error.to_string())?;
-        let stale = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        fixture
-            .state
-            .extension_control
-            .disable_skill(&fixture.state, "fanout-skill")
-            .await
-            .map_err(|error| error.to_string())?;
-        let flow = fixture
-            .state
-            .session
-            .product_data_io
-            .begin_owned_flow("test pre-fanout generation CAS")
-            .map_err(|error| error.to_string())?;
-        let receipt = fixture
-            .state
-            .extension_control
-            .reconcile_skill_config(
-                &fixture.state,
-                &flow,
-                stale,
-                "stale-prefanout".to_string(),
-                false,
-                true,
-                Vec::new(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        flow.settle(None);
-        assert_eq!(receipt.status, SkillSettlementStatus::Degraded);
-        let targets = fixture
-            .state
-            .extension_runtime_targets()
-            .await
-            .map_err(|error| error.to_string())?;
-        for target in targets.iter() {
-            assert!(
-                !skill_source_present(
-                    &target.primary_agent(),
-                    "fanout-skill",
-                    &user_skill_source("fanout-skill"),
-                )
-                .await
-            );
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn mid_fanout_failure_keeps_durable_policy_and_records_repair_debt() -> Result<(), String>
+    async fn skill_activation_targets_only_the_requested_conversation_agent() -> Result<(), String>
     {
-        let fixture = fanout_fixture(3).await?;
-        let targets = fixture
-            .state
-            .extension_runtime_targets()
-            .await
-            .map_err(|error| error.to_string())?;
-        let middle_workspace = fixture
-            .workspaces
-            .get(1)
-            .ok_or_else(|| "middle workspace fixture missing".to_string())?;
-        let failing = targets
-            .iter()
-            .find(|target| target.scope() == middle_workspace.id.as_str())
-            .map(|target| target.plugin_runtime())
-            .ok_or_else(|| "middle workspace target missing".to_string())?;
-        drop(targets);
-        failing
-            .shutdown()
-            .await
-            .map_err(|error| error.to_string())?;
+        use crate::extension_commands::{
+            ExtensionCommand, ExtensionCommandDispatcher, ExtensionCommandIdentity,
+            ExtensionCommandReceipt, ExtensionCommandRequest, ExtensionCommandStatus,
+            ExtensionRequestScope, SkillCommand,
+        };
 
-        let receipt = fixture
-            .state
-            .extension_control
-            .enable_skill(&fixture.state, "fanout-skill")
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(receipt.status, SkillSettlementStatus::Degraded);
-        assert!(receipt.durable_committed);
-        assert!(receipt.repair_debt.is_some());
-        let targets = fixture
-            .state
-            .extension_runtime_targets()
-            .await
-            .map_err(|error| error.to_string())?;
-        let first = targets
-            .iter()
-            .next()
-            .ok_or_else(|| "global target missing".to_string())?;
-        assert!(
-            skill_source_present(
-                &first.primary_agent(),
-                "fanout-skill",
-                &user_skill_source("fanout-skill"),
-            )
-            .await,
-            "a settled target was incorrectly rolled back"
-        );
-        let config = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        assert!(
-            config
-                .skills
-                .get("fanout-skill")
-                .is_some_and(|entry| entry.enabled)
-        );
-        assert!(config.desired_generation > config.settled_generation);
-        assert!(config.repair_debt.is_some());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stale_artifact_operations_cannot_overwrite_or_remove_a_reinstall() -> Result<(), String>
-    {
-        let fixture = fanout_fixture(1).await?;
-        let source_parent = fixture.temp.path().join("operation-sources");
-        let source = source_parent.join("operation-skill");
-        std::fs::create_dir_all(&source).map_err(|error| error.to_string())?;
-        std::fs::write(
-            source.join("SKILL.md"),
-            "---\nname: operation-skill\ndescription: first install\n---\nfirst",
-        )
-        .map_err(|error| error.to_string())?;
-        let service = Arc::clone(&fixture.state.extension_control);
-        service
-            .install_skill_with_operation(
-                &fixture.state,
-                "old-install-operation",
-                source.to_string_lossy().as_ref(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        service
-            .uninstall_skill_with_operation(
-                &fixture.state,
-                "old-uninstall-operation",
-                "operation-skill",
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-
-        std::fs::write(
-            source.join("SKILL.md"),
-            "---\nname: operation-skill\ndescription: reinstall\n---\nsecond",
-        )
-        .map_err(|error| error.to_string())?;
-        service
-            .install_skill_with_operation(
-                &fixture.state,
-                "new-install-operation",
-                source.to_string_lossy().as_ref(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let installed_path = fixture.temp.path().join("skills/operation-skill/SKILL.md");
-        std::fs::write(
-            &installed_path,
-            "---\nname: operation-skill\ndescription: local edit\n---\nkeep-me",
-        )
-        .map_err(|error| error.to_string())?;
-
-        let duplicate_install = service
-            .install_skill_with_operation(
-                &fixture.state,
-                "old-install-operation",
-                source.to_string_lossy().as_ref(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        assert!(duplicate_install.settlement.idempotent);
-        let after_install_retry =
-            std::fs::read_to_string(&installed_path).map_err(|error| error.to_string())?;
-        assert!(after_install_retry.contains("keep-me"));
-
-        let conflicting_source = source_parent.join("different-operation-skill");
-        std::fs::create_dir_all(&conflicting_source).map_err(|error| error.to_string())?;
-        std::fs::write(
-            conflicting_source.join("SKILL.md"),
-            "---\nname: different-operation-skill\ndescription: conflict\n---\nconflict",
-        )
-        .map_err(|error| error.to_string())?;
-        let conflict = service
-            .install_skill_with_operation(
-                &fixture.state,
-                "old-install-operation",
-                conflicting_source.to_string_lossy().as_ref(),
-            )
-            .await
-            .err()
-            .ok_or_else(|| "conflicting install operation was accepted".to_string())?;
-        assert!(matches!(
-            conflict,
-            SkillInstallError::Enable(SkillMutationError::OperationConflict { .. })
-        ));
-        assert!(
-            !fixture
-                .temp
-                .path()
-                .join("skills/different-operation-skill")
-                .exists()
-        );
-
-        let duplicate_uninstall = service
-            .uninstall_skill_with_operation(
-                &fixture.state,
-                "old-uninstall-operation",
-                "operation-skill",
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        assert!(duplicate_uninstall.settlement.idempotent);
-        assert!(!duplicate_uninstall.artifact_removed);
-        assert!(installed_path.exists());
-        let after_uninstall_retry =
-            std::fs::read_to_string(installed_path).map_err(|error| error.to_string())?;
-        assert!(after_uninstall_retry.contains("keep-me"));
-        let config = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        assert!(
-            config
-                .skills
-                .get("operation-skill")
-                .is_some_and(|entry| entry.enabled)
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn install_degraded_settlement_keeps_installed_directory_and_desired_state()
-    -> Result<(), String> {
-        let fixture = fanout_fixture(2).await?;
-        let source = fixture.temp.path().join("install-failure");
-        std::fs::create_dir_all(&source).map_err(|error| error.to_string())?;
-        std::fs::write(
-            source.join("SKILL.md"),
-            "---\nname: install-failure\ndescription: degraded install fixture\n---\ndegraded",
-        )
-        .map_err(|error| error.to_string())?;
-        let targets = fixture
-            .state
-            .extension_runtime_targets()
-            .await
-            .map_err(|error| error.to_string())?;
-        let failing = targets
-            .iter()
-            .find(|target| target.scope() != "global")
-            .map(|target| target.plugin_runtime())
-            .ok_or_else(|| "workspace target missing".to_string())?;
-        drop(targets);
-        failing
-            .shutdown()
-            .await
-            .map_err(|error| error.to_string())?;
-
-        let installed = fixture
-            .state
-            .extension_control
-            .install_skill(&fixture.state, source.to_string_lossy().as_ref())
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(installed.name, "install-failure");
-        assert_eq!(installed.settlement.status, SkillSettlementStatus::Degraded);
-        assert!(
-            fixture
-                .state
-                .skills_hub
-                .read()
-                .await
-                .root()
-                .join("install-failure")
-                .exists()
-        );
-        let config = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        assert!(
-            config
-                .skills
-                .get("install-failure")
-                .is_some_and(|entry| entry.enabled)
-        );
-        assert!(config.repair_debt.is_some());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn uninstall_returns_typed_degraded_after_durable_disable() -> Result<(), String> {
-        let fixture = fanout_fixture(1).await?;
-        fixture
-            .state
-            .extension_control
-            .enable_skill(&fixture.state, "fanout-skill")
-            .await
-            .map_err(|error| error.to_string())?;
-        let targets = fixture
-            .state
-            .extension_runtime_targets()
-            .await
-            .map_err(|error| error.to_string())?;
-        let failing = targets
-            .iter()
-            .find(|target| target.scope() != "global")
-            .map(|target| target.plugin_runtime())
-            .ok_or_else(|| "workspace target missing".to_string())?;
-        drop(targets);
-        failing
-            .shutdown()
-            .await
-            .map_err(|error| error.to_string())?;
-        let receipt = fixture
-            .state
-            .extension_control
-            .uninstall_skill(&fixture.state, "fanout-skill")
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(receipt.settlement.status, SkillSettlementStatus::Degraded);
-        assert!(receipt.artifact_removed);
-        assert!(receipt.artifact_error.is_none());
-        let config = EnabledSkillsConfig::load(&fixture.enabled_config_path)
-            .map_err(|error| error.to_string())?;
-        assert!(
-            config
-                .skills
-                .get("fanout-skill")
-                .is_some_and(|entry| !entry.enabled)
-        );
-        assert!(config.repair_debt.is_some());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn uninstall_of_absent_artifact_reports_not_removed() -> Result<(), String> {
         let fixture = fanout_fixture(0).await?;
         fixture
             .state
@@ -1346,22 +702,116 @@ mod tests {
             .enable_skill(&fixture.state, "fanout-skill")
             .await
             .map_err(|error| error.to_string())?;
-        std::fs::remove_dir_all(fixture.temp.path().join("skills/fanout-skill"))
+        let first = fixture
+            .seed_pool
+            .acquire("conversation-first")
+            .await
             .map_err(|error| error.to_string())?;
+        let first_agent = first.agent();
+        drop(first);
+        let second = fixture
+            .seed_pool
+            .acquire("conversation-second")
+            .await
+            .map_err(|error| error.to_string())?;
+        let second_agent = second.agent();
+        drop(second);
+
+        let product_data = fixture
+            .state
+            .current_product_data()
+            .await
+            .map_err(|error| error.to_string())?;
+        let scope = ExtensionRequestScope::new(
+            product_data.workspace_id(),
+            product_data.generation(),
+            None,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let identity = ExtensionCommandIdentity::new("request-activate", "operation-activate")
+            .map_err(|error| error.to_string())?;
+        let receipt = ExtensionCommandDispatcher::new(fixture.state.clone())
+            .dispatch_for_scope(
+                scope.clone(),
+                ExtensionCommandRequest {
+                    request_id: identity.request_id,
+                    operation_id: identity.operation_id,
+                    scope: Some(scope),
+                    command: ExtensionCommand::Skills(SkillCommand::Activate {
+                        name: "fanout-skill".to_string(),
+                    }),
+                },
+                "conversation-first".to_string(),
+            )
+            .await;
+        match receipt {
+            ExtensionCommandReceipt::Skills { meta, .. }
+                if meta.status == ExtensionCommandStatus::Settled => {}
+            other => return Err(format!("unexpected activation receipt: {other:?}")),
+        }
+
+        assert!(skill_projection_present(&first_agent, "fanout-skill").await);
+        assert!(!skill_projection_present(&second_agent, "fanout-skill").await);
+        assert!(
+            !skill_projection_present(&fixture.state.connection.primary_agent(), "fanout-skill")
+                .await
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plugin_package_install_enables_every_skill_atomically() -> Result<(), String> {
+        let fixture = fanout_fixture(0).await?;
+        let plugin = fixture.temp.path().join("plugin-package");
+        std::fs::create_dir_all(&plugin).map_err(|error| error.to_string())?;
+        std::fs::write(
+            plugin.join("plugin.json"),
+            format!(
+                r#"{{"$schema":"{}","name":"fixture-plugin"}}"#,
+                echo_agent::plugin::AGENT_PLUGIN_SCHEMA_V1
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        for name in ["alpha", "beta"] {
+            let skill = plugin.join("skills").join(name);
+            std::fs::create_dir_all(&skill).map_err(|error| error.to_string())?;
+            std::fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name} fixture\n---\n{name}"),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+
+        let source = plugin
+            .to_str()
+            .ok_or_else(|| "plugin fixture path is not UTF-8".to_string())?;
         let receipt = fixture
             .state
             .extension_control
-            .uninstall_skill_with_operation(
-                &fixture.state,
-                "absent-artifact-uninstall",
-                "fanout-skill",
-            )
+            .install_skill(&fixture.state, source)
             .await
             .map_err(|error| error.to_string())?;
-        assert!(!receipt.artifact_removed);
-        assert!(receipt.artifact_error.is_none());
+        assert_eq!(
+            receipt.installed_names,
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert!(!receipt.settlement.idempotent);
+        let config = EnabledSkillsConfig::load(&fixture.temp.path().join("enabled-skills.json"))
+            .map_err(|error| error.to_string())?;
+        assert!(config.is_enabled("alpha"));
+        assert!(config.is_enabled("beta"));
+        assert!(
+            fixture
+                .state
+                .connection
+                .primary_agent()
+                .read(|agent| agent.has_skill("alpha") && agent.has_skill("beta"))
+                .await
+        );
         Ok(())
     }
+
 
     #[tokio::test]
     async fn mutation_permit_serializes_two_surface_commands() -> Result<(), String> {

@@ -59,7 +59,7 @@ launcher 不再维护跨 TaskRun metadata DAG 或轮询器。CLI 使用 `/tasks 
 | Agent 协作控制面 | discriminated Conversation/TaskSubagent target、bounded list/inspect/message/followup/wait/interrupt | `echo-agent-app-core/src/agent_control.rs` |
 | Hooks/Webhooks | 生命周期事件、command/Subagent/MCP actions、配置热重载                                   | `echo-agent-app-core/src/hook_config_loader.rs`        |
 | Plugins        | framework prepared generation、captured target fanout、typed generation receipt、Subagents/LSP/scope-qualified monitors/themes/styles | `echo-agent-app-core/src/plugin_runtime/runtime.rs` |
-| Skills         | 递归发现、安装、启停、upstream staging sync 与 durable desired/settled generation        | `skills_hub/` + `extension_control/skills.rs`                 |
+| Skills         | 递归发现、安装、启停、upstream staging sync、flat policy 原子写与即时 reconcile         | `skills_hub/` + `extension_control/skills.rs`                 |
 
 ### Extension Control Authority
 
@@ -67,9 +67,9 @@ launcher 不再维护跨 TaskRun metadata DAG 或轮询器。CLI 使用 `/tasks 
 admission，并把真实执行委托给既有 specialist owner。它不建立第二套 registry、manager 或
 store。
 
-- Skill 使用 v2 durable desired/settled generation、atomic commit、typed degraded/debt
-  receipt 与 caller-drop owned settlement；GUI/headless boot、workspace load 和下一 mutation
-  都重放 debt。
+- Skill 使用 version 2 flat policy、atomic commit、typed settled/degraded receipt 与
+  caller-drop owned settlement；GUI/headless boot、workspace load 和下一 mutation 都重新读取
+  policy 并 reconcile，不保留 repair debt。
 - GUI 使用 generated typed generic IPC；JSONL 输出 journaled typed `ExtensionReceipt` 且不
   进入模型；CLI、TUI、channel 使用同一 app-core authority 并保留 terminal settlement。
 - Browser 与 LSP 的完整命令面在 GUI、TUI、CLI/JSONL 和 channel 可达。

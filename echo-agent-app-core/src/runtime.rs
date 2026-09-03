@@ -793,16 +793,11 @@ impl ApplicationServices {
             Ok(receipt)
                 if receipt.status == crate::extension_control::SkillSettlementStatus::Settled =>
             {
-                tracing::info!(
-                    generation = receipt.settled_generation,
-                    "Extension Skill generation settled during application startup"
-                );
+                tracing::info!("Extension Skill runtimes settled during application startup");
             }
             Ok(receipt) => tracing::warn!(
-                desired_generation = receipt.desired_generation,
-                settled_generation = receipt.settled_generation,
                 status = ?receipt.status,
-                "Extension Skill repair remains pending after application startup"
+                "Extension Skill runtime reconciliation is degraded after application startup"
             ),
             Err(error) => tracing::warn!(
                 %error,
@@ -1135,67 +1130,21 @@ impl AgentRuntime {
         }
 
         // ── 5b. Methodology baseline injection ──
-        // Inject core methodology skill bodies (brainstorming / debugging /
-        // verification / planning) directly into the system prompt so they
-        // are always active without requiring explicit activate_skill calls.
-        {
-            let enabled_config_path = crate::data_root::user_data_path("enabled-skills.json");
-            let enabled_config = match crate::skills_hub::EnabledSkillsConfig::load(
-                &enabled_config_path,
-            ) {
-                Ok(config) => Some(config),
-                Err(error) => {
-                    tracing::warn!(
-                        path = %enabled_config_path.display(),
-                        %error,
-                        "Skipping methodology baseline injection because enabled-skills.json is invalid"
-                    );
-                    None
-                }
-            };
-            // 收集 baseline 名为 owned Vec<String>,move 进 async 闭包(闭包要 'static,
-            // 不能借用会在块结束 drop 的 enabled_config)。
-            let baseline_names: Vec<String> = enabled_config
-                .as_ref()
-                .map(|config| {
-                    config
-                        .enabled_baseline_names()
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect()
+        // The same authority is called by pooled conversation Agent creation.
+        let baseline_config_path = crate::data_root::user_data_path("enabled-skills.json");
+        let baseline_names = agent_handle
+            .write_async(|agent| {
+                Box::pin(async move {
+                    crate::skills_hub::apply_methodology_baseline(agent, &baseline_config_path)
+                        .await
                 })
-                .unwrap_or_default();
-            tracing::info!(
-                count = baseline_names.len(),
-                skills = ?baseline_names,
-                "Methodology baseline skills loaded from enabled-skills.json"
-            );
-            if !baseline_names.is_empty() {
-                agent_handle
-                    .write_async(|a| {
-                        Box::pin(async move {
-                            // 用 public API 读当前有效 system_prompt(优先 runtime
-                            // override,否则 config.system_prompt)。bootstrap 阶段
-                            // mutable_system_prompt 还是 None,返回 config 值。
-                            // 避免访问 pub(crate) 私有字段 system_prompt。
-                            let mut sp = a.current_system_prompt();
-                            // baseline_names 已 move 进闭包,此处借用安全。
-                            let refs: Vec<&str> =
-                                baseline_names.iter().map(|s| s.as_str()).collect();
-                            a.skill_registry()
-                                .inject_methodology_baseline(&mut sp, &refs);
-                            a.set_system_prompt(sp).await;
-                            let disabled_tools = a.disabled_tool_names();
-                            crate::subagent_prompt::refresh_primary_system_prompt(
-                                a,
-                                &disabled_tools,
-                            );
-                        })
-                    })
-                    .await;
-                tracing::info!("Methodology baseline injected into system prompt");
-            }
-        }
+            })
+            .await;
+        tracing::info!(
+            count = baseline_names.len(),
+            skills = ?baseline_names,
+            "Methodology baseline injected into primary Agent"
+        );
 
         // ── 6. User hooks ──
         // Single merged load: eko.yaml inline + ~/.eko/hooks.yaml +

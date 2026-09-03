@@ -9,8 +9,8 @@ pub mod policy_contract;
 pub mod registry;
 
 pub use enabled_skills::{
-    ActiveSkillLoadPolicy, BUILTIN_SKILL_NAMES, EnabledSkillsConfig, builtin_skills_root,
-    is_builtin_skill_path,
+    ActiveSkillLoadPolicy, BUILTIN_SKILL_NAMES, EnabledSkillsConfig, apply_methodology_baseline,
+    builtin_skills_root, configure_bundled_skills_root, is_builtin_skill_path,
 };
 pub(crate) use install::sync_skills;
 pub use install::{SkillSourceRecord, SkillUpdateState, SkillUpdateStatus, check_updates};

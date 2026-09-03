@@ -90,6 +90,8 @@ pub enum SlashCommand {
     /// Attach a file (image/document) to the next message (B5.3 multimodal).
     Attach,
     Skills,
+    /// Activate a skill in the current conversation (user-invoked).
+    Skill,
     Mcp,
     Hooks,
     Plugins,
@@ -190,6 +192,7 @@ impl SlashCommand {
             Self::Forget => "Remove a fact from memory",
             Self::Attach => "Attach a file to the next message (/attach <path>)",
             Self::Skills => "List and manage skills",
+            Self::Skill => "Activate a skill in the current conversation",
             Self::Mcp => "List, load, or disconnect MCP servers",
             Self::Hooks => "List, reload, or test hooks",
             Self::Plugins => "Manage live plugins",
@@ -282,6 +285,7 @@ impl SlashCommand {
             | Self::Forget
             | Self::Attach
             | Self::Skills
+            | Self::Skill
             | Self::Mcp
             | Self::Hooks
             | Self::Plugins => Category::Context,
@@ -402,6 +406,7 @@ impl SlashCommand {
             Self::CodeReview => "[file-or-dir]",
             Self::Attach => "<file-path>",
             Self::Skills => "[list|search|install|uninstall|info|refresh] [args]",
+            Self::Skill => "<skill-name> [instructions]",
             Self::Mcp => "[list|load <config>|disconnect <name>]",
             Self::Hooks => "[list|reload|test <event> [matcher]]",
             Self::Plugins => {

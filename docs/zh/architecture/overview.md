@@ -327,29 +327,24 @@ EKO 启动时把 framework 用户数据根设置为 `~/.eko`，也可用 `EKO_DA
 | EKO app-core       | workspace generation capture、mutation admission、配置文件、生命周期和 typed receipt |
 | surface            | 参数转换和 receipt 渲染                                                              |
 
-`enabled-skills.json` 是 Skill 启停的唯一 durable desired fact。Skill settlement
-先用同目录 staging、文件同步、原子替换和父目录同步提交 desired generation，
-再向 global seed、已加载 workspace、existing AgentPool 和 future Agent fanout。durable commit
-之后的 target failure 返回 typed degraded receipt 与 repair debt，不进行内存 rollback。
+`enabled-skills.json` 是 Skill 启停的唯一持久事实，只保存
+`{category, enabled, baseline}` flat map。Skill settlement 在 extension mutation 锁内原子写，
+再向 global seed、已加载 workspace、existing AgentPool 和 future Agent reconcile。target
+失败返回带逐 target 错误的 typed `Degraded` receipt，不回滚已经提交的配置，也不保留
+generation CAS、operation identity 或 repair debt。
 
-receipt 同时携带 operation/content identity、desired generation、settlement 状态、逐 target
-的 workspace/specialist generation、committed file path 以及结构化 repair debt。每个
-`SkillRepairTargetDebt` 包含 target/component、expected/observed generation、reason 与
-retryable。相同 operation + 相同 content 幂等返回，
-相同 operation + 不同 content 是冲突；旧 generation 不能覆盖新 generation。repair debt 由
-durable desired generation 与 live applied generation 的差异推导；bounded debt snapshot
-可以与 desired state 同存在一个文件中，但不建立第二个 store，并在 restart、workspace load
-和下一次 mutation 前重放。disabled Skill artifact 删除失败也进入同一 bounded debt，不由
-surface 私下重试。
+配置损坏或不可读时统一回退默认启用集。文件已写但运行时未同步完成的窗口，由下一次
+Skill 操作、restart 或 workspace load 重新读取 flat policy 并收敛。install/uninstall/sync
+的 artifact 结果与 runtime settlement 保持分离，surface 不私下重试。
 
 service 接受 operation 后由应用 lifecycle 持有到 settlement；caller drop 不能取消已经接受的
 提交或 fanout。shutdown 先关闭 admission，再等待已接受 operation。完整决策见
 [ADR 0012](../adr/0012-extension-control-authority.md)。
 
-v2 desired/settled generation、`atomic_write`、ProductData-owned `SkillSyncReceipt` 和带
-workspace/specialist generation 的 target receipt 已进入生产路径；Skill content identity 同时
-覆盖 policy 与 enabled `SKILL.md`。GUI/headless bootstrap 在 Agent delivery recovery 前调用
-on-load reconcile，workspace create/switch settlement 也执行相同 repair。
+version 2 flat policy、`atomic_write`、ProductData-owned `SkillSyncReceipt` 和带
+workspace generation 的 target receipt 已进入生产路径。GUI/headless bootstrap 在 Agent
+delivery recovery 前调用 on-load reconcile，workspace create/switch settlement 也执行同一
+收敛路径。
 
 `ExtensionCommandDispatcher` 提供 Skills/Plugins/MCP/Hooks/LSP/Browser 的 surface-neutral
 request/receipt。GUI 使用 typed Tauri IPC；JSONL 把 typed `ExtensionReceipt` 写入 canonical

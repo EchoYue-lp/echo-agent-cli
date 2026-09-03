@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted; catalog and baseline inventory amended on 2026-09-03
 
 ## Context
 
@@ -69,6 +69,13 @@ frontmatter extension concepts.
 8. **ADR 0003 remains a historical snapshot**: its 25-entry / 14-superpowers
    inventory records the catalog at that time and is not retro-edited; the
    live inventory is `/skills list` plus the catalog gate.
+9. **Second contraction in 2026-09 (39 → 24):** removed `coding`,
+   `translation`, `doc-writing`, and `web-search`, whose behavioral guidance is
+   covered by the base prompt, plus 11 vendored design/automation/research
+   examples installable from `anthropics/skills`. The default-active set moves
+   from 8 to 5 and the methodology baseline from 4 to 1, retaining only
+   `verification-before-completion`. Bounded workspace profile prompts and the
+   remaining domain Skills own workspace-specific behavior.
 
 ## Consequences
 
@@ -77,9 +84,9 @@ frontmatter extension concepts.
 - Keyword routing no longer comes from files: the `KeywordClassifier` word
   list is empty and routing relies on the LLM intent classifier reading
   descriptions (DirectAnswer/Fallback without an LLM).
-- The bundled catalog contracts from 41 to 39; `BUILTIN_SKILL_NAMES`, the
-  unchanged `DEFAULT_ACTIVE_BUILTIN_SKILLS`, the CHANGELOG, and this ADR
-  stay in sync.
+- The bundled catalog contracts first from 41 to 39 and then to 24 in 2026-09;
+  `BUILTIN_SKILL_NAMES`, `DEFAULT_ACTIVE_BUILTIN_SKILLS`, the methodology
+  baseline, the CHANGELOG, and this ADR stay in sync.
 - Third-party user skills written in the old private format fail to parse
   with an explicit discovery diagnostic — per this project's
   no-backward-compatibility rule, no migration shim is provided.

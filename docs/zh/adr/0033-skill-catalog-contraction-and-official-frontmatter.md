@@ -2,7 +2,7 @@
 
 ## 状态
 
-已采纳
+已采纳；2026-09-03 修订 catalog 与 baseline 清单
 
 ## 背景
 
@@ -29,10 +29,17 @@ EKO 捆绑的 Skill catalog 使用私有 frontmatter 扩展字段（顶层 `trig
 6. **evolution 子系统跟随标准**：`SkillDraftGenerator` 生成的草稿只写标准字段（trigger patterns 留在 curator state）；`SkillMerger` 落盘时只合并 `allowed-tools`，trigger/path 联合保留在内存 descriptor。
 7. **路径边界规范化**：`builtin_skills_root()`、`ActiveSkillLoadPolicy` 与 `reload_skills_from_dir` 全部与 loader 一样 canonicalize 路径，消除 symlink 前缀失配导致的 policy 绕过与 reload 静默 no-op。
 8. **ADR 0003 保留为历史快照**：其记录的 25 条目/14 个 superpowers 的清单是当时的 catalog 状态，不回填修改；当前清单以 `/skills list` 与 catalog gate 为准。
+9. **2026-09 第二次收缩（39 → 24）**：删除已由基础 prompt 覆盖的
+   `coding` / `translation` / `doc-writing` / `web-search`，以及 11 个可从
+   `anthropics/skills` 安装的 vendored design/automation/research 示例；默认启用集
+   8 → 5，methodology baseline 4 → 1，仅保留
+   `verification-before-completion`。工作区专属行为由有界 profile prompt 与仍存在的领域
+   Skill 承担。
 
 ## 影响
 
 - 捆绑 Skill 与官方生态兼容，可用 `skills-ref validate` 或进程内 gate 校验。
 - 关键词路由不再来自文件；`KeywordClassifier` 的词表为空，路由依赖 LLM 意图分类器读取 description（无 LLM 时走 DirectAnswer/Fallback）。
-- 捆绑 catalog 从 41 收缩到 39；`BUILTIN_SKILL_NAMES`、`DEFAULT_ACTIVE_BUILTIN_SKILLS`（不变）、CHANGELOG 与本 ADR 同步。
+- 捆绑 catalog 先从 41 收缩到 39，再于 2026-09 收缩到 24；
+  `BUILTIN_SKILL_NAMES`、`DEFAULT_ACTIVE_BUILTIN_SKILLS`、baseline、CHANGELOG 与本 ADR 同步。
 - 用户安装的第三方 Skill 若使用旧私有字段，将解析失败并在 discovery 诊断中显式报错——按"无需向后兼容"的项目原则，不提供迁移垫片。

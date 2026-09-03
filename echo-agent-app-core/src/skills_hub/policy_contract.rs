@@ -113,9 +113,13 @@ mod tests {
         // Progressive activation registry: the disabled skill cannot activate.
         assert!(!agent.skill_registry_mut().is_installed("off-skill"));
         assert!(agent.skill_registry_mut().is_installed("on-skill"));
-        // `activate_skill` no-ops for uninstalled skills; the disabled skill
-        // must stay unactivated rather than error out or load from disk.
-        agent.activate_skill("off-skill").await.expect("no-op ok");
+        // `activate_skill` surfaces an explicit error for uninstalled skills
+        // (Phase 0 contract change); the disabled skill must stay unactivated.
+        let rejected = agent
+            .activate_skill("off-skill")
+            .await
+            .expect_err("disabled skill activation must error");
+        assert!(rejected.to_string().contains("not installed"));
         assert!(!agent.skill_registry_mut().is_activated("off-skill"));
         agent
             .activate_skill("on-skill")
@@ -212,21 +216,33 @@ mod tests {
     }
 
     #[test]
-    fn malformed_enabled_config_fails_closed_for_all_builtins() {
-        let root = temp_root("failclosed");
+    fn malformed_enabled_config_falls_back_to_default_active_set() {
+        // 2026-09 语义变更(fail-closed → fail-open):本地个人助理不应因
+        // 一个写坏的 JSON 而静默丢失全部内置 skill;坏文件回退默认启用集。
+        let root = temp_root("failopen");
         let config_path = root.0.join("enabled-skills.json");
         std::fs::write(&config_path, "{ not valid json").expect("corrupt config");
 
         let policy = ActiveSkillLoadPolicy::new(config_path, root.0.join("builtin"), None);
         let mut descriptor = echo_agent::skills::external::SkillDocument::parse(
-            "---\nname: coding\ndescription: core\n---\nbody",
+            "---\nname: git-workflow\ndescription: core\n---\nbody",
         )
         .expect("parse")
         .into_descriptor();
-        descriptor.location = root.0.join("builtin/coding/SKILL.md");
+        descriptor.location = root.0.join("builtin/git-workflow/SKILL.md");
         assert!(
-            !policy.allows(&descriptor),
-            "corrupted enabled-skills.json must deactivate every builtin"
+            policy.allows(&descriptor),
+            "corrupted enabled-skills.json must fall back to the default active set"
+        );
+        let mut optional = echo_agent::skills::external::SkillDocument::parse(
+            "---\nname: docx\ndescription: optional\n---\nbody",
+        )
+        .expect("parse")
+        .into_descriptor();
+        optional.location = root.0.join("builtin/docx/SKILL.md");
+        assert!(
+            !policy.allows(&optional),
+            "default fallback must still keep opt-in skills disabled"
         );
     }
 

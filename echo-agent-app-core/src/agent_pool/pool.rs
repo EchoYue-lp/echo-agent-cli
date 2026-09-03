@@ -1486,19 +1486,21 @@ impl AgentPool {
     pub(crate) async fn reconcile_builtin_skills(
         &self,
         builtin_root: std::path::PathBuf,
-    ) -> Result<(), String> {
+        enabled_config_path: std::path::PathBuf,
+    ) -> Result<Vec<String>, String> {
         let primary = self.primary_agent().await.map_err(|error| error.to_string())?;
         let primary_builtin_root = builtin_root.clone();
-        let descriptors = primary
+        let primary_config_path = enabled_config_path.clone();
+        let (descriptors, mut changed_entries) = primary
             .write_async(|agent| {
                 Box::pin(async move {
-                    agent
-                        .reload_skills_from_dir(primary_builtin_root)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    agent.reconcile_skill_load_policy().await;
-                    crate::runtime::configure_intent_router(agent);
-                    Ok::<_, String>(agent.skill_descriptors())
+                    let changed = reconcile_builtin_agent(
+                        agent,
+                        &primary_builtin_root,
+                        &primary_config_path,
+                    )
+                    .await?;
+                    Ok::<_, String>((agent.skill_descriptors(), changed))
                 })
             })
             .await?;
@@ -1513,22 +1515,20 @@ impl AgentPool {
             .collect::<Vec<_>>();
         for handle in handles {
             let builtin_root = builtin_root.clone();
-            handle
+            let enabled_config_path = enabled_config_path.clone();
+            let changed = handle
                 .write_async(|agent| {
                     Box::pin(async move {
-                        agent
-                            .reload_skills_from_dir(builtin_root)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        agent.reconcile_skill_load_policy().await;
-                        crate::runtime::configure_intent_router(agent);
-                        Ok::<_, String>(())
+                        reconcile_builtin_agent(agent, &builtin_root, &enabled_config_path).await
                     })
                 })
                 .await?;
+            changed_entries.extend(changed);
         }
         self.agent_generation.write().await.skill_descriptors = descriptors;
-        Ok(())
+        changed_entries.sort();
+        changed_entries.dedup();
+        Ok(changed_entries)
     }
 
     /// Return the primary Agent for this pool generation.
@@ -1881,6 +1881,17 @@ impl AgentPool {
             .reload_skills_from_dir(crate::skills_hub::builtin_skills_root())
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let baseline_config_path = crate::data_root::user_data_path("enabled-skills.json");
+        let baseline_names = crate::skills_hub::apply_methodology_baseline(
+            &mut agent,
+            &baseline_config_path,
+        )
+        .await;
+        tracing::debug!(
+            conversation_id,
+            skills = ?baseline_names,
+            "Methodology baseline injected into pooled conversation Agent"
+        );
         let conversation_store = self
             .conversation_store_override
             .read()
@@ -2016,4 +2027,45 @@ impl AgentPool {
             conversation_id.to_string(),
         ))
     }
+}
+
+async fn reconcile_builtin_agent(
+    agent: &mut echo_agent::agent::ReactAgent,
+    builtin_root: &std::path::Path,
+    enabled_config_path: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    let builtin_names = |agent: &echo_agent::agent::ReactAgent| {
+        agent
+            .skill_descriptors()
+            .into_iter()
+            .filter(|descriptor| descriptor.location.starts_with(builtin_root))
+            .map(|descriptor| descriptor.name)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let before = builtin_names(agent);
+    let baseline_before = agent
+        .context()
+        .lock()
+        .await
+        .has_projection(crate::skills_hub::enabled_skills::METHODOLOGY_BASELINE_PROJECTION);
+    agent
+        .reload_skills_from_dir(builtin_root.to_path_buf())
+        .await
+        .map_err(|error| error.to_string())?;
+    agent.reconcile_skill_load_policy().await;
+    let baseline_names =
+        crate::skills_hub::apply_methodology_baseline(agent, enabled_config_path).await;
+    crate::runtime::configure_intent_router(agent);
+    let after = builtin_names(agent);
+    let mut changed = before
+        .symmetric_difference(&after)
+        .cloned()
+        .collect::<Vec<_>>();
+    if baseline_before != !baseline_names.is_empty() {
+        changed.extend(baseline_names);
+        if baseline_before && changed.is_empty() {
+            changed.push("verification-before-completion".to_string());
+        }
+    }
+    Ok(changed)
 }

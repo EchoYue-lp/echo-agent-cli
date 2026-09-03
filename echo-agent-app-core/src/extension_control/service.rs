@@ -852,8 +852,9 @@ impl ExtensionControlService {
             .await
     }
 
-    /// Admit one durable desired-state mutation. Once spawned, settlement is
-    /// independent of the caller's future and is joined by ProductData shutdown.
+    /// 直写直同步(2026-09 简化):锁内 读取 config → 修改条目 → 原子写 →
+    /// reconcile 到所有运行时目标。不再做 operation identity 去重与
+    /// generation CAS;重复操作天然幂等(条目值不变 → idempotent=true)。
     pub async fn set_skill_enabled_with_operation(
         self: &Arc<Self>,
         state: &Arc<AppState>,
@@ -875,155 +876,50 @@ impl ExtensionControlService {
         let state = Arc::clone(state);
         let operation_id = operation_id.to_string();
         let name = name.to_string();
-        let command_identity = skill_toggle_command_identity(&name, enabled);
-        let settlement_flow = flow;
         tokio::spawn(async move {
             let _mutation = service.mutation.lock().await;
-            let outcome = service
-                .settle_skill_mutation_owned(
-                    &state,
-                    &settlement_flow,
-                    AdmittedSkillMutation {
-                        operation_id,
-                        command_identity,
-                        name,
-                        enabled,
-                        artifact_name: None,
-                    },
-                )
-                .await;
-            settlement_flow.settle(skill_business_failure(&outcome));
+            let outcome = async {
+                let mut config =
+                    read_enabled_skills_config(&flow, service.enabled_config_path.clone()).await?;
+                let idempotent = config.is_enabled(&name) == enabled
+                    && config.skills.contains_key(&name);
+                let category = match config.skills.get(&name) {
+                    Some(entry) if entry.category != "builtin" => entry.category.clone(),
+                    _ => skill_entry(&state, &name)
+                        .await
+                        .map(|(_, category)| category)
+                        .map_err(|error| SkillMutationError::BeforeCommit(error.to_string()))?,
+                };
+                match config.skills.get_mut(&name) {
+                    Some(entry) => entry.enabled = enabled,
+                    None => {
+                        config.skills.insert(
+                            name.clone(),
+                            SkillEnableEntry {
+                                category,
+                                enabled,
+                                baseline: false,
+                            },
+                        );
+                    }
+                }
+                write_enabled_skills_config(&flow, service.enabled_config_path.clone(), config)
+                    .await?;
+                service.reconcile_skill_runtimes(&state, &flow, operation_id, idempotent).await
+            }
+            .await;
+            let failure = match &outcome {
+                Ok(receipt) if receipt.status == SkillSettlementStatus::Degraded => {
+                    Some("skill policy committed but runtime reconciliation is degraded".to_string())
+                }
+                Ok(_) => None,
+                Err(error) => Some(error.to_string()),
+            };
+            flow.settle(failure);
             outcome
         })
         .await
         .map_err(|error| SkillMutationError::SettlementTask(error.to_string()))?
-    }
-
-    async fn settle_skill_mutation_owned(
-        &self,
-        state: &Arc<AppState>,
-        flow: &crate::product_data_io::ProductDataIoFlow,
-        mutation: AdmittedSkillMutation,
-    ) -> Result<SkillSyncReceipt, SkillMutationError> {
-        let AdmittedSkillMutation {
-            operation_id,
-            command_identity,
-            name,
-            enabled,
-            artifact_name,
-        } = mutation;
-        let _repair = self
-            .reconcile_committed_skill_policy(state, flow, format!("repair-before-{operation_id}"))
-            .await?;
-        let skill_root = state.skills_hub.read().await.root().to_path_buf();
-        let mut config = read_enabled_skills_config(flow, self.enabled_config_path.clone()).await?;
-        normalize_skill_content_identity(flow, &mut config, skill_root.clone()).await?;
-        let durable_config = config.clone();
-        if let Some(committed) = config.operation(&operation_id)
-            && !committed.command_identity.is_empty()
-        {
-            if committed.command_identity != command_identity {
-                return Err(SkillMutationError::OperationConflict {
-                    operation_id,
-                    committed_content_identity: committed.content_identity.clone(),
-                });
-            }
-            return self
-                .reconcile_skill_config(
-                    state,
-                    flow,
-                    durable_config,
-                    operation_id,
-                    true,
-                    true,
-                    Vec::new(),
-                )
-                .await;
-        }
-        let category = if !enabled {
-            config.skills.get(&name).map(|entry| entry.category.clone())
-        } else {
-            None
-        };
-        let category = match category {
-            Some(category) => category,
-            None => skill_entry(state, &name)
-                .await
-                .map(|(_, category)| category)
-                .map_err(|error| SkillMutationError::BeforeCommit(error.to_string()))?,
-        };
-        match config.skills.get_mut(&name) {
-            Some(entry) => entry.enabled = enabled,
-            None => {
-                config.skills.insert(
-                    name.clone(),
-                    SkillEnableEntry {
-                        category,
-                        enabled,
-                        baseline: false,
-                    },
-                );
-            }
-        }
-        let proposed_identity =
-            compute_skill_content_identity(flow, config.skills.clone(), skill_root).await?;
-        if let Some(committed) = config.operation(&operation_id) {
-            if committed.content_identity != proposed_identity {
-                return Err(SkillMutationError::OperationConflict {
-                    operation_id,
-                    committed_content_identity: committed.content_identity.clone(),
-                });
-            }
-            return self
-                .reconcile_skill_config(
-                    state,
-                    flow,
-                    durable_config,
-                    operation_id,
-                    true,
-                    true,
-                    Vec::new(),
-                )
-                .await;
-        }
-
-        let same_content = proposed_identity == config.content_identity;
-        if !same_content {
-            config.desired_generation =
-                config.desired_generation.checked_add(1).ok_or_else(|| {
-                    SkillMutationError::BeforeCommit(
-                        "enabled skill desired generation is exhausted".to_string(),
-                    )
-                })?;
-            config.content_identity = proposed_identity.clone();
-            config.set_repair_debt(SkillRepairDebt {
-                generation: config.desired_generation,
-                content_identity: proposed_identity.clone(),
-                attempts: 0,
-                target_failures: Vec::new(),
-                artifact_removals: Vec::new(),
-                artifact_syncs: Vec::new(),
-                artifact_enablements: Vec::new(),
-            });
-        }
-        config.record_operation(SkillOperationIdentity {
-            operation_id: operation_id.clone(),
-            command_identity,
-            artifact_name,
-            content_identity: proposed_identity,
-            generation: config.desired_generation,
-        });
-        write_enabled_skills_config(flow, self.enabled_config_path.clone(), config.clone()).await?;
-        self.reconcile_skill_config(
-            state,
-            flow,
-            config,
-            operation_id,
-            same_content,
-            true,
-            Vec::new(),
-        )
-        .await
     }
 
     pub async fn refresh_enabled_skills(
@@ -1055,41 +951,19 @@ impl ExtensionControlService {
         let service = Arc::clone(self);
         let state = Arc::clone(state);
         let operation_id = operation_id.to_string();
-        let command_identity = skill_artifact_command_identity("refresh", "enabled-skills", false);
-        let settlement_flow = flow;
         tokio::spawn(async move {
             let _mutation = service.mutation.lock().await;
-            let outcome = async {
-                let duplicate = admitted_skill_operation(
-                    &settlement_flow,
-                    service.enabled_config_path.clone(),
-                    &operation_id,
-                    &command_identity,
-                )
-                .await?
-                .is_some();
-                let receipt = service
-                    .reconcile_committed_skill_policy(
-                        &state,
-                        &settlement_flow,
-                        operation_id.clone(),
-                    )
-                    .await?;
-                if !duplicate {
-                    record_skill_operation_identity(
-                        &settlement_flow,
-                        service.enabled_config_path.clone(),
-                        &receipt,
-                        operation_id,
-                        command_identity,
-                        None,
-                    )
-                    .await?;
+            let outcome = service
+                .reconcile_skill_runtimes(&state, &flow, operation_id, true)
+                .await;
+            let failure = match &outcome {
+                Ok(receipt) if receipt.status == SkillSettlementStatus::Degraded => {
+                    Some("skill runtime reconciliation is degraded".to_string())
                 }
-                Ok(receipt)
-            }
-            .await;
-            settlement_flow.settle(skill_business_failure(&outcome));
+                Ok(_) => None,
+                Err(error) => Some(error.to_string()),
+            };
+            flow.settle(failure);
             outcome
         })
         .await
@@ -1097,7 +971,7 @@ impl ExtensionControlService {
     }
 
     /// Restart and workspace-load owners call the same reconciliation path as
-    /// explicit refresh; repair debt never has a surface-specific replayer.
+    /// explicit refresh.
     pub async fn reconcile_enabled_skills_on_load(
         self: &Arc<Self>,
         state: &Arc<AppState>,
@@ -1105,184 +979,69 @@ impl ExtensionControlService {
         self.refresh_enabled_skills(state).await
     }
 
-    async fn reconcile_committed_skill_policy(
+    /// 把 enabled-skills.json 的当前状态同步到所有运行时目标:
+    /// 每个 target 先 reconcile 内置目录,再对齐用户/插件 skill。
+    async fn reconcile_skill_runtimes(
         &self,
         state: &Arc<AppState>,
         flow: &crate::product_data_io::ProductDataIoFlow,
-        operation_id: String,
-    ) -> Result<SkillSyncReceipt, SkillMutationError> {
-        let skill_root = state.skills_hub.read().await.root().to_path_buf();
-        let mut config = read_enabled_skills_config(flow, self.enabled_config_path.clone()).await?;
-        let (artifact_changed, target_receipts, terminal_receipts) =
-            replay_skill_artifact_debt(state, &mut config).await;
-        let metadata_changed =
-            normalize_skill_content_identity(flow, &mut config, skill_root).await?;
-        if artifact_changed || metadata_changed {
-            write_enabled_skills_config(flow, self.enabled_config_path.clone(), config.clone())
-                .await?;
-        }
-        let mut receipt = self
-            .reconcile_skill_config(
-                state,
-                flow,
-                config,
-                operation_id,
-                true,
-                true,
-                target_receipts,
-            )
-            .await?;
-        if !terminal_receipts.is_empty() {
-            receipt.status = SkillSettlementStatus::Degraded;
-            receipt.target_receipts.extend(terminal_receipts);
-        }
-        Ok(receipt)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn reconcile_skill_config(
-        &self,
-        state: &Arc<AppState>,
-        flow: &crate::product_data_io::ProductDataIoFlow,
-        config: EnabledSkillsConfig,
         operation_id: String,
         idempotent: bool,
-        durable_committed: bool,
-        mut target_receipts: Vec<SkillTargetSettlementReceipt>,
     ) -> Result<SkillSyncReceipt, SkillMutationError> {
         let skill_root = state.skills_hub.read().await.root().to_path_buf();
-        if !skill_commit_is_current(flow, self.enabled_config_path.clone(), &config).await? {
-            target_receipts.push(stale_skill_generation_receipt(&config));
-            return settle_skill_generation(
-                flow,
-                self.enabled_config_path.clone(),
-                config,
-                operation_id,
-                idempotent,
-                durable_committed,
-                target_receipts,
-            )
-            .await;
-        }
-        let artifact_removals = config
-            .repair_debt
-            .as_ref()
-            .map(|debt| debt.artifact_removals.clone())
-            .unwrap_or_default();
-        for name in artifact_removals {
-            if config.skills.get(&name).is_some_and(|entry| entry.enabled) {
-                continue;
-            }
-            let removal_root = skill_root.clone();
-            let removal_name = name.clone();
-            let removal = flow
-                .run("repair disabled skill artifact", move || {
-                    remove_skill_artifact(removal_root, &removal_name)
-                })
-                .await;
-            let receipt = match removal {
-                Ok(Ok(removed)) => SkillTargetSettlementReceipt {
-                    target: format!("skill-artifact:{name}"),
-                    workspace_generation: "global".to_string(),
-                    specialist_generation: config.desired_generation,
-                    status: SkillTargetSettlementStatus::Settled,
-                    changed_entries: removed.then_some(name).into_iter().collect(),
-                    error: None,
-                },
-                Ok(Err(error)) => SkillTargetSettlementReceipt {
-                    target: format!("skill-artifact:{name}"),
-                    workspace_generation: "global".to_string(),
-                    specialist_generation: config.desired_generation,
-                    status: SkillTargetSettlementStatus::Degraded,
-                    changed_entries: Vec::new(),
-                    error: Some(error),
-                },
-                Err(error) => SkillTargetSettlementReceipt {
-                    target: format!("skill-artifact:{name}"),
-                    workspace_generation: "global".to_string(),
-                    specialist_generation: config.desired_generation,
-                    status: SkillTargetSettlementStatus::Degraded,
-                    changed_entries: Vec::new(),
-                    error: Some(error.to_string()),
-                },
-            };
-            target_receipts.push(receipt);
-        }
+        let config = read_enabled_skills_config(flow, self.enabled_config_path.clone()).await?;
         let desired_config = config.clone();
         let desired_root = skill_root.clone();
-        let desired = match flow
+        let desired = flow
             .run("resolve enabled skill catalog", move || {
                 desired_skill_entries(&desired_config, desired_root)
             })
             .await
-        {
-            Ok(desired) => desired,
-            Err(error) => {
-                target_receipts.push(SkillTargetSettlementReceipt {
-                    target: "skill-catalog".to_string(),
-                    workspace_generation: "global".to_string(),
-                    specialist_generation: config.desired_generation,
-                    status: SkillTargetSettlementStatus::Degraded,
-                    changed_entries: Vec::new(),
-                    error: Some(error.to_string()),
-                });
-                return settle_skill_generation(
-                    flow,
-                    self.enabled_config_path.clone(),
-                    config,
-                    operation_id,
-                    idempotent,
-                    durable_committed,
-                    target_receipts,
-                )
-                .await;
-            }
-        };
+            .map_err(|error| SkillMutationError::BeforeCommit(error.to_string()))?;
+
+        let mut target_receipts = Vec::new();
         match state.extension_runtime_targets().await {
             Ok(targets) => {
                 for target in targets.iter() {
-                    if !skill_commit_is_current(flow, self.enabled_config_path.clone(), &config)
-                        .await?
-                    {
-                        target_receipts.push(stale_skill_generation_receipt(&config));
-                        break;
-                    }
                     let workspace_generation = target.workspace_generation().to_string();
                     let builtin_result = target
                         .pool()
-                        .reconcile_builtin_skills(crate::skills_hub::builtin_skills_root())
+                        .reconcile_builtin_skills(
+                            crate::skills_hub::builtin_skills_root(),
+                            self.enabled_config_path.clone(),
+                        )
                         .await;
                     let receipt = match builtin_result {
                         Err(error) => SkillTargetSettlementReceipt {
                             target: target.scope().to_string(),
                             workspace_generation,
-                            specialist_generation: config.desired_generation,
                             status: SkillTargetSettlementStatus::Degraded,
                             changed_entries: Vec::new(),
                             error: Some(error),
                         },
-                        Ok(()) => match reconcile_target_skills(target, &desired, &skill_root).await {
                         Ok(mut changed_entries) => {
-                            changed_entries.sort();
-                            changed_entries.dedup();
-                            SkillTargetSettlementReceipt {
+                            match reconcile_target_skills(target, &desired, &skill_root).await {
+                            Ok(user_changed_entries) => {
+                                changed_entries.extend(user_changed_entries);
+                                changed_entries.sort();
+                                changed_entries.dedup();
+                                SkillTargetSettlementReceipt {
+                                    target: target.scope().to_string(),
+                                    workspace_generation,
+                                    status: SkillTargetSettlementStatus::Settled,
+                                    changed_entries,
+                                    error: None,
+                                }
+                            }
+                            Err(error) => SkillTargetSettlementReceipt {
                                 target: target.scope().to_string(),
-                                workspace_generation: workspace_generation.clone(),
-                                specialist_generation: config.desired_generation,
-                                status: SkillTargetSettlementStatus::Settled,
+                                workspace_generation,
+                                status: SkillTargetSettlementStatus::Degraded,
                                 changed_entries,
-                                error: None,
+                                error: Some(error.to_string()),
+                            },
                             }
                         }
-                        Err(error) => SkillTargetSettlementReceipt {
-                            target: target.scope().to_string(),
-                            workspace_generation,
-                            specialist_generation: config.desired_generation,
-                            status: SkillTargetSettlementStatus::Degraded,
-                            changed_entries: Vec::new(),
-                            error: Some(error.to_string()),
-                        },
-                        },
                     };
                     target_receipts.push(receipt);
                 }
@@ -1290,22 +1049,28 @@ impl ExtensionControlService {
             Err(error) => target_receipts.push(SkillTargetSettlementReceipt {
                 target: "runtime-targets".to_string(),
                 workspace_generation: "unknown".to_string(),
-                specialist_generation: config.desired_generation,
                 status: SkillTargetSettlementStatus::Degraded,
                 changed_entries: Vec::new(),
                 error: Some(error.to_string()),
             }),
         }
-        settle_skill_generation(
-            flow,
-            self.enabled_config_path.clone(),
-            config,
+        let status = if target_receipts
+            .iter()
+            .any(|receipt| receipt.status == SkillTargetSettlementStatus::Degraded)
+        {
+            SkillSettlementStatus::Degraded
+        } else {
+            SkillSettlementStatus::Settled
+        };
+        let runtime_changed = target_receipts
+            .iter()
+            .any(|receipt| !receipt.changed_entries.is_empty());
+        Ok(SkillSyncReceipt {
             operation_id,
-            idempotent,
-            durable_committed,
+            idempotent: idempotent && !runtime_changed,
+            status,
             target_receipts,
-        )
-        .await
+        })
     }
 
     /// Extension settlement is part of the application ProductData lifecycle;
@@ -1348,9 +1113,7 @@ impl ExtensionControlService {
         let service = Arc::clone(self);
         let state = Arc::clone(state);
         let source = source.to_string();
-        let command_identity = skill_artifact_command_identity("install", &source, false);
         let operation_id = operation_id.to_string();
-        let settlement_flow = flow;
         tokio::spawn(async move {
             let _mutation = service.mutation.lock().await;
             let outcome: Result<
@@ -1358,45 +1121,6 @@ impl ExtensionControlService {
                 SkillInstallError,
             > = async {
                 let root = state.skills_hub.read().await.root().to_path_buf();
-                if let Some(committed) = admitted_skill_operation(
-                    &settlement_flow,
-                    service.enabled_config_path.clone(),
-                    &operation_id,
-                    &command_identity,
-                )
-                .await
-                .map_err(SkillInstallError::Enable)?
-                {
-                    let name = committed.artifact_name.ok_or_else(|| {
-                        SkillInstallError::Enable(SkillMutationError::BeforeCommit(
-                            "duplicate install identity has no artifact name; refusing to mutate"
-                                .to_string(),
-                        ))
-                    })?;
-                    let path = root.join(&name);
-                    let revision = crate::skills_hub::install::read_source_record(&path)
-                        .ok()
-                        .flatten()
-                        .map(|record| record.revision);
-                    let installed = crate::skills_hub::install::InstallResult {
-                        name,
-                        path,
-                        source: if source.starts_with("http://")
-                            || source.starts_with("https://")
-                            || source.ends_with(".git")
-                        {
-                            format!("git:{source}")
-                        } else {
-                            format!("local:{}", PathBuf::from(&source).display())
-                        },
-                        revision,
-                    };
-                    let receipt = service
-                        .reconcile_committed_skill_policy(&state, &settlement_flow, operation_id)
-                        .await
-                        .map_err(SkillInstallError::Enable)?;
-                    return Ok((installed, receipt));
-                }
                 let mut hub = SkillsHub::with_root(root);
                 let installed = if source.starts_with("http://")
                     || source.starts_with("https://")
@@ -1412,51 +1136,44 @@ impl ExtensionControlService {
                     )
                     .map_err(SkillInstallError::Install)?
                 };
-                let artifact_name = installed.name.clone();
-                let receipt = match service
-                    .settle_skill_mutation_owned(
-                        &state,
-                        &settlement_flow,
-                        AdmittedSkillMutation {
-                            operation_id,
-                            command_identity,
-                            name: installed.name.clone(),
+                // 安装即启用:写入 enabled 条目并 reconcile 运行时。
+                let mut config = read_enabled_skills_config(
+                    &flow,
+                    service.enabled_config_path.clone(),
+                )
+                .await
+                .map_err(SkillInstallError::Enable)?;
+                for installed_name in &installed.installed_names {
+                    config.skills.insert(
+                        installed_name.clone(),
+                        SkillEnableEntry {
+                            category: "user".to_string(),
                             enabled: true,
-                            artifact_name: Some(artifact_name),
+                            baseline: false,
                         },
-                    )
+                    );
+                }
+                write_enabled_skills_config(&flow, service.enabled_config_path.clone(), config)
                     .await
-                {
-                    Ok(receipt) => receipt,
-                    Err(error) => {
-                        record_install_repair_debt(
-                            &state,
-                            &settlement_flow,
-                            service.enabled_config_path.clone(),
-                            &installed.name,
-                            &error.to_string(),
-                        )
-                        .await
-                        .map_err(SkillInstallError::Enable)?;
-                        return Err(SkillInstallError::Enable(error));
-                    }
-                };
+                    .map_err(SkillInstallError::Enable)?;
+                let receipt = service
+                    .reconcile_skill_runtimes(&state, &flow, operation_id, false)
+                    .await
+                    .map_err(SkillInstallError::Enable)?;
                 Ok((installed, receipt))
             }
             .await;
             let failure = match &outcome {
                 Ok((_, receipt)) if receipt.status == SkillSettlementStatus::Degraded => {
-                    Some(format!(
-                        "installed skill generation {} remains degraded",
-                        receipt.desired_generation
-                    ))
+                    Some("installed skill runtime reconciliation is degraded".to_string())
                 }
                 Ok(_) => None,
                 Err(error) => Some(error.to_string()),
             };
-            settlement_flow.settle(failure);
+            flow.settle(failure);
             outcome.map(|(installed, settlement)| SkillInstallSettlementReceipt {
                 name: installed.name,
+                installed_names: installed.installed_names,
                 path: installed.path,
                 source: installed.source,
                 revision: installed.revision,
@@ -1497,48 +1214,21 @@ impl ExtensionControlService {
         let service = Arc::clone(self);
         let state = Arc::clone(state);
         let name = name.to_string();
-        let command_identity = skill_artifact_command_identity("uninstall", &name, false);
         let operation_id = operation_id.to_string();
-        let settlement_flow = flow;
         tokio::spawn(async move {
             let _mutation = service.mutation.lock().await;
             let outcome: Result<SkillUninstallSettlementReceipt, SkillMutationError> = async {
-                if admitted_skill_operation(
-                    &settlement_flow,
-                    service.enabled_config_path.clone(),
-                    &operation_id,
-                    &command_identity,
-                )
-                .await?
-                .is_some()
-                {
-                    let settlement = service
-                        .reconcile_committed_skill_policy(&state, &settlement_flow, operation_id)
-                        .await?;
-                    return Ok(SkillUninstallSettlementReceipt {
-                        name,
-                        artifact_removed: false,
-                        artifact_error: None,
-                        settlement,
-                    });
-                }
-                let artifact_name = name.clone();
+                let mut config =
+                    read_enabled_skills_config(&flow, service.enabled_config_path.clone()).await?;
+                let policy_changed = config.skills.remove(&name).is_some();
+                write_enabled_skills_config(&flow, service.enabled_config_path.clone(), config)
+                    .await?;
                 let mut settlement = service
-                    .settle_skill_mutation_owned(
-                        &state,
-                        &settlement_flow,
-                        AdmittedSkillMutation {
-                            operation_id,
-                            command_identity,
-                            name: name.clone(),
-                            enabled: false,
-                            artifact_name: Some(artifact_name),
-                        },
-                    )
+                    .reconcile_skill_runtimes(&state, &flow, operation_id, !policy_changed)
                     .await?;
                 let root = state.skills_hub.read().await.root().to_path_buf();
                 let uninstall_name = name.clone();
-                let artifact = settlement_flow
+                let artifact = flow
                     .run("remove disabled skill artifact", move || {
                         remove_skill_artifact(root, &uninstall_name)
                     })
@@ -1548,6 +1238,7 @@ impl ExtensionControlService {
                     Ok(Err(error)) => (false, Some(error)),
                     Err(error) => (false, Some(error.to_string())),
                 };
+                settlement.idempotent = !policy_changed && !artifact_removed;
                 if let Some(error) = artifact_error.as_ref() {
                     settlement.status = SkillSettlementStatus::Degraded;
                     settlement
@@ -1555,36 +1246,10 @@ impl ExtensionControlService {
                         .push(SkillTargetSettlementReceipt {
                             target: format!("skill-artifact:{name}"),
                             workspace_generation: "global".to_string(),
-                            specialist_generation: settlement.desired_generation,
                             status: SkillTargetSettlementStatus::Degraded,
                             changed_entries: Vec::new(),
                             error: Some(error.clone()),
                         });
-                    match record_artifact_repair_debt(
-                        &settlement_flow,
-                        service.enabled_config_path.clone(),
-                        &settlement,
-                        &name,
-                        error,
-                    )
-                    .await
-                    {
-                        Ok(debt) => settlement.repair_debt = Some(debt),
-                        Err(debt_error) => {
-                            settlement
-                                .target_receipts
-                                .push(SkillTargetSettlementReceipt {
-                                    target: "enabled-skills.json".to_string(),
-                                    workspace_generation: "global".to_string(),
-                                    specialist_generation: settlement.desired_generation,
-                                    status: SkillTargetSettlementStatus::Degraded,
-                                    changed_entries: Vec::new(),
-                                    error: Some(format!(
-                                        "artifact repair debt commit failed: {debt_error}"
-                                    )),
-                                });
-                        }
-                    }
                 }
                 Ok(SkillUninstallSettlementReceipt {
                     name,
@@ -1596,15 +1261,12 @@ impl ExtensionControlService {
             .await;
             let failure = match &outcome {
                 Ok(receipt) if receipt.settlement.status == SkillSettlementStatus::Degraded => {
-                    Some(format!(
-                        "uninstalled skill generation {} remains degraded",
-                        receipt.settlement.desired_generation
-                    ))
+                    Some("uninstalled skill runtime reconciliation is degraded".to_string())
                 }
                 Ok(_) => None,
                 Err(error) => Some(error.to_string()),
             };
-            settlement_flow.settle(failure);
+            flow.settle(failure);
             outcome
         })
         .await
@@ -1645,42 +1307,20 @@ impl ExtensionControlService {
         let state = Arc::clone(state);
         let target = target.map(str::to_string);
         let operation_id = operation_id.to_string();
-        let command_identity =
-            skill_artifact_command_identity("sync", target.as_deref().unwrap_or("*"), force);
-        let settlement_flow = flow;
         tokio::spawn(async move {
             let _mutation = service.mutation.lock().await;
             let outcome: anyhow::Result<(
                 Vec<crate::skills_hub::install::SkillSyncResult>,
                 SkillSyncReceipt,
             )> = async {
-                let duplicate = admitted_skill_operation(
-                    &settlement_flow,
-                    service.enabled_config_path.clone(),
-                    &operation_id,
-                    &command_identity,
-                )
-                .await
-                .map_err(anyhow::Error::new)?
-                .is_some();
-                if duplicate {
-                    let receipt = service
-                        .reconcile_committed_skill_policy(&state, &settlement_flow, operation_id)
-                        .await
-                        .map_err(anyhow::Error::new)?;
-                    return Ok((Vec::new(), receipt));
-                }
                 let root = state.skills_hub.read().await.root().to_path_buf();
                 let mut hub = SkillsHub::with_root(root);
                 let results = crate::skills_hub::sync_skills(&mut hub, target.as_deref(), force)
                     .await
                     .map_err(anyhow::Error::msg)?;
+                let idempotent = results.iter().all(|result| !result.updated);
                 let mut receipt = service
-                    .reconcile_committed_skill_policy(
-                        &state,
-                        &settlement_flow,
-                        operation_id.clone(),
-                    )
+                    .reconcile_skill_runtimes(&state, &flow, operation_id, idempotent)
                     .await
                     .map_err(anyhow::Error::new)?;
                 let failures = results
@@ -1689,71 +1329,27 @@ impl ExtensionControlService {
                     .collect::<Vec<_>>();
                 if !failures.is_empty() {
                     receipt.status = SkillSettlementStatus::Degraded;
-                    receipt
-                        .target_receipts
-                        .extend(failures.iter().map(|result| SkillTargetSettlementReceipt {
+                    receipt.target_receipts.extend(
+                        failures.iter().map(|result| SkillTargetSettlementReceipt {
                             target: format!("skill-artifact-sync:{}", result.name),
                             workspace_generation: "global".to_string(),
-                            specialist_generation: receipt.desired_generation,
                             status: SkillTargetSettlementStatus::Degraded,
                             changed_entries: Vec::new(),
                             error: Some(result.message.clone()),
-                        }));
-                    let retryable_failures = failures
-                        .iter()
-                        .filter(|result| result.retryable)
-                        .map(|result| (result.name.clone(), result.message.clone()))
-                        .collect::<Vec<_>>();
-                    if !retryable_failures.is_empty() {
-                        match record_artifact_sync_repair_debt(
-                            &settlement_flow,
-                            service.enabled_config_path.clone(),
-                            &receipt,
-                            &retryable_failures,
-                            force,
-                        )
-                        .await
-                        {
-                            Ok(debt) => receipt.repair_debt = Some(debt),
-                            Err(error) => {
-                                receipt.target_receipts.push(SkillTargetSettlementReceipt {
-                                    target: "enabled-skills.json".to_string(),
-                                    workspace_generation: "global".to_string(),
-                                    specialist_generation: receipt.desired_generation,
-                                    status: SkillTargetSettlementStatus::Degraded,
-                                    changed_entries: Vec::new(),
-                                    error: Some(format!(
-                                        "artifact sync repair debt commit failed: {error}"
-                                    )),
-                                });
-                            }
-                        }
-                    }
+                        }),
+                    );
                 }
-                record_skill_operation_identity(
-                    &settlement_flow,
-                    service.enabled_config_path.clone(),
-                    &receipt,
-                    operation_id,
-                    command_identity,
-                    None,
-                )
-                .await
-                .map_err(anyhow::Error::new)?;
                 Ok((results, receipt))
             }
             .await;
             let failure = match &outcome {
                 Ok((_, receipt)) if receipt.status == SkillSettlementStatus::Degraded => {
-                    Some(format!(
-                        "synced skill generation {} remains degraded",
-                        receipt.desired_generation
-                    ))
+                    Some("synced skill runtime reconciliation is degraded".to_string())
                 }
                 Ok(_) => None,
                 Err(error) => Some(error.to_string()),
             };
-            settlement_flow.settle(failure);
+            flow.settle(failure);
             outcome.map(|(results, settlement)| SkillArtifactSyncReceipt {
                 results: results
                     .into_iter()

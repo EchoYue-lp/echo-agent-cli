@@ -8,13 +8,15 @@ use echo_agent::llm::types::Message;
 
 const WORKSPACE_PROFILE_PROJECTION: &str = "eko:workspace-profile";
 const MEDICAL_SKILLS: &[&str] = &["evidence-medicine", "paper-search", "paper-reader"];
-const RESEARCH_SKILLS: &[&str] = &["paper-search", "paper-reader", "doc-writing"];
+const RESEARCH_SKILLS: &[&str] = &["paper-search", "paper-reader"];
 const DATA_SKILLS: &[&str] = &[
     "data-wrangling",
     "statistical-analysis",
     "data-visualization",
 ];
-const CODE_SKILLS: &[&str] = &["coding", "git-workflow"];
+/// coding skill 已删(行为准则由基础 prompt contract 承担),Code 工作区
+/// 保留 git-workflow;CODE_PROMPT 本身承担编程工作区的行为注入。
+const CODE_SKILLS: &[&str] = &["git-workflow"];
 
 /// 医学研究系统提示词增强
 const MEDICAL_RESEARCH_PROMPT: &str = r#"
