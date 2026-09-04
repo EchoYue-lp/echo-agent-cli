@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use echo_agent::subagent::{ContextTransferPolicy, SubagentInvocation};
 use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
+use echo_agent::agent::ExecutionAdmission;
 use echo_agent::runtime::{
     AgentTurnDriver, EventSink, SinkControl, TurnMode, TurnOutcome, TurnReceipt, TurnRequest,
 };
@@ -47,7 +48,6 @@ use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
 /// Per-run limits still apply; a dispatch must hold both permits, so opening
 /// more workspace hosts cannot multiply provider or machine concurrency.
 pub(crate) struct ProcessExecutionGovernor {
-    subagent: Arc<Semaphore>,
     write: Arc<Semaphore>,
     shell: Arc<Semaphore>,
     llm: Arc<Semaphore>,
@@ -57,12 +57,22 @@ static PROCESS_EXECUTION_GOVERNOR: std::sync::LazyLock<Arc<ProcessExecutionGover
     std::sync::LazyLock::new(|| {
         let limits = EkoExecutionLimits::default();
         Arc::new(ProcessExecutionGovernor {
-            subagent: Arc::new(Semaphore::new(limits.max_concurrent_subagents.max(1))),
             write: Arc::new(Semaphore::new(limits.max_concurrent_writes.max(1))),
             shell: Arc::new(Semaphore::new(limits.max_concurrent_shells.max(1))),
             llm: Arc::new(Semaphore::new(limits.max_parallel_llm_calls.max(1))),
         })
     });
+
+static PROCESS_SUBAGENT_ADMISSION: std::sync::LazyLock<Arc<ExecutionAdmission>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(ExecutionAdmission::with_capacity(
+            EkoExecutionLimits::default().max_concurrent_subagents,
+        ))
+    });
+
+pub(crate) fn process_subagent_admission() -> Arc<ExecutionAdmission> {
+    PROCESS_SUBAGENT_ADMISSION.clone()
+}
 
 pub(crate) fn process_execution_governor() -> Arc<ProcessExecutionGovernor> {
     PROCESS_EXECUTION_GOVERNOR.clone()
@@ -76,9 +86,7 @@ impl ProcessExecutionGovernor {
     fn snapshot(&self) -> ProcessExecutionResourceSnapshot {
         let limits = EkoExecutionLimits::default();
         ProcessExecutionResourceSnapshot {
-            subagent_active: limits
-                .max_concurrent_subagents
-                .saturating_sub(self.subagent.available_permits()),
+            subagent_active: PROCESS_SUBAGENT_ADMISSION.active_count(),
             subagent_limit: limits.max_concurrent_subagents,
             write_active: limits
                 .max_concurrent_writes
@@ -115,7 +123,7 @@ pub struct EkoExecutionLimits {
 impl Default for EkoExecutionLimits {
     fn default() -> Self {
         Self {
-            max_concurrent_subagents: 4,
+            max_concurrent_subagents: 5,
             max_concurrent_writes: 4,
             max_concurrent_shells: 1,
             max_parallel_llm_calls: 4,

@@ -27,6 +27,7 @@ async fn execute_runtime_plan<W: TaskDispatcher + 'static>(
         controller,
         echo_agent::tasks::RuntimeTaskServiceConfig {
             max_concurrent_subagents: limits.max_concurrent_subagents,
+            shared_admission: Some(process_subagent_admission()),
             ..Default::default()
         },
     );
