@@ -60,6 +60,15 @@ pub async fn execute_run(
 
     let primary_agent = primary_agent.ok_or(ExecError::NoAgent)?;
     let limits = EkoExecutionLimits::default();
+    let admission = process_subagent_admission();
+    primary_agent
+        .write_async(|agent| {
+            let admission = admission.clone();
+            Box::pin(async move {
+                agent.set_subagent_admission(admission).await;
+            })
+        })
+        .await;
 
     let mut drain_cycle = 0usize;
     let outcome = loop {
