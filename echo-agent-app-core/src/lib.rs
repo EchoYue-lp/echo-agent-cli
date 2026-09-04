@@ -18,6 +18,7 @@ pub(crate) mod conversation_archive;
 pub(crate) mod conversation_deletion;
 pub(crate) mod conversation_input;
 pub(crate) mod conversation_projection;
+pub(crate) mod creator_tools;
 pub(crate) mod data_root;
 pub(crate) mod developer_commands;
 pub(crate) mod diff;
