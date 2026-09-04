@@ -279,6 +279,32 @@ mod resolve_subagent_model_tests {
         ))
     }
 
+    /// GitHub 托管 runner 的内核限制会让 bwrap 无法在新 network namespace
+    /// 里配置 loopback(`RTM_NEWADDR: Operation not permitted`)。shell 策略
+    /// 测试验证的是工具层权限让渡,不依赖网络隔离本身;netns 不可用的
+    /// 环境降级为无 OS 沙箱执行,避免把环境限制误判为回归。
+    fn shell_policy_sandbox() -> SandboxManager {
+        if linux_unshare_net_available() {
+            SandboxManager::local_sandbox()
+        } else {
+            SandboxManager::local_only()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_unshare_net_available() -> bool {
+        std::process::Command::new("bwrap")
+            .args(["--unshare-net", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--", "true"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn linux_unshare_net_available() -> bool {
+        true
+    }
+
     #[test]
     fn stable_task_guide_stays_within_cache_budget() {
         assert!(TASK_MANAGEMENT_GUIDE.chars().count() <= 2_400);
@@ -539,7 +565,7 @@ mod resolve_subagent_model_tests {
             Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
             Arc::new(SubagentRegistry::new()),
             None,
-            Arc::new(SandboxManager::local_sandbox()),
+            Arc::new(shell_policy_sandbox()),
             test_command_cells()?,
             Arc::new(crate::analysis_runtime::AnalyticsRuntime::default()),
             true,

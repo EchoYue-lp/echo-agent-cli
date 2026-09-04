@@ -281,11 +281,10 @@ mod tests {
     #[test]
     fn write_progress_creates_file_and_returns_markdown() -> Result<(), Box<dyn std::error::Error>>
     {
-        // Use a temp CWD so the test doesn't litter the repo.
+        // Pass the output directory explicitly so this test has no process-wide
+        // current-directory side effect while the suite runs in parallel.
         let tmp = std::env::temp_dir().join(format!("eko-progress-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp)?;
-        let prev = std::env::current_dir()?;
-        std::env::set_current_dir(&tmp)?;
 
         let store = seeded_store()?;
         let md = write_progress(&store, "r1", Some(&tmp))?;
@@ -293,7 +292,6 @@ mod tests {
         assert_eq!(md, written);
         assert!(written.contains("## Goal"));
 
-        std::env::set_current_dir(prev)?;
         let _ = std::fs::remove_dir_all(&tmp);
         Ok(())
     }

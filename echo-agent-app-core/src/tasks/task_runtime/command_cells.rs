@@ -4120,15 +4120,25 @@ mod tests {
             .map_err(|error| error.to_string())?;
 
         assert_eq!(service.stop_run("workspace", "cancel-owned-cells"), 1);
-        let terminal = service
-            .inner
-            .wait(&cell_id, 0, 5_000)
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(
-            terminal.snapshot.phase,
-            echo_agent::tools::cell::CommandCellPhase::Cancelled
-        );
+        // CI runner 高负载时,取消传播可能超过单轮 wait 的预算,拿到 Running
+        // 快照后直接断言会误报;轮询到 terminal 再断言,总预算 30s。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let phase = loop {
+            let delta = service
+                .inner
+                .wait(&cell_id, 0, 1_000)
+                .await
+                .map_err(|error| error.to_string())?;
+            if delta.snapshot.phase.is_terminal() {
+                break delta.snapshot.phase;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "owned cell never reached a terminal phase after run cancel"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(phase, echo_agent::tools::cell::CommandCellPhase::Cancelled);
         Ok(())
     }
 
@@ -4277,10 +4287,12 @@ mod tests {
 
         store.begin_operation_shutdown()?;
         service.begin_shutdown()?;
-        tokio::time::timeout(Duration::from_secs(5), store.shutdown_operations())
+        // 杀掉并回收 "sleep 30" 子进程在负载高的 CI runner 上可能超过 5s;
+        // 放宽到 30s 只影响等待预算,不放松"必须完成关闭"的断言。
+        tokio::time::timeout(Duration::from_secs(30), store.shutdown_operations())
             .await
             .map_err(|_| "operation join waited for the uncancelled long command".to_string())??;
-        tokio::time::timeout(Duration::from_secs(5), service.shutdown())
+        tokio::time::timeout(Duration::from_secs(30), service.shutdown())
             .await
             .map_err(|_| "command-cell shutdown exceeded its total deadline".to_string())??;
         let replay = service

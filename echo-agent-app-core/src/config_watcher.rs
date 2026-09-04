@@ -570,6 +570,14 @@ fn reconcile_watched_directories(
     let mut removed: Vec<PathBuf> = Vec::new();
     for directory in removals {
         if let Err(error) = watcher.unwatch(&directory) {
+            if matches!(error.kind, notify::ErrorKind::WatchNotFound) {
+                // 被 watch 的目录被外部删除时(例如用户删掉自己的 .eko),
+                // Linux inotify 会自动摘除 watch,notify 的映射里已没有它。
+                // "已经不 watch" 正是本轮要收敛到的目标状态,静默对齐即可,
+                // 不能当作错误回滚。
+                watched.remove(&directory);
+                continue;
+            }
             let mut rollback_errors = Vec::new();
             for restore in removed {
                 if let Err(restore_error) = watcher.watch(&restore, RecursiveMode::Recursive) {
