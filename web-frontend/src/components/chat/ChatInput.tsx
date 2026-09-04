@@ -25,6 +25,7 @@ import { CONTEXT_RING_CIRCUMFERENCE, ringDashOffset } from './contextRing';
 import { computeContextUsage, estimateDraftTokens, type ContextUsageSource } from './contextUsage';
 import { isKnownThinkingLevel, thinkingLevelOptions } from './thinkingLevels';
 import { filterCommands, groupByCategory, type SlashCommand } from '../../lib/slashCommands';
+import { AgentComposerFrame } from './AgentComposerFrame';
 import {
   PERMISSION_MODES,
   PERMISSIONS_CHANGED_EVENT,
@@ -759,7 +760,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
 
   return (
     <div
-      className="px-4 pb-4 pt-2 sm:px-6"
+      className="px-3 pb-3 sm:px-5"
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
@@ -778,7 +779,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
         <div className="relative space-y-2">
           {/* Drag overlay */}
           {isDragging && (
-            <div className="absolute inset-0 z-10 flex items-center justify-center rounded-[22px] border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/5">
+            <div className="absolute inset-0 z-10 flex items-center justify-center rounded-lg border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/5">
               <span className="text-sm font-medium text-[var(--accent)]">
                 Drop files here to upload
               </span>
@@ -825,11 +826,11 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
           )}
 
           {/* Input row */}
-          <div className="flex items-end rounded-[22px] border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 shadow-[var(--shadow-sm)] transition-all focus-within:border-[var(--border-focus)] focus-within:shadow-[var(--shadow-glow)] sm:px-4">
+          <AgentComposerFrame>
             {/* Attachment button */}
             <button
               onClick={() => fileInputRef.current?.click()}
-              className="mr-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--bg-secondary)] text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+              className="mr-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
               title="Upload attachment"
             >
               <Paperclip size={16} />
@@ -872,7 +873,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
                 <ArrowUp size={16} strokeWidth={2.5} />
               </button>
             )}
-          </div>
+          </AgentComposerFrame>
           <div className="flex flex-wrap items-center justify-between gap-2 px-2 text-[11px] text-[var(--text-tertiary)]">
             <div className="flex min-w-0 flex-wrap items-center gap-1.5 sm:gap-2">
               {queuedCount > 0 && <span>已排队 {queuedCount} 条</span>}

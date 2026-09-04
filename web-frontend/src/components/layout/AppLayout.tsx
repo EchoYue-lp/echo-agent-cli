@@ -39,9 +39,9 @@ export function AppLayout({
         className={`shrink-0 overflow-hidden transition-all duration-300 ease-in-out
           max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-50
           ${leftSidebarOpen ? 'border-r border-[var(--border-primary)] bg-[var(--bg-sidebar)]' : ''}`}
-        style={{ width: leftSidebarOpen ? '272px' : '0px' }}
+        style={{ width: leftSidebarOpen ? '264px' : '0px' }}
       >
-        <div className="h-full w-[272px]">{left}</div>
+        <div className="h-full w-[264px]">{left}</div>
       </div>
 
       {/* Center + Terminal drawer */}
@@ -55,8 +55,8 @@ export function AppLayout({
         >
           {leftSidebarOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
         </button>
-        <div className="flex flex-1 min-h-0">
-          <div className="flex min-w-0 flex-1 flex-col">{center}</div>
+        <div className="flex min-h-0 flex-1">
+          <div className="flex min-w-[320px] flex-1 flex-col">{center}</div>
           {right}
         </div>
         {/* Terminal drawer at bottom */}

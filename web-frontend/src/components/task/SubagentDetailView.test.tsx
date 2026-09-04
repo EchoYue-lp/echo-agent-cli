@@ -4,7 +4,7 @@ import type { SubagentRunState } from '../../stores/subagentRunStore';
 import { SubagentDetailView } from './SubagentDetailView';
 
 describe('SubagentDetailView', () => {
-  it('renders exact-attempt controls for a running Subagent', () => {
+  it('renders an inline exact-attempt composer for a running Subagent', () => {
     const run: SubagentRunState = {
       subagentRunId: 'run-1:task-1:3:2:claim-1',
       runId: 'run-1',
@@ -19,9 +19,11 @@ describe('SubagentDetailView', () => {
 
     const html = renderToStaticMarkup(<SubagentDetailView run={run} onBack={() => undefined} />);
 
-    expect(html).toContain('aria-label="Message Subagent"');
-    expect(html).toContain('aria-label="Interrupt Subagent"');
-    expect(html).toContain('aria-label="Queue guidance for next attempt"');
+    expect(html).toContain('aria-label="Subagent 消息"');
+    expect(html).toContain('aria-label="发送 Subagent 消息"');
+    expect(html).toContain('aria-label="中断 Subagent"');
+    expect(html).toContain('attempt 2');
+    expect(html).not.toContain('window.prompt');
   });
 
   it('shows task, execution and result as one stream without tabs', () => {
@@ -77,5 +79,38 @@ describe('SubagentDetailView', () => {
     expect(html).not.toContain('见上方分析结果');
     expect(html).not.toContain('## Result');
     expect(html).not.toContain('Cargo.toml');
+  });
+
+  it('routes a settled attempt through the follow-up composer presentation', () => {
+    const run: SubagentRunState = {
+      subagentRunId: 'run-1:task-1:3:2:claim-1',
+      runId: 'run-1',
+      workspaceId: 'workspace-1',
+      taskId: 'task-1',
+      planRevision: 3,
+      attempt: 2,
+      agent: 'reviewer',
+      status: 'failed',
+      startedAt: 1,
+      error: 'provider unavailable',
+      outcome: {
+        contract_version: 1,
+        status: 'failed',
+        summary: 'provider unavailable',
+        artifacts: [],
+        evidence: [],
+        verification: [],
+        remaining_work: ['provider unavailable'],
+        touched_files: { read: [], written: [] },
+      },
+      events: [],
+    };
+
+    const html = renderToStaticMarkup(<SubagentDetailView run={run} onBack={() => undefined} />);
+
+    expect(html).toContain('aria-label="Subagent 后续任务"');
+    expect(html).toContain('aria-label="发送 Subagent 后续任务"');
+    expect(html.match(/provider unavailable/g)).toHaveLength(1);
+    expect(html).not.toContain('未完成');
   });
 });

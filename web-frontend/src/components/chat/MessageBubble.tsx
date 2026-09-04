@@ -342,7 +342,7 @@ export const MessageBubble = memo(function MessageBubble({
                 </div>
               </div>
             ) : (
-              <div className="rounded-2xl bg-[var(--bg-user-bubble)] px-4 py-3 text-sm leading-relaxed text-[var(--text-primary)]">
+              <div className="rounded-lg bg-[var(--bg-user-bubble)] px-3 py-2.5 text-sm leading-relaxed text-[var(--text-primary)]">
                 <div className="whitespace-pre-wrap break-words">{message.content}</div>
               </div>
             )}

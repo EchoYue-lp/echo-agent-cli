@@ -9,16 +9,30 @@ import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { useConversationStore } from '../../stores/conversationStore';
 import { useToastStore } from '../../stores/toastStore';
 import { useSubagentRunStore } from '../../stores/subagentRunStore';
-import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { FailureToast } from './FailureToast';
-import { CornerUpLeft, GripVertical, MessagesSquare, PanelRightOpen, X } from 'lucide-react';
+import {
+  BookOpen,
+  CornerUpLeft,
+  FileCode,
+  FileJson,
+  FlaskConical,
+  Globe2,
+  GripVertical,
+  MessagesSquare,
+  MoreHorizontal,
+  PanelRightOpen,
+  Workflow,
+  X,
+} from 'lucide-react';
 import { AgentMessageDialog } from './AgentMessageDialog';
 import type { Attachment } from '../../types/api';
 import type { QueuedChatInput } from '../../hooks/useTauriChat';
-import { useRightWorkspaceStore } from '../../stores/rightWorkspaceStore';
+import { useContextPaneStore } from '../../stores/contextPaneStore';
+import { useWorkspaceViewStore } from '../../stores/workspaceViewStore';
 import { useToolExecutionStore } from '../../stores/toolExecutionStore';
 import { dispatchGuiSlashCommand } from '../../lib/slashCommands';
+import { AgentPane } from './AgentPane';
 
 // Tauri IPC is the only live transport. The WebSocket transport
 // (hooks/useWebSocket.ts) was removed after the chat path migrated to Tauri
@@ -34,18 +48,43 @@ export function ChatPanel() {
   const isCancelled = useChatStore((s) => s.isCancelled);
   const runStatus = useChatStore((s) => s.runStatus);
   const currentWorkspace = useWorkspaceStore((s) => s.current);
-  const rightWorkspace = useRightWorkspaceStore();
+  const contextTarget = useContextPaneStore((state) => state.target);
+  const openTasks = useContextPaneStore((state) => state.openTasks);
+  const openBrowser = useContextPaneStore((state) => state.openBrowser);
+  const openFiles = useContextPaneStore((state) => state.openFiles);
+  const openWorkspaceView = useWorkspaceViewStore((state) => state.open);
   const todoCount = useTaskRuntimeStore((state) => state.todos.length);
-  const closeSubagentDetail = useSubagentDetailStore((s) => s.close);
 
   // ── 按需卡片状态 ──
   const [failureToastDismissed, setFailureToastDismissed] = useState(false);
   const [agentMessagesOpen, setAgentMessagesOpen] = useState(false);
+  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
+  const workspaceMenuRef = useRef<HTMLDivElement>(null);
 
   // Reset failure toast dismiss when a new run starts (status changes)
   useEffect(() => {
     setFailureToastDismissed(false);
   }, [runStatus]);
+
+  useEffect(() => {
+    if (!workspaceMenuOpen) return;
+    const closeOnPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && !workspaceMenuRef.current?.contains(target)) {
+        setWorkspaceMenuOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setWorkspaceMenuOpen(false);
+    };
+    document.addEventListener('pointerdown', closeOnPointerDown);
+    window.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnPointerDown);
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [workspaceMenuOpen]);
+
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
@@ -68,8 +107,8 @@ export function ChatPanel() {
     await useConversationStore.getState().clearCurrent();
     useTaskRuntimeStore.getState().reset();
     useSubagentRunStore.getState().clear();
-    closeSubagentDetail();
-  }, [cancel, clearQueuedMessages, closeSubagentDetail]);
+    useContextPaneStore.getState().reset();
+  }, [cancel, clearQueuedMessages]);
 
   const branchAndResend = async (messageId: string, newContent?: string) => {
     clearQueuedMessages();
@@ -155,17 +194,22 @@ export function ChatPanel() {
     sendMessage(text);
   };
 
+  const openPrimaryWorkbench = (view: 'analysis' | 'research' | 'workflow' | 'extract') => {
+    useContextPaneStore.getState().reset();
+    openWorkspaceView(view);
+  };
+
   const handleSend = async (text: string, attachments?: Attachment[]) => {
     if (!attachments?.length) {
       const dispatched = await dispatchGuiSlashCommand(text, {
         clear: clearCurrentChat,
-        tasks: rightWorkspace.openTasks,
-        analysis: rightWorkspace.openAnalysis,
-        research: rightWorkspace.openResearch,
-        browser: rightWorkspace.openBrowser,
-        files: rightWorkspace.openFiles,
-        workflows: rightWorkspace.openWorkflows,
-        extract: rightWorkspace.openExtract,
+        tasks: openTasks,
+        analysis: () => openPrimaryWorkbench('analysis'),
+        research: () => openPrimaryWorkbench('research'),
+        browser: openBrowser,
+        files: openFiles,
+        workflows: () => openPrimaryWorkbench('workflow'),
+        extract: () => openPrimaryWorkbench('extract'),
       });
       if (dispatched) return true;
     }
@@ -173,57 +217,130 @@ export function ChatPanel() {
   };
 
   return (
-    <div
-      className="flex h-full min-h-0 flex-col bg-[var(--bg-chat)]"
-      role="main"
-      aria-label="聊天面板"
-    >
-      <div className="flex h-11 shrink-0 items-center justify-between border-b border-[var(--border-secondary)] bg-[var(--bg-chat)]/95 px-12 backdrop-blur">
-        <div className="min-w-0">
-          <div className="truncate text-[13px] font-medium text-[var(--text-primary)]">
-            {currentWorkspace?.name || 'EKO'}
-          </div>
-          <div className="truncate text-[10px] text-[var(--text-tertiary)]">
-            {currentWorkspace?.root || '选择或创建一个任务开始工作'}
-          </div>
-        </div>
-        <div className="flex items-center gap-2 text-xs text-[var(--text-tertiary)]">
-          <div className="hidden items-center gap-2 sm:flex">
-            <span className="h-2 w-2 rounded-full bg-[var(--accent)]" />
-            <span>{runStatusLabel(runStatus, isStreaming)}</span>
-          </div>
-          <button
-            type="button"
-            onClick={() => setAgentMessagesOpen(true)}
-            className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-            title="Agent 消息"
-            aria-label="打开 Agent 消息"
-          >
-            <MessagesSquare size={15} />
-          </button>
-          <button
-            type="button"
-            onClick={rightWorkspace.openWorkspace}
-            className={`relative flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] ${rightWorkspace.open ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : 'text-[var(--text-tertiary)]'}`}
-            title="右侧工作区"
-            aria-label="打开右侧工作区"
-          >
-            <PanelRightOpen size={15} />
-            {todoCount > 0 && (
-              <span className="absolute -right-0.5 -top-0.5 min-w-3 rounded-full bg-[var(--accent)] px-0.5 text-center text-[8px] leading-3 text-white">
-                {todoCount > 9 ? '9+' : todoCount}
-              </span>
+    <>
+      <AgentPane
+        ariaLabel="主 Agent"
+        role="main"
+        bodyRef={scrollRef}
+        bodyRole="log"
+        bodyAriaLive="polite"
+        bodyAriaLabel="消息列表"
+        onBodyScroll={handleScroll}
+        header={
+          <>
+            <div className="min-w-0 pl-9">
+              <div className="truncate text-[13px] font-medium text-[var(--text-primary)]">
+                {currentWorkspace?.name || 'EKO'}
+              </div>
+              <div className="truncate text-[10px] text-[var(--text-tertiary)]">
+                {currentWorkspace?.root || '选择或创建一个任务开始工作'}
+              </div>
+            </div>
+            <div className="ml-auto flex items-center gap-2 text-xs text-[var(--text-tertiary)]">
+              <div className="hidden items-center gap-2 sm:flex">
+                <span className="h-2 w-2 rounded-full bg-[var(--accent)]" />
+                <span>{runStatusLabel(runStatus, isStreaming)}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAgentMessagesOpen(true)}
+                className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                title="Agent 消息"
+                aria-label="打开 Agent 消息"
+              >
+                <MessagesSquare size={15} />
+              </button>
+              <div ref={workspaceMenuRef} className="relative">
+                <button
+                  type="button"
+                  onClick={() => setWorkspaceMenuOpen((open) => !open)}
+                  className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  title="打开工作台"
+                  aria-label="打开工作台菜单"
+                  aria-expanded={workspaceMenuOpen}
+                >
+                  <MoreHorizontal size={15} />
+                </button>
+                {workspaceMenuOpen && (
+                  <WorkspaceMenu
+                    onSelect={(action) => {
+                      action();
+                      setWorkspaceMenuOpen(false);
+                    }}
+                    openAnalysis={() => openPrimaryWorkbench('analysis')}
+                    openResearch={() => openPrimaryWorkbench('research')}
+                    openBrowser={openBrowser}
+                    openFiles={openFiles}
+                    openWorkflow={() => openPrimaryWorkbench('workflow')}
+                    openExtract={() => openPrimaryWorkbench('extract')}
+                  />
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={openTasks}
+                className={`relative flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] ${contextTarget?.kind === 'tasks' ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : 'text-[var(--text-tertiary)]'}`}
+                title="任务运行"
+                aria-label="打开任务运行"
+              >
+                <PanelRightOpen size={15} />
+                {todoCount > 0 && (
+                  <span className="absolute -right-0.5 -top-0.5 min-w-3 rounded-full bg-[var(--accent)] px-0.5 text-center text-[8px] leading-3 text-white">
+                    {todoCount > 9 ? '9+' : todoCount}
+                  </span>
+                )}
+              </button>
+            </div>
+          </>
+        }
+        footer={
+          <div className="border-t border-[var(--border-secondary)] pt-2">
+            {pendingHitlRequest?.kind === 'approval' && (
+              <div className="mx-auto w-full max-w-[980px] px-4 pb-2 sm:px-6 lg:px-8">
+                <ApprovalCard
+                  request={pendingHitlRequest}
+                  onApprove={() => sendApproval(pendingHitlRequest.requestId, true)}
+                  onReject={(reason) => sendApproval(pendingHitlRequest.requestId, false, reason)}
+                  onModify={(feedback) =>
+                    sendApproval(pendingHitlRequest.requestId, false, `修改意见: ${feedback}`)
+                  }
+                  onApproveAll={() =>
+                    sendApproval(pendingHitlRequest.requestId, true, undefined, 'session_tool')
+                  }
+                />
+              </div>
             )}
-          </button>
-        </div>
-      </div>
-      <div
-        ref={scrollRef}
-        className="min-h-0 flex-1 overflow-y-auto"
-        onScroll={handleScroll}
-        role="log"
-        aria-live="polite"
-        aria-label="消息列表"
+            {isStreaming && messages.length > 0 && (
+              <div className="flex justify-center pb-2">
+                <button
+                  onClick={cancel}
+                  aria-label="停止生成"
+                  className="flex items-center gap-2 rounded-md border border-[var(--border-primary)] bg-[var(--bg-primary)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                >
+                  <div
+                    className="h-3 w-3 rounded-[3px]"
+                    style={{ background: 'var(--text-secondary)' }}
+                  />
+                  停止生成
+                </button>
+              </div>
+            )}
+            {queuedInputs.length > 0 && (
+              <QueuedInputList
+                items={queuedInputs}
+                onRemove={removeQueuedMessage}
+                onReorder={reorderQueuedMessage}
+                onSteer={steerQueuedMessage}
+              />
+            )}
+            <ChatInput
+              onSend={handleSend}
+              isStreaming={isStreaming}
+              onCancel={cancel}
+              queuedCount={queuedInputs.length}
+            />
+          </div>
+        }
       >
         {messages.length === 0 ? (
           <WelcomeScreen onSuggestionClick={handleSuggestionClick} />
@@ -243,13 +360,7 @@ export function ChatPanel() {
                   <div key={msg.id}>
                     {showSeparator && idx > 0 && (
                       <div className="flex items-center gap-3 py-4">
-                        <div
-                          className="h-px flex-1"
-                          style={{
-                            background:
-                              'linear-gradient(to right, transparent, var(--border-primary), transparent)',
-                          }}
-                        />
+                        <div className="h-px flex-1 bg-[var(--border-secondary)]" />
                         <span
                           className="text-xs text-[var(--text-tertiary)]"
                           style={{ fontVariantNumeric: 'tabular-nums' }}
@@ -259,13 +370,7 @@ export function ChatPanel() {
                             minute: '2-digit',
                           })}
                         </span>
-                        <div
-                          className="h-px flex-1"
-                          style={{
-                            background:
-                              'linear-gradient(to right, transparent, var(--border-primary), transparent)',
-                          }}
-                        />
+                        <div className="h-px flex-1 bg-[var(--border-secondary)]" />
                       </div>
                     )}
                     <MessageBubble
@@ -285,45 +390,17 @@ export function ChatPanel() {
                 ) && (
                   <div className="flex items-center gap-3 px-1 py-3">
                     <div className="spinner" />
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-xs text-[var(--text-tertiary)] animate-breathe">
-                        {runStatusLabel(runStatus, true)}
-                      </span>
-                      <span className="flex gap-0.5">
-                        <span
-                          className="h-1 w-1 rounded-full bg-[var(--accent)] animate-bounce"
-                          style={{ animationDelay: '0ms' }}
-                        />
-                        <span
-                          className="h-1 w-1 rounded-full bg-[var(--accent)] animate-bounce"
-                          style={{ animationDelay: '150ms' }}
-                        />
-                        <span
-                          className="h-1 w-1 rounded-full bg-[var(--accent)] animate-bounce"
-                          style={{ animationDelay: '300ms' }}
-                        />
-                      </span>
-                    </div>
+                    <span className="text-xs text-[var(--text-tertiary)] animate-breathe">
+                      {runStatusLabel(runStatus, true)}
+                    </span>
                   </div>
                 )}
 
               {isCancelled && (
                 <div className="flex items-center gap-3 py-3">
-                  <div
-                    className="h-px flex-1"
-                    style={{
-                      background:
-                        'linear-gradient(to right, transparent, var(--border-primary), transparent)',
-                    }}
-                  />
-                  <span className="text-xs text-[var(--text-tertiary)] italic">已停止响应</span>
-                  <div
-                    className="h-px flex-1"
-                    style={{
-                      background:
-                        'linear-gradient(to right, transparent, var(--border-primary), transparent)',
-                    }}
-                  />
+                  <div className="h-px flex-1 bg-[var(--border-secondary)]" />
+                  <span className="text-xs italic text-[var(--text-tertiary)]">已停止响应</span>
+                  <div className="h-px flex-1 bg-[var(--border-secondary)]" />
                 </div>
               )}
 
@@ -351,7 +428,6 @@ export function ChatPanel() {
                 </div>
               )}
 
-              {/* Failure toast (spec §3.4) */}
               {!failureToastDismissed && (
                 <div className="py-1">
                   <FailureToast onDismiss={() => setFailureToastDismissed(true)} />
@@ -361,55 +437,55 @@ export function ChatPanel() {
             <div ref={bottomRef} className="h-1" />
           </div>
         )}
-      </div>
-
-      <div className="shrink-0 bg-[linear-gradient(to_top,var(--bg-chat)_72%,transparent)]">
-        {pendingHitlRequest?.kind === 'approval' && (
-          <div className="mx-auto w-full max-w-[980px] px-4 pb-2 sm:px-6 lg:px-8">
-            <ApprovalCard
-              request={pendingHitlRequest}
-              onApprove={() => sendApproval(pendingHitlRequest.requestId, true)}
-              onReject={(reason) => sendApproval(pendingHitlRequest.requestId, false, reason)}
-              onModify={(feedback) =>
-                sendApproval(pendingHitlRequest.requestId, false, `修改意见: ${feedback}`)
-              }
-              onApproveAll={() =>
-                sendApproval(pendingHitlRequest.requestId, true, undefined, 'session_tool')
-              }
-            />
-          </div>
-        )}
-        {isStreaming && messages.length > 0 && (
-          <div className="flex justify-center pb-2">
-            <button
-              onClick={cancel}
-              aria-label="停止生成"
-              className="flex items-center gap-2 rounded-full border border-[var(--border-primary)] bg-[var(--bg-primary)] px-4 py-2 text-sm font-medium text-[var(--text-secondary)] shadow-[var(--shadow-sm)] transition-all hover:text-[var(--text-primary)]"
-            >
-              <div
-                className="h-3 w-3 rounded-[3px]"
-                style={{ background: 'var(--text-secondary)' }}
-              />
-              停止生成
-            </button>
-          </div>
-        )}
-        {queuedInputs.length > 0 && (
-          <QueuedInputList
-            items={queuedInputs}
-            onRemove={removeQueuedMessage}
-            onReorder={reorderQueuedMessage}
-            onSteer={steerQueuedMessage}
-          />
-        )}
-        <ChatInput
-          onSend={handleSend}
-          isStreaming={isStreaming}
-          onCancel={cancel}
-          queuedCount={queuedInputs.length}
-        />
-      </div>
+      </AgentPane>
       <AgentMessageDialog isOpen={agentMessagesOpen} onClose={() => setAgentMessagesOpen(false)} />
+    </>
+  );
+}
+
+function WorkspaceMenu({
+  onSelect,
+  openAnalysis,
+  openResearch,
+  openBrowser,
+  openFiles,
+  openWorkflow,
+  openExtract,
+}: {
+  onSelect: (action: () => void) => void;
+  openAnalysis: () => void;
+  openResearch: () => void;
+  openBrowser: () => void;
+  openFiles: () => void;
+  openWorkflow: () => void;
+  openExtract: () => void;
+}) {
+  const items = [
+    { label: '分析', icon: <FlaskConical size={13} />, action: openAnalysis },
+    { label: '研究', icon: <BookOpen size={13} />, action: openResearch },
+    { label: '浏览器', icon: <Globe2 size={13} />, action: openBrowser },
+    { label: '文件', icon: <FileCode size={13} />, action: openFiles },
+    { label: '工作流', icon: <Workflow size={13} />, action: openWorkflow },
+    { label: '结构化提取', icon: <FileJson size={13} />, action: openExtract },
+  ];
+  return (
+    <div
+      role="menu"
+      aria-label="工作台"
+      className="absolute right-0 top-9 z-50 w-40 overflow-hidden rounded-md border border-[var(--border-primary)] bg-[var(--bg-primary)] py-1 shadow-[var(--shadow-md)]"
+    >
+      {items.map((item) => (
+        <button
+          key={item.label}
+          type="button"
+          role="menuitem"
+          onClick={() => onSelect(item.action)}
+          className="flex h-8 w-full items-center gap-2 px-2.5 text-left text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+        >
+          <span className="text-[var(--text-tertiary)]">{item.icon}</span>
+          <span>{item.label}</span>
+        </button>
+      ))}
     </div>
   );
 }

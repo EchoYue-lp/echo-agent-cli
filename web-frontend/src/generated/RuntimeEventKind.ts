@@ -4,7 +4,7 @@
  * Structured event emitted at every run / task / step boundary.
  *
  * Every state transition must write one of these inside the same
- * persistence transaction as the state update (see `store.rs`).
+ * persistence transaction as the state update (see `store/runtime.rs`).
  */
 export type RuntimeEventKind =
   | 'run_created'
@@ -42,6 +42,7 @@ export type RuntimeEventKind =
   | 'subagent_guidance_rejected'
   | 'subagent_interrupt_requested'
   | 'subagent_interrupt_settled'
+  | 'subagent_escalation_requested'
   | 'isolation_observed'
   | 'thinking_started'
   | 'thinking_delta'

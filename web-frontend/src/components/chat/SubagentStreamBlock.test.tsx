@@ -1,8 +1,7 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { SubagentRunState } from '../../stores/subagentRunStore';
-import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
-import { useRightWorkspaceStore } from '../../stores/rightWorkspaceStore';
+import { useContextPaneStore } from '../../stores/contextPaneStore';
 import { SubagentStreamBlock } from './SubagentStreamBlock';
 
 describe('SubagentStreamBlock', () => {
@@ -17,8 +16,7 @@ describe('SubagentStreamBlock', () => {
   };
 
   beforeEach(() => {
-    useSubagentDetailStore.setState({ selected: null });
-    useRightWorkspaceStore.setState({ open: false });
+    useContextPaneStore.setState({ target: null, returnTarget: null });
   });
 
   // vitest globals are off, so testing-library auto-cleanup does not register.
@@ -35,16 +33,16 @@ describe('SubagentStreamBlock', () => {
     expect(screen.queryByText('结果')).toBeNull();
   });
 
-  it('opens the right-workspace detail on row click', () => {
+  it('selects the Subagent as the single contextual target on row click', () => {
     render(<SubagentStreamBlock run={run} />);
 
     fireEvent.click(screen.getByTitle('在右侧边栏查看完整执行过程'));
 
-    expect(useSubagentDetailStore.getState().selected).toEqual({
+    expect(useContextPaneStore.getState().target).toEqual({
+      kind: 'subagent',
       runId: 'run-1',
       subagentRunId: 'subagent-1',
     });
-    expect(useRightWorkspaceStore.getState().open).toBe(true);
   });
 });
 // @vitest-environment jsdom

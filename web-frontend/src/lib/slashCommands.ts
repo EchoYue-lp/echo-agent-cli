@@ -63,14 +63,14 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     name: '/workflow',
     aliases: [],
     description: 'Open workflow management',
-    category: 'Automation',
+    category: 'Workspace',
     target: 'workflows',
   },
   {
     name: '/extract',
     aliases: [],
     description: 'Open structured extraction',
-    category: 'Automation',
+    category: 'Workspace',
     target: 'extract',
   },
 ];
@@ -78,7 +78,6 @@ export const SLASH_COMMANDS: SlashCommand[] = [
 export const CATEGORY_META: Record<string, { order: number }> = {
   Session: { order: 0 },
   Workspace: { order: 1 },
-  Automation: { order: 2 },
 };
 
 export type GuiSlashHandlers = Record<GuiSlashTarget, () => void | Promise<void>>;

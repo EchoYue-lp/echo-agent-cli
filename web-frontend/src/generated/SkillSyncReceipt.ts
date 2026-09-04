@@ -6,10 +6,14 @@ import type { SkillTargetSettlementReceipt } from './SkillTargetSettlementReceip
  * Surface-neutral result of one durable skill policy mutation or repair pass.
  *
  * 2026-09 简化(取代 ADR 0032 的 durable 状态机):不再携带
- * generation/content_identity/repair_debt 等崩溃恢复对账字段。
+ * generation/content_identity/repair_debt 等崩溃恢复对账字段,只报告
+ * 本次操作对各运行时目标的即时结果。
  */
 export type SkillSyncReceipt = {
   operation_id: string;
+  /**
+   * 本次操作是否未改变任何状态(重复开关同一个 skill 等)。
+   */
   idempotent: boolean;
   status: SkillSettlementStatus;
   target_receipts: Array<SkillTargetSettlementReceipt>;
