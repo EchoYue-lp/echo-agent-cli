@@ -1868,11 +1868,10 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_skill_allowlists_match_registered_tool_names() -> anyhow::Result<()> {
-        let agent = echo_agent::agent::ReactAgent::new(echo_agent::agent::AgentConfig::standard(
-            "test-model",
-            "skill-audit",
-            "test",
-        ));
+        let mut agent = echo_agent::agent::ReactAgent::new(
+            echo_agent::agent::AgentConfig::standard("test-model", "skill-audit", "test"),
+        );
+        crate::creator_tools::install_creator_tools(&mut agent);
         let mut tool_names = agent.tool_names();
         tool_names.extend(
             ["task_create", "task_update", "task_list", "task_execute"]

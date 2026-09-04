@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     原生 `plugin-creator`；两者默认启用、按需加载，新增三个模型可调用薄工具并复用
     framework Skill validator 与应用 PluginRuntime 的 scaffold / validate 权威。ADR
     [0038](docs/zh/adr/0038-builtin-creator-skills.md)。
+  - app-core 数据根与 binary 入口统一尊重绝对 `EKO_DATA_DIR`，使隔离测试和本地多实例
+    不再误占用真实 `~/.eko` authority。
   - 用户可调用 Skill：TUI 新增 `/skill <name> [instructions]`（激活 + 可选引导输入），GUI Settings 的 Skills 面板新增"在当前会话激活"；framework `activate_skill` 对未安装/被禁用 skill 从静默返回改为显式报错。
   - 内置目录先收敛 39 → 24，随后因 creator 能力调整为 25：删除通用能力型（coding/translation/doc-writing/web-search，行为准则由基础 prompt 承担）与 vendored Anthropic 示例 11 个（design/automation/research，可经 SkillsHub 安装）；默认启用先从 8 → 5，随后加入两个 creator 变为 7；methodology baseline 常驻注入 4 → 1（仅 verification-before-completion）。
   - 打包修复：builtin skills 根从编译期 `CARGO_MANIFEST_DIR` 改为运行时解析（`$EKO_SKILLS_ROOT` → Tauri bundle resources → 源码树），`tauri.conf.json` 增加 `bundle.resources`，修复安装态应用丢失全部内置 skill 的问题。
