@@ -42,6 +42,14 @@ pub async fn register_task_tools_on_agent(
     store: Arc<TaskRuntimeStore>,
     subagent_catalog: Arc<SubagentCatalogSnapshot>,
 ) {
+    let admission = super::executor::process_subagent_admission();
+    agent_handle
+        .write_async(|agent| {
+            Box::pin(async move {
+                agent.set_subagent_admission(admission).await;
+            })
+        })
+        .await;
     let tool_names = agent_handle.read(|agent| agent.tool_names()).await;
     let capabilities = Arc::new(TaskCapabilityCatalog::new(
         subagent_catalog.clone(),

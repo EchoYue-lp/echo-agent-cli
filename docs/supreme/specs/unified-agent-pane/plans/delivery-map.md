@@ -18,4 +18,4 @@ outcomes:
       - framework-subagent-event-envelope
 design_revision: sha256:dcd276c17c2c75d4cddbe40bd8f9f1e035be2ae4e3dcde6b74ceb0e1f97b2c4b
 ---
-本轮选择纯前端壳与上下文分栏；framework event envelope 必须避开正在执行的 shared admission Plan，最终事件集成等待两个前置结果。
+前端壳与 framework event envelope 两个前置结果均已交付；当前执行 EKO app-core 事件投影、跨 surface 恢复与生成契约集成。

@@ -9,7 +9,7 @@
 //! - 工具调用交互式审批
 //! - Token 用量追踪
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::result::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1120,6 +1120,11 @@ pub struct ReplConfig {
     pub webhook_emitter: Option<std::sync::Arc<echo_agent_app_core::api::webhook::WebhookEmitter>>,
     /// Authoritative application state used by workspace and other stateful commands.
     pub app_state: Option<Arc<echo_agent_app_core::api::state::AppState>>,
+    /// Application-owned fallback stream for background Subagent events that
+    /// outlive the turn-local chat sink.
+    pub subagent_projection: Option<
+        Arc<echo_agent_app_core::api::subagent_event_projection::SubagentEnvelopeProjectionService>,
+    >,
 }
 
 impl Default for ReplConfig {
@@ -1141,6 +1146,7 @@ impl Default for ReplConfig {
             conversation_id: uuid::Uuid::new_v4().to_string(),
             webhook_emitter: None,
             app_state: None,
+            subagent_projection: None,
         }
     }
 }
@@ -1287,6 +1293,82 @@ async fn run_repl_inner(
     let hitl_rx = &mut hitl_session.request_rx;
     let failure_rx = &mut hitl_session.failure_rx;
     let foreground_turns = app_state.session.foreground_turns.clone();
+    let committed_workspace_id = app_state
+        .current_execution_scope()
+        .await
+        .workspace_id()
+        .to_string();
+    let committed_subagent_task = config.subagent_projection.as_ref().map(|service| {
+        let mut events = service.subscribe_committed();
+        let mut replayed_events = VecDeque::from(service.replay_committed());
+        let service = Arc::clone(service);
+        let live_output = live_output.clone();
+        let conversation_id = config.conversation_id.clone();
+        let workspace_id = committed_workspace_id.clone();
+        tokio::spawn(async move {
+            let mut delivered_event_ids = HashSet::new();
+            let mut delivered_event_order = VecDeque::new();
+            loop {
+                let projected = if let Some(projected) = replayed_events.pop_front() {
+                    projected
+                } else {
+                    match events.recv().await {
+                        Ok(projected) => projected,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                            tracing::warn!(count, "CLI committed Subagent projection lagged; replaying retained commits");
+                            replayed_events.extend(service.replay_committed());
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                };
+                if projected.envelope.workspace_id != workspace_id
+                    || projected.envelope.conversation_id.as_deref() != Some(&conversation_id)
+                {
+                    continue;
+                }
+                if !remember_repl_committed_event(
+                    &mut delivered_event_ids,
+                    &mut delivered_event_order,
+                    &projected.envelope.event_id,
+                ) {
+                    continue;
+                }
+                let echo_agent_app_core::api::chat_driver::ChatDriverEvent::Execution(event) =
+                    &projected.envelope.payload
+                else {
+                    continue;
+                };
+                let terminal = matches!(
+                    event.event,
+                    echo_agent_app_core::api::tasks::task_runtime::RuntimeEventKind::Completed
+                        | echo_agent_app_core::api::tasks::task_runtime::RuntimeEventKind::Failed
+                        | echo_agent_app_core::api::tasks::task_runtime::RuntimeEventKind::Cancelled
+                        | echo_agent_app_core::api::tasks::task_runtime::RuntimeEventKind::TimedOut
+                        | echo_agent_app_core::api::tasks::task_runtime::RuntimeEventKind::SubagentStreamGap
+                );
+                if terminal {
+                    let agent = event.agent.as_deref().unwrap_or("subagent");
+                    let summary = event
+                        .payload
+                        .get("outcome")
+                        .and_then(|outcome| outcome.get("summary"))
+                        .or_else(|| event.payload.get("summary"))
+                        .or_else(|| event.payload.get("error"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let message = if summary.is_empty() {
+                        format!("Subagent {agent}: {}", event.event)
+                    } else {
+                        format!("Subagent {agent}: {} - {summary}", event.event)
+                    };
+                    if !live_output.emit(message) {
+                        break;
+                    }
+                }
+            }
+        })
+    });
     let mut active_turn: Option<ActiveReplTurn> = None;
     let mut pending_hitl = VecDeque::new();
     let mut pending_git: Option<PendingGitAction> = None;
@@ -1673,6 +1755,9 @@ async fn run_repl_inner(
             }
         }
     };
+    if let Some(task) = committed_subagent_task {
+        task.abort();
+    }
     let abandoned_attachments = {
         let mut staged = staged_attachments.lock().await;
         std::mem::take(&mut *staged)
@@ -1690,6 +1775,23 @@ async fn run_repl_inner(
             "CLI session failed: {error}; attachment staging cleanup failed: {cleanup}"
         )),
     }
+}
+
+fn remember_repl_committed_event(
+    seen: &mut HashSet<String>,
+    order: &mut VecDeque<String>,
+    event_id: &str,
+) -> bool {
+    if !seen.insert(event_id.to_string()) {
+        return false;
+    }
+    order.push_back(event_id.to_string());
+    while order.len() > 2048 {
+        if let Some(retired) = order.pop_front() {
+            seen.remove(&retired);
+        }
+    }
+    true
 }
 
 /// Run auto-memory extraction when the session ends.

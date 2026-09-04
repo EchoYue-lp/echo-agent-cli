@@ -854,6 +854,19 @@ fn event_identity(event: &ChatDriverEvent, root_turn_id: &str) -> (String, Strin
                 .map(|message_id| message_id.as_str().to_string())
                 .unwrap_or_else(|| root_turn_id.to_string()),
         ),
+        ChatDriverEvent::Execution(event) => event
+            .framework_event
+            .as_ref()
+            .map(|metadata| {
+                (
+                    metadata.turn_id.clone(),
+                    metadata
+                        .message_id
+                        .clone()
+                        .unwrap_or_else(|| root_turn_id.to_string()),
+                )
+            })
+            .unwrap_or_else(|| (root_turn_id.to_string(), root_turn_id.to_string())),
         _ => (root_turn_id.to_string(), root_turn_id.to_string()),
     }
 }
@@ -912,13 +925,26 @@ fn validate_event_stream_identity(
                 )));
             }
         }
-        ChatDriverEvent::Execution(execution)
+        ChatDriverEvent::Execution(execution) => {
             if execution.workspace_id != workspace_id
-                || Some(execution.conversation_id.as_str()) != conversation_id =>
-        {
-            return Err(ChatEventLogError::InvalidIdentity(
-                "execution event address does not match journal stream".to_string(),
-            ));
+                || Some(execution.conversation_id.as_str()) != conversation_id
+            {
+                return Err(ChatEventLogError::InvalidIdentity(
+                    "execution event address does not match journal stream".to_string(),
+                ));
+            }
+            if let Some(metadata) = execution.framework_event.as_ref()
+                && (metadata.message_id.as_deref().is_some_and(|id| id != root_turn_id)
+                    || execution.subagent_run_id.as_deref()
+                        != Some(metadata.execution_id.as_str())
+                    || execution.task_id.as_deref() != metadata.task_id.as_deref()
+                    || execution.agent.as_deref() != Some(metadata.agent_name.as_str()))
+            {
+                return Err(ChatEventLogError::InvalidIdentity(
+                    "framework Subagent metadata does not match its EKO execution event"
+                        .to_string(),
+                ));
+            }
         }
         ChatDriverEvent::InputLifecycle(fact)
             if fact.identity().address.workspace_id != workspace_id

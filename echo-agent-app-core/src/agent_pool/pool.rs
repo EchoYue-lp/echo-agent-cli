@@ -391,6 +391,7 @@ impl AgentPool {
         )
         .await;
         let mut shared = shared;
+        shared.subagent_event_bus = runtime.model_consumers.subagent_event_bus();
         shared.browser_runtime = Some(runtime.browser_runtime.clone());
         shared.task_runtime_store = task_runtime_store;
         shared.command_cell_runtime = Some(runtime.command_cell_runtime.clone());
@@ -503,6 +504,7 @@ impl AgentPool {
         let authority_plugin_generation = self.agent_generation.read().await.clone();
         let mcp_config_snapshot = self.mcp_config_snapshot.read().await.clone();
         let shared = SharedResources {
+            subagent_event_bus: self.shared.subagent_event_bus.clone(),
             tool_manager: None,
             hook_registry: None,
             sandbox_manager: self.shared.sandbox_manager.clone(),
@@ -1829,9 +1831,13 @@ impl AgentPool {
             product_data_io: self.shared.product_data_io.clone(),
             execution_scope: self.shared.execution_scope.clone(),
         };
-        let created = infra::create_agent_with_diagnostics(&params, &app_config)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let created = infra::create_agent_with_diagnostics_and_event_bus(
+            &params,
+            &app_config,
+            self.shared.subagent_event_bus.clone(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut agent = created.agent;
         let model_consumers = created.model_consumers;
         #[cfg(test)]

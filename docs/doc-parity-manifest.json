@@ -331,6 +331,14 @@
       "legacyRemoved": true
     },
     {
+      "legacyPath": "adr/0040-app-core-subagent-event-projection.md",
+      "targetPath": "adr/0040-app-core-subagent-event-projection.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
       "legacyPath": "architecture.md",
       "targetPath": "architecture/overview.md",
       "kind": "architecture",

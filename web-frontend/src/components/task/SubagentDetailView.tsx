@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
@@ -24,6 +24,7 @@ import { AgentComposerFrame } from '../chat/AgentComposerFrame';
 import { AgentPane } from '../chat/AgentPane';
 import { ExecutionProcessGroup } from '../chat/ExecutionProcessGroup';
 import { InlineToolCall } from '../chat/InlineToolCall';
+import { ThinkingSegment } from '../chat/ThinkingSegment';
 import { SubagentOutcomeView } from '../subagent/SubagentOutcomeView';
 
 interface SubagentDetailViewProps {
@@ -55,6 +56,84 @@ function commandId(action: string): string {
   return randomId ?? `${action}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+export type SubagentTimelineEntry =
+  | { kind: 'thinking'; key: string; content: string }
+  | { kind: 'text'; key: string; content: string }
+  | { kind: 'tool'; key: string; toolId: string }
+  | { kind: 'gap'; key: string; from?: number; to?: number };
+
+export function subagentTimelineEntries(
+  run: SubagentRunState,
+  toolIds: readonly string[],
+  tools: Record<string, { call_id: string }>
+): SubagentTimelineEntry[] {
+  const toolByCall = new Map<string, string>();
+  for (const toolId of toolIds) {
+    const callId = tools[toolId]?.call_id;
+    if (callId) toolByCall.set(callId, toolId);
+  }
+  const usedTools = new Set<string>();
+  const entries: SubagentTimelineEntry[] = [];
+  const appendText = (kind: 'thinking' | 'text', key: string, content: string) => {
+    if (!content) return;
+    const previous = entries.at(-1);
+    if (previous?.kind === kind) {
+      previous.content += content;
+    } else {
+      entries.push({ kind, key, content });
+    }
+  };
+
+  run.events.forEach((event, index) => {
+    const key = event.event_id ?? `${event.event}-${index}`;
+    if (event.event === 'thinking_delta') {
+      appendText('thinking', key, typeof event.content === 'string' ? event.content : '');
+    } else if (event.event === 'token_delta') {
+      appendText('text', key, typeof event.content === 'string' ? event.content : '');
+    } else if (event.event === 'tool_started' && typeof event.call_id === 'string') {
+      const toolId = toolByCall.get(event.call_id);
+      if (toolId) {
+        usedTools.add(toolId);
+        entries.push({ kind: 'tool', key, toolId });
+      }
+    } else if (event.event === 'subagent_stream_gap') {
+      entries.push({
+        kind: 'gap',
+        key,
+        from: event.requested_after,
+        to: event.available_from != null ? event.available_from - 1 : event.latest_sequence,
+      });
+    }
+  });
+  for (const toolId of toolIds) {
+    if (!usedTools.has(toolId)) entries.push({ kind: 'tool', key: toolId, toolId });
+  }
+  return entries;
+}
+
+export function visibleSubagentTimelineEntries(
+  terminal: boolean,
+  finalOutput: string,
+  entries: SubagentTimelineEntry[]
+): SubagentTimelineEntry[] {
+  const normalizedOutput = finalOutput.replace(/\s+/g, ' ').trim();
+  const normalizedStream = entries
+    .filter(
+      (entry): entry is Extract<SubagentTimelineEntry, { kind: 'text' }> => entry.kind === 'text'
+    )
+    .map((entry) => entry.content)
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const terminalCoversStream =
+    normalizedOutput.length > 0 &&
+    normalizedStream.length > 0 &&
+    normalizedOutput.includes(normalizedStream);
+  return terminal && terminalCoversStream
+    ? entries.filter((entry) => entry.kind !== 'text')
+    : entries;
+}
+
 export function SubagentDetailView({ run, onBack }: SubagentDetailViewProps) {
   const presentation = subagentOutcomePresentation(run);
   const addToast = useToastStore((state) => state.addToast);
@@ -72,7 +151,17 @@ export function SubagentDetailView({ run, onBack }: SubagentDetailViewProps) {
   const toolIds = useToolExecutionStore((state) =>
     toolExecutionIdsForOwner(state.idsByOwner, ownerKey)
   );
+  const tools = useToolExecutionStore((state) => state.tools);
+  const timeline = useMemo(
+    () => subagentTimelineEntries(run, toolIds, tools),
+    [run, toolIds, tools]
+  );
   const terminal = run.status !== 'running';
+  const visibleTimeline = useMemo(
+    () => visibleSubagentTimelineEntries(terminal, run.finalOutput ?? '', timeline),
+    [run.finalOutput, terminal, timeline]
+  );
+  const thinkingCount = visibleTimeline.filter((entry) => entry.kind === 'thinking').length;
   const canControl = Boolean(run.taskId && run.planRevision != null && run.attempt != null);
 
   const controlIdentity = (
@@ -237,12 +326,50 @@ export function SubagentDetailView({ run, onBack }: SubagentDetailViewProps) {
           </div>
         )}
 
-        {toolIds.length > 0 && (
+        {visibleTimeline.length > 0 && (
           <ExecutionProcessGroup completed={terminal}>
             <div className="space-y-1">
-              {toolIds.map((toolId, index) => (
-                <InlineToolCall key={toolId} toolId={toolId} index={index} />
-              ))}
+              {visibleTimeline.map((entry, index) => {
+                if (entry.kind === 'thinking') {
+                  const thinkingIndex = visibleTimeline
+                    .slice(0, index + 1)
+                    .filter((item) => item.kind === 'thinking').length;
+                  return (
+                    <ThinkingSegment
+                      key={entry.key}
+                      index={thinkingIndex}
+                      total={thinkingCount}
+                      content={entry.content}
+                      isStreaming={!terminal}
+                    />
+                  );
+                }
+                if (entry.kind === 'text') {
+                  return (
+                    <div
+                      key={entry.key}
+                      className="whitespace-pre-wrap break-words py-1 text-sm leading-relaxed text-[var(--text-primary)]"
+                    >
+                      {entry.content}
+                    </div>
+                  );
+                }
+                if (entry.kind === 'gap') {
+                  return (
+                    <div
+                      key={entry.key}
+                      role="status"
+                      className="border-l-2 border-[var(--color-warning)] py-1 pl-2 text-xs text-[var(--text-secondary)]"
+                    >
+                      部分实时过程未保留
+                      {entry.from != null && entry.to != null
+                        ? `（sequence ${entry.from + 1}-${entry.to}）`
+                        : ''}
+                    </div>
+                  );
+                }
+                return <InlineToolCall key={entry.key} toolId={entry.toolId} index={index} />;
+              })}
             </div>
           </ExecutionProcessGroup>
         )}

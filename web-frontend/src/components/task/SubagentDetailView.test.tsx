@@ -1,7 +1,11 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import type { SubagentRunState } from '../../stores/subagentRunStore';
-import { SubagentDetailView } from './SubagentDetailView';
+import {
+  SubagentDetailView,
+  subagentTimelineEntries,
+  visibleSubagentTimelineEntries,
+} from './SubagentDetailView';
 
 describe('SubagentDetailView', () => {
   it('renders an inline exact-attempt composer for a running Subagent', () => {
@@ -112,5 +116,56 @@ describe('SubagentDetailView', () => {
     expect(html).toContain('aria-label="发送 Subagent 后续任务"');
     expect(html.match(/provider unavailable/g)).toHaveLength(1);
     expect(html).not.toContain('未完成');
+  });
+
+  it('uses terminal output once and reports a fully evicted gap inclusively', () => {
+    const run: SubagentRunState = {
+      subagentRunId: 'execution-1',
+      runId: '',
+      agent: 'explorer',
+      status: 'completed',
+      startedAt: 1,
+      finalOutput: 'complete answer',
+      events: [
+        {
+          kind: 'subagent',
+          workspace_id: 'workspace-1',
+          conversation_id: 'conversation-1',
+          run_id: '',
+          subagent_run_id: 'execution-1',
+          agent: 'explorer',
+          event: 'token_delta',
+          content: 'complete answer',
+        },
+        {
+          kind: 'subagent',
+          workspace_id: 'workspace-1',
+          conversation_id: 'conversation-1',
+          run_id: '',
+          subagent_run_id: 'execution-1',
+          agent: 'explorer',
+          event: 'subagent_stream_gap',
+          requested_after: 1,
+          available_from: null,
+          latest_sequence: 2,
+        },
+      ],
+    };
+    const timeline = subagentTimelineEntries(run, [], {});
+    expect(timeline.find((entry) => entry.kind === 'gap')).toMatchObject({ from: 1, to: 2 });
+    expect(visibleSubagentTimelineEntries(true, 'complete answer', timeline)).toEqual([
+      expect.objectContaining({ kind: 'gap', from: 1, to: 2 }),
+    ]);
+  });
+
+  it('keeps partial streamed output when a failed terminal has no complete output', () => {
+    const entries = [
+      { kind: 'text' as const, key: 'partial', content: 'partial investigation result' },
+    ];
+
+    expect(visibleSubagentTimelineEntries(true, '', entries)).toEqual(entries);
+    expect(visibleSubagentTimelineEntries(true, 'different failure summary', entries)).toEqual(
+      entries
+    );
   });
 });

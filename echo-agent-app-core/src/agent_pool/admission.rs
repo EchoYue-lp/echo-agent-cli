@@ -235,8 +235,12 @@ impl std::fmt::Display for PoolError {
 impl std::error::Error for PoolError {}
 
 /// Resources extracted from the primary agent that can be shared across
-/// multiple pool agents. All fields are `Arc`-wrapped for thread-safe sharing.
+/// multiple pool agents. Cloneable handles preserve the underlying
+/// thread-safe resource owners.
 pub struct SharedResources {
+    /// One framework Subagent event transport shared by every Agent generation
+    /// in the process, including workspace-owned pool forks.
+    pub(crate) subagent_event_bus: echo_agent::subagent::SubagentEventBus,
     pub tool_manager: Option<Arc<echo_agent::tools::ToolManager>>,
     pub hook_registry: Option<Arc<tokio::sync::RwLock<echo_agent::skills::hooks::HookRegistry>>>,
     pub sandbox_manager: Option<Arc<echo_agent::sandbox::SandboxManager>>,
@@ -283,6 +287,7 @@ impl SharedResources {
     ) -> Self {
         agent
             .read(|a| {
+                let subagent_event_bus = a.subagent_registry().event_bus().clone();
                 let tool_manager = Some(a.tool_manager().clone());
                 let hook_registry = Some(a.hook_registry().clone());
                 let sandbox_manager = a.sandbox_manager().cloned();
@@ -295,6 +300,7 @@ impl SharedResources {
                 let permission_service = a.permission_service().cloned();
 
                 SharedResources {
+                    subagent_event_bus,
                     tool_manager,
                     hook_registry,
                     sandbox_manager,

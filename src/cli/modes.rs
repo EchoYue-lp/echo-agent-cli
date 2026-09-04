@@ -104,6 +104,7 @@ fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
         conversation_id: String::new(),
         webhook_emitter: None,
         app_state: None,
+        subagent_projection: None,
     }
 }
 
@@ -743,6 +744,7 @@ pub async fn run_cli_mode(
     repl_config.conversation_id = conversation_id;
     repl_config.webhook_emitter = Some(webhook_emitter);
     repl_config.plugin_runtime = Some(plugin_runtime.clone());
+    repl_config.subagent_projection = Some(services.subagent_projection.clone());
     repl_config.app_state = Some(services.app_state.clone());
 
     crate::cli::run_repl(agent, repl_config, repl_hitl_session).await

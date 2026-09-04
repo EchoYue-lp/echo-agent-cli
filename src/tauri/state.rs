@@ -9,6 +9,8 @@ use tokio_util::sync::CancellationToken;
 pub struct TauriState {
     pub app_state: Arc<AppState>,
     pub browser_runtime: Arc<BrowserRuntime>,
+    pub subagent_projection:
+        Arc<echo_agent_app_core::api::subagent_event_projection::SubagentEnvelopeProjectionService>,
     pub bridge_supervisor: Arc<TauriBridgeSupervisor>,
 }
 
@@ -16,11 +18,15 @@ impl TauriState {
     pub fn new(
         app_state: Arc<AppState>,
         browser_runtime: Arc<BrowserRuntime>,
+        subagent_projection: Arc<
+            echo_agent_app_core::api::subagent_event_projection::SubagentEnvelopeProjectionService,
+        >,
         bridge_supervisor: Arc<TauriBridgeSupervisor>,
     ) -> Self {
         Self {
             app_state,
             browser_runtime,
+            subagent_projection,
             bridge_supervisor,
         }
     }

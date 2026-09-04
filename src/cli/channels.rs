@@ -246,7 +246,7 @@ fn channel_live_terminal_projector(
 }
 
 #[cfg(feature = "channels")]
-async fn project_channel_input_lifecycle(
+async fn project_channel_committed_events(
     log: &echo_agent_app_core::api::chat_event_log::ChatEventLog,
     identity: &echo_agent_app_core::api::conversation_input::ConversationInputIdentity,
     render_tx: &tokio::sync::mpsc::Sender<ChannelRenderEvent>,
@@ -265,7 +265,7 @@ async fn project_channel_input_lifecycle(
         .map_err(|error| error.to_string())?;
     if replay.truncated {
         return Err(format!(
-            "channel input lifecycle replay for {} was truncated after cursor {}",
+            "channel committed-event replay for {} was truncated after cursor {}",
             identity.input_id, after_cursor
         ));
     }
@@ -274,11 +274,12 @@ async fn project_channel_input_lifecycle(
         if matches!(
             &envelope.payload,
             echo_agent_app_core::api::chat_driver::ChatDriverEvent::InputLifecycle(_)
+                | echo_agent_app_core::api::chat_driver::ChatDriverEvent::Execution(_)
         ) {
             render_tx
                 .send(ChannelRenderEvent::Driver(envelope.payload))
                 .await
-                .map_err(|_| "channel input lifecycle renderer is closed".to_string())?;
+                .map_err(|_| "channel committed-event renderer is closed".to_string())?;
         }
         *cursor
             .lock()
@@ -1305,7 +1306,7 @@ impl input_pump::ChannelInputPumpAdapter for ChannelInputPumpAdapter {
                         let observed = service
                             .observe_turn_input_through_drain(attempt, receipt)
                             .await;
-                        let projected = project_channel_input_lifecycle(
+                        let projected = project_channel_committed_events(
                             log.as_ref(),
                             &identity,
                             &render_tx,
@@ -1347,7 +1348,7 @@ impl input_pump::ChannelInputPumpAdapter for ChannelInputPumpAdapter {
                             .settle_attempt(&attempt, &outcome)
                             .await
                             .map_err(|error| error.to_string())?;
-                        if let Err(error) = project_channel_input_lifecycle(
+                        if let Err(error) = project_channel_committed_events(
                             log.as_ref(),
                             &identity,
                             &render_tx,
@@ -7550,7 +7551,7 @@ mod tests {
     mod durable_ingress {
         use super::super::{
             ChannelRenderEvent, channel_input_address, channel_input_attempt,
-            project_channel_input_lifecycle,
+            project_channel_committed_events,
         };
         use echo_agent_app_core::api::chat_event_log::{ChatEventLog, ChatEventRetention};
         use echo_agent_app_core::api::conversation_input::{
@@ -7743,6 +7744,8 @@ mod tests {
         -> Result<(), String> {
             use echo_agent_app_core::api::chat_driver::ChatDriverEvent;
             use echo_agent_app_core::api::conversation_input::ConversationInputFact;
+            use echo_agent_app_core::api::tasks::task_runtime::RuntimeEventKind;
+            use echo_agent_app_core::api::tasks::task_runtime::executor::ExecEvent;
 
             let temp = TestDirectory::new("pump-renderer")?;
             let log = Arc::new(
@@ -7773,6 +7776,24 @@ mod tests {
                 .drained(attempt.clone())
                 .await
                 .map_err(|error| error.to_string())?;
+            log.append(
+                "channel-workspace",
+                Some("channel-conversation"),
+                &submitted.identity.input_id,
+                ChatDriverEvent::Execution(Box::new(
+                    ExecEvent::subagent_attempt(
+                        "channel-workspace",
+                        "channel-conversation",
+                        "",
+                        None,
+                        "background-execution",
+                        RuntimeEventKind::Started,
+                        serde_json::json!({"task": "background review"}),
+                    )
+                    .with_agent("reviewer"),
+                )),
+            )
+            .map_err(|error| error.to_string())?;
             let message = echo_agent::channels::InboundMessage::new(
                 "qq",
                 "sender",
@@ -7783,7 +7804,7 @@ mod tests {
             );
             let (route, mut receiver) =
                 super::super::input_pump::channel_input_reply_route(&message);
-            project_channel_input_lifecycle(
+            project_channel_committed_events(
                 log.as_ref(),
                 &submitted.identity,
                 &route.render_tx,
@@ -7797,7 +7818,7 @@ mod tests {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            project_channel_input_lifecycle(
+            project_channel_committed_events(
                 log.as_ref(),
                 &submitted.identity,
                 &route.render_tx,
@@ -7806,21 +7827,30 @@ mod tests {
             .await?;
 
             let mut completed_phases = Vec::new();
+            let mut saw_background_execution = false;
             while let Ok(event) = receiver.render_rx.try_recv() {
-                if let ChannelRenderEvent::Driver(ChatDriverEvent::InputLifecycle(fact)) = event {
-                    completed_phases.push(match fact.as_ref() {
-                        ConversationInputFact::Persisted { .. } => "persisted",
-                        ConversationInputFact::AttemptStarted { .. } => "attempt_started",
-                        ConversationInputFact::MailboxAccepted { .. } => "mailbox_accepted",
-                        ConversationInputFact::Drained { .. } => "drained",
-                        ConversationInputFact::TurnSettled { .. } => "turn_settled",
-                        ConversationInputFact::Deferred { .. } => "deferred",
-                        ConversationInputFact::Reordered { .. } => "reordered",
-                        ConversationInputFact::RecoveryRequired { .. } => "recovery_required",
-                        ConversationInputFact::Cancelled { .. } => "cancelled",
-                    });
+                match event {
+                    ChannelRenderEvent::Driver(ChatDriverEvent::InputLifecycle(fact)) => {
+                        completed_phases.push(match fact.as_ref() {
+                            ConversationInputFact::Persisted { .. } => "persisted",
+                            ConversationInputFact::AttemptStarted { .. } => "attempt_started",
+                            ConversationInputFact::MailboxAccepted { .. } => "mailbox_accepted",
+                            ConversationInputFact::Drained { .. } => "drained",
+                            ConversationInputFact::TurnSettled { .. } => "turn_settled",
+                            ConversationInputFact::Deferred { .. } => "deferred",
+                            ConversationInputFact::Reordered { .. } => "reordered",
+                            ConversationInputFact::RecoveryRequired { .. } => "recovery_required",
+                            ConversationInputFact::Cancelled { .. } => "cancelled",
+                        });
+                    }
+                    ChannelRenderEvent::Driver(ChatDriverEvent::Execution(event)) => {
+                        saw_background_execution =
+                            event.subagent_run_id.as_deref() == Some("background-execution");
+                    }
+                    _ => {}
                 }
             }
+            assert!(saw_background_execution);
             assert_eq!(
                 completed_phases,
                 vec![
@@ -7864,7 +7894,7 @@ mod tests {
             );
             let (recovery_route, mut recovery_receiver) =
                 super::super::input_pump::channel_input_reply_route(&recovery_message);
-            project_channel_input_lifecycle(
+            project_channel_committed_events(
                 log.as_ref(),
                 &recovery.identity,
                 &recovery_route.render_tx,
@@ -7883,7 +7913,7 @@ mod tests {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            project_channel_input_lifecycle(
+            project_channel_committed_events(
                 log.as_ref(),
                 &recovery.identity,
                 &recovery_route.render_tx,
@@ -8801,7 +8831,7 @@ mod tests {
                     },
                 ),
                 Ok(ChannelRenderEvent::Driver(
-                    echo_agent_app_core::api::chat_driver::ChatDriverEvent::Execution(
+                    echo_agent_app_core::api::chat_driver::ChatDriverEvent::Execution(Box::new(
                         ExecEvent::subagent(
                             "workspace-a",
                             "conversation-a",
@@ -8815,7 +8845,7 @@ mod tests {
                             }),
                         )
                         .with_agent("reviewer"),
-                    ),
+                    )),
                 )),
                 agent_render_event(
                     2,
@@ -8829,7 +8859,7 @@ mod tests {
                     },
                 ),
                 Ok(ChannelRenderEvent::Driver(
-                    echo_agent_app_core::api::chat_driver::ChatDriverEvent::Execution(
+                    echo_agent_app_core::api::chat_driver::ChatDriverEvent::Execution(Box::new(
                         ExecEvent::subagent(
                             "workspace-a",
                             "conversation-a",
@@ -8845,7 +8875,7 @@ mod tests {
                             }),
                         )
                         .with_agent("reviewer"),
-                    ),
+                    )),
                 )),
                 Ok(projection_event(
                     "shared-call",
@@ -8870,7 +8900,7 @@ mod tests {
                     },
                 )),
                 Ok(ChannelRenderEvent::Driver(
-                    echo_agent_app_core::api::chat_driver::ChatDriverEvent::Execution(
+                    echo_agent_app_core::api::chat_driver::ChatDriverEvent::Execution(Box::new(
                         ExecEvent::subagent(
                             "workspace-a",
                             "conversation-a",
@@ -8885,7 +8915,7 @@ mod tests {
                             }),
                         )
                         .with_agent("reviewer"),
-                    ),
+                    )),
                 )),
                 Ok(ChannelRenderEvent::Terminal(
                     echo_agent_app_core::api::chat_driver::TurnOutcome::Completed,
@@ -8949,7 +8979,7 @@ mod tests {
                     },
                 ),
                 Ok(ChannelRenderEvent::Driver(
-                    echo_agent_app_core::api::chat_driver::ChatDriverEvent::Execution(
+                    echo_agent_app_core::api::chat_driver::ChatDriverEvent::Execution(Box::new(
                         ExecEvent::run(
                             "workspace-a",
                             "conversation-a",
@@ -8957,7 +8987,7 @@ mod tests {
                             RuntimeEventKind::RunFailed,
                             serde_json::json!({"token": secret}),
                         ),
-                    ),
+                    )),
                 )),
                 Ok(ChannelRenderEvent::Driver(
                     echo_agent_app_core::api::chat_driver::ChatDriverEvent::Interrupt {

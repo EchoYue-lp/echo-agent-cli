@@ -158,22 +158,65 @@ pub fn process_execution_resource_snapshot() -> ProcessExecutionResourceSnapshot
 }
 
 /// Scope of an execution-flow event on the unified frontend channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    ts_rs::TS,
+)]
 #[serde(rename_all = "snake_case")]
+#[ts(export, rename = "ExecEventScope")]
 pub enum ExecEventScope {
     Run,
     Task,
     Subagent,
 }
 
-/// A lightweight execution-flow event emitted to the frontend via the unified
-/// `execution://event` Tauri channel.
+/// Framework-owned identity and ordering attached to an EKO Subagent event.
+///
+/// The application keeps this metadata separate from its workspace address so
+/// replay can validate both authorities without parsing execution-id formats.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS,
+)]
+#[serde(deny_unknown_fields)]
+#[ts(export, rename = "SubagentEventMetadata")]
+pub struct SubagentEventMetadata {
+    pub schema_version: u16,
+    pub event_id: String,
+    pub content_hash: String,
+    #[ts(type = "number")]
+    pub sequence: u64,
+    pub stream_id: String,
+    pub turn_id: String,
+    pub message_id: Option<String>,
+    pub execution_id: String,
+    pub parent_event_id: Option<String>,
+    pub timestamp: String,
+    pub parent_agent: String,
+    pub agent_name: String,
+    pub parent_execution_id: Option<String>,
+    pub agent_path: Option<String>,
+    pub task_id: Option<String>,
+    pub attempt: Option<u32>,
+    #[ts(type = "number | null")]
+    pub plan_revision: Option<u64>,
+}
+
+/// A lightweight execution-flow event committed as
+/// `ChatDriverEvent::Execution` for every surface.
 ///
 /// Replaces the pre-unification trace pair. `event` is typed inside the
 /// runtime and serializes to the frontend's snake_case event name. `payload`
 /// carries event-specific fields
 /// (`content`/`name`/`args`/...) as a flat JSON object.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export, rename = "ExecEvent")]
 pub struct ExecEvent {
     pub workspace_id: String,
     pub conversation_id: String,
@@ -187,7 +230,12 @@ pub struct ExecEvent {
     pub subagent_run_id: Option<String>,
     pub event: RuntimeEventKind,
     pub agent: Option<String>,
+    #[ts(type = "unknown")]
     pub payload: serde_json::Value,
+    /// Present only for events projected from the framework's authoritative
+    /// Subagent envelope. Existing EKO run/task events remain compatible.
+    #[serde(default)]
+    pub framework_event: Option<SubagentEventMetadata>,
 }
 
 impl ExecEvent {
@@ -209,6 +257,7 @@ impl ExecEvent {
             event,
             agent: None,
             payload,
+            framework_event: None,
         }
     }
 
@@ -231,6 +280,7 @@ impl ExecEvent {
             event,
             agent: None,
             payload,
+            framework_event: None,
         }
     }
 
@@ -254,6 +304,32 @@ impl ExecEvent {
             event,
             agent: None,
             payload,
+            framework_event: None,
+        }
+    }
+
+    /// Construct one Subagent attempt even when it is not attached to a formal
+    /// PlanTask (ordinary `agent_tool` dispatches have no task id).
+    pub fn subagent_attempt(
+        workspace_id: impl Into<String>,
+        conversation_id: impl Into<String>,
+        run_id: impl Into<String>,
+        task_id: Option<String>,
+        subagent_run_id: impl Into<String>,
+        event: RuntimeEventKind,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            workspace_id: workspace_id.into(),
+            conversation_id: conversation_id.into(),
+            run_id: run_id.into(),
+            scope: ExecEventScope::Subagent,
+            task_id,
+            subagent_run_id: Some(subagent_run_id.into()),
+            event,
+            agent: None,
+            payload,
+            framework_event: None,
         }
     }
 
@@ -261,6 +337,41 @@ impl ExecEvent {
     pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
         self.agent = Some(agent.into());
         self
+    }
+
+    pub fn with_framework_event(mut self, metadata: SubagentEventMetadata) -> Self {
+        self.framework_event = Some(metadata);
+        self
+    }
+}
+
+#[cfg(test)]
+mod exec_event_typescript_contract_tests {
+    use super::{ExecEvent, ExecEventScope, RuntimeEventKind, SubagentEventMetadata};
+    use ts_rs::TS;
+
+    #[test]
+    fn export_exec_event_typescript_contract() -> Result<(), String> {
+        ExecEventScope::export().map_err(|error| error.to_string())?;
+        RuntimeEventKind::export().map_err(|error| error.to_string())?;
+        SubagentEventMetadata::export().map_err(|error| error.to_string())?;
+        ExecEvent::export().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn app_owned_exec_event_serializes_absent_framework_metadata_as_null()
+    -> Result<(), String> {
+        let value = serde_json::to_value(ExecEvent::run(
+            "workspace-1",
+            "conversation-1",
+            "run-1",
+            RuntimeEventKind::RunStarted,
+            serde_json::json!({}),
+        ))
+        .map_err(|error| error.to_string())?;
+        assert!(value.get("framework_event").is_some_and(serde_json::Value::is_null));
+        Ok(())
     }
 }
 

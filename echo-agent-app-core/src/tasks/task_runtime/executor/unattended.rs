@@ -430,18 +430,21 @@ async fn execute_task(
             })?;
         None
     };
-    emit_subagent_started(
-        trace_sink.as_ref(),
-        &workspace_id,
-        &run_id,
-        &execution_id,
-        &task,
-        &contract,
-        claim_revision,
-        attempt,
-        &conversation_id,
-        Some(&root_message_id),
-    );
+    let framework_delegated = is_read_only_task || is_writer_task;
+    if !framework_delegated {
+        emit_subagent_started(
+            trace_sink.as_ref(),
+            &workspace_id,
+            &run_id,
+            &execution_id,
+            &task,
+            &contract,
+            claim_revision,
+            attempt,
+            &conversation_id,
+            Some(&root_message_id),
+        );
+    }
     let framework_attempt_identity = controlled_attempt
         .as_ref()
         .map(|(identity, _guard)| identity.clone());
@@ -698,19 +701,21 @@ async fn execute_task(
                 "touched_files": &task_result.touched_files,
                 "usage": &usage,
             });
-            emit_exec(
-                trace_sink.as_ref(),
-                ExecEvent::subagent(
-                    workspace_id.clone(),
-                    conversation_id.clone(),
-                    run_id.clone(),
-                    task_id.clone(),
-                    execution_id.clone(),
-                    subagent_terminal_event(task_result.status),
-                    terminal_payload.clone(),
-                )
-                .with_agent(task.agent_role.clone()),
-            );
+            if !framework_delegated {
+                emit_exec(
+                    trace_sink.as_ref(),
+                    ExecEvent::subagent(
+                        workspace_id.clone(),
+                        conversation_id.clone(),
+                        run_id.clone(),
+                        task_id.clone(),
+                        execution_id.clone(),
+                        subagent_terminal_event(task_result.status),
+                        terminal_payload.clone(),
+                    )
+                    .with_agent(task.agent_role.clone()),
+                );
+            }
             Ok(TaskDispatchSuccess {
                 task_id,
                 outcome: task_result,
@@ -795,19 +800,21 @@ async fn execute_task(
                 "usage": usage.as_ref(),
                 "agent_failure": &agent_failure,
             });
-            emit_exec(
-                trace_sink.as_ref(),
-                ExecEvent::subagent(
-                    workspace_id.clone(),
-                    conversation_id.clone(),
-                    run_id.clone(),
-                    task_id.clone(),
-                    execution_id.clone(),
-                    subagent_terminal_event(status),
-                    terminal_payload.clone(),
-                )
-                .with_agent(task.agent_role.clone()),
-            );
+            if !framework_delegated {
+                emit_exec(
+                    trace_sink.as_ref(),
+                    ExecEvent::subagent(
+                        workspace_id.clone(),
+                        conversation_id.clone(),
+                        run_id.clone(),
+                        task_id.clone(),
+                        execution_id.clone(),
+                        subagent_terminal_event(status),
+                        terminal_payload.clone(),
+                    )
+                    .with_agent(task.agent_role.clone()),
+                );
+            }
             Err(TaskDispatchFailure::from_execution(
                 task_id,
                 ExecutionFailure {

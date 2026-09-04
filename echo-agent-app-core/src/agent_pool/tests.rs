@@ -704,6 +704,118 @@ mod tests {
         Ok(AgentPool::new_for_test(handle, Some(review_integration), Some(store), 3, false).await)
     }
 
+    async fn expect_subagent_bus_probe(
+        receiver: &mut tokio::sync::broadcast::Receiver<Arc<echo_agent::subagent::SubagentEvent>>,
+        expected: &str,
+    ) -> TestResult {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let event = tokio::time::timeout_at(deadline, receiver.recv())
+                .await
+                .map_err(|_| format!("timed out waiting for Subagent bus probe '{expected}'"))?
+                .map_err(|error| format!("Subagent bus probe receive failed: {error}"))?;
+            if let echo_agent::subagent::SubagentEvent::Registered { name } = event.as_ref()
+                && name == expected
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_existing_and_future_pool_agents_share_subagent_event_bus() -> TestResult {
+        let pool = create_test_pool(3, false).await?;
+        let primary = pool
+            .primary_agent()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut receiver = primary
+            .read(|agent| agent.subagent_registry().event_bus().subscribe())
+            .await;
+
+        for (conversation_id, probe) in [
+            ("subagent-bus-existing", "existing-pool-agent"),
+            ("subagent-bus-future", "future-pool-agent"),
+        ] {
+            let lease = pool
+                .acquire(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let event_bus = lease
+                .agent()
+                .read(|agent| agent.subagent_registry().event_bus().clone())
+                .await;
+            event_bus.emit(echo_agent::subagent::SubagentEvent::Registered {
+                name: probe.to_string(),
+            });
+            expect_subagent_bus_probe(&mut receiver, probe).await?;
+            drop(lease);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_primary_and_conversation_agent_share_seed_subagent_event_bus() -> TestResult
+    {
+        let seed = Arc::new(create_test_pool(3, false).await?);
+        let seed_primary = seed
+            .primary_agent()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut receiver = seed_primary
+            .read(|agent| agent.subagent_registry().event_bus().subscribe())
+            .await;
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("shared-subagent-bus-workspace");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let now = chrono::Utc::now();
+        let workspace = crate::workspace::Workspace {
+            id: crate::workspace::WorkspaceId::from_name("shared-subagent-bus"),
+            name: "Shared Subagent bus".to_string(),
+            root,
+            project_root: None,
+            kind: WorkspaceKind::General,
+            metadata: crate::workspace::WorkspaceMetadata::default(),
+            product_data_generation: String::new(),
+            created_at: now,
+            last_active: now,
+        };
+        let registry = crate::workspace::runtime::WorkspaceRuntimeRegistry::new();
+        let host = registry
+            .get_or_open(workspace)
+            .await
+            .map_err(|error| error.to_string())?;
+        let runtime = host
+            .get_or_open_execution(&seed)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let workspace_primary_bus = runtime
+            .primary_agent()
+            .read(|agent| agent.subagent_registry().event_bus().clone())
+            .await;
+        workspace_primary_bus.emit(echo_agent::subagent::SubagentEvent::Registered {
+            name: "workspace-primary".to_string(),
+        });
+        expect_subagent_bus_probe(&mut receiver, "workspace-primary").await?;
+
+        let conversation = runtime
+            .pool()
+            .acquire("workspace-conversation")
+            .await
+            .map_err(|error| error.to_string())?;
+        let conversation_bus = conversation
+            .agent()
+            .read(|agent| agent.subagent_registry().event_bus().clone())
+            .await;
+        conversation_bus.emit(echo_agent::subagent::SubagentEvent::Registered {
+            name: "workspace-conversation".to_string(),
+        });
+        expect_subagent_bus_probe(&mut receiver, "workspace-conversation").await?;
+        drop(conversation);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn runtime_state_store_rebind_reaches_existing_and_future_agents() -> TestResult {
         let pool = create_test_pool(4, false).await?;

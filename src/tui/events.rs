@@ -19,12 +19,12 @@ use crossterm::terminal::{
 use futures::FutureExt;
 use ratatui::layout::Rect;
 use ratatui::{Terminal, backend::CrosstermBackend};
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use echo_agent::subagent::SubagentEvent;
 use echo_agent::tools::{ToolFailure, artifact::ToolOutputArtifactRef};
 use echo_agent_app_core::api::chat_driver::TurnOutcome;
 use echo_agent_app_core::api::context_window::ContextWindowSnapshot;
@@ -353,7 +353,7 @@ enum AgentEvent {
         usage_reported: bool,
     },
     Notice(String),
-    Execution(echo_agent_app_core::api::tasks::task_runtime::executor::ExecEvent),
+    Execution(Box<echo_agent_app_core::api::tasks::task_runtime::executor::ExecEvent>),
     TurnStatus(String),
     ConversationInputReceipt(Box<ConversationInputReceipt>),
     /// The sole TUI lifecycle terminal, emitted after the driver settles.
@@ -605,15 +605,19 @@ pub async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut TuiApp,
     agent: AgentHandle,
+    subagent_projection: Arc<
+        echo_agent_app_core::api::subagent_event_projection::SubagentEnvelopeProjectionService,
+    >,
 ) -> anyhow::Result<()> {
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
+    let mut committed_subagent_events = subagent_projection.subscribe_committed();
+    let mut replayed_subagent_events = VecDeque::from(subagent_projection.replay_committed());
+    let mut committed_subagent_event_ids = HashSet::new();
+    let mut committed_subagent_event_order = VecDeque::new();
     let mut terminal_event_rx = app
         .app_state
         .as_ref()
         .map(|state| state.terminal.subscribe());
-    let mut subagent_event_rx = agent
-        .read(|a| a.subagent_registry().event_bus().subscribe())
-        .await;
     let mut last_runtime_refresh = Instant::now()
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
@@ -625,10 +629,42 @@ pub async fn run_event_loop(
         if terminal_events_closed {
             terminal_event_rx = None;
         }
-        while let Ok(event) = subagent_event_rx.try_recv() {
-            update_subagent_runs(app, &event);
+        loop {
+            let projected = if let Some(projected) = replayed_subagent_events.pop_front() {
+                projected
+            } else {
+                match committed_subagent_events.try_recv() {
+                    Ok(projected) => projected,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(count)) => {
+                        tracing::warn!(
+                            count,
+                            "TUI committed Subagent projection lagged; replaying retained commits"
+                        );
+                        replayed_subagent_events.extend(subagent_projection.replay_committed());
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                }
+            };
+            if projected.envelope.workspace_id != app.workspace_execution_scope.workspace_id()
+                || projected.envelope.conversation_id.as_deref() != app.conversation_id.as_deref()
+            {
+                continue;
+            }
+            if !remember_tui_committed_event(
+                &mut committed_subagent_event_ids,
+                &mut committed_subagent_event_order,
+                &projected.envelope.event_id,
+            ) {
+                continue;
+            }
+            if let echo_agent_app_core::api::chat_driver::ChatDriverEvent::Execution(event) =
+                &projected.envelope.payload
+            {
+                update_subagent_runs_from_execution(app, event);
+            }
         }
-
         if last_runtime_refresh.elapsed() >= Duration::from_millis(250) {
             refresh_task_runtime_view(app).await;
             if let Ok(address) = tui_conversation_input_address(app) {
@@ -885,6 +921,7 @@ pub async fn run_event_loop(
                     app.rebuild_message_groups();
                 }
                 AgentEvent::Execution(event) => {
+                    update_subagent_runs_from_execution(app, &event);
                     app.status_msg = format!("{}: {}", event.run_id, event.event);
                     if event.event.is_attention_event() {
                         let detail: String = event.payload.to_string().chars().take(500).collect();
@@ -1020,6 +1057,23 @@ pub async fn run_event_loop(
     }
 
     Ok(())
+}
+
+fn remember_tui_committed_event(
+    seen: &mut HashSet<String>,
+    order: &mut VecDeque<String>,
+    event_id: &str,
+) -> bool {
+    if !seen.insert(event_id.to_string()) {
+        return false;
+    }
+    order.push_back(event_id.to_string());
+    while order.len() > 2048 {
+        if let Some(retired) = order.pop_front() {
+            seen.remove(&retired);
+        }
+    }
+    true
 }
 
 fn render_cancelled_event(app: &mut TuiApp) {
@@ -7320,35 +7374,51 @@ fn apply_tui_extension_receipt(
         _ => {}
     }
 }
-fn update_subagent_runs(app: &mut TuiApp, event: &SubagentEvent) {
-    match event {
-        SubagentEvent::DispatchStarted {
-            agent,
-            task,
-            execution_id,
-            background,
-            ..
-        } => {
-            let id = subagent_event_id(execution_id.as_deref(), agent);
+fn update_subagent_runs_from_execution(
+    app: &mut TuiApp,
+    event: &echo_agent_app_core::api::tasks::task_runtime::executor::ExecEvent,
+) {
+    use echo_agent_app_core::api::tasks::task_runtime::RuntimeEventKind;
+    use echo_agent_app_core::api::tasks::task_runtime::executor::ExecEventScope;
+
+    if event.scope != ExecEventScope::Subagent {
+        return;
+    }
+    let agent = event.agent.as_deref().unwrap_or("subagent");
+    let execution_id = event.subagent_run_id.as_deref();
+    match event.event {
+        RuntimeEventKind::Started => {
+            let id = subagent_event_id(execution_id, agent);
+            let task = event
+                .payload
+                .get("task")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let background = event
+                .payload
+                .get("background")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             if let Some(run) = app
                 .subagent_runs
                 .iter_mut()
                 .find(|run| run.execution_id == id)
             {
-                run.agent = agent.clone();
-                run.task = task.clone();
+                run.agent = agent.to_string();
+                run.task = task;
                 run.status = "running".to_string();
-                run.background = *background;
+                run.background = background;
             } else {
                 app.subagent_runs.push(SubagentRuntimeView {
                     execution_id: id,
-                    agent: agent.clone(),
-                    task: task.clone(),
+                    agent: agent.to_string(),
+                    task,
                     status: "running".to_string(),
                     tool_calls: 0,
                     tokens_used: None,
                     duration_ms: None,
-                    background: *background,
+                    background,
                     summary: String::new(),
                     artifacts: Vec::new(),
                     verification: Vec::new(),
@@ -7358,51 +7428,34 @@ fn update_subagent_runs(app: &mut TuiApp, event: &SubagentEvent) {
                 });
             }
         }
-        SubagentEvent::DispatchToolStarted {
-            agent,
-            execution_id,
-            ..
-        } => {
-            if let Some(run) = find_subagent_run_mut(app, execution_id.as_deref(), agent) {
+        RuntimeEventKind::ToolStarted => {
+            if let Some(run) = find_subagent_run_mut(app, execution_id, agent) {
                 run.tool_calls = run.tool_calls.saturating_add(1);
             }
         }
-        SubagentEvent::DispatchCompleted {
-            agent,
-            execution_id,
-            duration_ms,
-            tokens_used,
-            outcome,
-            ..
-        } => {
-            if let Some(run) = find_subagent_run_mut(app, execution_id.as_deref(), agent) {
-                run.status = outcome.status.as_str().to_string();
-                run.duration_ms = Some(*duration_ms);
-                run.tokens_used = *tokens_used;
-                apply_subagent_outcome(run, outcome);
-            }
-        }
-        SubagentEvent::DispatchFailed {
-            agent,
-            execution_id,
-            status,
-            outcome,
-            ..
-        } => {
-            if let Some(run) = find_subagent_run_mut(app, execution_id.as_deref(), agent) {
-                run.status = status.as_str().to_string();
-                apply_subagent_outcome(run, outcome);
-            }
-        }
-        SubagentEvent::DispatchCancelled {
-            agent,
-            execution_id,
-            outcome,
-            ..
-        } => {
-            if let Some(run) = find_subagent_run_mut(app, execution_id.as_deref(), agent) {
-                run.status = "cancelled".to_string();
-                apply_subagent_outcome(run, outcome);
+        RuntimeEventKind::Completed
+        | RuntimeEventKind::Failed
+        | RuntimeEventKind::Cancelled
+        | RuntimeEventKind::TimedOut => {
+            if let Some(run) = find_subagent_run_mut(app, execution_id, agent) {
+                run.status = event.event.as_str().to_string();
+                run.duration_ms = event
+                    .payload
+                    .get("duration_ms")
+                    .and_then(serde_json::Value::as_u64);
+                run.tokens_used = event
+                    .payload
+                    .get("tokens_used")
+                    .and_then(serde_json::Value::as_u64);
+                match subagent_outcome_from_execution(event) {
+                    Ok(Some(outcome)) => apply_subagent_outcome(run, &outcome),
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(
+                        %error,
+                        execution_id = ?execution_id,
+                        "TUI could not decode Subagent terminal outcome"
+                    ),
+                }
             }
         }
         _ => {}
@@ -7413,6 +7466,65 @@ fn update_subagent_runs(app: &mut TuiApp, event: &SubagentEvent) {
     }
 }
 
+fn subagent_outcome_from_execution(
+    event: &echo_agent_app_core::api::tasks::task_runtime::executor::ExecEvent,
+) -> Result<Option<echo_agent::subagent::SubagentOutcome>, serde_json::Error> {
+    use echo_agent::subagent::{SubagentOutcome, SubagentStatus};
+    use echo_agent_app_core::api::tasks::task_runtime::RuntimeEventKind;
+
+    if let Some(outcome) = event.payload.get("outcome") {
+        return serde_json::from_value(outcome.clone()).map(Some);
+    }
+    let status = match event.event {
+        RuntimeEventKind::Completed => SubagentStatus::Completed,
+        RuntimeEventKind::Failed => SubagentStatus::Failed,
+        RuntimeEventKind::Cancelled => SubagentStatus::Cancelled,
+        RuntimeEventKind::TimedOut => SubagentStatus::TimedOut,
+        _ => return Ok(None),
+    };
+    let summary = event
+        .payload
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            event
+                .payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or_default()
+        .to_string();
+    Ok(Some(SubagentOutcome {
+        contract_version: event
+            .payload
+            .get("contract_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_default(),
+        status,
+        summary,
+        artifacts: decode_execution_field(&event.payload, "artifacts")?,
+        evidence: decode_execution_field(&event.payload, "evidence")?,
+        verification: decode_execution_field(&event.payload, "verification")?,
+        remaining_work: decode_execution_field(&event.payload, "remaining_work")?,
+        touched_files: decode_execution_field(&event.payload, "touched_files")?,
+    }))
+}
+
+fn decode_execution_field<T>(
+    payload: &serde_json::Value,
+    field: &str,
+) -> Result<T, serde_json::Error>
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    payload
+        .get(field)
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
 fn apply_subagent_outcome(
     run: &mut SubagentRuntimeView,
     outcome: &echo_agent::subagent::SubagentOutcome,
@@ -7464,7 +7576,8 @@ mod tests {
         project_tui_task_views, render_cancelled_event, render_conversation_input_receipt,
         render_error_event, request_from_prepared, resolve_tui_workspace_file, retry_tui_task,
         reverse_history_search, run_turn_binding_for_request, settle_planned_resume_foreground,
-        slash_command_allowed_while_busy, update_subagent_runs, validate_tui_task_run_scope,
+        slash_command_allowed_while_busy, update_subagent_runs_from_execution,
+        validate_tui_task_run_scope,
     };
     use crate::tui::{
         ChatMessage, MessageRole, TaskRunResumeWake, TaskRuntimeRequirementView,
@@ -8766,44 +8879,39 @@ mod tests {
         assert!(text.contains("Pause reason: time budget exhausted"));
         assert!(text.contains("Pause detail: configured limit reached"));
     }
-
     #[test]
-    fn subagent_events_update_live_projection() {
-        use echo_agent::subagent::{ExecutionMode, SubagentEvent};
+    fn subagent_execution_events_update_live_projection() -> Result<(), String> {
+        use echo_agent_app_core::api::tasks::task_runtime::RuntimeEventKind;
+        use echo_agent_app_core::api::tasks::task_runtime::executor::ExecEvent;
 
         let mut app = app();
-        update_subagent_runs(
+        update_subagent_runs_from_execution(
             &mut app,
-            &SubagentEvent::DispatchStarted {
-                parent: "main".to_string(),
-                agent: "explorer".to_string(),
-                mode: ExecutionMode::Fork,
-                task: "inspect TUI".to_string(),
-                execution_id: Some("task-1:1".to_string()),
-                run_id: Some("run-1".to_string()),
-                conversation_id: Some("conversation-1".to_string()),
-                message_id: None,
-                background: false,
-            },
+            &ExecEvent::subagent_attempt(
+                "workspace-1",
+                "conversation-1",
+                "run-1",
+                Some("task-1".to_string()),
+                "run-1:task-1:1:1",
+                RuntimeEventKind::Started,
+                serde_json::json!({"task": "inspect TUI", "background": false}),
+            )
+            .with_agent("explorer"),
         );
-        update_subagent_runs(
+        update_subagent_runs_from_execution(
             &mut app,
-            &SubagentEvent::DispatchToolStarted {
-                parent: "main".to_string(),
-                agent: "explorer".to_string(),
-                call_id: "call-1".to_string(),
-                invocation: echo_agent::agent::ToolInvocation {
-                    requested_name: "read_file".to_string(),
-                    requested_args: serde_json::json!({}),
-                    name: "read_file".to_string(),
-                    args: serde_json::json!({}),
-                    rewrites: Vec::new(),
-                },
-                execution_id: Some("task-1:1".to_string()),
-                run_id: Some("run-1".to_string()),
-            },
+            &ExecEvent::subagent_attempt(
+                "workspace-1",
+                "conversation-1",
+                "run-1",
+                Some("task-1".to_string()),
+                "run-1:task-1:1:1",
+                RuntimeEventKind::ToolStarted,
+                serde_json::json!({"call_id": "call-1"}),
+            )
+            .with_agent("explorer"),
         );
-        let mut terminal_outcome = echo_agent::subagent::SubagentOutcome {
+        let mut outcome = echo_agent::subagent::SubagentOutcome {
             contract_version: 2,
             status: echo_agent::subagent::SubagentStatus::Completed,
             summary: "done".to_string(),
@@ -8812,53 +8920,38 @@ mod tests {
                 kind: "report".to_string(),
                 bytes: Some(42),
                 sha256: Some("a".repeat(64)),
-                producer_execution_id: Some("task-1:1".to_string()),
+                producer_execution_id: Some("run-1:task-1:1:1".to_string()),
                 available: true,
             }],
-            evidence: vec![
-                echo_agent::subagent::SubagentEvidence {
-                    kind: "verification".to_string(),
-                    subject: "cargo test".to_string(),
-                    outcome: Some("passed".to_string()),
-                    details: "ok".to_string(),
-                    source: echo_agent::subagent::SubagentEvidenceSource::Observed,
-                    attributes: serde_json::Value::Null,
-                },
-                echo_agent::subagent::SubagentEvidence {
-                    kind: "tool_result".to_string(),
-                    subject: "read_file".to_string(),
-                    outcome: Some("succeeded".to_string()),
-                    details: String::new(),
-                    source: echo_agent::subagent::SubagentEvidenceSource::Observed,
-                    attributes: serde_json::json!({ "args": { "path": "src/lib.rs" } }),
-                },
-                echo_agent::subagent::SubagentEvidence {
-                    kind: "tool_result".to_string(),
-                    subject: "write_file".to_string(),
-                    outcome: Some("succeeded".to_string()),
-                    details: String::new(),
-                    source: echo_agent::subagent::SubagentEvidenceSource::Observed,
-                    attributes: serde_json::json!({ "args": { "path": "report.json" } }),
-                },
-            ],
+            evidence: vec![echo_agent::subagent::SubagentEvidence {
+                kind: "verification".to_string(),
+                subject: "cargo test".to_string(),
+                outcome: Some("passed".to_string()),
+                details: "ok".to_string(),
+                source: echo_agent::subagent::SubagentEvidenceSource::Observed,
+                attributes: serde_json::Value::Null,
+            }],
             verification: Vec::new(),
             remaining_work: Vec::new(),
             touched_files: echo_agent::subagent::SubagentTouchedFiles::default(),
         };
-        terminal_outcome.refresh_derived_views();
-        update_subagent_runs(
+        outcome.refresh_derived_views();
+        update_subagent_runs_from_execution(
             &mut app,
-            &SubagentEvent::DispatchCompleted {
-                parent: "main".to_string(),
-                agent: "explorer".to_string(),
-                duration_ms: 120,
-                tokens_used: Some(42),
-                iterations: Some(1),
-                output: "done".to_string(),
-                outcome: terminal_outcome,
-                execution_id: Some("task-1:1".to_string()),
-                run_id: Some("run-1".to_string()),
-            },
+            &ExecEvent::subagent_attempt(
+                "workspace-1",
+                "conversation-1",
+                "run-1",
+                Some("task-1".to_string()),
+                "run-1:task-1:1:1",
+                RuntimeEventKind::Completed,
+                serde_json::json!({
+                    "duration_ms": 120,
+                    "tokens_used": 42,
+                    "outcome": outcome,
+                }),
+            )
+            .with_agent("explorer"),
         );
 
         let run = app.subagent_runs.first().cloned().unwrap_or_default();
@@ -8869,7 +8962,53 @@ mod tests {
         assert_eq!(run.summary, "done");
         assert_eq!(run.artifacts, vec!["report.json".to_string()]);
         assert_eq!(run.verification, vec!["cargo test: Passed".to_string()]);
-        assert_eq!(run.files_read, vec!["src/lib.rs".to_string()]);
-        assert_eq!(run.files_written, vec!["report.json".to_string()]);
+
+        let mut flat_app = TuiApp::new("test-model".to_string(), "test".to_string(), Theme::dark());
+        update_subagent_runs_from_execution(
+            &mut flat_app,
+            &ExecEvent::subagent_attempt(
+                "workspace-1",
+                "conversation-1",
+                "run-1",
+                Some("task-direct".to_string()),
+                "run-1:task-direct:1:1",
+                RuntimeEventKind::Started,
+                serde_json::json!({"task": "verify"}),
+            )
+            .with_agent("primary"),
+        );
+        update_subagent_runs_from_execution(
+            &mut flat_app,
+            &ExecEvent::subagent_attempt(
+                "workspace-1",
+                "conversation-1",
+                "run-1",
+                Some("task-direct".to_string()),
+                "run-1:task-direct:1:1",
+                RuntimeEventKind::Completed,
+                serde_json::json!({
+                    "contract_version": 2,
+                    "summary": "verified",
+                    "artifacts": [],
+                    "evidence": [],
+                    "verification": [{
+                        "check": "cargo test",
+                        "status": "passed",
+                        "details": "ok",
+                        "source": "observed"
+                    }],
+                    "remaining_work": [],
+                    "touched_files": {"read": [], "written": []}
+                }),
+            )
+            .with_agent("primary"),
+        );
+        let flat = flat_app
+            .subagent_runs
+            .first()
+            .ok_or_else(|| "flat terminal projection was not created".to_string())?;
+        assert_eq!(flat.summary, "verified");
+        assert_eq!(flat.verification, vec!["cargo test: Passed".to_string()]);
+        Ok(())
     }
 }

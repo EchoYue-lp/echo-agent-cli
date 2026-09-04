@@ -83,6 +83,7 @@ impl ChatEventLog {
             retention: ChatEventRetention::default(),
             streams: DashMap::new(),
             stream_access: Mutex::new(VecDeque::new()),
+            live_sinks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             deletion_pause: None,
             #[cfg(test)]
@@ -109,6 +110,7 @@ impl ChatEventLog {
             retention,
             streams: DashMap::new(),
             stream_access: Mutex::new(VecDeque::new()),
+            live_sinks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             deletion_pause: None,
             #[cfg(test)]

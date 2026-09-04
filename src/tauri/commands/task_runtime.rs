@@ -552,7 +552,8 @@ pub async fn resume_task_run(
     let execution_projector = Arc::new(TauriExecutionProjector::new(
         app,
         state.app_state.storage.tool_executions.clone(),
-        Some(store.clone()),
+        state.app_state.storage.chat_events.clone(),
+        store.clone(),
     ));
     let trace_sink: echo_agent_app_core::api::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
         execution_projector.emit(ev);
@@ -831,7 +832,8 @@ pub async fn retry_blocked_task(
     let execution_projector = Arc::new(TauriExecutionProjector::new(
         app,
         state.app_state.storage.tool_executions.clone(),
-        Some(store.clone()),
+        state.app_state.storage.chat_events.clone(),
+        store.clone(),
     ));
     let trace_sink: echo_agent_app_core::api::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
         execution_projector.emit(ev);

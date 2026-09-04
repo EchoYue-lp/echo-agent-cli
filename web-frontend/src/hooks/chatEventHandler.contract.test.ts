@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import fixtureText from '../fixtures/chat-event-envelope-v4.json?raw';
 import { useChatStore } from '../stores/chatStore';
+import { subagentRunStoreKey, useSubagentRunStore } from '../stores/subagentRunStore';
 import type { ChatEventEnvelope } from '../types/api';
 import { handleChatEventEnvelope } from './chatEventHandler';
 import { resetChatEventCursorsForTest } from './chatEventSequencer';
@@ -18,6 +19,7 @@ const context = (): Parameters<typeof handleChatEventEnvelope>[1] => ({
 describe('canonical chat event v4 contract', () => {
   beforeEach(() => {
     useChatStore.getState().clearMessages();
+    useSubagentRunStore.getState().clear();
     resetChatEventCursorsForTest();
   });
 
@@ -80,6 +82,58 @@ describe('canonical chat event v4 contract', () => {
     handleChatEventEnvelope(toolCall, refs);
     handleChatEventEnvelope(toolResult, refs);
     expect(useChatStore.getState().runStatus).toBe('using_tool');
+  });
+
+  it('applies journaled Subagent execution events through the replay handler', () => {
+    const base = fixture[0];
+    if (!base) throw new Error('contract fixture is incomplete');
+    const envelope = {
+      ...base,
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
+      root_turn_id: 'message-1',
+      turn_id: 'message-1',
+      message_id: 'message-1',
+      payload: {
+        source: 'execution',
+        event: {
+          workspace_id: 'workspace-1',
+          conversation_id: 'conversation-1',
+          run_id: '',
+          scope: 'subagent',
+          task_id: null,
+          subagent_run_id: 'execution-1',
+          event: 'thinking_delta',
+          agent: 'explorer',
+          payload: { content: 'inspect the repository' },
+          framework_event: {
+            schema_version: 4,
+            event_id: 'evt-2',
+            content_hash: 'sha256:2',
+            sequence: 2,
+            stream_id: 'subagent-stream',
+            turn_id: 'message-1',
+            message_id: 'message-1',
+            execution_id: 'execution-1',
+            parent_event_id: null,
+            timestamp: '2026-09-05T00:00:02Z',
+            parent_agent: 'primary',
+            agent_name: 'explorer',
+            parent_execution_id: null,
+            agent_path: 'primary/explorer',
+            task_id: null,
+            attempt: 1,
+            plan_revision: null,
+          },
+        },
+      },
+    } as ChatEventEnvelope;
+
+    handleChatEventEnvelope(envelope, context());
+
+    const run = useSubagentRunStore.getState().runs[subagentRunStoreKey('', 'execution-1')];
+    expect(run?.events).toHaveLength(1);
+    expect(run?.events[0]?.content).toBe('inspect the repository');
   });
 
   it('fails closed for an unknown material agent variant', () => {

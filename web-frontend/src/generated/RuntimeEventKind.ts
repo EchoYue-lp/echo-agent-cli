@@ -43,6 +43,7 @@ export type RuntimeEventKind =
   | 'subagent_interrupt_requested'
   | 'subagent_interrupt_settled'
   | 'subagent_escalation_requested'
+  | 'subagent_stream_gap'
   | 'isolation_observed'
   | 'thinking_started'
   | 'thinking_delta'
