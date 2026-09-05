@@ -6,8 +6,8 @@ goal: 让 EKO app-core 无损接入 framework Subagent event envelope，并以�
   ExecEvent 为唯一产品投影与恢复路径
 ships: EKO 无损接入 framework Subagent event envelope，持久化产品边界并在统一 Agent 分栏中恢复实时与历史执行过程
 verify: app-core envelope 投影、地址校验、gap/replay、全部事件类别与持久化测试通过，Tauri/TUI 不再直接消费 raw
-  SubagentEvent，生成 TypeScript 契约、前端 live/replay reducer 与 echo-agent-cli
-  完整门禁全部通过
+  SubagentEvent，生成 TypeScript 契约、前端 live/replay reducer、echo-agent-cli 完整门禁与
+  echo-website 文档同步门禁全部通过
 design_ref: docs/supreme/specs/unified-agent-pane/design.md
 delivery_ref: docs/supreme/specs/unified-agent-pane/plans/delivery-map.md#eko-event-projection-integration
 todos:
@@ -89,9 +89,15 @@ todos:
       - docs/en/architecture/runtime.md
       - docs/zh/architecture/runtime.md
       - docs/doc-parity-manifest.json
-    summary: 记录 framework/app-core/Tauri/frontend 的职责、恢复与降级语义并同步 EKO 正式架构文档
-    verify: ADR 引用真实 API 和门禁证据；SDK-Docs-Impact 与 SDK-Skill-Impact 结论完整
-lifecycle: ready
+      - ../echo-website/docs-sync-manifest.json
+      - ../echo-website/src/docs/content/echo-agent/en/06-subagent.md
+      - ../echo-website/src/docs/content/echo-agent/zh/06-subagent.md
+      - ../echo-website/public/llms-full.txt
+    summary: 记录 framework/app-core/Tauri/frontend 的职责、恢复与降级语义，同步 EKO 正式架构文档与
+      framework 官网投影
+    verify: ADR 引用真实 API；SDK Docs/Skill/Website impact 结论完整；website docs
+      sync、discovery 与完整门禁通过
+lifecycle: completed
 artifact_id: plan:3796a99e-3378-474e-8eab-f889b2d7787b
 design_revision: sha256:dcd276c17c2c75d4cddbe40bd8f9f1e035be2ae4e3dcde6b74ceb0e1f97b2c4b
 ---
@@ -107,7 +113,7 @@ design_revision: sha256:dcd276c17c2c75d4cddbe40bd8f9f1e035be2ae4e3dcde6b74ceb0e1
 - formal TaskRun 按 typed run/task/attempt/revision 关联；ordinary turn 使用 exact foreground address；冲突或缺失 fail closed。
 - live/replay 使用同一 serialized ExecEvent 和 ingest；sequence gap 必须显式，不得伪造 transient 内容。
 - 不新增依赖，不引入 worker 术语，不使用 panic/unwrap/expect 或 UTF-8 字节截断。
-- SDK-Docs-Impact: none；SDK-Skill-Impact: none；EKO 产品 ADR/架构文档 required；Website-Impact: none，官网不承载 EKO runtime 内部合同或本应用界面。
+- SDK-Docs-Impact: required/fulfilled；framework 公共恢复 API 已同步中英文文档与示例。SDK-Skill-Impact: none。EKO 产品 ADR/架构文档 required/fulfilled；Website-Impact: required/fulfilled，官网同步 framework 文档并记录 EKO reviewed revision。
 
 ## Files
 
@@ -169,6 +175,10 @@ design_revision: sha256:dcd276c17c2c75d4cddbe40bd8f9f1e035be2ae4e3dcde6b74ceb0e1
 - Modify: `docs/en/architecture/runtime.md` — 记录 runtime 装配、恢复与 surface 消费边界。
 - Modify: `docs/zh/architecture/runtime.md` — 同步中文 runtime 架构。
 - Modify: `docs/doc-parity-manifest.json` — 注册双语 ADR 对等关系。
+- Modify: `../echo-website/docs-sync-manifest.json` — 固定 framework 与 EKO reviewed revision 及文档哈希。
+- Modify: `../echo-website/src/docs/content/echo-agent/en/06-subagent.md` — 同步 framework active stream 恢复 API。
+- Modify: `../echo-website/src/docs/content/echo-agent/zh/06-subagent.md` — 同步中文 active stream 恢复 API。
+- Modify: `../echo-website/public/llms-full.txt` — 重新生成公开文档发现内容。
 
 ## Reuse
 
@@ -260,9 +270,9 @@ steps:
 1. 记录单一投影权威、地址、持久化、gap/replay/terminal 与 surface 分层。
    verify: 文档 API 和路径与实现一致。
    expected: 后续 surface 不重引 raw event 旁路。
-2. 运行 focused、GUI、前端和 echo-agent-cli 完整门禁。
-   verify: fmt、clippy、tests、no-default、GUI check/test、prettier/test/build 全部通过。
-   expected: 后端服务和前端集成可独立交付。
+2. 运行 focused、GUI、前端、echo-agent-cli 与 echo-website 完整门禁。
+   verify: fmt、clippy、tests、no-default、GUI check/test、prettier/test/build、website docs/discovery/verify 全部通过。
+   expected: 后端服务、前端集成和公开 framework 文档投影可独立交付。
 
 ## Diagram
 
@@ -283,4 +293,4 @@ flowchart LR
 - app-core 是 EKO 产品投影唯一权威；Tauri 不解析 framework 事件。
 - ChatEventLog 继续持久化 ordinary turn；formal TaskRun 仍由 TaskRuntimeStore 持有运行权威。
 - transient delta 可因 retention 缺失，但 sequence gap 和 terminal reconciliation 必须显式。
-- Website-Impact 为 none：官网不承载 EKO runtime 内部合同或当前应用界面，不新增 EKO 文档树或公开索引。
+- Website-Impact 为 required/fulfilled：官网不新增 EKO UI 文档树，但同步 framework 公共恢复 API，并把 EKO `37cd9b0` 记录为 reviewed source revision。
