@@ -50,13 +50,14 @@ pub const DEFAULT_BASELINE_SKILLS: &[&str] = &["verification-before-completion"]
 
 const METHODOLOGY_SKILLS: &[&str] = &[
     "brainstorming",
+    "plugin-creator",
     "receiving-code-review",
     "requesting-code-review",
+    "skill-creator",
     "systematic-debugging",
     "test-driven-development",
     "verification-before-completion",
     "writing-plans",
-    "writing-skills",
 ];
 
 /// Built-in skills shipped with EKO. They are cataloged in the source tree but
@@ -79,17 +80,18 @@ pub const BUILTIN_SKILL_NAMES: &[&str] = &[
     "paper-reader",
     "paper-search",
     "pdf",
+    "plugin-creator",
     "pptx",
     "receiving-code-review",
     "requesting-code-review",
     "statistical-analysis",
     "subagent-driven-development",
+    "skill-creator",
     "systematic-debugging",
     "test-driven-development",
     "using-git-worktrees",
     "verification-before-completion",
     "writing-plans",
-    "writing-skills",
     "xlsx",
 ];
 
@@ -97,10 +99,12 @@ pub const BUILTIN_SKILL_NAMES: &[&str] = &[
 /// source/catalog but are opt-in through `enabled-skills.json`.
 pub const DEFAULT_ACTIVE_BUILTIN_SKILLS: &[&str] = &[
     "brainstorming",
+    "git-workflow",
+    "plugin-creator",
+    "skill-creator",
     "systematic-debugging",
     "verification-before-completion",
     "writing-plans",
-    "git-workflow",
 ];
 
 /// Source-tree fallback root used when the binary runs from a dev checkout.
@@ -421,6 +425,22 @@ mod tests {
         let config = EnabledSkillsConfig::default();
         assert!(config.is_enabled("git-workflow"));
         assert!(config.is_enabled("brainstorming"));
+        assert!(config.is_enabled("skill-creator"));
+        assert!(config.is_enabled("plugin-creator"));
+        assert_eq!(
+            config
+                .skills
+                .get("skill-creator")
+                .map(|entry| entry.baseline),
+            Some(false)
+        );
+        assert_eq!(
+            config
+                .skills
+                .get("plugin-creator")
+                .map(|entry| entry.baseline),
+            Some(false)
+        );
         assert!(!config.is_enabled("docx"));
         assert!(!config.is_enabled("paper-search"));
         assert_eq!(

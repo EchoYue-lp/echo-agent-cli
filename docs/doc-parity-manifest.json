@@ -315,6 +315,14 @@
       "legacyRemoved": true
     },
     {
+      "legacyPath": "adr/0038-builtin-creator-skills.md",
+      "targetPath": "adr/0038-builtin-creator-skills.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
       "legacyPath": "adr/0038-unified-task-subagent-execution.md",
       "targetPath": "adr/0038-unified-task-subagent-execution.md",
       "kind": "adr",

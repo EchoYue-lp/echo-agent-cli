@@ -16,8 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ADR [0037](docs/zh/adr/0037-unified-turn-run-binding.md)。
 
 - **Skill 系统重构（2026-09）**:
+  - 内置 creator 能力：`writing-skills` 收敛为面向用户的 `skill-creator`，新增 EKO
+    原生 `plugin-creator`；两者默认启用、按需加载，新增三个模型可调用薄工具并复用
+    framework Skill validator 与应用 PluginRuntime 的 scaffold / validate 权威。ADR
+    [0038](docs/zh/adr/0038-builtin-creator-skills.md)。
+  - app-core 数据根与 binary 入口统一尊重绝对 `EKO_DATA_DIR`，使隔离测试和本地多实例
+    不再误占用真实 `~/.eko` authority。
   - 用户可调用 Skill：TUI 新增 `/skill <name> [instructions]`（激活 + 可选引导输入），GUI Settings 的 Skills 面板新增"在当前会话激活"；framework `activate_skill` 对未安装/被禁用 skill 从静默返回改为显式报错。
-  - 内置目录收敛 39 → 24：删除通用能力型（coding/translation/doc-writing/web-search，行为准则由基础 prompt 承担）与 vendored Anthropic 示例 11 个（design/automation/research，可经 SkillsHub 安装）；默认启用 8 → 5；methodology baseline 常驻注入 4 → 1（仅 verification-before-completion）。
+  - 内置目录先收敛 39 → 24，随后因 creator 能力调整为 25：删除通用能力型（coding/translation/doc-writing/web-search，行为准则由基础 prompt 承担）与 vendored Anthropic 示例 11 个（design/automation/research，可经 SkillsHub 安装）；默认启用先从 8 → 5，随后加入两个 creator 变为 7；methodology baseline 常驻注入 4 → 1（仅 verification-before-completion）。
   - 打包修复：builtin skills 根从编译期 `CARGO_MANIFEST_DIR` 改为运行时解析（`$EKO_SKILLS_ROOT` → Tauri bundle resources → 源码树），`tauri.conf.json` 增加 `bundle.resources`，修复安装态应用丢失全部内置 skill 的问题。
   - durable 管制机器移除（约 3000 行）：`enabled-skills.json` 保留平铺 `{category, enabled, baseline}` + 原子写，删除 generation CAS / operation identity / repair debt；坏配置回退默认启用集（fail-closed → fail-open）。ADR [0036](docs/zh/adr/0036-skill-policy-simplification.md)（取代 [0032](docs/zh/adr/0032-enabled-skill-runtime-authority.md) 的结算部分）。
   - Agent Plugins 1.0 留口：`install` 复用 framework manifest validator 识别
@@ -47,7 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   design / research / automation），按 `skills/<category>/<name>/SKILL.md` 组织。
 - **技能资产移植与收缩**: superpowers 方法论/工作流 13 个 + Anthropic 领域技能
   15 个 + 现有技能，全部移植到 `skills/<category>/` 目录；经本轮质量收缩后
-  最终随附 24 个，见上方 Changed 条目。
+  最终随附 25 个，见上方 Changed 条目。
 - **方法论 baseline 默认挂载**: `verification-before-completion` 的正文在
   primary 与 pooled conversation Agent 创建时注入 system prompt。
 - **enabled-skills.json 配置管理**: `EnabledSkillsConfig` 模块，管理技能

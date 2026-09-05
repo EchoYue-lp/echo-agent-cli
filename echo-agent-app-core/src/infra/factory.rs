@@ -887,6 +887,7 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
         tracing::error!("Failed to build agent: {e}");
         format!("Failed to initialize agent: {e}. Please check your configuration and try again.")
     })?;
+    crate::creator_tools::install_creator_tools(&mut agent);
     // The built parent is the memory authority. This also preserves memory in
     // the fallback path where the workspace FileStore could not be opened and
     // the framework installed its configured default store instead.
