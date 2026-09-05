@@ -25,6 +25,12 @@ use crate::workspace::WorkspaceKind;
 
 type Fixture = (tempfile::TempDir, Arc<AppState>);
 
+// These tests assert lifecycle ordering, not a five-second latency SLA. Agent
+// and context initialization can contend with the full app-core suite on a
+// constrained Linux runner, so keep one bounded harness deadline consistent
+// with the newer lifecycle tests in this module.
+const COLD_DELIVERY_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 struct CheckpointReadBarrier {
     inner: Arc<dyn echo_agent::state::RuntimeStateStore>,
     entered: tokio::sync::Notify,
@@ -1284,7 +1290,7 @@ async fn f1_cold_drain_is_durable_before_terminal_and_reopen_visible() -> anyhow
             .await
     });
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + COLD_DELIVERY_TEST_TIMEOUT;
     loop {
         let records = state.agent_router.records(&target).await?;
         if records
@@ -1383,7 +1389,7 @@ async fn f1_cold_owner_exit_after_drain_recovers_without_model_replay() -> anyho
             .await
     });
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + COLD_DELIVERY_TEST_TIMEOUT;
     let injected = loop {
         if let Some(in_flight) = state.agent_router.in_flight_claim(&target).await?
             && in_flight.phase == crate::agent_router::AgentDeliveryPhase::Drained
@@ -1445,7 +1451,7 @@ async fn f1_cold_owner_exit_after_drain_recovers_without_model_replay() -> anyho
     assert_eq!(abandoned.turn_id, injected.turn_id);
 
     assert_eq!(state.recover_agent_deliveries().await?, 1);
-    let recovery_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let recovery_deadline = tokio::time::Instant::now() + COLD_DELIVERY_TEST_TIMEOUT;
     let recovered = loop {
         let record = state
             .agent_router
@@ -1548,7 +1554,7 @@ async fn f1_cold_acceptance_waits_for_real_context_drain() -> anyhow::Result<()>
             .await
     });
     tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        COLD_DELIVERY_TEST_TIMEOUT,
         barrier.wait_until_entered(),
     )
     .await?;
@@ -1566,7 +1572,7 @@ async fn f1_cold_acceptance_waits_for_real_context_drain() -> anyhow::Result<()>
         "AgentTurnDriver accepted the request before entering context restore, but the router must not project Drained yet"
     );
     barrier.release();
-    assert!(tokio::time::timeout(std::time::Duration::from_secs(5), delivery).await???);
+    assert!(tokio::time::timeout(COLD_DELIVERY_TEST_TIMEOUT, delivery).await???);
     let terminal = state
         .agent_router
         .records(&target)
@@ -1628,7 +1634,7 @@ async fn f1_cold_terminal_before_drain_fails_without_drained_replay() -> anyhow:
             .await
     });
     tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        COLD_DELIVERY_TEST_TIMEOUT,
         barrier.wait_until_entered(),
     )
     .await?;
@@ -1642,7 +1648,7 @@ async fn f1_cold_terminal_before_drain_fails_without_drained_replay() -> anyhow:
         Some(crate::agent_router::AgentDeliveryPhase::EffectStarted)
     );
     barrier.release();
-    assert!(tokio::time::timeout(std::time::Duration::from_secs(5), delivery).await???);
+    assert!(tokio::time::timeout(COLD_DELIVERY_TEST_TIMEOUT, delivery).await???);
     let failed = state
         .agent_router
         .records(&target)
