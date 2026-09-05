@@ -197,6 +197,8 @@ pub struct ApplicationLifecycleOwner {
     mcp_config_runtime: Option<Arc<crate::mcp_config_runtime::McpConfigRuntime>>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     product_data_io: Option<crate::product_data_io::ProductDataIoService>,
+    subagent_projection:
+        Option<Arc<crate::subagent_event_projection::SubagentEnvelopeProjectionService>>,
     background_tasks: Vec<ApplicationBackgroundTask>,
     external_owners: Vec<ApplicationExternalOwner>,
     #[cfg(test)]
@@ -220,6 +222,7 @@ impl ApplicationLifecycleOwner {
             mcp_config_runtime: None,
             browser_runtime: None,
             product_data_io: None,
+            subagent_projection: None,
             background_tasks: Vec::new(),
             external_owners: Vec::new(),
             #[cfg(test)]
@@ -286,6 +289,13 @@ impl ApplicationLifecycleOwner {
         product_data_io: crate::product_data_io::ProductDataIoService,
     ) {
         self.product_data_io = Some(product_data_io);
+    }
+
+    pub fn bind_subagent_projection(
+        &mut self,
+        service: Arc<crate::subagent_event_projection::SubagentEnvelopeProjectionService>,
+    ) {
+        self.subagent_projection = Some(service);
     }
 
     #[cfg(test)]
@@ -553,6 +563,11 @@ impl ApplicationLifecycleOwner {
         {
             receipt.record("primary Agent", error);
         }
+        if let Some(service) = self.subagent_projection.as_ref()
+            && let Err(error) = service.shutdown_and_join().await
+        {
+            receipt.record("Subagent event projection", error);
+        }
         receipt
     }
 
@@ -574,6 +589,9 @@ impl Drop for ApplicationLifecycleOwner {
         self.root_cancel.cancel();
         for task in self.background_tasks.drain(..) {
             task.handle.abort();
+        }
+        if let Some(service) = self.subagent_projection.as_ref() {
+            service.abort();
         }
         self.external_owners.clear();
     }
@@ -629,6 +647,8 @@ pub struct AgentRuntime {
 pub struct ApplicationServices {
     pub app_state: Arc<AppState>,
     pub pool: Arc<crate::agent_pool::AgentPool>,
+    pub subagent_projection:
+        Arc<crate::subagent_event_projection::SubagentEnvelopeProjectionService>,
     lifecycle: Option<ApplicationLifecycleOwner>,
 }
 
@@ -747,7 +767,7 @@ impl ApplicationServices {
         pool.apply_permission_mode(initial_pool_permission).await;
         crate::tasks::task_runtime::bind_task_execute_to_pool(
             &runtime.agent_handle,
-            task_runtime,
+            task_runtime.clone(),
             &pool,
         )
         .await;
@@ -755,6 +775,22 @@ impl ApplicationServices {
         // resolver. Direct field assignment leaves headless TaskRuns unable to
         // resolve cold or switched workspace targets.
         state.set_pool(pool.clone());
+
+        let subagent_projector = Arc::new(
+            crate::subagent_event_projection::SubagentEnvelopeProjector::new(
+                runtime.model_consumers.subagent_event_bus(),
+                Some(task_runtime.clone()),
+                state.workspace.runtimes.clone(),
+                state.session.foreground_turns.clone(),
+                state.storage.chat_events.clone(),
+                state.storage.tool_executions.clone(),
+            ),
+        );
+        let subagent_projection =
+            crate::subagent_event_projection::SubagentEnvelopeProjectionService::start(
+                subagent_projector,
+            );
+        lifecycle.bind_subagent_projection(subagent_projection.clone());
 
         let scheduler_store: Arc<dyn echo_agent::memory::Store> = {
             let file_path = crate::data_root::user_data_path("scheduler_store");
@@ -818,6 +854,7 @@ impl ApplicationServices {
         Ok(Self {
             app_state,
             pool,
+            subagent_projection,
             lifecycle: Some(lifecycle),
         })
     }

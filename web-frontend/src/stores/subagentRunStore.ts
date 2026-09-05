@@ -15,7 +15,9 @@
 import { create } from 'zustand';
 import { isCanonicalUsageEvent } from '../components/compress/subagentUsage';
 import type {
+  ExecEvent as GeneratedExecEvent,
   RuntimeTaskEvent,
+  RuntimeEventKind,
   SubagentArtifact,
   SubagentEvidence,
   SubagentStatus,
@@ -24,19 +26,30 @@ import type {
   SubagentVerification,
   PlanRevision,
   TaskRun,
+  SubagentEventMetadata,
 } from '../generated';
 
 export type { SubagentStatus } from '../generated';
 
 /** Event variants carried on execution://event with kind="subagent". */
-export type SubagentRunEventKind =
+export type SubagentRunEventKind = Extract<
+  RuntimeEventKind,
   | 'started'
-  | 'usage' // canonical DispatchLlmUsage event with provider/cache metadata
+  | 'usage'
   | 'isolation_observed'
+  | 'thinking_started'
+  | 'thinking_delta'
+  | 'thinking_ended'
+  | 'token_delta'
+  | 'tool_started'
+  | 'tool_completed'
+  | 'subagent_escalation_requested'
+  | 'subagent_stream_gap'
   | 'completed'
   | 'failed'
   | 'timed_out'
-  | 'cancelled';
+  | 'cancelled'
+>;
 
 interface WireSubagentArtifact {
   path: string;
@@ -47,13 +60,15 @@ interface WireSubagentArtifact {
   available: boolean;
 }
 
-/** One raw event on the wire (the bridge emits these as a serde_json::Object). */
-export interface ExecutionEvent {
+type GeneratedExecutionAddress = Pick<
+  GeneratedExecEvent,
+  'workspace_id' | 'conversation_id' | 'run_id'
+>;
+
+/** UI projection derived from the generated Rust `ExecEvent` contract. */
+export type ExecutionEvent = GeneratedExecutionAddress & {
   kind: 'subagent';
-  workspace_id: string;
-  conversation_id: string;
   subagent_run_id: string;
-  run_id: string;
   agent: string;
   event: SubagentRunEventKind;
   task_id?: string;
@@ -96,8 +111,17 @@ export interface ExecutionEvent {
   verification?: SubagentVerification[];
   remaining_work?: string[];
   touched_files?: SubagentTouchedFiles;
+  framework_event?: SubagentEventMetadata | null;
+  event_id?: string;
+  stream_id?: string;
+  sequence?: number;
+  timestamp?: string;
+  parent_event_id?: string;
+  requested_after?: number;
+  available_from?: number | null;
+  latest_sequence?: number;
   [key: string]: unknown;
-}
+};
 
 export interface SubagentRunState {
   subagentRunId: string;
@@ -156,6 +180,14 @@ const STORED_SUBAGENT_EVENTS = new Set<string>([
   'started',
   'usage',
   'isolation_observed',
+  'thinking_started',
+  'thinking_delta',
+  'thinking_ended',
+  'token_delta',
+  'tool_started',
+  'tool_completed',
+  'subagent_escalation_requested',
+  'subagent_stream_gap',
   'completed',
   'failed',
   'timed_out',
@@ -326,6 +358,79 @@ function runtimeTouchedFiles(value: unknown): SubagentTouchedFiles | undefined {
   };
 }
 
+/** Convert the generated Rust wire contract into the view-only event shape. */
+export function subagentExecutionEventFromWire(
+  event: GeneratedExecEvent,
+  journal?: { event_id: string; stream_id: string; sequence: number; timestamp: string }
+): ExecutionEvent | null {
+  if (
+    event.scope !== 'subagent' ||
+    !event.subagent_run_id ||
+    !STORED_SUBAGENT_EVENTS.has(event.event)
+  ) {
+    return null;
+  }
+  const payload = jsonRecord(event.payload) ?? {};
+  const outcome = jsonRecord(payload.outcome);
+  const metadata = event.framework_event;
+  const terminalStatus = runtimeTerminalEvent(payload.terminal_status ?? outcome?.status);
+  const timestamp = metadata?.timestamp ?? journal?.timestamp;
+  const startedAt = timestamp ? runtimeEventTimestamp(timestamp) : undefined;
+  const artifacts = runtimeArtifacts(outcome?.artifacts ?? payload.artifacts);
+  const verification = runtimeVerification(outcome?.verification ?? payload.verification);
+  const touchedFiles = runtimeTouchedFiles(outcome?.touched_files ?? payload.touched_files);
+  const evidence = Array.isArray(outcome?.evidence ?? payload.evidence)
+    ? ((outcome?.evidence ?? payload.evidence) as SubagentEvidence[])
+    : undefined;
+
+  return {
+    ...payload,
+    kind: 'subagent',
+    workspace_id: event.workspace_id,
+    conversation_id: event.conversation_id,
+    run_id: event.run_id,
+    subagent_run_id: event.subagent_run_id,
+    task_id: event.task_id ?? metadata?.task_id ?? undefined,
+    agent: event.agent ?? metadata?.agent_name ?? 'subagent',
+    event: event.event as SubagentRunEventKind,
+    parent: metadata?.parent_execution_id ?? undefined,
+    plan_revision: metadata?.plan_revision ?? jsonNumber(payload.plan_revision),
+    attempt: metadata?.attempt ?? jsonNumber(payload.attempt),
+    message_id: metadata?.message_id ?? jsonString(payload.message_id),
+    started_at: startedAt,
+    task: jsonString(payload.task),
+    mode: jsonString(payload.mode),
+    duration_ms: jsonNumber(payload.duration_ms),
+    tokens_used: jsonNumber(payload.tokens_used),
+    iteration_count: jsonNumber(payload.iterations ?? payload.iteration_count),
+    output: jsonString(payload.output),
+    error: jsonString(payload.error),
+    isolation_observed: jsonString(payload.isolation ?? payload.isolation_observed),
+    summary: jsonString(outcome?.summary ?? payload.summary),
+    contract_version: jsonNumber(outcome?.contract_version ?? payload.contract_version),
+    terminal_status: terminalStatus ?? undefined,
+    artifacts,
+    evidence,
+    verification,
+    remaining_work: jsonStringArray(outcome?.remaining_work ?? payload.remaining_work),
+    touched_files: touchedFiles,
+    framework_event: metadata,
+    event_id: metadata?.event_id ?? journal?.event_id,
+    stream_id:
+      metadata?.stream_id ??
+      (event.event === 'subagent_stream_gap' ? jsonString(payload.stream_id) : journal?.stream_id),
+    // A synthetic gap describes the framework stream but is itself sequenced
+    // by ChatEventLog. Do not compare that outer sequence with framework data.
+    sequence:
+      metadata?.sequence ?? (event.event === 'subagent_stream_gap' ? undefined : journal?.sequence),
+    timestamp,
+    parent_event_id: metadata?.parent_event_id ?? undefined,
+    requested_after: jsonNumber(payload.requested_after),
+    available_from: payload.available_from === null ? null : jsonNumber(payload.available_from),
+    latest_sequence: jsonNumber(payload.latest_sequence),
+  };
+}
+
 function runtimeEventTimestamp(timestamp: string): number | undefined {
   const value = Date.parse(timestamp);
   return Number.isFinite(value) ? value : undefined;
@@ -468,12 +573,30 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
       const storeKey = subagentRunStoreKey(ev.run_id, id);
       const prev = s.runs[storeKey];
       const newStatus = statusFromEvent(ev.event);
-      // One execution id has one monotonic lifecycle. Retries use a new
-      // `{run_id}:{task_id}:{plan_revision}:{attempt}:{claim_id}` id, so late/duplicate events
-      // must not reopen a terminal execution or overwrite its result.
-      if (prev && prev.status !== 'running') {
+      if (
+        prev &&
+        ((ev.event_id && prev.events.some((candidate) => candidate.event_id === ev.event_id)) ||
+          (ev.sequence != null &&
+            prev.events.some(
+              (candidate) =>
+                candidate.stream_id === ev.stream_id &&
+                candidate.sequence != null &&
+                candidate.sequence >= ev.sequence!
+            )))
+      ) {
         return s;
       }
+      // Synthetic TaskRuntime recovery may settle before the canonical chat
+      // replay arrives. It cannot be overwritten by another synthetic event,
+      // but framework-sequenced history may still fill the timeline and enrich
+      // the same terminal outcome.
+      const previousTerminal = Boolean(prev && prev.status !== 'running');
+      const frameworkSequenced = Boolean(ev.framework_event);
+      if (previousTerminal && !frameworkSequenced) {
+        return s;
+      }
+      const compatibleTerminal =
+        !previousTerminal || newStatus === null || newStatus === prev?.status;
       // P1.0: capture conversation_id (present on run_started; carried via the
       // ExecutionEvent's index signature). Persists on the run record so
       // TaskRuntimePanel can group all inline subagent runs per conversation.
@@ -510,7 +633,8 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
       const usageEvents = isCanonicalUsageEvent(ev)
         ? [...(run.usageEvents ?? []), ev]
         : run.usageEvents;
-      const outcome = terminalOutcome(ev, newStatus) ?? run.outcome;
+      const outcome =
+        (compatibleTerminal ? terminalOutcome(ev, newStatus) : undefined) ?? run.outcome;
       const next: SubagentRunState = {
         ...run,
         workspaceId: ev.workspace_id || run.workspaceId,
@@ -522,12 +646,12 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         task: ev.task ?? run.task,
         mode: ev.mode ?? run.mode,
         conversationId: evConvId ?? run.conversationId,
-        status: newStatus ?? run.status,
+        status: compatibleTerminal ? (newStatus ?? run.status) : run.status,
         durationMs: ev.duration_ms ?? run.durationMs,
         tokensUsed: ev.tokens_used ?? run.tokensUsed,
         iterationCount: ev.iteration_count ?? run.iterationCount,
-        finalOutput: ev.output ?? run.finalOutput,
-        error: ev.error ?? run.error,
+        finalOutput: compatibleTerminal ? (ev.output ?? run.finalOutput) : run.finalOutput,
+        error: compatibleTerminal ? (ev.error ?? run.error) : run.error,
         promptSource: ev.prompt_source ?? run.promptSource,
         isolationRequested: ev.isolation_requested ?? run.isolationRequested,
         isolationObserved: ev.isolation_observed ?? run.isolationObserved,
@@ -545,6 +669,15 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
 
   clear: () => set({ runs: {} }),
 }));
+
+/** Shared live/replay ingress for the generated Rust execution contract. */
+export function ingestSubagentExecEvent(
+  event: GeneratedExecEvent,
+  journal?: { event_id: string; stream_id: string; sequence: number; timestamp: string }
+): void {
+  const projected = subagentExecutionEventFromWire(event, journal);
+  if (projected) useSubagentRunStore.getState().ingest(projected);
+}
 
 export function ingestTaskRuntimeSubagentEvents(
   run: TaskRun,

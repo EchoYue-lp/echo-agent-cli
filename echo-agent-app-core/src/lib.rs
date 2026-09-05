@@ -56,6 +56,7 @@ pub(crate) mod scheduler;
 pub(crate) mod skills_hub;
 pub(crate) mod state;
 pub(crate) mod structured_extraction;
+pub(crate) mod subagent_event_projection;
 pub(crate) mod subagent_loader;
 pub(crate) mod subagent_prompt;
 pub(crate) mod tasks;

@@ -153,6 +153,29 @@ Tauri mutation 使用 ts-rs 生成的 `TaskRunControlReceipt`、`TaskRunResumeRe
 `TaskRetryReceipt`。Continuation resume 的 `turn_id` 是正式 wire 字段；surface capability
 来自已注册工具与 workspace facts，不再由前端传递 mode DTO。
 
+## Subagent execution 投影
+
+bootstrap、pooled conversation 和 workspace Agent 共用一个 framework
+`SubagentEventBus`。app-core 只消费它的 versioned envelope stream。formal event 通过
+TaskRuntime owner registry 定位；没有 run 的事件通过 exact active foreground turn 定位；
+当前 workspace focus 与 execution-id 字符串格式都不是身份输入。
+
+进程级 Subagent admission 在 Agent 构造期或 bootstrap 后 task tool 注册期安装。TaskRuntime
+不会在 `task_execute` 内再次获取同一 Agent 的 write lease，因为外层 ReAct turn 可能正持有它。
+
+app-core projector 把 framework metadata 保留在 generated `ExecEvent`，向既有
+`ChatEventLog` 追加事件，并调用既有 tool detail projector。sequence 跳跃先走 framework
+replay；无法恢复的 transient suffix 形成 `subagent_stream_gap`，保留的 terminal 仍用于
+对账最终结果。恢复会扫描 retained、active 与已知 stream 的并集；active publisher 的
+dispatch-start anchor 可在完整 replay 被挤出后继续提供准确地址。tool detail 失败从已提交事件
+重试，并可由 ChatEventLog 重建。active GUI/TUI/CLI/channel sink 通过 journal 的 weak live
+registry 接收已提交事件；GUI、TUI 和 REPL 后台事件由 committed projection stream 及其有界
+late-subscriber/lag replay 投递；请求级 channel 在下一次响应中从 durable conversation cursor
+重放 execution event。因此 live 与 replay 使用同一个 `ChatDriverEvent::Execution` payload。
+
+Tauri 和 TUI 不再订阅 raw Subagent event；Tauri 只发布已提交的 chat envelope 与 tool
+summary。详见 [ADR 0040](../adr/0040-app-core-subagent-event-projection.md)。
+
 ## 取舍与影响
 
 - EKO adapter 不再拥有 executor、validator、retry loop 或 descendant traversal。

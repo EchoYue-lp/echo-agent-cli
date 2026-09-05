@@ -184,29 +184,10 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   return (
     <div className="flex h-full flex-col bg-[var(--bg-sidebar)] text-[var(--text-secondary)]">
       {/* Brand Header */}
-      <div className="flex items-center justify-between px-2.5 py-2.5">
+      <div className="flex h-11 items-center justify-between px-3">
         <div className="flex items-center gap-2">
           <BrandIcon size="md" />
           <span className="text-sm font-semibold text-[var(--text-primary)]">EKO</span>
-          {current && (
-            <div className="flex items-center gap-1">
-              <button
-                onClick={() => onNewTask()}
-                className="flex max-w-[104px] items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
-                title={`当前: ${current.name}\n${current.root}`}
-              >
-                <FolderOpen size={11} />
-                {current.name}
-              </button>
-              <button
-                onClick={(e) => handleOpenFolder(e, current)}
-                className="rounded-md p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
-                title="在文件管理器中打开"
-              >
-                <FolderOpen size={13} />
-              </button>
-            </div>
-          )}
         </div>
         <button
           onClick={toggleTheme}
@@ -218,17 +199,17 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       </div>
 
       {/* New Task + Search */}
-      <div className="space-y-2 px-2.5 pb-3">
+      <div className="space-y-1 px-2 pb-2">
         <button
           onClick={() => onNewTask()}
-          className="flex w-full items-center gap-2 rounded-lg bg-[var(--accent-bg)] px-2.5 py-2 text-[13px] font-medium text-[var(--accent)] transition-all hover:shadow-[var(--shadow-sm)]"
+          className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-[13px] text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
         >
-          <Plus size={15} strokeWidth={2.5} />
+          <Plus size={14} />
           新建任务
         </button>
 
         {workspaces.length > 0 && (
-          <div className="flex items-center gap-2 rounded-md bg-[var(--bg-sidebar-hover)]/70 px-2.5 py-1.5 transition-colors focus-within:bg-[var(--bg-primary)] focus-within:ring-1 focus-within:ring-[var(--border-focus)]">
+          <div className="flex h-8 items-center gap-2 rounded-md px-2 transition-colors focus-within:bg-[var(--bg-sidebar-hover)]">
             <Search size={13} className="shrink-0 text-[var(--text-tertiary)]" />
             <input
               ref={searchInputRef}
@@ -328,10 +309,10 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                 role="button"
                 tabIndex={0}
                 aria-label={`打开工作区 ${ws.name}`}
-                className={`group relative cursor-pointer rounded-md transition-all
+                className={`group relative cursor-pointer rounded-md transition-colors
                   ${
                     isActive
-                      ? 'bg-[var(--bg-sidebar-active)] shadow-[inset_3px_0_0_var(--accent)]'
+                      ? 'bg-[var(--bg-sidebar-active)] text-[var(--text-primary)]'
                       : 'hover:bg-[var(--bg-sidebar-hover)]'
                   }`}
                 onClick={() => handleSwitch(ws)}
@@ -343,7 +324,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                   }
                 }}
               >
-                <div className="flex items-center gap-2 px-2.5 py-2">
+                <div className="flex h-8 items-center gap-2 px-2">
                   {/* Expand arrow */}
                   {isActive ? (
                     isExpanded ? (
@@ -355,13 +336,11 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                     getKindIcon(ws.kind)
                   )}
 
-                  <div className="min-w-0 flex-1">
-                    <div className={`truncate text-[13px] ${isActive ? 'font-medium' : ''}`}>
-                      {ws.name}
-                    </div>
-                    <div className="truncate text-[11px] text-[var(--text-tertiary)]">
-                      {ws.root}
-                    </div>
+                  <div
+                    className={`min-w-0 flex-1 truncate text-[13px] ${isActive ? 'font-medium' : ''}`}
+                    title={ws.root}
+                  >
+                    {ws.name}
                   </div>
 
                   <div className="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">

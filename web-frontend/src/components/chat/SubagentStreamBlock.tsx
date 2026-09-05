@@ -13,8 +13,7 @@ import {
   toolExecutionOwnerKey,
   useToolExecutionStore,
 } from '../../stores/toolExecutionStore';
-import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
-import { useRightWorkspaceStore } from '../../stores/rightWorkspaceStore';
+import { useContextPaneStore } from '../../stores/contextPaneStore';
 import { SubagentOutcomeView } from '../subagent/SubagentOutcomeView';
 import { statusLabel } from '../../utils/subagentProgress';
 import { subagentOutcomePresentation } from '../../utils/subagentOutcome';
@@ -51,8 +50,7 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
   const presentation = subagentOutcomePresentation(run);
 
   const openDetail = () => {
-    useSubagentDetailStore.getState().selectSubagent(run.runId, run.subagentRunId);
-    useRightWorkspaceStore.getState().openWorkspace();
+    useContextPaneStore.getState().openSubagent(run.runId, run.subagentRunId);
   };
 
   const statusIcon =

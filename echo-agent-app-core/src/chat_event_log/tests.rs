@@ -15,6 +15,7 @@ mod tests {
     #[derive(Default)]
     struct CapturingSink {
         journaled: Mutex<Vec<ChatEventEnvelope>>,
+        tool_updates: Mutex<Vec<String>>,
     }
 
     impl crate::chat_driver::ChatSink for CapturingSink {
@@ -28,6 +29,60 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .push(envelope);
             true
+        }
+
+        fn on_tool_execution_projection(
+            &self,
+            update: &crate::tool_execution_projection::ToolExecutionProjectionUpdate,
+        ) -> bool {
+            self.tool_updates
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(update.summary.id.clone());
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct RejectingJournaledSink {
+        journaled_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::chat_driver::ChatSink for RejectingJournaledSink {
+        fn on_event(&self, _event: ChatDriverEvent) -> bool {
+            false
+        }
+
+        fn on_journaled_event(&self, _envelope: ChatEventEnvelope) -> bool {
+            self.journaled_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+    }
+
+    fn tool_projection_update(
+        id: &str,
+    ) -> crate::tool_execution_projection::ToolExecutionProjectionUpdate {
+        crate::tool_execution_projection::ToolExecutionProjectionUpdate {
+            kind: crate::tool_execution_projection::ToolExecutionProjectionKind::Started,
+            agent: "explorer".to_string(),
+            summary: crate::tool_execution::ToolExecutionSummary {
+                id: id.to_string(),
+                call_id: "call-1".to_string(),
+                owner: crate::tool_execution::ToolExecutionOwner::Subagent {
+                    subagent_run_id: "subagent-1".to_string(),
+                },
+                workspace_id: "workspace-1".to_string(),
+                conversation_id: Some("conversation-1".to_string()),
+                run_id: Some("run-1".to_string()),
+                name: "shell".to_string(),
+                args_preview: "command=test".to_string(),
+                status: crate::tool_execution::ToolExecutionStatus::Running,
+                started_at: 1,
+                finished_at: None,
+                duration_ms: None,
+                detail_ref: "tool-execution://tool-1".to_string(),
+            },
         }
     }
 
@@ -551,6 +606,247 @@ mod tests {
                 .len(),
             4
         );
+        Ok(())
+    }
+
+    #[test]
+    fn projected_live_event_routes_once_to_each_exact_surface_turn() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = Arc::new(
+            ChatEventLog::open(temp.path().join("events"), ChatEventRetention::default())
+                .map_err(|error| error.to_string())?,
+        );
+        let tools = Arc::new(
+            ToolExecutionRepository::open(temp.path().join("tools"))
+                .map_err(|error| error.to_string())?,
+        );
+        let gui = Arc::new(CapturingSink::default());
+        let tui = Arc::new(CapturingSink::default());
+        let other_turn = Arc::new(CapturingSink::default());
+        let gui_bound = bind_surface_chat_sink(
+            ChatSurface::Gui,
+            gui.clone(),
+            log.clone(),
+            tools.clone(),
+            "workspace-1",
+            Some("conversation-1".to_string()),
+            "turn-1",
+        );
+        let tui_bound = bind_surface_chat_sink(
+            ChatSurface::Tui,
+            tui.clone(),
+            log.clone(),
+            tools.clone(),
+            "workspace-1",
+            Some("conversation-1".to_string()),
+            "turn-1",
+        );
+        let other_bound = bind_surface_chat_sink(
+            ChatSurface::Cli,
+            other_turn.clone(),
+            log.clone(),
+            tools,
+            "workspace-1",
+            Some("conversation-1".to_string()),
+            "turn-2",
+        );
+        let envelope = log
+            .append(
+                "workspace-1",
+                Some("conversation-1"),
+                "turn-1",
+                ChatDriverEvent::TurnStatus {
+                    status: "running".to_string(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let updates = vec![tool_projection_update("tool-1")];
+
+        assert!(log.deliver_projected_event(&envelope, &updates));
+        assert!(log.deliver_projected_event(&envelope, &updates));
+        for sink in [&gui, &tui] {
+            assert_eq!(
+                sink.journaled
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .len(),
+                1
+            );
+            assert_eq!(
+                sink.tool_updates
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_slice(),
+                ["tool-1"]
+            );
+        }
+        assert!(
+            other_turn
+                .journaled
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+        drop((gui_bound, tui_bound, other_bound));
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_live_sink_is_pruned_without_delivery() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = Arc::new(
+            ChatEventLog::open(temp.path().join("events"), ChatEventRetention::default())
+                .map_err(|error| error.to_string())?,
+        );
+        let tools = Arc::new(
+            ToolExecutionRepository::open(temp.path().join("tools"))
+                .map_err(|error| error.to_string())?,
+        );
+        {
+            let sink = Arc::new(CapturingSink::default());
+            let bound = bind_surface_chat_sink(
+                ChatSurface::Gui,
+                sink,
+                log.clone(),
+                tools,
+                "workspace-1",
+                Some("conversation-1".to_string()),
+                "turn-1",
+            );
+            assert_eq!(log.live_sink_count(), 1);
+            drop(bound);
+        }
+        assert_eq!(log.live_sink_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_live_callback_does_not_rollback_committed_event() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = Arc::new(
+            ChatEventLog::open(temp.path().join("events"), ChatEventRetention::default())
+                .map_err(|error| error.to_string())?,
+        );
+        let tools = Arc::new(
+            ToolExecutionRepository::open(temp.path().join("tools"))
+                .map_err(|error| error.to_string())?,
+        );
+        let rejecting = Arc::new(RejectingJournaledSink::default());
+        let accepting = Arc::new(CapturingSink::default());
+        let rejecting_bound = bind_surface_chat_sink(
+            ChatSurface::Gui,
+            rejecting.clone(),
+            log.clone(),
+            tools.clone(),
+            "workspace-1",
+            Some("conversation-1".to_string()),
+            "turn-1",
+        );
+        let accepting_bound = bind_surface_chat_sink(
+            ChatSurface::Tui,
+            accepting.clone(),
+            log.clone(),
+            tools,
+            "workspace-1",
+            Some("conversation-1".to_string()),
+            "turn-1",
+        );
+        let envelope = log
+            .append(
+                "workspace-1",
+                Some("conversation-1"),
+                "turn-1",
+                ChatDriverEvent::TurnStatus {
+                    status: "running".to_string(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+
+        assert!(!log.deliver_projected_event(&envelope, &[]));
+        assert_eq!(
+            rejecting
+                .journaled_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            accepting
+                .journaled
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
+        assert_eq!(log.live_sink_count(), 1);
+        assert_eq!(
+            log.replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+                .map_err(|error| error.to_string())?
+                .events
+                .len(),
+            1
+        );
+        drop((rejecting_bound, accepting_bound));
+        Ok(())
+    }
+
+    #[test]
+    fn journaled_sink_does_not_rebroadcast_its_own_event() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = Arc::new(
+            ChatEventLog::open(temp.path().join("events"), ChatEventRetention::default())
+                .map_err(|error| error.to_string())?,
+        );
+        let tools = Arc::new(
+            ToolExecutionRepository::open(temp.path().join("tools"))
+                .map_err(|error| error.to_string())?,
+        );
+        let producer = Arc::new(CapturingSink::default());
+        let observer = Arc::new(CapturingSink::default());
+        let producer_bound = bind_surface_chat_sink(
+            ChatSurface::Gui,
+            producer.clone(),
+            log.clone(),
+            tools.clone(),
+            "workspace-1",
+            Some("conversation-1".to_string()),
+            "turn-1",
+        );
+        let observer_bound = bind_surface_chat_sink(
+            ChatSurface::Tui,
+            observer.clone(),
+            log.clone(),
+            tools,
+            "workspace-1",
+            Some("conversation-1".to_string()),
+            "turn-1",
+        );
+
+        assert!(producer_bound.on_event(ChatDriverEvent::TurnStatus {
+            status: "running".to_string(),
+        }));
+        assert_eq!(
+            producer
+                .journaled
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
+        assert!(
+            observer
+                .journaled
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+        assert_eq!(
+            log.replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+                .map_err(|error| error.to_string())?
+                .events
+                .len(),
+            1
+        );
+        drop(observer_bound);
         Ok(())
     }
 

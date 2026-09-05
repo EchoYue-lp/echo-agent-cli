@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import type { PlanRevision, RuntimeTaskEvent, TaskRun } from '../generated';
+import type {
+  ExecEvent,
+  PlanRevision,
+  RuntimeTaskEvent,
+  SubagentEventMetadata,
+  TaskRun,
+} from '../generated';
 import {
+  ingestSubagentExecEvent,
   ingestTaskRuntimeSubagentEvents,
   latestSubagentRunsByTask,
   subagentRunStoreKey,
@@ -11,6 +18,177 @@ import {
 describe('subagentRunStore terminal result', () => {
   beforeEach(() => {
     useSubagentRunStore.getState().clear();
+  });
+
+  it('uses the generated ExecEvent contract for live and replayed timeline events', () => {
+    const metadata = (sequence: number): SubagentEventMetadata => ({
+      schema_version: 4,
+      event_id: `evt-${sequence}`,
+      content_hash: `sha256:${sequence}`,
+      sequence,
+      stream_id: 'stream-1',
+      turn_id: 'message-1',
+      message_id: 'message-1',
+      execution_id: 'execution-1',
+      parent_event_id: null,
+      timestamp: `2026-09-05T00:00:0${sequence}Z`,
+      parent_agent: 'primary',
+      agent_name: 'explorer',
+      parent_execution_id: null,
+      agent_path: 'primary/explorer',
+      task_id: null,
+      attempt: 1,
+      plan_revision: null,
+    });
+    const wire = (
+      event: ExecEvent['event'],
+      sequence: number,
+      payload: ExecEvent['payload']
+    ): ExecEvent => ({
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
+      run_id: '',
+      scope: 'subagent',
+      task_id: null,
+      subagent_run_id: 'execution-1',
+      event,
+      agent: 'explorer',
+      payload,
+      framework_event: metadata(sequence),
+    });
+
+    ingestSubagentExecEvent(wire('started', 1, { task: 'inspect', background: false }));
+    ingestSubagentExecEvent(wire('thinking_delta', 2, { content: 'reasoning' }));
+    ingestSubagentExecEvent(
+      {
+        ...wire('subagent_stream_gap', 3, {
+          stream_id: 'stream-1',
+          requested_after: 2,
+          available_from: 5,
+          latest_sequence: 6,
+        }),
+        framework_event: null,
+      },
+      {
+        event_id: 'journal-gap-30',
+        stream_id: 'conversation-stream',
+        sequence: 30,
+        timestamp: '2026-09-05T00:00:03Z',
+      }
+    );
+    ingestSubagentExecEvent(
+      wire('completed', 6, {
+        output: 'done',
+        duration_ms: 10,
+        tokens_used: 4,
+        outcome: {
+          contract_version: 2,
+          status: 'completed',
+          summary: 'done',
+          artifacts: [],
+          evidence: [],
+          verification: [],
+          remaining_work: [],
+          touched_files: { read: [], written: [] },
+        },
+      })
+    );
+    ingestSubagentExecEvent(wire('completed', 6, { output: 'duplicate' }));
+
+    const run = useSubagentRunStore.getState().runs[subagentRunStoreKey('', 'execution-1')];
+    expect(run?.status).toBe('completed');
+    expect(run?.events.map((event) => event.event)).toEqual([
+      'started',
+      'thinking_delta',
+      'subagent_stream_gap',
+      'completed',
+    ]);
+    expect(run?.events[1]?.content).toBe('reasoning');
+    expect(run?.events[2]?.available_from).toBe(5);
+    expect(run?.events[2]?.stream_id).toBe('stream-1');
+    expect(run?.events[2]?.sequence).toBeUndefined();
+    expect(run?.finalOutput).toBe('done');
+  });
+
+  it('treats TaskRuntime terminal hydration as fallback while framework replay fills history', () => {
+    const base = {
+      kind: 'subagent' as const,
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
+      run_id: 'run-1',
+      subagent_run_id: 'execution-1',
+      task_id: 'task-1',
+      agent: 'explorer',
+    };
+    useSubagentRunStore.getState().ingest({
+      ...base,
+      event: 'completed',
+      summary: 'durable fallback',
+    });
+    const metadata = (sequence: number): SubagentEventMetadata => ({
+      schema_version: 4,
+      event_id: `framework-${sequence}`,
+      content_hash: `sha256:${sequence}`,
+      sequence,
+      stream_id: 'framework-stream',
+      turn_id: 'message-1',
+      message_id: 'message-1',
+      execution_id: 'execution-1',
+      parent_event_id: null,
+      timestamp: `2026-09-05T00:00:0${sequence}Z`,
+      parent_agent: 'primary',
+      agent_name: 'explorer',
+      parent_execution_id: null,
+      agent_path: 'primary/explorer',
+      task_id: 'task-1',
+      attempt: 1,
+      plan_revision: 1,
+    });
+    const wire = (event: ExecEvent['event'], sequence: number, payload: unknown): ExecEvent => ({
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
+      run_id: 'run-1',
+      scope: 'subagent',
+      task_id: 'task-1',
+      subagent_run_id: 'execution-1',
+      event,
+      agent: 'explorer',
+      payload,
+      framework_event: metadata(sequence),
+    });
+    ingestSubagentExecEvent(wire('started', 1, { task: 'inspect' }));
+    ingestSubagentExecEvent(wire('thinking_delta', 2, { content: 'reasoning' }));
+    ingestSubagentExecEvent(
+      wire('completed', 3, {
+        output: 'framework result',
+        outcome: {
+          contract_version: 2,
+          status: 'completed',
+          summary: 'framework result',
+          artifacts: [],
+          evidence: [],
+          verification: [],
+          remaining_work: [],
+          touched_files: { read: [], written: [] },
+        },
+      })
+    );
+    useSubagentRunStore.getState().ingest({
+      ...base,
+      event: 'completed',
+      summary: 'late synthetic result',
+    });
+
+    const run = useSubagentRunStore.getState().runs[subagentRunStoreKey('run-1', 'execution-1')];
+    expect(run?.status).toBe('completed');
+    expect(run?.finalOutput).toBe('framework result');
+    expect(run?.outcome?.summary).toBe('framework result');
+    expect(run?.events.map((event) => event.event)).toEqual([
+      'completed',
+      'started',
+      'thinking_delta',
+      'completed',
+    ]);
   });
 
   it('preserves the complete timed-out result contract', () => {

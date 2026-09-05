@@ -1,10 +1,14 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import type { SubagentRunState } from '../../stores/subagentRunStore';
-import { SubagentDetailView } from './SubagentDetailView';
+import {
+  SubagentDetailView,
+  subagentTimelineEntries,
+  visibleSubagentTimelineEntries,
+} from './SubagentDetailView';
 
 describe('SubagentDetailView', () => {
-  it('renders exact-attempt controls for a running Subagent', () => {
+  it('renders an inline exact-attempt composer for a running Subagent', () => {
     const run: SubagentRunState = {
       subagentRunId: 'run-1:task-1:3:2:claim-1',
       runId: 'run-1',
@@ -19,9 +23,11 @@ describe('SubagentDetailView', () => {
 
     const html = renderToStaticMarkup(<SubagentDetailView run={run} onBack={() => undefined} />);
 
-    expect(html).toContain('aria-label="Message Subagent"');
-    expect(html).toContain('aria-label="Interrupt Subagent"');
-    expect(html).toContain('aria-label="Queue guidance for next attempt"');
+    expect(html).toContain('aria-label="Subagent 消息"');
+    expect(html).toContain('aria-label="发送 Subagent 消息"');
+    expect(html).toContain('aria-label="中断 Subagent"');
+    expect(html).toContain('attempt 2');
+    expect(html).not.toContain('window.prompt');
   });
 
   it('shows task, execution and result as one stream without tabs', () => {
@@ -77,5 +83,89 @@ describe('SubagentDetailView', () => {
     expect(html).not.toContain('见上方分析结果');
     expect(html).not.toContain('## Result');
     expect(html).not.toContain('Cargo.toml');
+  });
+
+  it('routes a settled attempt through the follow-up composer presentation', () => {
+    const run: SubagentRunState = {
+      subagentRunId: 'run-1:task-1:3:2:claim-1',
+      runId: 'run-1',
+      workspaceId: 'workspace-1',
+      taskId: 'task-1',
+      planRevision: 3,
+      attempt: 2,
+      agent: 'reviewer',
+      status: 'failed',
+      startedAt: 1,
+      error: 'provider unavailable',
+      outcome: {
+        contract_version: 1,
+        status: 'failed',
+        summary: 'provider unavailable',
+        artifacts: [],
+        evidence: [],
+        verification: [],
+        remaining_work: ['provider unavailable'],
+        touched_files: { read: [], written: [] },
+      },
+      events: [],
+    };
+
+    const html = renderToStaticMarkup(<SubagentDetailView run={run} onBack={() => undefined} />);
+
+    expect(html).toContain('aria-label="Subagent 后续任务"');
+    expect(html).toContain('aria-label="发送 Subagent 后续任务"');
+    expect(html.match(/provider unavailable/g)).toHaveLength(1);
+    expect(html).not.toContain('未完成');
+  });
+
+  it('uses terminal output once and reports a fully evicted gap inclusively', () => {
+    const run: SubagentRunState = {
+      subagentRunId: 'execution-1',
+      runId: '',
+      agent: 'explorer',
+      status: 'completed',
+      startedAt: 1,
+      finalOutput: 'complete answer',
+      events: [
+        {
+          kind: 'subagent',
+          workspace_id: 'workspace-1',
+          conversation_id: 'conversation-1',
+          run_id: '',
+          subagent_run_id: 'execution-1',
+          agent: 'explorer',
+          event: 'token_delta',
+          content: 'complete answer',
+        },
+        {
+          kind: 'subagent',
+          workspace_id: 'workspace-1',
+          conversation_id: 'conversation-1',
+          run_id: '',
+          subagent_run_id: 'execution-1',
+          agent: 'explorer',
+          event: 'subagent_stream_gap',
+          requested_after: 1,
+          available_from: null,
+          latest_sequence: 2,
+        },
+      ],
+    };
+    const timeline = subagentTimelineEntries(run, [], {});
+    expect(timeline.find((entry) => entry.kind === 'gap')).toMatchObject({ from: 1, to: 2 });
+    expect(visibleSubagentTimelineEntries(true, 'complete answer', timeline)).toEqual([
+      expect.objectContaining({ kind: 'gap', from: 1, to: 2 }),
+    ]);
+  });
+
+  it('keeps partial streamed output when a failed terminal has no complete output', () => {
+    const entries = [
+      { kind: 'text' as const, key: 'partial', content: 'partial investigation result' },
+    ];
+
+    expect(visibleSubagentTimelineEntries(true, '', entries)).toEqual(entries);
+    expect(visibleSubagentTimelineEntries(true, 'different failure summary', entries)).toEqual(
+      entries
+    );
   });
 });

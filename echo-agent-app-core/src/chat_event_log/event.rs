@@ -52,7 +52,7 @@ impl Default for ChatEventRetention {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatEventEnvelope {
     pub schema_version: u16,
@@ -160,6 +160,27 @@ type StreamAuthorityCell = Mutex<Option<StreamAuthority>>;
 type CachedStreamJournal = Arc<StreamAuthorityCell>;
 type StreamAuthorityRegistry = HashMap<PathBuf, Weak<StreamAuthorityCell>>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LiveChatSinkRoute {
+    workspace_id: String,
+    conversation_id: Option<String>,
+    root_turn_id: String,
+}
+
+struct LiveChatSinkRegistration {
+    surface: ChatSurface,
+    sink: Weak<dyn crate::chat_driver::ChatSink>,
+    last_delivered_sequence: u64,
+}
+
+type LiveChatSinkRegistry = HashMap<LiveChatSinkRoute, Vec<LiveChatSinkRegistration>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectedEventLiveDelivery {
+    pub had_live_sink: bool,
+    pub all_succeeded: bool,
+}
+
 fn stream_authority_registry() -> &'static Mutex<StreamAuthorityRegistry> {
     static REGISTRY: OnceLock<Mutex<StreamAuthorityRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -170,6 +191,7 @@ pub struct ChatEventLog {
     retention: ChatEventRetention,
     streams: DashMap<String, CachedStreamJournal>,
     stream_access: Mutex<VecDeque<String>>,
+    live_sinks: Mutex<LiveChatSinkRegistry>,
     #[cfg(test)]
     deletion_pause: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
     #[cfg(test)]
@@ -243,6 +265,15 @@ pub fn bind_surface_chat_sink(
     conversation_id: Option<String>,
     turn_id: impl Into<String>,
 ) -> Arc<dyn crate::chat_driver::ChatSink> {
+    let workspace_id = workspace_id.into();
+    let turn_id = turn_id.into();
+    log.register_live_sink(
+        surface,
+        &inner,
+        &workspace_id,
+        conversation_id.as_deref(),
+        &turn_id,
+    );
     JournaledChatSink::wrap(
         inner,
         log,
@@ -252,6 +283,149 @@ pub fn bind_surface_chat_sink(
         conversation_id,
         turn_id,
     )
+}
+
+impl ChatEventLog {
+    fn register_live_sink(
+        &self,
+        surface: ChatSurface,
+        sink: &Arc<dyn crate::chat_driver::ChatSink>,
+        workspace_id: &str,
+        conversation_id: Option<&str>,
+        root_turn_id: &str,
+    ) {
+        let route = LiveChatSinkRoute {
+            workspace_id: workspace_id.to_string(),
+            conversation_id: conversation_id.map(ToString::to_string),
+            root_turn_id: root_turn_id.to_string(),
+        };
+        let mut registry = self
+            .live_sinks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let registrations = registry.entry(route).or_default();
+        registrations.retain(|registration| registration.sink.strong_count() > 0);
+        if registrations
+            .iter()
+            .any(|registration| Weak::ptr_eq(&registration.sink, &Arc::downgrade(sink)))
+        {
+            return;
+        }
+        registrations.push(LiveChatSinkRegistration {
+            surface,
+            sink: Arc::downgrade(sink),
+            last_delivered_sequence: 0,
+        });
+    }
+
+    /// Deliver one event already committed by an app-core projector to the
+    /// currently bound surfaces for its exact Chat turn.
+    ///
+    /// The caller must first append the envelope and commit all tool detail
+    /// projections. This live registry is not a second journal: delivery
+    /// failure is reported to the caller but never changes durable state.
+    pub fn deliver_projected_event(
+        &self,
+        envelope: &ChatEventEnvelope,
+        tool_updates: &[crate::tool_execution_projection::ToolExecutionProjectionUpdate],
+    ) -> bool {
+        self.deliver_projected_event_with_status(envelope, tool_updates)
+            .all_succeeded
+    }
+
+    /// Deliver and report whether a live sink was pinned under the registry
+    /// lock. The pinned `Arc` values close the drop race before callbacks run.
+    pub fn deliver_projected_event_with_status(
+        &self,
+        envelope: &ChatEventEnvelope,
+        tool_updates: &[crate::tool_execution_projection::ToolExecutionProjectionUpdate],
+    ) -> ProjectedEventLiveDelivery {
+        let route = LiveChatSinkRoute {
+            workspace_id: envelope.workspace_id.clone(),
+            conversation_id: envelope.conversation_id.clone(),
+            root_turn_id: envelope.root_turn_id.clone(),
+        };
+        let deliveries = {
+            let mut registry = self
+                .live_sinks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(registrations) = registry.get_mut(&route) else {
+                return ProjectedEventLiveDelivery {
+                    had_live_sink: false,
+                    all_succeeded: true,
+                };
+            };
+            let mut deliveries = Vec::with_capacity(registrations.len());
+            let mut had_live_sink = false;
+            registrations.retain_mut(|registration| {
+                let Some(sink) = registration.sink.upgrade() else {
+                    return false;
+                };
+                had_live_sink = true;
+                if envelope.sequence <= registration.last_delivered_sequence {
+                    return true;
+                }
+                registration.last_delivered_sequence = envelope.sequence;
+                deliveries.push((registration.surface, sink));
+                true
+            });
+            if registrations.is_empty() {
+                registry.remove(&route);
+            }
+            (deliveries, had_live_sink)
+        };
+
+        let mut failed = Vec::new();
+        for (surface, sink) in deliveries.0 {
+            let updates_delivered = tool_updates
+                .iter()
+                .all(|update| sink.on_tool_execution_projection(update));
+            let delivered = updates_delivered && sink.on_journaled_event(envelope.clone());
+            if !delivered {
+                tracing::warn!(?surface, sequence = envelope.sequence, event_id = %envelope.event_id, "live Chat event consumer closed after durable projection");
+                failed.push(sink);
+            }
+        }
+        if failed.is_empty() {
+            return ProjectedEventLiveDelivery {
+                had_live_sink: deliveries.1,
+                all_succeeded: true,
+            };
+        }
+
+        let mut registry = self
+            .live_sinks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(registrations) = registry.get_mut(&route) {
+            registrations.retain(|registration| {
+                registration.sink.upgrade().is_some_and(|registered| {
+                    !failed.iter().any(|sink| Arc::ptr_eq(&registered, sink))
+                })
+            });
+            if registrations.is_empty() {
+                registry.remove(&route);
+            }
+        }
+        ProjectedEventLiveDelivery {
+            had_live_sink: deliveries.1,
+            all_succeeded: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn live_sink_count(&self) -> usize {
+        let mut registry = self
+            .live_sinks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        registry.retain(|_, registrations| {
+            registrations.retain(|registration| registration.sink.strong_count() > 0);
+            !registrations.is_empty()
+        });
+        registry.values().map(Vec::len).sum()
+    }
 }
 
 struct JournalOnlySink;
@@ -269,11 +443,14 @@ pub fn bind_boot_recovery_chat_sink(
     conversation_id: String,
     root_turn_id: impl Into<String>,
 ) -> Arc<dyn crate::chat_driver::ChatSink> {
-    bind_surface_chat_sink(
-        ChatSurface::BootRecovery,
+    // Boot recovery is durable projection only. Registering its JournalOnlySink
+    // as a live renderer would suppress the committed fallback used by visible
+    // surfaces while delivering the event to nobody.
+    JournaledChatSink::wrap(
         Arc::new(JournalOnlySink),
         log,
-        tool_executions,
+        Arc::new(ToolExecutionProjector::new(tool_executions, None)),
+        ChatSurface::BootRecovery,
         workspace_id,
         Some(conversation_id),
         root_turn_id,
@@ -320,6 +497,13 @@ impl crate::chat_driver::ChatSink for JournaledChatSink {
 
     fn continuation_sink(&self) -> Option<Arc<dyn crate::chat_driver::ChatSink>> {
         self.inner.continuation_sink().map(|inner| {
+            self.log.register_live_sink(
+                self.surface,
+                &inner,
+                &self.workspace_id,
+                self.conversation_id.as_deref(),
+                &self.turn_id,
+            );
             Self::wrap(
                 inner,
                 self.log.clone(),

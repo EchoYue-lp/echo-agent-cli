@@ -13,97 +13,16 @@ pub mod terminal;
 
 use echo_agent_app_core::api::{AppState, browser::BrowserRuntime};
 use state::{TauriBridgeSupervisor, TauriState};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tauri::Emitter;
-
-fn task_id_for_execution(execution_id: &str, run_id: &str) -> Option<String> {
-    let scoped = execution_id.strip_prefix(run_id)?.strip_prefix(':')?;
-    let mut parts = scoped.rsplitn(3, ':');
-    let attempt = parts.next()?;
-    let revision = parts.next()?;
-    let task_id = parts.next()?;
-    (!task_id.is_empty() && revision.parse::<u64>().is_ok() && attempt.parse::<u32>().is_ok())
-        .then(|| task_id.to_string())
-}
-
-fn emit_tool_projection_updates(
-    app: &tauri::AppHandle,
-    updates: &[echo_agent_app_core::api::tool_execution_projection::ToolExecutionProjectionUpdate],
-) {
-    use echo_agent_app_core::api::tool_execution_projection::ToolExecutionProjectionKind;
-
-    for update in updates {
-        commands::chat::emit_tool_execution_summary(
-            app,
-            match update.kind {
-                ToolExecutionProjectionKind::Started => "started",
-                ToolExecutionProjectionKind::Finished => "finished",
-            },
-            &update.agent,
-            &update.summary,
-        );
-    }
-}
-
-fn terminate_subagent_tools(
-    app: &tauri::AppHandle,
-    projector: &echo_agent_app_core::api::tool_execution_projection::ToolExecutionProjector,
-    subagent_run_id: Option<&str>,
-    status: echo_agent_app_core::api::tool_execution::ToolExecutionStatus,
-    agent: &str,
-    workspace_id: Option<&str>,
-) {
-    let (Some(subagent_run_id), Some(workspace_id)) = (subagent_run_id, workspace_id) else {
-        tracing::error!(%agent, "subagent terminal event is missing a stable execution id or workspace address");
-        return;
-    };
-    match projector.terminate_subagent(workspace_id, subagent_run_id, status, agent) {
-        Ok(updates) => emit_tool_projection_updates(app, &updates),
-        Err(error) => {
-            tracing::warn!(%error, %subagent_run_id, "failed to close orphaned subagent tools");
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OrdinarySubagentProjectionAddress {
-    workspace_id: String,
-    conversation_id: String,
-    message_id: String,
-}
-
-fn resolve_gui_subagent_projection_address(
-    foreground_turns: &echo_agent_app_core::api::foreground_turn::ForegroundTurnControl,
-    conversation_id: &str,
-    message_id: Option<&str>,
-) -> Option<OrdinarySubagentProjectionAddress> {
-    let snapshots = foreground_turns
-        .snapshots(echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui)
-        .ok()?;
-    let mut matches = snapshots.into_iter().filter(|snapshot| {
-        snapshot.conversation_id == conversation_id
-            && message_id.is_none_or(|message_id| {
-                snapshot.root_turn_id == message_id || snapshot.active_turn_id == message_id
-            })
-    });
-    let selected = matches.next()?;
-    if matches.next().is_some() {
-        return None;
-    }
-    Some(OrdinarySubagentProjectionAddress {
-        workspace_id: selected.workspace_id,
-        conversation_id: selected.conversation_id,
-        message_id: message_id.unwrap_or(&selected.root_turn_id).to_string(),
-    })
-}
-
-fn framework_subagent_event_needs_app_projection(_agent: &str, run_id: Option<&str>) -> bool {
-    run_id.is_none()
-}
 
 pub fn build_tauri_app(
     app_state: Arc<AppState>,
     browser_runtime: Arc<BrowserRuntime>,
+    subagent_projection: Arc<
+        echo_agent_app_core::api::subagent_event_projection::SubagentEnvelopeProjectionService,
+    >,
     bridge_supervisor: Arc<TauriBridgeSupervisor>,
 ) -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
@@ -115,6 +34,7 @@ pub fn build_tauri_app(
         .manage(TauriState::new(
             app_state,
             browser_runtime,
+            subagent_projection,
             bridge_supervisor,
         ))
         .invoke_handler(tauri::generate_handler![
@@ -417,6 +337,60 @@ pub fn build_tauri_app(
             });
             browser_reservation.track(browser_bridge);
 
+            let subagent_state = app.state::<TauriState>();
+            let subagent_projection = Arc::clone(&subagent_state.subagent_projection);
+            let mut subagent_events = subagent_projection.subscribe_committed();
+            let mut replayed_subagent_events =
+                VecDeque::from(subagent_projection.replay_committed());
+            let subagent_cancel = subagent_state.bridge_supervisor.cancellation_token();
+            let subagent_reservation = subagent_state.bridge_supervisor.reserve()?;
+            let subagent_app = app.handle().clone();
+            let subagent_bridge = tokio::spawn(async move {
+                let mut delivered_event_ids = HashSet::new();
+                let mut delivered_event_order = VecDeque::new();
+                loop {
+                    let event = if let Some(event) = replayed_subagent_events.pop_front() {
+                        event
+                    } else {
+                        let received = tokio::select! {
+                            _ = subagent_cancel.cancelled() => break,
+                            event = subagent_events.recv() => event,
+                        };
+                        match received {
+                            Ok(event) => event,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                                tracing::warn!(count, "committed Subagent projection bridge lagged; replaying retained commits");
+                                replayed_subagent_events
+                                    .extend(subagent_projection.replay_committed());
+                                continue;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    };
+                    if !remember_committed_event(
+                        &mut delivered_event_ids,
+                        &mut delivered_event_order,
+                        &event.envelope.event_id,
+                    ) {
+                        continue;
+                    }
+                    for update in &event.tool_updates {
+                        let event_name = match update.kind {
+                            echo_agent_app_core::api::tool_execution_projection::ToolExecutionProjectionKind::Started => "started",
+                            echo_agent_app_core::api::tool_execution_projection::ToolExecutionProjectionKind::Finished => "finished",
+                        };
+                        commands::chat::emit_tool_execution_summary(
+                            &subagent_app,
+                            event_name,
+                            &update.agent,
+                            &update.summary,
+                        );
+                    }
+                    let _ = commands::chat::emit_chat_envelope(&subagent_app, &event.envelope);
+                }
+            });
+            subagent_reservation.track(subagent_bridge);
+
             let handle = app.handle().clone();
             app.global_shortcut()
                 .on_shortcut("CmdOrCtrl+Shift+E", move |_app, _window, shortcut| {
@@ -436,603 +410,23 @@ pub fn build_tauri_app(
                     tracing::warn!(error = %e, "Global shortcut CmdOrCtrl+Shift+E registration failed (likely held by another app)");
                 });
 
-            // Subagent execution event bridge — forward every SubagentEventBus
-            // event onto the unified `execution://event` Tauri channel. The
-            // pre-unification trace/event channels and the temp-id HashMap
-            // were removed in Phase 4 of the Subagent
-            // unification; the frontend now reads exclusively from
-            // `execution://event` (keyed by the stable `execution_id` carried
-            // on the event itself, no bridge-side allocation).
-            //
-            // Do NOT forward framework `parent` (parent agent *name*) as the
-            // frontend `parent` field — that field means parent subagent_run_id
-            // for nesting. Agent-name parent would fail ParallelExecutionBlock's
-            // top-level filter and hide agent_tool cards.
-            {
-                let app_handle = app.handle().clone();
-                let state = app.state::<TauriState>();
-                let agent = state.app_state.connection.agent.clone();
-                let task_runtime_store = state.app_state.tasks.runtime.clone();
-                let tool_executions = state.app_state.storage.tool_executions.clone();
-                let tool_projector = Arc::new(
-                    echo_agent_app_core::api::tool_execution_projection::ToolExecutionProjector::new(
-                        tool_executions,
-                        task_runtime_store.clone(),
-                    ),
-                );
-                let foreground_turns = state.app_state.session.foreground_turns.clone();
-                let supervisor = state.bridge_supervisor.clone();
-                let reservation = supervisor.reserve()?;
-                let cancel = supervisor.cancellation_token();
-                let bridge = tokio::spawn(async move {
-                    let subscription = agent.read_async(|a| {
-                        Box::pin(async move { a.subagent_registry().event_bus().subscribe() })
-                    });
-                    let mut rx = tokio::select! {
-                        _ = cancel.cancelled() => return,
-                        rx = subscription => rx,
-                    };
-                    let mut usage_sequence_by_execution =
-                        std::collections::HashMap::<String, u64>::new();
-                    let mut subagent_context_by_execution = std::collections::HashMap::<
-                        String,
-                        OrdinarySubagentProjectionAddress,
-                    >::new();
-                    loop {
-                        let event = tokio::select! {
-                            _ = cancel.cancelled() => break,
-                            event = rx.recv() => event,
-                        };
-                        match event {
-                            Ok(event) => {
-                                use echo_agent::subagent::SubagentEvent;
-                                if let SubagentEvent::DispatchStarted {
-                                    execution_id: Some(execution_id),
-                                    conversation_id,
-                                    message_id,
-                                    ..
-                                } = event.as_ref()
-                                    && let Some(conversation_id) = conversation_id.as_deref()
-                                {
-                                    match resolve_gui_subagent_projection_address(
-                                        &foreground_turns,
-                                        conversation_id,
-                                        message_id.as_deref(),
-                                    ) {
-                                        Some(address) => {
-                                            subagent_context_by_execution
-                                                .insert(execution_id.clone(), address);
-                                        }
-                                        None => tracing::error!(
-                                            %execution_id,
-                                            %conversation_id,
-                                            "ordinary subagent event has no unique GUI workspace address"
-                                        ),
-                                    }
-                                }
-
-                                match event.as_ref() {
-                                    SubagentEvent::DispatchThinkingStarted { .. }
-                                    | SubagentEvent::DispatchThinkingDelta { .. }
-                                    | SubagentEvent::DispatchThinkingEnded { .. }
-                                    | SubagentEvent::DispatchTokenDelta { .. } => continue,
-                                    SubagentEvent::DispatchToolStarted {
-                                        agent,
-                                        call_id,
-                                        invocation,
-                                        execution_id,
-                                        run_id,
-                                        ..
-                                    } => {
-                                        if !framework_subagent_event_needs_app_projection(agent, run_id.as_deref()) {
-                                            continue;
-                                        }
-                                        let Some(subagent_run_id) = execution_id.as_deref() else {
-                                            tracing::error!(%call_id, name = %invocation.name, "subagent tool start is missing a stable execution id");
-                                            continue;
-                                        };
-                                        let Some(address) = subagent_context_by_execution
-                                            .get(subagent_run_id)
-                                        else {
-                                            tracing::error!(%subagent_run_id, %call_id, "subagent tool start has no workspace-qualified address");
-                                            continue;
-                                        };
-                                        match tool_projector.project_subagent_started(
-                                            echo_agent_app_core::api::tool_execution_projection::SubagentToolStart {
-                                                workspace_id: &address.workspace_id,
-                                                subagent_run_id,
-                                                conversation_id: Some(&address.conversation_id),
-                                                run_id: run_id.as_deref(),
-                                                call_id,
-                                                invocation,
-                                                agent,
-                                            },
-                                        ) {
-                                            Ok(updates) => emit_tool_projection_updates(
-                                                &app_handle,
-                                                &updates,
-                                            ),
-                                            Err(error) => {
-                                                tracing::warn!(%error, %call_id, name = %invocation.name, "failed to persist subagent tool start");
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                    SubagentEvent::DispatchToolCompleted {
-                                        agent,
-                                        call_id,
-                                        name,
-                                        result,
-                                        execution_id,
-                                        run_id,
-                                        ..
-                                    } => {
-                                        if !framework_subagent_event_needs_app_projection(agent, run_id.as_deref()) {
-                                            continue;
-                                        }
-                                        let Some(subagent_run_id) = execution_id.as_deref() else {
-                                            tracing::error!(%call_id, %name, "subagent tool result is missing a stable execution id");
-                                            continue;
-                                        };
-                                        let Some(address) = subagent_context_by_execution
-                                            .get(subagent_run_id)
-                                        else {
-                                            tracing::error!(%subagent_run_id, %call_id, "subagent tool result has no workspace-qualified address");
-                                            continue;
-                                        };
-                                        match tool_projector.project_subagent_completed(
-                                            &address.workspace_id,
-                                            subagent_run_id,
-                                            call_id,
-                                            name,
-                                            result,
-                                            agent,
-                                        ) {
-                                            Ok(updates) => emit_tool_projection_updates(
-                                                &app_handle,
-                                                &updates,
-                                            ),
-                                            Err(error) => {
-                                                tracing::warn!(%error, %call_id, "failed to persist subagent tool completion");
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                    SubagentEvent::DispatchCompleted {
-                                        execution_id,
-                                        agent,
-                                        run_id,
-                                        ..
-                                    } if framework_subagent_event_needs_app_projection(
-                                        agent,
-                                        run_id.as_deref(),
-                                    ) => {
-                                        terminate_subagent_tools(
-                                            &app_handle,
-                                            &tool_projector,
-                                            execution_id.as_deref(),
-                                            echo_agent_app_core::api::tool_execution::ToolExecutionStatus::Unknown,
-                                            agent,
-                                            execution_id
-                                                .as_deref()
-                                                .and_then(|execution_id| subagent_context_by_execution.get(execution_id))
-                                                .map(|address| address.workspace_id.as_str()),
-                                        );
-                                    }
-                                    SubagentEvent::DispatchFailed {
-                                        execution_id,
-                                        agent,
-                                        status,
-                                        run_id,
-                                        ..
-                                    } if framework_subagent_event_needs_app_projection(
-                                        agent,
-                                        run_id.as_deref(),
-                                    ) => {
-                                        let tool_status = match *status {
-                                            echo_agent::subagent::SubagentStatus::Cancelled => {
-                                                echo_agent_app_core::api::tool_execution::ToolExecutionStatus::Cancelled
-                                            }
-                                            echo_agent::subagent::SubagentStatus::TimedOut => {
-                                                echo_agent_app_core::api::tool_execution::ToolExecutionStatus::TimedOut
-                                            }
-                                            echo_agent::subagent::SubagentStatus::Completed
-                                            | echo_agent::subagent::SubagentStatus::Failed => {
-                                                echo_agent_app_core::api::tool_execution::ToolExecutionStatus::Unknown
-                                            }
-                                            // A failed terminal event should never carry Running,
-                                            // but keep the bridge exhaustive and fail-safe if it does.
-                                            echo_agent::subagent::SubagentStatus::Running => {
-                                                echo_agent_app_core::api::tool_execution::ToolExecutionStatus::Unknown
-                                            }
-                                        };
-                                        terminate_subagent_tools(
-                                            &app_handle,
-                                            &tool_projector,
-                                            execution_id.as_deref(),
-                                            tool_status,
-                                            agent,
-                                            execution_id
-                                                .as_deref()
-                                                .and_then(|execution_id| subagent_context_by_execution.get(execution_id))
-                                                .map(|address| address.workspace_id.as_str()),
-                                        );
-                                    }
-                                    SubagentEvent::DispatchCancelled {
-                                        execution_id,
-                                        agent,
-                                        run_id,
-                                        ..
-                                    } if framework_subagent_event_needs_app_projection(
-                                        agent,
-                                        run_id.as_deref(),
-                                    ) => {
-                                        terminate_subagent_tools(
-                                            &app_handle,
-                                            &tool_projector,
-                                            execution_id.as_deref(),
-                                            echo_agent_app_core::api::tool_execution::ToolExecutionStatus::Cancelled,
-                                            agent,
-                                            execution_id
-                                                .as_deref()
-                                                .and_then(|execution_id| subagent_context_by_execution.get(execution_id))
-                                                .map(|address| address.workspace_id.as_str()),
-                                        );
-                                    }
-                                    _ => {}
-                                }
-                                let (event_type, execution_id, run_id, agent_name, extra) =
-                                    match event.as_ref() {
-                                        SubagentEvent::DispatchStarted { agent, run_id, .. }
-                                        | SubagentEvent::DispatchIsolationObserved { agent, run_id, .. }
-                                        | SubagentEvent::DispatchCompleted { agent, run_id, .. }
-                                        | SubagentEvent::DispatchFailed { agent, run_id, .. }
-                                        | SubagentEvent::DispatchCancelled { agent, run_id, .. }
-                                            if !framework_subagent_event_needs_app_projection(
-                                                agent,
-                                                run_id.as_deref(),
-                                            ) =>
-                                        {
-                                            continue;
-                                        }
-                                        SubagentEvent::DispatchStarted {
-                                            parent: _,
-                                            agent,
-                                            mode,
-                                            task,
-                                            execution_id,
-                                            run_id,
-                                            conversation_id,
-                                            message_id,
-                                            background,
-                                        } => (
-                                            "started",
-                                            execution_id.clone(),
-                                            run_id.clone(),
-                                            agent.clone(),
-                                            serde_json::json!({
-                                                "mode": format!("{:?}", mode),
-                                                "task": task.clone(),
-                                                "conversation_id": conversation_id.clone(),
-                                                "message_id": message_id.clone(),
-                                                "background": background,
-                                            }),
-                                        ),
-                                        SubagentEvent::DispatchIsolationObserved {
-                                            parent: _,
-                                            agent,
-                                            isolation,
-                                            execution_id,
-                                            run_id,
-                                        } => (
-                                            "isolation_observed",
-                                            execution_id.clone(),
-                                            run_id.clone(),
-                                            agent.clone(),
-                                            serde_json::json!({
-                                                "isolation_observed": isolation.as_str(),
-                                            }),
-                                        ),
-                                        SubagentEvent::DispatchCompleted {
-                                            parent: _,
-                                            agent,
-                                            duration_ms,
-                                            tokens_used,
-                                            iterations,
-                                            output,
-                                            outcome,
-                                            execution_id,
-                                            run_id,
-                                        } => {
-                                            (
-                                                "completed",
-                                                execution_id.clone(),
-                                                run_id.clone(),
-                                                agent.clone(),
-                                                serde_json::json!({
-                                                    "duration_ms": duration_ms,
-                                                    "tokens_used": tokens_used,
-                                                    "iteration_count": iterations,
-                                                    "output": output.clone(),
-                                                    "terminal_status": outcome.status.as_str(),
-                                                    "contract_version": outcome.contract_version,
-                                                    "summary": outcome.summary.clone(),
-                                                    "artifacts": outcome.artifacts.clone(),
-                                                    "verification": outcome.verification(),
-                                                    "remaining_work": outcome.remaining_work.clone(),
-                                                    "touched_files": outcome.touched_files(),
-                                                }),
-                                            )
-                                        },
-                                        SubagentEvent::DispatchFailed {
-                                            parent: _,
-                                            agent,
-                                            error,
-                                            status,
-                                            outcome,
-                                            execution_id,
-                                            run_id,
-                                        } => {
-                                            (
-                                                status.as_str(),
-                                                execution_id.clone(),
-                                                run_id.clone(),
-                                                agent.clone(),
-                                                serde_json::json!({
-                                                    "error": error.clone(),
-                                                    "terminal_status": status.as_str(),
-                                                    "contract_version": outcome.contract_version,
-                                                    "summary": outcome.summary.clone(),
-                                                    "artifacts": outcome.artifacts.clone(),
-                                                    "verification": outcome.verification(),
-                                                    "remaining_work": outcome.remaining_work.clone(),
-                                                    "touched_files": outcome.touched_files(),
-                                                }),
-                                            )
-                                        },
-                                        SubagentEvent::DispatchCancelled {
-                                            parent: _,
-                                            agent,
-                                            outcome,
-                                            execution_id,
-                                            run_id,
-                                        } => {
-                                            (
-                                                "cancelled",
-                                                execution_id.clone(),
-                                                run_id.clone(),
-                                                agent.clone(),
-                                                serde_json::json!({
-                                                    "terminal_status": outcome.status.as_str(),
-                                                    "contract_version": outcome.contract_version,
-                                                    "summary": outcome.summary.clone(),
-                                                    "artifacts": outcome.artifacts.clone(),
-                                                    "verification": outcome.verification(),
-                                                    "remaining_work": outcome.remaining_work.clone(),
-                                                    "touched_files": outcome.touched_files(),
-                                                }),
-                                            )
-                                        },
-                                        SubagentEvent::DispatchThinkingStarted { .. }
-                                        | SubagentEvent::DispatchThinkingDelta { .. }
-                                        | SubagentEvent::DispatchThinkingEnded { .. }
-                                        | SubagentEvent::DispatchTokenDelta { .. }
-                                        | SubagentEvent::DispatchToolStarted { .. }
-                                        | SubagentEvent::DispatchToolCompleted { .. } => continue,
-                                        SubagentEvent::DispatchLlmUsage {
-                                            parent: _,
-                                            agent,
-                                            model,
-                                            prompt_tokens,
-                                            completion_tokens,
-                                            total_tokens,
-                                            cached_prompt_tokens,
-                                            cache_creation_prompt_tokens,
-                                            usage_reported,
-                                            execution_id,
-                                            run_id,
-                                        } => {
-                                            let usage_key = execution_id.clone().unwrap_or_else(|| {
-                                                format!(
-                                                    "{}:{}",
-                                                    run_id.as_deref().unwrap_or("unknown-run"),
-                                                    agent
-                                                )
-                                            });
-                                            let sequence = usage_sequence_by_execution
-                                                .entry(usage_key.clone())
-                                                .or_insert(0);
-                                            *sequence = sequence.saturating_add(1);
-                                            let usage_event_id =
-                                                format!("{usage_key}:usage:{sequence}");
-                                            (
-                                                "usage",
-                                                execution_id.clone(),
-                                                run_id.clone(),
-                                                agent.clone(),
-                                                serde_json::json!({
-                                                    "model": model.clone(),
-                                                    "prompt_tokens": prompt_tokens,
-                                                    "completion_tokens": completion_tokens,
-                                                    "total_tokens": total_tokens,
-                                                    "cached_prompt_tokens": cached_prompt_tokens,
-                                                    "cache_creation_prompt_tokens":
-                                                        cache_creation_prompt_tokens,
-                                                    "usage_reported": usage_reported,
-                                                    "usage_event_id": usage_event_id,
-                                                }),
-                                            )
-                                        }
-                                        // Registered/Unregistered/Team* are not
-                                        // execution-flow events; skip them.
-                                        _ => continue,
-                                    };
-                                let mut payload = serde_json::Map::new();
-                                payload.insert("kind".into(), "subagent".into());
-                                // `task_id` identifies the stable plan node, while
-                                // `subagent_run_id` identifies this concrete attempt.
-                                // Keeping `{run_id}:{task_id}:{plan_revision}:{attempt}` intact
-                                // prevents late events from an older spec or retry
-                                // overwriting newer lifecycle, usage, or terminal data.
-                                let task_id_owned: Option<String> =
-                                    execution_id.as_deref().and_then(|execution_id| {
-                                        run_id.as_deref().and_then(|run_id| {
-                                            task_id_for_execution(execution_id, run_id)
-                                        })
-                                    });
-                                let subagent_run_id_owned: String = execution_id
-                                    .clone()
-                                    .unwrap_or_else(|| format!("{agent_name}:unknown"));
-                                let ordinary_address = if run_id.is_none() {
-                                    match subagent_context_by_execution.get(&subagent_run_id_owned) {
-                                        Some(address) => Some(address),
-                                        None => {
-                                            tracing::error!(%subagent_run_id_owned, "ordinary subagent event has no workspace-qualified address");
-                                            continue;
-                                        }
-                                    }
-                                } else {
-                                    None
-                                };
-                                let task_id = task_id_owned.as_deref();
-                                if let Some(task_id) = task_id {
-                                    payload.insert("task_id".into(), task_id.into());
-                                }
-                                payload.insert(
-                                    "subagent_run_id".into(),
-                                    subagent_run_id_owned.clone().into(),
-                                );
-                                if let Some(run_id) = run_id.as_deref() {
-                                    payload.insert("run_id".into(), run_id.into());
-                                    if let Some(store) = task_runtime_store.as_ref()
-                                    {
-                                        let lookup_run_id = run_id.to_string();
-                                        if let Ok(Some(run)) = echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeOperation::new(store.clone())
-                                            .run_store("project Tauri TaskRun identity", move |store| store.get_run(&lookup_run_id))
-                                            .await
-                                        {
-                                            payload.insert(
-                                                "conversation_id".into(),
-                                                run.conversation_id.into(),
-                                            );
-                                            payload.insert(
-                                                "message_id".into(),
-                                                run.root_message_id.into(),
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    payload.insert("run_id".into(), String::new().into());
-                                }
-                                if let Some(address) = ordinary_address {
-                                    payload.insert(
-                                        "workspace_id".into(),
-                                        address.workspace_id.clone().into(),
-                                    );
-                                    payload.insert(
-                                        "conversation_id".into(),
-                                        address.conversation_id.clone().into(),
-                                    );
-                                    payload.insert(
-                                        "message_id".into(),
-                                        address.message_id.clone().into(),
-                                    );
-                                }
-                                payload.insert("agent".into(), agent_name.into());
-                                payload.insert("event".into(), event_type.into());
-                                if let serde_json::Value::Object(map) = extra {
-                                    for (k, v) in map {
-                                        payload.insert(k, v);
-                                    }
-                                }
-                                let _ = app_handle
-                                    .emit("execution://event", serde_json::Value::Object(payload));
-                                if matches!(
-                                    event_type,
-                                    "completed" | "failed" | "cancelled" | "timed_out"
-                                ) {
-                                    subagent_context_by_execution.remove(&subagent_run_id_owned);
-                                    usage_sequence_by_execution.remove(&subagent_run_id_owned);
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::warn!("Subagent event receiver lagged by {} events", n);
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                });
-                reservation.track(bridge);
-            }
-
             Ok(())
         })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        framework_subagent_event_needs_app_projection, resolve_gui_subagent_projection_address,
-        task_id_for_execution,
-    };
-
-    #[test]
-    fn task_runtime_subagent_tools_have_only_the_exec_event_projector() {
-        assert!(!framework_subagent_event_needs_app_projection(
-            "explorer",
-            Some("run-1")
-        ));
-        assert!(framework_subagent_event_needs_app_projection(
-            "explorer", None
-        ));
+fn remember_committed_event(
+    seen: &mut HashSet<String>,
+    order: &mut VecDeque<String>,
+    event_id: &str,
+) -> bool {
+    if !seen.insert(event_id.to_string()) {
+        return false;
     }
-
-    #[test]
-    fn execution_attempt_keeps_full_identity_and_extracts_only_the_task_join_key() {
-        let execution_id = "run-1:phase:task-1:7:2";
-        assert_eq!(
-            task_id_for_execution(execution_id, "run-1").as_deref(),
-            Some("phase:task-1")
-        );
-        assert_eq!(execution_id, "run-1:phase:task-1:7:2");
-        assert!(task_id_for_execution("phase:task-1", "run-1").is_none());
-        assert!(task_id_for_execution("run-2:phase:task-1:7:2", "run-1").is_none());
+    order.push_back(event_id.to_string());
+    while order.len() > 2048 {
+        if let Some(retired) = order.pop_front() {
+            seen.remove(&retired);
+        }
     }
-
-    #[test]
-    fn ordinary_subagent_address_is_resolved_from_exact_gui_turn() -> Result<(), String> {
-        use echo_agent_app_core::api::foreground_turn::{
-            ForegroundTurnControl, ForegroundTurnSurface,
-        };
-
-        let control = ForegroundTurnControl::default();
-        let _workspace_a = control
-            .begin_scoped(
-                "workspace-a",
-                ForegroundTurnSurface::Gui,
-                "conversation-1",
-                "message-a",
-            )
-            .map_err(|error| error.to_string())?;
-        let _workspace_b = control
-            .begin_scoped(
-                "workspace-b",
-                ForegroundTurnSurface::Gui,
-                "conversation-1",
-                "message-b",
-            )
-            .map_err(|error| error.to_string())?;
-
-        assert!(
-            resolve_gui_subagent_projection_address(&control, "conversation-1", None).is_none(),
-            "conversation-only resolution must reject cross-workspace ambiguity"
-        );
-        let resolved =
-            resolve_gui_subagent_projection_address(&control, "conversation-1", Some("message-b"))
-                .ok_or_else(|| "exact GUI turn did not resolve a workspace address".to_string())?;
-        assert_eq!(resolved.workspace_id, "workspace-b");
-        assert_eq!(resolved.conversation_id, "conversation-1");
-        assert_eq!(resolved.message_id, "message-b");
-        Ok(())
-    }
+    true
 }

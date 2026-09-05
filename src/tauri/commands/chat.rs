@@ -18,7 +18,8 @@ use echo_agent_app_core::api::conversation_input::{
     ConversationInputProjection, ConversationInputReceipt, ConversationInputSource,
     stable_scoped_input_id,
 };
-use echo_agent_app_core::api::tasks::task_runtime::executor::{ExecEvent, ExecEventScope};
+use echo_agent_app_core::api::subagent_event_projection::JournaledExecutionProjector;
+use echo_agent_app_core::api::tasks::task_runtime::executor::ExecEvent;
 use echo_agent_app_core::api::tool_execution::{ToolExecutionRepository, ToolExecutionSummary};
 use echo_agent_app_core::api::tool_execution_projection::{
     ToolExecutionProjectionKind, ToolExecutionProjectionUpdate, ToolExecutionProjector,
@@ -1840,24 +1841,24 @@ pub async fn send_selection_response(
     }
 }
 
-/// Projects app-owned TaskRuntime tool events into the same durable repository
-/// and `kind=tool` channel used by ordinary chat and framework Subagents.
+/// Commits app-owned TaskRuntime events to the canonical chat journal before
+/// publishing them, then derives the same tool detail used by every surface.
 pub(crate) struct TauriExecutionProjector {
     app: Option<tauri::AppHandle>,
-    projector: Arc<ToolExecutionProjector>,
+    projector: Arc<JournaledExecutionProjector>,
 }
 
 impl TauriExecutionProjector {
     pub(crate) fn new(
         app: tauri::AppHandle,
         tool_executions: Arc<ToolExecutionRepository>,
-        task_runtime_store: Option<
-            Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
-        >,
+        chat_events: Arc<ChatEventLog>,
+        task_runtime_store: Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
     ) -> Self {
         Self {
             app: Some(app),
-            projector: Arc::new(ToolExecutionProjector::new(
+            projector: Arc::new(JournaledExecutionProjector::new(
+                chat_events,
                 tool_executions,
                 task_runtime_store,
             )),
@@ -1865,29 +1866,29 @@ impl TauriExecutionProjector {
     }
 
     pub(crate) fn emit(&self, event: ExecEvent) {
-        match self.projector.project_execution_event(&event) {
-            Ok(updates) => {
-                self.emit_updates(&updates);
+        match self.projector.project(event) {
+            Ok(projected) => {
+                self.emit_updates(&projected.tool_updates);
+                if let Some(app) = self.app.as_ref() {
+                    let _ = emit_chat_envelope(app, &projected.envelope);
+                }
             }
             Err(error) => {
-                tracing::error!(%error, run_id = %event.run_id, event = ?event.event, "failed to project canonical TaskRuntime tool event");
+                tracing::error!(%error, "failed to commit TaskRuntime execution event");
             }
-        }
-        if let Some(app) = self.app.as_ref() {
-            emit_tauri_execution_event(app, event);
         }
     }
 
     #[cfg(test)]
     fn without_app(
+        chat_events: Arc<ChatEventLog>,
         tool_executions: Arc<ToolExecutionRepository>,
-        task_runtime_store: Option<
-            Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
-        >,
+        task_runtime_store: Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
     ) -> Self {
         Self {
             app: None,
-            projector: Arc::new(ToolExecutionProjector::new(
+            projector: Arc::new(JournaledExecutionProjector::new(
+                chat_events,
                 tool_executions,
                 task_runtime_store,
             )),
@@ -1920,7 +1921,6 @@ impl TauriExecutionProjector {
 /// turn (normal reply + any complex runs the agent autonomously spins up via
 /// `create_complex_task`) flows through one unified `drive_chat`.
 struct TauriChatSink {
-    app: Option<tauri::AppHandle>,
     emit_envelope: Arc<dyn Fn(&ChatEventEnvelope) -> bool + Send + Sync>,
     emit_tool_projection: Arc<dyn Fn(&ToolExecutionProjectionUpdate) -> bool + Send + Sync>,
 }
@@ -1936,7 +1936,6 @@ pub(crate) fn tauri_chat_sink(
     let envelope_app = app.clone();
     let projection_app = app.clone();
     let renderer = Arc::new(TauriChatSink {
-        app: Some(app),
         emit_envelope: Arc::new(move |envelope| emit_chat_envelope(&envelope_app, envelope)),
         emit_tool_projection: Arc::new(move |update| {
             let event_name = match update.kind {
@@ -1969,7 +1968,6 @@ impl TauriChatSink {
         emit_tool_projection: Arc<dyn Fn(&ToolExecutionProjectionUpdate) -> bool + Send + Sync>,
     ) -> Self {
         Self {
-            app: None,
             emit_envelope,
             emit_tool_projection,
         }
@@ -1990,11 +1988,6 @@ impl echo_agent_app_core::api::chat_driver::ChatSink for TauriChatSink {
     }
 
     fn on_journaled_event(&self, envelope: ChatEventEnvelope) -> bool {
-        if let ChatDriverEvent::Execution(event) = &envelope.payload
-            && let Some(app) = self.app.as_ref()
-        {
-            emit_tauri_execution_event(app, event.clone());
-        }
         (self.emit_envelope)(&envelope)
     }
 
@@ -2660,41 +2653,6 @@ mod chat_sink_contract_tests {
     }
 }
 
-fn emit_tauri_execution_event(app: &tauri::AppHandle, event: ExecEvent) {
-    let ExecEvent {
-        workspace_id,
-        conversation_id,
-        run_id,
-        scope,
-        task_id,
-        subagent_run_id,
-        event,
-        agent,
-        mut payload,
-    } = event;
-    let kind = match scope {
-        ExecEventScope::Run => "run",
-        ExecEventScope::Task => "task",
-        ExecEventScope::Subagent => "subagent",
-    };
-    if let (Some(task_id), serde_json::Value::Object(fields)) = (&task_id, &mut payload) {
-        fields.insert("task_id".into(), task_id.clone().into());
-    }
-    emit_execution_event(
-        app,
-        ExecutionEventProjection {
-            workspace_id: &workspace_id,
-            conversation_id: &conversation_id,
-            run_id: &run_id,
-            kind,
-            event: event.as_str(),
-            agent: agent.as_deref().unwrap_or("echo-assistant"),
-            subagent_run_id: subagent_run_id.as_deref().unwrap_or(""),
-            payload,
-        },
-    );
-}
-
 #[cfg(test)]
 mod hitl_pending_tests {
     use super::*;
@@ -2793,7 +2751,11 @@ mod execution_projector_tests {
     fn task_runtime_tools_preserve_canonical_result_and_unknown_orphan_status()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = TestDir::new()?;
-        let repository = Arc::new(ToolExecutionRepository::open(temp.path())?);
+        let repository = Arc::new(ToolExecutionRepository::open(temp.path().join("tools"))?);
+        let chat_events = Arc::new(ChatEventLog::open(
+            temp.path().join("chat-events"),
+            echo_agent_app_core::api::chat_event_log::ChatEventRetention::default(),
+        )?);
         let runtime = Arc::new(TaskRuntimeStore::new_in_memory()?);
         runtime.create_run(
             "run-1",
@@ -2805,8 +2767,11 @@ mod execution_projector_tests {
             "formal_plan",
             AttendedMode::Attended,
         )?;
-        let projector =
-            TauriExecutionProjector::without_app(repository.clone(), Some(runtime.clone()));
+        let projector = TauriExecutionProjector::without_app(
+            chat_events.clone(),
+            repository.clone(),
+            runtime.clone(),
+        );
         let execution_id = "run-1:task-1:1:1";
 
         projector.emit(
@@ -2923,6 +2888,13 @@ mod execution_projector_tests {
             .find(|summary| summary.call_id == "call-2")
             .ok_or_else(|| "missing orphaned tool summary".to_string())?;
         assert_eq!(orphaned.status, ToolExecutionStatus::Unknown);
+        assert_eq!(
+            chat_events
+                .replay("workspace-1", Some("conversation-1"), "message-1", 0)?
+                .events
+                .len(),
+            5
+        );
         Ok(())
     }
 }

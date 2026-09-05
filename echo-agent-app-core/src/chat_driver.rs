@@ -50,11 +50,11 @@ pub struct ChatAttachmentDescriptor {
     pub source: crate::types::AttachmentSource,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "source", content = "event", rename_all = "snake_case")]
 pub enum ChatDriverEvent {
     Agent(Box<EventEnvelope>),
-    Execution(ExecEvent),
+    Execution(Box<ExecEvent>),
     TurnStatus {
         status: String,
     },
@@ -168,7 +168,7 @@ pub fn subagent_trace_sink_for(
 ) -> crate::tasks::task_runtime::task_tools::TraceSink {
     let sink = std::sync::Arc::clone(sink);
     std::sync::Arc::new(move |event| {
-        let _ = sink.on_event(ChatDriverEvent::Execution(event));
+        let _ = sink.on_event(ChatDriverEvent::Execution(Box::new(event)));
     })
 }
 
@@ -178,7 +178,7 @@ pub fn framework_trace_sink_for(sink: &std::sync::Arc<dyn ChatSink>) -> TraceSin
     std::sync::Arc::new(
         move |value| match serde_json::from_value::<ExecEvent>(value) {
             Ok(event) => {
-                let _ = sink.on_event(ChatDriverEvent::Execution(event));
+                let _ = sink.on_event(ChatDriverEvent::Execution(Box::new(event)));
             }
             Err(error) => {
                 tracing::warn!(%error, "invalid TaskRuntime trace event");
@@ -1751,7 +1751,7 @@ mod tests {
                 )
                 .map_err(|error| error.to_string())?,
             )),
-            ChatDriverEvent::Execution(ExecEvent::subagent(
+            ChatDriverEvent::Execution(Box::new(ExecEvent::subagent(
                 "workspace-1",
                 "conversation-1",
                 "run-1",
@@ -1768,7 +1768,7 @@ mod tests {
                         "available": true
                     }
                 }),
-            )),
+            ))),
             ChatDriverEvent::TurnStatus {
                 status: "completed".to_string(),
             },

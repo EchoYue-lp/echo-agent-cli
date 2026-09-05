@@ -89,6 +89,40 @@ The process-level services are:
   product-owned configuration, browser events, and extension mutation policy.
 - `WorkflowService` and `StructuredExtractionService` for EKO catalog and
   surface adapters while framework owns graph and extraction execution.
+- `SubagentEnvelopeProjectionService` for the single shared framework
+  `SubagentEventBus` subscription, exact EKO addressing, ChatEventLog commit,
+  gap reconciliation, and surface-neutral live publication.
+
+### Subagent execution projection
+
+All bootstrap, pooled conversation, and workspace Agents share one framework
+`SubagentEventBus`. App-core consumes only its versioned envelope stream. It
+resolves formal events through the TaskRuntime owner registry and run-less
+events through an exact active foreground turn; current workspace focus and
+execution-id string formats are never identity inputs.
+
+The process Subagent admission is installed during Agent construction or
+post-bootstrap task-tool registration. TaskRuntime does not reacquire an Agent
+write lease from inside `task_execute`, which may already run under that Agent's
+outer ReAct write owner.
+
+The app-core projector retains framework event metadata on generated
+`ExecEvent`, appends the event to the existing `ChatEventLog`, and invokes the
+existing tool detail projector. Sequence jumps use framework replay; an
+unrecoverable transient suffix becomes `subagent_stream_gap`, while retained
+terminal data still reconciles the final outcome. Recovery scans retained,
+active, and known streams; an active publisher's dispatch-start anchor preserves
+address identity after full replay eviction. Tool detail failures are retried
+from the already-committed event and remain rebuildable from ChatEventLog.
+Active GUI/TUI/CLI/channel
+sinks receive the committed event through the journal's weak live registry;
+background GUI, TUI, and REPL delivery uses the committed projection stream and
+its bounded late-subscriber/lag replay. Request-scoped channels replay execution
+events from the durable conversation cursor on their next response. Live and
+replay therefore share the same `ChatDriverEvent::Execution` payload.
+
+Tauri and TUI do not subscribe to raw Subagent events. Tauri publishes committed
+chat envelopes and tool summaries only. See [ADR 0040](../adr/0040-app-core-subagent-event-projection.md).
 
 ## Workspace Runtime
 

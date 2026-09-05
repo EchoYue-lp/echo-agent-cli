@@ -254,6 +254,15 @@ pub struct AgentModelConsumers {
 }
 
 impl AgentModelConsumers {
+    /// Return the framework event transport owned by this Agent generation.
+    ///
+    /// EKO clones this handle into every pooled and workspace Agent so one
+    /// application subscriber observes all Subagent attempts without creating
+    /// a parallel event bus.
+    pub(crate) fn subagent_event_bus(&self) -> echo_agent::subagent::SubagentEventBus {
+        self.registry.event_bus().clone()
+    }
+
     pub(crate) fn subagent_catalog(
         &self,
     ) -> Arc<crate::subagent_loader::SubagentCatalogSnapshot> {
@@ -567,6 +576,25 @@ pub async fn create_agent_with_diagnostics(
     params: &AgentCreateParams,
     app_config: &EkoConfig,
 ) -> std::result::Result<CreatedAgent, String> {
+    create_agent_with_diagnostics_and_event_bus(
+        params,
+        app_config,
+        echo_agent::subagent::SubagentEventBus::new(),
+    )
+    .await
+}
+
+/// Create an Agent on an application-owned Subagent event transport.
+///
+/// The public factory intentionally starts an independent transport for
+/// standalone embedders. AgentPool uses this crate-private entry point so the
+/// bootstrap primary, pooled conversations, and workspace forks share one
+/// framework bus.
+pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
+    params: &AgentCreateParams,
+    app_config: &EkoConfig,
+    subagent_event_bus: echo_agent::subagent::SubagentEventBus,
+) -> std::result::Result<CreatedAgent, String> {
     // EKO can boot before the user configures a provider. An explicit selector
     // must still resolve, while an absent selector leaves the Agent detached
     // from LLM transport until the first model mutation is published.
@@ -675,7 +703,9 @@ pub async fn create_agent_with_diagnostics(
         command_cell_runtime.scoped(execution_scope.clone(), params.task_runtime_store.clone());
     let subagent_prompt_compiler: Arc<dyn SubagentPromptCompiler> =
         Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler);
-    let subagent_registry = Arc::new(echo_agent::subagent::SubagentRegistry::new());
+    let subagent_registry = Arc::new(echo_agent::subagent::SubagentRegistry::with_event_bus(
+        subagent_event_bus,
+    ));
     let run_code_available = sandbox_manager.has_local_os_sandbox().await;
     if !run_code_available {
         tracing::warn!("OS sandbox unavailable; run_code will be disabled for this EKO runtime");
@@ -958,6 +988,14 @@ pub async fn create_agent_with_diagnostics(
         command_cell_runtime.clone(),
         execution_scope,
     );
+    // Bind EKO's process-wide Subagent ceiling while the Agent is still
+    // exclusively owned. Mutating it from inside task_execute would re-enter
+    // the outer ReAct turn's AgentHandle write lock.
+    agent
+        .set_subagent_admission(
+            crate::tasks::task_runtime::executor::process_subagent_admission(),
+        )
+        .await;
 
     // Register default hooks
     register_default_hooks(&mut agent);

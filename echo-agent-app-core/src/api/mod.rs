@@ -181,6 +181,9 @@ pub mod state {
 pub mod structured_extraction {
     pub use crate::structured_extraction::*;
 }
+pub mod subagent_event_projection {
+    pub use crate::subagent_event_projection::*;
+}
 pub mod subagent_loader {
     pub use crate::subagent_loader::*;
 }

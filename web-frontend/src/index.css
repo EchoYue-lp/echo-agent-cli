@@ -27,23 +27,23 @@
 
 /* ============================================================================
  * LIGHT THEME — calm desktop agent
- * Near-white work canvas, mist-blue side chrome, quiet blue accent.
+ * Near-white work canvas, neutral side chrome, quiet blue accent.
  * ========================================================================== */
 :root {
   --bg-primary: #ffffff;
-  --bg-secondary: #f4f7f8;
-  --bg-chat: #fbfcfd;
-  --bg-hover: #edf3f5;
+  --bg-secondary: #f5f6f7;
+  --bg-chat: #ffffff;
+  --bg-hover: #eceef0;
   --bg-input: #ffffff;
   --bg-user-msg: #2563eb;
   --bg-user-bubble: #eaf1fe; /* soft accent wash for the user prompt row */
   --bg-assistant-msg: transparent;
   --bg-code: #111827;
   --bg-code-header: #1f2937;
-  --bg-sidebar: #e9f3f5;
-  --bg-sidebar-hover: #dfecef;
-  --bg-sidebar-active: #d5e4e8;
-  --bg-rail: #fbfcfd;
+  --bg-sidebar: #f3f4f5;
+  --bg-sidebar-hover: #e9ebed;
+  --bg-sidebar-active: #dfe2e5;
+  --bg-rail: #ffffff;
   --bg-overlay: rgba(15, 23, 42, 0.42);
 
   --text-primary: #20252b;
@@ -56,25 +56,25 @@
   --text-assistant-msg: #20252b;
   --text-link: #1d4ed8;
 
-  --border-primary: #dce5e8;
-  --border-secondary: #edf2f4;
+  --border-primary: #dfe2e5;
+  --border-secondary: #eceef0;
   --border-focus: #3b82f6;
 
   --accent: #2563eb;
   --accent-light: #60a5fa;
   --accent-bg: #e8f0ff;
-  --action-soft: #eef5f7;
-  --action-soft-hover: #ddebef;
+  --action-soft: #f1f2f3;
+  --action-soft-hover: #e5e7e9;
   --action-run: #5db872; /* run = success green */
   --action-run-hover: #4aa35f;
   --action-run-bg: #e8f3ea;
   --text-on-run: #ffffff;
 
-  --settings-dialog-bg: #f7fafb;
-  --settings-sidebar-bg: #e9f3f5;
-  --settings-content-bg: #fbfcfd;
+  --settings-dialog-bg: #f7f8f9;
+  --settings-sidebar-bg: #f1f2f3;
+  --settings-content-bg: #ffffff;
   --settings-panel-bg: #ffffff;
-  --settings-active-bg: #dfecef;
+  --settings-active-bg: #e2e4e6;
   --settings-accent: #2563eb;
   --settings-accent-bg: #e8f0ff;
   --settings-text-on-accent: #ffffff;

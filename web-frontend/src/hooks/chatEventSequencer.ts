@@ -49,8 +49,13 @@ export class ChatEventSequencer {
       const envelope = pending.get(next);
       pending.delete(next);
       if (envelope) {
+        const terminalTurnStatus =
+          envelope.payload.source === 'turn_status' &&
+          ['completed', 'failed', 'cancelled'].includes(envelope.payload.event.status);
         if (
           envelope.payload.source === 'input_lifecycle' ||
+          envelope.payload.source === 'execution' ||
+          terminalTurnStatus ||
           shouldProjectTurn(envelope.stream_id, envelope.turn_id)
         ) {
           apply(envelope);

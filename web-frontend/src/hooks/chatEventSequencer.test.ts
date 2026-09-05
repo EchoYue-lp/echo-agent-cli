@@ -122,4 +122,45 @@ describe('ChatEventSequencer', () => {
     ]);
     expect(sequencer.cursor('conversation:one')).toBe(5);
   });
+
+  it('keeps continuation execution and its root terminal visible across turn ids', () => {
+    const sequencer = new ChatEventSequencer();
+    const projected: Array<[number, string]> = [];
+    const apply = (event: ChatEventEnvelope) =>
+      projected.push([event.sequence, event.payload.source]);
+    const execution = {
+      ...turnEnvelope(2, 'continuation-turn'),
+      root_turn_id: 'root-turn',
+      message_id: 'root-turn',
+      payload: {
+        source: 'execution',
+        event: {
+          workspace_id: 'workspace-1',
+          conversation_id: 'one',
+          run_id: '',
+          scope: 'subagent',
+          task_id: null,
+          subagent_run_id: 'execution-1',
+          event: 'token_delta',
+          agent: 'explorer',
+          payload: { content: 'working' },
+          framework_event: null,
+        },
+      },
+    } as ChatEventEnvelope;
+    const rootTerminal = {
+      ...turnEnvelope(3, 'root-turn'),
+      payload: { source: 'turn_status', event: { status: 'completed' } },
+    } as ChatEventEnvelope;
+
+    sequencer.ingest(turnEnvelope(1, 'root-turn'), apply);
+    sequencer.ingest(execution, apply);
+    sequencer.ingest(rootTerminal, apply);
+
+    expect(projected).toEqual([
+      [1, 'turn_status'],
+      [2, 'execution'],
+      [3, 'turn_status'],
+    ]);
+  });
 });

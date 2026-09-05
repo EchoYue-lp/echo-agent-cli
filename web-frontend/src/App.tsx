@@ -1,8 +1,8 @@
 import { useCallback, useState, useMemo, useEffect } from 'react';
 import { AppLayout } from './components/layout/AppLayout';
 import { LeftSidebar } from './components/layout/LeftSidebar';
-import { RightWorkspace } from './components/layout/RightWorkspace';
-import { ChatPanel } from './components/chat/ChatPanel';
+import { ContextPane } from './components/layout/ContextPane';
+import { PrimaryWorkspace } from './components/layout/PrimaryWorkspace';
 import { SettingsDialog } from './components/layout/SettingsDialog';
 import { InterruptPromptDialog } from './components/task/TaskRuntimePanel';
 import { ToastContainer } from './components/common/Toast';
@@ -17,6 +17,8 @@ import { useWorkspaceStore } from './stores/workspaceStore';
 import { useTaskRuntimeStore } from './stores/taskRuntimeStore';
 import { RequireAuth } from './components/Auth/RequireAuth';
 import { workspaceIdForView } from './lib/viewAddress';
+import { useContextPaneStore } from './stores/contextPaneStore';
+import { useWorkspaceViewStore } from './stores/workspaceViewStore';
 
 function App() {
   const initConversations = useConversationStore((s) => s.init);
@@ -30,6 +32,17 @@ function App() {
   const initWorkspaces = useWorkspaceStore((s) => s.init);
   const currentWorkspace = useWorkspaceStore((s) => s.current);
   const currentWorkspaceId = useWorkspaceStore((s) => workspaceIdForView(s.current?.id));
+  const openWorkspaceView = useWorkspaceViewStore((s) => s.open);
+  const openTasks = useContextPaneStore((s) => s.openTasks);
+  const openBrowser = useContextPaneStore((s) => s.openBrowser);
+  const openFiles = useContextPaneStore((s) => s.openFiles);
+  const openPrimaryWorkbench = useCallback(
+    (view: 'analysis' | 'research' | 'workflow' | 'extract') => {
+      useContextPaneStore.getState().reset();
+      openWorkspaceView(view);
+    },
+    [openWorkspaceView]
+  );
 
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [newTaskOpen, setNewTaskOpen] = useState(false);
@@ -180,8 +193,67 @@ function App() {
         },
         category: 'Navigation',
       },
+      {
+        id: 'open-task-run',
+        label: '任务运行',
+        description: '查看当前目标、计划和执行状态',
+        action: openTasks,
+        category: '工作台',
+      },
+      {
+        id: 'open-analysis',
+        label: '分析',
+        description: '打开数据分析工作台',
+        action: () => openPrimaryWorkbench('analysis'),
+        category: '工作台',
+      },
+      {
+        id: 'open-research',
+        label: '研究',
+        description: '打开研究与来源工作台',
+        action: () => openPrimaryWorkbench('research'),
+        category: '工作台',
+      },
+      {
+        id: 'open-browser',
+        label: '浏览器',
+        description: '在右侧打开浏览器上下文',
+        action: openBrowser,
+        category: '工作台',
+      },
+      {
+        id: 'open-files',
+        label: '文件',
+        description: '在右侧打开文件与 Diff',
+        action: openFiles,
+        category: '工作台',
+      },
+      {
+        id: 'open-workflow',
+        label: '工作流',
+        description: '打开工作流工作台',
+        action: () => openPrimaryWorkbench('workflow'),
+        category: '工作台',
+      },
+      {
+        id: 'open-extract',
+        label: '结构化提取',
+        description: '打开结构化提取工作台',
+        action: () => openPrimaryWorkbench('extract'),
+        category: '工作台',
+      },
     ],
-    [openSettings, setActiveSettingsTab, toggleTheme, toggleSidebar, toggleTerminal]
+    [
+      openBrowser,
+      openFiles,
+      openSettings,
+      openTasks,
+      openPrimaryWorkbench,
+      setActiveSettingsTab,
+      toggleSidebar,
+      toggleTerminal,
+      toggleTheme,
+    ]
   );
 
   return (
@@ -189,8 +261,8 @@ function App() {
       <RequireAuth>
         <AppLayout
           left={<LeftSidebar onNewTask={handleNewTask} />}
-          center={<ChatPanel />}
-          right={<RightWorkspace />}
+          center={<PrimaryWorkspace />}
+          right={<ContextPane />}
         />
         <SettingsDialog />
         <NewTaskDialog isOpen={newTaskOpen} onClose={() => setNewTaskOpen(false)} />

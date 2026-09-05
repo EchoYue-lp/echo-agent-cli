@@ -3,5 +3,5 @@ import type { McpServerConfig } from './McpServerConfig';
 
 export type McpConfigDocument = {
   $schema: string | null;
-  mcpServers: { [key: string]: McpServerConfig };
+  mcpServers: Record<string, McpServerConfig>;
 };
