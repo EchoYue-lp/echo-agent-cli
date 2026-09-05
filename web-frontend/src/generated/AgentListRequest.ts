@@ -4,6 +4,11 @@ import type { AgentListScope } from './AgentListScope';
 export type AgentListRequest = {
   scope: AgentListScope;
   workspace_id: string | null;
+  /**
+   * Optional collaboration-group filter: only conversations that are the
+   * leader or a member of this group are returned.
+   */
+  group_id: string | null;
   status: string | null;
   limit: number;
 };

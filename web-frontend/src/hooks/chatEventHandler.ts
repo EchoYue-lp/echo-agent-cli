@@ -8,7 +8,15 @@
  */
 
 import { useChatStore } from '../stores/chatStore';
+import {
+  ingestSubagentExecEvent,
+  subagentRunStoreKey,
+  useSubagentRunStore,
+} from '../stores/subagentRunStore';
+import { useToastStore } from '../stores/toastStore';
+import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 import type { AgentEvent, ChatEvent, ChatEventEnvelope } from '../types/api';
+import type { ExecEvent } from '../generated';
 
 interface EventContext {
   assistantIdRef: React.MutableRefObject<string | null>;
@@ -94,11 +102,37 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
     case 'command_cell_watch_acknowledged':
       break;
     case 'execution':
-      // The exact payload remains in the durable envelope. The dedicated
-      // execution projection updates the TaskRuntime store.
+      applyExecutionEvent(payload.event, envelope);
       break;
     default:
       assertNever(payload, 'chat driver event');
+  }
+}
+
+/** One ingress for both live ChatEventEnvelope delivery and journal replay. */
+export function applyExecutionEvent(
+  event: ExecEvent,
+  journal?: Pick<ChatEventEnvelope, 'event_id' | 'stream_id' | 'sequence' | 'timestamp'>
+): void {
+  if (
+    event.scope === 'run' &&
+    (event.event === 'run_started' || event.event === 'plan_revision_committed')
+  ) {
+    void useTaskRuntimeStore
+      .getState()
+      .loadByConversation(event.workspace_id, event.conversation_id)
+      .catch((error) => console.warn('[ChatEvent] Failed to refresh TaskRun projection:', error));
+    return;
+  }
+  if (event.scope !== 'subagent' || !event.subagent_run_id) return;
+  const key = subagentRunStoreKey(event.run_id, event.subagent_run_id);
+  const previous = useSubagentRunStore.getState().runs[key];
+  ingestSubagentExecEvent(event, journal);
+  const current = useSubagentRunStore.getState().runs[key];
+  if (event.event === 'completed' && current?.background && previous?.status !== 'completed') {
+    useToastStore
+      .getState()
+      .addToast('success', `Subagent ${current.agent || event.subagent_run_id} 已完成`);
   }
 }
 

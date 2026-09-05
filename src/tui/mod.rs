@@ -2002,6 +2002,9 @@ pub async fn run_tui(
     browser_runtime: std::sync::Arc<echo_agent_app_core::api::browser::BrowserRuntime>,
     prompt_assembly: echo_agent_app_core::api::project::prompt::PromptAssembly,
     plugin_runtime: std::sync::Arc<echo_agent_app_core::api::plugin_runtime::PluginRuntimeService>,
+    subagent_projection: std::sync::Arc<
+        echo_agent_app_core::api::subagent_event_projection::SubagentEnvelopeProjectionService,
+    >,
     app_state: std::sync::Arc<echo_agent_app_core::api::state::AppState>,
     inline_mode: bool,
 ) -> anyhow::Result<()> {
@@ -2104,7 +2107,7 @@ pub async fn run_tui(
         .await;
 
     // Main event loop.
-    let result = events::run_event_loop(&mut terminal, &mut app, agent).await;
+    let result = events::run_event_loop(&mut terminal, &mut app, agent, subagent_projection).await;
 
     let foreground_workspace_id = app
         .active_turn_workspace_id

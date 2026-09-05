@@ -1,11 +1,6 @@
 import { useRef, useCallback, useEffect, useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useConversationStore } from '../stores/conversationStore';
-import {
-  subagentRunStoreKey,
-  useSubagentRunStore,
-  type ExecutionEvent,
-} from '../stores/subagentRunStore';
 import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 import { useToastStore } from '../stores/toastStore';
 import { useToolExecutionStore } from '../stores/toolExecutionStore';
@@ -80,6 +75,7 @@ export function useTauriChat() {
   const previousNewConversationEpochRef = useRef(newConversationEpoch);
   const thinkingIdRef = useRef<string | null>(null);
   const eventSequencerRef = useRef(new ChatEventSequencer());
+  const replayingGapStreamsRef = useRef(new Set<string>());
   const frontierRef = useRef<ConversationInputFrontier>(EMPTY_FRONTIER);
   const frontierRequestOrdinalRef = useRef(0);
   const frontierAppliedOrdinalRef = useRef(0);
@@ -266,6 +262,17 @@ export function useTauriChat() {
         });
         return;
       }
+      if (event.payload.source === 'execution') {
+        if (!isCurrentStreamEvent(event)) return;
+        handleChatEventEnvelope(event, {
+          assistantIdRef,
+          currentMessageKeyRef,
+          currentMessageIdRef: currentMessageKeyRef,
+          isCancelledRef,
+          currentThinkingIdRef: thinkingIdRef,
+        });
+        return;
+      }
       if (!isCurrentRunEvent(event)) return;
       rebindEventRefs(event);
       handleChatEventEnvelope(event, {
@@ -294,7 +301,7 @@ export function useTauriChat() {
         }
       }
     },
-    [dispatchNextQueued, isCurrentRunEvent, rebindEventRefs, refreshFrontier]
+    [dispatchNextQueued, isCurrentRunEvent, isCurrentStreamEvent, rebindEventRefs, refreshFrontier]
   );
 
   const handleEvent = useCallback(
@@ -330,8 +337,29 @@ export function useTauriChat() {
       const { listen } = await import('@tauri-apps/api/event');
       if (aborted) return; // 卸载发生在 import 期间, 不再注册
       const unlisten = await listen<ChatEventEnvelope>('chat://event', (event) => {
-        if (!aborted && isCurrentStreamEvent(event.payload)) {
-          eventSequencerRef.current.ingest(event.payload, handleEvent);
+        if (aborted || !isCurrentStreamEvent(event.payload)) return;
+        const envelope = event.payload;
+        const sequencer = eventSequencerRef.current;
+        const cursor = sequencer.cursor(envelope.stream_id);
+        sequencer.ingest(envelope, handleEvent);
+        if (
+          envelope.sequence > cursor + 1 &&
+          !replayingGapStreamsRef.current.has(envelope.stream_id)
+        ) {
+          replayingGapStreamsRef.current.add(envelope.stream_id);
+          void apiInvoke<ChatEventReplay>('replay_chat_events', {
+            workspaceId: envelope.workspace_id,
+            conversationId: envelope.conversation_id ?? undefined,
+            messageKey: envelope.root_turn_id,
+            afterCursor: cursor,
+          })
+            .then((replay) => {
+              if (!aborted) sequencer.ingestReplay(replay, handleEvent);
+            })
+            .catch((error) => {
+              if (!aborted) console.warn('[TauriChat] Failed to recover live event gap:', error);
+            })
+            .finally(() => replayingGapStreamsRef.current.delete(envelope.stream_id));
         }
       });
       // 卸载发生在两个 listen 之间: 立即注销刚注册的第一个, 不再注册第二个。
@@ -340,11 +368,8 @@ export function useTauriChat() {
         return;
       }
       pendingCleanup.push(unlisten);
-      // Unified execution://event channel (Subagent unification Phase 4).
-      // Replaces the legacy subagent trace + subagent event channels.
-      // kind="subagent" -> lifecycle, usage, and complete terminal outcome;
-      // kind="tool" → shared lightweight summaries for main/subagent tools;
-      // kind="run" → run lifecycle (run_started triggers loadByConversation).
+      // `execution://event` now carries only secondary committed tool summaries.
+      // Run/Subagent lifecycle arrives on the canonical journaled chat stream.
       const unlistenExec = await listen<Record<string, unknown>>('execution://event', (event) => {
         if (aborted) return;
         const payload = event.payload;
@@ -364,41 +389,12 @@ export function useTauriChat() {
         ) {
           return;
         }
-        if (kind === 'subagent') {
-          const subagentRunId = String(payload.subagent_run_id ?? '');
-          const taskRunId = String(payload.run_id ?? '');
-          const storeKey = subagentRunId ? subagentRunStoreKey(taskRunId, subagentRunId) : null;
-          const prevStatus = storeKey
-            ? useSubagentRunStore.getState().runs[storeKey]?.status
-            : undefined;
-          useSubagentRunStore.getState().ingest(payload as unknown as ExecutionEvent);
-          // Background Subagent completion is already represented by its
-          // message-bound execution card. Notify without appending a second
-          // assistant message that duplicates the terminal summary.
-          if (storeKey && payload.event === 'completed') {
-            const run = useSubagentRunStore.getState().runs[storeKey];
-            if (run?.background && prevStatus !== 'completed') {
-              useToastStore
-                .getState()
-                .addToast('success', `Subagent ${run.agent || subagentRunId} 已完成`);
-            }
-          }
-        } else if (kind === 'tool') {
+        if (kind === 'tool') {
           const tool = payload as unknown as ToolExecution;
           useToolExecutionStore.getState().ingest(tool);
           if (payload.event === 'started' && tool.owner.kind === 'chat') {
             useChatStore.getState().recordToolStart(tool.owner.message_id, tool.id);
           }
-        } else if (
-          kind === 'run' &&
-          (payload.event === 'run_started' || payload.event === 'plan_revision_committed')
-        ) {
-          // run_started covers orchestrated runs; plan_revision_committed
-          // promotes an eager conversation run into the task UI.
-          useTaskRuntimeStore
-            .getState()
-            .loadByConversation(workspaceId, conversationId)
-            .catch((e) => console.warn('[TauriChat] Failed to load task run on run_started:', e));
         }
       });
       // 卸载发生在第二个 listen 之后、push 之前: 立即注销。
@@ -419,14 +415,28 @@ export function useTauriChat() {
           const messageKey = snapshot?.root_turn_id;
           if (conversationId || messageKey) {
             const streamId = chatStreamId(currentWorkspaceId, conversationId, messageKey);
+            const cursor = eventSequencerRef.current.cursor(streamId);
             const replay = await apiInvoke<ChatEventReplay>('replay_chat_events', {
               workspaceId: currentWorkspaceId,
               conversationId,
               messageKey,
-              afterCursor: eventSequencerRef.current.cursor(streamId),
+              afterCursor: cursor,
             });
             if (!aborted && setupIdentityGeneration === identityGenerationRef.current) {
               eventSequencerRef.current.ingestReplay(replay, handleEvent);
+              if (cursor > 0) {
+                const projectionReplay = await apiInvoke<ChatEventReplay>('replay_chat_events', {
+                  workspaceId: currentWorkspaceId,
+                  conversationId,
+                  messageKey,
+                  afterCursor: 0,
+                });
+                if (!aborted && setupIdentityGeneration === identityGenerationRef.current) {
+                  for (const event of projectionReplay.events) {
+                    if (event.payload.source === 'execution') applyEvent(event);
+                  }
+                }
+              }
               if (!snapshot && useChatStore.getState().isStreaming) {
                 useChatStore.getState().clearInactiveTurnProjection();
               }
@@ -460,6 +470,7 @@ export function useTauriChat() {
     };
   }, [
     currentWorkspaceId,
+    applyEvent,
     dispatchNextQueued,
     getActiveTurnSnapshot,
     handleEvent,

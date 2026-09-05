@@ -244,11 +244,6 @@ impl TaskDispatcher for RealTaskDispatcher {
             let cancel = context.cancel;
             let delegation_policy = context.delegation_policy;
             let task_id = task.id.clone();
-            let _process_subagent_permit = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for process Subagent permit")),
-                permit = PROCESS_EXECUTION_GOVERNOR.subagent.acquire() => permit.map_err(|error| TaskDispatchFailure::failed(task_id.clone(), error.to_string()))?,
-            };
             let (execution_agent, target_lease) =
                 resolve_task_execution_agent(&store, &blocking, &run_id, &task, local_agent)
                     .await

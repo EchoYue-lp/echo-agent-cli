@@ -315,6 +315,30 @@
       "legacyRemoved": true
     },
     {
+      "legacyPath": "adr/0038-unified-task-subagent-execution.md",
+      "targetPath": "adr/0038-unified-task-subagent-execution.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0039-unified-agent-conversation-pane.md",
+      "targetPath": "adr/0039-unified-agent-conversation-pane.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0040-app-core-subagent-event-projection.md",
+      "targetPath": "adr/0040-app-core-subagent-event-projection.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
       "legacyPath": "architecture.md",
       "targetPath": "architecture/overview.md",
       "kind": "architecture",

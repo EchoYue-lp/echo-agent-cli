@@ -324,6 +324,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             runtime.browser_runtime.clone(),
             runtime.prompt_assembly.clone(),
             runtime.plugin_runtime.clone(),
+            application_services.subagent_projection.clone(),
             application_services.app_state.clone(),
             args.no_alt_screen,
         )

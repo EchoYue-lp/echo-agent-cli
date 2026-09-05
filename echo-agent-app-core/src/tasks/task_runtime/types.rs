@@ -578,6 +578,9 @@ pub enum RuntimeEventKind {
     /// informational report or a blocking clarification request. Payload
     /// carries `blocking`, the bounded question text, and sender identity.
     SubagentEscalationRequested,
+    /// Framework replay could not supply a contiguous transient event range.
+    /// The payload carries the exact stream cursor boundary and recovery facts.
+    SubagentStreamGap,
     IsolationObserved,
     ThinkingStarted,
     ThinkingDelta,
@@ -664,6 +667,7 @@ impl RuntimeEventKind {
             SubagentInterruptRequested => "subagent_interrupt_requested",
             SubagentInterruptSettled => "subagent_interrupt_settled",
             SubagentEscalationRequested => "subagent_escalation_requested",
+            SubagentStreamGap => "subagent_stream_gap",
             IsolationObserved => "isolation_observed",
             ThinkingStarted => "thinking_started",
             ThinkingDelta => "thinking_delta",
@@ -716,6 +720,7 @@ impl RuntimeEventKind {
                 | RuntimeEventKind::SubagentGuidanceRejected
                 | RuntimeEventKind::SubagentInterruptSettled
                 | RuntimeEventKind::SubagentEscalationRequested
+                | RuntimeEventKind::SubagentStreamGap
                 | RuntimeEventKind::Failed
                 | RuntimeEventKind::Cancelled
                 | RuntimeEventKind::TimedOut
@@ -766,6 +771,8 @@ impl RuntimeEventKind {
             "subagent_guidance_rejected" => SubagentGuidanceRejected,
             "subagent_interrupt_requested" => SubagentInterruptRequested,
             "subagent_interrupt_settled" => SubagentInterruptSettled,
+            "subagent_escalation_requested" => SubagentEscalationRequested,
+            "subagent_stream_gap" => SubagentStreamGap,
             "isolation_observed" => IsolationObserved,
             "thinking_started" => ThinkingStarted,
             "thinking_delta" => ThinkingDelta,

@@ -26,10 +26,12 @@ export type {
   ConversationInputProjection,
   ConversationInputReceipt,
   ConversationInputSource,
+  ExecEvent,
 } from '../generated';
 import type {
   BackgroundCellState,
   ConversationInputFact,
+  ExecEvent,
   ExtensionSkillEntry,
   McpServerInfo as GeneratedMcpServerInfo,
   McpToolInfo as GeneratedMcpToolInfo,
@@ -328,7 +330,7 @@ export interface AgentEventEnvelope {
 
 export type ChatDriverEvent =
   | { source: 'agent'; event: AgentEventEnvelope }
-  | { source: 'execution'; event: Record<string, unknown> }
+  | { source: 'execution'; event: ExecEvent }
   | { source: 'turn_status'; event: { status: ChatRunStatus } }
   | { source: 'execution_path'; event: { observed_path: string } }
   | { source: 'interrupt'; event: { run_id: string; goal: string; new_message: string } }

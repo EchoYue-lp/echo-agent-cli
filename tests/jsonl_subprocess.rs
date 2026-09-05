@@ -590,7 +590,7 @@ fn execution_events(
     events
         .iter()
         .filter_map(|envelope| match &envelope.payload {
-            ChatDriverEvent::Execution(event) => Some(event),
+            ChatDriverEvent::Execution(event) => Some(event.as_ref()),
             _ => None,
         })
 }

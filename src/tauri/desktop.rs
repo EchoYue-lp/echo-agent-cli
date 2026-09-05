@@ -220,6 +220,7 @@ async fn run_desktop() -> anyhow::Result<()> {
     let tauri_result = crate::tauri::build_tauri_app(
         state.clone(),
         runtime.browser_runtime.clone(),
+        services.subagent_projection.clone(),
         bridge_supervisor.clone(),
     )
     .run(tauri_context);

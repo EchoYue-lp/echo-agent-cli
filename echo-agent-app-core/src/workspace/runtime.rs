@@ -889,6 +889,56 @@ impl WorkspaceRuntimeRegistry {
         runtimes
     }
 
+    /// Resolve the exact TaskRuntime store that owns `run_id` without using the
+    /// currently focused workspace. Old workspace generations may continue a
+    /// Subagent after focus has moved elsewhere, so focus is never an identity
+    /// input for execution-event projection.
+    pub(crate) async fn resolve_run_owner(
+        &self,
+        global_store: Option<Arc<TaskRuntimeStore>>,
+        run_id: &str,
+    ) -> anyhow::Result<Option<(Arc<TaskRuntimeStore>, crate::tasks::task_runtime::TaskRun)>> {
+        let mut stores = Vec::new();
+        if let Some(store) = global_store {
+            stores.push(store);
+        }
+        {
+            let hosts = self.hosts.lock().await;
+            for host in hosts.values() {
+                if let Some(store) = host.task_runtime.get()
+                    && !stores.iter().any(|candidate| Arc::ptr_eq(candidate, store))
+                {
+                    stores.push(Arc::clone(store));
+                }
+            }
+        }
+        let run_id = run_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut owner: Option<(Arc<TaskRuntimeStore>, crate::tasks::task_runtime::TaskRun)> =
+                None;
+            for store in stores {
+                let Some(run) = store
+                    .get_run(&run_id)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                else {
+                    continue;
+                };
+                if let Some((_, previous)) = owner.as_ref() {
+                    anyhow::bail!(
+                        "TaskRun '{}' has multiple runtime owners ('{}' and '{}')",
+                        run_id,
+                        previous.workspace_id,
+                        run.workspace_id
+                    );
+                }
+                owner = Some((store, run));
+            }
+            Ok(owner)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("TaskRun owner lookup task failed: {error}"))?
+    }
+
     /// Pin every initialized workspace execution generation for one global
     /// control mutation. Acquiring leases while holding registry membership
     /// prevents delete/eviction from racing the returned snapshot.

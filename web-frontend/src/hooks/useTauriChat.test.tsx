@@ -5,6 +5,8 @@ import { useConversationStore } from '../stores/conversationStore';
 import { useChatStore } from '../stores/chatStore';
 import { useToastStore } from '../stores/toastStore';
 import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
+import { subagentRunStoreKey, useSubagentRunStore } from '../stores/subagentRunStore';
+import type { ExecEvent } from '../generated';
 import type {
   AgentEvent,
   ChatEventEnvelope,
@@ -122,6 +124,26 @@ const turnStatusEnvelope = (
   payload: { source: 'turn_status', event: { status } },
 });
 
+const executionEnvelope = (
+  messageId: string,
+  sequence: number,
+  conversationId: string,
+  event: ExecEvent
+): ChatEventEnvelope => ({
+  schema_version: 2,
+  workspace_id: event.workspace_id,
+  event_id: `chat-execution-${sequence}`,
+  content_hash: `execution-hash-${sequence}`,
+  sequence,
+  stream_id: JSON.stringify([event.workspace_id, conversationId]),
+  conversation_id: conversationId,
+  root_turn_id: messageId,
+  turn_id: messageId,
+  message_id: messageId,
+  timestamp: '2026-08-18T00:00:00Z',
+  payload: { source: 'execution', event },
+});
+
 const inputLifecycleEnvelope = (
   sequence: number,
   phase: 'persisted' | 'attempt_started',
@@ -210,6 +232,7 @@ describe('useTauriChat foreground turn recovery', () => {
     useChatStore.getState().setRunStatus('running');
     useToastStore.getState().clearAll();
     useTaskRuntimeStore.getState().reset();
+    useSubagentRunStore.getState().clear();
     queuedFrontier = { queue_revision: 0, items: [] };
     mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
       if (command === 'get_active_chat_turn') {
@@ -594,17 +617,22 @@ describe('useTauriChat foreground turn recovery', () => {
       .mockResolvedValue();
 
     const hook = renderHook(() => useTauriChat());
-    await waitFor(() => expect(mocks.listeners.has('execution://event')).toBe(true));
+    await waitFor(() => expect(mocks.listeners.has('chat://event')).toBe(true));
 
     act(() => {
-      mocks.listeners.get('execution://event')?.({
-        payload: {
-          kind: 'run',
+      mocks.listeners.get('chat://event')?.({
+        payload: executionEnvelope('plan-root', 1, conversationId, {
+          scope: 'run',
           event: 'plan_revision_committed',
           workspace_id: 'global',
           conversation_id: conversationId,
           run_id: 'taskrun:conversation-plan-committed',
-        },
+          task_id: null,
+          subagent_run_id: null,
+          agent: null,
+          payload: {},
+          framework_event: null,
+        }),
       });
     });
 
@@ -675,6 +703,69 @@ describe('useTauriChat foreground turn recovery', () => {
       useChatStore.getState().messages.find((message) => message.id === snapshot.root_turn_id)
         ?.content
     ).toContain('ordered token');
+    hook.unmount();
+  });
+
+  it('replays immediately when a live chat envelope exposes an outer sequence gap', async () => {
+    const conversationId = 'conversation-live-gap';
+    const snapshot = {
+      ...activeSnapshot,
+      conversation_id: conversationId,
+      root_turn_id: 'gap-root',
+      active_turn_id: 'gap-turn',
+    };
+    useConversationStore.setState({ activeId: conversationId });
+    let replayCalls = 0;
+    const first = agentEnvelope(
+      snapshot.active_turn_id,
+      1,
+      { type: 'token', data: 'first ' },
+      conversationId,
+      snapshot.root_turn_id
+    );
+    const second = agentEnvelope(
+      snapshot.active_turn_id,
+      2,
+      { type: 'token', data: 'second' },
+      conversationId,
+      snapshot.root_turn_id
+    );
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return snapshot;
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'replay_chat_events') {
+        replayCalls += 1;
+        return replayCalls === 1
+          ? emptyReplay()
+          : {
+              events: [first, second],
+              retained_earliest_cursor: 1,
+              returned_earliest_cursor: 1,
+              latest_cursor: 2,
+              truncated: false,
+            };
+      }
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(mocks.listeners.has('chat://event')).toBe(true));
+
+    act(() => {
+      mocks.listeners.get('chat://event')?.({ payload: second });
+    });
+
+    await waitFor(() => {
+      expect(
+        useChatStore.getState().messages.find((message) => message.id === snapshot.root_turn_id)
+          ?.content
+      ).toContain('first second');
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('replay_chat_events', {
+      workspaceId: 'global',
+      conversationId,
+      messageKey: snapshot.root_turn_id,
+      afterCursor: 0,
+    });
     hook.unmount();
   });
 
@@ -869,6 +960,68 @@ describe('useTauriChat foreground turn recovery', () => {
       expect(useChatStore.getState().runStatus).toBe('completed');
     });
     hook.unmount();
+  });
+
+  it('rehydrates Subagent projection from zero after its store was cleared', async () => {
+    const conversationId = 'conversation-subagent-rehydrate';
+    const rootTurnId = 'subagent-root';
+    const snapshot = {
+      ...activeSnapshot,
+      conversation_id: conversationId,
+      root_turn_id: rootTurnId,
+      active_turn_id: rootTurnId,
+    };
+    const event = executionEnvelope(rootTurnId, 1, conversationId, {
+      workspace_id: 'global',
+      conversation_id: conversationId,
+      run_id: '',
+      scope: 'subagent',
+      task_id: null,
+      subagent_run_id: 'execution-rehydrate',
+      event: 'started',
+      agent: 'explorer',
+      payload: { task: 'rehydrate' },
+      framework_event: null,
+    });
+    const replay: ChatEventReplay = {
+      events: [event],
+      retained_earliest_cursor: 1,
+      returned_earliest_cursor: 1,
+      latest_cursor: 1,
+      truncated: false,
+    };
+    useConversationStore.setState({ activeId: conversationId });
+    mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'get_active_chat_turn') return snapshot;
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'replay_chat_events') {
+        return args?.afterCursor === 0 ? replay : emptyReplay();
+      }
+      return { success: true };
+    });
+
+    const first = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(
+        useSubagentRunStore.getState().runs[subagentRunStoreKey('', 'execution-rehydrate')]
+      ).toBeDefined()
+    );
+    first.unmount();
+    useSubagentRunStore.getState().clear();
+
+    const second = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(
+        useSubagentRunStore.getState().runs[subagentRunStoreKey('', 'execution-rehydrate')]
+      ).toBeDefined()
+    );
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('replay_chat_events', {
+      workspaceId: 'global',
+      conversationId,
+      messageKey: rootTurnId,
+      afterCursor: 0,
+    });
+    second.unmount();
   });
 
   it('does not cancel or fail a replay with no active snapshot and no terminal fact', async () => {
