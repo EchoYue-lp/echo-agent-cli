@@ -24,12 +24,6 @@ pub struct SkillHubEntry {
     /// 分类
     #[serde(default)]
     pub category: String,
-    /// 是否 baseline 注入
-    #[serde(default)]
-    pub is_baseline: bool,
-    /// 是否内置技能
-    #[serde(default)]
-    pub is_builtin: bool,
     /// 上游版本
     #[serde(default)]
     pub upstream_version: Option<String>,
@@ -221,21 +215,13 @@ impl SkillsHub {
             .map(|record| record.revision.chars().take(12).collect::<String>())
             .or_else(|| descriptor.metadata.get("upstream-version").cloned());
 
-        let is_baseline = metadata_category == "methodology"
-            && super::enabled_skills::DEFAULT_BASELINE_SKILLS.contains(&descriptor.name.as_str());
-
         let missing_dependencies = missing_binary_names(&descriptor);
-
-        let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-        let is_builtin = canonical_dir.starts_with(super::enabled_skills::builtin_skills_root());
 
         Some(SkillHubEntry {
             name: descriptor.name,
             description: descriptor.description,
             path: dir.to_path_buf(),
             category: metadata_category,
-            is_baseline,
-            is_builtin,
             upstream_version,
             source: metadata_source,
             license: descriptor.license,

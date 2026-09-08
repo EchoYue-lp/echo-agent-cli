@@ -245,15 +245,17 @@ Plugin 使用根 `plugin.json` 和固定组件位置。Skill 安装、启用和�
 
 ### Skill 启用状态与 settlement
 
-`enabled-skills.json` 是启停策略的唯一持久文件。version 2 schema 只包含 flat Skill map：
-每项为 `{category, enabled, baseline}`，通过同目录 staging 与 `atomic_write` 原子替换。
-旧 generation、operation identity、content identity 与 repair debt 字段会被忽略；损坏或
-不可读配置回退默认启用集并记录 warn。
+`enabled-skills.json` 是外部 Skill 启停策略的唯一持久文件。version 3 schema 只包含
+flat Skill map，每项为 `{enabled}`，通过同目录 staging 与 `atomic_write` 原子替换。
+旧文件中的 `category`、`baseline`、generation、operation identity、content identity 与
+repair debt 字段会被忽略，但已有外部 Skill 的 `enabled` 选择会保留。损坏或不可读配置
+回退空集合并记录 warn；EKO 不再生成默认启用集。
 
 `ExtensionControlService` 在同一 mutation 锁内写文件，再向 global seed、已加载 workspace
 和 AgentPool 发布。`SkillSyncReceipt` 只返回本次操作的 `Settled` 或 `Degraded` 即时结果及
 逐 target 错误。文件已写但运行时同步失败时不回滚配置；下一次 Skill 操作、应用启动或
-workspace load 会重新读取 flat policy 并收敛，不保留精确重放状态。
+workspace load 会重新读取 flat policy 并收敛，不保留精确重放状态。EKO 不扫描源码树
+`skills/`，也不向 Agent 注入方法论 baseline；仓库 `.agents/skills/` 仅用于开发协作。
 
 ## 项目指令
 

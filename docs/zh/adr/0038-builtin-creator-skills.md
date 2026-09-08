@@ -4,6 +4,8 @@
 
 已采纳
 
+Superseded by: ADR 0041
+
 ## 背景
 
 EKO 已经具备 Skill 标准解析、发现、启用与用户目录，也具备 Agent Plugins 1.0

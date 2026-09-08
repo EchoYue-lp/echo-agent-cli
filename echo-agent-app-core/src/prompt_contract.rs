@@ -80,7 +80,6 @@ mod tests {
     use crate::subagent_loader::discover_subagents;
     use crate::tasks::task_runtime::profiles::ProfileTemplate;
     use crate::tasks::task_runtime::types::DomainProfile;
-    use std::path::{Path, PathBuf};
 
     fn assert_compliant(report: PromptAuditReport) -> Result<(), String> {
         if report.is_compliant() {
@@ -186,52 +185,6 @@ mod tests {
                 },
                 template.prompt_suffix,
             ))?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn bundled_skills_are_bounded_and_not_demo_prompts() -> Result<(), String> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills");
-        let mut files = Vec::new();
-        collect_skill_files(root.as_path(), &mut files)?;
-        files.sort();
-        if files.is_empty() {
-            return Err("no bundled SKILL.md files discovered".to_string());
-        }
-
-        for path in files {
-            let content = std::fs::read_to_string(&path)
-                .map_err(|error| format!("read {}: {error}", path.display()))?;
-            assert_compliant(audit_prompt(
-                &PromptContractSpec {
-                    name: path.to_string_lossy().as_ref(),
-                    max_tokens: 1_800,
-                    required_phrases: &["name:", "description:", "#"],
-                    forbidden_phrases: DEMO_PHRASES,
-                },
-                content.as_str(),
-            ))?;
-        }
-        Ok(())
-    }
-
-    fn collect_skill_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
-        let entries = std::fs::read_dir(dir)
-            .map_err(|error| format!("read skill directory {}: {error}", dir.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| format!("read directory entry: {error}"))?;
-            let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .map_err(|error| format!("read file type {}: {error}", path.display()))?;
-            if file_type.is_dir() {
-                collect_skill_files(path.as_path(), files)?;
-            } else if file_type.is_file()
-                && path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
-            {
-                files.push(path);
-            }
         }
         Ok(())
     }

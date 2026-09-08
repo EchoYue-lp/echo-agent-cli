@@ -38,6 +38,11 @@ application does not scan or import `~/.echo-agent`, and it does not construct
 `.workspace.json` is checked only to prevent accidental overwrite during
 workspace creation; it is never parsed or migrated.
 
+`skills/` contains only independently installed user Skills, and
+`enabled-skills.json` stores only their `{enabled}` choices. EKO does not create
+built-in Skills, a default active set, or a baseline in either the data root or
+the application package.
+
 ## Authorities
 
 - Framework `ConversationStore` owns the durable conversation transcript.

@@ -4,6 +4,8 @@
 
 Accepted (2026-09-03)
 
+Superseded by: ADR 0041
+
 Supersedes the durable-settlement half of
 [ADR 0032](./0032-enabled-skill-runtime-authority.md); the core stance of
 0032 — enabled-skills.json as the runtime activation authority — is retained.

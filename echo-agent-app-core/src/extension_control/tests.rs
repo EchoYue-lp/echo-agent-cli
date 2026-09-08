@@ -607,63 +607,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn baseline_projection_tracks_enablement_on_primary_and_existing_pool_agents()
-    -> Result<(), String> {
-        let fixture = fanout_fixture(0).await?;
-        let pooled = fixture
-            .seed_pool
-            .acquire("baseline-conversation")
-            .await
-            .map_err(|error| error.to_string())?;
-        let pooled_agent = pooled.agent();
-        drop(pooled);
-        let marker = "eko:methodology-baseline".to_string();
-
-        fixture
-            .state
-            .extension_control
-            .disable_skill(&fixture.state, "verification-before-completion")
-            .await
-            .map_err(|error| error.to_string())?;
-        assert!(
-            !context_projection_present(
-                &fixture.state.connection.primary_agent(),
-                marker.clone()
-            )
-            .await
-        );
-        assert!(!context_projection_present(&pooled_agent, marker.clone()).await);
-
-        fixture
-            .state
-            .extension_control
-            .enable_skill(&fixture.state, "verification-before-completion")
-            .await
-            .map_err(|error| error.to_string())?;
-        assert!(
-            context_projection_present(
-                &fixture.state.connection.primary_agent(),
-                marker.clone()
-            )
-            .await
-        );
-        assert!(context_projection_present(&pooled_agent, marker.clone()).await);
-
-        fixture
-            .state
-            .extension_control
-            .disable_skill(&fixture.state, "verification-before-completion")
-            .await
-            .map_err(|error| error.to_string())?;
-        assert!(
-            !context_projection_present(&fixture.state.connection.primary_agent(), marker.clone())
-                .await
-        );
-        assert!(!context_projection_present(&pooled_agent, marker).await);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn list_projection_reads_loaded_state_from_agent_descriptors() -> Result<(), String> {
         let fixture = fanout_fixture(0).await?;
         fixture

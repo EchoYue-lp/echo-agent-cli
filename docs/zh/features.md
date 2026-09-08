@@ -67,7 +67,7 @@ launcher 不再维护跨 TaskRun metadata DAG 或轮询器。CLI 使用 `/tasks 
 admission，并把真实执行委托给既有 specialist owner。它不建立第二套 registry、manager 或
 store。
 
-- Skill 使用 version 2 flat policy、atomic commit、typed settled/degraded receipt 与
+- Skill 使用 version 3 `{enabled}` flat policy、atomic commit、typed settled/degraded receipt 与
   caller-drop owned settlement；GUI/headless boot、workspace load 和下一 mutation 都重新读取
   policy 并 reconcile，不保留 repair debt。
 - GUI 使用 generated typed generic IPC；JSONL 输出 journaled typed `ExtensionReceipt` 且不
@@ -115,14 +115,12 @@ watcher retained cell、按 typed cursor drain 到真实终态，再向全部 su
 派发 Subagent，也不依赖 model/provider output。`interrupt_command_cell_watch` 只取消观察意图，
 绝不隐式停止 command 本身。
 
-内置 Skill 采用 catalog 与 runtime 分离：SkillsHub 可以列出和安装全部随附产物，
-`enabled-skills.json` 决定哪些 bundled descriptor 能进入 Agent。disabled Skill 不会贡献
-私有 Hook 扩展、progressive activation entry 或 IntentRouter 候选。
+EKO 不再随应用捆绑 Skill，也不维护默认启用集、方法论 baseline 或内置 catalog。
+SkillsHub 只管理用户安装到 `~/.eko/skills/` 的独立 Skill；Plugin 中的 Skill 由插件
+generation 提供。`enabled-skills.json` 只记录外部 Skill 的启用选择，禁用项不会注册
+progressive activation entry 或 IntentRouter 候选。
 
-捆绑 Skill 的 `SKILL.md` 只使用 agentskills.io 官方标准字段（`name` / `description` /
-`license` / `compatibility` / `metadata` 字符串映射 / 空格分隔的 `allowed-tools`），不引入
-任何私有扩展命名空间；LLM routing 是 description-driven。Skill 文件不携带私有 Hook 文件，
-Hooks 继续由 application/plugin configuration 负责。
-framework 提供 `validate_skill_dir`（`skills-ref validate` 的进程内等价物），catalog gate
-测试遍历 `skills/` 强制零违规并保证 `BUILTIN_SKILL_NAMES` 与磁盘一致。详见 ADR
-[0033](./adr/0033-skill-catalog-contraction-and-official-frontmatter.md)。
+外部 `SKILL.md` 仍由 framework 的 agentskills.io 标准解析器和 validator 统一处理，
+Hooks 继续属于 application/plugin configuration。仓库根 `.agents/skills/` 是开发本项目时
+使用的 Agent 指导，不属于 EKO 产品运行时。详见 ADR
+[0041](./adr/0041-external-only-skills.md)。

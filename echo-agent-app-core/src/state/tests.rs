@@ -2545,8 +2545,8 @@ mod workspace_transition_tests {
             &temp.path().join("enabled-skills.json"),
         )
         .map_err(|error| error.to_string())?;
-        // 2026-09 简化后 config 只有平铺条目;确保文件可读且无多余状态字段。
-        assert!(!enabled.skills.is_empty());
+        // ADR 0041:首次加载只创建空配置，不隐式启用任何产品内置 Skill。
+        assert!(enabled.skills.is_empty());
         Ok(())
     }
 

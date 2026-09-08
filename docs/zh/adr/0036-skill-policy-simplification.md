@@ -4,6 +4,8 @@
 
 已采纳(2026-09-03)
 
+Superseded by: ADR 0041
+
 取代 [ADR 0032](./0032-enabled-skill-runtime-authority.md) 的 durable
 结算部分;0032 中"enabled-skills.json 是运行时激活权威"的核心立场保留。
 

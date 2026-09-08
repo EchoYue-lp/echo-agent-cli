@@ -4,6 +4,8 @@
 
 已采纳；2026-09-03 修订 catalog 与 baseline 清单
 
+Superseded by: ADR 0041
+
 ## 背景
 
 EKO 捆绑的 Skill catalog 使用私有 frontmatter 扩展字段（顶层 `triggers:`、`hooks:`、`shell:`、`paths:`、`sandbox:`、`depends_on:`）承载路由与运行时语义。这与 [agentskills.io 官方规范](https://agentskills.io/specification)不兼容：

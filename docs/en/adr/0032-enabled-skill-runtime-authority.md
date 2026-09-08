@@ -4,6 +4,8 @@
 
 Accepted (partially superseded: the durable settlement machinery is replaced by [ADR 0036](./0036-skill-policy-simplification.md); the enabled-skills.json runtime-authority stance is retained)
 
+Superseded by: ADR 0041
+
 ## Context
 
 EKO shipped a large bundled Skill catalog and loaded every bundled `SKILL.md`

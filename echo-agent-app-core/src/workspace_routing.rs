@@ -1,6 +1,7 @@
-//! 工作区路由 — 根据 WorkspaceKind 自动激活 Skills 和注入系统提示词
+//! 工作区路由 — 根据 WorkspaceKind 激活可用的外部 Skills 并注入系统提示词
 //!
-//! 当用户切换到特定类型的工作区时，自动配置 Agent 以适应该工作区的专业需求。
+//! 当用户切换到特定类型的工作区时，自动配置 Agent 以适应该工作区的专业需求；
+//! 只有已经安装且启用的同名 Skill 才会被激活。
 
 use crate::workspace::WorkspaceKind;
 use echo_agent::agent::ReactAgent;
@@ -14,8 +15,8 @@ const DATA_SKILLS: &[&str] = &[
     "statistical-analysis",
     "data-visualization",
 ];
-/// coding skill 已删(行为准则由基础 prompt contract 承担),Code 工作区
-/// 保留 git-workflow;CODE_PROMPT 本身承担编程工作区的行为注入。
+/// Code 工作区的行为由 `CODE_PROMPT` 保证；若用户另行安装并启用了
+/// `git-workflow`，则在该工作区按需激活。
 const CODE_SKILLS: &[&str] = &["git-workflow"];
 
 /// 医学研究系统提示词增强
@@ -68,7 +69,7 @@ Outcome: deliver a repository-native change that solves the requested behavior a
 
 /// 根据工作区类型配置 Agent
 ///
-/// 自动激活相关 Skills 并注入专业系统提示词。
+/// 激活已安装且启用的相关 Skills，并注入专业系统提示词。
 pub async fn configure_agent_for_workspace(agent: &mut ReactAgent, kind: &WorkspaceKind) {
     let (skills, profile, label): (&[&str], Option<&str>, &str) = match kind {
         WorkspaceKind::Medical { .. } => (

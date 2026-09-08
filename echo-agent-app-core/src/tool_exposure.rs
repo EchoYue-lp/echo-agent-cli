@@ -275,7 +275,7 @@ mod tests {
 
     #[tokio::test]
     async fn invocation_schema_budget_does_not_regress() -> anyhow::Result<()> {
-        let mut agent = ReactAgentBuilder::new()
+        let agent = ReactAgentBuilder::new()
             .model("test-model")
             .name("audit")
             .system_prompt("test")
@@ -284,8 +284,6 @@ mod tests {
             .enable_subagent()
             .enable_human_in_loop()
             .build()?;
-        let skill_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills");
-        agent.load_skills_from_dir(skill_root).await?;
         let agent = crate::agent_handle::AgentHandle::new(agent);
         let task_store =
             std::sync::Arc::new(crate::tasks::task_runtime::store::TaskRuntimeStore::new()?);

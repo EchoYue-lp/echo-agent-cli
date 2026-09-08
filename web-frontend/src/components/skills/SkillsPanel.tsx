@@ -18,7 +18,6 @@ import {
   Play,
   Power,
   Search,
-  Star,
   AlertTriangle,
   Download,
   RefreshCw,
@@ -553,24 +552,12 @@ export function SkillsPanel() {
                   style={{ borderColor: s.border, background: s.bg }}
                 >
                   <div className="flex items-start gap-2">
-                    {sk.is_baseline ? (
-                      <Star size={12} className="mt-0.5 shrink-0" style={{ color: '#eab308' }} />
-                    ) : (
-                      <BookOpen size={12} className="mt-0.5 shrink-0" style={{ color: s.accent }} />
-                    )}
+                    <BookOpen size={12} className="mt-0.5 shrink-0" style={{ color: s.accent }} />
                     <div className="min-w-0 flex-1">
                       <div className="flex min-w-0 items-center gap-1.5">
                         <span className="truncate text-xs font-medium" style={{ color: s.text }}>
                           {sk.name}
                         </span>
-                        {sk.is_baseline && (
-                          <span
-                            className="shrink-0 rounded-md px-1 py-0.5 text-[8px] font-medium"
-                            style={{ background: '#eab30820', color: '#eab308' }}
-                          >
-                            baseline
-                          </span>
-                        )}
                         {sk.missing_dependencies && sk.missing_dependencies.length > 0 && (
                           <span title={sk.missing_dependencies.join(', ')}>
                             <AlertTriangle
@@ -626,18 +613,16 @@ export function SkillsPanel() {
                         <Play size={11} />
                       </button>
                     )}
-                    {!sk.is_builtin && (
-                      <button
-                        onClick={() => void uninstallSkill(sk.name)}
-                        disabled={Boolean(busySkill)}
-                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border transition-opacity disabled:opacity-50"
-                        style={{ borderColor: s.border, color: 'var(--color-error)' }}
-                        title="卸载技能"
-                        aria-label={`卸载技能 ${sk.name}`}
-                      >
-                        <Trash2 size={11} />
-                      </button>
-                    )}
+                    <button
+                      onClick={() => void uninstallSkill(sk.name)}
+                      disabled={Boolean(busySkill)}
+                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border transition-opacity disabled:opacity-50"
+                      style={{ borderColor: s.border, color: 'var(--color-error)' }}
+                      title="卸载技能"
+                      aria-label={`卸载技能 ${sk.name}`}
+                    >
+                      <Trash2 size={11} />
+                    </button>
                   </div>
                   {updateStatuses[sk.name] && (
                     <div

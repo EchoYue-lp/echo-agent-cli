@@ -93,6 +93,14 @@ elapsed time across chat, continuation, and TaskRuntime lifecycle. EKO does not
 define a `ChatTurnOutcome` wrapper; Task and webhook surfaces read only the
 fields they need at their final product boundary.
 
+External Skills follow the same ownership rule. EKO installs independent Skills
+under `~/.eko/skills/` and consumes Skills from plugin generations; it does not
+ship a built-in catalog, default active set, methodology baseline, or Tauri
+Skill resources. Framework parsing and validation remain generic authorities,
+while SkillsHub owns product installation and enablement. The version 3
+`enabled-skills.json` file stores only `{enabled}` entries and falls back to an
+empty set when unreadable. See [ADR 0041](../adr/0041-external-only-skills.md).
+
 Task execution follows the single product model:
 
 ```text

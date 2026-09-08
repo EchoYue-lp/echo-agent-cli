@@ -83,17 +83,13 @@ Only capabilities with a real registered handler are exposed by a surface.
 Remaining project status and release residuals are recorded in
 `project-status.md`, not duplicated in this feature reference.
 
-Bundled Skills use a catalog-versus-runtime split: SkillsHub can list and
-install all shipped artifacts, while `enabled-skills.json` decides which
-bundled descriptors enter the Agent. Disabled Skills therefore contribute no
-private Hook extensions, progressive activation entries, or IntentRouter candidates.
+EKO no longer bundles Skills or owns a default active set, methodology
+baseline, or built-in catalog. SkillsHub manages independently installed
+Skills under `~/.eko/skills/`; plugin Skills come from plugin generations.
+`enabled-skills.json` records only external Skill enablement, and disabled
+entries do not register progressive activation or IntentRouter candidates.
 
-Bundled `SKILL.md` files use official agentskills.io standard fields only
-(`name`, `description`, `license`, `compatibility`, string-valued `metadata`, and a
-space-separated `allowed-tools`) with no private extension namespace; LLM
-routing is description-driven. Skill files do not carry private Hook files;
-Hooks remain application/plugin configuration. The framework ships `validate_skill_dir` (the in-process
-equivalent of `skills-ref validate`), and the catalog gate test walks
-`skills/` enforcing zero violations plus `BUILTIN_SKILL_NAMES` parity with
-disk. See ADR
-[0033](./adr/0033-skill-catalog-contraction-and-official-frontmatter.md).
+External `SKILL.md` files still use the framework's agentskills.io parser and
+validator, while Hooks remain application/plugin configuration. Repository
+`.agents/skills/` files guide development of EKO and are not product runtime
+content. See [ADR 0041](./adr/0041-external-only-skills.md).

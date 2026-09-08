@@ -803,33 +803,6 @@ impl ExtensionControlService {
             })
             .collect::<Vec<_>>();
         drop(hub);
-
-        let builtin_hub = crate::skills_hub::SkillsHub::with_root(
-            crate::skills_hub::builtin_skills_root(),
-        );
-        let enabled_config = crate::skills_hub::EnabledSkillsConfig::load(
-            &crate::data_root::user_data_path("enabled-skills.json"),
-        )
-        .ok();
-        for entry in builtin_hub.list() {
-            let builtin_active = enabled_config
-                .as_ref()
-                .is_some_and(|config| config.is_enabled(&entry.name));
-            let builtin_entry = ExtensionSkillEntry {
-                loaded: loaded.contains(&entry.name),
-                catalog: entry.clone(),
-            };
-            if let Some(existing) = entries
-                .iter_mut()
-                .find(|current| current.catalog.name == entry.name)
-            {
-                if builtin_active {
-                    *existing = builtin_entry;
-                }
-            } else {
-                entries.push(builtin_entry);
-            }
-        }
         entries.sort_by(|left, right| left.catalog.name.cmp(&right.catalog.name));
         Ok(entries)
     }
@@ -883,26 +856,12 @@ impl ExtensionControlService {
                     read_enabled_skills_config(&flow, service.enabled_config_path.clone()).await?;
                 let idempotent = config.is_enabled(&name) == enabled
                     && config.skills.contains_key(&name);
-                let category = match config.skills.get(&name) {
-                    Some(entry) if entry.category != "builtin" => entry.category.clone(),
-                    _ => skill_entry(&state, &name)
+                if enabled || !config.skills.contains_key(&name) {
+                    ensure_skill_installed(&state, &name)
                         .await
-                        .map(|(_, category)| category)
-                        .map_err(|error| SkillMutationError::BeforeCommit(error.to_string()))?,
-                };
-                match config.skills.get_mut(&name) {
-                    Some(entry) => entry.enabled = enabled,
-                    None => {
-                        config.skills.insert(
-                            name.clone(),
-                            SkillEnableEntry {
-                                category,
-                                enabled,
-                                baseline: false,
-                            },
-                        );
-                    }
+                        .map_err(|error| SkillMutationError::BeforeCommit(error.to_string()))?;
                 }
+                config.set_enabled(&name, enabled);
                 write_enabled_skills_config(&flow, service.enabled_config_path.clone(), config)
                     .await?;
                 service.reconcile_skill_runtimes(&state, &flow, operation_id, idempotent).await
@@ -979,8 +938,7 @@ impl ExtensionControlService {
         self.refresh_enabled_skills(state).await
     }
 
-    /// 把 enabled-skills.json 的当前状态同步到所有运行时目标:
-    /// 每个 target 先 reconcile 内置目录,再对齐用户/插件 skill。
+    /// 把 enabled-skills.json 的当前状态同步到所有运行时目标。
     async fn reconcile_skill_runtimes(
         &self,
         state: &Arc<AppState>,
@@ -1004,44 +962,22 @@ impl ExtensionControlService {
             Ok(targets) => {
                 for target in targets.iter() {
                     let workspace_generation = target.workspace_generation().to_string();
-                    let builtin_result = target
-                        .pool()
-                        .reconcile_builtin_skills(
-                            crate::skills_hub::builtin_skills_root(),
-                            self.enabled_config_path.clone(),
-                        )
-                        .await;
-                    let receipt = match builtin_result {
+                    let receipt = match reconcile_target_skills(target, &desired, &skill_root).await
+                    {
+                        Ok(changed_entries) => SkillTargetSettlementReceipt {
+                            target: target.scope().to_string(),
+                            workspace_generation,
+                            status: SkillTargetSettlementStatus::Settled,
+                            changed_entries,
+                            error: None,
+                        },
                         Err(error) => SkillTargetSettlementReceipt {
                             target: target.scope().to_string(),
                             workspace_generation,
                             status: SkillTargetSettlementStatus::Degraded,
                             changed_entries: Vec::new(),
-                            error: Some(error),
+                            error: Some(error.to_string()),
                         },
-                        Ok(mut changed_entries) => {
-                            match reconcile_target_skills(target, &desired, &skill_root).await {
-                            Ok(user_changed_entries) => {
-                                changed_entries.extend(user_changed_entries);
-                                changed_entries.sort();
-                                changed_entries.dedup();
-                                SkillTargetSettlementReceipt {
-                                    target: target.scope().to_string(),
-                                    workspace_generation,
-                                    status: SkillTargetSettlementStatus::Settled,
-                                    changed_entries,
-                                    error: None,
-                                }
-                            }
-                            Err(error) => SkillTargetSettlementReceipt {
-                                target: target.scope().to_string(),
-                                workspace_generation,
-                                status: SkillTargetSettlementStatus::Degraded,
-                                changed_entries,
-                                error: Some(error.to_string()),
-                            },
-                            }
-                        }
                     };
                     target_receipts.push(receipt);
                 }
@@ -1147,9 +1083,7 @@ impl ExtensionControlService {
                     config.skills.insert(
                         installed_name.clone(),
                         SkillEnableEntry {
-                            category: "user".to_string(),
                             enabled: true,
-                            baseline: false,
                         },
                     );
                 }

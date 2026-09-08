@@ -127,25 +127,6 @@ pub struct McpToolInfo {
     pub input_schema: Value,
 }
 
-// ── 技能相关 ─────────────────────────────────────────────────
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, rename = "SkillInfo")]
-pub struct SkillInfo {
-    pub name: String,
-    pub description: String,
-    pub enabled: bool,
-    pub tool_names: Vec<String>,
-    pub source: SkillSource,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, rename = "SkillSource")]
-pub enum SkillSource {
-    Builtin,
-    External { path: String },
-}
-
 // ── 配置相关 ─────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, TS)]

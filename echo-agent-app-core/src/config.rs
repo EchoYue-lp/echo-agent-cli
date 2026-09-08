@@ -73,6 +73,7 @@ fn default_eko_agent_settings() -> AgentSettings {
         compress_strategy: "summary".to_string(),
         compress_window: 20,
         subagent_timeout_secs: 600,
+        ..AgentSettings::default()
     }
 }
 

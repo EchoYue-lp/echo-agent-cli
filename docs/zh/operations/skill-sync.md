@@ -1,173 +1,111 @@
-# EKO Skill 管理与上游同步
+# EKO 外部 Skill 管理与上游同步
 
-## 概述
+## 内容边界
 
-EKO SkillsHub 支持从 git remote 安装和更新技能。内置技能随产品升级更新；
-用户安装的技能通过上游同步命令管理。
+EKO 不随应用捆绑 Skill，也不从源码树、Tauri resources 或默认 catalog 加载 Skill。
+产品运行时只消费两类外部内容：用户安装到 `~/.eko/skills/` 的独立 Skill，以及 Plugin
+generation 提供的 Skill。仓库根 `.agents/skills/` 只指导 EKO 开发，不进入产品运行时。
 
-`/skills install` 也识别 Agent Plugins 1.0 根 `plugin.json`：先复用 framework
-manifest/Skill validator 全量预检，再把 `skills/` 面作为一个 staging 目录原子安装并启用
-全部 Skill。每个 Git Skill 保存精确 `skills/<name>` subdir，后续可独立同步；包含
-`mcp.json` 的插件包暂不由 Skill 安装入口处理。若目标插件目录已存在，安装会要求先显式
-卸载，避免在没有 owner marker 时覆盖用户已有目录。
+SkillsHub 负责独立 Skill 的安装、启停、卸载、上游记录和 surface 投影；PluginRuntime
+负责完整插件包。两者都复用 framework 的 `SkillDocument`、manifest parser 与 validator，
+不维护第二套 frontmatter parser 或 activation runtime。
 
-Skill 的分类来自 `SKILL.md` metadata，不由目录深度决定。loader 递归扫描
-`skills/**/SKILL.md`，因此仓库同时支持 `skills/<name>/` 和
-`skills/<category>/<name>/`。当前清单以 GUI/TUI/CLI 的 `/skills list` 为准，文档不
-冻结数量，避免新增或删除 Skill 后出现第二份过期目录。
-
-## 技能分类
-
-| 类型             | 位置                                  | 更新方式                        |
-| ---------------- | ------------------------------------- | ------------------------------- |
-| **内置技能**     | `<echo-agent-cli>/skills/<category>/` | 随产品版本升级                  |
-| **用户安装技能** | `~/.eko/skills/`                      | 显式检查并通过 staging 原子同步 |
+`/skills install` 识别单个 Skill 仓库，也识别带根 `plugin.json` 的 Agent Plugins 1.0 包。
+对插件包，它先完整预检 `skills/` 面，再以 staging 目录原子安装并启用其中全部 Skill。
+包含 `mcp.json` 的插件包暂不由 Skill 安装入口处理；已有且没有 owner marker 的目标目录
+不会被覆盖，必须先显式卸载。
 
 ## enabled-skills.json
 
-管理技能的启用状态与 baseline，位于
-`~/.eko/enabled-skills.json`。当前 version 2 形状如下：
+`~/.eko/enabled-skills.json` 是外部 Skill 启用选择的唯一持久事实。当前 version 3：
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "skills": {
-    "brainstorming": {
-      "category": "methodology",
-      "enabled": true,
-      "baseline": true
-    },
-    "docx": { "category": "document", "enabled": false, "baseline": false }
+    "paper-reader": { "enabled": true },
+    "my-local-skill": { "enabled": false }
   }
 }
 ```
 
-- `enabled`: 技能是否加载进 agent
-- `baseline`: 仅对 methodology 技能有效；当前只允许
-  `verification-before-completion` 正文进入可替换 system-context projection
-- 旧文件的 generation、operation identity、content identity 与 repair debt 字段被忽略
-- upstream sync 的失败只在当次 typed receipt 中报告，不保留自动重放状态
-- 首次启动自动生成默认配置（1 个方法论 baseline-on）
+- `enabled` 决定已安装的外部 Skill 是否进入 Agent runtime。
+- 新安装的 Skill 默认启用；首次启动不生成任何默认 Skill 条目。
+- 旧文件中的 `category`、`baseline`、generation、operation identity、content identity 与
+  repair debt 字段会被忽略，已有条目的 `enabled` 选择继续生效。
+- 配置损坏或不可读时回退空集合并记录警告，不猜测用户应启用哪些内容。
 
-内置和用户 Skill 使用 framework `SkillDocument` 单一解析 API；SkillsHub 只负责 EKO 的
-安装、启停、上游记录和 surface 投影，不复制 frontmatter parser 或 activation runtime。
-
-## SKILL.md 官方标准格式
-
-EKO 只接受 agentskills.io 官方 frontmatter，不引入任何私有扩展命名空间：
-
-```yaml
----
-name: my-skill                  # 必填：kebab-case，1-64 字符，等于目录名
-description: >-                 # 必填：≤1024 字符；写清"做什么"和"何时用"，
-  一行描述，包含路由关键词。        # 路由是 description-driven
-license: MIT                    # 可选
-compatibility: Requires poppler # 可选：环境要求，≤500 字符
-allowed-tools: shell read_file  # 可选：空格分隔字符串（不是 YAML 列表）；空则省略
-metadata:                       # 可选：string → string 映射
-  category: methodology
-  author: author-name
----
-# 正文——完整指令
-```
-
-- Skill 文件不定义 Hooks。Hooks 属于 application/plugin configuration；frontmatter 出现
-  `hooks:` 会作为非标准字段直接解析失败。
-- "catalog 可发现"与"runtime active"不是同一状态：SkillsHub/catalog 能列出全部随附
-  Skill，只有 `enabled-skills.json` 允许的 entry 才注册 descriptor 与 LLM 路由候选；Hooks
-  继续由 application/plugin configuration 负责。
-- 校验门禁：framework `validate_skill_dir`（`skills-ref validate` 的进程内等价物）；
-  `cargo test -p echo-agent-app-core --lib skills_hub::catalog_gate` 遍历 `skills/`
-  断言零违规且 `BUILTIN_SKILL_NAMES` 与磁盘一致。
-
-`enabled` 是进程级全局策略，文件是唯一持久启用事实。GUI、TUI、CLI/JSONL 和
-channel 都进入 `ExtensionControlService`，使用原子写与同一即时 settlement。
-JSONL 输出 journaled typed `ExtensionReceipt`，不把 Skill slash command 交给模型。
-
-enable/disable/refresh 返回 `SkillSyncReceipt`；install、uninstall 和 upstream sync 分别用
-`SkillInstallSettlementReceipt`、`SkillUninstallSettlementReceipt` 与
-`SkillArtifactSyncReceipt` 保留相同 settlement，不能把 artifact 成功与 runtime degraded
-压成一个成功字符串。install receipt 的 `installed_names` 列出单 Skill 或插件包内全部
-已安装并启用的 Skill。
-
-## 直写直同步合同(2026-09 简化,ADR 0036)
-
-Extension authority 直接升级现有文件,不建立第二个 Skill store。schema 只保留
-平铺的 Skill map(`{category, enabled, baseline}`),原子写;旧文件遗留的
-generation / repair debt 字段被直接忽略。配置损坏或不可读时回退默认启用集
-(fail-open)并记录 warn 日志。
-
-每个变更操作(enable/disable/install/uninstall/sync/refresh)统一走:
+每个变更操作都经过同一个 Extension authority：
 
 ```text
 获取 extension mutation 锁
   -> 读取 enabled-skills.json
-  -> 修改条目
+  -> 校验外部 Skill 并修改条目
   -> 原子写
-  -> reconcile 所有运行时目标(内置目录 + 用户/插件 Skill)
+  -> reconcile 用户目录 Skill 到所有运行时目标（Plugin generation 独立管理）
   -> 返回 Settled 或 Degraded
 ```
 
-崩溃窗口内(文件已写、运行时未同步完成)的最坏情形,由下一次 skill 操作或应用
-启动补齐收敛;不保留精确重放状态。
+GUI、TUI、CLI/JSONL 和 channel 使用同一服务。文件已写但某个 runtime target 同步失败时，
+配置不回滚；下一次 Skill 操作、应用启动或 workspace load 会重新收敛。typed receipt 会分别
+报告 artifact 结果与逐 target runtime settlement，不保存精确重放状态。
+
+## SKILL.md 格式
+
+EKO 只接受 agentskills.io 官方 frontmatter，不引入私有扩展命名空间：
+
+```yaml
+---
+name: my-skill
+description: >-
+  说明这个 Skill 做什么以及何时使用。
+license: MIT
+compatibility: Requires poppler
+allowed-tools: shell read_file
+metadata:
+  category: research
+  author: author-name
+---
+# 完整指令
+```
+
+- `name` 必须是 1 至 64 个字符的 kebab-case，并与目录名一致。
+- `description` 最长 1024 个字符，路由依据写在这里。
+- `allowed-tools` 是空格分隔字符串，不是 YAML 列表。
+- `metadata` 必须是 string 到 string 的映射。
+- Skill 文件不定义 Hooks；Hooks 属于 application/plugin configuration。
+- framework `validate_skill_dir` 是唯一目录校验权威。
 
 ## 上游同步
 
-从 Git 安装时,EKO 在技能目录写入 `.eko-skill-source.json`,记录仓库 URL、
-子目录、revision、内容哈希和同步时间。该记录不进入 `SKILL.md`,也不影响
-技能加载。
-
-### 检查更新
+从 Git 安装时，EKO 在 Skill 目录写入 `.eko-skill-source.json`，记录仓库 URL、精确子目录、
+revision、内容哈希和同步时间。该记录不进入 `SKILL.md`，也不影响加载。
 
 ```bash
-/skills check-updates             # 全部技能
+/skills check-updates
 /skills check-updates paper-reader
-```
-
-检查通过 `git ls-remote` 获取上游 HEAD。结果区分:已是最新、存在更新、检测到
-本地修改、非 Git 安装和远程错误。GUI SkillsPanel 提供同一操作。
-
-### 同步
-
-```bash
 /skills sync paper-reader
 /skills sync all
 /skills sync paper-reader --force
 ```
 
-同步会先克隆到同文件系统的 staging 目录,验证 `SKILL.md`,计算内容哈希,再原子
-替换当前技能。检测到本地修改时默认不覆盖;只有显式 `--force` 才会替换。同步完成后，
-GUI、TUI、CLI/JSONL 和 channel 都通过 Extension authority 刷新 runtime target。refresh
-重新读取当前 flat policy 并 reconcile 所有运行时目标，返回同一个 `SkillSyncReceipt`
-即时 settlement。
+同步先克隆到同文件系统的 staging 目录，验证 `SKILL.md`，计算内容哈希，再原子替换当前
+Skill。检测到本地修改时默认不覆盖，只有显式 `--force` 才替换。Git 地址只接受 HTTPS；
+同步由用户显式触发，使用用户现有凭据，超时为 120 秒，不在后台自动拉取。
 
-## 本地应用约束
+## 依赖声明
 
-- Git 地址只接受 HTTPS,拒绝明文 HTTP、SSH 和 `file://` 等明显错误输入。
-- EKO 是用户自己的本地助理,允许用户配置可信的内网 Git 服务。
-- 更新和同步均为显式命令,不自动后台拉取。
-- Git 操作使用用户现有凭据并设置 120 秒超时。
-
-## 编写带依赖的技能
-
-### PEP 723 内联依赖（Python）
+Python Skill 可以使用 PEP 723 内联依赖：
 
 ```python
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = [
-#     "defusedxml",
-#     "lxml",
-# ]
+# dependencies = ["defusedxml", "lxml"]
 # ///
 ```
 
-`uv run --script` 自动建临时环境装依赖，无需 venv/pip。
-
-### 声明系统二进制依赖
-
-在 SKILL.md frontmatter metadata 中声明：
+系统二进制或 Python 包依赖可写入 string-valued metadata：
 
 ```yaml
 metadata:
@@ -175,7 +113,4 @@ metadata:
   requires-python-packages: "defusedxml, lxml"
 ```
 
-`metadata` 的值必须都是字符串。指令写在 Markdown 正文，支持文件放在 Skill 目录；
-EKO 不再使用顶层 `version`、`author`、`tags`、`instructions` 或 `resources` 旧字段。
-
-不自动安装——只探测并提示。
+EKO 只探测并提示依赖，不自动安装。

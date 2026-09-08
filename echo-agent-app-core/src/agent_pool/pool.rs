@@ -1480,59 +1480,6 @@ impl AgentPool {
         self.agents.read().await.len()
     }
 
-    /// Refresh the active builtin Skill set for this pool generation.
-    ///
-    /// Every live Agent refreshes its progressive Skill registry from the same
-    /// active builtin set. Hook registration is keyed by Skill source in the
-    /// shared registry, so re-registering an unchanged source is idempotent.
-    pub(crate) async fn reconcile_builtin_skills(
-        &self,
-        builtin_root: std::path::PathBuf,
-        enabled_config_path: std::path::PathBuf,
-    ) -> Result<Vec<String>, String> {
-        let primary = self.primary_agent().await.map_err(|error| error.to_string())?;
-        let primary_builtin_root = builtin_root.clone();
-        let primary_config_path = enabled_config_path.clone();
-        let (descriptors, mut changed_entries) = primary
-            .write_async(|agent| {
-                Box::pin(async move {
-                    let changed = reconcile_builtin_agent(
-                        agent,
-                        &primary_builtin_root,
-                        &primary_config_path,
-                    )
-                    .await?;
-                    Ok::<_, String>((agent.skill_descriptors(), changed))
-                })
-            })
-            .await?;
-
-        let handles = self
-            .agents
-            .read()
-            .await
-            .values()
-            .map(|pooled| pooled.handle.clone())
-            .filter(|handle| !Arc::ptr_eq(handle.inner(), primary.inner()))
-            .collect::<Vec<_>>();
-        for handle in handles {
-            let builtin_root = builtin_root.clone();
-            let enabled_config_path = enabled_config_path.clone();
-            let changed = handle
-                .write_async(|agent| {
-                    Box::pin(async move {
-                        reconcile_builtin_agent(agent, &builtin_root, &enabled_config_path).await
-                    })
-                })
-                .await?;
-            changed_entries.extend(changed);
-        }
-        self.agent_generation.write().await.skill_descriptors = descriptors;
-        changed_entries.sort();
-        changed_entries.dedup();
-        Ok(changed_entries)
-    }
-
     /// Return the primary Agent for this pool generation.
     pub(crate) async fn primary_agent(&self) -> anyhow::Result<AgentHandle> {
         self.primary_agent
@@ -1874,30 +1821,9 @@ impl AgentPool {
         if let Some(ref tep) = self.shared.tool_execution_pipeline {
             agent.set_tool_execution_pipeline(tep.clone());
         }
-        let skill_policy = Arc::new(crate::skills_hub::ActiveSkillLoadPolicy::new(
-            crate::data_root::user_data_path("enabled-skills.json"),
-            crate::skills_hub::builtin_skills_root(),
-            self.shared
-                .review_integration
-                .clone()
-                .map(|policy| policy as Arc<dyn echo_agent::skills::external::SkillLoadPolicy>),
-        ));
-        agent.set_skill_load_policy(Some(skill_policy));
-        agent
-            .reload_skills_from_dir(crate::skills_hub::builtin_skills_root())
-            .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let baseline_config_path = crate::data_root::user_data_path("enabled-skills.json");
-        let baseline_names = crate::skills_hub::apply_methodology_baseline(
-            &mut agent,
-            &baseline_config_path,
-        )
-        .await;
-        tracing::debug!(
-            conversation_id,
-            skills = ?baseline_names,
-            "Methodology baseline injected into pooled conversation Agent"
-        );
+        if let Some(skill_policy) = self.shared.review_integration.clone() {
+            agent.set_skill_load_policy(Some(skill_policy));
+        }
         let conversation_store = self
             .conversation_store_override
             .read()
@@ -1950,9 +1876,7 @@ impl AgentPool {
         // 3. Install the exact plugin generation committed by PluginRuntime.
         let agent_generation = self.agent_generation.read().await.clone();
         for desc in &agent_generation.skill_descriptors {
-            if !crate::skills_hub::is_builtin_skill_path(&desc.location) {
-                agent.skill_registry_mut().register_descriptor(desc.clone());
-            }
+            agent.skill_registry_mut().register_descriptor(desc.clone());
         }
         register_plugin_agents(&mut agent, &agent_generation.plugin_agents)
             .await
@@ -2033,45 +1957,4 @@ impl AgentPool {
             conversation_id.to_string(),
         ))
     }
-}
-
-async fn reconcile_builtin_agent(
-    agent: &mut echo_agent::agent::ReactAgent,
-    builtin_root: &std::path::Path,
-    enabled_config_path: &std::path::Path,
-) -> Result<Vec<String>, String> {
-    let builtin_names = |agent: &echo_agent::agent::ReactAgent| {
-        agent
-            .skill_descriptors()
-            .into_iter()
-            .filter(|descriptor| descriptor.location.starts_with(builtin_root))
-            .map(|descriptor| descriptor.name)
-            .collect::<std::collections::BTreeSet<_>>()
-    };
-    let before = builtin_names(agent);
-    let baseline_before = agent
-        .context()
-        .lock()
-        .await
-        .has_projection(crate::skills_hub::enabled_skills::METHODOLOGY_BASELINE_PROJECTION);
-    agent
-        .reload_skills_from_dir(builtin_root.to_path_buf())
-        .await
-        .map_err(|error| error.to_string())?;
-    agent.reconcile_skill_load_policy().await;
-    let baseline_names =
-        crate::skills_hub::apply_methodology_baseline(agent, enabled_config_path).await;
-    crate::runtime::configure_intent_router(agent);
-    let after = builtin_names(agent);
-    let mut changed = before
-        .symmetric_difference(&after)
-        .cloned()
-        .collect::<Vec<_>>();
-    if baseline_before != !baseline_names.is_empty() {
-        changed.extend(baseline_names);
-        if baseline_before && changed.is_empty() {
-            changed.push("verification-before-completion".to_string());
-        }
-    }
-    Ok(changed)
 }

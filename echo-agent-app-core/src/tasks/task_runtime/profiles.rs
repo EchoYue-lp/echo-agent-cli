@@ -46,31 +46,7 @@ pub struct ProfileTemplate {
     pub execution_guidance: &'static str,
     /// Review checklist items surfaced to the reviewer and plan UI.
     pub review_checklist: &'static [&'static str],
-    /// Universal Superpowers-style methodology workflows enabled for this
-    /// profile. The planner prompt references these so the LLM structures
-    /// plans accordingly (plan §46-99).
-    pub workflows: &'static [&'static str],
 }
-
-/// Universal workflows available to every profile (plan §67-87).
-pub const UNIVERSAL_WORKFLOWS: &[&str] = &[
-    "brainstorming",
-    "writing-plans",
-    "executing-plans",
-    "dispatching-parallel-agents",
-    "subagent-driven-work",
-    "systematic-debugging",
-    "quality-review",
-    "verification-before-completion",
-    "finishing-a-development-branch",
-];
-
-/// Coding-specific workflows enabled only for the AI Coding profile.
-pub const CODING_WORKFLOWS: &[&str] = &[
-    "test-driven-development",
-    "using-git-worktrees",
-    "finishing-a-development-branch",
-];
 
 impl ProfileTemplate {
     /// Look up the template for a profile. Always succeeds — `General` is the
@@ -162,7 +138,6 @@ should be parallelizable. Assign a role by capability, name concrete targets, \
 and state what evidence will prove the task complete. Keep assumptions, external \
 side effects, and unresolved risks explicit.",
     execution_guidance: "Apply the evidence, artifact, and verification standard stated by the task. Keep observed facts, assumptions, and unresolved work distinct.",
-    workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
         "Is the goal understood and restated?",
         "Is the plan concrete (specific targets, not vague)?",
@@ -187,7 +162,6 @@ their changes. Every behavior-changing task needs a concrete verification path \
 dirty-worktree preservation, state ownership, failure handling, and rollback \
 considerations when relevant. Cross-domain tasks may use data or research roles.",
     execution_guidance: "Work from the real repository and its local instructions. Preserve unrelated changes, keep edits scoped, and report exact build, test, type, and format evidence actually observed.",
-    workflows: CODING_WORKFLOWS,
     review_checklist: &[
         "Architecture fit with existing code?",
         "File changes match the task scope (no drive-by edits)?",
@@ -218,7 +192,6 @@ Durable user-facing analyses live under `analysis/<analysis-id>/` with a \
 versioned manifest whose id matches the directory; do not make \
 an in-memory-only notebook the source of truth.",
     execution_guidance: "Preserve raw inputs and provenance. Make transformations reproducible, state metric definitions and assumptions, and validate material results with reconciliation or sensitivity evidence. For formal inference, persist the exact Python/R script and record input hashes, package versions, seeds, missing-data handling, diagnostics, warnings, and result artifacts; do not hand-write statistical distributions or p-value approximations.",
-    workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
         "Data source and provenance are clear?",
         "Missing values and outliers inspected?",
@@ -245,7 +218,6 @@ limitations. Preserve disagreement and null results. Require a search trail and 
 evidence table when the scope is a review; add data or coding tasks for \
 statistical, dataset, notebook, or reproducibility work.",
     execution_guidance: "Keep a reproducible source trail. Record study type, methods, population or data, result, limitations, and direct citation support; preserve disagreement, null results, and evidence gaps.",
-    workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
         "Search strategy explicit and reproducible?",
         "Papers and citations real and verifiable?",
@@ -270,7 +242,6 @@ conflicting guidance, and uncertainty. Do not convert population evidence into \
 individual diagnosis or treatment. Add data-analysis or coding tasks for \
 cohorts, statistics, tables, notebooks, pipelines, or reproducibility work.",
     execution_guidance: "Frame clinical evidence with PICO, PECO, or an equivalent structure. Prioritize authoritative sources, assess evidence quality, applicability, harms, contraindications, disagreement, and uncertainty, and do not turn population evidence into individual medical advice.",
-    workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
         "Authoritative sources prioritized?",
         "Guideline / systematic-review / trial type distinguished?",

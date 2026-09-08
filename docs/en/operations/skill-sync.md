@@ -1,89 +1,94 @@
-# Skill Management and Upstream Sync
+# External Skill Management and Upstream Sync
 
-## Overview
+## Content Boundary
 
-EKO SkillsHub installs and updates Skills from Git remotes. Built-in Skills are
-updated with the product; user-installed Skills use explicit upstream sync.
-The loader recursively scans `skills/**/SKILL.md`, and category depth does not
-change Skill identity.
+EKO does not bundle Skills or load them from the source tree, Tauri resources,
+or a default catalog. Product runtimes consume only independently installed
+Skills under `~/.eko/skills/` and Skills supplied by plugin generations.
+Repository `.agents/skills/` files guide EKO development and are not product
+runtime content.
 
-`/skills install` also recognizes an Agent Plugins 1.0 root `plugin.json`. It
-reuses the framework manifest and Skill validators, preflights every Skill,
-then atomically installs and enables the complete `skills/` face as one staged
-directory. Each Git-installed Skill records its exact `skills/<name>` subdir
-for later independent sync. Packages containing `mcp.json` are not yet handled
-by the Skill installation entry point. An existing plugin target directory is
-never overwritten without an ownership marker; users must explicitly uninstall
-it first.
+SkillsHub owns installation, enablement, removal, upstream records, and surface
+projection for independent Skills. PluginRuntime owns complete plugin packages.
+Both reuse the framework `SkillDocument`, manifest parser, and validators
+without introducing another frontmatter parser or activation runtime.
 
-Built-in and user Skills share framework `SkillDocument` parsing. SkillsHub
-owns installation, enablement, upstream records, and surface projection; it
-does not own another frontmatter parser or activation runtime.
+`/skills install` accepts a single-Skill repository or an Agent Plugins 1.0
+package with a root `plugin.json`. For a plugin package, it preflights the full
+`skills/` face, then atomically stages, installs, and enables every Skill.
+Packages containing `mcp.json` are not handled by the Skill installation entry
+point. An existing target without an ownership marker is never overwritten and
+must be explicitly uninstalled first.
 
-## Official SKILL.md Format
+## enabled-skills.json
 
-EKO accepts only the official agentskills.io frontmatter — no private
-extension namespace:
+`~/.eko/enabled-skills.json` is the sole durable enablement fact for external
+Skills. The current version 3 schema is:
 
-```yaml
----
-name: my-skill                  # required: kebab-case, 1-64 chars, equals dir name
-description: >-                 # required: ≤1024 chars; what it does and when
-  One-line description with routing keywords.   # routing is description-driven
-license: MIT                    # optional
-compatibility: Requires poppler # optional: environment needs, ≤500 chars
-allowed-tools: shell read_file  # optional: space-separated string (not a list); omit if empty
-metadata:                       # optional: string → string mapping
-  category: methodology
-  author: author-name
----
-# Body — full instructions
+```json
+{
+  "version": 3,
+  "skills": {
+    "paper-reader": { "enabled": true },
+    "my-local-skill": { "enabled": false }
+  }
+}
 ```
 
-- Skill files do not define Hooks. Hooks are application/plugin configuration;
-  a frontmatter `hooks:` block is rejected as a non-standard field.
-- "Discoverable in the catalog" and "runtime active" are different states:
-  SkillsHub lists every shipped Skill, but only entries allowed by
-  `enabled-skills.json` register descriptors and LLM routing candidates;
-  Hooks remain application/plugin configuration.
-- Validation gate: framework `validate_skill_dir` (the in-process equivalent
-  of `skills-ref validate`); `cargo test -p echo-agent-app-core --lib
-  skills_hub::catalog_gate` walks `skills/` asserting zero violations and
-  `BUILTIN_SKILL_NAMES` parity with disk.
+- `enabled` determines whether an installed external Skill enters an Agent runtime.
+- A newly installed Skill is enabled; first startup creates no default entries.
+- Obsolete category, baseline, generation, operation identity, content identity,
+  and repair-debt fields are ignored while existing `enabled` choices remain.
+- Corrupt or unreadable configuration falls back to an empty set with a warning.
 
-| Type | Location | Update method |
-| --- | --- | --- |
-| Built-in | `<echo-agent-cli>/skills/<category>/` | Product release |
-| User-installed | `~/.eko/skills/` | Explicit check and atomic staging sync |
-
-## Enablement State
-
-`~/.eko/enabled-skills.json` is the sole durable enablement fact. Since the
-2026-09 simplification (ADR 0036) it stores only the flat skill map
-(`{category, enabled, baseline}`) written atomically; stale generation or
-repair-debt fields from older files are ignored. Corrupt or unreadable files
-fall back to the default active set (fail-open) with a warning log.
-
-Every mutation (enable/disable/install/uninstall/sync/refresh) follows:
+Every mutation uses the same Extension authority:
 
 ```text
 lock extension mutation
   -> read enabled-skills.json
-  -> mutate the entry
+  -> validate the external Skill and mutate its entry
   -> atomic write
-  -> reconcile all runtime targets (builtin dir + user/plugin skills)
+  -> reconcile user Skills to every runtime target (plugin generations are separate)
   -> return Settled or Degraded
 ```
 
-Within a crash window (file written, runtimes not yet reconciled) the next
-skill operation or app start converges the state; no precise replay is kept.
-Install receipts expose `installed_names` for either the single Skill or every
-Skill installed and enabled from a plugin package.
+GUI, TUI, CLI/JSONL, and channels share this service. A runtime-target failure
+does not roll back an already written file; the next Skill operation, app start,
+or workspace load converges again. Typed receipts keep artifact results and
+per-target runtime settlement distinct without retaining exact replay state.
+
+## SKILL.md Format
+
+EKO accepts only official agentskills.io frontmatter, with no private extension
+namespace:
+
+```yaml
+---
+name: my-skill
+description: >-
+  Describe what this Skill does and when it should be used.
+license: MIT
+compatibility: Requires poppler
+allowed-tools: shell read_file
+metadata:
+  category: research
+  author: author-name
+---
+# Full instructions
+```
+
+- `name` is 1-64 characters of kebab-case and matches the directory name.
+- `description` is at most 1,024 characters and carries routing guidance.
+- `allowed-tools` is a space-separated string, not a YAML list.
+- `metadata` is a string-to-string map.
+- Skill files do not define Hooks; Hooks belong to application/plugin configuration.
+- Framework `validate_skill_dir` is the sole directory-validation authority.
 
 ## Upstream Sync
 
-Git-installed Skills carry `.eko-skill-source.json` with repository URL,
-subdirectory, revision, content hash, and sync time.
+A Git-installed Skill carries `.eko-skill-source.json` with repository URL,
+exact subdirectory, revision, content hash, and sync time. This record is not
+part of `SKILL.md` and does not affect loading.
 
 ```bash
 /skills check-updates
@@ -94,19 +99,14 @@ subdirectory, revision, content hash, and sync time.
 ```
 
 Sync clones into a same-filesystem staging directory, validates `SKILL.md`,
-hashes content, and atomically replaces the installed Skill. Local changes are
-not overwritten without explicit `--force`. The shared extension authority then
-reconciles every runtime target and returns an immediate typed settlement.
+hashes the content, and atomically replaces the installed Skill. Local changes
+are not overwritten without `--force`. Git sources must use HTTPS. Sync is
+explicit, uses the user's credentials, times out after 120 seconds, and never
+pulls automatically in the background.
 
-## Local Constraints
+## Dependency Declarations
 
-Git sources must use HTTPS. Sync is explicit, uses the user's credentials, and
-has a 120-second timeout. The local application does not automatically pull
-from upstream.
-
-## Skills with Dependencies
-
-Python Skills can declare PEP 723 inline dependencies:
+Python Skills can use PEP 723 inline dependencies:
 
 ```python
 #!/usr/bin/env -S uv run --script
@@ -116,9 +116,12 @@ Python Skills can declare PEP 723 inline dependencies:
 # ///
 ```
 
-System binaries and Python packages can be declared in `SKILL.md` metadata;
-EKO probes and reports them but does not install them automatically.
+System binary or Python package dependencies can use string-valued metadata:
 
-All `metadata` values are strings. Instructions belong in the Markdown body,
-and supporting files belong in the Skill directory; EKO does not use the old
-top-level `version`, `author`, `tags`, `instructions`, or `resources` fields.
+```yaml
+metadata:
+  requires-binaries: "soffice, pdftoppm"
+  requires-python-packages: "defusedxml, lxml"
+```
+
+EKO detects and reports dependencies but does not install them automatically.

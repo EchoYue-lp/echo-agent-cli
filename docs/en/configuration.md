@@ -110,8 +110,13 @@ EKO reads the repository-standard root-to-working-directory chain of
 Plugins live in user or project plugin roots. User Skills live in
 `~/.eko/skills/`; desired enablement is stored in
 `~/.eko/enabled-skills.json`. Install, enable, disable, and upstream sync use
-an atomic flat policy plus immediate typed runtime reconciliation. See
-[Skill operations](./operations/skill-sync.md).
+an atomic version 3 flat policy whose entries contain only `{enabled}`, plus
+immediate typed runtime reconciliation. Obsolete category, baseline,
+generation, identity, and repair-debt fields are ignored while external Skill
+enablement is preserved. Corrupt files fall back to an empty set; EKO has no
+bundled or default-enabled Skills and injects no methodology baseline.
+Repository `.agents/skills/` files are development guidance, not runtime
+content. See [Skill operations](./operations/skill-sync.md).
 
 ## Channels and Environment
 

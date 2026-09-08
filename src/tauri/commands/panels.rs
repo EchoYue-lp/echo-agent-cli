@@ -1926,8 +1926,6 @@ mod scoped_control_tests {
                 description: "Review changes".to_string(),
                 path: PathBuf::from("/tmp/skills/review"),
                 category: "development".to_string(),
-                is_baseline: false,
-                is_builtin: true,
                 upstream_version: None,
                 source: None,
                 license: None,

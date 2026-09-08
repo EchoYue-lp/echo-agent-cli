@@ -4,6 +4,8 @@
 
 已采纳(部分取代:durable 结算状态机部分由 [ADR 0036](./0036-skill-policy-simplification.md) 取代;"enabled-skills.json 是运行时激活权威"的核心立场保留)
 
+Superseded by: ADR 0041
+
 ## 背景
 
 EKO 携带了较大的内置 Skill catalog，并在启动时把所有内置 `SKILL.md` 加载进每个 Agent。

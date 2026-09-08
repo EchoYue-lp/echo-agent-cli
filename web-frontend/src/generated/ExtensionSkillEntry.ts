@@ -19,14 +19,6 @@ export type ExtensionSkillEntry = {
    */
   category: string;
   /**
-   * 是否 baseline 注入
-   */
-  is_baseline: boolean;
-  /**
-   * 是否内置技能
-   */
-  is_builtin: boolean;
-  /**
    * 上游版本
    */
   upstream_version: string | null;

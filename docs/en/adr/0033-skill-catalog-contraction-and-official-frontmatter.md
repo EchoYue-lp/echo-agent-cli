@@ -4,6 +4,8 @@
 
 Accepted; catalog and baseline inventory amended on 2026-09-03
 
+Superseded by: ADR 0041
+
 ## Context
 
 The bundled EKO skill catalog carried routing and runtime semantics in private

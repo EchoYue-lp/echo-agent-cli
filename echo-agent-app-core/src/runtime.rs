@@ -962,13 +962,12 @@ impl AgentRuntime {
     /// 3. Configure auto-compression
     /// 4. Wrap in `AgentHandle`
     /// 5. Wire HITL dispatcher
-    /// 6. Load built-in skills
-    /// 7. Load user hooks
-    /// 8. Create hook bridges (task + subagent lifecycle)
-    /// 9. Initialize unified memory
-    /// 10. Load plugins (skills / hooks / MCP)
-    /// 11. Register LSP tools
-    /// 12. Fire startup hook
+    /// 6. Load user hooks
+    /// 7. Create hook bridges (task + subagent lifecycle)
+    /// 8. Initialize unified memory
+    /// 9. Load plugins (skills / hooks / MCP)
+    /// 10. Register LSP tools
+    /// 11. Fire startup hook
     pub async fn bootstrap(
         app_config: &EkoConfig,
         mut params: AgentCreateParams,
@@ -1133,56 +1132,6 @@ impl AgentRuntime {
             .set_default_approval_provider(hitl_dispatcher.clone())
             .await;
 
-        // ── 5. Built-in skills ──
-        // The durable enabled-skills file is the activation authority. All
-        // bundled files remain discoverable in SkillsHub, but disabled entries
-        // never register descriptors, hooks, or intent-routing candidates.
-        {
-            let builtin_skills_dir = crate::skills_hub::builtin_skills_root();
-            let enabled_config_path = crate::data_root::user_data_path("enabled-skills.json");
-            let active_policy = Arc::new(crate::skills_hub::ActiveSkillLoadPolicy::new(
-                enabled_config_path,
-                builtin_skills_dir.clone(),
-                None,
-            ));
-            agent_handle
-                .write(|agent| agent.set_skill_load_policy(Some(active_policy.clone())))
-                .await;
-            if builtin_skills_dir.is_dir() {
-                agent_handle
-                    .write_async(|a| {
-                        Box::pin(async move {
-                            match a.load_skills_from_dir(&builtin_skills_dir).await {
-                                Ok(names) => {
-                                    tracing::info!(count = names.len(), skills = ?names, "Built-in skills loaded");
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to load built-in skills: {e}");
-                                }
-                            }
-                        })
-                    })
-                    .await;
-            }
-        }
-
-        // ── 5b. Methodology baseline injection ──
-        // The same authority is called by pooled conversation Agent creation.
-        let baseline_config_path = crate::data_root::user_data_path("enabled-skills.json");
-        let baseline_names = agent_handle
-            .write_async(|agent| {
-                Box::pin(async move {
-                    crate::skills_hub::apply_methodology_baseline(agent, &baseline_config_path)
-                        .await
-                })
-            })
-            .await;
-        tracing::info!(
-            count = baseline_names.len(),
-            skills = ?baseline_names,
-            "Methodology baseline injected into primary Agent"
-        );
-
         // ── 6. User hooks ──
         // Single merged load: eko.yaml inline + ~/.eko/hooks.yaml +
         // .eko/hooks.yaml are merged into one HooksDefinition by
@@ -1276,11 +1225,7 @@ impl AgentRuntime {
                 }
             };
             let trigger_sink = review_integration.clone();
-            let skill_policy = Arc::new(crate::skills_hub::ActiveSkillLoadPolicy::new(
-                crate::data_root::user_data_path("enabled-skills.json"),
-                crate::skills_hub::builtin_skills_root(),
-                Some(review_integration.clone()),
-            ));
+            let skill_policy = review_integration.clone();
             let skill_curator = review_integration.curator();
             let workspace_skills = review_echo_agent_dir.join("skills");
             agent_handle
@@ -1526,7 +1471,6 @@ pub(crate) async fn register_lsp_tools(
 mod tests {
     use super::*;
     use echo_agent::intent::IntentClassifier;
-    use echo_agent::skills::external::{SkillLoader, tool_matcher};
 
     #[tokio::test]
     async fn lifecycle_broadcasts_root_cancel_before_joining_background_tasks() {
@@ -1900,42 +1844,6 @@ mod tests {
             "Standalone 'bug' should trigger coding, got {:?}",
             intent
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn bundled_skill_allowlists_match_registered_tool_names() -> anyhow::Result<()> {
-        let mut agent = echo_agent::agent::ReactAgent::new(
-            echo_agent::agent::AgentConfig::standard("test-model", "skill-audit", "test"),
-        );
-        crate::creator_tools::install_creator_tools(&mut agent);
-        let mut tool_names = agent.tool_names();
-        tool_names.extend(
-            ["task_create", "task_update", "task_list", "task_execute"]
-                .into_iter()
-                .map(str::to_string),
-        );
-
-        let skill_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills");
-        let mut loader = SkillLoader::new();
-        let descriptors = loader.discover_directory(skill_root).await?;
-        assert!(
-            !descriptors.is_empty(),
-            "bundled skills were not discovered"
-        );
-
-        for descriptor in descriptors {
-            for matcher in descriptor.allowed_tools {
-                assert!(
-                    tool_names
-                        .iter()
-                        .any(|tool_name| tool_matcher(&matcher, tool_name)),
-                    "Skill '{}' allowed-tools entry '{}' matches no registered tool",
-                    descriptor.name,
-                    matcher
-                );
-            }
-        }
         Ok(())
     }
 }

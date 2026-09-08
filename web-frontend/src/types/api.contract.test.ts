@@ -53,8 +53,6 @@ const serializedSkill = {
   description: 'Research workflow',
   path: '/skills/research',
   category: 'research',
-  is_baseline: false,
-  is_builtin: false,
   upstream_version: null,
   source: 'local',
   license: null,

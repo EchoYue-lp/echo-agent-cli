@@ -308,8 +308,8 @@ EKO 启动时把 framework 用户数据根设置为 `~/.eko`，也可用 `EKO_DA
 - Plugin：framework 从根 `plugin.json` 和固定组件目录生成不可变 prepared generation；EKO
   在 captured workspace target 上补充产品组件，完整验证后才替换 live generation。rollback
   使用 exact apply receipt，不重读旧文件。
-- Skill：内置和用户 Skill 都通过 framework loader；SkillsHub 负责 artifact
-  discovery/install/sync，不拥有第二份 live registry。
+- Skill：用户安装与 Plugin generation 提供的外部 Skill 都通过 framework loader；
+  SkillsHub 负责独立 artifact 的 discovery/install/sync，不拥有第二份 live registry。
 - 分析/研究：计划、脚本、数据、source/evidence/review/report 都保存为可检查 artifact。
 - Memory/evolution：workspace-bound layered memory、Review Inbox、shared hot projection 与
   `/reflect` 是应用策略；写入需要可追溯证据，并返回 generation-bound settlement receipt。
@@ -327,21 +327,22 @@ EKO 启动时把 framework 用户数据根设置为 `~/.eko`，也可用 `EKO_DA
 | EKO app-core       | workspace generation capture、mutation admission、配置文件、生命周期和 typed receipt |
 | surface            | 参数转换和 receipt 渲染                                                              |
 
-`enabled-skills.json` 是 Skill 启停的唯一持久事实，只保存
-`{category, enabled, baseline}` flat map。Skill settlement 在 extension mutation 锁内原子写，
-再向 global seed、已加载 workspace、existing AgentPool 和 future Agent reconcile。target
-失败返回带逐 target 错误的 typed `Degraded` receipt，不回滚已经提交的配置，也不保留
-generation CAS、operation identity 或 repair debt。
+`enabled-skills.json` 是外部 Skill 启停的唯一持久事实，version 3 只保存 `{enabled}` flat
+map。Skill settlement 在 extension mutation 锁内原子写，再向 global seed、已加载
+workspace、existing AgentPool 和 future Agent reconcile。target 失败返回带逐 target 错误的
+typed `Degraded` receipt，不回滚已经提交的配置，也不保留 generation CAS、operation
+identity 或 repair debt。
 
-配置损坏或不可读时统一回退默认启用集。文件已写但运行时未同步完成的窗口，由下一次
-Skill 操作、restart 或 workspace load 重新读取 flat policy 并收敛。install/uninstall/sync
-的 artifact 结果与 runtime settlement 保持分离，surface 不私下重试。
+配置损坏或不可读时回退空集合。文件已写但运行时未同步完成的窗口，由下一次 Skill 操作、
+restart 或 workspace load 重新读取 flat policy 并收敛。EKO 不再扫描源码树内置目录、加载
+Tauri Skill resource、生成默认启用集或注入方法论 baseline。install/uninstall/sync 的 artifact
+结果与 runtime settlement 保持分离，surface 不私下重试。
 
 service 接受 operation 后由应用 lifecycle 持有到 settlement；caller drop 不能取消已经接受的
 提交或 fanout。shutdown 先关闭 admission，再等待已接受 operation。完整决策见
 [ADR 0012](../adr/0012-extension-control-authority.md)。
 
-version 2 flat policy、`atomic_write`、ProductData-owned `SkillSyncReceipt` 和带
+version 3 flat policy、`atomic_write`、ProductData-owned `SkillSyncReceipt` 和带
 workspace generation 的 target receipt 已进入生产路径。GUI/headless bootstrap 在 Agent
 delivery recovery 前调用 on-load reconcile，workspace create/switch settlement 也执行同一
 收敛路径。

@@ -4,6 +4,8 @@
 
 Accepted
 
+Superseded by: ADR 0041
+
 ## Context
 
 EKO already has standard Skill parsing, discovery, enablement, and a user Skill
