@@ -94,7 +94,8 @@ define a `ChatTurnOutcome` wrapper; Task and webhook surfaces read only the
 fields they need at their final product boundary.
 
 External Skills follow the same ownership rule. EKO installs independent Skills
-under `~/.eko/skills/` and consumes Skills from plugin generations; it does not
+under `~/.eko/skills/`, discovers project Skills under the current project's
+`.eko/skills/`, and consumes Skills from plugin generations; it does not
 ship a built-in catalog, default active set, methodology baseline, or Tauri
 Skill resources. Framework parsing and validation remain generic authorities,
 while SkillsHub owns product installation and enablement. The version 3

@@ -24,6 +24,8 @@ pub struct AgentPool {
     app_config: RwLock<EkoConfig>,
     /// Working directory applied to existing and future pooled agents.
     working_dir: RwLock<Option<std::path::PathBuf>>,
+    /// Linked repository root used for project `AGENTS.md` and `.eko/skills/`.
+    project_root: RwLock<Option<std::path::PathBuf>>,
     permission_mode: RwLock<PermissionMode>,
     /// Workspace-scoped reasoning-depth publication. Mirrors
     /// `permission_mode`: applied to existing and future pooled agents (and
@@ -424,6 +426,7 @@ impl AgentPool {
             config,
             app_config: RwLock::new(runtime.session_app_config.clone()),
             working_dir: RwLock::new(working_dir),
+            project_root: RwLock::new(runtime.project_root.clone()),
             permission_mode: RwLock::new(PermissionMode::Default),
             thinking_override: RwLock::new(None),
             agent_generation: RwLock::new(AgentPluginGeneration::new(
@@ -487,6 +490,7 @@ impl AgentPool {
     )> {
         let WorkspaceAgentPoolResources {
             root,
+            project_root,
             kind,
             conversation_store,
             state_store,
@@ -503,6 +507,7 @@ impl AgentPool {
         );
         let authority_plugin_generation = self.agent_generation.read().await.clone();
         let mcp_config_snapshot = self.mcp_config_snapshot.read().await.clone();
+        let project_root_for_load = project_root.clone();
         let shared = SharedResources {
             subagent_event_bus: self.shared.subagent_event_bus.clone(),
             tool_manager: None,
@@ -536,6 +541,7 @@ impl AgentPool {
             config: self.config.clone(),
             app_config: RwLock::new(self.app_config.read().await.clone()),
             working_dir: RwLock::new(Some(root.clone())),
+            project_root: RwLock::new(project_root),
             permission_mode: RwLock::new(*self.permission_mode.read().await),
             thinking_override: RwLock::new(self.thinking_override.read().await.clone()),
             agent_generation: RwLock::new(authority_plugin_generation.clone()),
@@ -598,12 +604,38 @@ impl AgentPool {
             &pool,
         )
         .await;
+        // A workspace fork starts from the seed generation only as a source of
+        // process-safe resources. Remove its previous project/user descriptors
+        // before loading the linked project's own Skills, so project scope wins
+        // consistently over an identically named plugin or stale global Skill.
+        let authority_for_cleanup = authority_plugin_generation.clone();
+        primary
+            .handle
+            .write_async(|agent| {
+                Box::pin(async move {
+                    crate::agent_pool::remove_agent_plugin_generation(
+                        agent,
+                        &authority_for_cleanup,
+                    )
+                    .await;
+                })
+            })
+            .await;
+        let loaded_project_skills = crate::skills_hub::load_project_skills(
+            &primary.handle,
+            project_root_for_load.as_deref(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        if !loaded_project_skills.is_empty() {
+            tracing::info!(skills = ?loaded_project_skills, "Loaded project-local Skills");
+        }
         let (plugin_runtime, mcp_ownership) = match (lsp_runtime, mcp_config_snapshot.as_ref()) {
             (Some(lsp_runtime), Some(mcp_config)) => {
                 let ownership = crate::mcp_config_runtime::McpNameOwnershipRegistry::new(
                     mcp_config.mcp_servers.keys().cloned(),
                 );
-                let runtime = crate::plugin_runtime::PluginRuntimeService::new_for_scope(
+                let runtime = crate::plugin_runtime::PluginRuntimeService::new_for_scope_after_agent_reset(
                     primary.handle.clone(),
                     lsp_runtime,
                     Arc::clone(&ownership),
@@ -614,10 +646,16 @@ impl AgentPool {
                 runtime.bind_agent_pool(Arc::downgrade(&pool)).await?;
                 (Some(runtime), ownership)
             }
-            _ => (
-                None,
-                crate::mcp_config_runtime::McpNameOwnershipRegistry::new(Vec::<String>::new()),
-            ),
+            _ => {
+                pool.agent_generation.write().await.skill_descriptors = primary
+                    .handle
+                    .read(|agent| agent.skill_descriptors())
+                    .await;
+                (
+                    None,
+                    crate::mcp_config_runtime::McpNameOwnershipRegistry::new(Vec::<String>::new()),
+                )
+            }
         };
         crate::infra::fire_startup_hook(&primary.handle).await;
 
@@ -712,6 +750,7 @@ impl AgentPool {
             },
             app_config: RwLock::new(app_config),
             working_dir: RwLock::new(None),
+            project_root: RwLock::new(None),
             permission_mode: RwLock::new(PermissionMode::Default),
             thinking_override: RwLock::new(None),
             agent_generation: RwLock::new(AgentPluginGeneration::default()),
@@ -1752,6 +1791,7 @@ impl AgentPool {
         //    see None and the runtime checkpoint loop silently no-op'd.)
         let app_config = self.app_config.read().await.clone();
         let working_dir = self.working_dir.read().await.clone();
+        let project_root = self.project_root.read().await.clone();
         let state_store = self
             .state_store_override
             .read()
@@ -1761,7 +1801,9 @@ impl AgentPool {
         let params = infra::AgentCreateParams {
             model: None, // will use app_config default
             system_prompt: None,
-            project: None,
+            project: project_root
+                .as_ref()
+                .map(|root| root.to_string_lossy().into_owned()),
             session_id: Some(conversation_id.to_string()),
             conversation_id: Some(conversation_id.to_string()),
             react_checkpoint_interval: None,

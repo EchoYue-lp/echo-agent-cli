@@ -3,8 +3,9 @@
 ## Content Boundary
 
 EKO does not bundle Skills or load them from the source tree, Tauri resources,
-or a default catalog. Product runtimes consume only independently installed
-Skills under `~/.eko/skills/` and Skills supplied by plugin generations.
+or a default catalog. Product runtimes consume independently installed Skills
+under `~/.eko/skills/`, project Skills under `<project>/.eko/skills/`, and Skills
+supplied by plugin generations.
 Repository `.agents/skills/` files guide EKO development and are not product
 runtime content.
 
@@ -48,7 +49,7 @@ lock extension mutation
   -> read enabled-skills.json
   -> validate the external Skill and mutate its entry
   -> atomic write
-  -> reconcile user Skills to every runtime target (plugin generations are separate)
+  -> reconcile user Skills to every runtime target (project Skills and plugin generations are separate)
   -> return Settled or Degraded
 ```
 
@@ -56,6 +57,16 @@ GUI, TUI, CLI/JSONL, and channels share this service. A runtime-target failure
 does not roll back an already written file; the next Skill operation, app start,
 or workspace load converges again. Typed receipts keep artifact results and
 per-target runtime settlement distinct without retaining exact replay state.
+
+Project Skills are not written to `enabled-skills.json`. Agent creation discovers
+and loads them from the current project root's `.eko/skills/`. The project's
+root-to-working-directory `AGENTS.md` / `AGENTS.override.md` chain enters the
+same instruction projection. Project repositories own their Skill content and
+updates; user Skill install/sync commands never overwrite or uninstall them.
+
+The fixed name-collision precedence is project `.eko/skills/`, plugin Skills,
+then user `~/.eko/skills/`. A lower-precedence descriptor never overwrites one
+already registered from a higher-precedence source.
 
 ## SKILL.md Format
 

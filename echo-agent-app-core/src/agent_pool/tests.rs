@@ -817,6 +817,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linked_project_agents_and_skills_reach_workspace_agents() -> TestResult {
+        let seed = Arc::new(create_test_pool(3, false).await?);
+        seed.update_mcp_config_snapshot(Default::default()).await;
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let workspace_root = temp.path().join("workspace-data");
+        let project_root = temp.path().join("linked-project");
+        let skill_dir = project_root.join(".eko/skills/project-review");
+        let old_project_root = temp.path().join("old-project");
+        let old_skill_dir = old_project_root.join(".eko/skills/project-review");
+        std::fs::create_dir_all(&workspace_root).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&old_skill_dir).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(project_root.join(".git"))
+            .map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&skill_dir).map_err(|error| error.to_string())?;
+        std::fs::write(project_root.join("AGENTS.md"), "LINKED_PROJECT_AGENT_RULE")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            old_skill_dir.join("SKILL.md"),
+            "---\nname: project-review\ndescription: Old linked project\n---\n# Old",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: project-review\ndescription: Review linked project\n---\n# Review",
+        )
+        .map_err(|error| error.to_string())?;
+        let canonical_project_root = project_root
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let seed_primary = seed
+            .primary_agent()
+            .await
+            .map_err(|error| error.to_string())?;
+        crate::skills_hub::load_project_skills(&seed_primary, Some(&old_project_root))
+            .await
+            .map_err(|error| error.to_string())?;
+        seed_primary
+            .write_async(|agent| {
+                Box::pin(async move {
+                    agent
+                        .tag_skills_source(
+                            &["project-review".to_string()],
+                            "plugin:old-project",
+                        )
+                        .await;
+                })
+            })
+            .await;
+        let seed_generation = seed_primary
+            .read(|agent| agent.skill_descriptors())
+            .await;
+        let mut publication = seed
+            .begin_plugin_publication()
+            .await
+            .map_err(|error| error.to_string())?;
+        publication
+            .prepare(AgentPluginGeneration::new(
+                1,
+                seed_generation,
+                Vec::new(),
+                None,
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        publication.commit().await.map_err(|error| error.to_string())?;
+
+        let now = chrono::Utc::now();
+        let workspace = crate::workspace::Workspace {
+            id: crate::workspace::WorkspaceId::from_name("linked-project-context"),
+            name: "Linked project context".to_string(),
+            root: workspace_root,
+            project_root: Some(project_root.clone()),
+            kind: WorkspaceKind::General,
+            metadata: crate::workspace::WorkspaceMetadata::default(),
+            product_data_generation: String::new(),
+            created_at: now,
+            last_active: now,
+        };
+        let registry = crate::workspace::runtime::WorkspaceRuntimeRegistry::new();
+        let host = registry
+            .get_or_open(workspace)
+            .await
+            .map_err(|error| error.to_string())?;
+        let runtime = host
+            .get_or_open_execution(&seed)
+            .await
+            .map_err(|error| error.to_string())?;
+        let conversation = runtime
+            .pool()
+            .acquire("linked-project-conversation")
+            .await
+            .map_err(|error| error.to_string())?;
+
+        for agent in [runtime.primary_agent(), conversation.agent()] {
+            let (has_skill, descriptor, context) = agent
+                .read(|agent| {
+                    (
+                        agent.has_skill("project-review"),
+                        agent
+                            .skill_descriptors()
+                            .into_iter()
+                            .find(|descriptor| descriptor.name == "project-review")
+                            .map(|descriptor| (descriptor.source, descriptor.location)),
+                        agent.context().clone(),
+                    )
+                })
+                .await;
+            let (source, location) = descriptor.ok_or_else(|| {
+                "project-review descriptor was not retained in the workspace Agent".to_string()
+            })?;
+            assert!(has_skill);
+            assert_eq!(source.as_deref(), Some("eko:project-skill:project-review"));
+            assert!(location.starts_with(canonical_project_root.as_path()));
+            let messages = context
+                .lock()
+                .await
+                .messages()
+                .iter()
+                .filter_map(|message| message.content.as_text_ref())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(messages.contains("LINKED_PROJECT_AGENT_RULE"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runtime_state_store_rebind_reaches_existing_and_future_agents() -> TestResult {
         let pool = create_test_pool(4, false).await?;
         let existing_lease = pool

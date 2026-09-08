@@ -85,11 +85,13 @@ Remaining project status and release residuals are recorded in
 
 EKO no longer bundles Skills or owns a default active set, methodology
 baseline, or built-in catalog. SkillsHub manages independently installed
-Skills under `~/.eko/skills/`; plugin Skills come from plugin generations.
-`enabled-skills.json` records only external Skill enablement, and disabled
+Skills under `~/.eko/skills/`; the current project's `<project>/.eko/skills/`
+is discovered by its project runtime; plugin Skills come from plugin
+generations. `enabled-skills.json` records only user Skill enablement, and disabled
 entries do not register progressive activation or IntentRouter candidates.
 
 External `SKILL.md` files still use the framework's agentskills.io parser and
 validator, while Hooks remain application/plugin configuration. Repository
 `.agents/skills/` files guide development of EKO and are not product runtime
-content. See [ADR 0041](./adr/0041-external-only-skills.md).
+content. The current project's `AGENTS.md` chain enters the same instruction
+projection. See [ADR 0041](./adr/0041-external-only-skills.md).

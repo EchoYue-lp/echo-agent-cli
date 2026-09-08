@@ -308,8 +308,9 @@ EKO 启动时把 framework 用户数据根设置为 `~/.eko`，也可用 `EKO_DA
 - Plugin：framework 从根 `plugin.json` 和固定组件目录生成不可变 prepared generation；EKO
   在 captured workspace target 上补充产品组件，完整验证后才替换 live generation。rollback
   使用 exact apply receipt，不重读旧文件。
-- Skill：用户安装与 Plugin generation 提供的外部 Skill 都通过 framework loader；
-  SkillsHub 负责独立 artifact 的 discovery/install/sync，不拥有第二份 live registry。
+- Skill：用户安装、当前项目 `.eko/skills/` 与 Plugin generation 提供的外部 Skill 都通过
+  framework loader；SkillsHub 负责用户 artifact 的 discovery/install/sync，不拥有第二份
+  live registry。
 - 分析/研究：计划、脚本、数据、source/evidence/review/report 都保存为可检查 artifact。
 - Memory/evolution：workspace-bound layered memory、Review Inbox、shared hot projection 与
   `/reflect` 是应用策略；写入需要可追溯证据，并返回 generation-bound settlement receipt。

@@ -238,6 +238,7 @@ secret 用于 HMAC-SHA256 签名，不会写入普通事件日志。
 - Project Plugin：`<project>/.echo-agent/plugins/`
 - Local Plugin：`<project>/.echo-agent/plugins.local/`
 - 用户 Skill：`~/.eko/skills/`
+- 项目 Skill：`<project>/.eko/skills/`
 - Skill 启用状态：`~/.eko/enabled-skills.json`
 
 Plugin 使用根 `plugin.json` 和固定组件位置。Skill 安装、启用和上游同步见
@@ -249,7 +250,8 @@ Plugin 使用根 `plugin.json` 和固定组件位置。Skill 安装、启用和�
 flat Skill map，每项为 `{enabled}`，通过同目录 staging 与 `atomic_write` 原子替换。
 旧文件中的 `category`、`baseline`、generation、operation identity、content identity 与
 repair debt 字段会被忽略，但已有外部 Skill 的 `enabled` 选择会保留。损坏或不可读配置
-回退空集合并记录 warn；EKO 不再生成默认启用集。
+回退空集合并记录 warn；EKO 不再生成默认启用集。项目 Skill 由当前项目的运行时直接发现，
+不写入用户启用文件，也不受用户 Skill 的卸载操作影响。
 
 `ExtensionControlService` 在同一 mutation 锁内写文件，再向 global seed、已加载 workspace
 和 AgentPool 发布。`SkillSyncReceipt` 只返回本次操作的 `Settled` 或 `Degraded` 即时结果及
@@ -259,17 +261,20 @@ workspace load 会重新读取 flat policy 并收敛，不保留精确重放状�
 
 ## 项目指令
 
-EKO 使用标准 `AGENTS.md` / `AGENTS.override.md` 的 root-to-cwd chain，并组合 EKO 自己的
+EKO 使用当前项目标准 `AGENTS.md` / `AGENTS.override.md` 的 root-to-cwd chain，并组合 EKO 自己的
 用户/项目/本地记忆投影。应用不会把 `.echo-agent/AGENT.md` 或 `CLAUDE.md` 当成 EKO
 项目指令来源。
 
 常用 EKO 文件：
 
 - `~/.eko/user.md`：用户级长期偏好
-- `<project>/.eko/learned-rules.md`：已采纳的项目规则
+- `<project>/.eko/learned-rules.md`：无独立 workspace 时的已采纳项目规则；链接 workspace
+  使用 `<workspace>/.eko/learned-rules.md`
 - `<cwd>/.eko/local.md`：本机/目录级说明
 
-`.eko/AGENTS.md` 不是产品指令源，也不会被重命名为 `learned-rules.md`。详见
+项目根及其子目录中的 `AGENTS.md` 会进入同一个 instruction projection；链接 workspace 的
+项目根由 `Workspace.project_root` 指定。`.eko/AGENTS.md`
+不是产品指令源，也不会被重命名为 `learned-rules.md`。详见
 [ADR 0028](./adr/0028-current-product-schema-authority.md)。
 
 ## Channel

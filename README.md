@@ -538,6 +538,10 @@ echo-agent (AI Agent 框架)
 - **Project** — 项目级上下文和规则（`.eko/`）
 - **Local** — 本地开发环境特定配置
 
+项目根到当前工作目录的 `AGENTS.md` / `AGENTS.override.md` 会统一进入项目指令投影；
+项目 `.eko/skills/` 中的 Skill 会在运行时自动发现。相同名称按项目 Skill、Plugin Skill、
+用户 Skill 的顺序优先，项目 Skill 不写入全局启停文件。
+
 支持 `/auto-memory` 从会话提取带证据候选，统一进入 Review Inbox，采纳后才写入长期记忆。
 
 ### LSP 集成

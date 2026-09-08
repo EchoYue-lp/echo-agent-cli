@@ -266,6 +266,7 @@ pub struct SharedResources {
 
 pub(crate) struct WorkspaceAgentPoolResources {
     pub root: std::path::PathBuf,
+    pub project_root: Option<std::path::PathBuf>,
     pub kind: WorkspaceKind,
     pub conversation_store: Arc<dyn echo_agent::memory::ConversationStore>,
     pub state_store: Arc<dyn echo_agent::state::RuntimeStateStore>,

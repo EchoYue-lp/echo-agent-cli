@@ -89,6 +89,22 @@ async fn reconcile_target_skills(
     desired: &[(String, PathBuf)],
     skill_root: &std::path::Path,
 ) -> anyhow::Result<Vec<String>> {
+    let project_skill_names = target
+        .primary_agent()
+        .read(|agent| {
+            agent
+                .skill_descriptors()
+                .into_iter()
+                .filter(|descriptor| {
+                    descriptor
+                        .source
+                        .as_deref()
+                        .is_some_and(|source| source.starts_with(crate::skills_hub::project::PROJECT_SKILL_SOURCE_PREFIX))
+                })
+                .map(|descriptor| descriptor.name)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .await;
     let mut current = target
         .primary_agent()
         .read(|agent| {
@@ -119,6 +135,9 @@ async fn reconcile_target_skills(
     }
     let mut loaded = Vec::new();
     for (name, load_root) in desired {
+        if project_skill_names.contains(name) {
+            continue;
+        }
         loaded.extend(
             target
                 .plugin_runtime()

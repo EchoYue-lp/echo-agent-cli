@@ -12,7 +12,8 @@ EKO 曾在应用仓库中维护一套内置 Skill catalog，并同时拥有默�
 前端契约、打包配置、测试与文档。
 
 framework 已经提供标准 `SKILL.md` 解析、验证、渐进激活和 Plugin generation。EKO 也已经
-具备用户目录 `~/.eko/skills/`、Git 安装/同步、启停、卸载和 PluginRuntime。因此应用内置
+具备用户目录 `~/.eko/skills/`、当前项目 `.eko/skills/`、Git 安装/同步、启停、卸载和
+PluginRuntime。因此应用内置
 内容不是能力成立的前提；Skill 或 creator 工作流更适合作为独立 Skill 或独立插件按需安装。
 
 ## 候选方案
@@ -31,15 +32,19 @@ framework 已经提供标准 `SKILL.md` 解析、验证、渐进激活和 Plugin
 3. `~/.eko/enabled-skills.json` 升级为 version 3，每个条目只保存 `{enabled}`。旧文件中的
    `category`、`baseline` 和结算字段被忽略，但已有外部 Skill 的启用选择保留；损坏配置
    回退空集合，不生成默认条目。
-4. SkillsHub 只列出和管理 `~/.eko/skills/` 下的独立 Skill；Plugin Skill 继续由 framework
-   prepared generation 提供。所有 surface 仍通过同一个 Extension authority 变更并立即
-   reconcile 当前运行时目标。
-5. 删除只为内置 `skill-creator` / `plugin-creator` 服务的三个模型工具。现有 PluginRuntime
+4. SkillsHub 列出和管理 `~/.eko/skills/` 下的用户 Skill；当前项目 `.eko/skills/` 由项目
+   runtime 直接发现，Plugin Skill 继续由 framework prepared generation 提供。所有 surface
+   仍通过同一个 Extension authority 变更并立即 reconcile 当前运行时目标；项目 Skill 不写入
+   用户启用文件。名称冲突时优先级为项目 `.eko/skills/`、Plugin Skill、用户 Skill。
+5. 链接 workspace 的项目 `AGENTS.md` 与 `.eko/skills/` 从 `Workspace.project_root` 读取；
+   EKO workspace 的 learned-rules、MEMORY 和其它产品状态仍从 workspace `.eko` 读取，
+   缺失时不回退读取项目状态文件（只允许回退全局用户 MEMORY）。
+6. 删除只为内置 `skill-creator` / `plugin-creator` 服务的三个模型工具。现有 PluginRuntime
    scaffold、validate、install、reload 以及 `/plugins` 命令继续保留，独立 Skill 或插件可以
    讲解和调用这些既有能力。
-6. framework 的 `SkillDocument`、loader、validator、progressive activation 与 Plugin
+7. framework 的 `SkillDocument`、loader、validator、progressive activation 与 Plugin
    协议保持不变；本决策只收缩 EKO 应用层的内容和产品策略。
-7. 仓库 `.agents/skills/` 是开发 EKO 的协作指令，不是产品运行时资源，也不随应用打包。
+8. 仓库 `.agents/skills/` 是开发 EKO 的协作指令，不是产品运行时资源，也不随应用打包。
 
 ## 分层与失败处理
 

@@ -1641,42 +1641,97 @@ impl AppState {
         // incarnation, otherwise exact wait/cancel and file CAS become stale.
         self.ensure_workspace_idle_for_delete_inner(&workspace_id)
             .await?;
+        let previous_workspace = self.workspace.registry.open(&workspace_id).map_err(|error| {
+            anyhow::anyhow!("failed to capture workspace before project relink: {error}")
+        })?;
+        let requested_project_root = project_root.canonicalize().map_err(|error| {
+            anyhow::anyhow!(
+                "Project root cannot be resolved ({}): {error}",
+                project_root.display()
+            )
+        })?;
+        if !requested_project_root.is_dir() {
+            anyhow::bail!(
+                "Project root is not a directory: {}",
+                requested_project_root.display()
+            );
+        }
+        let was_current = self
+            .workspace
+            .current
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|host| host.id() == &workspace_id);
+        let had_loaded_runtime = self
+            .workspace
+            .runtimes
+            .loaded_host(&workspace_id)
+            .await
+            .is_some();
         let registry = Arc::clone(&self.workspace.registry);
         let link_workspace_id = workspace_id.clone();
         let workspace = tokio::task::spawn_blocking(move || {
-            registry.link_project(&link_workspace_id, project_root)
+            registry.link_project(&link_workspace_id, requested_project_root)
         })
         .await
         .map_err(|error| anyhow::anyhow!("workspace link task failed: {error}"))??;
-        if let Some(host) = self.workspace.runtimes.loaded_host(&workspace_id).await {
-            host.refresh_workspace(workspace.clone()).await?;
-            if let (Some(watcher), Some(execution)) =
-                (self.config_watcher.as_ref(), host.execution_if_loaded())
+        if had_loaded_runtime {
+            // A linked project root is part of the execution generation. Retire
+            // the idle host only after the registry commit succeeds, so an
+            // invalid project path cannot destroy the current runtime.
+            if let Err(error) = self
+                .workspace
+                .runtimes
+                .shutdown_and_evict_if_idle(&workspace_id)
+                .await
             {
-                match watcher
-                    .register_workspace(
-                        crate::config_watcher::ConfigWatcherWorkspaceIdentity::new(
-                            workspace.id.to_string(),
-                            workspace.opaque_product_data_generation(),
-                        ),
-                        workspace.root.clone(),
-                        execution.primary_agent(),
-                        execution.plugin_runtime(),
-                    )
-                    .await
-                {
-                    Ok(receipt) if receipt.errors.is_empty() => {}
-                    Ok(receipt) => tracing::warn!(
-                        workspace = %workspace.id,
-                        errors = %receipt.errors.join("; "),
-                        "Workspace relink committed with degraded config watcher settlement"
-                    ),
-                    Err(error) => tracing::warn!(
-                        workspace = %workspace.id,
-                        %error,
-                        "Workspace relink committed before config watcher registration settled"
-                    ),
+                let restore = self
+                    .workspace
+                    .registry
+                    .restore_project_link(&previous_workspace)
+                    .map_err(|restore_error| {
+                        anyhow::anyhow!(
+                            "project relink runtime shutdown failed: {error}; restoring project link failed: {restore_error}"
+                        )
+                    })?;
+                let _ = restore;
+                return Err(error);
+            }
+            if was_current {
+                *self.workspace.current.write().await = None;
+            }
+        }
+        if was_current {
+            let receipt = match self.switch_workspace_inner_locked(workspace.clone()).await {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    let restore = self
+                        .workspace
+                        .registry
+                        .restore_project_link(&previous_workspace);
+                    let recovery = match restore {
+                        Ok(_) => self.switch_workspace_inner_locked(previous_workspace).await,
+                        Err(restore_error) => Err(anyhow::anyhow!(
+                            "project relink rebuild failed: {error}; restoring project link failed: {restore_error}"
+                        )),
+                    };
+                    return match recovery {
+                        Ok(_) => Err(anyhow::anyhow!(
+                            "project relink rebuild failed; previous runtime restored: {error}"
+                        )),
+                        Err(recovery_error) => Err(anyhow::anyhow!(
+                            "project relink rebuild failed: {error}; previous runtime recovery failed: {recovery_error}"
+                        )),
+                    };
                 }
+            };
+            if receipt.status == WorkspaceTransitionStatus::Degraded {
+                tracing::warn!(
+                    workspace = %workspace.id,
+                    degraded = receipt.degraded_subsystems.len(),
+                    "Workspace relink rebuilt the current runtime with degraded subsystems"
+                );
             }
         }
         Ok(workspace)
@@ -4054,10 +4109,29 @@ impl AppState {
                 WorkspaceTransitionRequest::LinkProject {
                     workspace_id,
                     project_root,
-                } => state
-                    .link_workspace_project_inner(workspace_id, project_root)
-                    .await
-                    .map(WorkspaceSettlementOutcome::Linked),
+                } => {
+                    let workspace = state
+                        .link_workspace_project_inner(workspace_id, project_root)
+                        .await?;
+                    match state
+                        .extension_control
+                        .reconcile_enabled_skills_on_load(&state)
+                        .await
+                    {
+                        Ok(receipt)
+                            if receipt.status
+                                == crate::extension_control::SkillSettlementStatus::Settled => {}
+                        Ok(receipt) => tracing::warn!(
+                            status = ?receipt.status,
+                            "Project relink committed but user Skill reconciliation is degraded"
+                        ),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "Project relink committed but user Skill reconciliation remains pending"
+                        ),
+                    }
+                    Ok(WorkspaceSettlementOutcome::Linked(workspace))
+                }
             }
         }));
         let result = match settlement.as_mut() {

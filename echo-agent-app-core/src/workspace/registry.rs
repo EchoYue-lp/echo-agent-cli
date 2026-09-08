@@ -351,8 +351,8 @@ impl WorkspaceRegistry {
 
         let canonical = project_root.canonicalize().unwrap_or(project_root.clone());
 
-        if !canonical.exists() {
-            anyhow::bail!("Project root does not exist: {}", canonical.display());
+        if !canonical.is_dir() {
+            anyhow::bail!("Project root is not a directory: {}", canonical.display());
         }
 
         let project_display = canonical.display().to_string();
@@ -372,6 +372,19 @@ impl WorkspaceRegistry {
             project = %project_display,
             "Linked project to workspace"
         );
+        Ok(workspace)
+    }
+
+    /// Restore the project-link fields from a previously captured workspace
+    /// snapshot after a runtime relink could not settle. This is only used by
+    /// the application transition owner while its workspace write admission
+    /// is held; it does not create a second workspace authority.
+    pub(crate) fn restore_project_link(&self, snapshot: &Workspace) -> anyhow::Result<Workspace> {
+        let mut workspace = self.open(&snapshot.id)?;
+        workspace.project_root = snapshot.project_root.clone();
+        workspace.metadata.project_root_revision = snapshot.metadata.project_root_revision;
+        workspace.refresh_product_data_generation();
+        self.save_manifest(&workspace)?;
         Ok(workspace)
     }
 
@@ -471,6 +484,18 @@ mod tests {
         assert_eq!(linked.metadata.project_root_revision, 1);
         assert_eq!(inspected.metadata.project_root_revision, 1);
         assert_eq!(inspected.project_root, linked.project_root);
+        Ok(())
+    }
+
+    #[test]
+    fn link_project_rejects_a_regular_file() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(temp.path().join("registry"))?;
+        let workspace = registry.create("reject-file", WorkspaceKind::default())?;
+        let file = temp.path().join("project-file");
+        std::fs::write(&file, "not a project directory")?;
+
+        assert!(registry.link_project(&workspace.id, file).is_err());
         Ok(())
     }
 

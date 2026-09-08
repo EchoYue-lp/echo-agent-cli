@@ -29,6 +29,26 @@ pub fn discover_project_root(start: Option<&Path>) -> Option<PathBuf> {
     crate::utils::find_project_root(&dir)
 }
 
+/// Resolve one explicit project path, or discover the project containing the
+/// supplied working directory/current process directory.
+///
+/// The returned path is the authority for repository `AGENTS.md` files and
+/// project-local `.eko/skills/`. EKO workspace data remains a separate root.
+pub fn resolve_project_root(project: Option<&str>, working_dir: Option<&Path>) -> Option<PathBuf> {
+    let candidate = project
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| working_dir.map(Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())?;
+    discover_project_root(Some(&candidate)).or_else(|| {
+        if candidate.is_absolute() {
+            Some(candidate)
+        } else {
+            candidate.canonicalize().ok()
+        }
+    })
+}
+
 pub fn load_project_context(project_root: &Path) -> ProjectContext {
     let name = project_root
         .file_name()

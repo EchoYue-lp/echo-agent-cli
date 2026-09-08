@@ -15,8 +15,9 @@ and documentation updates.
 
 The framework already provides standard `SKILL.md` parsing, validation,
 progressive activation, and plugin generations. EKO already supports the user
-root `~/.eko/skills/`, Git installation and sync, enablement, removal, and
-PluginRuntime. Bundled content is not required for those capabilities; Skill
+root `~/.eko/skills/`, the current project's `.eko/skills/`, Git installation
+and sync, enablement, removal, and PluginRuntime. Bundled content is not
+required for those capabilities; Skill
 and creator workflows can be installed independently as Skills or plugins.
 
 ## Options
@@ -39,18 +40,26 @@ and creator workflows can be installed independently as Skills or plugins.
    per-entry field. Obsolete category, baseline, and settlement fields are
    ignored while existing external enablement choices remain. Corrupt input
    falls back to an empty set and no default entries are created.
-4. SkillsHub lists and manages only independent Skills under `~/.eko/skills/`.
+4. SkillsHub lists and manages user Skills under `~/.eko/skills/`; the current
+   project's `.eko/skills/` is discovered directly by its project runtime.
    Plugin Skills continue to come from framework prepared generations. Every
    surface still changes state through one Extension authority and immediately
-   reconciles current runtime targets.
-5. Remove the three model tools that existed only for the bundled
+   reconciles current runtime targets; project Skills are not written to the
+   user enablement file. Name collisions use project `.eko/skills/`, plugin
+   Skills, then user Skills as the precedence order.
+5. Linked-workspace `AGENTS.md` and `.eko/skills/` are read from
+   `Workspace.project_root`; EKO workspace learned rules, MEMORY, and other
+   product state remain under the workspace `.eko` directory, with no fallback
+   to project state files when those state files are missing (only global user
+   MEMORY fallback is allowed).
+6. Remove the three model tools that existed only for the bundled
    `skill-creator` and `plugin-creator`. Existing PluginRuntime scaffold,
    validation, installation, reload, and `/plugins` commands remain available
    for independently installed guidance to use.
-6. Framework `SkillDocument`, loading, validation, progressive activation, and
+7. Framework `SkillDocument`, loading, validation, progressive activation, and
    plugin protocols remain unchanged. This decision narrows only EKO application
    content and policy.
-7. Repository `.agents/skills/` files are development instructions, not product
+8. Repository `.agents/skills/` files are development instructions, not product
    runtime resources, and are not packaged with EKO.
 
 ## Placement and Failure Handling

@@ -21,6 +21,29 @@ impl PluginRuntimeService {
             RegistrySource::Default,
             target_scope,
             authority_generation,
+            true,
+        )
+        .await
+    }
+
+    /// Construct a scoped plugin runtime after the caller has already
+    /// retired the seed Agent generation. This avoids a second name-based
+    /// descriptor cleanup after project-local Skills have been loaded.
+    pub(crate) async fn new_for_scope_after_agent_reset(
+        agent_handle: AgentHandle,
+        lsp: PluginLspRuntime,
+        mcp_ownership: Arc<McpNameOwnershipRegistry>,
+        target_scope: String,
+        authority_generation: Option<AgentPluginGeneration>,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::new_with_source(
+            agent_handle,
+            lsp,
+            mcp_ownership,
+            RegistrySource::Default,
+            target_scope,
+            authority_generation,
+            false,
         )
         .await
     }
@@ -32,6 +55,7 @@ impl PluginRuntimeService {
         registry_source: RegistrySource,
         target_scope: String,
         authority_generation: Option<AgentPluginGeneration>,
+        remove_authority_descriptors: bool,
     ) -> anyhow::Result<Arc<Self>> {
         let framework_generation = authority_generation
             .as_ref()
@@ -84,7 +108,9 @@ impl PluginRuntimeService {
             agent_pool: RwLock::new(None),
             mutation_supervisor: Mutex::new(PluginMutationSupervisor::default()),
         });
-        if let Some(authority_generation) = authority_generation {
+        if remove_authority_descriptors
+            && let Some(authority_generation) = authority_generation
+        {
             // A cold workspace primary is created from the global pool's exact
             // committed projection. Retire it before applying the workspace's
             // full User + Project + Local prepared set so global project-only
@@ -145,6 +171,7 @@ impl PluginRuntimeService {
             },
             target_scope,
             None,
+            true,
         )
         .await
     }

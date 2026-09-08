@@ -116,11 +116,13 @@ watcher retained cell、按 typed cursor drain 到真实终态，再向全部 su
 绝不隐式停止 command 本身。
 
 EKO 不再随应用捆绑 Skill，也不维护默认启用集、方法论 baseline 或内置 catalog。
-SkillsHub 只管理用户安装到 `~/.eko/skills/` 的独立 Skill；Plugin 中的 Skill 由插件
-generation 提供。`enabled-skills.json` 只记录外部 Skill 的启用选择，禁用项不会注册
+SkillsHub 管理用户安装到 `~/.eko/skills/` 的独立 Skill；当前项目
+`<project>/.eko/skills/` 由项目运行时直接发现；Plugin 中的 Skill 由插件 generation 提供。
+`enabled-skills.json` 只记录用户 Skill 的启用选择，禁用项不会注册
 progressive activation entry 或 IntentRouter 候选。
 
 外部 `SKILL.md` 仍由 framework 的 agentskills.io 标准解析器和 validator 统一处理，
 Hooks 继续属于 application/plugin configuration。仓库根 `.agents/skills/` 是开发本项目时
-使用的 Agent 指导，不属于 EKO 产品运行时。详见 ADR
+使用的 Agent 指导，不属于 EKO 产品运行时；当前项目 `AGENTS.md` 会作为项目 instruction
+projection 参与每个 Agent。详见 ADR
 [0041](./adr/0041-external-only-skills.md)。

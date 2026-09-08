@@ -13,8 +13,9 @@
 
 `Store` 是重载名称，不表示这些类型共享同一数据模型。讨论状态时必须带领域限定，例如“memory Store”“conversation Store”“TaskRuntime journal”或“trace RunStore”。
 
-`skills/` 只保存用户安装的独立 Skill，`enabled-skills.json` 只保存这些外部 Skill 的
-`{enabled}` 选择。EKO 不在数据根或应用包中生成内置 Skill、默认启用集或 baseline。
+数据根下的 `skills/` 只保存用户安装的独立 Skill；当前项目根下的 `.eko/skills/` 保存项目
+Skill。`enabled-skills.json` 只保存用户 Skill 的 `{enabled}` 选择。EKO 不在数据根或应用包
+中生成内置 Skill、默认启用集或 baseline。
 
 ## Turn 与正式任务:TaskRuntime Journal 是事实权威
 

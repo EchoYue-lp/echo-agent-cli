@@ -213,7 +213,22 @@ impl UnifiedMemory {
 pub(crate) fn load_instruction_projection_strict(
     root: Option<&std::path::Path>,
 ) -> std::io::Result<InstructionProjectionSnapshot> {
-    let suffix = InstructionProvider::load_for_strict(root)?
+    load_instruction_projection_strict_with_state(root, None)
+}
+
+/// Build an instruction projection from a linked project while retaining
+/// EKO-owned learned rules and hot memory under a separate state directory.
+pub(crate) fn load_instruction_projection_strict_with_state(
+    project_root: Option<&std::path::Path>,
+    state_dir: Option<&std::path::Path>,
+) -> std::io::Result<InstructionProjectionSnapshot> {
+    let provider = match state_dir {
+        Some(state_dir) => {
+            InstructionProvider::load_for_strict_with_state(project_root, Some(state_dir))?
+        }
+        None => InstructionProvider::load_for_strict(project_root)?,
+    };
+    let suffix = provider
         .get_instruction_suffix()
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_string());

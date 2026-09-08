@@ -73,6 +73,16 @@ impl InstructionProvider {
     /// publishing a runtime generation. Missing optional files are valid;
     /// symlinks, non-regular entries, invalid UTF-8, and read failures are not.
     pub(crate) fn load_for_strict(working_dir: Option<&Path>) -> std::io::Result<Self> {
+        Self::load_for_strict_with_state(working_dir, None)
+    }
+
+    /// Strictly load project/repository instructions from one path while
+    /// optionally taking EKO-owned learned rules and hot memory from another
+    /// state directory (used by linked workspaces).
+    pub(crate) fn load_for_strict_with_state(
+        working_dir: Option<&Path>,
+        state_dir: Option<&Path>,
+    ) -> std::io::Result<Self> {
         let project_root = working_dir.map(|path| {
             crate::utils::find_project_root(path).unwrap_or_else(|| path.to_path_buf())
         });
@@ -91,15 +101,22 @@ impl InstructionProvider {
                 .map(|root| root.join(".eko").join("local.md"))
                 .as_deref(),
         )?;
-        let agents_level = strict_learned_rules(project_root.as_deref())?
-            .map(|raw| crate::utils::strip_yaml_frontmatter(&raw));
-        let project_memory = project_root
-            .as_deref()
-            .map(|root| root.join(".eko").join("MEMORY.md"));
+        let agents_level = match state_dir {
+            Some(root) => strict_optional_text(Some(&root.join(LEARNED_RULES_FILE)))?,
+            None => strict_learned_rules(project_root.as_deref())?,
+        }
+        .map(|raw| crate::utils::strip_yaml_frontmatter(&raw));
         let global_memory = crate::data_root::user_data_path("MEMORY.md");
-        let hot_memory = match project_memory.as_deref() {
-            Some(path) if path.try_exists()? => strict_optional_text(Some(path))?,
-            _ => strict_optional_text(Some(&global_memory))?,
+        let hot_memory = if let Some(state_dir) = state_dir {
+            match strict_optional_text(Some(&state_dir.join("MEMORY.md")))? {
+                Some(raw) => Some(raw),
+                None => strict_optional_text(Some(&global_memory))?,
+            }
+        } else {
+            match project_root.as_deref() {
+                Some(root) => strict_optional_text(Some(&root.join(".eko").join("MEMORY.md")))?,
+                None => strict_optional_text(Some(&global_memory))?,
+            }
         }
         .map(|raw| crate::utils::strip_yaml_frontmatter(&raw));
 
@@ -436,6 +453,49 @@ mod tests {
         assert!(repository.contains("ROOT_RULE"));
         assert!(repository.contains("CHILD_RULE"));
         assert!(!repository.contains("NOT_EKO_PROTOCOL"));
+        Ok(())
+    }
+
+    #[test]
+    fn strict_loader_keeps_project_agents_and_eko_state_rules_distinct() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        let state = temp.path().join("state/.eko");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(project.join(".eko"))?;
+        std::fs::create_dir_all(&state)?;
+        std::fs::write(project.join("AGENTS.md"), "PROJECT_AGENT_RULE")?;
+        std::fs::write(state.join("learned-rules.md"), "STATE_LEARNED_RULE")?;
+
+        let provider =
+            InstructionProvider::load_for_strict_with_state(Some(&project), Some(&state))?;
+        let repository = provider.repository_level.unwrap_or_default();
+        let learned = provider.agents_level.unwrap_or_default();
+        assert!(repository.contains("PROJECT_AGENT_RULE"));
+        assert_eq!(learned, "STATE_LEARNED_RULE");
+        Ok(())
+    }
+
+    #[test]
+    fn strict_loader_does_not_fallback_to_project_state_files() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        let state = temp.path().join("state/.eko");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(project.join(".eko"))?;
+        std::fs::create_dir_all(&state)?;
+        std::fs::write(project.join(".eko/learned-rules.md"), "PROJECT_LEARNED")?;
+        std::fs::write(project.join(".eko/MEMORY.md"), "PROJECT_MEMORY")?;
+
+        let provider =
+            InstructionProvider::load_for_strict_with_state(Some(&project), Some(&state))?;
+        assert!(provider.agents_level.is_none());
+        assert!(
+            !provider
+                .hot_memory
+                .as_deref()
+                .is_some_and(|memory| memory.contains("PROJECT_MEMORY"))
+        );
         Ok(())
     }
 

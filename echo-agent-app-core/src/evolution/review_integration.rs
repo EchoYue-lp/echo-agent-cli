@@ -67,6 +67,9 @@ struct ReviewBinding {
     authority_scope: String,
     workspace_generation: String,
     echo_agent_dir: PathBuf,
+    /// Optional linked repository root. Its `AGENTS.md` chain and
+    /// `.eko/skills/` are project-owned inputs, distinct from EKO state.
+    project_root: Option<PathBuf>,
     store: Arc<dyn Store>,
     generation: u64,
     layer_manager: Arc<Mutex<Option<Arc<MemoryLayerManager>>>>,
@@ -731,12 +734,29 @@ pub struct ReviewIntegration {
 impl ReviewIntegration {
     /// Create a new review integration with the given config.
     pub fn new(config: ReviewConfig, echo_agent_dir: PathBuf, store: Arc<dyn Store>) -> Self {
-        Self::new_scoped(
+        Self::new_scoped_with_project_root(
             config,
             echo_agent_dir,
             store,
             "global".to_string(),
             "global".to_string(),
+            None,
+        )
+    }
+
+    pub fn new_with_project_root(
+        config: ReviewConfig,
+        echo_agent_dir: PathBuf,
+        store: Arc<dyn Store>,
+        project_root: Option<PathBuf>,
+    ) -> Self {
+        Self::new_scoped_with_project_root(
+            config,
+            echo_agent_dir,
+            store,
+            "global".to_string(),
+            "global".to_string(),
+            project_root,
         )
     }
 
@@ -746,6 +766,24 @@ impl ReviewIntegration {
         store: Arc<dyn Store>,
         authority_scope: String,
         workspace_generation: String,
+    ) -> Self {
+        Self::new_scoped_with_project_root(
+            config,
+            echo_agent_dir,
+            store,
+            authority_scope,
+            workspace_generation,
+            None,
+        )
+    }
+
+    pub fn new_scoped_with_project_root(
+        config: ReviewConfig,
+        echo_agent_dir: PathBuf,
+        store: Arc<dyn Store>,
+        authority_scope: String,
+        workspace_generation: String,
+        project_root: Option<PathBuf>,
     ) -> Self {
         let forwarding_evolution_observer = Arc::new(RwLock::new(None));
         let projection_gate = Arc::new(tokio::sync::Mutex::new(()));
@@ -776,6 +814,7 @@ impl ReviewIntegration {
                         authority_scope,
                         workspace_generation,
                         echo_agent_dir,
+                        project_root,
                         store,
                         generation: 0,
                         layer_manager: Arc::new(Mutex::new(None)),
@@ -877,8 +916,10 @@ impl ReviewIntegration {
                 .await?;
         }
         let effects = promoter.promote_rule(proposal, &change_log).await?;
-        let snapshot = crate::unified_memory::load_instruction_projection_strict(
-            lease.echo_agent_dir().parent(),
+        let binding = self.binding_snapshot();
+        let snapshot = crate::unified_memory::load_instruction_projection_strict_with_state(
+            binding.project_root.as_deref(),
+            Some(&binding.echo_agent_dir),
         )
         .map_err(|error| RulePromotionError::Projection(error.to_string()))?;
         self.publish_rule_projection(snapshot).await?;
@@ -944,10 +985,14 @@ impl ReviewIntegration {
 
     fn current_or_load_rule_projection(
         &self,
-        lease: &ReviewGenerationLease,
+        _lease: &ReviewGenerationLease,
     ) -> Result<crate::unified_memory::InstructionProjectionSnapshot, RulePromotionError> {
-        crate::unified_memory::load_instruction_projection_strict(lease.echo_agent_dir().parent())
-            .map_err(|error| RulePromotionError::Projection(error.to_string()))
+        let binding = self.binding_snapshot();
+        crate::unified_memory::load_instruction_projection_strict_with_state(
+            binding.project_root.as_deref(),
+            Some(&binding.echo_agent_dir),
+        )
+        .map_err(|error| RulePromotionError::Projection(error.to_string()))
     }
 
     fn has_rule_projection_primary(&self) -> bool {
@@ -1519,6 +1564,11 @@ impl echo_agent::skills::external::SkillLoadPolicy for ReviewIntegration {
         let current_root = binding.echo_agent_dir.join("skills");
         if let Some(skill_root) = workspace_skill_root(&descriptor.location)
             && normalize_path(&skill_root) != normalize_path(&current_root)
+            && binding
+                .project_root
+                .as_ref()
+                .map(|root| normalize_path(&root.join(".eko").join("skills")))
+                .is_none_or(|project_root| normalize_path(&skill_root) != project_root)
         {
             return false;
         }
@@ -1787,6 +1837,32 @@ mod tests {
             .path()
             .join("workspace-b/.eko/skills/test-skill/SKILL.md");
         assert!(!echo_agent::skills::external::SkillLoadPolicy::allows(
+            &integration,
+            &descriptor,
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn skill_policy_allows_linked_project_skills() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let echo_dir = temp.path().join("workspace/.eko");
+        let project_root = temp.path().join("project");
+        let store = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
+        let integration = ReviewIntegration::new_with_project_root(
+            ReviewConfig::default(),
+            echo_dir,
+            store,
+            Some(project_root.clone()),
+        );
+        let mut descriptor = echo_agent::skills::external::SkillDocument::parse(
+            "---\nname: project-skill\ndescription: project skill\n---\nbody",
+        )
+        .map_err(|error| error.to_string())?
+        .into_descriptor();
+        descriptor.location = project_root.join(".eko/skills/project-skill/SKILL.md");
+
+        assert!(echo_agent::skills::external::SkillLoadPolicy::allows(
             &integration,
             &descriptor,
         ));

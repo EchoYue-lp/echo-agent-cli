@@ -287,10 +287,6 @@ impl WorkspaceRuntimeHost {
         self.workspace.read().await.clone()
     }
 
-    pub(crate) fn execution_if_loaded(&self) -> Option<Arc<WorkspaceExecutionRuntime>> {
-        self.execution.get().map(Arc::clone)
-    }
-
     pub(crate) fn id(&self) -> &WorkspaceId {
         &self.resources.workspace().id
     }
@@ -453,17 +449,20 @@ impl WorkspaceRuntimeHost {
             .get_or_try_init(|| async {
                 let task_runtime = self.task_runtime().await?;
                 let workspace = self.workspace().await;
-                let review_integration = Arc::new(ReviewIntegration::new_scoped(
+                let project_root = workspace.project_root.clone();
+                let review_integration = Arc::new(ReviewIntegration::new_scoped_with_project_root(
                     echo_agent::evolution::ReviewConfig::default(),
                     self.resources.state_dir().to_path_buf(),
                     self.resources.memory_store(),
                     workspace.id.to_string(),
                     workspace.opaque_product_data_generation(),
+                    project_root.clone(),
                 ));
                 let workspace_io_identity = self.workspace_io_identity();
                 let (pool, plugin_runtime, _mcp_ownership) = seed_pool
                     .fork_for_workspace(WorkspaceAgentPoolResources {
                         root: self.root().to_path_buf(),
+                        project_root: project_root.clone(),
                         kind: workspace.kind,
                         conversation_store: self.resources.conversation_store(),
                         state_store: self.resources.runtime_state_store(),
@@ -1052,8 +1051,11 @@ impl WorkspaceRuntimeRegistry {
                 activity.active_controls
             );
         }
-        closing.commit();
         host.shutdown_runtime().await?;
+        // Keep the closing guard uncommitted until shutdown succeeds. On a
+        // shutdown error its Drop implementation reopens the host so callers
+        // can retry or restore a failed project relink.
+        closing.commit();
         hosts.remove(workspace_id);
         Ok(true)
     }

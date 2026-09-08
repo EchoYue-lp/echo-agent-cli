@@ -2928,10 +2928,37 @@ mod workspace_transition_tests {
             .map_err(|error| error.to_string())?;
         drop(prelink_product_b);
         drop(runtime_b);
+        let invalid_project = temp.path().join("invalid-project-file");
+        std::fs::write(&invalid_project, "not a project directory")
+            .map_err(|error| error.to_string())?;
+        assert!(
+            state
+                .link_current_workspace_project_owned(invalid_project)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            state
+                .current_workspace()
+                .await
+                .ok_or_else(|| "current workspace disappeared after invalid relink".to_string())?
+                .id
+                .as_str(),
+            "workspace-b"
+        );
         let linked_project = temp.path().join("workspace-b-project");
         std::fs::create_dir_all(&linked_project).map_err(|error| error.to_string())?;
         std::fs::write(linked_project.join("same.txt"), "same bytes")
             .map_err(|error| error.to_string())?;
+        let linked_skill = linked_project.join(".eko/skills/linked-review");
+        std::fs::create_dir_all(&linked_skill).map_err(|error| error.to_string())?;
+        std::fs::write(linked_project.join("AGENTS.md"), "LINKED_PROJECT_AGENT_RULE")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            linked_skill.join("SKILL.md"),
+            "---\nname: linked-review\ndescription: Review linked project\n---\n# Review",
+        )
+        .map_err(|error| error.to_string())?;
         let canonical_linked_project = linked_project
             .canonicalize()
             .map_err(|error| error.to_string())?;
@@ -2962,6 +2989,25 @@ mod workspace_transition_tests {
             execution_b.agent().read(|agent| agent.working_dir()).await,
             Some(canonical_b.clone())
         );
+        assert!(
+            execution_b
+                .agent()
+                .read(|agent| agent.has_skill("linked-review"))
+                .await
+        );
+        let linked_context = execution_b
+            .agent()
+            .read(|agent| agent.context().clone())
+            .await;
+        let linked_context_text = linked_context
+            .lock()
+            .await
+            .messages()
+            .iter()
+            .filter_map(|message| message.content.as_text_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(linked_context_text.contains("LINKED_PROJECT_AGENT_RULE"));
         let task_store_b = runtime_b
             .task_runtime()
             .ok_or_else(|| "workspace B TaskRuntime missing".to_string())?;

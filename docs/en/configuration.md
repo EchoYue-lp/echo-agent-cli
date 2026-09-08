@@ -95,20 +95,23 @@ ordinary event logs.
 
 ## Project Instructions
 
-EKO reads the repository-standard root-to-working-directory chain of
+EKO reads the current project's repository-standard root-to-working-directory chain of
 `AGENTS.md` and `AGENTS.override.md`, then combines its own files:
 
 - `~/.eko/user.md` for user-level preferences;
-- `<project>/.eko/learned-rules.md` for RulePromoter output;
+- `<project>/.eko/learned-rules.md` for RulePromoter output without a separate
+  linked workspace; linked workspaces use `<workspace>/.eko/learned-rules.md`;
 - `<cwd>/.eko/local.md` for machine/directory-specific instructions.
 
-`.eko/AGENTS.md` is not a product instruction source and is never renamed into
-`learned-rules.md`. See [ADR 0028](./adr/0028-current-product-schema-authority.md).
+`AGENTS.md` files from the project root through the working directory enter one
+instruction projection. A linked workspace takes its project root from
+`Workspace.project_root`. `.eko/AGENTS.md` is not a product instruction source
+and is never renamed into `learned-rules.md`. See [ADR 0028](./adr/0028-current-product-schema-authority.md).
 
 ## Plugins and Skills
 
 Plugins live in user or project plugin roots. User Skills live in
-`~/.eko/skills/`; desired enablement is stored in
+`~/.eko/skills/`; project Skills live in `<project>/.eko/skills/`; desired enablement is stored in
 `~/.eko/enabled-skills.json`. Install, enable, disable, and upstream sync use
 an atomic version 3 flat policy whose entries contain only `{enabled}`, plus
 immediate typed runtime reconciliation. Obsolete category, baseline,
@@ -116,7 +119,9 @@ generation, identity, and repair-debt fields are ignored while external Skill
 enablement is preserved. Corrupt files fall back to an empty set; EKO has no
 bundled or default-enabled Skills and injects no methodology baseline.
 Repository `.agents/skills/` files are development guidance, not runtime
-content. See [Skill operations](./operations/skill-sync.md).
+content. Project Skills are discovered by the current project runtime, are not
+written to the user enablement file, and are not removed by user Skill
+uninstall. See [Skill operations](./operations/skill-sync.md).
 
 ## Channels and Environment
 

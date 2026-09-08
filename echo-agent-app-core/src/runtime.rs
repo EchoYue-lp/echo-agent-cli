@@ -636,6 +636,10 @@ pub struct AgentRuntime {
         Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>,
     /// Single application-generation owner for blocking product-data work.
     pub product_data_io: crate::product_data_io::ProductDataIoService,
+    /// Current linked project root used for repository `AGENTS.md` and
+    /// project-local `.eko/skills/` discovery. This is separate from EKO's
+    /// workspace data root.
+    pub project_root: Option<std::path::PathBuf>,
 }
 
 /// Canonical EKO application composition shared by every interaction surface.
@@ -973,6 +977,10 @@ impl AgentRuntime {
         mut params: AgentCreateParams,
         mcp_config_path: PathBuf,
     ) -> anyhow::Result<Self> {
+        let project_root = crate::project::context::resolve_project_root(
+            params.project.as_deref(),
+            params.working_dir.as_deref(),
+        );
         let product_data_io = params.product_data_io.clone().unwrap_or_default();
         params.product_data_io = Some(product_data_io.clone());
         // ── 0a. Runtime state store (must be ready before agent is built so that
@@ -1103,6 +1111,11 @@ impl AgentRuntime {
                 &agent_handle,
             );
         }
+        if let Err(error) =
+            crate::skills_hub::load_project_skills(&agent_handle, project_root.as_deref()).await
+        {
+            tracing::warn!(%error, "Failed to load project-local skills");
+        }
 
         // ── NOTE: ExecuteTaskTool + the task-management tools are NOT registered
         // here. The TaskRuntimeStore doesn't exist yet at primary-agent build
@@ -1156,10 +1169,11 @@ impl AgentRuntime {
             .read(|a| a.store().cloned())
             .await
             .map(|store| {
-                Arc::new(ReviewIntegration::new(
+                Arc::new(ReviewIntegration::new_with_project_root(
                     ReviewConfig::default(),
                     review_echo_agent_dir.clone(),
                     store,
+                    project_root.clone(),
                 ))
             });
         if review_integration.is_some() {
@@ -1227,7 +1241,6 @@ impl AgentRuntime {
             let trigger_sink = review_integration.clone();
             let skill_policy = review_integration.clone();
             let skill_curator = review_integration.curator();
-            let workspace_skills = review_echo_agent_dir.join("skills");
             agent_handle
                 .write_async(|a| {
                     Box::pin(async move {
@@ -1236,11 +1249,6 @@ impl AgentRuntime {
                         a.set_skill_load_policy(Some(skill_policy));
                         a.set_skill_curator(Some(skill_curator));
                         let _ = a.reconcile_skill_load_policy().await;
-                        if workspace_skills.is_dir()
-                            && let Err(error) = a.load_skills_from_dir(workspace_skills).await
-                        {
-                            tracing::warn!(%error, "Failed to load workspace-curated skills");
-                        }
                     })
                 })
                 .await;
@@ -1340,6 +1348,7 @@ impl AgentRuntime {
             extension_control,
             command_cell_runtime,
             product_data_io,
+            project_root,
         })
     }
 

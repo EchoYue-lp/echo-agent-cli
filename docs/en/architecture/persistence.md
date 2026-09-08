@@ -38,10 +38,11 @@ application does not scan or import `~/.echo-agent`, and it does not construct
 `.workspace.json` is checked only to prevent accidental overwrite during
 workspace creation; it is never parsed or migrated.
 
-`skills/` contains only independently installed user Skills, and
-`enabled-skills.json` stores only their `{enabled}` choices. EKO does not create
-built-in Skills, a default active set, or a baseline in either the data root or
-the application package.
+The data-root `skills/` contains independently installed user Skills; the
+current project root's `.eko/skills/` contains project Skills.
+`enabled-skills.json` stores only user Skill `{enabled}` choices. EKO does not
+create built-in Skills, a default active set, or a baseline in either the data
+root or the application package.
 
 ## Authorities
 

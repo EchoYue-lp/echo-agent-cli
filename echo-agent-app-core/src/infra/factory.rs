@@ -640,12 +640,10 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
 
     // Resolve subagent .md scopes early so the role catalog can be injected
     // into the system prompt before build (same defs used by register_default_subagents).
-    let subagent_project_root = params
-        .project
-        .as_ref()
-        .map(std::path::PathBuf::from)
-        .or_else(|| params.working_dir.clone())
-        .or_else(|| crate::project::context::discover_project_root(None));
+    let subagent_project_root = crate::project::context::resolve_project_root(
+        params.project.as_deref(),
+        params.working_dir.as_deref(),
+    );
     let subagent_user_home = dirs::home_dir();
     let discovered_subagents = crate::subagent_loader::discover_subagents(
         subagent_project_root.as_deref(),

@@ -3,8 +3,9 @@
 ## 内容边界
 
 EKO 不随应用捆绑 Skill，也不从源码树、Tauri resources 或默认 catalog 加载 Skill。
-产品运行时只消费两类外部内容：用户安装到 `~/.eko/skills/` 的独立 Skill，以及 Plugin
-generation 提供的 Skill。仓库根 `.agents/skills/` 只指导 EKO 开发，不进入产品运行时。
+产品运行时消费三类外部内容：用户安装到 `~/.eko/skills/` 的独立 Skill、当前项目
+`<project>/.eko/skills/` 的项目 Skill，以及 Plugin generation 提供的 Skill。仓库根
+`.agents/skills/` 只指导 EKO 开发，不进入产品运行时。
 
 SkillsHub 负责独立 Skill 的安装、启停、卸载、上游记录和 surface 投影；PluginRuntime
 负责完整插件包。两者都复用 framework 的 `SkillDocument`、manifest parser 与 validator，
@@ -42,13 +43,21 @@ SkillsHub 负责独立 Skill 的安装、启停、卸载、上游记录和 surfa
   -> 读取 enabled-skills.json
   -> 校验外部 Skill 并修改条目
   -> 原子写
-  -> reconcile 用户目录 Skill 到所有运行时目标（Plugin generation 独立管理）
+  -> reconcile 用户目录 Skill 到所有运行时目标（项目 Skill 与 Plugin generation 独立管理）
   -> 返回 Settled 或 Degraded
 ```
 
 GUI、TUI、CLI/JSONL 和 channel 使用同一服务。文件已写但某个 runtime target 同步失败时，
 配置不回滚；下一次 Skill 操作、应用启动或 workspace load 会重新收敛。typed receipt 会分别
 报告 artifact 结果与逐 target runtime settlement，不保存精确重放状态。
+
+项目 Skill 不写入 `enabled-skills.json`。Agent 创建时从当前项目根的 `.eko/skills/` 发现并
+加载它们；项目根到当前工作目录的 `AGENTS.md`/`AGENTS.override.md` 链也在同一 instruction
+projection 中生效。项目 Skill 的内容和更新由项目仓库负责，用户 Skill 的 install/sync 命令
+不会覆盖或卸载它们。
+
+同名 Skill 的加载优先级固定为项目 `.eko/skills/`、Plugin Skill、用户 `~/.eko/skills/`；
+较高优先级的 descriptor 已存在时，较低优先级内容不会覆盖它。
 
 ## SKILL.md 格式
 

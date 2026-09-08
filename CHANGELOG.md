@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Skill 内容边界收敛（2026-09）**：删除 EKO 仓库内置 `skills/`、默认启用集、
   方法论 baseline、Tauri Skill resource、内置来源字段和 creator 模型工具。产品只消费
-  `~/.eko/skills/` 中用户安装的独立 Skill 与 Plugin generation 提供的 Skill；
+  `~/.eko/skills/` 中用户安装的独立 Skill、当前项目 `.eko/skills/` 中的项目 Skill 与
+  Plugin generation 提供的 Skill；
   `enabled-skills.json` version 3 只保存 `{enabled}`。用户安装、启停、卸载、Git 同步、
   会话激活、framework 标准校验和 PluginRuntime 全部保留。ADR
   [0041](docs/zh/adr/0041-external-only-skills.md)。
