@@ -13,18 +13,21 @@ import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { FailureToast } from './FailureToast';
 import {
   BookOpen,
+  Bot,
   CornerUpLeft,
   FileCode,
   FileJson,
   FlaskConical,
   Globe2,
   GripVertical,
+  GitFork,
   MessagesSquare,
   MoreHorizontal,
   PanelRightOpen,
   Workflow,
   X,
 } from 'lucide-react';
+import { providerApi } from '../../api/endpoints';
 import { AgentMessageDialog } from './AgentMessageDialog';
 import type { Attachment } from '../../types/api';
 import type { QueuedChatInput } from '../../hooks/useTauriChat';
@@ -33,6 +36,8 @@ import { useWorkspaceViewStore } from '../../stores/workspaceViewStore';
 import { useToolExecutionStore } from '../../stores/toolExecutionStore';
 import { dispatchGuiSlashCommand } from '../../lib/slashCommands';
 import { AgentPane } from './AgentPane';
+import { SideConversationDialog } from './SideConversationDialog';
+import type { ConfiguredModel } from '../../generated';
 
 // Tauri IPC is the only live transport. The WebSocket transport
 // (hooks/useWebSocket.ts) was removed after the chat path migrated to Tauri
@@ -54,10 +59,26 @@ export function ChatPanel() {
   const openFiles = useContextPaneStore((state) => state.openFiles);
   const openWorkspaceView = useWorkspaceViewStore((state) => state.open);
   const todoCount = useTaskRuntimeStore((state) => state.todos.length);
+  const activeConversationId = useConversationStore((state) => state.activeId);
+  const conversations = useConversationStore((state) => state.conversations);
+  const sideConversations = useConversationStore((state) => state.sideConversations);
+  const updateSideConversationModel = useConversationStore(
+    (state) => state.updateSideConversationModel
+  );
+  const noteSideConversationTurnStarted = useConversationStore(
+    (state) => state.noteSideConversationTurnStarted
+  );
+  const activeConversation = conversations.find((item) => item.id === activeConversationId);
+  const activeSide = sideConversations.find(
+    (item) => item.conversation_id === activeConversationId
+  );
+  const activeSideConversationId = activeSide?.conversation_id;
 
   // ── 按需卡片状态 ──
   const [failureToastDismissed, setFailureToastDismissed] = useState(false);
   const [agentMessagesOpen, setAgentMessagesOpen] = useState(false);
+  const [sideConversationOpen, setSideConversationOpen] = useState(false);
+  const [configuredModels, setConfiguredModels] = useState<ConfiguredModel[]>([]);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const workspaceMenuRef = useRef<HTMLDivElement>(null);
 
@@ -84,6 +105,25 @@ export function ChatPanel() {
       window.removeEventListener('keydown', closeOnEscape);
     };
   }, [workspaceMenuOpen]);
+
+  useEffect(() => {
+    if (!activeSideConversationId) {
+      setConfiguredModels([]);
+      return;
+    }
+    let current = true;
+    providerApi
+      .listConfigured()
+      .then((response) => {
+        if (current) setConfiguredModels(response.models.filter((model) => model.enabled));
+      })
+      .catch(() => {
+        if (current) setConfiguredModels([]);
+      });
+    return () => {
+      current = false;
+    };
+  }, [activeSideConversationId]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -213,13 +253,31 @@ export function ChatPanel() {
       });
       if (dispatched) return true;
     }
-    return sendMessage(text, attachments);
+    if (activeSide) {
+      noteSideConversationTurnStarted(activeSide.conversation_id);
+    }
+    const sent = await sendMessage(text, attachments);
+    if (!sent && activeSide) {
+      void useConversationStore.getState().init(activeSide.workspace_id);
+    }
+    return sent;
+  };
+
+  const handleSideModelChange = async (modelId: string) => {
+    if (!activeSide) return;
+    try {
+      await updateSideConversationModel(activeSide.conversation_id, modelId || null);
+    } catch (cause) {
+      useToastStore
+        .getState()
+        .addToast('error', cause instanceof Error ? cause.message : String(cause));
+    }
   };
 
   return (
     <>
       <AgentPane
-        ariaLabel="主 Agent"
+        ariaLabel={activeSide ? '支线 Agent' : '主 Agent'}
         role="main"
         bodyRef={scrollRef}
         bodyRole="log"
@@ -230,13 +288,51 @@ export function ChatPanel() {
           <>
             <div className="min-w-0 pl-9">
               <div className="truncate text-[13px] font-medium text-[var(--text-primary)]">
-                {currentWorkspace?.name || 'EKO'}
+                {activeSide
+                  ? activeSide.title
+                  : activeConversation?.title || currentWorkspace?.name || 'EKO'}
               </div>
               <div className="truncate text-[10px] text-[var(--text-tertiary)]">
-                {currentWorkspace?.root || '选择或创建一个任务开始工作'}
+                {activeSide
+                  ? activeSide.launch_error
+                    ? 'Side Conversation · 首轮待重试'
+                    : `Side Conversation · 已提交快照 ${activeSide.snapshot_message_count} 条`
+                  : currentWorkspace?.root || '选择或创建一个任务开始工作'}
               </div>
             </div>
             <div className="ml-auto flex items-center gap-2 text-xs text-[var(--text-tertiary)]">
+              {activeSide && (
+                <label
+                  className="relative flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] focus-within:ring-1 focus-within:ring-[var(--accent)] sm:w-auto sm:bg-transparent sm:hover:bg-transparent"
+                  title="支线对话模型"
+                >
+                  <Bot size={15} className="sm:hidden" aria-hidden="true" />
+                  <select
+                    value={activeSide.model_id ?? ''}
+                    onChange={(event) => void handleSideModelChange(event.target.value)}
+                    aria-label="支线对话模型"
+                    className="absolute inset-0 cursor-pointer opacity-0 sm:static sm:h-7 sm:max-w-44 sm:rounded-md sm:border sm:border-[var(--border-primary)] sm:bg-[var(--bg-secondary)] sm:px-2 sm:text-[11px] sm:text-[var(--text-secondary)] sm:opacity-100 sm:outline-none sm:focus:border-[var(--accent)]"
+                  >
+                    <option value="">继承主对话</option>
+                    {configuredModels.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.display_name || model.model}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {!activeSide && activeConversationId && (
+                <button
+                  type="button"
+                  onClick={() => setSideConversationOpen(true)}
+                  className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  title="新建支线对话"
+                  aria-label="新建支线对话"
+                >
+                  <GitFork size={15} />
+                </button>
+              )}
               <div className="hidden items-center gap-2 sm:flex">
                 <span className="h-2 w-2 rounded-full bg-[var(--accent)]" />
                 <span>{runStatusLabel(runStatus, isStreaming)}</span>
@@ -439,6 +535,10 @@ export function ChatPanel() {
         )}
       </AgentPane>
       <AgentMessageDialog isOpen={agentMessagesOpen} onClose={() => setAgentMessagesOpen(false)} />
+      <SideConversationDialog
+        isOpen={sideConversationOpen}
+        onClose={() => setSideConversationOpen(false)}
+      />
     </>
   );
 }

@@ -3373,6 +3373,14 @@ impl TaskRuntimeStore {
             run_id,
             echo_agent::tasks::TaskGraphCommit {
                 expected_revision: Some(current.snapshot.revision),
+                expected_executions: Some(
+                    current
+                        .snapshot
+                        .tasks
+                        .iter()
+                        .map(|task| (task.spec.id.clone(), task.execution.clone()))
+                        .collect(),
+                ),
                 next: echo_agent::tasks::RevisionedTaskGraph {
                     snapshot: echo_agent::tasks::RuntimePlanSnapshot {
                         revision: next_revision,
@@ -6250,6 +6258,14 @@ impl TaskRuntimeStore {
                         Some(&current),
                         echo_agent::tasks::TaskGraphCommit {
                             expected_revision: Some(current.snapshot.revision),
+                            expected_executions: Some(
+                                current
+                                    .snapshot
+                                    .tasks
+                                    .iter()
+                                    .map(|task| (task.spec.id.clone(), task.execution.clone()))
+                                    .collect(),
+                            ),
                             next: echo_agent::tasks::RevisionedTaskGraph {
                                 snapshot: echo_agent::tasks::RuntimePlanSnapshot {
                                     revision: next_revision,

@@ -13,6 +13,11 @@ pub struct SavedMessage {
     pub message_id: Option<String>,
     pub role: String,
     pub content: Option<String>,
+    /// True when this transcript segment came from AgentRouter coordination.
+    /// Primary conversation views filter these messages before serialization;
+    /// Side Conversation views retain and label them.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub internal_agent: bool,
     pub tool_calls: Option<Vec<SavedToolCall>>,
     /// Thinking/reasoning segments from the LLM (e.g., DeepSeek thinking process)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,6 +38,10 @@ pub struct SavedMessage {
     /// display metadata so its body is not duplicated in conversation JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<SavedAttachment>>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// A persisted attachment reference (stored inside SavedMessage).
@@ -138,6 +147,7 @@ mod tests {
             message_id: Some("message-1".to_string()),
             role: "user".to_string(),
             content: Some("hello".to_string()),
+            internal_agent: false,
             tool_calls: None,
             thinking_segments: None,
             execution_steps: None,

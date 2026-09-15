@@ -355,6 +355,14 @@
       "legacyRemoved": true
     },
     {
+      "legacyPath": "adr/0042-side-conversation.md",
+      "targetPath": "adr/0042-side-conversation.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
       "legacyPath": "architecture.md",
       "targetPath": "architecture/overview.md",
       "kind": "architecture",

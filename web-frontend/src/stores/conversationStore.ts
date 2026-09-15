@@ -6,8 +6,15 @@ import { useToolExecutionStore } from './toolExecutionStore';
 import { useSubagentRunStore } from './subagentRunStore';
 import { useTaskRuntimeStore } from './taskRuntimeStore';
 import { GLOBAL_WORKSPACE_ID } from '../lib/viewAddress';
-import type { ChatMessage, ConversationListItem, ExecutionStep, SavedMessage } from '../types/api';
+import type {
+  ChatMessage,
+  ConversationListItem,
+  ExecutionStep,
+  SavedMessage,
+  SideConversationEntry,
+} from '../types/api';
 
+let listGeneration = 0;
 let loadGeneration = 0;
 let loadingConversationId: string | null = null;
 
@@ -44,6 +51,8 @@ interface ConversationState {
   workspaceId: string;
   /** All conversations sorted by updatedAt desc */
   conversations: ConversationMeta[];
+  /** Durable parent/member projection from AgentRouter groups. */
+  sideConversations: SideConversationEntry[];
   /** Conversation ids archived locally for the active workspace. */
   archivedConversationIds: string[];
   /** Currently active conversation ID */
@@ -63,6 +72,19 @@ interface ConversationState {
   loadConversation: (id: string) => Promise<void>;
   /** Branch the canonical transcript immediately before one user turn. */
   branchCurrent: (userTurnIndex: number) => Promise<{ id: string; targetContent: string }>;
+  /** Create and immediately open a Side Conversation. */
+  createSideConversation: (input: {
+    requestId: string;
+    prompt: string;
+    title?: string;
+    modelId?: string;
+  }) => Promise<SideConversationEntry>;
+  /** Update one child-local model; null means inherit the primary model. */
+  updateSideConversationModel: (conversationId: string, modelId: string | null) => Promise<void>;
+  /** Retry the stable initial prompt after a synchronous launch failure. */
+  retrySideConversation: (conversationId: string) => Promise<void>;
+  /** Publish a rebuildable running hint until the backend lifecycle poll settles. */
+  noteSideConversationTurnStarted: (conversationId: string) => void;
   /** Archive a conversation in the active workspace projection. */
   archiveConversation: (id: string) => Promise<void>;
   /** Restore an archived conversation. */
@@ -70,7 +92,7 @@ interface ConversationState {
   /** Delete a conversation */
   deleteConversation: (id: string) => Promise<void>;
   /** Rename a conversation */
-  renameConversation: (id: string, title: string) => void;
+  renameConversation: (id: string, title: string) => Promise<void>;
   /** Start a brand new chat */
   startNew: () => Promise<void>;
   /** Clear current chat immediately without saving it */
@@ -175,6 +197,7 @@ export function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
       message_id: m.id,
       role: m.role,
       content: m.content,
+      internal_agent: m.internalAgent,
     };
 
     // Save thinking segments
@@ -231,46 +254,89 @@ export function restoredMessageId(
   return message.message_id ?? `loaded-${conversationId}-${index}`;
 }
 
+function projectSideInitialPrompt(conversationId: string, messageId: string, prompt: string): void {
+  if (useConversationStore.getState().activeId !== conversationId) return;
+  const chatStore = useChatStore.getState();
+  if (chatStore.messages.some((message) => message.id === messageId)) return;
+  chatStore.replaceMessages([
+    ...chatStore.messages,
+    {
+      id: messageId,
+      role: 'user',
+      content: prompt,
+      timestamp: Date.now(),
+    },
+  ]);
+}
+
 // ── Store ──
 
 export const useConversationStore = create<ConversationState>((set, get) => ({
   workspaceId: GLOBAL_WORKSPACE_ID,
   conversations: [],
+  sideConversations: [],
   archivedConversationIds: [],
   activeId: null,
   newConversationEpoch: 0,
   isLoading: false,
 
   init: async (workspaceId: string) => {
-    const generation = loadGeneration + 1;
-    loadGeneration = generation;
-    set({ workspaceId });
+    const generation = listGeneration + 1;
+    listGeneration = generation;
+    if (get().workspaceId !== workspaceId) {
+      loadGeneration += 1;
+      loadingConversationId = null;
+      set({ workspaceId, isLoading: false });
+    } else {
+      set({ workspaceId });
+    }
     try {
       const items = await conversationApi.list(workspaceId);
-      if (generation !== loadGeneration || get().workspaceId !== workspaceId) return;
+      if (generation !== listGeneration || get().workspaceId !== workspaceId) return;
       if (import.meta.env.DEV)
         console.debug('[conversationStore] init: loaded', items.length, 'conversations');
       const metas: ConversationMeta[] = items
         .map((item) => conversationMeta(item, workspaceId))
         .sort((a, b) => b.updatedAt - a.updatedAt);
+      const activeId = get().activeId;
+      const sideConversations = items
+        .flatMap((item) => (item.side_conversation ? [item.side_conversation] : []))
+        .map((entry) =>
+          entry.conversation_id === activeId ? { ...entry, unread_count: 0 } : entry
+        );
       set({
         conversations: metas,
+        sideConversations,
         archivedConversationIds: metas.filter((item) => item.archived).map((item) => item.id),
       });
+      if (
+        activeId &&
+        items.some(
+          (item) =>
+            item.side_conversation?.conversation_id === activeId &&
+            item.side_conversation.unread_count > 0
+        )
+      ) {
+        void conversationApi.markSideViewed(workspaceId, activeId).catch((error) => {
+          console.error('[conversationStore] mark Side Conversation viewed FAILED:', error);
+        });
+      }
     } catch (e) {
       console.error('[conversationStore] init FAILED:', e);
-      if (generation === loadGeneration && get().workspaceId === workspaceId) {
-        set({ conversations: [] });
+      if (generation === listGeneration && get().workspaceId === workspaceId) {
+        set({ conversations: [], sideConversations: [] });
       }
     }
   },
 
   detachForWorkspace: (workspaceId: string) => {
+    listGeneration += 1;
     loadGeneration += 1;
     loadingConversationId = null;
     set((state) => ({
       workspaceId,
       conversations: [],
+      sideConversations: [],
       archivedConversationIds: [],
       activeId: null,
       newConversationEpoch: state.newConversationEpoch + 1,
@@ -378,6 +444,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
             id: restoredMessageId(id, idx, m),
             role: m.role as 'user' | 'assistant',
             content: m.content || '',
+            internalAgent: m.internal_agent ?? false,
             isStreaming: false,
             timestamp: Date.now(),
           };
@@ -427,7 +494,13 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       chatStore.replaceMessages(chatMessages);
       chatStore.setHistoryView(!restoreReady);
 
-      set({ activeId: id, isLoading: false });
+      set((state) => ({
+        activeId: id,
+        isLoading: false,
+        sideConversations: state.sideConversations.map((entry) =>
+          entry.conversation_id === id ? { ...entry, unread_count: 0 } : entry
+        ),
+      }));
       loadingConversationId = null;
     } catch (e) {
       console.error('Failed to load conversation:', e);
@@ -446,6 +519,74 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     set({ activeId: result.id, isLoading: false });
     await get().init(workspaceId);
     return { id: result.id, targetContent: result.target_content };
+  },
+
+  createSideConversation: async ({ requestId, prompt, title, modelId }) => {
+    const parentConversationId = get().activeId;
+    const workspaceId = get().workspaceId;
+    if (!parentConversationId) throw new Error('A persisted primary conversation is required');
+    if (get().sideConversations.some((entry) => entry.conversation_id === parentConversationId)) {
+      throw new Error('Side Conversations cannot create nested Side Conversations');
+    }
+    const receipt = await conversationApi.createSide({
+      workspace_id: workspaceId,
+      parent_conversation_id: parentConversationId,
+      request_id: requestId,
+      prompt,
+      title: title?.trim() || null,
+      model_id: modelId?.trim() || null,
+    });
+    await get().init(workspaceId);
+    await get().loadConversation(receipt.creation.entry.conversation_id);
+    projectSideInitialPrompt(
+      receipt.creation.entry.conversation_id,
+      receipt.first_turn?.message_key ?? `side-start:${receipt.creation.entry.group_id}`,
+      receipt.initial_prompt
+    );
+    if (receipt.launch_error) {
+      useToastStore
+        .getState()
+        .addToast('error', `支线已创建，但首轮启动失败：${receipt.launch_error}`);
+    }
+    return receipt.creation.entry;
+  },
+
+  updateSideConversationModel: async (conversationId, modelId) => {
+    const workspaceId = get().workspaceId;
+    await conversationApi.updateSideModel(workspaceId, conversationId, modelId);
+    if (get().workspaceId !== workspaceId) return;
+    set((state) => ({
+      sideConversations: state.sideConversations.map((item) =>
+        item.conversation_id === conversationId ? { ...item, model_id: modelId } : item
+      ),
+    }));
+    if (get().activeId === conversationId) {
+      await get().loadConversation(conversationId);
+    }
+  },
+
+  retrySideConversation: async (conversationId) => {
+    const workspaceId = get().workspaceId;
+    const receipt = await conversationApi.retrySide(workspaceId, conversationId);
+    if (get().workspaceId !== workspaceId) return;
+    await get().init(workspaceId);
+    await get().loadConversation(conversationId);
+    projectSideInitialPrompt(
+      conversationId,
+      receipt.first_turn?.message_key ?? `side-start:${receipt.creation.entry.group_id}`,
+      receipt.initial_prompt
+    );
+    if (receipt.launch_error) {
+      useToastStore.getState().addToast('error', `支线首轮仍未启动：${receipt.launch_error}`);
+    }
+  },
+
+  noteSideConversationTurnStarted: (conversationId) => {
+    set((state) => ({
+      sideConversations: state.sideConversations.map((entry) =>
+        entry.conversation_id === conversationId ? { ...entry, status: 'running' } : entry
+      ),
+    }));
   },
 
   archiveConversation: async (id: string) => {
@@ -477,7 +618,14 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   deleteConversation: async (id: string) => {
     // P1-12: 此前 catch 吞错后仍执行本地删除 → 后端还在但前端已移除,
     // 刷新后数据"恢复"又"丢失", 体验混乱。改为 API 失败则不更新本地 + 报错。
-    if (get().activeId === id || loadingConversationId === id) {
+    const initialChildIds = new Set(
+      get()
+        .sideConversations.filter((entry) => entry.parent_conversation_id === id)
+        .map((entry) => entry.conversation_id)
+    );
+    const removesConversation = (conversationId: string | null) =>
+      conversationId === id || (conversationId != null && initialChildIds.has(conversationId));
+    if (removesConversation(get().activeId) || removesConversation(loadingConversationId)) {
       loadGeneration += 1;
       loadingConversationId = null;
       set({ isLoading: false });
@@ -493,18 +641,31 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       return;
     }
 
-    const wasActive = get().activeId === id;
     const archivedIds = new Set(get().archivedConversationIds);
     archivedIds.delete(id);
+    let clearedActive = false;
     set((s) => {
-      const conversations = s.conversations.filter((c) => c.id !== id);
+      const removedSideIds = new Set(
+        s.sideConversations
+          .filter((entry) => entry.conversation_id === id || entry.parent_conversation_id === id)
+          .map((entry) => entry.conversation_id)
+      );
+      const conversations = s.conversations.filter(
+        (conversation) => conversation.id !== id && !removedSideIds.has(conversation.id)
+      );
+      const activeRemoved =
+        s.activeId === id || (s.activeId != null && removedSideIds.has(s.activeId));
+      clearedActive = activeRemoved;
       return {
         conversations,
+        sideConversations: s.sideConversations.filter(
+          (entry) => entry.conversation_id !== id && entry.parent_conversation_id !== id
+        ),
         archivedConversationIds: [...archivedIds],
-        activeId: s.activeId === id ? null : s.activeId,
+        activeId: activeRemoved ? null : s.activeId,
       };
     });
-    if (wasActive) {
+    if (clearedActive) {
       useChatStore.getState().clearMessages();
       useTaskRuntimeStore.getState().reset();
       useToolExecutionStore.getState().clear();
@@ -519,11 +680,14 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     } catch (e) {
       console.error('Failed to rename conversation:', e);
       useToastStore.getState().addToast('error', '重命名会话失败，请重试');
-      return;
+      throw e;
     }
 
     set((s) => ({
       conversations: s.conversations.map((c) => (c.id === id ? { ...c, title } : c)),
+      sideConversations: s.sideConversations.map((entry) =>
+        entry.conversation_id === id ? { ...entry, title } : entry
+      ),
     }));
   },
 

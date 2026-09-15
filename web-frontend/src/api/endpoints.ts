@@ -87,6 +87,8 @@ import type {
   PluginThemeProjection,
   PluginValidationProjection,
   SkillCommand,
+  SideConversationCreateReceipt,
+  SideConversationCreateRequest,
 } from '../generated';
 
 export type {
@@ -640,34 +642,78 @@ export const extractApi = {
       : get<StructuredExtractionExample[]>('/extract/examples'),
 };
 
+export interface SideConversationLaunchReceipt {
+  creation: SideConversationCreateReceipt;
+  first_turn: { kind: string; message_key: string; root_turn_id: string } | null;
+  initial_prompt: string;
+  launch_error: string | null;
+}
+
 export const conversationApi = {
   list: (workspaceId: string) =>
     isTauri()
       ? apiInvoke<ConversationListItem[]>('list_conversations', { workspaceId })
       : get<ConversationListItem[]>('/conversations'),
+  createSide: (request: SideConversationCreateRequest) => {
+    const { workspace_id, ...sideRequest } = request;
+    if (!isTauri()) {
+      return Promise.reject(new Error('Side Conversation requires the EKO desktop GUI'));
+    }
+    return apiInvoke<SideConversationLaunchReceipt>('create_conversation', {
+      workspaceId: workspace_id,
+      request: { kind: 'side', ...sideRequest },
+    });
+  },
+  updateSideModel: (workspaceId: string, conversationId: string, modelId: string | null) => {
+    if (!isTauri()) {
+      return Promise.reject(new Error('Side Conversation requires the EKO desktop GUI'));
+    }
+    return apiInvoke<{ success: boolean }>('update_conversation', {
+      workspaceId,
+      id: conversationId,
+      request: { kind: 'side_model', model_id: modelId },
+    });
+  },
+  retrySide: (workspaceId: string, conversationId: string) => {
+    if (!isTauri()) {
+      return Promise.reject(new Error('Side Conversation requires the EKO desktop GUI'));
+    }
+    return apiInvoke<SideConversationLaunchReceipt>('update_conversation', {
+      workspaceId,
+      id: conversationId,
+      request: { kind: 'side_retry' },
+    });
+  },
+  markSideViewed: (workspaceId: string, conversationId: string) => {
+    if (!isTauri()) {
+      return Promise.reject(new Error('Side Conversation requires the EKO desktop GUI'));
+    }
+    return apiInvoke<{ success: boolean }>('update_conversation', {
+      workspaceId,
+      id: conversationId,
+      request: { kind: 'side_viewed' },
+    });
+  },
   save: (
     workspaceId: string,
     data: { id: string; title: string; messages: SavedMessage[]; model?: string }
   ) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; id: string }>('save_conversation', {
+      ? apiInvoke<{ kind: string; id: string }>('create_conversation', {
           workspaceId,
-          id: data.id,
-          title: data.title,
-          messages: data.messages,
+          request: { kind: 'primary', id: data.id, title: data.title },
         })
       : post<{ success: boolean; id: string }>('/conversations', data),
   get: (workspaceId: string, id: string) =>
     isTauri()
       ? apiInvoke<ConversationRecord>('get_conversation', { workspaceId, id })
       : get<ConversationRecord>(`/conversations/${id}`),
-  update: (workspaceId: string, id: string, data: { title?: string; messages?: SavedMessage[] }) =>
+  update: (workspaceId: string, id: string, data: { title: string }) =>
     isTauri()
       ? apiInvoke<{ success: boolean }>('update_conversation', {
           workspaceId,
           id,
-          title: data.title,
-          messages: data.messages,
+          request: { kind: 'rename', title: data.title },
         })
       : put<{ success: boolean }>(`/conversations/${id}`, data),
   branch: (workspaceId: string, id: string, userTurnIndex: number) =>

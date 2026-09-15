@@ -172,6 +172,9 @@ pub mod runtime {
 pub mod scheduler {
     pub use crate::scheduler::*;
 }
+pub mod side_conversation {
+    pub use crate::side_conversation::*;
+}
 pub mod skills_hub {
     pub use crate::skills_hub::*;
 }

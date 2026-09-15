@@ -283,6 +283,7 @@ fn prepare_revisioned_graph_commit(
 ) -> Result<PreparedRevisionCommit, StoreError> {
     let echo_agent::tasks::TaskGraphCommit {
         expected_revision,
+        expected_executions,
         mut next,
         reason,
         effects,
@@ -294,6 +295,25 @@ fn prepare_revisioned_graph_commit(
             expected: expected_revision.unwrap_or_default(),
             current: current_revision.unwrap_or_default(),
         });
+    }
+    if let Some(expected_executions) = expected_executions {
+        let current_executions = current
+            .map(|graph| {
+                graph
+                    .snapshot
+                    .tasks
+                    .iter()
+                    .map(|task| (task.spec.id.clone(), task.execution.clone()))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        if current_executions != expected_executions {
+            return Err(StoreError::PlanConflict {
+                run_id: run_id.to_string(),
+                expected: expected_revision.unwrap_or_default(),
+                current: current_revision.unwrap_or_default(),
+            });
+        }
     }
     let next_revision = expected_revision
         .unwrap_or_default()

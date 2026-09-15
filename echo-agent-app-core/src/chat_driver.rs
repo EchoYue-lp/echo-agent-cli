@@ -3214,6 +3214,12 @@ mod tests {
         parked: std::sync::atomic::AtomicBool,
     }
 
+    // This remains a deadlock guard; synchronization is driven by the real
+    // task_execute ToolResult. Cold all-feature suites can take more than five
+    // seconds to reach that event under host load.
+    const TASK_EXECUTE_RECEIPT_TEST_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(30);
+
     impl ChatSink for TaskExecuteReceiptBarrierSink {
         fn on_event(&self, event: ChatDriverEvent) -> bool {
             let should_park = matches!(
@@ -3233,7 +3239,7 @@ mod tests {
             self.release
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .recv_timeout(std::time::Duration::from_secs(5))
+                .recv_timeout(TASK_EXECUTE_RECEIPT_TEST_TIMEOUT)
                 .is_ok()
         }
     }
@@ -3815,13 +3821,13 @@ mod tests {
         });
         let barrier_result = tokio::task::spawn_blocking(move || {
             reached_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
+                .recv_timeout(TASK_EXECUTE_RECEIPT_TEST_TIMEOUT)
                 .map_err(|error| format!("task_execute result barrier was not reached: {error}"))
         })
         .await
         .map_err(|error| error.to_string())?;
         if let Err(error) = barrier_result {
-            let early_outcome = tokio::time::timeout(std::time::Duration::from_secs(5), drive)
+            let early_outcome = tokio::time::timeout(TASK_EXECUTE_RECEIPT_TEST_TIMEOUT, drive)
                 .await
                 .map_err(|_| {
                     "pooled chat driver did not settle after closing the barrier".to_string()
@@ -3840,7 +3846,7 @@ mod tests {
         release_tx
             .send(())
             .map_err(|_| "task_execute result barrier receiver closed".to_string())?;
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), drive)
+        let outcome = tokio::time::timeout(TASK_EXECUTE_RECEIPT_TEST_TIMEOUT, drive)
             .await
             .map_err(|_| "pooled chat driver did not settle".to_string())?
             .map_err(|error| error.to_string())??;
@@ -3851,7 +3857,7 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         drop(foreground_execution);
-        tokio::time::timeout(std::time::Duration::from_secs(5), pool.shutdown())
+        tokio::time::timeout(TASK_EXECUTE_RECEIPT_TEST_TIMEOUT, pool.shutdown())
             .await
             .map_err(|_| "pool shutdown timed out after outer settlement".to_string())??;
         Ok(())

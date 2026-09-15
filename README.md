@@ -213,11 +213,15 @@ Tauri CLI 打包时会构建包名二进制 `echo-agent-cli`，项目已在 `--n
 
 #### GUI 功能状态
 
-GUI 已接真实 Tauri 后端的聊天/会话、TaskRuntime/Subagent、记忆/自进化、工具、
+GUI 已接真实 Tauri 后端的聊天/会话、一级 Side Conversation、TaskRuntime/Subagent、记忆/自进化、工具、
 MCP、技能、Plugin、模型供应商、权限/审计、压缩、定时任务、Trace、Terminal、
 Browser、Sandbox、数据分析和论文/系统综述工作台。Workflow 和通用结构化抽取的后端
 已存在，但 React panel 尚未接入生产导航，不能算 GUI 完成。当前代码依据与尚在收口的
 缺口见 [功能总览](docs/zh/features.md)。
+
+Side Conversation 依赖 GUI 的侧栏树和并行视图，只通过 Tauri 提供创建、恢复与管理；
+TUI、CLI/JSONL 和 channel 保留普通 conversation、Subagent 与 `/fork` 行为，不增加该布局
+能力的专用命令或 wire contract。
 
 > **注意**：每个平台只能打包该平台原生的安装包。如需交叉编译请使用 CI/CD（如 GitHub Actions）。
 

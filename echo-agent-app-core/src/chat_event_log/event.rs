@@ -215,6 +215,7 @@ pub enum ChatSurface {
     Tui,
     Cli,
     Channel,
+    Agent,
     BootRecovery,
 }
 

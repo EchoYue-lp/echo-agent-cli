@@ -487,11 +487,18 @@ fn update_group_sync(
             .iter_mut()
             .find(|group| group.group_id == group_id)
             .ok_or_else(|| AgentRouterError::GroupNotFound(group_id.to_string()))?;
+        if existing.side_conversation.is_some() {
+            return Err(AgentRouterError::Validation(
+                "Side Conversation groups are managed by the Side Conversation service"
+                    .to_string(),
+            ));
+        }
         let updated = AgentGroup {
             group_id: existing.group_id.clone(),
             name,
             leader,
             members,
+            side_conversation: existing.side_conversation.clone(),
             created_at: existing.created_at,
             updated_at: Utc::now(),
         };
@@ -502,9 +509,46 @@ fn update_group_sync(
     })
 }
 
-fn delete_group_sync(root: &Path, group_id: &str) -> Result<bool, AgentRouterError> {
+fn mutate_group_sync<F>(
+    root: &Path,
+    group_id: &str,
+    mutate: F,
+) -> Result<AgentGroup, AgentRouterError>
+where
+    F: FnOnce(&mut AgentGroup) -> Result<(), AgentRouterError>,
+{
     with_groups_lock(root, |groups_path| {
         let mut groups = read_groups(groups_path)?;
+        let existing = groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| AgentRouterError::GroupNotFound(group_id.to_string()))?;
+        mutate(existing)?;
+        existing.updated_at = Utc::now();
+        existing.validate()?;
+        let updated = existing.clone();
+        write_groups(groups_path, &groups)?;
+        Ok(updated)
+    })
+}
+
+fn delete_group_sync(
+    root: &Path,
+    group_id: &str,
+    allow_side_conversation: bool,
+) -> Result<bool, AgentRouterError> {
+    with_groups_lock(root, |groups_path| {
+        let mut groups = read_groups(groups_path)?;
+        if !allow_side_conversation
+            && groups
+                .iter()
+                .any(|group| group.group_id == group_id && group.side_conversation.is_some())
+        {
+            return Err(AgentRouterError::Validation(
+                "Side Conversation groups are managed by the Side Conversation service"
+                    .to_string(),
+            ));
+        }
         let before = groups.len();
         groups.retain(|group| group.group_id != group_id);
         if groups.len() == before {

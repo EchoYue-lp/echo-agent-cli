@@ -180,6 +180,14 @@ struct ConversationLockRegistration<'a> {
     lock: Arc<Mutex<()>>,
 }
 
+#[must_use]
+pub(crate) struct ConversationIdentityGuard {
+    locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    conversation_id: String,
+    lock: Arc<Mutex<()>>,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
 #[derive(Clone, Copy)]
 enum DeletionIo<'a> {
     Service(&'a crate::product_data_io::ProductDataIoService),
@@ -197,6 +205,19 @@ impl Drop for ConversationLockRegistration<'_> {
             return;
         };
         if Arc::ptr_eq(entry.get(), &self.lock) && Arc::strong_count(&self.lock) == 2 {
+            entry.remove();
+        }
+    }
+}
+
+impl Drop for ConversationIdentityGuard {
+    fn drop(&mut self) {
+        let Entry::Occupied(entry) = self.locks.entry(self.conversation_id.clone()) else {
+            return;
+        };
+        // The map, this struct and OwnedMutexGuard each retain one Arc. Any
+        // waiter adds another strong reference and keeps the registration live.
+        if Arc::ptr_eq(entry.get(), &self.lock) && Arc::strong_count(&self.lock) == 3 {
             entry.remove();
         }
     }
@@ -238,7 +259,7 @@ impl ConversationDeletionService {
     }
 
     #[cfg(test)]
-    fn install_before_lineage_barrier(
+    pub(crate) fn install_before_lineage_barrier(
         &self,
         entered: tokio::sync::oneshot::Sender<()>,
         release: tokio::sync::oneshot::Receiver<()>,
@@ -269,6 +290,11 @@ impl ConversationDeletionService {
             .io_fault
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fault);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_tombstone_retirement_for_test(&self) {
+        self.fail_next_io(DeletionIoFault::RemoveFileBarrier);
     }
 
     #[cfg(test)]
@@ -330,6 +356,25 @@ impl ConversationDeletionService {
             return Err(ConversationDeletionError::DeletionPending(conversation_id));
         }
         Ok(())
+    }
+
+    pub(crate) async fn acquire_identity(
+        &self,
+        conversation_id: &str,
+    ) -> Result<ConversationIdentityGuard, ConversationDeletionError> {
+        let conversation_id = validated_id(conversation_id)?.to_string();
+        let lock = self
+            .locks
+            .entry(conversation_id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let guard = Arc::clone(&lock).lock_owned().await;
+        Ok(ConversationIdentityGuard {
+            locks: Arc::clone(&self.locks),
+            conversation_id,
+            lock,
+            _guard: guard,
+        })
     }
 
     pub async fn create_conversation(
@@ -453,6 +498,15 @@ impl ConversationDeletionService {
             }
             if !authority_commit_started(&discovered) {
                 let conversation_id = discovered.conversation_id;
+                let identity = match self.acquire_identity(&conversation_id).await {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        continue;
+                    }
+                };
                 match self
                     .delete_owned(
                         flow,
@@ -469,6 +523,7 @@ impl ConversationDeletionService {
                         context.agent_deliveries.clone(),
                         context.artifact_config.clone(),
                         context.workspace_io_receipt.clone(),
+                        identity,
                     )
                     .await
                 {
@@ -614,8 +669,51 @@ impl ConversationDeletionService {
         artifact_config: Option<ToolOutputArtifactConfig>,
         workspace_io_receipt: crate::state::ScopedWorkspaceIoReceipt,
     ) -> Result<ConversationDeletionReceipt, ConversationDeletionError> {
+        let identity = self.acquire_identity(conversation_id).await?;
+        self.delete_with_identity(
+            identity,
+            workspace_id,
+            conversation_id,
+            conversation_store,
+            agent_pool,
+            task_runtime,
+            tool_executions,
+            chat_events,
+            runtime_state,
+            foreground_turns,
+            agent_router,
+            agent_deliveries,
+            artifact_config,
+            workspace_io_receipt,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn delete_with_identity(
+        &self,
+        identity: ConversationIdentityGuard,
+        workspace_id: &str,
+        conversation_id: &str,
+        conversation_store: Option<Arc<dyn ConversationStore>>,
+        agent_pool: Option<Arc<crate::agent_pool::AgentPool>>,
+        task_runtime: Option<Arc<TaskRuntimeStore>>,
+        tool_executions: Arc<ToolExecutionRepository>,
+        chat_events: Arc<ChatEventLog>,
+        runtime_state: Option<Arc<dyn RuntimeStateStore>>,
+        foreground_turns: &ForegroundTurnControl,
+        agent_router: Arc<crate::agent_router::AgentRouter>,
+        agent_deliveries: Arc<crate::agent_router::AgentDeliverySupervisor>,
+        artifact_config: Option<ToolOutputArtifactConfig>,
+        workspace_io_receipt: crate::state::ScopedWorkspaceIoReceipt,
+    ) -> Result<ConversationDeletionReceipt, ConversationDeletionError> {
         let workspace_id = workspace_id.to_string();
         let conversation_id = validated_id(conversation_id)?.to_string();
+        if identity.conversation_id != conversation_id {
+            return Err(ConversationDeletionError::ConversationStore(
+                "conversation identity guard does not match deletion target".to_string(),
+            ));
+        }
         let foreground_turns = foreground_turns.clone();
         let flow = self
             .product_data_io
@@ -640,6 +738,7 @@ impl ConversationDeletionService {
                     agent_deliveries,
                     artifact_config,
                     workspace_io_receipt,
+                    identity,
                 )
                 .await;
             let durable_failure = result
@@ -680,9 +779,8 @@ impl ConversationDeletionService {
         agent_deliveries: Arc<crate::agent_router::AgentDeliverySupervisor>,
         artifact_config: Option<ToolOutputArtifactConfig>,
         workspace_io_receipt: crate::state::ScopedWorkspaceIoReceipt,
+        _identity: ConversationIdentityGuard,
     ) -> Result<ConversationDeletionReceipt, ConversationDeletionError> {
-        let registration = self.lock_registration(&conversation_id);
-        let _identity_lock = registration.lock.lock().await;
         let _foreground_suspension = foreground_turns
             .suspend_conversation_admission_if_idle_scoped(&workspace_id, &conversation_id)?;
         let tombstone_path = self.tombstone_path(&conversation_id);

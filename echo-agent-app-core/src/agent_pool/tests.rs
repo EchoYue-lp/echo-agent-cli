@@ -1100,6 +1100,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn side_conversation_model_override_replaces_the_cached_child_agent() -> TestResult {
+        use echo_agent::agent::Agent;
+
+        let agent = create_test_agent_handle()?;
+        let mut config = EkoConfig {
+            configured_models: vec![
+                crate::config::ConfiguredModel {
+                    id: "local:a".to_string(),
+                    display_name: "A".to_string(),
+                    provider: "local".to_string(),
+                    model: "a".to_string(),
+                    ..crate::config::ConfiguredModel::default()
+                },
+                crate::config::ConfiguredModel {
+                    id: "local:b".to_string(),
+                    display_name: "B".to_string(),
+                    provider: "local".to_string(),
+                    model: "b".to_string(),
+                    ..crate::config::ConfiguredModel::default()
+                },
+            ],
+            ..EkoConfig::default()
+        };
+        config.model.default_model_id = Some("local:a".to_string());
+        config.model_providers.insert(
+            "local".to_string(),
+            crate::config::ModelProviderConfig {
+                base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+                ..Default::default()
+            },
+        );
+        let pool = AgentPool::new_for_test_with_config(&agent, None, None, 3, false, config).await;
+
+        pool.configure_side_conversation("side-1", Some("local:a"))
+            .await
+            .map_err(|error| error.to_string())?;
+        let first = pool
+            .acquire("side-1")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(first.agent().read(|child| child.model_name().to_string()).await, "a");
+        drop(first);
+
+        pool.configure_side_conversation("side-1", Some("local:b"))
+            .await
+            .map_err(|error| error.to_string())?;
+        let second = pool
+            .acquire("side-1")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(second.agent().read(|child| child.model_name().to_string()).await, "b");
+        drop(second);
+        assert!(
+            pool.configure_side_conversation("side-1", Some("missing:model"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            pool.conversation_model_override("side-1").await.as_deref(),
+            Some("local:b")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn workspace_transition_gate_rejects_acquire_until_publication_finishes() -> TestResult {
         let pool = create_test_pool(4, false).await?;
         let mut transition = pool

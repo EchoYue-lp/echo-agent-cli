@@ -749,6 +749,370 @@ impl AppState {
             .set_archived(workspace_id, conversation_id, archived)
     }
 
+    pub async fn list_side_conversations_scoped(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<crate::side_conversation::SideConversationEntry>, String> {
+        let runtime = self
+            .chat_runtime_for_scope(workspace_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let store = runtime
+            .conversation_store()
+            .ok_or_else(|| "conversation store is unavailable".to_string())?;
+        let mut entries = crate::side_conversation::SideConversationService::new(Arc::clone(
+            &self.agent_router,
+        ))
+            .list_for_workspace(store, workspace_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        for entry in &mut entries {
+            if !entry.degraded
+                && !self
+                .session
+                .foreground_turns
+                .snapshots_for_conversation_scoped(workspace_id, &entry.conversation_id)
+                .map_err(|error| error.to_string())?
+                .is_empty()
+            {
+                entry.status = crate::side_conversation::SideConversationStatus::Running;
+                continue;
+            }
+            let replay = self
+                .storage
+                .chat_events
+                .replay(workspace_id, Some(&entry.conversation_id), "side-status", 0)
+                .map_err(|error| error.to_string())?;
+            if let Some((_, status)) = replay
+                .events
+                .iter()
+                .filter_map(|event| match &event.payload {
+                    crate::chat_driver::ChatDriverEvent::TurnStatus { status } => {
+                        Some((event.sequence, status.as_str()))
+                    }
+                    _ => None,
+                })
+                .max_by_key(|(sequence, _)| *sequence)
+            {
+                entry.status = match status {
+                    "idle" => crate::side_conversation::SideConversationStatus::Idle,
+                    "running" | "thinking" | "using_tool" | "waiting_approval"
+                    | "waiting_input" => crate::side_conversation::SideConversationStatus::Running,
+                    "completed" => crate::side_conversation::SideConversationStatus::Completed,
+                    "failed" => crate::side_conversation::SideConversationStatus::Failed,
+                    "cancelled" => crate::side_conversation::SideConversationStatus::Cancelled,
+                    _ => entry.status,
+                };
+            }
+        }
+        Ok(entries)
+    }
+
+    pub async fn prepare_side_conversation_model(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, String> {
+        let runtime = self
+            .chat_runtime_for_scope(workspace_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let store = runtime
+            .conversation_store()
+            .ok_or_else(|| "conversation store is unavailable".to_string())?;
+        let relation = crate::side_conversation::SideConversationService::new(Arc::clone(
+            &self.agent_router,
+        ))
+        .relation_for_child(store, workspace_id, conversation_id)
+        .await
+        .map_err(|error| error.to_string())?;
+        let Some(relation) = relation else {
+            return Ok(false);
+        };
+        if let Some(pool) = runtime.pool() {
+            pool.configure_side_conversation(
+                conversation_id,
+                relation.model_id.as_deref(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(true)
+    }
+
+    pub async fn create_side_conversation_owned(
+        self: &Arc<Self>,
+        request: crate::side_conversation::SideConversationCreateRequest,
+    ) -> Result<crate::side_conversation::SideConversationLaunchPreparation, String> {
+        let runtime = self
+            .chat_runtime_for_scope(&request.workspace_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let store = runtime
+            .conversation_store()
+            .ok_or_else(|| "conversation store is unavailable".to_string())?;
+        let service = crate::side_conversation::SideConversationService::new(Arc::clone(
+            &self.agent_router,
+        ));
+        let child_id = crate::side_conversation::SideConversationService::child_id_for_request(
+            &request,
+        )
+        .map_err(|error| error.to_string())?;
+        let _parent_identity = runtime
+            .deletions
+            .acquire_identity(&request.parent_conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        runtime
+            .deletions
+            .ensure_admission_allowed(
+                &request.parent_conversation_id,
+                Some(runtime.workspace_io_receipt()),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let _child_identity = runtime
+            .deletions
+            .acquire_identity(&child_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        runtime
+            .deletions
+            .ensure_admission_allowed(&child_id, Some(runtime.workspace_io_receipt()))
+            .await
+            .map_err(|error| error.to_string())?;
+        let prompt = request.prompt.trim().to_string();
+        let creation = service
+            .create(Arc::clone(&store), request)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(crate::side_conversation::SideConversationLaunchPreparation {
+            admission: crate::side_conversation::SideConversationLaunchAdmission {
+                workspace_id: creation.entry.workspace_id.clone(),
+                parent_conversation_id: creation.entry.parent_conversation_id.clone(),
+                conversation_id: child_id,
+                _parent_identity,
+                _child_identity,
+            },
+            creation,
+            prompt,
+        })
+    }
+
+    pub async fn prepare_side_conversation_retry(
+        self: &Arc<Self>,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Result<crate::side_conversation::SideConversationLaunchPreparation, String> {
+        let runtime = self
+            .chat_runtime_for_scope(workspace_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let store = runtime
+            .conversation_store()
+            .ok_or_else(|| "conversation store is unavailable".to_string())?;
+        let service = crate::side_conversation::SideConversationService::new(Arc::clone(
+            &self.agent_router,
+        ));
+        let initial_entry = service
+            .relation_for_child(Arc::clone(&store), workspace_id, conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "conversation is not a Side Conversation".to_string())?;
+        let parent_identity = runtime
+            .deletions
+            .acquire_identity(&initial_entry.parent_conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        runtime
+            .deletions
+            .ensure_admission_allowed(
+                &initial_entry.parent_conversation_id,
+                Some(runtime.workspace_io_receipt()),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let child_identity = runtime
+            .deletions
+            .acquire_identity(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        runtime
+            .deletions
+            .ensure_admission_allowed(conversation_id, Some(runtime.workspace_io_receipt()))
+            .await
+            .map_err(|error| error.to_string())?;
+        let entry = service
+            .relation_for_child(Arc::clone(&store), workspace_id, conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .filter(|entry| {
+                entry.parent_conversation_id == initial_entry.parent_conversation_id
+                    && entry.group_id == initial_entry.group_id
+            })
+            .ok_or_else(|| "Side Conversation relation changed before retry".to_string())?;
+        let parent_conversation_id = entry.parent_conversation_id.clone();
+        let creation = crate::side_conversation::SideConversationCreateReceipt {
+            entry,
+            duplicate: true,
+        };
+        let prompt = service
+            .initial_prompt_for_child(workspace_id, conversation_id)
+            .await;
+        Ok(crate::side_conversation::SideConversationLaunchPreparation {
+            admission: crate::side_conversation::SideConversationLaunchAdmission {
+                workspace_id: workspace_id.to_string(),
+                parent_conversation_id,
+                conversation_id: conversation_id.to_string(),
+                _parent_identity: parent_identity,
+                _child_identity: child_identity,
+            },
+            creation,
+            prompt: prompt.map_err(|error| error.to_string())?,
+        })
+    }
+
+    pub async fn begin_side_conversation_gui_turn(
+        &self,
+        admission: crate::side_conversation::SideConversationLaunchAdmission,
+        turn_id: impl Into<String>,
+    ) -> Result<crate::foreground_turn::ForegroundTurnLease, crate::conversation_deletion::ConversationDeletionError>
+    {
+        let runtime = self
+            .chat_runtime_for_scope(&admission.workspace_id)
+            .await
+            .map_err(|error| {
+                crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                    error.to_string(),
+                )
+            })?;
+        runtime
+            .deletions
+            .ensure_admission_allowed(
+                &admission.parent_conversation_id,
+                Some(runtime.workspace_io_receipt()),
+            )
+            .await?;
+        runtime
+            .deletions
+            .ensure_admission_allowed(
+                &admission.conversation_id,
+                Some(runtime.workspace_io_receipt()),
+            )
+            .await?;
+        let store = runtime.conversation_store().ok_or(
+            crate::conversation_deletion::ConversationDeletionError::StoreUnavailable,
+        )?;
+        let relation = crate::side_conversation::SideConversationService::new(Arc::clone(
+            &self.agent_router,
+        ))
+        .relation_for_child(
+            store,
+            &admission.workspace_id,
+            &admission.conversation_id,
+        )
+        .await
+        .map_err(|error| {
+            crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                error.to_string(),
+            )
+        })?
+        .filter(|entry| entry.parent_conversation_id == admission.parent_conversation_id)
+        .ok_or_else(|| {
+            crate::conversation_deletion::ConversationDeletionError::NotFound(
+                admission.conversation_id.clone(),
+            )
+        })?;
+        let lease = self
+            .session
+            .foreground_turns
+            .begin_scoped(
+                &relation.workspace_id,
+                crate::foreground_turn::ForegroundTurnSurface::Gui,
+                &relation.conversation_id,
+                turn_id,
+            )
+            .map_err(crate::conversation_deletion::ConversationDeletionError::Foreground)?;
+        Ok(lease)
+    }
+
+    pub async fn mark_side_conversation_viewed(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, String> {
+        crate::side_conversation::SideConversationService::new(Arc::clone(&self.agent_router))
+            .mark_viewed(workspace_id, conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_side_conversation_launch_error(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        launch_error: Option<String>,
+    ) -> Result<crate::side_conversation::SideConversationEntry, String> {
+        let runtime = self
+            .chat_runtime_for_scope(workspace_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let store = runtime
+            .conversation_store()
+            .ok_or_else(|| "conversation store is unavailable".to_string())?;
+        crate::side_conversation::SideConversationService::new(Arc::clone(&self.agent_router))
+            .set_launch_error(
+                store,
+                workspace_id,
+                conversation_id,
+                launch_error,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn update_side_conversation_model(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        model_id: Option<String>,
+    ) -> Result<crate::side_conversation::SideConversationEntry, String> {
+        if let Some(selector) = model_id.as_deref() {
+            let app_config = self.config.app_config.read().await;
+            crate::model_config::resolve_runtime_model(&app_config, Some(selector))
+                .map_err(|error| error.to_string())?;
+        }
+        let runtime = self
+            .chat_runtime_for_scope(workspace_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let store = runtime
+            .conversation_store()
+            .ok_or_else(|| "conversation store is unavailable".to_string())?;
+        let entry = crate::side_conversation::SideConversationService::new(Arc::clone(
+            &self.agent_router,
+        ))
+        .update_model(store, workspace_id, conversation_id, model_id)
+        .await
+        .map_err(|error| error.to_string())?;
+        if let Some(pool) = runtime.pool() {
+            pool.configure_side_conversation(conversation_id, entry.model_id.as_deref())
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(entry)
+    }
+
+    pub async fn cancel_conversation_turn_scoped(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, String> {
+        self.cancel_conversation_turn_for_delete(workspace_id, conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     /// Create a conversation under the same identity lock used by aggregate deletion.
     pub async fn create_conversation_owned(
         &self,
@@ -842,7 +1206,7 @@ impl AppState {
                 error.to_string(),
             )
         })?;
-        self.delete_conversation_with_runtime(&runtime, conversation_id)
+        self.delete_conversation_tree_with_runtime(&runtime, conversation_id)
             .await
     }
 
@@ -863,14 +1227,203 @@ impl AppState {
                     error.to_string(),
                 )
             })?;
-        self.delete_conversation_with_runtime(&runtime, conversation_id)
+        self.delete_conversation_tree_with_runtime(&runtime, conversation_id)
             .await
     }
 
-    async fn delete_conversation_with_runtime(
+    async fn delete_conversation_tree_with_runtime(
         &self,
         runtime: &ScopedChatRuntime,
         conversation_id: &str,
+    ) -> std::result::Result<
+        crate::conversation_deletion::ConversationDeletionReceipt,
+        crate::conversation_deletion::ConversationDeletionError,
+    > {
+        let store = runtime
+            .conversation_store()
+            .ok_or(crate::conversation_deletion::ConversationDeletionError::StoreUnavailable)?;
+        let workspace_id = runtime.execution_scope().workspace_id();
+        let service = crate::side_conversation::SideConversationService::new(Arc::clone(
+            &self.agent_router,
+        ));
+        let identity = runtime
+            .deletions
+            .acquire_identity(conversation_id)
+            .await?;
+        let relation = service
+            .relation_for_child(Arc::clone(&store), workspace_id, conversation_id)
+            .await
+            .map_err(|error| {
+                crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                    error.to_string(),
+                )
+            })?;
+        if relation.as_ref().is_some_and(|entry| entry.degraded) {
+            self.cancel_conversation_turn_for_delete(workspace_id, conversation_id)
+                .await?;
+            self.delete_degraded_side_relation(&service, workspace_id, conversation_id)
+                .await?;
+            return Ok(crate::conversation_deletion::ConversationDeletionReceipt {
+                conversation_id: conversation_id.to_string(),
+                resumed: false,
+                cleanup_pending: false,
+            });
+        }
+        if relation.is_some() {
+            self.cancel_conversation_turn_for_delete(workspace_id, conversation_id)
+                .await?;
+            let receipt = self
+                .delete_conversation_with_identity(runtime, conversation_id, identity)
+                .await?;
+            service
+                .remove_relation(workspace_id, conversation_id)
+                .await
+                .map_err(|error| {
+                    crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                        error.to_string(),
+                    )
+                })?;
+            return Ok(receipt);
+        }
+
+        let children = service
+            .list_for_parent(Arc::clone(&store), workspace_id, conversation_id)
+            .await
+            .map_err(|error| {
+                crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                    error.to_string(),
+                )
+            })?;
+        let mut child_cleanup_pending = false;
+        for child in children {
+            let child_identity = runtime
+                .deletions
+                .acquire_identity(&child.conversation_id)
+                .await?;
+            let child_exists = store
+                .get_conversation(&child.conversation_id)
+                .await
+                .map_err(|error| {
+                    crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                        error.to_string(),
+                    )
+                })?
+                .is_some();
+            if !child_exists {
+                self.delete_degraded_side_relation(
+                    &service,
+                    workspace_id,
+                    &child.conversation_id,
+                )
+                .await?;
+                drop(child_identity);
+                continue;
+            }
+            self.cancel_conversation_turn_for_delete(workspace_id, &child.conversation_id)
+                .await?;
+            let child_receipt = self
+                .delete_conversation_with_identity(
+                    runtime,
+                    &child.conversation_id,
+                    child_identity,
+                )
+                .await?;
+            child_cleanup_pending |= child_receipt.cleanup_pending;
+            service
+                .remove_relation(workspace_id, &child.conversation_id)
+                .await
+                .map_err(|error| {
+                    crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                        error.to_string(),
+                    )
+                })?;
+        }
+        self.cancel_conversation_turn_for_delete(workspace_id, conversation_id)
+            .await?;
+        let mut receipt = self
+            .delete_conversation_with_identity(runtime, conversation_id, identity)
+            .await?;
+        receipt.cleanup_pending |= child_cleanup_pending;
+        Ok(receipt)
+    }
+
+    async fn delete_degraded_side_relation(
+        &self,
+        service: &crate::side_conversation::SideConversationService,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> std::result::Result<(), crate::conversation_deletion::ConversationDeletionError> {
+        let target = crate::agent_router::AgentAddress::new(
+            crate::workspace::WorkspaceId::from_raw(workspace_id.to_string()),
+            conversation_id.to_string(),
+        );
+        let router_retirement = self
+            .agent_router
+            .begin_target_retirement(target.clone())
+            .map_err(|error| {
+                crate::conversation_deletion::ConversationDeletionError::AgentRouter(
+                    error.to_string(),
+                )
+            })?;
+        let delivery_retirement = self
+            .agent_deliveries
+            .retire_target(target)
+            .await
+            .map_err(|error| {
+                crate::conversation_deletion::ConversationDeletionError::AgentRouter(
+                    error.to_string(),
+                )
+            })?;
+        router_retirement.purge().await.map_err(|error| {
+            crate::conversation_deletion::ConversationDeletionError::AgentRouter(error.to_string())
+        })?;
+        service
+            .remove_relation(workspace_id, conversation_id)
+            .await
+            .map_err(|error| {
+                crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                    error.to_string(),
+                )
+            })?;
+        drop(delivery_retirement);
+        drop(router_retirement);
+        Ok(())
+    }
+
+    async fn cancel_conversation_turn_for_delete(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> std::result::Result<bool, crate::conversation_deletion::ConversationDeletionError> {
+        let snapshots = self
+            .session
+            .foreground_turns
+            .snapshots_for_conversation_scoped(workspace_id, conversation_id)?;
+        let Some(snapshot) = snapshots.first() else {
+            return Ok(false);
+        };
+        if snapshots.len() != 1 {
+            return Err(crate::conversation_deletion::ConversationDeletionError::Foreground(
+                crate::foreground_turn::ForegroundTurnError::ActiveConversationTurns {
+                    conversation_id: conversation_id.to_string(),
+                },
+            ));
+        }
+        let waiter = self.session.foreground_turns.request_root_cancel_scoped(
+            workspace_id,
+            snapshot.surface,
+            conversation_id,
+            &snapshot.root_turn_id,
+        )?;
+        waiter.wait().await?;
+        Ok(true)
+    }
+
+    async fn delete_conversation_with_identity(
+        &self,
+        runtime: &ScopedChatRuntime,
+        conversation_id: &str,
+        identity: crate::conversation_deletion::ConversationIdentityGuard,
     ) -> std::result::Result<
         crate::conversation_deletion::ConversationDeletionReceipt,
         crate::conversation_deletion::ConversationDeletionError,
@@ -881,7 +1434,8 @@ impl AppState {
             .await;
         runtime
             .deletions
-            .delete(
+            .delete_with_identity(
+                identity,
                 runtime.execution_scope().workspace_id(),
                 conversation_id,
                 runtime.conversation_store(),
@@ -2842,6 +3396,19 @@ impl AppState {
                 .await?;
             return Ok(false);
         }
+        if claim.payload.origin != crate::agent_router::AgentMessageOrigin::User
+            && self
+                .agent_delivery_involves_side_conversation(&claim.payload)
+                .await?
+        {
+            self.agent_router
+                .defer(
+                    &claim,
+                    "internal Agent messages wait for a delivery-owned cold turn",
+                )
+                .await?;
+            return Ok(false);
+        }
         let agent = execution.agent();
         let instruction = render_agent_delivery_instruction(&claim.payload);
         let Some(snapshot) = exact_live_delivery_candidate(active) else {
@@ -3037,9 +3604,18 @@ impl AppState {
         shutdown: &CancellationToken,
     ) -> Result<bool, AgentMessageSendError> {
         let runtime = self.chat_runtime_for_agent(target).await?;
+        self.prepare_side_conversation_model(
+            target.workspace_id.as_str(),
+            &target.conversation_id,
+        )
+        .await
+        .map_err(AgentMessageSendError::Workspace)?;
         let Some(claim) = self.agent_router.claim_next(target).await? else {
             return Ok(true);
         };
+        let side_delivery = self
+            .agent_delivery_involves_side_conversation(&claim.payload)
+            .await?;
         let root_turn_id = claim.payload.delivery_turn_id();
         let lease = match runtime
             .begin_turn(
@@ -3080,6 +3656,24 @@ impl AppState {
             drop(lease);
             return Ok(true);
         }
+        let transcript_count_before = if side_delivery
+            && claim.payload.origin != crate::agent_router::AgentMessageOrigin::User
+        {
+            Some(
+                runtime
+                    .conversation_store()
+                    .ok_or_else(|| {
+                        AgentMessageSendError::Conversation(
+                            "target conversation store is unavailable".to_string(),
+                        )
+                    })?
+                    .count_messages(&target.conversation_id)
+                    .await
+                    .map_err(|error| AgentMessageSendError::Conversation(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         let instruction = render_agent_delivery_instruction(&claim.payload);
         let execution = match runtime.agent_for(&target.conversation_id).await {
             Ok(execution) => execution,
@@ -3137,7 +3731,19 @@ impl AppState {
             turn.authorship = crate::prepared_turn::InstructionAuthorship::Runtime;
         }
         let capture = Arc::new(AgentDeliveryCaptureSink::default());
-        let sink: Arc<dyn crate::chat_driver::ChatSink> = capture.clone();
+        let sink: Arc<dyn crate::chat_driver::ChatSink> = if side_delivery {
+            crate::chat_event_log::bind_surface_chat_sink(
+                crate::chat_event_log::ChatSurface::Agent,
+                capture.clone(),
+                Arc::clone(&self.storage.chat_events),
+                Arc::clone(&self.storage.tool_executions),
+                target.workspace_id.to_string(),
+                Some(target.conversation_id.clone()),
+                root_turn_id.clone(),
+            )
+        } else {
+            capture.clone()
+        };
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: runtime.execution_scope().clone(),
             workspace_io_receipt: Some(runtime.workspace_io_receipt()),
@@ -3233,7 +3839,6 @@ impl AppState {
         let input_drained = observation_rx.await.unwrap_or_else(|_| {
             Err("cold Agent delivery input observer ended without a receipt".to_string())
         });
-        drop(execution);
         let input_drained = match input_drained {
             Ok(drained) => drained,
             Err(error) => {
@@ -3281,6 +3886,7 @@ impl AppState {
                 .await?;
             return Ok(true);
         }
+        drop(execution);
         match outcome {
             Ok(crate::chat_driver::TurnOutcome::Completed) => {
                 let reply_message_id = self
@@ -3355,7 +3961,48 @@ impl AppState {
                     .await?;
             }
         }
+        if let Some(transcript_count_before) = transcript_count_before {
+            let store = runtime.conversation_store().ok_or_else(|| {
+                AgentMessageSendError::Conversation(
+                    "target conversation store is unavailable".to_string(),
+                )
+            })?;
+            crate::side_conversation::mark_internal_agent_turn_messages(
+                store.as_ref(),
+                &target.conversation_id,
+                transcript_count_before,
+                &instruction,
+            )
+            .await
+            .map_err(|error| AgentMessageSendError::Conversation(error.to_string()))?;
+        }
         Ok(true)
+    }
+
+    async fn agent_delivery_involves_side_conversation(
+        &self,
+        message: &crate::agent_router::AgentMessage,
+    ) -> Result<bool, AgentMessageSendError> {
+        let service = crate::side_conversation::SideConversationService::new(Arc::clone(
+            &self.agent_router,
+        ));
+        if service
+            .is_side_conversation(
+                message.to.workspace_id.as_str(),
+                &message.to.conversation_id,
+            )
+            .await
+            .map_err(|error| AgentMessageSendError::Conversation(error.to_string()))?
+        {
+            return Ok(true);
+        }
+        let Some(source) = message.from.as_ref() else {
+            return Ok(false);
+        };
+        service
+            .is_side_conversation(source.workspace_id.as_str(), &source.conversation_id)
+            .await
+            .map_err(|error| AgentMessageSendError::Conversation(error.to_string()))
     }
 
     async fn queue_agent_delivery_reply(

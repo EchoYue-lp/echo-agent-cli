@@ -42,4 +42,20 @@ describe('MessageBubble completed execution', () => {
     expect(markup).not.toContain('不应默认展开的思考');
     expect(markup).not.toContain('不应默认展开的 Subagent 结果');
   });
+
+  it('labels an internal Agent instruction instead of presenting it as user-authored', () => {
+    const message: ChatMessage = {
+      id: 'internal-agent-message',
+      role: 'user',
+      content: '检查这个替代方案',
+      internalAgent: true,
+      timestamp: 1,
+    };
+
+    const markup = renderToStaticMarkup(<MessageBubble message={message} />);
+
+    expect(markup).toContain('Agent 内部消息');
+    expect(markup).toContain('检查这个替代方案');
+    expect(markup).not.toContain('aria-label="编辑"');
+  });
 });

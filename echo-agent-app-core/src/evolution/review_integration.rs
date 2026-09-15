@@ -1550,44 +1550,47 @@ impl echo_agent::evolution::MemoryTriggerSink for ReviewIntegration {
 }
 
 impl echo_agent::skills::external::SkillLoadPolicy for ReviewIntegration {
-    fn allows(&self, descriptor: &echo_agent::skills::external::SkillDescriptor) -> bool {
-        if descriptor
-            .location
-            .ancestors()
-            .any(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some("_drafts"))
-        {
-            return false;
-        }
-        // One synchronous snapshot keeps the policy root and curator state on
-        // the same generation even if a workspace transition publishes next.
-        let binding = self.binding_snapshot();
-        let current_root = binding.echo_agent_dir.join("skills");
-        if let Some(skill_root) = workspace_skill_root(&descriptor.location)
-            && normalize_path(&skill_root) != normalize_path(&current_root)
-            && binding
-                .project_root
-                .as_ref()
-                .map(|root| normalize_path(&root.join(".eko").join("skills")))
-                .is_none_or(|project_root| normalize_path(&skill_root) != project_root)
-        {
-            return false;
-        }
-        match workspace_curator(&binding.echo_agent_dir).skill_for_path(&descriptor.location) {
-            Ok(Some(meta)) => matches!(
-                meta.lifecycle,
-                echo_agent::evolution::SkillLifecycle::Active
-                    | echo_agent::evolution::SkillLifecycle::Stale
-            ),
-            Ok(None) => true,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    path = %descriptor.location.display(),
-                    "refusing to load skill because curator state is unreadable"
-                );
-                false
+    fn allows<'a>(
+        &'a self,
+        descriptor: &'a echo_agent::skills::external::SkillDescriptor,
+    ) -> futures::future::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            if descriptor.location.ancestors().any(|ancestor| {
+                ancestor.file_name().and_then(|name| name.to_str()) == Some("_drafts")
+            }) {
+                return false;
             }
-        }
+            // One snapshot keeps the policy root and curator state on the same
+            // generation even if a workspace transition publishes next.
+            let binding = self.binding_snapshot();
+            let current_root = binding.echo_agent_dir.join("skills");
+            if let Some(skill_root) = workspace_skill_root(&descriptor.location)
+                && normalize_path(&skill_root) != normalize_path(&current_root)
+                && binding
+                    .project_root
+                    .as_ref()
+                    .map(|root| normalize_path(&root.join(".eko").join("skills")))
+                    .is_none_or(|project_root| normalize_path(&skill_root) != project_root)
+            {
+                return false;
+            }
+            match workspace_curator(&binding.echo_agent_dir).skill_for_path(&descriptor.location) {
+                Ok(Some(meta)) => matches!(
+                    meta.lifecycle,
+                    echo_agent::evolution::SkillLifecycle::Active
+                        | echo_agent::evolution::SkillLifecycle::Stale
+                ),
+                Ok(None) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %descriptor.location.display(),
+                        "refusing to load skill because curator state is unreadable"
+                    );
+                    false
+                }
+            }
+        })
     }
 }
 
@@ -1809,8 +1812,8 @@ mod tests {
         assert!(text.contains("'old_fact' → suggested Archived"));
     }
 
-    #[test]
-    fn skill_policy_blocks_drafts_and_foreign_workspaces() -> Result<(), String> {
+    #[tokio::test]
+    async fn skill_policy_blocks_drafts_and_foreign_workspaces() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let echo_dir = temp.path().join("workspace-a/.eko");
         let store = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
@@ -1822,29 +1825,28 @@ mod tests {
         .into_descriptor();
 
         descriptor.location = echo_dir.join("skills/_drafts/test-skill/SKILL.md");
-        assert!(!echo_agent::skills::external::SkillLoadPolicy::allows(
-            &integration,
-            &descriptor,
-        ));
+        assert!(
+            !echo_agent::skills::external::SkillLoadPolicy::allows(&integration, &descriptor,)
+                .await
+        );
 
         descriptor.location = echo_dir.join("skills/test-skill/SKILL.md");
-        assert!(echo_agent::skills::external::SkillLoadPolicy::allows(
-            &integration,
-            &descriptor,
-        ));
+        assert!(
+            echo_agent::skills::external::SkillLoadPolicy::allows(&integration, &descriptor,).await
+        );
 
         descriptor.location = temp
             .path()
             .join("workspace-b/.eko/skills/test-skill/SKILL.md");
-        assert!(!echo_agent::skills::external::SkillLoadPolicy::allows(
-            &integration,
-            &descriptor,
-        ));
+        assert!(
+            !echo_agent::skills::external::SkillLoadPolicy::allows(&integration, &descriptor,)
+                .await
+        );
         Ok(())
     }
 
-    #[test]
-    fn skill_policy_allows_linked_project_skills() -> Result<(), String> {
+    #[tokio::test]
+    async fn skill_policy_allows_linked_project_skills() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let echo_dir = temp.path().join("workspace/.eko");
         let project_root = temp.path().join("project");
@@ -1862,15 +1864,14 @@ mod tests {
         .into_descriptor();
         descriptor.location = project_root.join(".eko/skills/project-skill/SKILL.md");
 
-        assert!(echo_agent::skills::external::SkillLoadPolicy::allows(
-            &integration,
-            &descriptor,
-        ));
+        assert!(
+            echo_agent::skills::external::SkillLoadPolicy::allows(&integration, &descriptor,).await
+        );
         Ok(())
     }
 
-    #[test]
-    fn skill_policy_rejects_unreadable_curator_state() -> Result<(), String> {
+    #[tokio::test]
+    async fn skill_policy_rejects_unreadable_curator_state() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let echo_dir = temp.path().join("workspace/.eko");
         let state_path = echo_dir.join("evolution/curator-state.json");
@@ -1889,10 +1890,10 @@ mod tests {
         .into_descriptor();
         descriptor.location = echo_dir.join("skills/test-skill/SKILL.md");
 
-        assert!(!echo_agent::skills::external::SkillLoadPolicy::allows(
-            &integration,
-            &descriptor,
-        ));
+        assert!(
+            !echo_agent::skills::external::SkillLoadPolicy::allows(&integration, &descriptor,)
+                .await
+        );
         assert_eq!(
             std::fs::read_to_string(state_path).map_err(|error| error.to_string())?,
             "{not-json"

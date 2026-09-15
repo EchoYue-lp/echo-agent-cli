@@ -191,8 +191,8 @@ pub fn build_tauri_app(
             commands::scheduler::run_scheduler_task,
             // Conversations
             commands::conversations::list_conversations,
+            commands::conversations::create_conversation,
             commands::conversations::set_conversation_archived,
-            commands::conversations::save_conversation,
             commands::conversations::get_conversation,
             commands::conversations::update_conversation,
             commands::conversations::branch_conversation,

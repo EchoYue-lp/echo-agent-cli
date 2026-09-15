@@ -211,6 +211,14 @@ impl AgentRouter {
     }
 
     pub async fn list_groups(&self) -> Result<Vec<AgentGroup>, AgentRouterError> {
+        let groups = self.list_group_records().await?;
+        Ok(groups
+            .into_iter()
+            .filter(|group| group.side_conversation.is_none())
+            .collect())
+    }
+
+    pub(crate) async fn list_group_records(&self) -> Result<Vec<AgentGroup>, AgentRouterError> {
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || list_groups_sync(&root))
             .await
@@ -229,12 +237,39 @@ impl AgentRouter {
             name: name.into(),
             leader,
             members,
+            side_conversation: None,
             created_at: now,
             updated_at: now,
         };
         group.validate()?;
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || create_group_sync(&root, group))
+            .await
+            .map_err(|error| AgentRouterError::Task(error.to_string()))?
+    }
+
+    pub(crate) async fn create_group_record(
+        &self,
+        group: AgentGroup,
+    ) -> Result<AgentGroup, AgentRouterError> {
+        group.validate()?;
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || create_group_sync(&root, group))
+            .await
+            .map_err(|error| AgentRouterError::Task(error.to_string()))?
+    }
+
+    pub(crate) async fn mutate_group_record<F>(
+        &self,
+        group_id: impl Into<String>,
+        mutate: F,
+    ) -> Result<AgentGroup, AgentRouterError>
+    where
+        F: FnOnce(&mut AgentGroup) -> Result<(), AgentRouterError> + Send + 'static,
+    {
+        let group_id = group_id.into();
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || mutate_group_sync(&root, &group_id, mutate))
             .await
             .map_err(|error| AgentRouterError::Task(error.to_string()))?
     }
@@ -264,7 +299,23 @@ impl AgentRouter {
         }
         let root = self.root.clone();
         let group_id = group_id.to_string();
-        tokio::task::spawn_blocking(move || delete_group_sync(&root, &group_id))
+        tokio::task::spawn_blocking(move || delete_group_sync(&root, &group_id, false))
+            .await
+            .map_err(|error| AgentRouterError::Task(error.to_string()))?
+    }
+
+    pub(crate) async fn delete_group_record(
+        &self,
+        group_id: &str,
+    ) -> Result<bool, AgentRouterError> {
+        if group_id.trim().is_empty() {
+            return Err(AgentRouterError::Validation(
+                "Agent group id must not be empty".to_string(),
+            ));
+        }
+        let root = self.root.clone();
+        let group_id = group_id.to_string();
+        tokio::task::spawn_blocking(move || delete_group_sync(&root, &group_id, true))
             .await
             .map_err(|error| AgentRouterError::Task(error.to_string()))?
     }

@@ -545,11 +545,11 @@ pub async fn execute_workflow(
 // Sandbox
 // ════════════════════════════════════════════════════════════════════════════
 
-async fn eko_local_sandbox_available(manager: &echo_agent::sandbox::SandboxManager) -> bool {
+async fn eko_local_sandbox_available(manager: &dyn echo_agent::sandbox::SandboxExecutor) -> bool {
     if cfg!(target_os = "windows") {
         false
     } else {
-        manager.has_local_sandbox().await
+        manager.is_available().await
     }
 }
 
@@ -581,7 +581,7 @@ pub async fn get_sandbox_status(
         .read(|agent| agent.sandbox_manager().cloned())
         .await;
     let local_available = match manager {
-        Some(manager) => eko_local_sandbox_available(&manager).await,
+        Some(manager) => eko_local_sandbox_available(manager.as_ref()).await,
         None => false,
     };
     Ok(serde_json::json!({
@@ -648,7 +648,7 @@ pub async fn execute_sandbox(
             ));
         }
     };
-    if !eko_local_sandbox_available(&manager).await {
+    if !eko_local_sandbox_available(manager.as_ref()).await {
         return Err(IpcError::Validation(
             eko_local_sandbox_unavailable_message().to_string(),
         ));

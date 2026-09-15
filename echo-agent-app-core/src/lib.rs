@@ -52,6 +52,7 @@ pub(crate) mod research_connectors;
 pub(crate) mod research_tool;
 pub(crate) mod run_driver;
 pub(crate) mod scheduler;
+pub(crate) mod side_conversation;
 pub(crate) mod skills_hub;
 pub(crate) mod state;
 pub(crate) mod structured_extraction;

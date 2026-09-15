@@ -5,18 +5,17 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
+use echo_agent::agent::Agent as _;
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent_app_core::api::chat_driver::ChatDriverEvent;
 use echo_agent_app_core::api::chat_driver::ChatSink;
 use echo_agent_app_core::api::chat_event_log::{
     ChatEventEnvelope, ChatEventLog, ChatSurface, bind_surface_chat_sink,
 };
-#[cfg(test)]
-use echo_agent_app_core::api::conversation_input::ConversationInputPhase;
 use echo_agent_app_core::api::conversation_input::{
     ConversationInputAddress, ConversationInputAttempt, ConversationInputIdentity,
-    ConversationInputProjection, ConversationInputReceipt, ConversationInputSource,
-    stable_scoped_input_id,
+    ConversationInputOutcome, ConversationInputPhase, ConversationInputProjection,
+    ConversationInputReceipt, ConversationInputSource, stable_scoped_input_id,
 };
 use echo_agent_app_core::api::subagent_event_projection::JournaledExecutionProjector;
 use echo_agent_app_core::api::tasks::task_runtime::executor::ExecEvent;
@@ -136,6 +135,31 @@ pub struct SendChatMessageRequest {
     attachments: Option<Vec<echo_agent_app_core::api::types::AttachmentData>>,
     input_identity: Option<ConversationInputIdentity>,
     expected_queue_revision: Option<u64>,
+    #[serde(default)]
+    terminal_duplicate_ok: bool,
+    #[serde(default)]
+    restore_transcript_before_turn: bool,
+}
+
+impl SendChatMessageRequest {
+    pub(crate) fn side_initial(
+        workspace_id: String,
+        conversation_id: String,
+        message_key: String,
+        message: String,
+    ) -> Self {
+        Self {
+            workspace_id,
+            message,
+            conversation_id: Some(conversation_id),
+            message_key: Some(message_key),
+            attachments: None,
+            input_identity: None,
+            expected_queue_revision: None,
+            terminal_duplicate_ok: true,
+            restore_transcript_before_turn: true,
+        }
+    }
 }
 
 pub(crate) struct ExecutionEventProjection<'a> {
@@ -489,6 +513,25 @@ pub async fn send_chat_message(
     app: tauri::AppHandle,
     request: SendChatMessageRequest,
 ) -> Result<serde_json::Value, IpcError> {
+    send_chat_message_inner(state.inner(), app, request).await
+}
+
+pub(crate) async fn send_chat_message_inner(
+    state: &TauriState,
+    app: tauri::AppHandle,
+    request: SendChatMessageRequest,
+) -> Result<serde_json::Value, IpcError> {
+    send_chat_message_inner_with_side_admission(state, app, request, None).await
+}
+
+pub(crate) async fn send_chat_message_inner_with_side_admission(
+    state: &TauriState,
+    app: tauri::AppHandle,
+    request: SendChatMessageRequest,
+    side_admission: Option<
+        echo_agent_app_core::api::side_conversation::SideConversationLaunchAdmission,
+    >,
+) -> Result<serde_json::Value, IpcError> {
     let SendChatMessageRequest {
         workspace_id,
         message,
@@ -497,10 +540,17 @@ pub async fn send_chat_message(
         attachments,
         input_identity,
         expected_queue_revision,
+        terminal_duplicate_ok,
+        restore_transcript_before_turn,
     } = request;
     let conversation_id = conversation_id
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| IpcError::Validation("conversation_id is required".to_string()))?;
+    state
+        .app_state
+        .prepare_side_conversation_model(&workspace_id, &conversation_id)
+        .await
+        .map_err(IpcError::Validation)?;
     let scoped_runtime = state
         .app_state
         .chat_runtime_for_scope(&workspace_id)
@@ -543,6 +593,28 @@ pub async fn send_chat_message(
             )
             .await
             .map_err(|error| IpcError::Validation(error.to_string()))?;
+        if terminal_duplicate_ok
+            && (receipt.phase == ConversationInputPhase::Cancelled
+                || (receipt.phase == ConversationInputPhase::TurnSettled && receipt.drained))
+        {
+            let kind = match receipt.outcome {
+                Some(ConversationInputOutcome::Completed) => "completed",
+                Some(ConversationInputOutcome::Cancelled) => "cancelled",
+                Some(ConversationInputOutcome::Failed | ConversationInputOutcome::Dropped)
+                | None => "failed",
+            };
+            return Ok(serde_json::json!({
+                "kind": kind,
+                "success": kind == "completed",
+                "workspace_id": workspace_id,
+                "conversation_id": conversation_id,
+                "input_id": receipt.identity.input_id,
+                "message_key": message_key,
+                "root_turn_id": receipt.turn_id.unwrap_or_else(|| message_key.clone()),
+                "active_turn_id": null,
+                "duplicate": true,
+            }));
+        }
         if let Err(error) = emit_conversation_input_lifecycle_after(
             &app,
             state.app_state.storage.chat_events.as_ref(),
@@ -663,15 +735,25 @@ pub async fn send_chat_message(
     }
 
     let active_turn_key = conversation_id.clone();
-    let foreground_lease = match scoped_runtime
-        .begin_turn(
-            &state.app_state.session.foreground_turns,
-            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
-            &active_turn_key,
-            message_key.clone(),
-        )
-        .await
-    {
+    let foreground_admission = match side_admission {
+        Some(admission) => {
+            state
+                .app_state
+                .begin_side_conversation_gui_turn(admission, message_key.clone())
+                .await
+        }
+        None => {
+            scoped_runtime
+                .begin_turn(
+                    &state.app_state.session.foreground_turns,
+                    echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
+                    &active_turn_key,
+                    message_key.clone(),
+                )
+                .await
+        }
+    };
+    let foreground_lease = match foreground_admission {
         Ok(lease) => lease,
         Err(
             echo_agent_app_core::api::conversation_deletion::ConversationDeletionError::Foreground(
@@ -697,6 +779,22 @@ pub async fn send_chat_message(
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;
     let agent_handle = pool_execution.agent();
+    if restore_transcript_before_turn {
+        let store = scoped_runtime
+            .conversation_store()
+            .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
+        let stored = store
+            .get_messages(&conversation_id)
+            .await
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        let system_prompt = agent_handle
+            .read(|agent| agent.system_prompt().to_string())
+            .await;
+        let messages = super::conversations::restore_agent_transcript(&stored, &system_prompt)?;
+        agent_handle
+            .read_async(|agent| Box::pin(async move { agent.load_messages(messages).await }))
+            .await;
+    }
 
     // Ensure stable cache_user_id for KVCache isolation (DeepSeek requires this
     // for prompt cache reuse across requests; without it, cache hit rate drops
@@ -1286,11 +1384,16 @@ fn select_active_chat_turn(
     use echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface;
 
     if let Some(conversation_id) = conversation_id {
-        return Ok(control.snapshot_scoped(
-            workspace_id,
-            ForegroundTurnSurface::Gui,
-            conversation_id,
-        ));
+        let mut snapshots = control
+            .snapshots_for_conversation_scoped(workspace_id, conversation_id)
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        return match snapshots.len() {
+            0 => Ok(None),
+            1 => Ok(snapshots.pop()),
+            _ => Err(IpcError::Validation(
+                "active_chat_turn_ambiguous:multiple_surfaces".to_string(),
+            )),
+        };
     }
     let mut snapshots = control
         .snapshots(ForegroundTurnSurface::Gui)
@@ -1520,11 +1623,37 @@ fn request_chat_cancel(
     Option<echo_agent_app_core::api::foreground_turn::ForegroundTurnSettlementWaiter>,
     IpcError,
 > {
-    use echo_agent_app_core::api::foreground_turn::{ForegroundTurnError, ForegroundTurnSurface};
+    use echo_agent_app_core::api::foreground_turn::ForegroundTurnError;
 
+    let snapshots = control
+        .snapshots_for_conversation_scoped(workspace_id, conversation_id)
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let actual = snapshots.first().cloned();
+    let mut matching = snapshots
+        .into_iter()
+        .filter(|snapshot| snapshot.root_turn_id == root_turn_id);
+    let Some(snapshot) = matching.next() else {
+        return match actual {
+            Some(actual) => Err(IpcError::Validation(
+                ForegroundTurnError::TurnMismatch {
+                    surface: actual.surface,
+                    conversation_id: conversation_id.to_string(),
+                    expected_turn_id: root_turn_id.to_string(),
+                    actual_turn_id: actual.root_turn_id,
+                }
+                .to_string(),
+            )),
+            None => Ok(None),
+        };
+    };
+    if matching.next().is_some() {
+        return Err(IpcError::Validation(
+            "chat_cancel_ambiguous:multiple_surfaces".to_string(),
+        ));
+    }
     match control.request_root_cancel_scoped(
         workspace_id,
-        ForegroundTurnSurface::Gui,
+        snapshot.surface,
         conversation_id,
         root_turn_id,
     ) {
@@ -2904,6 +3033,29 @@ mod foreground_turn_command_tests {
     use super::*;
     use echo_agent_app_core::api::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
 
+    #[test]
+    fn side_initial_request_enables_restore_and_terminal_idempotency_only() -> Result<(), String> {
+        let request = SendChatMessageRequest::side_initial(
+            "workspace-1".to_string(),
+            "side-1".to_string(),
+            "side-start:group-1".to_string(),
+            "investigate".to_string(),
+        );
+        assert!(request.terminal_duplicate_ok);
+        assert!(request.restore_transcript_before_turn);
+        assert_eq!(request.message_key.as_deref(), Some("side-start:group-1"));
+        assert_eq!(request.conversation_id.as_deref(), Some("side-1"));
+        let ordinary: SendChatMessageRequest = serde_json::from_value(serde_json::json!({
+            "workspaceId": "workspace-1",
+            "message": "hello",
+            "conversationId": "conversation-1"
+        }))
+        .map_err(|error| error.to_string())?;
+        assert!(!ordinary.terminal_duplicate_ok);
+        assert!(!ordinary.restore_transcript_before_turn);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn active_snapshot_returns_real_message_scope_without_product_conversation()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2961,6 +3113,33 @@ mod foreground_turn_command_tests {
         let waiter = request_chat_cancel(&control, "workspace-1", "conversation-1", "turn-1")?;
 
         assert!(waiter.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exact_conversation_lookup_and_cancel_include_agent_surface_turns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin_scoped(
+            "workspace-1",
+            ForegroundTurnSurface::Agent,
+            "side-1",
+            "agent-turn-1",
+        )?;
+        let snapshot = select_active_chat_turn(&control, "workspace-1", Some("side-1"))?
+            .ok_or_else(|| "missing Agent surface turn".to_string())?;
+        assert_eq!(snapshot.surface, ForegroundTurnSurface::Agent);
+
+        let waiter = request_chat_cancel(&control, "workspace-1", "side-1", "agent-turn-1")?
+            .ok_or_else(|| "missing Agent surface cancel waiter".to_string())?;
+        assert!(lease.cancellation_token().is_cancelled());
+        lease
+            .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Cancelled)
+            .await?;
+        assert_eq!(
+            waiter.wait().await?.outcome,
+            echo_agent_app_core::api::chat_driver::TurnOutcome::Cancelled
+        );
         Ok(())
     }
 

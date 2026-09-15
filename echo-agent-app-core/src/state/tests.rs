@@ -1244,6 +1244,375 @@ mod model_mutation_tests {
 }
 
 #[cfg(test)]
+mod side_conversation_lifecycle_tests {
+    use super::*;
+    use echo_agent::agent::ReactAgentBuilder;
+    use echo_agent::memory::{ConversationStore, FileConversationStore, NewConversation};
+    use echo_agent::testing::MockLlmClient;
+
+    const WORKSPACE_ID: &str = "global";
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        state: Arc<AppState>,
+        store: Arc<dyn ConversationStore>,
+        deletions: Arc<crate::conversation_deletion::ConversationDeletionService>,
+    }
+
+    async fn fixture() -> Result<Fixture, String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store: Arc<dyn ConversationStore> = Arc::new(
+            FileConversationStore::new(temp.path().join("conversations"))
+                .map_err(|error| error.to_string())?,
+        );
+        let primary = ReactAgentBuilder::new()
+            .llm_client(Arc::new(
+                MockLlmClient::new().with_responses(["side answer"]),
+            ))
+            .system_prompt("Side Conversation lifecycle test")
+            .build()
+            .map(AgentHandle::new)
+            .map_err(|error| error.to_string())?;
+        let pool = Arc::new(
+            crate::agent_pool::AgentPool::new_for_test(primary.clone(), None, None, 4, false)
+                .await,
+        );
+        pool.apply_conversation_store(Arc::clone(&store)).await;
+        let mcp = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
+            temp.path().join("mcp.json"),
+            Default::default(),
+        ));
+        let mut state = AppState::from_shared(
+            primary,
+            None,
+            Arc::new(crate::hitl::HitlDispatcher::new()),
+            Some(Arc::clone(&store)),
+            None,
+            Default::default(),
+            mcp,
+            crate::product_data_io::ProductDataIoService::new(),
+        )
+        .map_err(|error| error.to_string())?
+        .with_agent_router(Arc::new(crate::agent_router::AgentRouter::new(
+            temp.path().join("agent-router"),
+        )));
+        let deletions = Arc::new(
+            crate::conversation_deletion::ConversationDeletionService::new(
+                temp.path().join("conversation-deletions"),
+            ),
+        );
+        {
+            let mut binding = state.storage.conversation.write().await;
+            binding.deletions = Arc::clone(&deletions);
+        }
+        state.workspace.global_conversation.deletions = Arc::clone(&deletions);
+        state.storage.conversation_archive = Arc::new(
+            crate::conversation_archive::ConversationArchiveStore::open(
+                temp.path().join("conversation-archive.json"),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        state.storage.tool_executions = Arc::new(
+            crate::tool_execution::ToolExecutionRepository::open(temp.path().join("tools"))
+                .map_err(|error| error.to_string())?,
+        );
+        state.storage.chat_events = Arc::new(
+            crate::chat_event_log::ChatEventLog::open(
+                temp.path().join("chat-events"),
+                Default::default(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        state.set_pool(pool);
+        Ok(Fixture {
+            _temp: temp,
+            state: Arc::new(state),
+            store,
+            deletions,
+        })
+    }
+
+    async fn create_primary(store: &dyn ConversationStore, id: &str) -> Result<(), String> {
+        store
+            .create_conversation(NewConversation {
+                conversation_id: id.to_string(),
+                user_id: "eko".to_string(),
+                agent_type: None,
+                title: Some("Main".to_string()),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn side_request(parent: &str, request_id: &str) -> crate::side_conversation::SideConversationCreateRequest {
+        crate::side_conversation::SideConversationCreateRequest {
+            workspace_id: WORKSPACE_ID.to_string(),
+            parent_conversation_id: parent.to_string(),
+            request_id: request_id.to_string(),
+            prompt: "Investigate the alternative".to_string(),
+            title: Some("Alternative".to_string()),
+            model_id: None,
+        }
+    }
+
+    fn settle_when_cancelled(
+        lease: crate::foreground_turn::ForegroundTurnLease,
+    ) -> tokio::task::JoinHandle<Result<(), String>> {
+        tokio::spawn(async move {
+            lease.cancellation_token().cancelled().await;
+            lease
+                .settle_after_observers(crate::chat_driver::TurnOutcome::Cancelled)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    #[tokio::test]
+    async fn active_child_delete_and_parent_cascade_cancel_and_aggregate_cleanup()
+    -> Result<(), String> {
+        let fixture = fixture().await?;
+        create_primary(fixture.store.as_ref(), "main").await?;
+        let direct = fixture
+            .state
+            .create_side_conversation_owned(
+                side_request("main", "direct-child"),
+            )
+            .await?;
+        let direct_child = direct.creation.entry.conversation_id.clone();
+        drop(direct);
+        fixture
+            .state
+            .storage
+            .chat_events
+            .append(
+                WORKSPACE_ID,
+                Some(&direct_child),
+                "later-turn",
+                crate::chat_driver::ChatDriverEvent::TurnStatus {
+                    status: "failed".to_string(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            fixture
+                .state
+                .list_side_conversations_scoped(WORKSPACE_ID)
+                .await?
+                .first()
+                .map(|entry| entry.status),
+            Some(crate::side_conversation::SideConversationStatus::Failed)
+        );
+        let direct_lease = fixture
+            .state
+            .session
+            .foreground_turns
+            .begin_scoped(WORKSPACE_ID, crate::foreground_turn::ForegroundTurnSurface::Gui, &direct_child, "direct-turn")
+            .map_err(|error| error.to_string())?;
+        let direct_settlement = settle_when_cancelled(direct_lease);
+        fixture
+            .state
+            .delete_conversation_scoped(WORKSPACE_ID, &direct_child)
+            .await
+            .map_err(|error| error.to_string())?;
+        direct_settlement
+            .await
+            .map_err(|error| error.to_string())??;
+        assert!(
+            fixture
+                .store
+                .get_conversation("main")
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some()
+        );
+
+        let cascading = fixture
+            .state
+            .create_side_conversation_owned(side_request("main", "cascade-child"))
+            .await?;
+        let cascading_child = cascading.creation.entry.conversation_id.clone();
+        drop(cascading);
+        let cascading_lease = fixture
+            .state
+            .session
+            .foreground_turns
+            .begin_scoped(
+                WORKSPACE_ID,
+                crate::foreground_turn::ForegroundTurnSurface::Gui,
+                &cascading_child,
+                "cascade-turn",
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            fixture
+                .state
+                .list_side_conversations_scoped(WORKSPACE_ID)
+                .await?
+                .first()
+                .map(|entry| entry.status),
+            Some(crate::side_conversation::SideConversationStatus::Running)
+        );
+        let cascading_settlement = settle_when_cancelled(cascading_lease);
+        fixture
+            .deletions
+            .fail_next_tombstone_retirement_for_test();
+        let receipt = fixture
+            .state
+            .delete_conversation_scoped(WORKSPACE_ID, "main")
+            .await
+            .map_err(|error| error.to_string())?;
+        cascading_settlement
+            .await
+            .map_err(|error| error.to_string())??;
+        assert!(receipt.cleanup_pending);
+        assert!(
+            fixture
+                .store
+                .get_conversation("main")
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .get_conversation(&cascading_child)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(
+            fixture
+                .state
+                .list_side_conversations_scoped(WORKSPACE_ID)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parent_delete_serializes_with_side_creation_and_leaves_no_orphan()
+    -> Result<(), String> {
+        let fixture = fixture().await?;
+        create_primary(fixture.store.as_ref(), "main").await?;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        fixture
+            .deletions
+            .install_before_lineage_barrier(entered_tx, release_rx);
+        let deleting_state = Arc::clone(&fixture.state);
+        let deleting = tokio::spawn(async move {
+            deleting_state
+                .delete_conversation_scoped(WORKSPACE_ID, "main")
+                .await
+        });
+        entered_rx
+            .await
+            .map_err(|_| "parent deletion did not reach its identity barrier".to_string())?;
+
+        let request = side_request("main", "racing-child");
+        let child_id = crate::side_conversation::SideConversationService::child_id_for_request(
+            &request,
+        )
+        .map_err(|error| error.to_string())?;
+        let creating_state = Arc::clone(&fixture.state);
+        let mut creating = tokio::spawn(async move {
+            creating_state.create_side_conversation_owned(request).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut creating)
+                .await
+                .is_err(),
+            "side creation passed the parent identity guard"
+        );
+        release_tx
+            .send(())
+            .map_err(|_| "parent deletion barrier closed early".to_string())?;
+        deleting
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let create_result = creating.await.map_err(|error| error.to_string())?;
+        assert!(create_result.is_err());
+        assert!(
+            fixture
+                .store
+                .get_conversation(&child_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(
+            fixture
+                .state
+                .list_side_conversations_scoped(WORKSPACE_ID)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_gui_turn_admission_closes_the_post_create_delete_window()
+    -> Result<(), String> {
+        let fixture = fixture().await?;
+        create_primary(fixture.store.as_ref(), "main").await?;
+        let preparation = fixture
+            .state
+            .create_side_conversation_owned(side_request("main", "first-turn-race"))
+            .await?;
+        let child_id = preparation.creation.entry.conversation_id.clone();
+
+        let deleting_state = Arc::clone(&fixture.state);
+        let child_for_delete = child_id.clone();
+        let mut deleting = tokio::spawn(async move {
+            deleting_state
+                .delete_conversation_scoped(WORKSPACE_ID, &child_for_delete)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut deleting)
+                .await
+                .is_err(),
+            "child deletion passed the retained first-turn admission identity"
+        );
+
+        let lease = fixture
+            .state
+            .begin_side_conversation_gui_turn(preparation.admission, "side-start:first-turn-race")
+            .await
+            .map_err(|error| error.to_string())?;
+        let settlement = settle_when_cancelled(lease);
+        let receipt = deleting
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        settlement.await.map_err(|error| error.to_string())??;
+
+        assert!(!receipt.cleanup_pending);
+        assert!(
+            fixture
+                .store
+                .get_conversation(&child_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(
+            fixture
+                .state
+                .list_side_conversations_scoped(WORKSPACE_ID)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod workspace_transition_tests {
     use super::*;
     use echo_agent::agent::ReactAgentBuilder;

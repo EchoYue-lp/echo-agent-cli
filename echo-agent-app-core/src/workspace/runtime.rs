@@ -1051,11 +1051,11 @@ impl WorkspaceRuntimeRegistry {
                 activity.active_controls
             );
         }
-        host.shutdown_runtime().await?;
-        // Keep the closing guard uncommitted until shutdown succeeds. On a
-        // shutdown error its Drop implementation reopens the host so callers
-        // can retry or restore a failed project relink.
+        // Crossing into the owned shutdown settlement is irreversible. Keep
+        // the host sealed even when shutdown reports durable cleanup debt;
+        // only cancellation before this safe point may reopen admission.
         closing.commit();
+        host.shutdown_runtime().await?;
         hosts.remove(workspace_id);
         Ok(true)
     }

@@ -70,7 +70,7 @@ struct PluginAgentResources {
     llm_config: Option<echo_agent::llm::LlmConfig>,
     parent_model: String,
     registry: Arc<echo_agent::subagent::SubagentRegistry>,
-    sandbox: Option<Arc<echo_agent::sandbox::SandboxManager>>,
+    sandbox: Option<Arc<dyn echo_agent::sandbox::SandboxExecutor>>,
     working_dir: Option<PathBuf>,
     tool_visibility: echo_agent::agent::ToolVisibilityPolicy,
 }
@@ -831,8 +831,6 @@ fn build_plugin_agent(
         );
     if definition.readonly {
         builder = builder.readonly_tools();
-    } else if let Some(sandbox) = resources.sandbox.clone() {
-        builder = builder.sandbox_manager(sandbox);
     }
     if let Some(max_iterations) = definition.max_turns {
         builder = builder.max_iterations(max_iterations);
@@ -850,6 +848,11 @@ fn build_plugin_agent(
         builder = builder.llm_config(config);
     }
     let mut agent = builder.build()?;
+    if !definition.readonly
+        && let Some(sandbox) = resources.sandbox.clone()
+    {
+        agent.set_sandbox_executor(sandbox);
+    }
     agent.use_tool_visibility_policy(resources.tool_visibility.clone());
     let disabled_tools = resources.tool_visibility.disabled_names();
     let capabilities =
