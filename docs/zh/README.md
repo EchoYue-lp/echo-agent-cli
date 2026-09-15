@@ -10,4 +10,5 @@
 node ../../scripts/check-docs-parity.mjs
 ```
 
-框架公共能力请阅读同级 `echo-agent` 仓库的正式文档；本目录只记录 EKO 应用策略和组合方式。
+框架公共能力请阅读同级 `echo-agent` 仓库的正式文档；跨语言 SDK、协议合同和 Host 适配器请阅读独立的
+[echo-agent-sdk](https://github.com/EchoYue-lp/echo-agent-sdk) 仓库。本目录只记录 EKO 应用策略和组合方式。
