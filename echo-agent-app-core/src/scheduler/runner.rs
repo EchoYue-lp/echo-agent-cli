@@ -155,7 +155,10 @@ fn build_fire_fn_with_cancel(
                 if let Some(layer_manager) = layer_manager {
                     run_agent
                         .write(|agent| agent.install_memory_layer_manager(layer_manager))
-                        .await;
+                        .await
+                        .map_err(|error| {
+                            format!("cron memory layer installation failed: {error}")
+                        })?;
                 }
                 let result = drive_existing_cron_run(
                     owned_store.clone(),
@@ -419,8 +422,10 @@ mod tests {
             .send(())
             .map_err(|_| "scheduler admission reservation stopped waiting".to_string())?;
 
+        // Both branches do durable settlement after the race is released; parallel suites can
+        // delay their scheduling without violating the already-observed admission ordering.
         let (fire_result, shutdown_result) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async move {
                 tokio::join!(fire, shutdown)
             })
             .await

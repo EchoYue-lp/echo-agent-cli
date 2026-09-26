@@ -76,6 +76,9 @@ pub mod conversation_input {
 pub mod conversation_projection {
     pub use crate::conversation_projection::*;
 }
+pub mod managed_conversation {
+    pub use crate::managed_conversation::*;
+}
 pub mod data_root {
     pub use crate::data_root::*;
 }

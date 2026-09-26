@@ -2135,6 +2135,7 @@ export const evolutionApi = {
     isTauri()
       ? apiInvoke<{
           success: boolean;
+          review_operation_id?: string;
           run_id: string;
           actions: string[];
           nothing_to_save: boolean;
@@ -2143,13 +2144,14 @@ export const evolutionApi = {
             content: string;
             evidence: string;
             confidence: number;
-            persisted: boolean;
+            persisted: boolean | null;
           } | null;
           evidence_candidate?: EvidenceCandidate | null;
           error?: string | null;
         }>('review_run', { run_id: runId })
       : post<{
           success: boolean;
+          review_operation_id?: string;
           run_id: string;
           actions: string[];
           nothing_to_save: boolean;
@@ -2158,7 +2160,7 @@ export const evolutionApi = {
             content: string;
             evidence: string;
             confidence: number;
-            persisted: boolean;
+            persisted: boolean | null;
           } | null;
           evidence_candidate?: EvidenceCandidate | null;
           error?: string | null;

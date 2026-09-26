@@ -612,8 +612,8 @@ impl ExtensionControlService {
                 let _control = control;
                 let artifact_name = name.clone();
                 let artifact = flow
-                    .run("promote curated skill artifact", move || {
-                        promote_curated_skill_artifact(echo_agent_dir, &artifact_name)
+                    .run_async("promote curated skill artifact", async move {
+                        promote_curated_skill_artifact(echo_agent_dir, &artifact_name).await
                     })
                     .await
                     .map_err(anyhow::Error::new)?

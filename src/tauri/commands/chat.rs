@@ -5,7 +5,6 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent::agent::Agent as _;
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent_app_core::api::chat_driver::ChatDriverEvent;
 use echo_agent_app_core::api::chat_driver::ChatSink;
@@ -783,17 +782,17 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
         let store = scoped_runtime
             .conversation_store()
             .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
-        let stored = store
-            .get_messages(&conversation_id)
-            .await
-            .map_err(|error| IpcError::Internal(error.to_string()))?;
-        let system_prompt = agent_handle
-            .read(|agent| agent.system_prompt().to_string())
-            .await;
-        let messages = super::conversations::restore_agent_transcript(&stored, &system_prompt)?;
-        agent_handle
-            .read_async(|agent| Box::pin(async move { agent.load_messages(messages).await }))
-            .await;
+        let runtime_state = scoped_runtime
+            .runtime_state_store()
+            .ok_or_else(|| IpcError::Internal("Runtime state store not available".to_string()))?;
+        echo_agent_app_core::api::managed_conversation::resume_or_import(
+            store.as_ref(),
+            runtime_state.as_ref(),
+            &agent_handle,
+            &conversation_id,
+        )
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
     }
 
     // Ensure stable cache_user_id for KVCache isolation (DeepSeek requires this

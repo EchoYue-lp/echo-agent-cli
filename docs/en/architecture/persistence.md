@@ -49,6 +49,9 @@ root or the application package.
 - Framework `ConversationStore` owns the durable conversation transcript.
 - Framework runtime state owns the compact checkpoint needed to resume an
   in-flight turn.
+- EKO's existing conversation visibility file owns archive choices and
+  epoch-scoped internal-turn intent/exact message IDs. It neither changes the
+  canonical transcript nor owns AgentRouter delivery outcomes.
 - EKO `ChatEventLog` owns product event payloads, conversation identity,
   retention pins, and UI/channel projection while reusing the framework
   segmented journal primitive.
@@ -62,11 +65,28 @@ root or the application package.
 
 These authorities are complementary. A checkpoint is not a transcript, a Todo
 projection is not a task graph, and a frontend store is not durable state.
+Managed transcript replacement imports the visible prefix and seeds a projection
+generation, then CAS-writes the matching Agent checkpoint. EKO replays the exact
+import receipt before repairing a crash between those two commits; it never
+hydrates a managed Agent through legacy `load_messages`.
 `ChatEventLog` owns surface delivery/replay while TaskRuntime owns the associated
 Goal, user constraints, execution, and recovery facts. See
 [ADR 0037](../adr/0037-unified-turn-run-binding.md).
 
 ## Recovery and Retention
+
+The scheduler binds framework `CronTaskStore` to the stable EKO data-root path
+`scheduler/tasks.json`; its sibling occurrence journal uses that identity even
+when a Memory Store owns task definitions. GUI, TUI, CLI, and JSONL startup do
+not derive scheduler durability from the process working directory.
+
+EKO records Background Review admission, outcome, and terminal settlement in
+`.eko/evolution/background-review.jsonl`. This journal owns only the review
+operation lifecycle: the framework Memory journal owns committed memory and
+the Review Inbox owns evidence candidates. Recovery replays a saved outcome
+into the Inbox idempotently; an admission without outcome is reconciled against
+the stable memory key and marked interrupted without inventing evidence. See
+[ADR 0043](../adr/0043-background-review-owner.md).
 
 Boot reconciliation closes interrupted command cells and repairs projections
 from the authoritative journal. Segment and cursor projections may be pruned

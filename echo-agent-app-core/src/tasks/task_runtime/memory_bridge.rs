@@ -483,7 +483,7 @@ mod tests {
     /// recall falls back to keyword search). The precondition: the run must
     /// have ≥1 Completed todo (else build_candidates returns nothing).
     #[tokio::test]
-    async fn completed_run_memory_is_recallable_after_settlement() -> Result<(), String> {
+    async fn completed_run_memory_remains_draft_until_approved() -> Result<(), String> {
         use echo_agent::evolution::{MemoryRecaller, ReviewConfig};
         use echo_agent::memory::InMemoryStore;
         use echo_agent::memory::store::Store;
@@ -519,12 +519,16 @@ mod tests {
 
         // (1) Exact-key lookup — strongest, no ranking luck. The key the write
         // path uses is `taskrun:completed:{run_id}`.
-        let located = lm.locate("taskrun:completed:r1").await;
+        let located = lm
+            .locate("taskrun:completed:r1")
+            .await
+            .map_err(|error| error.to_string())?;
         assert!(
             located.is_some(),
             "RunCompleted memory must be located by exact key"
         );
         let (_, entry) = located.ok_or_else(|| "completed memory was not located".to_string())?;
+        assert_eq!(entry.meta.status, echo_agent::memory::MemoryStatus::Draft);
         assert!(
             entry.content.contains("Review runtime"),
             "memory content must carry the goal; got: {}",
@@ -536,29 +540,19 @@ mod tests {
             entry.content
         );
 
-        // (2) Keyword recall via the manager (exercises the layered search path
-        // the frontend/agent recall would use).
+        // (2) Draft evidence is stored but not promoted into ordinary recall.
         let hits = lm
             .search_layered("Review", 10)
             .await
             .map_err(|error| error.to_string())?;
-        assert!(
-            hits.iter()
-                .any(|(_, e)| e.content.contains("Review runtime")),
-            "search_layered should find the completed-run memory by keyword"
-        );
+        assert!(!hits.iter().any(|(_, e)| e.key == "taskrun:completed:r1"));
 
-        // (3) True ReactAgent recall path over the same store (what a follow-up
-        // question actually does). Confirms the write landed in a recallable
-        // namespace, not just an internal log.
+        // (3) The Agent recaller must respect the same activation boundary.
         let recalled = MemoryRecaller::new(store.clone())
             .recall("Review", 5)
             .await
             .map_err(|error| error.to_string())?;
-        assert!(
-            recalled.iter().any(|i| i.key == "taskrun:completed:r1"),
-            "MemoryRecaller (the real follow-up-question path) must find the completed-run memory"
-        );
+        assert!(!recalled.iter().any(|i| i.key == "taskrun:completed:r1"));
         Ok(())
     }
 }

@@ -111,6 +111,7 @@ pub async fn list_memory(
 
     let mut entries = layer_manager
         .list_hot()
+        .map_err(|error| IpcError::Internal(error.to_string()))?
         .into_iter()
         .map(|entry| entry_json(MemoryLayer::Hot, entry))
         .collect::<Vec<_>>();

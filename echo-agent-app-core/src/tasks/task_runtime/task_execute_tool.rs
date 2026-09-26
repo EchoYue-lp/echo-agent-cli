@@ -134,10 +134,10 @@ async fn acquire_run_execution_lock(run_id: &str) -> RunExecutionGuard {
 ///
 /// 字段说明:
 /// - `store`: TaskRuntimeStore (用来读/写 run 状态)
-/// - `primary_agent`: AgentHandle (传给 execute_run 做 subagent 调度)
+/// - `primary_agent`: weak Agent handle (avoids retaining the Agent through its own tool)
 pub struct ExecuteTaskTool {
     store: Arc<TaskRuntimeStore>,
-    primary_agent: AgentHandle,
+    primary_agent: std::sync::Weak<tokio::sync::RwLock<echo_agent::agent::ReactAgent>>,
     agent_pool: Option<std::sync::Weak<crate::agent_pool::AgentPool>>,
     /// D7 stage 2: unattended write mode for this tool's runs. Determines
     /// whether the CP A preflight loosens its write ban (Worktree/InPlace)
@@ -162,7 +162,7 @@ impl ExecuteTaskTool {
     ) -> Self {
         Self {
             store,
-            primary_agent,
+            primary_agent: Arc::downgrade(primary_agent.inner()),
             agent_pool: None,
             write_mode,
             workspace_io: None,
@@ -219,7 +219,11 @@ impl ExecuteTaskTool {
             });
         }
         Ok(TaskExecutionAgent {
-            agent: self.primary_agent.clone(),
+            agent: AgentHandle::from_arc(
+                self.primary_agent
+                    .upgrade()
+                    .ok_or(crate::agent_pool::PoolError::ShuttingDown)?,
+            ),
             pool_receipt: None,
         })
     }

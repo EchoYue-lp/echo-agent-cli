@@ -85,8 +85,8 @@ incarnation ID。active pin 只保存已捕获 runtime/root 与 exact agent key�
    新增附件更早被拒绝。启用 continuation 的 run 使用 `RunTurnBinding::resume_expected`；已有正式
    plan 且未启用 continuation 的 run 使用 `launch_planned_run_resume`，两者不建立平行 resume authority。
 8. EKO `/reset` 在旧 admission 关闭、foreground/lease settlement 与 exact retirement 成功后，
-   调用 framework `clear_persisted_runtime_incarnation` 精确回收旧 checkpoint 和任何误写到
-   incarnation key 的 transcript，再通过 coordinator 锁驱动 framework instance 原子 rotate，并把
+   调用 framework `clear_persisted_runtime_incarnation` 精确退休旧 checkpoint；EKO 随后按
+   incarnation transcript 的 managed epoch 删除该独立 transcript，再通过 coordinator 锁驱动 framework instance 原子 rotate，并把
    interaction mode 重置为 Auto、清理 pending HITL。失败或取消不 rotate、不改 mode；authority
    mismatch 进入 quarantine。timeout replacement 的 pending retirement 复用同一 exact GC。reset
    表示新模型上下文，不删除 ChatEventLog、稳定产品 transcript 或 TaskRun。

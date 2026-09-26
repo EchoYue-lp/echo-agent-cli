@@ -15,7 +15,7 @@
 use echo_agent::evolution::{
     Curator, CuratorConfig, EvolutionObserver, MemoryLayerManager, MemoryReviewer,
     MemoryRuntimeIntegrationBuilder, ReviewChange, ReviewConfig, ReviewReport,
-    SkillCandidateDetector, SkillDraftGenerator,
+    SkillApprovalArtifact, SkillCandidateDetector, SkillDraftGenerator, SkillMutationAuthority,
 };
 use echo_agent::memory::Store;
 use echo_agent::memory::TypedMemoryStore;
@@ -24,6 +24,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
+use super::background_review_owner::{
+    BackgroundReviewReceipt, ReviewReceiptStore, ReviewRecoveryReceipt, evidence_terminal,
+    memory_fingerprint,
+};
 use super::evidence::{
     EvidenceCandidate, EvidenceCandidateDraft, EvidenceKind, EvidenceRef, EvidenceSource,
     EvidenceStore, capture_memory_conflict, capture_review_outcome,
@@ -180,6 +184,7 @@ struct ReviewBindingState {
 
 struct ReviewBindingControl {
     state: Mutex<ReviewBindingState>,
+    background_review_admission: tokio::sync::Mutex<()>,
     background_reviews: Mutex<BackgroundReviewRegistry>,
 }
 
@@ -189,6 +194,7 @@ struct BackgroundReviewRegistry {
 }
 
 struct OwnedBackgroundReview {
+    identity: echo_agent::evolution::ReviewIdentity,
     abort_handle: tokio::task::AbortHandle,
     release: echo_agent::agent::CancellationToken,
     supervisor: tokio::task::JoinHandle<Result<(), String>>,
@@ -287,6 +293,285 @@ impl ReviewGenerationLease {
         self.receipt.binding.store.clone()
     }
 
+    pub fn skill_mutation_authority(
+        &self,
+    ) -> echo_agent::error::Result<Arc<SkillMutationAuthority>> {
+        skill_mutation_authority(&self.receipt.binding.echo_agent_dir)
+    }
+
+    pub async fn generate_skill_draft(
+        &self,
+        name: &str,
+        approver: &str,
+    ) -> Result<echo_agent::evolution::DraftResult, String> {
+        let typed_store = TypedMemoryStore::new(self.memory_store());
+        let entry = typed_store
+            .get_typed(echo_agent::evolution::candidate::CANDIDATE_NAMESPACE, name)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("Skill candidate '{name}' not found"))?;
+        let candidate: echo_agent::evolution::SkillCandidate =
+            serde_json::from_str(&entry.content).map_err(|error| error.to_string())?;
+        if candidate.name != name {
+            return Err("Skill candidate name does not match its store key".to_string());
+        }
+        let authority = self
+            .skill_mutation_authority()
+            .map_err(|error| error.to_string())?;
+        let generator = SkillDraftGenerator::new(self.echo_agent_dir().to_path_buf(), authority);
+        let preview = generator
+            .preview_generate_from_candidate(&candidate, uuid::Uuid::new_v4().to_string())
+            .await
+            .map_err(|error| error.to_string())?;
+        let approval = SkillApprovalArtifact::new(
+            uuid::Uuid::new_v4().to_string(),
+            &preview.preview.operation_digest,
+            approver,
+            chrono::Utc::now(),
+        );
+        generator
+            .generate_from_preview(preview, approval)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn apply_skill_state(
+        authority: &SkillMutationAuthority,
+        name: &str,
+        kind: echo_agent::evolution::SkillMutationKind,
+        reason: &str,
+        approver: &str,
+        before: echo_agent::evolution::CuratorState,
+        after: echo_agent::evolution::CuratorState,
+    ) -> Result<(), String> {
+        let request = echo_agent::evolution::SkillMutationRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            entity_key: name.to_string(),
+            kind,
+            reason: reason.to_string(),
+            files: Vec::new(),
+            curator_before: before,
+            curator_after: after,
+            rollback_of: None,
+        };
+        let preview = authority
+            .preview(&request)
+            .map_err(|error| error.to_string())?;
+        let approval = SkillApprovalArtifact::new(
+            uuid::Uuid::new_v4().to_string(),
+            preview.operation_digest,
+            approver,
+            chrono::Utc::now(),
+        );
+        match authority
+            .apply(request, approval)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            echo_agent::evolution::SkillMutationOutcome::Applied(_)
+            | echo_agent::evolution::SkillMutationOutcome::AlreadyApplied(_) => Ok(()),
+            outcome => Err(format!("Skill mutation did not settle: {outcome:?}")),
+        }
+    }
+
+    pub async fn set_skill_pinned(
+        &self,
+        name: &str,
+        pinned: bool,
+        approver: &str,
+    ) -> Result<(), String> {
+        let authority = self
+            .skill_mutation_authority()
+            .map_err(|error| error.to_string())?;
+        let before = authority
+            .curator()
+            .load_state()
+            .map_err(|error| error.to_string())?;
+        let mut after = before.clone();
+        let meta = after
+            .skills
+            .get_mut(name)
+            .ok_or_else(|| format!("Skill '{name}' was not found"))?;
+        if meta.pinned == pinned {
+            return Ok(());
+        }
+        meta.pinned = pinned;
+        meta.last_modified_at = chrono::Utc::now();
+        Self::apply_skill_state(
+            &authority,
+            name,
+            echo_agent::evolution::SkillMutationKind::Touch,
+            if pinned { "pin Skill" } else { "unpin Skill" },
+            approver,
+            before,
+            after,
+        )
+        .await
+    }
+
+    pub async fn register_user_skill(
+        &self,
+        name: &str,
+        path: &std::path::Path,
+        approver: &str,
+    ) -> Result<(), String> {
+        if name.trim().is_empty()
+            || std::path::Path::new(name)
+                .file_name()
+                .is_none_or(|component| component != std::ffi::OsStr::new(name))
+        {
+            return Err("Skill name must be one non-empty path component".to_string());
+        }
+        if !path.is_file() {
+            return Err(format!("Skill file does not exist: {}", path.display()));
+        }
+        let canonical_path = echo_agent::evolution::SkillFileMutation::canonical_path(path)
+            .map_err(|error| error.to_string())?;
+        let expected = echo_agent::evolution::SkillFileMutation::canonical_path(
+            self.echo_agent_dir()
+                .join("skills")
+                .join(name)
+                .join("SKILL.md"),
+        )
+        .map_err(|error| error.to_string())?;
+        if canonical_path != expected {
+            return Err("Skill path does not match the selected workspace and name".to_string());
+        }
+        let authority = self
+            .skill_mutation_authority()
+            .map_err(|error| error.to_string())?;
+        let before = authority
+            .curator()
+            .load_state()
+            .map_err(|error| error.to_string())?;
+        let mut after = before.clone();
+        let now = chrono::Utc::now();
+        if let Some(meta) = after.skills.get_mut(name) {
+            meta.last_used_at = now;
+            meta.path = Some(canonical_path);
+            meta.last_modified_at = now;
+        } else {
+            after.skills.insert(
+                name.to_string(),
+                echo_agent::evolution::SkillMeta {
+                    name: name.to_string(),
+                    path: Some(canonical_path),
+                    lifecycle: echo_agent::evolution::SkillLifecycle::Active,
+                    created_at: now,
+                    last_used_at: now,
+                    last_modified_at: now,
+                    pinned: false,
+                    agent_created: false,
+                    superseded_by: None,
+                },
+            );
+        }
+        Self::apply_skill_state(
+            &authority,
+            name,
+            echo_agent::evolution::SkillMutationKind::Promote,
+            "register user Skill",
+            approver,
+            before,
+            after,
+        )
+        .await
+    }
+
+    pub async fn run_skill_transitions(
+        &self,
+        approver: &str,
+    ) -> Result<
+        Vec<(
+            String,
+            echo_agent::evolution::SkillLifecycle,
+            echo_agent::evolution::SkillLifecycle,
+        )>,
+        String,
+    > {
+        use echo_agent::evolution::SkillLifecycle;
+
+        let authority = self
+            .skill_mutation_authority()
+            .map_err(|error| error.to_string())?;
+        let state = authority
+            .curator()
+            .load_state()
+            .map_err(|error| error.to_string())?;
+        let config = echo_agent::evolution::CuratorConfig::default();
+        if !config.enabled {
+            return Ok(Vec::new());
+        }
+        let now = chrono::Utc::now();
+        let mut planned = Vec::new();
+        for meta in state.skills.values() {
+            if meta.pinned || !meta.agent_created {
+                continue;
+            }
+            let idle_days = (now - meta.last_used_at).num_days().max(0) as u64;
+            let next = match meta.lifecycle {
+                SkillLifecycle::Active if idle_days >= config.stale_days => {
+                    Some(SkillLifecycle::Stale)
+                }
+                SkillLifecycle::Stale if idle_days >= config.deprecate_days => {
+                    Some(SkillLifecycle::Deprecated)
+                }
+                SkillLifecycle::Deprecated if idle_days >= config.archive_days => {
+                    Some(SkillLifecycle::Archived)
+                }
+                _ => None,
+            };
+            if let Some(next) = next {
+                planned.push((meta.name.clone(), meta.lifecycle, next));
+            }
+        }
+        planned.sort_by(|left, right| left.0.cmp(&right.0));
+        for (name, _, next) in &planned {
+            let before = authority
+                .curator()
+                .load_state()
+                .map_err(|error| error.to_string())?;
+            let mut after = before.clone();
+            let meta = after
+                .skills
+                .get_mut(name)
+                .ok_or_else(|| format!("Skill '{name}' disappeared during maintenance"))?;
+            meta.lifecycle = *next;
+            meta.last_modified_at = now;
+            Self::apply_skill_state(
+                &authority,
+                name,
+                echo_agent::evolution::SkillMutationKind::Deprecate,
+                "run Skill inactivity transition",
+                approver,
+                before,
+                after,
+            )
+            .await?;
+        }
+        Ok(planned)
+    }
+
+    pub async fn recover_background_reviews(&self) -> Result<Vec<ReviewRecoveryReceipt>, String> {
+        let store = ReviewReceiptStore::open(self.echo_agent_dir())?;
+        let layer_manager = self.layer_manager().map_err(|error| error.to_string())?;
+        store
+            .recover(
+                &layer_manager,
+                &self.evidence_store(),
+                &self.receipt.binding.authority_scope,
+                &self.receipt.binding.workspace_generation,
+            )
+            .await
+    }
+
+    pub fn background_review_receipt(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<BackgroundReviewReceipt>, String> {
+        ReviewReceiptStore::open(self.echo_agent_dir())?.receipt(operation_id)
+    }
+
     pub async fn settle_hot_memory_projection(&self) -> MemoryProjectionSettlementReceipt {
         let receipt = settle_hot_memory_projection_for_binding(
             &self.receipt.binding,
@@ -341,15 +626,36 @@ impl ReviewGenerationLease {
         }));
     }
 
-    /// Transfer a spawned framework review into the integration's owned
-    /// settlement registry. The returned value only observes the outcome;
-    /// caller cancellation aborts the inner task while the registry retains and
-    /// awaits the supervisor that owns this generation lease.
+    /// Admit a lazy framework review before its first poll and retain its
+    /// generation through durable outcome and evidence settlement.
     pub async fn track_background_review(
         self,
-        handle: tokio::task::JoinHandle<echo_agent::evolution::ReviewOutcome>,
+        handle: echo_agent::evolution::BackgroundReviewHandle,
     ) -> Result<BackgroundReviewPass, String> {
-        let abort_handle = handle.abort_handle();
+        let identity = handle.identity().clone();
+        self.track_review_operation(identity, handle).await
+    }
+
+    async fn track_review_operation<F>(
+        self,
+        identity: echo_agent::evolution::ReviewIdentity,
+        handle: F,
+    ) -> Result<BackgroundReviewPass, String>
+    where
+        F: std::future::Future<Output = echo_agent::evolution::ReviewOutcome> + Send + 'static,
+    {
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let admission_control = self.receipt.control.clone();
+        let _admission_gate = admission_control.background_review_admission.lock().await;
+        let receipt_store = ReviewReceiptStore::open(self.echo_agent_dir())?;
+        if let Some(pending_operation_id) = receipt_store.pending_for_identity(&identity)? {
+            return Err(format!(
+                "background review for run '{}' has unsettled operation {pending_operation_id}",
+                identity.run_id
+            ));
+        }
+        let layer_manager = self.layer_manager().map_err(|error| error.to_string())?;
+        let memory_before = memory_fingerprint(&layer_manager, &identity.persistence_key).await?;
         let evidence_store = self.evidence_store();
         let control = self.receipt.control.clone();
         let admission = {
@@ -358,31 +664,77 @@ impl ReviewGenerationLease {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !registry.accepting {
-                Err(handle)
+                Err("background review admission is closed".to_string())
             } else {
+                if registry
+                    .tasks
+                    .iter()
+                    .any(|task| !task.supervisor.is_finished() && task.identity == identity)
+                {
+                    return Err(format!(
+                        "background review for run '{}' is already active",
+                        identity.run_id
+                    ));
+                }
+                receipt_store.admit(
+                    operation_id.clone(),
+                    identity.clone(),
+                    &self.receipt.binding.authority_scope,
+                    &self.receipt.binding.workspace_generation,
+                    memory_before.clone(),
+                )?;
                 let (completed, pending): (Vec<_>, Vec<_>) = std::mem::take(&mut registry.tasks)
                     .into_iter()
                     .partition(|task| task.supervisor.is_finished());
                 registry.tasks = pending;
+                let child = tokio::spawn(handle);
+                let abort_handle = child.abort_handle();
                 let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
                 let release = echo_agent::agent::CancellationToken::new();
                 let supervisor_release = release.clone();
+                let supervisor_identity = identity.clone();
+                let supervisor_memory_before = memory_before.clone();
+                let supervisor_operation_id = operation_id.clone();
                 let supervisor = tokio::spawn(async move {
-                    let (settlement, owner_error) = match handle.await {
-                        Ok(outcome) => match capture_review_outcome(&evidence_store, &outcome) {
-                            Ok(evidence_candidate) => (
+                    let (settlement, owner_error) = match child.await {
+                        Ok(outcome) => {
+                            let result = (|| {
+                                if outcome.run_id != supervisor_identity.run_id {
+                                    return Err(
+                                        "review outcome run ID differs from admission".to_string()
+                                    );
+                                }
+                                receipt_store
+                                    .record_outcome(&supervisor_operation_id, outcome.clone())?;
+                                let evidence_candidate =
+                                    capture_review_outcome(&evidence_store, &outcome)?;
+                                receipt_store.settle(
+                                    &supervisor_operation_id,
+                                    evidence_terminal(&evidence_candidate),
+                                )?;
                                 Ok(BackgroundReviewSettlement {
+                                    operation_id: supervisor_operation_id.clone(),
                                     outcome,
                                     evidence_candidate,
-                                }),
-                                None,
-                            ),
-                            Err(error) => (Err(error.clone()), Some(error)),
-                        },
+                                })
+                            })();
+                            let error = result.as_ref().err().cloned();
+                            (result, error)
+                        }
                         Err(error) => {
                             let was_cancelled = error.is_cancelled();
                             let message = format!("Background review task failed to join: {error}");
-                            let owner_error = (!was_cancelled).then(|| message.clone());
+                            let owner_error = receipt_store
+                                .settle_interrupted(
+                                    &supervisor_operation_id,
+                                    &supervisor_identity,
+                                    supervisor_memory_before.as_deref(),
+                                    &layer_manager,
+                                    message.clone(),
+                                )
+                                .await
+                                .err()
+                                .or_else(|| (!was_cancelled).then(|| message.clone()));
                             (Err(message), owner_error)
                         }
                     };
@@ -398,26 +750,24 @@ impl ReviewGenerationLease {
                     }
                 });
                 registry.tasks.push(OwnedBackgroundReview {
+                    identity: identity.clone(),
                     abort_handle: abort_handle.clone(),
                     release: release.clone(),
                     supervisor,
                 });
-                Ok((completed, outcome_receiver, release))
+                Ok((completed, outcome_receiver, abort_handle, release))
             }
         };
-        let (completed, outcome_receiver, release) = match admission {
+        let (completed, outcome_receiver, abort_handle, release) = match admission {
             Ok(accepted) => accepted,
-            Err(handle) => {
-                abort_handle.abort();
-                let _settled = handle.await;
-                return Err("background review admission is closed".to_string());
-            }
+            Err(error) => return Err(error),
         };
-        // Admission owns incremental collection of finished supervisors. This
-        // keeps long-lived sessions bounded without detaching a cleanup task;
-        // shutdown drains the same registry when no later review is admitted.
-        let _historical_error = await_owned_background_reviews(completed).await;
+        // Finished supervisors logged their own settlement errors. Removing
+        // their handles keeps the registry bounded; no await is allowed after
+        // admitting the new child and before returning its observer pass.
+        drop(completed);
         Ok(BackgroundReviewPass {
+            operation_id,
             outcome: Some(outcome_receiver),
             abort_handle,
             release,
@@ -449,6 +799,20 @@ fn layer_manager_for_binding(
     );
     *manager = Some(Arc::clone(&created));
     Ok(created)
+}
+
+pub(crate) fn skill_mutation_authority(
+    echo_agent_dir: &std::path::Path,
+) -> echo_agent::error::Result<Arc<SkillMutationAuthority>> {
+    let change_log = Arc::new(echo_agent::evolution::JsonlChangeLog::new(
+        echo_agent_dir
+            .join("evolution")
+            .join("skill-change-log.jsonl"),
+    )?);
+    Ok(Arc::new(SkillMutationAuthority::open(
+        workspace_curator(echo_agent_dir),
+        change_log,
+    )?))
 }
 
 fn projection_target_bindings(control: &HotMemoryProjectionControl) -> (bool, bool, bool) {
@@ -629,6 +993,7 @@ impl Drop for ReviewGenerationReceipt {
 
 /// Completed application settlement for one framework background review.
 pub struct BackgroundReviewSettlement {
+    pub operation_id: String,
     pub outcome: echo_agent::evolution::ReviewOutcome,
     pub evidence_candidate: Option<EvidenceCandidate>,
 }
@@ -638,6 +1003,7 @@ pub struct BackgroundReviewSettlement {
 /// retains the generation through evidence persistence.
 #[must_use]
 pub struct BackgroundReviewPass {
+    operation_id: String,
     outcome: Option<tokio::sync::oneshot::Receiver<Result<BackgroundReviewSettlement, String>>>,
     abort_handle: tokio::task::AbortHandle,
     release: echo_agent::agent::CancellationToken,
@@ -645,16 +1011,21 @@ pub struct BackgroundReviewPass {
 }
 
 impl BackgroundReviewPass {
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
     pub async fn settle(&mut self) -> Result<BackgroundReviewSettlement, String> {
         let outcome = self
             .outcome
             .take()
             .ok_or_else(|| "background review pass was already settled".to_string())?;
-        let outcome = outcome
+        let settlement = outcome
             .await
-            .map_err(|_| "background review supervisor dropped its outcome".to_string())??;
+            .map_err(|_| "background review supervisor dropped its outcome".to_string())?;
         self.settled = true;
-        Ok(outcome)
+        self.release.cancel();
+        settlement
     }
 }
 
@@ -826,6 +1197,7 @@ impl ReviewIntegration {
                     rejected_triggers: 0,
                     last_trigger_delivery_error: None,
                 }),
+                background_review_admission: tokio::sync::Mutex::new(()),
                 background_reviews: Mutex::new(BackgroundReviewRegistry {
                     accepting: true,
                     tasks: Vec::new(),
@@ -1364,15 +1736,33 @@ impl ReviewIntegration {
                         });
                     }
 
-                    // Optionally auto-generate drafts for new candidates.
+                    // The configured auto-draft policy authorizes the exact
+                    // preview digest, not a direct curator or file write.
                     if self.config.auto_generate_drafts
                         && !candidate_report.new_candidates.is_empty()
                     {
-                        let generator =
-                            SkillDraftGenerator::new(echo_agent_dir.clone(), change_log.as_ref())
-                                .with_curator(workspace_curator(&echo_agent_dir));
+                        let authority = lease.skill_mutation_authority().map_err(|error| {
+                            format!("Skill mutation authority unavailable: {error}")
+                        })?;
+                        let generator = SkillDraftGenerator::new(echo_agent_dir.clone(), authority);
                         for candidate in &candidate_report.new_candidates {
-                            match generator.generate_from_candidate(candidate).await {
+                            let generated = async {
+                                let preview = generator
+                                    .preview_generate_from_candidate(
+                                        candidate,
+                                        uuid::Uuid::new_v4().to_string(),
+                                    )
+                                    .await?;
+                                let approval = SkillApprovalArtifact::new(
+                                    uuid::Uuid::new_v4().to_string(),
+                                    &preview.preview.operation_digest,
+                                    "eko:configured-auto-draft",
+                                    chrono::Utc::now(),
+                                );
+                                generator.generate_from_preview(preview, approval).await
+                            }
+                            .await;
+                            match generated {
                                 Ok(draft_result) => {
                                     report.drafts_generated += 1;
                                     report.changes.push(ReviewChange::DraftGenerated {
@@ -1728,6 +2118,7 @@ pub fn format_review_report(report: &ReviewReport) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::background_review_owner::{ReviewAppendFault, ReviewTerminal};
     use super::*;
     use futures::future::BoxFuture;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1948,8 +2339,9 @@ mod tests {
         let secondary = layer_manager
             .locate("make")
             .await
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| "secondary memory disappeared during review".to_string())?;
-        assert_eq!(secondary.1.meta.status, MemoryStatus::Active);
+        assert_eq!(secondary.1.meta.status, MemoryStatus::Draft);
         Ok(())
     }
 
@@ -2279,7 +2671,7 @@ mod tests {
             )
             .await
             .map_err(|error| error.to_string())?;
-        let child = tokio::spawn(async {
+        let child = async {
             echo_agent::evolution::ReviewOutcome {
                 run_id: "review-clone-run".to_string(),
                 actions: vec!["capture reusable decision".to_string()],
@@ -2289,12 +2681,18 @@ mod tests {
                     content: "review generation remains stable".to_string(),
                     evidence: "the background owner captured this candidate".to_string(),
                     confidence: 0.95,
-                    persisted: false,
+                    persisted: Some(false),
                 }),
                 error: None,
             }
-        });
-        let mut pass = review_lease.clone().track_background_review(child).await?;
+        };
+        let mut pass = review_lease
+            .clone()
+            .track_review_operation(
+                echo_agent::evolution::ReviewIdentity::for_run("review-clone-run"),
+                child,
+            )
+            .await?;
         let settlement = pass.settle().await?;
         assert!(settlement.evidence_candidate.is_some());
         drop(pass);
@@ -2304,11 +2702,11 @@ mod tests {
         assert_eq!(receipt.status, MemoryProjectionSettlementStatus::Settled);
         assert_eq!(receipt.authority_scope, "workspace:review");
         assert_eq!(receipt.workspace_generation, "generation-review");
-        assert!(receipt.changed);
-        assert_eq!(integration.hot_memory_projection_read_count(), 2);
+        assert!(!receipt.changed);
+        assert_eq!(integration.hot_memory_projection_read_count(), 1);
         let unchanged = review_lease.settle_hot_memory_projection().await;
         assert!(!unchanged.changed);
-        assert_eq!(integration.hot_memory_projection_read_count(), 2);
+        assert_eq!(integration.hot_memory_projection_read_count(), 1);
         Ok(())
     }
 
@@ -2672,17 +3070,14 @@ mod tests {
         let (child_started_sender, child_started_receiver) = tokio::sync::oneshot::channel();
         let (drop_entered_sender, drop_entered_receiver) = tokio::sync::oneshot::channel();
         let (drop_release_sender, drop_release_receiver) = std::sync::mpsc::channel();
-        let child = tokio::spawn(async move {
+        let child = async move {
             let _drop_signal = BlockingDrop {
                 entered: Some(drop_entered_sender),
                 release: drop_release_receiver,
             };
             let _ignored = child_started_sender.send(());
             futures::future::pending::<echo_agent::evolution::ReviewOutcome>().await
-        });
-        child_started_receiver
-            .await
-            .map_err(|error| format!("background review child did not start: {error}"))?;
+        };
 
         let caller_integration = integration.clone();
         let (pass_started_sender, pass_started_receiver) = tokio::sync::oneshot::channel();
@@ -2690,13 +3085,21 @@ mod tests {
             let lease = caller_integration
                 .lease_generation()
                 .map_err(|error| error.to_string())?;
-            let _pass = lease.track_background_review(child).await?;
+            let _pass = lease
+                .track_review_operation(
+                    echo_agent::evolution::ReviewIdentity::for_run("cancelled-review"),
+                    child,
+                )
+                .await?;
             let _ignored = pass_started_sender.send(());
             futures::future::pending::<Result<(), String>>().await
         });
         pass_started_receiver
             .await
             .map_err(|error| format!("background review receipt was not installed: {error}"))?;
+        child_started_receiver
+            .await
+            .map_err(|error| format!("background review child did not start: {error}"))?;
         caller.abort();
         let _caller_result = caller.await;
         drop_entered_receiver
@@ -2722,7 +3125,7 @@ mod tests {
             store,
         ));
         let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
-        let child = tokio::spawn(async move {
+        let child = async move {
             let _released = release_receiver.await;
             echo_agent::evolution::ReviewOutcome {
                 run_id: "run-a".to_string(),
@@ -2733,15 +3136,20 @@ mod tests {
                     content: "workspace uses Rust".to_string(),
                     evidence: "Cargo.toml declares Rust crates".to_string(),
                     confidence: 0.9,
-                    persisted: false,
+                    persisted: Some(false),
                 }),
                 error: None,
             }
-        });
+        };
         let lease = integration
             .lease_generation()
             .map_err(|error| error.to_string())?;
-        let pass = lease.track_background_review(child).await?;
+        let pass = lease
+            .track_review_operation(
+                echo_agent::evolution::ReviewIdentity::for_run("run-a"),
+                child,
+            )
+            .await?;
         release_sender
             .send(())
             .map_err(|_| "failed to release background review".to_string())?;
@@ -2781,7 +3189,7 @@ mod tests {
             temp.path().join("workspace-a/.eko"),
             store,
         ));
-        let completed_child = tokio::spawn(async {
+        let completed_child = async {
             echo_agent::evolution::ReviewOutcome {
                 run_id: "completed-review".to_string(),
                 actions: Vec::new(),
@@ -2789,12 +3197,15 @@ mod tests {
                 candidate: None,
                 error: None,
             }
-        });
+        };
         let completed_lease = integration
             .lease_generation()
             .map_err(|error| error.to_string())?;
         let mut completed_pass = completed_lease
-            .track_background_review(completed_child)
+            .track_review_operation(
+                echo_agent::evolution::ReviewIdentity::for_run("completed-review"),
+                completed_child,
+            )
             .await?;
         let _settlement = completed_pass.settle().await?;
         drop(completed_pass);
@@ -2810,19 +3221,150 @@ mod tests {
         .await
         .map_err(|_| "completed background review supervisor did not settle".to_string())?;
 
-        let active_child = tokio::spawn(async {
-            futures::future::pending::<echo_agent::evolution::ReviewOutcome>().await
-        });
+        let active_child =
+            async { futures::future::pending::<echo_agent::evolution::ReviewOutcome>().await };
         let active_lease = integration
             .lease_generation()
             .map_err(|error| error.to_string())?;
-        let active_pass = active_lease.track_background_review(active_child).await?;
+        let active_pass = active_lease
+            .track_review_operation(
+                echo_agent::evolution::ReviewIdentity::for_run("active-review"),
+                active_child,
+            )
+            .await?;
         assert_eq!(integration.background_review_registry_counts(), (1, 0));
 
         drop(active_pass);
         integration.shutdown_background_reviews().await?;
         assert_eq!(integration.background_review_registry_counts(), (0, 0));
         Ok(())
+    }
+
+    async fn review_receipt_append_failure_recovers(
+        fault: ReviewAppendFault,
+    ) -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("workspace/.eko");
+        let store = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
+        let integration =
+            ReviewIntegration::new(ReviewConfig::default(), root.clone(), store.clone());
+        let run_id = match fault {
+            ReviewAppendFault::Outcome => "outcome-append-fault",
+            ReviewAppendFault::Terminal => "terminal-append-fault",
+        };
+        let identity = echo_agent::evolution::ReviewIdentity::for_run(run_id);
+        let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
+        let review_run_id = run_id.to_string();
+        let review = async move {
+            let _released = release_receiver.await;
+            echo_agent::evolution::ReviewOutcome {
+                run_id: review_run_id,
+                actions: vec!["capture fact".to_string()],
+                nothing_to_save: false,
+                candidate: Some(echo_agent::evolution::ReviewCandidate {
+                    kind: echo_agent::evolution::ReviewCandidateKind::ProjectFact,
+                    content: "workspace uses Rust".to_string(),
+                    evidence: "Cargo.toml declares Rust crates".to_string(),
+                    confidence: 0.9,
+                    persisted: Some(false),
+                }),
+                error: None,
+            }
+        };
+        let lease = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        let mut pass = lease
+            .track_review_operation(identity.clone(), review)
+            .await?;
+        let operation_id = pass.operation_id().to_string();
+        ReviewReceiptStore::fail_next_append_for_test(&root, fault);
+        release_sender
+            .send(())
+            .map_err(|_| "review release failed".to_string())?;
+        assert!(pass.settle().await.is_err());
+        assert!(integration.shutdown_background_reviews().await.is_err());
+        assert_eq!(integration.background_review_registry_counts(), (0, 0));
+        let pending = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?
+            .background_review_receipt(&operation_id)?
+            .ok_or_else(|| "review receipt missing".to_string())?;
+        assert!(pending.terminal.is_none());
+        assert_eq!(
+            pending.outcome_recorded,
+            fault == ReviewAppendFault::Terminal
+        );
+        let before = integration.evidence_store().list()?.len();
+        assert_eq!(before, usize::from(fault == ReviewAppendFault::Terminal));
+        drop(integration);
+
+        let reopened = ReviewIntegration::new(ReviewConfig::default(), root, store);
+        let recovered = reopened
+            .lease_generation()
+            .map_err(|error| error.to_string())?
+            .recover_background_reviews()
+            .await?;
+        assert_eq!(recovered.len(), 1);
+        let terminal = reopened
+            .lease_generation()
+            .map_err(|error| error.to_string())?
+            .background_review_receipt(&operation_id)?
+            .and_then(|receipt| receipt.terminal)
+            .ok_or_else(|| "review terminal missing after recovery".to_string())?;
+        match fault {
+            ReviewAppendFault::Outcome => assert!(matches!(
+                terminal,
+                ReviewTerminal::Interrupted {
+                    memory_persisted: Some(false),
+                    ..
+                }
+            )),
+            ReviewAppendFault::Terminal => assert!(matches!(
+                terminal,
+                ReviewTerminal::Settled {
+                    evidence_candidate_id: Some(_)
+                }
+            )),
+        }
+        assert_eq!(reopened.evidence_store().list()?.len(), before);
+        assert!(
+            reopened
+                .lease_generation()
+                .map_err(|error| error.to_string())?
+                .recover_background_reviews()
+                .await?
+                .is_empty()
+        );
+        let lease = reopened
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        let retry_run_id = run_id.to_string();
+        let mut retry = lease
+            .track_review_operation(identity, async move {
+                echo_agent::evolution::ReviewOutcome {
+                    run_id: retry_run_id,
+                    actions: Vec::new(),
+                    nothing_to_save: true,
+                    candidate: None,
+                    error: None,
+                }
+            })
+            .await?;
+        retry.settle().await?;
+        reopened.shutdown_background_reviews().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outcome_receipt_append_failure_is_recovered_after_owner_shutdown() -> Result<(), String>
+    {
+        review_receipt_append_failure_recovers(ReviewAppendFault::Outcome).await
+    }
+
+    #[tokio::test]
+    async fn terminal_receipt_append_failure_replays_inbox_once() -> Result<(), String> {
+        review_receipt_append_failure_recovers(ReviewAppendFault::Terminal).await
     }
 
     #[tokio::test]
@@ -2835,28 +3377,321 @@ mod tests {
             temp.path().join("workspace-a/.eko"),
             store,
         ));
-        let child = tokio::spawn(async {
-            futures::future::pending::<echo_agent::evolution::ReviewOutcome>().await
-        });
+        let child =
+            async { futures::future::pending::<echo_agent::evolution::ReviewOutcome>().await };
         let lease = integration
             .lease_generation()
             .map_err(|error| error.to_string())?;
-        let mut pass = lease.track_background_review(child).await?;
+        let mut pass = lease
+            .track_review_operation(
+                echo_agent::evolution::ReviewIdentity::for_run("shutdown-review"),
+                child,
+            )
+            .await?;
 
         integration.shutdown_background_reviews().await?;
         assert!(pass.settle().await.is_err());
 
-        let rejected_child = tokio::spawn(async {
-            futures::future::pending::<echo_agent::evolution::ReviewOutcome>().await
-        });
+        let rejected_child =
+            async { futures::future::pending::<echo_agent::evolution::ReviewOutcome>().await };
         let rejected_lease = integration
             .lease_generation()
             .map_err(|error| error.to_string())?;
         assert!(
             rejected_lease
-                .track_background_review(rejected_child)
+                .track_review_operation(
+                    echo_agent::evolution::ReviewIdentity::for_run("rejected-review"),
+                    rejected_child
+                )
                 .await
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admission_failure_never_polls_the_review() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("workspace/.eko");
+        let integration = ReviewIntegration::new(
+            ReviewConfig::default(),
+            root.clone(),
+            Arc::new(echo_agent::memory::InMemoryStore::new()),
+        );
+        let lease = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        lease.layer_manager().map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(root.join("evolution/background-review.jsonl"))
+            .map_err(|error| error.to_string())?;
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = polled.clone();
+        let review = async move {
+            observed.store(true, Ordering::SeqCst);
+            echo_agent::evolution::ReviewOutcome {
+                run_id: "never-polled".to_string(),
+                actions: Vec::new(),
+                nothing_to_save: true,
+                candidate: None,
+                error: None,
+            }
+        };
+        assert!(
+            lease
+                .track_review_operation(
+                    echo_agent::evolution::ReviewIdentity::for_run("never-polled"),
+                    review,
+                )
+                .await
+                .is_err()
+        );
+        assert!(!polled.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_unsettled_identity_blocks_retry_until_terminal() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("workspace/.eko");
+        let integration = ReviewIntegration::new(
+            ReviewConfig::default(),
+            root.clone(),
+            Arc::new(echo_agent::memory::InMemoryStore::new()),
+        );
+        let identity = echo_agent::evolution::ReviewIdentity::for_run("durable-retry");
+        let receipts = ReviewReceiptStore::open(&root)?;
+        receipts.admit(
+            "interrupted-operation".to_string(),
+            identity.clone(),
+            "workspace",
+            "generation",
+            None,
+        )?;
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = polled.clone();
+        let blocked_review = async move {
+            observed.store(true, Ordering::SeqCst);
+            echo_agent::evolution::ReviewOutcome {
+                run_id: "durable-retry".to_string(),
+                actions: Vec::new(),
+                nothing_to_save: true,
+                candidate: None,
+                error: None,
+            }
+        };
+        let lease = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        assert!(
+            lease
+                .track_review_operation(identity.clone(), blocked_review)
+                .await
+                .is_err()
+        );
+        assert!(!polled.load(Ordering::SeqCst));
+
+        receipts.settle(
+            "interrupted-operation",
+            super::super::background_review_owner::ReviewTerminal::Interrupted {
+                memory_persisted: Some(false),
+                reason: "reconciled".to_string(),
+            },
+        )?;
+        let lease = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        let retry = async {
+            echo_agent::evolution::ReviewOutcome {
+                run_id: "durable-retry".to_string(),
+                actions: Vec::new(),
+                nothing_to_save: true,
+                candidate: None,
+                error: None,
+            }
+        };
+        let mut pass = lease.track_review_operation(identity, retry).await?;
+        pass.settle().await?;
+        integration.shutdown_background_reviews().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_settles_a_write_before_observer_completion() -> Result<(), String> {
+        use echo_agent::memory::{MemoryMeta, MemorySource, MemoryType};
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("workspace/.eko");
+        let integration = ReviewIntegration::new(
+            ReviewConfig::default(),
+            root,
+            Arc::new(echo_agent::memory::InMemoryStore::new()),
+        );
+        let lease = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        let manager = lease.layer_manager().map_err(|error| error.to_string())?;
+        let identity = echo_agent::evolution::ReviewIdentity::for_run("write-before-observer");
+        let write_key = identity.persistence_key.clone();
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        let review = async move {
+            if let Err(error) = manager
+                .write_memory(
+                    &write_key,
+                    "durable explicit preference",
+                    MemoryMeta::new(
+                        MemoryType::UserPreference,
+                        MemorySource::ExplicitSave,
+                        "background-review-test",
+                    ),
+                )
+                .await
+            {
+                return echo_agent::evolution::ReviewOutcome {
+                    run_id: "write-before-observer".to_string(),
+                    actions: Vec::new(),
+                    nothing_to_save: true,
+                    candidate: None,
+                    error: Some(error.to_string()),
+                };
+            }
+            let _sent = written_tx.send(());
+            futures::future::pending::<echo_agent::evolution::ReviewOutcome>().await
+        };
+        let mut pass = lease.track_review_operation(identity, review).await?;
+        let operation_id = pass.operation_id().to_string();
+        written_rx.await.map_err(|error| error.to_string())?;
+        integration.shutdown_background_reviews().await?;
+        assert!(pass.settle().await.is_err());
+        let receipt = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?
+            .background_review_receipt(&operation_id)?
+            .ok_or_else(|| "background review receipt missing after shutdown".to_string())?;
+        assert!(!receipt.outcome_recorded);
+        assert!(matches!(
+            receipt.terminal,
+            Some(
+                super::super::background_review_owner::ReviewTerminal::Interrupted {
+                    memory_persisted: Some(true),
+                    ..
+                }
+            )
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skill_metadata_actions_use_bound_mutation_authority() -> Result<(), String> {
+        use echo_agent::evolution::{SkillLifecycle, SkillMeta, SkillMutationKind};
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("workspace/.eko");
+        let skill_path = root.join("skills/manual/SKILL.md");
+        std::fs::create_dir_all(
+            skill_path
+                .parent()
+                .ok_or_else(|| "Skill fixture has no parent".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &skill_path,
+            "---\nname: manual\ndescription: fixture\n---\nbody",
+        )
+        .map_err(|error| error.to_string())?;
+        let generated_path = root.join("skills/old-generated/SKILL.md");
+        std::fs::create_dir_all(
+            generated_path
+                .parent()
+                .ok_or_else(|| "generated Skill fixture has no parent".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &generated_path,
+            "---\nname: old-generated\ndescription: fixture\n---\nbody",
+        )
+        .map_err(|error| error.to_string())?;
+        let integration = ReviewIntegration::new(
+            ReviewConfig::default(),
+            root.clone(),
+            Arc::new(echo_agent::memory::InMemoryStore::new()),
+        );
+        let lease = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        lease
+            .register_user_skill("manual", &skill_path, "eko:test-user")
+            .await?;
+        let authority = lease
+            .skill_mutation_authority()
+            .map_err(|error| error.to_string())?;
+        let registered = authority
+            .curator()
+            .load_state()
+            .map_err(|error| error.to_string())?;
+        let manual = registered
+            .skills
+            .get("manual")
+            .ok_or_else(|| "registered Skill missing".to_string())?;
+        assert_eq!(manual.lifecycle, SkillLifecycle::Active);
+        assert!(!manual.agent_created);
+
+        let before = registered;
+        let mut after = before.clone();
+        let now = chrono::Utc::now();
+        after.skills.insert(
+            "old-generated".to_string(),
+            SkillMeta {
+                name: "old-generated".to_string(),
+                path: Some(
+                    echo_agent::evolution::SkillFileMutation::canonical_path(&generated_path)
+                        .map_err(|error| error.to_string())?,
+                ),
+                lifecycle: SkillLifecycle::Active,
+                created_at: now - chrono::Duration::days(100),
+                last_used_at: now - chrono::Duration::days(100),
+                last_modified_at: now - chrono::Duration::days(100),
+                pinned: false,
+                agent_created: true,
+                superseded_by: None,
+            },
+        );
+        ReviewGenerationLease::apply_skill_state(
+            &authority,
+            "old-generated",
+            SkillMutationKind::Promote,
+            "seed generated Skill fixture",
+            "eko:test-user",
+            before,
+            after,
+        )
+        .await?;
+        lease
+            .set_skill_pinned("old-generated", true, "eko:test-user")
+            .await?;
+        assert!(
+            lease
+                .run_skill_transitions("eko:test-user")
+                .await?
+                .is_empty()
+        );
+        lease
+            .set_skill_pinned("old-generated", false, "eko:test-user")
+            .await?;
+        let transitions = lease.run_skill_transitions("eko:test-user").await?;
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            transitions.first().map(|(_, _, next)| *next),
+            Some(SkillLifecycle::Stale)
+        );
+        assert_eq!(
+            authority
+                .curator()
+                .load_state()
+                .map_err(|error| error.to_string())?
+                .skills
+                .get("old-generated")
+                .map(|meta| meta.lifecycle),
+            Some(SkillLifecycle::Stale)
         );
         Ok(())
     }

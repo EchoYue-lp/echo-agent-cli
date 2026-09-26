@@ -343,6 +343,7 @@ mod tests {
                 .map_err(|error| error.to_string())?
                 .locate(&receipt.key)
                 .await
+                .map_err(|error| error.to_string())?
                 .is_some()
         );
         Ok(())

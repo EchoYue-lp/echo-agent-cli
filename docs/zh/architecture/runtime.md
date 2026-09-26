@@ -203,6 +203,12 @@ summary。详见 [ADR 0040](../adr/0040-app-core-subagent-event-projection.md)�
   Gate 使用 checkpoint-backed projection，Artifact/Review 历史使用增量 segment。10k/100k
   release 规模验证仍属于 Final Integration Gate，不能仅凭实现存在宣称已通过。
 
+## Background Review 生命周期
+
+GUI、TUI、CLI 把框架惰性 handle 交给 app-core 的 generation-bound owner。owner 在首次 poll 前
+持久准入，持有 generation 直到证据结算，shutdown 时取消并 await 已准入任务；启动时在发布
+主 Agent 前恢复未完成收据。详见 [ADR 0043](../adr/0043-background-review-owner.md)。
+
 ## 业界依据
 
 - [Temporal Workflow execution](https://docs.temporal.io/workflow-execution)以 event history

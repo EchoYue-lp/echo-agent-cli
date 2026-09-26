@@ -1890,14 +1890,14 @@ Read the runtime path and found one missing branch.
             Box::pin(async move {
                 if let Some(gate) = gate {
                     tokio::select! {
-                        _ = context.cancel.cancelled() => {
+                        _ = context.cancellation_token().cancelled() => {
                             return Err(TaskDispatchFailure::cancelled(task_id, "cancelled"));
                         }
                         _ = gate.release.notified() => {}
                     }
                 }
                 // Honor cancellation even in the mock.
-                if context.cancel.is_cancelled() {
+                if context.cancellation_token().is_cancelled() {
                     return Err(TaskDispatchFailure::cancelled(task_id, "cancelled"));
                 }
                 let result = match results {

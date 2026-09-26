@@ -184,7 +184,17 @@ impl StructuredExtractionService {
         let data = agent
             .read_async(|agent| Box::pin(async move { agent.extract_json(&input, format).await }))
             .await
-            .map_err(|error| StructuredExtractionError::Execution(error.to_string()))?;
+            .map_err(|error| match &error {
+                echo_agent::error::ReactError::StructuredOutput(inner)
+                    if matches!(
+                        inner.as_ref(),
+                        echo_agent::error::StructuredOutputError::SchemaMismatch { .. }
+                    ) =>
+                {
+                    StructuredExtractionError::OutputSchema(error.to_string())
+                }
+                _ => StructuredExtractionError::Execution(error.to_string()),
+            })?;
         validator
             .validate(&data)
             .map_err(|error| StructuredExtractionError::OutputSchema(error.to_string()))?;
@@ -390,7 +400,7 @@ mod tests {
             .model("structured-extraction-test")
             .system_prompt("Extract structured data")
             .llm_client(Arc::new(
-                MockLlmClient::new().with_response(r#"{"age":"unknown"}"#),
+                MockLlmClient::new().with_responses(std::iter::repeat_n(r#"{"age":"unknown"}"#, 4)),
             ))
             .build()
             .map(AgentHandle::new)

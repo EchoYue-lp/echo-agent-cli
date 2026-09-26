@@ -361,7 +361,7 @@ pub async fn drive_chat_turn_with_input_observer(
     input_observer: Option<InputReceiptObserver>,
 ) -> Result<TurnReceipt, String> {
     match drive_chat_turn_dispatch(agent, turn, res, binding, input_observer).await? {
-        RunTurnDriveOutcome::Driven(receipt) => Ok(receipt),
+        RunTurnDriveOutcome::Driven(receipt) => Ok(*receipt),
         RunTurnDriveOutcome::Deferred => {
             Err("RunTurn continuation deferred before model execution".to_string())
         }
@@ -389,7 +389,7 @@ async fn drive_chat_turn_dispatch(
         ChatExecutionPreparation::Ready(prepared) => {
             drive_prepared_chat(agent.clone(), turn, *prepared, None, input_observer)
                 .await
-                .map(RunTurnDriveOutcome::Driven)
+                .map(|receipt| RunTurnDriveOutcome::Driven(Box::new(receipt)))
         }
         ChatExecutionPreparation::Settled(outcome) => Ok(RunTurnDriveOutcome::Driven(outcome)),
         ChatExecutionPreparation::Deferred => Ok(RunTurnDriveOutcome::Deferred),
@@ -435,7 +435,7 @@ where
     match drive_pooled_chat_turn_dispatch(pool, pool_key, configure, turn, res, binding.into())
         .await?
     {
-        RunTurnDriveOutcome::Driven(receipt) => Ok(receipt),
+        RunTurnDriveOutcome::Driven(receipt) => Ok(*receipt),
         RunTurnDriveOutcome::Deferred => {
             Err("RunTurn continuation deferred before model execution".to_string())
         }
@@ -513,7 +513,7 @@ where
     }
     drive_prepared_chat(agent, turn, *prepared, Some(execution), None)
         .await
-        .map(RunTurnDriveOutcome::Driven)
+        .map(|receipt| RunTurnDriveOutcome::Driven(Box::new(receipt)))
 }
 
 async fn wait_for_previous_continuation_driver(
@@ -539,13 +539,13 @@ async fn wait_for_previous_continuation_driver(
 
 enum ChatExecutionPreparation {
     Ready(Box<PreparedChatExecution>),
-    Settled(TurnReceipt),
+    Settled(Box<TurnReceipt>),
     Deferred,
 }
 
 #[derive(Debug)]
 pub(crate) enum RunTurnDriveOutcome {
-    Driven(TurnReceipt),
+    Driven(Box<TurnReceipt>),
     Deferred,
 }
 
@@ -729,9 +729,9 @@ async fn prepare_chat_execution(
                     tracing::error!(%envelope_error, "failed to report memory admission failure");
                 }
             }
-            return Ok(ChatExecutionPreparation::Settled(
+            return Ok(ChatExecutionPreparation::Settled(Box::new(
                 TurnReceipt::failed(turn_id, failure).map_err(|error| error.to_string())?,
-            ));
+            )));
         }
     };
     let res = std::sync::Arc::new(crate::chat_resources::ChatResources {
@@ -987,43 +987,56 @@ async fn drive_prepared_chat(
         && !continuation_dispatch_owned
         && let Some(store) = prepared.store.as_ref()
     {
-        let outcome = crate::tasks::task_runtime::continuation::request_continue(
-            store,
-            &prepared.formal_run_id,
-            RunTurnOrigin::Continuation,
-        );
-        if let crate::tasks::task_runtime::continuation::ContinueRequestOutcome::Running(request) =
-            outcome
-        {
-            tracing::debug!(
-                run_id = %prepared.formal_run_id,
-                disposition = ?request.disposition,
-                "finite RunTurn requested continuation"
+        let status = store
+            .get_run(&prepared.formal_run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "TaskRun {} disappeared after its turn",
+                    prepared.formal_run_id
+                )
+            })?
+            .status;
+        if status == crate::tasks::task_runtime::TaskRunStatus::Running {
+            let outcome = crate::tasks::task_runtime::continuation::request_continue(
+                store,
+                &prepared.formal_run_id,
+                RunTurnOrigin::Continuation,
             );
-            if prepared.foreground_progress.is_some() {
-                let completion = request.completion.wait().await?;
-                if completion.terminal != TurnOutcome::Completed
-                    && let Ok(outcome) = result.as_mut()
-                {
-                    outcome.outcome = completion.terminal;
-                }
+            if let crate::tasks::task_runtime::continuation::ContinueRequestOutcome::Running(
+                request,
+            ) = outcome
+            {
                 tracing::debug!(
                     run_id = %prepared.formal_run_id,
-                    reason = ?completion.reason,
-                    "foreground continuation chain settled"
+                    disposition = ?request.disposition,
+                    "finite RunTurn requested continuation"
                 );
-            }
-        } else {
-            tracing::debug!(
-                run_id = %prepared.formal_run_id,
-                ?outcome,
-                "finite RunTurn has no continuation launcher"
-            );
-            if prepared.foreground_progress.is_some() {
-                return Err(format!(
-                    "foreground TaskRun {} lost its continuation launcher",
-                    prepared.formal_run_id
-                ));
+                if prepared.foreground_progress.is_some() {
+                    let completion = request.completion.wait().await?;
+                    if completion.terminal != TurnOutcome::Completed
+                        && let Ok(outcome) = result.as_mut()
+                    {
+                        outcome.outcome = completion.terminal;
+                    }
+                    tracing::debug!(
+                        run_id = %prepared.formal_run_id,
+                        reason = ?completion.reason,
+                        "foreground continuation chain settled"
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    run_id = %prepared.formal_run_id,
+                    ?outcome,
+                    "running RunTurn has no continuation launcher"
+                );
+                if prepared.foreground_progress.is_some() {
+                    return Err(format!(
+                        "foreground TaskRun {} lost its continuation launcher",
+                        prepared.formal_run_id
+                    ));
+                }
             }
         }
     }
@@ -1862,6 +1875,7 @@ mod tests {
         Ok(TurnReceipt {
             turn_id: identity.turn_id,
             outcome,
+            delivery: echo_agent::runtime::TurnDeliveryOutcome::NotAttempted,
             final_answer: None,
             final_message_id: None,
             prompt_tokens: 0,

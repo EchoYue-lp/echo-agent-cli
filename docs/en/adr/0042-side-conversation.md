@@ -28,7 +28,7 @@ Claude Code's documented Fork is also a Subagent that inherits the parent contex
 5. Children use the existing conversation AgentPool, input frontier, foreground turn, ChatEventLog, and deletion service. Tauri starts the first turn through the complete GUI chat driver with stable input/message identity, preserving the GUI sink, HITL, Browser approval, cancellation, and replay. Parent/child identity guards remain owned until the first GUI foreground lease is registered, so deletion cannot reopen a relation-less conversation in the gap after create. AgentRouter remains responsible only for internal Agent-to-Agent messages.
 6. AgentGroup metadata is the durable child-model authority; AgentPool keeps only a rebuildable projection. Changing it retires the cached child Agent. An unavailable model fails explicitly.
 7. Children retain the complete ordinary Agent tool surface. Side Conversation creation exists only in GUI/Tauri, and app-core admission rejects a Side parent before any side-creation effect, so the one-level rule does not disable Task or ordinary Subagent tools.
-8. Internal Agent messages stay in the canonical model transcript for recovery, but their existing `attachments_json` projection is marked `internal_agent`. Primary views filter them by default; Side Conversation views retain them. Internal delivery waits for a separate cold turn.
+8. Internal Agent messages stay in the canonical model transcript for recovery. EKO's existing conversation visibility file records a durable intent before the Agent effect and settles exact committed message IDs before the AgentRouter terminal; it does not rewrite managed `attachments_json`. Primary GUI views filter those IDs; Side views retain and label them. The same projection is independent of Side group deletion. Internal delivery waits for a separate cold turn.
 9. Tauri exposes the converged conversation surface only: `list_conversations` includes an optional relation; `create_conversation` accepts `primary|side`; `update_conversation` accepts `rename|side_model|side_retry|side_viewed`; existing get/delete/cancel/send operations remain authoritative. No parallel `side_conversation_*` CRUD is retained.
 10. GUI renders Workspace -> primary -> Side Conversation with status and unread state, and reuses the complete Agent timeline/composer. Side Conversation is a GUI layout capability that depends on a sidebar and parallel views, so only Tauri exposes it. TUI, CLI/JSONL, and channels add no dedicated commands, events, or wire contracts and retain their existing ordinary conversation, Subagent, and `/fork` behavior.
 
@@ -41,10 +41,11 @@ Claude Code's documented Fork is also a Subagent that inherits the parent contex
 - A missing child remains a degraded relation and is never rebound by name.
 - Child deletion completes existing aggregate cleanup before deleting the relationship. Parent deletion removes children first, and GUI confirmation shows the cascade scope.
 - AgentRouter receipts continue to distinguish persisted, drained, and terminal delivery.
+- A crash or visibility write failure before delivery terminal leaves a durable intent and a retained non-terminal AgentRouter frontier. GUI read can settle exact transcript rows against that record, or fails closed when proof is missing. The Router terminal is written only after visibility settlement; settled IDs remain available after terminal retention eviction. Replacing the transcript advances its epoch and retires prior visibility IDs/intents.
 
 ## Consequences
 
-- No `echo-agent` public API changes; this is an EKO application composition.
+- Side-specific topology and GUI semantics remain EKO-owned. The separate generic framework managed-import generation and checkpoint CAS contract is recorded in framework ADR 0080.
 - EKO gains one app-core Side Conversation service, typed AgentGroup metadata, child-local AgentPool projection, converged Tauri requests, a GUI adapter, and generated TypeScript contracts.
 - Cross-surface parity still governs core Agent capabilities. Pure layout and window-composition affordances may remain surface-specific; this exception cannot justify removing task, Subagent, tool, HITL, memory, or attachment capabilities from TUI, CLI, or channels.
 - Framework examples do not change because no public framework contract changed.

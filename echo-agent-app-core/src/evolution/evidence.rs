@@ -150,7 +150,7 @@ pub enum EvidenceTarget {
     MemoryMerge {
         primary_key: String,
         superseded_keys: Vec<String>,
-        before: Vec<echo_agent::evolution::MemoryMergeSnapshot>,
+        batch_id: String,
     },
 }
 
@@ -238,6 +238,25 @@ fn decode_log_record(line: &str) -> Result<EvidenceLogRecord, String> {
 pub struct EvidenceStore {
     path: PathBuf,
     scope: EvidenceScope,
+}
+
+async fn rollback_memory_merge(
+    layer_manager: &Arc<echo_agent::evolution::MemoryLayerManager>,
+    batch_id: &str,
+) -> Result<(), String> {
+    use echo_agent::evolution::{MemoryRollbackOutcome, MemoryRollbackTarget};
+
+    let result = layer_manager
+        .rollback_memory(
+            &uuid::Uuid::new_v4().to_string(),
+            MemoryRollbackTarget::batch_id(batch_id),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    match result {
+        MemoryRollbackOutcome::Applied(_) | MemoryRollbackOutcome::AlreadyApplied(_) => Ok(()),
+        other => Err(format!("memory merge rollback did not settle: {other:?}")),
+    }
 }
 
 /// Convert and persist a framework background-review proposal.
@@ -598,7 +617,9 @@ impl EvidenceStore {
                         return Err(format!("failed to apply memory merge proposal: {error}"));
                     }
                 };
-                let before = applied.before.clone();
+                let batch_id = applied.batch_id.clone().ok_or_else(|| {
+                    "memory merge committed without a durable batch ID".to_string()
+                })?;
                 let primary_key = applied.primary_key.clone();
                 let superseded_keys = applied.superseded_keys.clone();
                 let update_result = self.update(candidate_id, |candidate, _| {
@@ -606,7 +627,7 @@ impl EvidenceStore {
                     candidate.target = Some(EvidenceTarget::MemoryMerge {
                         primary_key,
                         superseded_keys,
-                        before: before.clone(),
+                        batch_id: batch_id.clone(),
                     });
                     Ok(())
                 });
@@ -619,7 +640,7 @@ impl EvidenceStore {
                         Ok(candidate)
                     }
                     Err(update_error) => {
-                        match layer_manager.restore_merge_snapshots(&applied.before).await {
+                        match rollback_memory_merge(layer_manager, &batch_id).await {
                             Ok(()) => {
                                 self.record_interaction_best_effort(
                                     candidate_id,
@@ -728,8 +749,8 @@ impl EvidenceStore {
                     }
                 }
             }
-            EvidenceTarget::MemoryMerge { before, .. } => {
-                if let Err(error) = layer_manager.restore_merge_snapshots(&before).await {
+            EvidenceTarget::MemoryMerge { batch_id, .. } => {
+                if let Err(error) = rollback_memory_merge(layer_manager, &batch_id).await {
                     self.record_interaction_best_effort(
                         candidate_id,
                         EvidenceInteractionAction::UndoFailed(
@@ -1070,7 +1091,7 @@ mod tests {
                     key: "cargo".to_string(),
                     content: "Build uses cargo".to_string(),
                     confidence: 0.9,
-                    status: echo_agent::memory::MemoryStatus::Active,
+                    status: echo_agent::memory::MemoryStatus::Draft,
                     recall_count: 0,
                     updated_at: 1,
                 },
@@ -1078,7 +1099,7 @@ mod tests {
                     key: "make".to_string(),
                     content: "Build uses make".to_string(),
                     confidence: 0.5,
-                    status: echo_agent::memory::MemoryStatus::Active,
+                    status: echo_agent::memory::MemoryStatus::Draft,
                     recall_count: 0,
                     updated_at: 1,
                 },
@@ -1317,6 +1338,7 @@ mod tests {
         let secondary = layer_manager
             .locate("make")
             .await
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| "merged secondary memory disappeared".to_string())?;
         assert_eq!(
             secondary.1.meta.status,
@@ -1329,10 +1351,11 @@ mod tests {
         let restored = layer_manager
             .locate("make")
             .await
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| "undone secondary memory disappeared".to_string())?;
         assert_eq!(
             restored.1.meta.status,
-            echo_agent::memory::MemoryStatus::Active
+            echo_agent::memory::MemoryStatus::Draft
         );
         assert_eq!(restored.1.meta.superseded_by, None);
         assert_eq!(restored.1.content, "Build uses make");
@@ -1376,11 +1399,12 @@ mod tests {
         let current = layer_manager
             .locate("make")
             .await
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| "stale secondary memory disappeared".to_string())?;
         assert_eq!(current.1.content, "Build uses ninja");
         assert_eq!(
             current.1.meta.status,
-            echo_agent::memory::MemoryStatus::Active
+            echo_agent::memory::MemoryStatus::Draft
         );
         let review_item = store
             .review_item(&candidate.candidate_id)?

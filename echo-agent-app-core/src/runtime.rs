@@ -825,6 +825,9 @@ impl ApplicationServices {
         let app_state = Arc::new(state);
         app_state.register_agent_control_tools().await;
         lifecycle.bind_app_state(app_state.clone());
+        if let Err(error) = app_state.recover_pending_conversation_handoffs().await {
+            return Err(rollback_composition(lifecycle, anyhow::anyhow!(error)).await);
+        }
         match app_state
             .extension_control
             .reconcile_enabled_skills_on_load(&app_state)
@@ -1238,20 +1241,57 @@ impl AgentRuntime {
                     return Err(anyhow::Error::new(receipt.into_error()));
                 }
             };
+            let recovered_reviews = match memory_generation.recover_background_reviews().await {
+                Ok(receipts) => receipts,
+                Err(error) => {
+                    let receipt = bootstrap_lifecycle
+                        .settle(
+                            ApplicationLifecycleReason::BootstrapRollback,
+                            Some(anyhow::anyhow!(
+                                "Failed to recover Background Review: {error}"
+                            )),
+                        )
+                        .await;
+                    return Err(anyhow::Error::new(receipt.into_error()));
+                }
+            };
+            for receipt in recovered_reviews {
+                tracing::warn!(
+                    operation_id = %receipt.operation_id,
+                    run_id = %receipt.identity.run_id,
+                    result = ?receipt.result,
+                    "recovered unfinished Background Review"
+                );
+            }
             let trigger_sink = review_integration.clone();
             let skill_policy = review_integration.clone();
-            let skill_curator = review_integration.curator();
+            let skill_authority = match memory_generation.skill_mutation_authority() {
+                Ok(authority) => authority,
+                Err(error) => {
+                    let receipt = bootstrap_lifecycle
+                        .settle(
+                            ApplicationLifecycleReason::BootstrapRollback,
+                            Some(anyhow::anyhow!(
+                                "Failed to initialize Skill authority: {error}"
+                            )),
+                        )
+                        .await;
+                    return Err(anyhow::Error::new(receipt.into_error()));
+                }
+            };
             agent_handle
                 .write_async(|a| {
                     Box::pin(async move {
-                        a.install_memory_layer_manager(layer_manager);
+                        a.install_memory_layer_manager(layer_manager)?;
                         a.set_memory_trigger_sink(Some(trigger_sink));
                         a.set_skill_load_policy(Some(skill_policy));
-                        a.set_skill_curator(Some(skill_curator));
+                        a.set_skill_mutation_authority(Some(skill_authority));
                         let _ = a.reconcile_skill_load_policy().await;
+                        Ok::<(), echo_agent::error::ReactError>(())
                     })
                 })
-                .await;
+                .await
+                .map_err(|error| anyhow::anyhow!("Failed to install memory layer: {error}"))?;
             let projection = memory_generation.settle_hot_memory_projection().await;
             if projection.status == crate::evolution::MemoryProjectionSettlementStatus::Degraded {
                 let error = projection
@@ -1442,7 +1482,9 @@ pub(crate) async fn register_lsp_tools(
     }
 
     let mut lsp_manager = LspManager::new();
-    lsp_manager.load_config(&config);
+    if let Err(error) = lsp_manager.load_config(&config) {
+        tracing::warn!(%error, "LSP config failed to load for workspace");
+    }
     lsp_manager.set_project_root(project_root);
     let languages: Vec<String> = lsp_manager
         .configured_languages()

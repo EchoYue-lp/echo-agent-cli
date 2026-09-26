@@ -18,6 +18,9 @@ AgentPool and checkpoint key. Product journal, TaskRun, router, UI, and
 foreground use the stable identity; runtime and cache use the incarnation.
 Reset rotates the runtime after closing old admission and waiting for exact
 foreground/lease settlement. It never erases product history.
+The framework exact-clear operation retires the incarnation checkpoint. EKO
+then deletes that incarnation's separate transcript using its managed epoch;
+neither step deletes the stable product conversation or another sender's data.
 
 ## Consequences
 

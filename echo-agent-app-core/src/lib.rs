@@ -33,6 +33,7 @@ pub(crate) mod hitl;
 pub(crate) mod hook_config_loader;
 pub(crate) mod infra;
 pub(crate) mod instruction_provider;
+pub(crate) mod managed_conversation;
 pub(crate) mod manual_compression;
 pub(crate) mod mcp_config_runtime;
 pub(crate) mod model_config;

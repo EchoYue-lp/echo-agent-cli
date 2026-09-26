@@ -3,11 +3,11 @@ schema_version: 1
 id: baseline.repository
 kind: baseline
 source_snapshot:
-  base_revision: 87eba93c6e557dafda2178e5b4763d91230fbcd6
-  content_digest: 87791a9dc0b2bb4484fff726fea064bd943e080f4f0e97b74d9d5821442c1e9a
+  base_revision: d4c6a80767fb688c2597fc623f922882b8718644
+  content_digest: caa0bf81fcda8d046037a8a1065adc31b7bb0652059b4e4c8e975d8831e26fc0
 inventory_closure: open
 behavior_model_closure: open
-map_refs: [map.eko-conversation-collaboration]
+map_refs: [map.eko-conversation-collaboration, map.eko-framework-consumer-settlement]
 regions:
   - { path: .agents, status: supporting }
   - { path: .cargo, status: supporting }
@@ -38,6 +38,9 @@ boundaries:
   - id: boundary.eko-conversation-collaboration
     map_ref: map.eko-conversation-collaboration
     risk: high
+  - id: boundary.eko-framework-consumer-settlement
+    map_ref: map.eko-framework-consumer-settlement
+    risk: high
 coverage: []
 ---
 
@@ -53,16 +56,16 @@ coverage: []
 
 ## 能力图与边界
 
-当前只建立 EKO Conversation collaboration 边界，覆盖会话 transcript、AgentRouter inbox/group、foreground turn、删除、GUI Side Conversation 入口和非 GUI surface 保持既有行为的边界。
+已建立 EKO Conversation collaboration 与最新 framework consumer settlement 两个边界。前者保留 GUI Side Conversation 的原始交付快照；后者覆盖 Background Review caller-owned 生命周期及最新框架下 Skill/Plugin、Managed conversation、workspace 与 Scheduler 的应用适配。
 
 ## 覆盖网格
 
-库存与行为模型保持 open，因此不宣称其它应用能力的八视角覆盖已经完成；本次高风险任务由 capability map、Behavior、Rule、Evidence 与后续差异验证闭合。
+库存与行为模型保持 open，因此不宣称全应用八视角覆盖已经完成；本次高风险任务由新增 capability map、Behavior、Rule、Evidence 与后续独立复审闭合。
 
 ## 未知与缺口
 
-Side Conversation 的 GUI/Tauri、app-core 和文件权威闭环已由全量工程门禁与独立 Review 验证；模型覆盖恢复、一级关系、级联删除、首轮 GUI 驱动/admission、稳定 prompt identity、轮询隔离、原子 metadata mutation、viewed marker、内部消息投影和非 GUI 无专用合同均有执行证据。
+Side Conversation 的 GUI/Tauri、app-core 和文件权威闭合已补充当前快照故障注入及独立复审。本地全量 Rust、GUI 和前端门禁已有候选证据；framework PR #174 虽然 CI 全绿，远端 main/CLI CI 和 Issue #38 关闭仍未完成。
 
 ## 闭合结论
 
-当前基线结构、路径分类和 Conversation collaboration 边界已验证，可作为后续增量依据；全仓其它能力的库存闭合与行为模型闭合仍为 open。
+当前基线结构与路径分类可作为后续增量依据；新增 consumer Behavior/Rule 的当前候选已独立复审，全仓其它能力的库存闭合与行为模型闭合仍为 open。

@@ -983,15 +983,29 @@ pub async fn review_run(
             .layer_manager()
             .map_err(|error| IpcError::Internal(error.to_string()))?,
     );
-    let handle = reviewer
-        .review_by_run_id(&run_id)
-        .map_err(|e| IpcError::Internal(e.to_string()))?;
+    let handle = reviewer.review_by_run_id(&run_id);
     let mut pass = review_lease
         .clone()
         .track_background_review(handle)
         .await
         .map_err(IpcError::Internal)?;
-    let settlement = pass.settle().await.map_err(IpcError::Internal)?;
+    let operation_id = pass.operation_id().to_string();
+    let settlement = match pass.settle().await {
+        Ok(settlement) => settlement,
+        Err(error) => {
+            return Ok(json!({
+                "success": false,
+                "review_operation_id": operation_id,
+                "run_id": run_id,
+                "actions": [],
+                "nothing_to_save": false,
+                "candidate": null,
+                "evidence_candidate": null,
+                "error": error,
+                "projection_settlement": null,
+            }));
+        }
+    };
     let projection_settlement = if settlement.evidence_candidate.is_some() {
         Some(review_lease.settle_hot_memory_projection().await)
     } else {
@@ -1001,6 +1015,7 @@ pub async fn review_run(
     let evidence_candidate = settlement.evidence_candidate;
     Ok(json!({
         "success": outcome.error.is_none(),
+        "review_operation_id": settlement.operation_id,
         "run_id": outcome.run_id,
         "actions": outcome.actions,
         "nothing_to_save": outcome.nothing_to_save,
@@ -1009,6 +1024,25 @@ pub async fn review_run(
         "error": outcome.error,
         "projection_settlement": projection_settlement,
     }))
+}
+
+#[tauri::command]
+pub async fn get_review_receipt(
+    state: tauri::State<'_, TauriState>,
+    operation_id: String,
+) -> Result<serde_json::Value, IpcError> {
+    if operation_id.trim().is_empty() {
+        return Err(IpcError::Validation(
+            "review operation_id is required".into(),
+        ));
+    }
+    let control = current_evolution_control(&state).await?;
+    let receipt = control
+        .generation
+        .background_review_receipt(&operation_id)
+        .map_err(IpcError::Internal)?
+        .ok_or_else(|| IpcError::NotFound("Review receipt not found".into()))?;
+    Ok(json!(receipt))
 }
 
 #[tauri::command]
@@ -1102,9 +1136,11 @@ pub async fn curator_action(
             "status": curator_status_json(curator.status().map_err(|e| IpcError::Internal(e.to_string()))?),
         })),
         "run" => {
-            let transitions = curator
-                .apply_transitions()
-                .map_err(|e| IpcError::Internal(e.to_string()))?;
+            let transitions = control
+                .generation
+                .run_skill_transitions("eko:gui-user")
+                .await
+                .map_err(IpcError::Internal)?;
             control
                 .runtime
                 .primary_agent()
@@ -1135,9 +1171,11 @@ pub async fn curator_action(
             let name = skill_name
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| IpcError::Validation("skill_name is required for pin".into()))?;
-            curator
-                .pin_skill(&name)
-                .map_err(|e| IpcError::Internal(e.to_string()))?;
+            control
+                .generation
+                .set_skill_pinned(&name, true, "eko:gui-user")
+                .await
+                .map_err(IpcError::Internal)?;
             Ok(
                 json!({"success": true, "pinned": name, "status": curator_status_json(curator.status().map_err(|e| IpcError::Internal(e.to_string()))?)}),
             )
@@ -1146,9 +1184,11 @@ pub async fn curator_action(
             let name = skill_name
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| IpcError::Validation("skill_name is required for unpin".into()))?;
-            curator
-                .unpin_skill(&name)
-                .map_err(|e| IpcError::Internal(e.to_string()))?;
+            control
+                .generation
+                .set_skill_pinned(&name, false, "eko:gui-user")
+                .await
+                .map_err(IpcError::Internal)?;
             Ok(
                 json!({"success": true, "unpinned": name, "status": curator_status_json(curator.status().map_err(|e| IpcError::Internal(e.to_string()))?)}),
             )
@@ -1346,19 +1386,8 @@ pub async fn generate_skill_draft(
     let control = current_evolution_control(&state).await?;
     let generation = control.generation;
     let agent = control.runtime.primary_agent();
-    let store = generation.memory_store();
-    let echo_agent_dir = generation.echo_agent_dir().to_path_buf();
-    let change_log = echo_agent::evolution::JsonlChangeLog::new(
-        echo_agent_dir.join("evolution").join("change-log.jsonl"),
-    )
-    .map_err(|error| IpcError::Internal(error.to_string()))?;
-    let typed = echo_agent::memory::TypedMemoryStore::new(store);
-
-    let curator = echo_agent_app_core::api::evolution::workspace_curator(&echo_agent_dir);
-    let generator = echo_agent::evolution::SkillDraftGenerator::new(echo_agent_dir, &change_log)
-        .with_curator(curator);
-    let result = generator
-        .generate(&name, &typed)
+    let result = generation
+        .generate_skill_draft(&name, "eko:gui-user")
         .await
         .map_err(|e| IpcError::Internal(format!("Failed to generate draft: {e}")))?;
 

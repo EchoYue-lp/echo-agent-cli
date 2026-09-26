@@ -240,9 +240,9 @@ impl TaskDispatcher for RealTaskDispatcher {
         let local_agent = self.primary_agent.clone();
         let workspace_io = self.workspace_io.clone();
         Box::pin(async move {
-            let run_id = context.run_id;
-            let cancel = context.cancel;
-            let delegation_policy = context.delegation_policy;
+            let run_id = context.run_id().to_owned();
+            let cancel = context.cancellation_token().clone();
+            let delegation_policy = context.delegation_policy();
             let task_id = task.id.clone();
             let (execution_agent, target_lease) =
                 resolve_task_execution_agent(&store, &blocking, &run_id, &task, local_agent)
@@ -1711,13 +1711,23 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
     async fn dispatch_task(
         &self,
         context: echo_agent::tasks::TaskSubagentContext,
-        claim: echo_agent::tasks::TaskClaim,
         runtime_task: echo_agent::tasks::Task,
     ) -> echo_agent::error::Result<Self::DispatchOutput> {
         let task = Self::plan_task(&runtime_task)?;
+        if context.task_id() != Some(task.id.as_str()) {
+            return Err(echo_agent::error::ReactError::Other(
+                "runtime task context does not match the dispatched task".into(),
+            ));
+        }
+        let claim = context.claim().cloned().ok_or_else(|| {
+            echo_agent::error::ReactError::Other("runtime task context has no claim".into())
+        })?;
+        let run_id = context.run_id().to_owned();
         let active_task_id = task.id.clone();
-        let execution_id = subagent_execution_id(&context.run_id, &task.id, &claim);
-        let recovery_run_id = context.run_id.clone();
+        let execution_id = context.execution_id().ok_or_else(|| {
+            echo_agent::error::ReactError::Other("runtime task context has no execution ID".into())
+        })?;
+        let recovery_run_id = run_id.clone();
         let recovery_task_id = task.id.clone();
         let recovery_execution_id = execution_id.clone();
         let recovery_revision = claim.revision;
@@ -1737,12 +1747,12 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         match recovery {
             Ok(Some(recovered)) => {
                 tracing::info!(
-                    run_id = %context.run_id,
+                    run_id = %run_id,
                     task_id = %task.id,
                     execution_id,
                     "task_runtime: reusing durable Subagent outcome after restart"
                 );
-                let note_run_id = context.run_id.clone();
+                let note_run_id = run_id.clone();
                 let note_task_id = task.id.clone();
                 if let Err(error) = self
                     .blocking
@@ -1755,7 +1765,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     })
                     .await
                 {
-                    tracing::warn!(run_id = %context.run_id, task_id = %task.id, %error, "failed to note recovered Subagent outcome");
+                    tracing::warn!(run_id = %run_id, task_id = %task.id, %error, "failed to note recovered Subagent outcome");
                 }
                 return Ok(TaskDispatchSuccess {
                     task_id: task.id,
@@ -1766,7 +1776,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             }
             Ok(None) => {}
             Err(error) => tracing::warn!(
-                run_id = %context.run_id,
+                run_id = %run_id,
                 task_id = %task.id,
                 %error,
                 "failed to inspect durable Subagent outcome; dispatching normally"

@@ -2,8 +2,6 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent::agent::Agent;
-use echo_agent::llm::types::{Message, Role};
 use echo_agent::memory::{NewConversation, StoredMessage};
 use echo_agent_app_core::api::conversation_projection::{AttachmentsPayload, SavedMessage};
 use echo_agent_app_core::api::state::ScopedChatRuntime;
@@ -418,36 +416,32 @@ fn strip_branch_ui_references(raw: Option<String>) -> Option<String> {
 
 async fn load_agent_transcript(
     runtime: &ScopedChatRuntime,
+    foreground_turns: &echo_agent_app_core::api::foreground_turn::ForegroundTurnControl,
     conversation_id: &str,
-    stored: &[StoredMessage],
 ) -> Result<usize, IpcError> {
+    let _admission = runtime
+        .begin_managed_replacement(foreground_turns, conversation_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let store = runtime
+        .conversation_store()
+        .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
+    let runtime_state = runtime
+        .runtime_state_store()
+        .ok_or_else(|| IpcError::Internal("Runtime state store not available".to_string()))?;
     let agent_execution = runtime
         .agent_for(conversation_id)
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;
     let agent = agent_execution.agent();
-    let system_prompt = agent.read(|agent| agent.system_prompt().to_string()).await;
-    let messages = restore_agent_transcript(stored, &system_prompt)?;
-    let message_count = messages.len().saturating_sub(1);
-    agent
-        .read_async(|agent| Box::pin(async move { agent.load_messages(messages).await }))
-        .await;
-    Ok(message_count)
-}
-
-pub(crate) fn restore_agent_transcript(
-    stored: &[StoredMessage],
-    system_prompt: &str,
-) -> Result<Vec<Message>, IpcError> {
-    let mut messages = echo_agent::memory::restore_messages(stored)
-        .map_err(|error| IpcError::Internal(error.to_string()))?;
-    if !messages
-        .first()
-        .is_some_and(|message| message.role == Role::System)
-    {
-        messages.insert(0, Message::system(system_prompt.to_string()));
-    }
-    Ok(messages)
+    echo_agent_app_core::api::managed_conversation::resume_or_import(
+        store.as_ref(),
+        runtime_state.as_ref(),
+        &agent,
+        conversation_id,
+    )
+    .await
+    .map_err(|error| IpcError::Internal(error.to_string()))
 }
 
 fn project_stored_message(message: StoredMessage) -> SavedMessage {
@@ -501,23 +495,29 @@ fn project_stored_message(message: StoredMessage) -> SavedMessage {
 fn project_conversation_messages(
     stored: Vec<StoredMessage>,
     side_initial_identity: Option<(usize, String, String)>,
+    internal_message_ids: &std::collections::HashSet<i64>,
 ) -> Vec<SavedMessage> {
     let mut side_initial_identity = side_initial_identity;
     stored
         .into_iter()
         .enumerate()
         .map(|(index, message)| {
+            let internal_agent = message
+                .id
+                .is_some_and(|id| internal_message_ids.contains(&id));
             let is_initial_side_user = side_initial_identity.as_ref().is_some_and(
                 |(snapshot_count, _, initial_prompt)| {
                     index >= *snapshot_count
                         && message.role == "user"
                         && message.content.as_deref() == Some(initial_prompt.as_str())
+                        && !internal_agent
                         && !echo_agent_app_core::api::side_conversation::is_internal_agent_message(
                             message.attachments_json.as_deref(),
                         )
                 },
             );
             let mut projected = project_stored_message(message);
+            projected.internal_agent |= internal_agent;
             if is_initial_side_user && let Some((_, message_id, _)) = side_initial_identity.take() {
                 projected.message_id = Some(message_id);
             }
@@ -634,6 +634,40 @@ mod tests {
     }
 
     #[test]
+    fn exact_message_ids_do_not_relabel_identical_user_text() {
+        let messages = [
+            ("user", "internal instruction"),
+            ("assistant", "internal result"),
+            ("user", "internal instruction"),
+            ("assistant", "later response"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (role, content))| StoredMessage {
+            id: i64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1)),
+            conversation_id: "side-1".to_string(),
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            attachments_json: None,
+            tool_calls_json: None,
+            tool_result_json: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        })
+        .collect();
+        let ids = std::collections::HashSet::from([1_i64, 2_i64]);
+        let projected = project_conversation_messages(messages, None, &ids);
+        assert_eq!(
+            projected
+                .iter()
+                .map(|message| message.internal_agent)
+                .collect::<Vec<_>>(),
+            vec![true, true, false, false]
+        );
+    }
+
+    #[test]
     fn completed_side_first_prompt_recovers_its_stable_gui_identity() {
         let stored = vec![
             StoredMessage {
@@ -675,6 +709,7 @@ mod tests {
                 "side-start:group-1".to_string(),
                 "initial side prompt".to_string(),
             )),
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -688,49 +723,6 @@ mod tests {
                 .first()
                 .is_some_and(|message| message.message_id.is_none())
         );
-    }
-
-    #[tokio::test]
-    async fn restored_child_transcript_starts_with_the_current_system_prompt() -> anyhow::Result<()>
-    {
-        let stored = [StoredMessage {
-            id: Some(1),
-            conversation_id: "side-1".to_string(),
-            role: "user".to_string(),
-            content: Some("parent context".to_string()),
-            attachments_json: None,
-            tool_calls_json: None,
-            tool_result_json: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-        }];
-
-        let messages = restore_agent_transcript(&stored, "EKO child system prompt")?;
-
-        assert!(matches!(messages.first(), Some(message) if message.role == Role::System));
-        assert_eq!(
-            messages
-                .first()
-                .and_then(|message| message.content.as_text()),
-            Some("EKO child system prompt".to_string())
-        );
-        assert!(matches!(messages.get(1), Some(message) if message.role == Role::User));
-        let child = echo_agent::agent::ReactAgentBuilder::new()
-            .llm_client(Arc::new(echo_agent::testing::MockLlmClient::new()))
-            .system_prompt("EKO child system prompt")
-            .build()
-            .map(echo_agent_app_core::api::agent_handle::AgentHandle::new)?;
-        child
-            .read_async(|agent| Box::pin(async move { agent.load_messages(messages).await }))
-            .await;
-        let actual = child
-            .read_async(|agent| Box::pin(async move { agent.get_messages().await }))
-            .await;
-        assert!(matches!(actual.first(), Some(message) if message.role == Role::System));
-        assert_eq!(
-            actual.first().and_then(|message| message.content.as_text()),
-            Some("EKO child system prompt".to_string())
-        );
-        Ok(())
     }
 
     #[test]
@@ -1173,11 +1165,21 @@ pub async fn get_conversation(
         .relation_for_child(Arc::clone(&store), &workspace_id, &id)
         .await
         .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let internal_message_ids = state
+        .app_state
+        .internal_message_ids_scoped(&workspace_id, &id)
+        .await
+        .map_err(IpcError::Internal)?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
     if side_relation.is_none() {
         stored.retain(|message| {
-            !echo_agent_app_core::api::side_conversation::is_internal_agent_message(
-                message.attachments_json.as_deref(),
-            )
+            !message
+                .id
+                .is_some_and(|id| internal_message_ids.contains(&id))
+                && !echo_agent_app_core::api::side_conversation::is_internal_agent_message(
+                    message.attachments_json.as_deref(),
+                )
         });
     } else {
         state
@@ -1199,7 +1201,8 @@ pub async fn get_conversation(
         )),
         None => None,
     };
-    let messages = project_conversation_messages(stored, side_initial_identity);
+    let messages =
+        project_conversation_messages(stored, side_initial_identity, &internal_message_ids);
 
     Ok(serde_json::json!({
         "id": conv.id,
@@ -1229,6 +1232,26 @@ pub async fn update_conversation(
 
     match request {
         ConversationUpdateRequest::Rename { title } => {
+            let runtime = scoped_runtime(&state, &workspace_id).await?;
+            let _admission = runtime
+                .begin_managed_replacement(&state.app_state.session.foreground_turns, &id)
+                .await
+                .map_err(|error| IpcError::Validation(error.to_string()))?;
+            let runtime_state = runtime.runtime_state_store().ok_or_else(|| {
+                IpcError::Internal("Runtime state store not available".to_string())
+            })?;
+            let execution = runtime
+                .agent_for(&id)
+                .await
+                .map_err(|error| IpcError::Validation(error.to_string()))?;
+            echo_agent_app_core::api::managed_conversation::resume_or_import(
+                store.as_ref(),
+                runtime_state.as_ref(),
+                &execution.agent(),
+                &id,
+            )
+            .await
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
             let side_conversations =
                 echo_agent_app_core::api::side_conversation::SideConversationService::new(
                     Arc::clone(&state.app_state.agent_router),
@@ -1243,10 +1266,13 @@ pub async fn update_conversation(
                     .await
                     .map_err(|error| IpcError::Internal(error.to_string()))?;
             } else {
-                store
-                    .update_conversation(&conv.conversation_id, Some(&title), None, None)
-                    .await
-                    .map_err(|error| IpcError::Internal(error.to_string()))?;
+                echo_agent_app_core::api::managed_conversation::update_title(
+                    store.as_ref(),
+                    &conv.conversation_id,
+                    &title,
+                )
+                .await
+                .map_err(|error| IpcError::Internal(error.to_string()))?;
             }
         }
         ConversationUpdateRequest::SideModel { model_id } => {
@@ -1354,17 +1380,28 @@ pub async fn branch_conversation(
         })
         .await
         .map_err(|error| IpcError::Internal(error.to_string()))?;
-    if let Err(error) = store.save_messages(&branch_id, &prefix).await {
-        if let Err(cleanup_error) = state
-            .app_state
-            .delete_conversation_scoped(&workspace_id, &branch_id)
-            .await
-        {
-            tracing::warn!(conversation_id = %branch_id, %cleanup_error, "Failed to roll back incomplete conversation branch");
-        }
-        return Err(IpcError::Internal(error.to_string()));
-    }
-    if let Err(error) = load_agent_transcript(&runtime, &branch_id, &prefix).await {
+    let admission = runtime
+        .begin_managed_replacement(&state.app_state.session.foreground_turns, &branch_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let runtime_state = runtime
+        .runtime_state_store()
+        .ok_or_else(|| IpcError::Internal("Runtime state store not available".to_string()))?;
+    let branch_agent = runtime
+        .agent_for(&branch_id)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    if let Err(error) = echo_agent_app_core::api::managed_conversation::replace_and_resume(
+        store.as_ref(),
+        runtime_state.as_ref(),
+        &branch_agent.agent(),
+        &branch_id,
+        &prefix,
+    )
+    .await
+    {
+        drop(branch_agent);
+        drop(admission);
         if let Err(cleanup_error) = state
             .app_state
             .delete_conversation_scoped(&workspace_id, &branch_id)
@@ -1372,7 +1409,7 @@ pub async fn branch_conversation(
         {
             tracing::warn!(conversation_id = %branch_id, %cleanup_error, "Failed to roll back unusable conversation branch");
         }
-        return Err(error);
+        return Err(IpcError::Internal(error.to_string()));
     }
 
     Ok(serde_json::json!({
@@ -1481,7 +1518,7 @@ pub async fn restore_conversation(
         .map_err(|error| IpcError::Internal(error.to_string()))?;
     let (message_count, readiness) = if active.is_empty() {
         (
-            load_agent_transcript(&runtime, &id, &stored).await?,
+            load_agent_transcript(&runtime, &state.app_state.session.foreground_turns, &id).await?,
             "ready",
         )
     } else {

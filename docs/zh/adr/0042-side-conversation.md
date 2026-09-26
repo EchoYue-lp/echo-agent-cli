@@ -28,7 +28,7 @@ Claude Code 官方 Fork 同样把支线作为继承主会话上下文的 Subagen
 5. Side Conversation 使用原 conversation-scoped AgentPool、input frontier、foreground turn、ChatEventLog 和 deletion service。首轮由 Tauri 以稳定 input/message identity 调用完整 GUI chat driver，因此沿用 GUI sink、HITL、Browser approval、取消和 replay；parent/child identity guard 会持有到首个 GUI foreground lease 注册完成，删除不能利用 create 后的间隙重新产生无 relation 会话。AgentRouter 只负责 Agent 间内部消息。
 6. child-local model 是 AgentGroup metadata 的持久权威，AgentPool 只保存可重建投影。变更模型会退休 cached child Agent；模型不存在时明确失败。
 7. child 保留普通 Agent 的完整工具能力。Side Conversation 创建只存在于 GUI/Tauri，且 app-core admission 会在任何副作用前拒绝支线 parent，因此一级限制不通过禁用 Task 或普通 Subagent 工具实现。
-8. AgentRouter internal message 仍进入模型的 canonical transcript，以便恢复上下文；该 turn 的新增消息在现有 `attachments_json` 投影中标记为 `internal_agent`。主对话默认过滤，Side Conversation 保留显示。运行中 internal delivery 等待独立 cold turn，避免错误标记主用户 turn。
+8. AgentRouter internal message 仍进入模型的 canonical transcript，以便恢复上下文。EKO 在 Agent effect 前把 intent 写入既有 conversation visibility 文件，在 AgentRouter terminal 前结算精确的已提交消息 ID；不为 UI 标签重写 managed `attachments_json`。主 GUI 按 ID 过滤，Side GUI 保留并标注；该投影不依赖 Side group 后续是否删除。运行中 internal delivery 等待独立 cold turn。
 9. Tauri 只公开收敛后的 conversation 命令：`list_conversations` 返回可选 relation，`create_conversation` 使用 `primary|side` request，`update_conversation` 使用 `rename|side_model|side_retry|side_viewed` request；get/delete/cancel/send 继续复用既有命令，不保留第二套 `side_conversation_*` CRUD。
 10. GUI 左侧呈现 Workspace -> 主对话 -> Side Conversation，显示状态和未读；中心复用完整 Agent timeline/composer。Side Conversation 是依赖侧栏与并行视图才成立的 GUI 布局能力，只通过 Tauri 暴露；TUI、CLI/JSONL 与 channel 不增加专用命令、事件或 wire contract，并保留既有普通 conversation、Subagent 和 `/fork` 行为。
 
@@ -41,10 +41,11 @@ Claude Code 官方 Fork 同样把支线作为继承主会话上下文的 Subagen
 - 缺失 child 的 group 作为 degraded relation 显示，不重绑到同名 conversation。
 - 删除 child 先完成现有 aggregate deletion，再删除 relation；删除 parent 先逐个删除 child，再删除 parent。GUI 明确显示级联范围。
 - internal message 继续使用 AgentRouter typed receipt，不把 persisted 误报为 completed。
+- effect 后、delivery terminal 前崩溃或 visibility 写失败时，durable intent 与非终态 AgentRouter 前沿继续保留。GUI 读取前可用 Router 记录和该回合时间边界内的精确 transcript 行修复；证据缺失或歧义时明确失败。visibility 成功结算后才写 Router terminal，terminal 保留窗口淘汰后 ID 仍可独立读取。替换 transcript 推进 epoch 后，旧来源 ID/intent 随之退役。
 
 ## 影响
 
-- `echo-agent` 公共 API 无变化；Side Conversation 是 EKO 应用层产品组合。
+- Side 专属拓扑与 GUI 语义仍属于 EKO；独立的通用框架 managed import generation/checkpoint CAS 合同由框架 ADR 0080 记录。
 - EKO 新增 app-core Side Conversation service、AgentGroup typed metadata、AgentPool child-local projection、Tauri conversation request、GUI adapter 与生成 TypeScript contract。
 - 多模式对等继续约束核心 Agent 能力；纯布局/窗口编排可按 surface 独有。该例外不允许用来删减 TUI、CLI/channel 的任务、Subagent、工具、HITL、记忆或附件能力。
 - framework examples 无需更新，因为没有公共 framework 合同变化。

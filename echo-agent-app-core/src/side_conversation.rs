@@ -149,6 +149,17 @@ impl SideConversationService {
         store: Arc<dyn ConversationStore>,
         request: SideConversationCreateRequest,
     ) -> Result<SideConversationCreateReceipt, SideConversationError> {
+        self.create_with_hidden_messages(store, request, &std::collections::BTreeSet::new(), None)
+            .await
+    }
+
+    pub async fn create_with_hidden_messages(
+        &self,
+        store: Arc<dyn ConversationStore>,
+        request: SideConversationCreateRequest,
+        hidden_message_ids: &std::collections::BTreeSet<i64>,
+        captured_messages: Option<Vec<StoredMessage>>,
+    ) -> Result<SideConversationCreateReceipt, SideConversationError> {
         validate_request(&request)?;
         let groups = self.router.list_group_records().await?;
         if relation_for_child_in(
@@ -189,13 +200,28 @@ impl SideConversationService {
             });
         }
 
-        let source_messages = store
-            .get_messages(&parent.conversation_id)
-            .await
-            .map_err(|error| SideConversationError::Conversation(error.to_string()))?;
+        let source_messages = match captured_messages {
+            Some(messages) => messages,
+            None => store
+                .get_messages(&parent.conversation_id)
+                .await
+                .map_err(|error| SideConversationError::Conversation(error.to_string()))?,
+        };
+        if source_messages.iter().any(|message| {
+            message.conversation_id != parent.conversation_id || message.id.is_none()
+        }) {
+            return Err(SideConversationError::Conversation(
+                "captured parent transcript has invalid message identities".to_string(),
+            ));
+        }
         let snapshot_source = source_messages
             .into_iter()
-            .filter(|message| !is_internal_agent_message(message.attachments_json.as_deref()))
+            .filter(|message| {
+                !message
+                    .id
+                    .is_some_and(|id| hidden_message_ids.contains(&id))
+                    && !is_internal_agent_message(message.attachments_json.as_deref())
+            })
             .collect::<Vec<_>>();
         let snapshot_last_message_id = snapshot_source
             .iter()
@@ -481,8 +507,7 @@ impl SideConversationService {
             ));
         }
         let title = title.chars().take(MAX_TITLE_CHARS).collect::<String>();
-        store
-            .update_conversation(conversation_id, Some(&title), None, None)
+        crate::managed_conversation::update_title(store.as_ref(), conversation_id, &title)
             .await
             .map_err(|error| SideConversationError::Conversation(error.to_string()))?;
         let group = self
@@ -767,66 +792,6 @@ pub fn is_internal_agent_message(raw: Option<&str>) -> bool {
         .is_some_and(|value| value == INTERNAL_VISIBILITY_VALUE)
 }
 
-pub async fn mark_internal_agent_turn_messages(
-    store: &dyn ConversationStore,
-    conversation_id: &str,
-    start_index: usize,
-    instruction: &str,
-) -> Result<(), SideConversationError> {
-    let mut messages = store
-        .get_messages(conversation_id)
-        .await
-        .map_err(|error| SideConversationError::Conversation(error.to_string()))?;
-    let turn_start = messages
-        .iter()
-        .enumerate()
-        .skip(start_index)
-        .find_map(|(index, message)| {
-            (message.role == "user" && message.content.as_deref() == Some(instruction))
-                .then_some(index)
-        })
-        .ok_or_else(|| {
-            SideConversationError::Conversation(
-                "internal Agent turn was not found in the committed transcript".to_string(),
-            )
-        })?;
-    let turn_end = messages
-        .iter()
-        .enumerate()
-        .skip(turn_start.saturating_add(1))
-        .find_map(|(index, message)| (message.role == "user").then_some(index))
-        .unwrap_or(messages.len());
-    for message in messages
-        .iter_mut()
-        .skip(turn_start)
-        .take(turn_end.saturating_sub(turn_start))
-    {
-        let mut projection = message
-            .attachments_json
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-            .filter(serde_json::Value::is_object)
-            .unwrap_or_else(|| serde_json::json!({}));
-        let object = projection.as_object_mut().ok_or_else(|| {
-            SideConversationError::Conversation(
-                "internal message projection is not an object".to_string(),
-            )
-        })?;
-        object.insert(
-            INTERNAL_VISIBILITY_FIELD.to_string(),
-            serde_json::Value::String(INTERNAL_VISIBILITY_VALUE.to_string()),
-        );
-        message.attachments_json = Some(
-            serde_json::to_string(&projection)
-                .map_err(|error| SideConversationError::Conversation(error.to_string()))?,
-        );
-    }
-    store
-        .save_messages(conversation_id, &messages)
-        .await
-        .map_err(|error| SideConversationError::Conversation(error.to_string()))
-}
-
 fn same_snapshot(existing: &[StoredMessage], expected: &[StoredMessage]) -> bool {
     existing.len() == expected.len()
         && existing.iter().zip(expected).all(|(left, right)| {
@@ -943,7 +908,8 @@ mod tests {
     use std::sync::Arc;
 
     use echo_agent::memory::{
-        ConversationStore, FileConversationStore, NewConversation, StoredMessage,
+        ConversationStore, FileConversationStore, ManagedConversationDelete,
+        ManagedConversationImport, NewConversation, StoredMessage, TranscriptProjectionApplyStatus,
     };
 
     use crate::agent_router::AgentRouter;
@@ -977,24 +943,25 @@ mod tests {
             })
             .await
             .map_err(|error| error.to_string())?;
-        let mut hidden = stored("main-conversation", "assistant", "内部协调消息", 3);
-        hidden.attachments_json = Some(
-            serde_json::json!({
-                "eko_visibility": "internal_agent",
-            })
-            .to_string(),
-        );
         store
             .save_messages(
                 "main-conversation",
                 &[
                     stored("main-conversation", "user", "先分析现状", 1),
                     stored("main-conversation", "assistant", "现状已分析", 2),
-                    hidden,
+                    stored("main-conversation", "assistant", "内部协调消息", 3),
                 ],
             )
             .await
             .map_err(|error| error.to_string())?;
+        let hidden_message_id = store
+            .get_messages("main-conversation")
+            .await
+            .map_err(|error| error.to_string())?
+            .get(2)
+            .and_then(|message| message.id)
+            .ok_or_else(|| "internal parent message has no stable ID".to_string())?;
+        let hidden_ids = std::collections::BTreeSet::from([hidden_message_id]);
 
         let service = SideConversationService::new(Arc::new(AgentRouter::new(
             root.path().join("agent-router"),
@@ -1014,7 +981,7 @@ mod tests {
             Err(SideConversationError::Validation(_))
         ));
         let created = service
-            .create(Arc::clone(&store), request.clone())
+            .create_with_hidden_messages(Arc::clone(&store), request.clone(), &hidden_ids, None)
             .await
             .map_err(|error| error.to_string())?;
         let duplicate = service
@@ -1179,50 +1146,37 @@ mod tests {
             "后续用户消息",
             5,
         ));
-        store
-            .save_messages(&created.entry.conversation_id, &messages)
+        let authority = store
+            .get_projection_authority(&created.entry.conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Side Conversation has no projection authority".to_string())?;
+        let canonical = messages
+            .iter()
+            .cloned()
+            .map(|mut message| {
+                message.id = None;
+                message
+            })
+            .collect();
+        let import = ManagedConversationImport::prepare_for_generation(
+            &created.entry.conversation_id,
+            authority.epoch,
+            authority.revision,
+            &created.entry.conversation_id,
+            canonical,
+        )
+        .map_err(|error| error.to_string())?;
+        let imported = store
+            .import_managed_messages(import)
             .await
             .map_err(|error| error.to_string())?;
-        mark_internal_agent_turn_messages(
-            store.as_ref(),
-            &created.entry.conversation_id,
-            2,
-            "内部协调请求",
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        let marked = store
+        assert_eq!(imported.status, TranscriptProjectionApplyStatus::Applied);
+        let committed = store
             .get_messages(&created.entry.conversation_id)
             .await
             .map_err(|error| error.to_string())?;
-        assert!(
-            marked
-                .first()
-                .is_some_and(|message| !is_internal_agent_message(
-                    message.attachments_json.as_deref()
-                ))
-        );
-        assert!(
-            marked
-                .get(2)
-                .is_some_and(|message| is_internal_agent_message(
-                    message.attachments_json.as_deref()
-                ))
-        );
-        assert!(
-            marked
-                .get(3)
-                .is_some_and(|message| is_internal_agent_message(
-                    message.attachments_json.as_deref()
-                ))
-        );
-        assert!(
-            marked
-                .get(4)
-                .is_some_and(|message| !is_internal_agent_message(
-                    message.attachments_json.as_deref()
-                ))
-        );
+        assert!(same_snapshot(&committed, &messages));
 
         let nested = service
             .create(
@@ -1241,8 +1195,16 @@ mod tests {
             nested,
             Err(SideConversationError::NestedNotAllowed)
         ));
+        let authority = store
+            .get_projection_authority(&created.entry.conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Side Conversation has no projection authority".to_string())?;
         store
-            .delete_conversation(&created.entry.conversation_id)
+            .delete_managed_conversation(
+                ManagedConversationDelete::prepare(&created.entry.conversation_id, authority.epoch)
+                    .map_err(|error| error.to_string())?,
+            )
             .await
             .map_err(|error| error.to_string())?;
         let degraded = service

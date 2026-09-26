@@ -9,7 +9,7 @@ use echo_agent::state::journal::{
     ApplyBatchReceipt, ApplyReceipt, CheckpointFrame, CheckpointStore, CheckpointedApplyError,
     CheckpointedReducer, EventJournal, FileCheckpointStore, FileEventJournal,
     JournalBatchAppendError, JournalBatchCommitStatus, JournalBatchLookup, JournalDurabilityStatus,
-    MemoryCheckpointStore, PreparedJournalBatch,
+    JournalIdentity, MemoryCheckpointStore, PreparedJournalBatch,
 };
 use echo_agent::utils::fs::{FileDurability, atomic_write, create_dir_all_durable};
 use serde::{Deserialize, Serialize};
@@ -112,8 +112,13 @@ impl RuntimeCheckpointStore {
 }
 
 impl CheckpointStore<EventFoldState> for RuntimeCheckpointStore {
-    fn save(&self, state: &EventFoldState, through_sequence: u64) -> echo_agent::error::Result<()> {
-        self.file.save(state, through_sequence)
+    fn save(
+        &self,
+        journal_identity: &JournalIdentity,
+        state: &EventFoldState,
+        through_sequence: u64,
+    ) -> echo_agent::error::Result<()> {
+        self.file.save(journal_identity, state, through_sequence)
     }
 
     fn load(&self) -> echo_agent::error::Result<Option<CheckpointFrame<EventFoldState>>> {
@@ -1164,6 +1169,7 @@ impl RunAuthority {
         let run_directory = self.event_path.parent().ok_or_else(|| {
             ShadowError::Io("TaskRuntime journal has no run directory".to_string())
         })?;
+        let journal_identity = state.journal.journal_identity().clone();
         state.reducer.with_state(|projection| {
             validate_projection_health(projection)?;
             let rebuilt = match projection.rebuilt_plan() {
@@ -1184,7 +1190,7 @@ impl RunAuthority {
                 .map_err(|error| projection_degraded(current, error))?;
             state
                 .checkpoints
-                .save(projection, current)
+                .save(&journal_identity, projection, current)
                 .map_err(|error| projection_degraded(current, error))
         })?;
         state.projection_sequence = current;

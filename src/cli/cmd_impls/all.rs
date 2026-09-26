@@ -198,7 +198,14 @@ async fn cmd_forget(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             return CommandOutcome::Continue;
         }
     };
-    let key = if layer_manager.locate(query.trim()).await.is_some() {
+    let located = match layer_manager.locate(query.trim()).await {
+        Ok(located) => located,
+        Err(error) => {
+            println!("Cannot inspect memory: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let key = if located.is_some() {
         Some(query.trim().to_string())
     } else {
         match layer_manager.search_layered(query.trim(), 20).await {

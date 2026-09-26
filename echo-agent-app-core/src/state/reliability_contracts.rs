@@ -35,6 +35,7 @@ struct CheckpointReadBarrier {
     inner: Arc<dyn echo_agent::state::RuntimeStateStore>,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    intercepted: std::sync::atomic::AtomicBool,
     fail: bool,
 }
 
@@ -44,6 +45,7 @@ impl CheckpointReadBarrier {
             inner,
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            intercepted: std::sync::atomic::AtomicBool::new(false),
             fail,
         }
     }
@@ -58,6 +60,68 @@ impl CheckpointReadBarrier {
 }
 
 impl echo_agent::state::RuntimeStateStore for CheckpointReadBarrier {
+    fn runtime_state_capability(&self) -> echo_agent::state::RuntimeStateCapability {
+        self.inner.runtime_state_capability()
+    }
+
+    fn persistence_call_capability(&self) -> echo_agent::memory::PersistenceCallCapability {
+        self.inner.persistence_call_capability()
+    }
+
+    fn load_runtime_state<'a>(
+        &'a self,
+        scope_id: &'a str,
+        runtime_state_id: &'a str,
+    ) -> BoxFuture<'a, echo_agent::error::Result<Option<echo_agent::state::ManagedRuntimeStateSnapshot>>> {
+        self.inner.load_runtime_state(scope_id, runtime_state_id)
+    }
+
+    fn load_runtime_state_with_context<'a>(
+        &'a self,
+        context: echo_agent::memory::PersistenceCallContext,
+        scope_id: &'a str,
+        runtime_state_id: &'a str,
+    ) -> BoxFuture<'a, echo_agent::error::Result<Option<echo_agent::state::ManagedRuntimeStateSnapshot>>> {
+        Box::pin(async move {
+            if !self.intercepted.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                self.entered.notify_one();
+                self.release.notified().await;
+                if self.fail {
+                    return Err(echo_agent::error::ReactError::Other(
+                        "checkpoint barrier rejected context restoration".to_string(),
+                    ));
+                }
+            }
+            self.inner
+                .load_runtime_state_with_context(context, scope_id, runtime_state_id)
+                .await
+        })
+    }
+
+    fn load_scope_authority_with_context<'a>(
+        &'a self,
+        context: echo_agent::memory::PersistenceCallContext,
+        scope_id: &'a str,
+    ) -> BoxFuture<'a, echo_agent::error::Result<Option<echo_agent::state::RuntimeScopeAuthority>>> {
+        self.inner.load_scope_authority_with_context(context, scope_id)
+    }
+
+    fn compare_and_save_checkpoint_with_context<'a>(
+        &'a self,
+        context: echo_agent::memory::PersistenceCallContext,
+        request: echo_agent::state::RuntimeCheckpointCasRequest,
+    ) -> BoxFuture<'a, echo_agent::error::Result<echo_agent::state::RuntimeCheckpointCasReceipt>> {
+        self.inner.compare_and_save_checkpoint_with_context(context, request)
+    }
+
+    fn acknowledge_transcript_projection_with_context<'a>(
+        &'a self,
+        context: echo_agent::memory::PersistenceCallContext,
+        request: echo_agent::state::RuntimeTranscriptAckRequest,
+    ) -> BoxFuture<'a, echo_agent::error::Result<echo_agent::state::RuntimeCheckpointCasReceipt>> {
+        self.inner.acknowledge_transcript_projection_with_context(context, request)
+    }
+
     fn get_checkpoint<'a>(
         &'a self,
         conversation_id: &'a str,
@@ -1586,7 +1650,9 @@ async fn f1_cold_acceptance_waits_for_real_context_drain() -> anyhow::Result<()>
     );
     assert_eq!(
         terminal.outcome,
-        Some(crate::agent_router::AgentDeliveryOutcome::Completed)
+        Some(crate::agent_router::AgentDeliveryOutcome::Completed),
+        "cold review terminal reason: {:?}",
+        terminal.reason
     );
     assert!(terminal.drained);
     Ok(())

@@ -97,13 +97,7 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
     };
     let reviewer = reviewer.with_layer_manager(layer_manager);
 
-    let handle = match reviewer.review(&run) {
-        Ok(handle) => handle,
-        Err(error) => {
-            println!("Review failed: {error}");
-            return CommandOutcome::Continue;
-        }
-    };
+    let handle = reviewer.review(&run);
     let settled = match review_lease.clone().track_background_review(handle).await {
         Ok(mut pass) => pass.settle().await,
         Err(error) => Err(error),
@@ -187,7 +181,11 @@ async fn cmd_curator(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("  Last run:     {}", last.format("%Y-%m-%d %H:%M:%S"));
             }
         }
-        "run" => match curator.apply_transitions() {
+        "run" => match control
+            .generation
+            .run_skill_transitions("eko:cli-user")
+            .await
+        {
             Ok(transitions) if !transitions.is_empty() => {
                 agent
                     .write_async(|agent| {
@@ -212,7 +210,11 @@ async fn cmd_curator(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         },
         "pin" => {
             if let Some(name) = args.get(1) {
-                match curator.pin_skill(name) {
+                match control
+                    .generation
+                    .set_skill_pinned(name, true, "eko:cli-user")
+                    .await
+                {
                     Ok(()) => println!("Pinned skill: {name}"),
                     Err(e) => println!("Error: {e}"),
                 }
@@ -222,7 +224,11 @@ async fn cmd_curator(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
         "unpin" => {
             if let Some(name) = args.get(1) {
-                match curator.unpin_skill(name) {
+                match control
+                    .generation
+                    .set_skill_pinned(name, false, "eko:cli-user")
+                    .await
+                {
                     Ok(()) => println!("Unpinned skill: {name}"),
                     Err(e) => println!("Error: {e}"),
                 }
@@ -829,30 +835,11 @@ async fn cmd_skill_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
         }
     };
 
-    let echo_agent_dir = control.generation.echo_agent_dir().to_path_buf();
-    let store = control.generation.memory_store();
-    let curator = echo_agent_app_core::api::evolution::workspace_curator(&echo_agent_dir);
-
-    // Generate draft from candidate.
-    let typed_store = echo_agent::memory::TypedMemoryStore::new(store);
-    let log_path = echo_agent_dir.join("evolution").join("change-log.jsonl");
-    if let Some(parent) = log_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let change_log = match echo_agent::evolution::JsonlChangeLog::new(log_path) {
-        Ok(change_log) => change_log,
-        Err(error) => {
-            println!("Failed to open evolution change log: {error}");
-            return CommandOutcome::Continue;
-        }
-    };
-    let generator = echo_agent::evolution::SkillDraftGenerator::new(
-        echo_agent_dir,
-        &change_log as &dyn echo_agent::evolution::ChangeLog,
-    )
-    .with_curator(curator);
-
-    match generator.generate(&name, &typed_store).await {
+    match control
+        .generation
+        .generate_skill_draft(&name, "eko:cli-user")
+        .await
+    {
         Ok(result) => {
             if result.created {
                 println!("✓ Draft SKILL.md created for '{}' at:", result.name);
@@ -905,7 +892,6 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
     };
     let store = control.generation.memory_store();
     let echo_agent_dir = control.generation.echo_agent_dir().to_path_buf();
-    let curator = echo_agent_app_core::api::evolution::workspace_curator(&echo_agent_dir);
 
     // If no args, run similarity detection and show proposals
     if args.is_empty() {
@@ -1031,30 +1017,37 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                     })
                     .await;
 
-                let log_path = echo_agent_dir.join("evolution").join("change-log.jsonl");
-                if let Some(parent) = log_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let change_log = match echo_agent::evolution::JsonlChangeLog::new(log_path) {
-                    Ok(change_log) => change_log,
+                let authority = match control.generation.skill_mutation_authority() {
+                    Ok(authority) => authority,
                     Err(error) => {
-                        println!("Failed to open evolution change log: {error}");
+                        println!("Failed to open Skill mutation authority: {error}");
                         return CommandOutcome::Continue;
                     }
                 };
-
-                let merger = echo_agent::evolution::SkillMerger::new(curator);
+                let merger = echo_agent::evolution::SkillMerger::new(authority);
 
                 let mut primary_desc_mut = primary_desc;
-                match merger
-                    .execute_merge(
-                        &proposal,
-                        &mut primary_desc_mut,
-                        deprecated_desc.as_ref(),
-                        &change_log,
-                    )
-                    .await
-                {
+                let merged = async {
+                    let preview = merger
+                        .preview_merge(
+                            uuid::Uuid::new_v4().to_string(),
+                            &proposal,
+                            &primary_desc_mut,
+                            deprecated_desc.as_ref(),
+                        )
+                        .await?;
+                    let approval = echo_agent::evolution::SkillApprovalArtifact::new(
+                        uuid::Uuid::new_v4().to_string(),
+                        &preview.preview.operation_digest,
+                        "eko:cli-user",
+                        chrono::Utc::now(),
+                    );
+                    merger
+                        .execute_preview(preview, approval, &mut primary_desc_mut)
+                        .await
+                }
+                .await;
+                match merged {
                     Ok(_) => {
                         println!("✓ Merge completed successfully.");
                         println!(
@@ -1252,7 +1245,7 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
     let store = control.generation.memory_store();
     let agent = control.runtime.primary_agent();
 
-    let patcher = echo_agent::evolution::SkillPatcher::new(store);
+    let patcher = echo_agent::evolution::SkillPatcher::new(store.clone());
 
     if args.is_empty() {
         // Show all patch proposals
@@ -1344,19 +1337,14 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
             return CommandOutcome::Continue;
         };
 
-        // Create change log.
-        let echo_agent_dir = control.generation.echo_agent_dir();
-        let log_path = echo_agent_dir.join("evolution").join("change-log.jsonl");
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let change_log = match echo_agent::evolution::JsonlChangeLog::new(log_path) {
-            Ok(change_log) => change_log,
+        let authority = match control.generation.skill_mutation_authority() {
+            Ok(authority) => authority,
             Err(error) => {
-                println!("Failed to open evolution change log: {error}");
+                println!("Failed to open Skill mutation authority: {error}");
                 return CommandOutcome::Continue;
             }
         };
+        let patcher = echo_agent::evolution::SkillPatcher::new(store).with_authority(authority);
 
         let patch = match patch.bind_to_source(&descriptor.location).await {
             Ok(patch) => patch,
@@ -1372,7 +1360,20 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
             patch.patch_type.label(),
             skill_name
         );
-        match patcher.apply_patch(&patch, &descriptor, &change_log).await {
+        let applied = async {
+            let preview = patcher
+                .preview_patch(uuid::Uuid::new_v4().to_string(), &patch, &descriptor)
+                .await?;
+            let approval = echo_agent::evolution::SkillApprovalArtifact::new(
+                uuid::Uuid::new_v4().to_string(),
+                &preview.preview.operation_digest,
+                "eko:cli-user",
+                chrono::Utc::now(),
+            );
+            patcher.apply_preview(preview, approval).await
+        }
+        .await;
+        match applied {
             Ok(()) => {
                 println!("✓ Patch applied to {}", descriptor.location.display());
                 // Fire SkillPatchApplied hook.
@@ -1599,10 +1600,12 @@ async fn cmd_skill_register(ctx: &CommandContext, args: &[&str]) -> CommandOutco
         }
     };
     let echo_agent_dir = control.generation.echo_agent_dir();
-    let curator = echo_agent_app_core::api::evolution::workspace_curator(echo_agent_dir);
     let skill_path = echo_agent_dir.join("skills").join(name).join("SKILL.md");
-    let path = skill_path.exists().then_some(skill_path.as_path());
-    match curator.touch_skill_at(name, path, false) {
+    match control
+        .generation
+        .register_user_skill(name, &skill_path, "eko:cli-user")
+        .await
+    {
         Ok(()) => {
             println!(
                 "✓ Skill '{}' registered as user-created (agent_created=false).",
@@ -1646,9 +1649,11 @@ async fn cmd_skill_pin(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             return CommandOutcome::Continue;
         }
     };
-    let curator = control.integration.curator();
-
-    match curator.pin_skill(name) {
+    match control
+        .generation
+        .set_skill_pinned(name, true, "eko:cli-user")
+        .await
+    {
         Ok(()) => println!("✓ Skill '{}' pinned — exempt from auto-transitions.", name),
         Err(e) => println!("Error pinning skill: {e}"),
     }
@@ -1683,9 +1688,11 @@ async fn cmd_skill_unpin(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
             return CommandOutcome::Continue;
         }
     };
-    let curator = control.integration.curator();
-
-    match curator.unpin_skill(name) {
+    match control
+        .generation
+        .set_skill_pinned(name, false, "eko:cli-user")
+        .await
+    {
         Ok(()) => println!(
             "✓ Skill '{}' unpinned — curator may auto-transition it.",
             name

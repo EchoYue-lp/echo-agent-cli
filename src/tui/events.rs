@@ -2973,7 +2973,7 @@ async fn cancel_active_tui_turn(app: &mut TuiApp) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-async fn rewind_last_turn(app: &mut TuiApp, agent: &AgentHandle) -> anyhow::Result<()> {
+async fn rewind_last_turn(app: &mut TuiApp, _agent: &AgentHandle) -> anyhow::Result<()> {
     let store = app
         .conversation_store
         .as_ref()
@@ -2982,27 +2982,22 @@ async fn rewind_last_turn(app: &mut TuiApp, agent: &AgentHandle) -> anyhow::Resu
         .conversation_id
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("no active conversation"))?;
+    let _admission = begin_tui_managed_replacement(app, conversation_id).await?;
     let mut stored = store.get_messages(conversation_id).await?;
-    let user_index = stored
-        .iter()
-        .rposition(|message| message.role == "user")
-        .ok_or_else(|| anyhow::anyhow!("no user turn to rewind"))?;
-    let prompt = stored
-        .get(user_index)
-        .and_then(|message| message.content.clone())
+    let prompt = echo_agent_app_core::api::managed_conversation::take_last_user_turn(&mut stored)
+        .ok_or_else(|| anyhow::anyhow!("no user turn to rewind"))?
+        .content
         .unwrap_or_default();
-    stored.truncate(user_index);
-    store.save_messages(conversation_id, &stored).await?;
-    let runtime_messages = match echo_agent::memory::restore_messages(&stored) {
-        Ok(msgs) => msgs,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to restore messages; continuing with empty history");
-            Vec::new()
-        }
-    };
-    agent
-        .read_async(|value| Box::pin(async move { value.load_messages(runtime_messages).await }))
-        .await;
+    let runtime_state = tui_runtime_state(app).await?;
+    let execution = tui_conversation_execution(app, conversation_id).await?;
+    echo_agent_app_core::api::managed_conversation::replace_and_resume(
+        store.as_ref(),
+        runtime_state.as_ref(),
+        &execution.agent(),
+        conversation_id,
+        &stored,
+    )
+    .await?;
     app.input = prompt;
     app.cursor = app.input.len();
     app.messages = stored
@@ -4459,8 +4454,16 @@ async fn handle_slash_command(
         Some(SlashCommand::Memory) => {
             let content = match current_tui_memory_control(app).await {
                 Ok((_runtime, _generation, layer_manager)) => {
-                    let mut items = layer_manager
-                        .list_hot()
+                    let hot = match layer_manager.list_hot() {
+                        Ok(hot) => hot,
+                        Err(error) => {
+                            return push_system_message(
+                                app,
+                                format!("Failed to list hot memories: {error}"),
+                            );
+                        }
+                    };
+                    let mut items = hot
                         .into_iter()
                         .map(|entry| format!("[hot] {}: {}", entry.key, entry.content))
                         .collect::<Vec<_>>();
@@ -4563,7 +4566,13 @@ async fn handle_slash_command(
                     }
                 };
             let query = args.trim();
-            let key = if layer_manager.locate(query).await.is_some() {
+            let located = match layer_manager.locate(query).await {
+                Ok(located) => located,
+                Err(error) => {
+                    return push_system_message(app, format!("Cannot inspect memory: {error}"));
+                }
+            };
+            let key = if located.is_some() {
                 Some(query.to_string())
             } else {
                 match layer_manager.search_layered(query, 20).await {
@@ -4612,14 +4621,26 @@ async fn handle_slash_command(
             });
         }
         Some(SlashCommand::Clear) => {
-            reset_conversation_state(app, agent, false).await;
+            if let Err(error) = reset_conversation_state(app, agent, false).await {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!("Could not clear conversation: {error}"),
+                });
+                return;
+            }
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: "Conversation context cleared.".to_string(),
             });
         }
         Some(SlashCommand::New) => {
-            reset_conversation_state(app, agent, true).await;
+            if let Err(error) = reset_conversation_state(app, agent, true).await {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!("Could not start a new conversation: {error}"),
+                });
+                return;
+            }
             if !args.trim().is_empty()
                 && let (Some(app_state), Some(id)) =
                     (app.app_state.as_ref(), app.conversation_id.as_deref())
@@ -4729,10 +4750,29 @@ async fn handle_slash_command(
                 app.conversation_id.as_deref(),
             ) {
                 (_, _) if args.trim().is_empty() => Err("Usage: /rename <title>".to_string()),
-                (Some(store), Some(id)) => store
-                    .update_conversation(id, Some(args.trim()), None, None)
-                    .await
-                    .map_err(|error| error.to_string()),
+                (Some(store), Some(id)) => {
+                    let operation = async {
+                        let _admission = begin_tui_managed_replacement(app, id).await?;
+                        let runtime_state = tui_runtime_state(app).await?;
+                        let execution = tui_conversation_execution(app, id).await?;
+                        echo_agent_app_core::api::managed_conversation::resume_or_import(
+                            store.as_ref(),
+                            runtime_state.as_ref(),
+                            &execution.agent(),
+                            id,
+                        )
+                        .await?;
+                        echo_agent_app_core::api::managed_conversation::update_title(
+                            store.as_ref(),
+                            id,
+                            args.trim(),
+                        )
+                        .await
+                    };
+                    operation
+                        .await
+                        .map_err(|error: anyhow::Error| error.to_string())
+                }
                 _ => Err("Conversation persistence is unavailable".to_string()),
             };
             app.messages.push(ChatMessage {
@@ -4797,8 +4837,14 @@ async fn handle_slash_command(
                     .map_err(|error| error.to_string()),
                 None => Err("Conversation persistence is unavailable".to_string()),
             };
-            if result.is_ok() && app.conversation_id.as_deref() == Some(id) {
-                reset_conversation_state(app, agent, true).await;
+            if result.is_ok()
+                && app.conversation_id.as_deref() == Some(id)
+                && let Err(error) = reset_conversation_state(app, agent, true).await
+            {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!("Conversation deleted, but reset failed: {error}"),
+                });
             }
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -5263,16 +5309,7 @@ async fn handle_slash_command(
                     run_summary.run_id.chars().take(12).collect::<String>()
                 ),
             });
-            let handle = match reviewer.review_by_run_id(&run_summary.run_id) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    app.messages.push(ChatMessage {
-                        role: MessageRole::System,
-                        content: format!("Run review failed: {error}"),
-                    });
-                    return;
-                }
-            };
+            let handle = reviewer.review_by_run_id(&run_summary.run_id);
             let settled = match review_lease.clone().track_background_review(handle).await {
                 Ok(mut pass) => pass.settle().await,
                 Err(error) => Err(error),
@@ -6817,15 +6854,28 @@ fn resolve_tui_workspace_file(
     Ok(target)
 }
 
-async fn reset_conversation_state(app: &mut TuiApp, agent: &AgentHandle, new_id: bool) {
+async fn reset_conversation_state(
+    app: &mut TuiApp,
+    agent: &AgentHandle,
+    new_id: bool,
+) -> anyhow::Result<()> {
     if !new_id
         && let (Some(store), Some(id)) = (
             app.conversation_store.as_ref(),
             app.conversation_id.as_deref(),
         )
-        && let Err(error) = store.save_messages(id, &[]).await
     {
-        tracing::warn!(error = %error, conversation_id = id, "failed to clear persisted conversation");
+        let _admission = begin_tui_managed_replacement(app, id).await?;
+        let runtime_state = tui_runtime_state(app).await?;
+        let execution = tui_conversation_execution(app, id).await?;
+        echo_agent_app_core::api::managed_conversation::replace_and_resume(
+            store.as_ref(),
+            runtime_state.as_ref(),
+            &execution.agent(),
+            id,
+            &[],
+        )
+        .await?;
     }
     if new_id {
         let id = uuid::Uuid::new_v4().to_string();
@@ -6858,17 +6908,21 @@ async fn reset_conversation_state(app: &mut TuiApp, agent: &AgentHandle, new_id:
     app.clear_selection();
     app.context_snapshot.clear_usage();
     app.usage_accumulator.reset();
-    active_agent
-        .read_async(|value| {
-            Box::pin(async move {
-                use echo_agent::agent::Agent;
-                value.reset().await;
+    if new_id {
+        active_agent
+            .read_async(|value| {
+                Box::pin(async move {
+                    use echo_agent::agent::Agent;
+                    value.reset().await;
+                })
             })
-        })
-        .await;
+            .await;
+    }
+    Ok(())
 }
 
 async fn resume_conversation(app: &mut TuiApp, conversation_id: &str) -> anyhow::Result<()> {
+    let _admission = begin_tui_managed_replacement(app, conversation_id).await?;
     let store = app
         .conversation_store
         .as_ref()
@@ -6878,18 +6932,16 @@ async fn resume_conversation(app: &mut TuiApp, conversation_id: &str) -> anyhow:
         .await?
         .ok_or_else(|| anyhow::anyhow!("conversation '{conversation_id}' was not found"))?;
     let stored = store.get_messages(conversation_id).await?;
-    let runtime_messages = match echo_agent::memory::restore_messages(&stored) {
-        Ok(msgs) => msgs,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to restore messages; continuing with empty history");
-            Vec::new()
-        }
-    };
     let pool_execution = tui_conversation_execution(app, conversation_id).await?;
     let active_agent = pool_execution.agent();
-    active_agent
-        .read_async(|value| Box::pin(async move { value.load_messages(runtime_messages).await }))
-        .await;
+    let runtime_state = tui_runtime_state(app).await?;
+    echo_agent_app_core::api::managed_conversation::resume_or_import(
+        store.as_ref(),
+        runtime_state.as_ref(),
+        &active_agent,
+        conversation_id,
+    )
+    .await?;
 
     app.conversation_id = Some(conversation_id.to_string());
     app.messages = stored
@@ -6924,7 +6976,7 @@ async fn resume_conversation(app: &mut TuiApp, conversation_id: &str) -> anyhow:
 
 async fn fork_conversation(
     app: &mut TuiApp,
-    agent: &AgentHandle,
+    _agent: &AgentHandle,
     title: &str,
 ) -> anyhow::Result<()> {
     let store = app
@@ -6932,19 +6984,22 @@ async fn fork_conversation(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("conversation persistence is unavailable"))?;
     let id = uuid::Uuid::new_v4().to_string();
-    let source_execution = match app.conversation_id.as_deref() {
-        Some(conversation_id) => Some(tui_conversation_execution(app, conversation_id).await?),
-        None => None,
+    let projected = match app.conversation_id.as_deref() {
+        Some(source_id) => {
+            let _admission = begin_tui_managed_replacement(app, source_id).await?;
+            store
+                .get_messages(source_id)
+                .await?
+                .into_iter()
+                .map(|mut message| {
+                    message.id = None;
+                    message.conversation_id = id.clone();
+                    message
+                })
+                .collect::<Vec<_>>()
+        }
+        None => Vec::new(),
     };
-    let source_agent = source_execution
-        .as_ref()
-        .map(echo_agent_app_core::api::agent_pool::AgentPoolExecutionLease::agent)
-        .unwrap_or_else(|| agent.clone());
-    let runtime_messages = source_agent
-        .read_async(|value| Box::pin(async move { value.get_messages().await }))
-        .await;
-    drop(source_execution);
-    let projected = echo_agent::memory::project_messages(&id, &runtime_messages)?;
     let default_title = app
         .conversation_id
         .as_deref()
@@ -6966,16 +7021,17 @@ async fn fork_conversation(
             }),
         })
         .await?;
-    store.save_messages(&id, &projected).await?;
     let target_execution = tui_conversation_execution(app, &id).await?;
-    target_execution
-        .agent()
-        .read_async(|value| {
-            Box::pin(async move {
-                value.load_messages(runtime_messages).await;
-            })
-        })
-        .await;
+    let _target_admission = begin_tui_managed_replacement(app, &id).await?;
+    let runtime_state = tui_runtime_state(app).await?;
+    echo_agent_app_core::api::managed_conversation::replace_and_resume(
+        store.as_ref(),
+        runtime_state.as_ref(),
+        &target_execution.agent(),
+        &id,
+        &projected,
+    )
+    .await?;
     app.conversation_id = Some(id.clone());
     app.messages.push(ChatMessage {
         role: MessageRole::System,
@@ -6998,6 +7054,39 @@ async fn tui_conversation_execution(
         .map_err(anyhow::Error::msg)?;
     runtime
         .agent_for(conversation_id)
+        .await
+        .map_err(anyhow::Error::msg)
+}
+
+async fn tui_runtime_state(
+    app: &TuiApp,
+) -> anyhow::Result<std::sync::Arc<dyn echo_agent::state::RuntimeStateStore>> {
+    let app_state = app
+        .app_state
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("TUI application state is unavailable"))?;
+    app_state
+        .current_control_runtime()
+        .await
+        .map_err(anyhow::Error::msg)?
+        .runtime_state_store()
+        .ok_or_else(|| anyhow::anyhow!("runtime state persistence is unavailable"))
+}
+
+async fn begin_tui_managed_replacement(
+    app: &TuiApp,
+    conversation_id: &str,
+) -> anyhow::Result<echo_agent_app_core::api::managed_conversation::ManagedConversationAdmission> {
+    let app_state = app
+        .app_state
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("TUI application state is unavailable"))?;
+    let runtime = app_state
+        .current_control_runtime()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    runtime
+        .begin_managed_replacement(&app_state.session.foreground_turns, conversation_id)
         .await
         .map_err(anyhow::Error::msg)
 }

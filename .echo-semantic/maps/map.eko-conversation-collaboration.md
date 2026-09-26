@@ -4,7 +4,7 @@ id: map.eko-conversation-collaboration
 kind: capability_map
 title: EKO Conversation collaboration
 risk: high
-observed_at: source:87791a9dc0b2bb4484fff726fea064bd943e080f4f0e97b74d9d5821442c1e9a
+observed_at: source:caa0bf81fcda8d046037a8a1065adc31b7bb0652059b4e4c8e975d8831e26fc0
 boundary_refs: [boundary.eko-conversation-collaboration]
 behavior_refs: [behavior.side-conversation-lifecycle]
 rule_refs: [rule.conversation-collaboration-authorities]
@@ -30,7 +30,7 @@ scenarios:
     evidence_refs: [evidence.side-conversation-preflight]
   side-conversation-create-and-recover:
     status: mapped
-    source_refs: [docs/supreme/specs/side-conversation/design.md, echo-agent-app-core/src/side_conversation.rs, echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/state/tests.rs, src/tauri/commands/conversations.rs, web-frontend/src/stores/conversationStore.ts]
+    source_refs: [docs/supreme/specs/side-conversation/design.md, echo-agent-app-core/src/side_conversation.rs, echo-agent-app-core/src/conversation_archive.rs, echo-agent-app-core/src/managed_conversation.rs, echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/state/workspace.rs, echo-agent-app-core/src/state/tests.rs, src/tauri/commands/conversations.rs, web-frontend/src/stores/conversationStore.ts, web-frontend/src/generated/TurnVisibility.ts]
     rule_refs: [rule.conversation-collaboration-authorities]
     evidence_refs: [evidence.side-conversation-preflight]
   side-conversation-gui-boundary:
@@ -52,7 +52,7 @@ GUI 通过 Tauri conversation commands 创建和管理 Side Conversation，模�
 
 ## 行为关系
 
-ConversationStore 保存 transcript，AgentRouter 保存内部 inbox 与 group，ForegroundTurnControl 保存活跃 turn；Side Conversation 只能组合这些权威。
+ConversationStore 保存 transcript，AgentRouter 保存内部 inbox 与 group，ForegroundTurnControl 保存活跃 turn；EKO 既有 conversation archive 文件保存界面可见性和 handoff 意图。Side Conversation 只能组合这些权威。
 
 ## 状态与数据流
 
@@ -64,7 +64,7 @@ ConversationStore 保存 transcript，AgentRouter 保存内部 inbox 与 group�
 
 ## 生命周期与失败路径
 
-覆盖 create、snapshot、first dispatch、continue、cancel、rename、delete、restart recovery 和 relation cleanup；部分写入必须有明确回执或补偿。
+覆盖 create、revision/visibility 一致性 snapshot、first dispatch、continue、cancel、rename、delete、restart recovery 和 relation cleanup；内部消息的可见性在 Router terminal 前结算，部分写入必须有明确回执或补偿。
 
 ## 权限与敏感信息
 

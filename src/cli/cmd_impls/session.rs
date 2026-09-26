@@ -1,7 +1,6 @@
 //! Session management slash commands — reset, new, undo, history, stats, status.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
-use echo_agent::agent::Agent;
 use std::sync::Arc;
 
 async fn active_execution(
@@ -22,21 +21,47 @@ fn active_agent(
         .unwrap_or_else(|| fallback.clone())
 }
 
+async fn clear_repl_conversation(ctx: &CommandContext) -> anyhow::Result<()> {
+    let conversation_id = ctx
+        .conversation_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("No active conversation"))?;
+    let app_state = ctx
+        .app_state
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Application state is unavailable"))?;
+    let runtime = app_state
+        .current_control_runtime()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let _admission = runtime
+        .begin_managed_replacement(&app_state.session.foreground_turns, conversation_id)
+        .await?;
+    let store = runtime
+        .conversation_store()
+        .ok_or_else(|| anyhow::anyhow!("Conversation store is unavailable"))?;
+    let state_store = runtime
+        .runtime_state_store()
+        .ok_or_else(|| anyhow::anyhow!("Runtime state store is unavailable"))?;
+    let execution = runtime.agent_for(conversation_id).await?;
+    echo_agent_app_core::api::managed_conversation::replace_and_resume(
+        store.as_ref(),
+        state_store.as_ref(),
+        &execution.agent(),
+        conversation_id,
+        &[],
+    )
+    .await?;
+    Ok(())
+}
+
 // ── ResetCommand ─────────────────────────────────────────────────────
 
 async fn cmd_reset(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    let execution = active_execution(ctx).await;
-    active_agent(execution.as_ref(), &ctx.agent)
-        .read_async(|a| {
-            Box::pin(async move {
-                let system_prompt = a.system_prompt().to_string();
-                let mut ctx = a.context().lock().await;
-                ctx.clear();
-                ctx.push(echo_agent::llm::types::Message::system(system_prompt));
-            })
-        })
-        .await;
-    println!("Conversation reset.");
+    match clear_repl_conversation(ctx).await {
+        Ok(()) => println!("Conversation reset."),
+        Err(error) => println!("Reset failed: {error}"),
+    }
     CommandOutcome::Continue
 }
 cmd!(
@@ -189,17 +214,13 @@ cmd!(
 // ── NewCommand ───────────────────────────────────────────────────────
 
 async fn cmd_new(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    crate::cli::repl::reset_usage_stats();
-    // N3 fix: actually reset the conversation, not just usage stats
-    let execution = active_execution(ctx).await;
-    active_agent(execution.as_ref(), &ctx.agent)
-        .read_async(|a| {
-            Box::pin(async move {
-                a.reset().await;
-            })
-        })
-        .await;
-    println!("\nNew session started (context cleared).");
+    match clear_repl_conversation(ctx).await {
+        Ok(()) => {
+            crate::cli::repl::reset_usage_stats();
+            println!("\nNew session started (context cleared).");
+        }
+        Err(error) => println!("New session failed: {error}"),
+    }
     CommandOutcome::Continue
 }
 cmd!(
@@ -214,22 +235,51 @@ cmd!(
 // ── UndoCommand ──────────────────────────────────────────────────────
 
 async fn cmd_undo(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    let execution = active_execution(ctx).await;
-    active_agent(execution.as_ref(), &ctx.agent)
-        .read_async(|a| {
-            Box::pin(async move {
-                let mut messages = a.get_messages().await;
-                let original_len = messages.len();
-                for _ in 0..2 {
-                    messages.pop();
-                }
-                if original_len != messages.len() {
-                    a.load_messages(messages).await;
-                }
-            })
-        })
-        .await;
-    println!("Undone last turn.");
+    let undone = async {
+        let conversation_id = ctx
+            .conversation_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("No active conversation"))?;
+        let app_state = ctx
+            .app_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Application state is unavailable"))?;
+        let runtime = app_state
+            .current_control_runtime()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let _admission = runtime
+            .begin_managed_replacement(&app_state.session.foreground_turns, conversation_id)
+            .await?;
+        let store = runtime
+            .conversation_store()
+            .ok_or_else(|| anyhow::anyhow!("Conversation store is unavailable"))?;
+        let state_store = runtime
+            .runtime_state_store()
+            .ok_or_else(|| anyhow::anyhow!("Runtime state store is unavailable"))?;
+        let mut stored = store.get_messages(conversation_id).await?;
+        if echo_agent_app_core::api::managed_conversation::take_last_user_turn(&mut stored)
+            .is_none()
+        {
+            return Ok::<bool, anyhow::Error>(false);
+        }
+        let execution = runtime.agent_for(conversation_id).await?;
+        echo_agent_app_core::api::managed_conversation::replace_and_resume(
+            store.as_ref(),
+            state_store.as_ref(),
+            &execution.agent(),
+            conversation_id,
+            &stored,
+        )
+        .await?;
+        Ok(true)
+    }
+    .await;
+    match undone {
+        Ok(true) => println!("Undone last turn."),
+        Ok(false) => println!("No turn to undo."),
+        Err(error) => println!("Undo failed: {error}"),
+    }
     CommandOutcome::Continue
 }
 cmd!(

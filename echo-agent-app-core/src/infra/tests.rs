@@ -765,8 +765,11 @@ mod resolve_subagent_model_tests {
             .store()
             .ok_or_else(|| echo_agent::error::ReactError::Other("memory store missing".to_string()))?;
         assert!(Arc::ptr_eq(installed, &memory_store));
-        for tool in ["remember", "recall", "search_memory", "forget"] {
+        for tool in ["recall", "search_memory"] {
             assert!(subagent.tool_names().iter().any(|name| name == tool));
+        }
+        for tool in ["remember", "forget"] {
+            assert!(!subagent.tool_names().iter().any(|name| name == tool));
         }
         Ok(())
     }

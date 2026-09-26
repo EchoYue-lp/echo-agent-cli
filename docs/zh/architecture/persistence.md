@@ -76,6 +76,17 @@ degraded observability，不阻断正确查询；该迁移不改变事件格式�
 artifact/review history segment 和 history cursor 同样可以删除重建；它们不能替代 events.jsonl。
 ```
 
+## Background Review 收据
+
+Scheduler 将框架 `CronTaskStore` 绑定到 EKO 数据根下稳定的 `scheduler/tasks.json`；
+即使 Memory Store 拥有任务定义，同目录 occurrence journal 仍使用该路径身份。GUI、TUI、
+CLI 和 JSONL 启动均不从进程 cwd 推断 Scheduler 持久化位置。
+
+EKO 在 `.eko/evolution/background-review.jsonl` 记录 Review 准入、outcome 和终态。它只拥有
+Review 操作生命周期：已提交 Memory 归框架 Memory journal，候选证据归 Review Inbox。
+恢复时可幂等重放已保存 outcome；只有准入而无 outcome 时，核对稳定 Memory key 后标记中断，
+不得编造证据。详见 [ADR 0043](../adr/0043-background-review-owner.md)。
+
 ## 普通聊天：独立的 Chat Journal
 
 普通 Chat 同时使用 `ChatEventLog` 保存 GUI、TUI、CLI、channel 和 boot recovery 消费的
@@ -102,6 +113,8 @@ Workspace runtime 同时配置：
 - `FileRuntimeStateStore`：保存 framework `AgentCheckpoint`，恢复完整 ReAct 消息、plan 文本、激活技能、blocked reason 和 working directory；
 - `FileConversationStore`：保存用户可见 transcript projection，供会话列表和历史界面读取。
 
+EKO 既有 conversation visibility 文件保存归档选择，以及按 conversation epoch 约束的内部投递 intent/精确消息 ID。它只控制 GUI 可见性，不改写 canonical transcript，也不替代 AgentRouter 投递终态。
+
 二者可能使用相同的 `conversation_id`，但不能互相替代：
 
 | 对比                     | Runtime checkpoint         | Conversation transcript |
@@ -112,6 +125,7 @@ Workspace runtime 同时配置：
 | 是否拥有 Task DAG        | 否                         | 否                      |
 
 正式任务的 Task DAG 和生命周期仍由 TaskRuntime Journal 拥有，不能塞进 `AgentCheckpoint`。
+Managed transcript 替换先导入可见前缀并建立投影 generation，再用 CAS 写入匹配的 Agent checkpoint。若两次提交之间崩溃，EKO 只凭精确导入回执恢复，不通过旧 `load_messages` 绕过 Managed 权威。
 
 ## Trace：诊断，不是恢复权威
 

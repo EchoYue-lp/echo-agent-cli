@@ -159,6 +159,39 @@ impl PreparedAgentPoolModelDeactivation<'_> {
 }
 
 impl PreparedAgentPoolPluginPublication<'_> {
+    pub(crate) async fn retire_failed_candidate(
+        &mut self,
+        retired: AgentPluginGeneration,
+    ) -> Result<(), String> {
+        let candidate = self.candidate.take().ok_or_else(|| {
+            "AgentPool has no prepared Plugin candidate to retire".to_string()
+        })?;
+        let mut errors = Vec::new();
+        let mut pooled_agents = self.agents.iter().collect::<Vec<_>>();
+        pooled_agents.sort_by(|left, right| left.0.cmp(right.0));
+        for (conversation_id, pooled) in pooled_agents {
+            if let Err(error) = replace_agent_plugin_generation(
+                &pooled.handle,
+                &candidate,
+                &retired,
+                None,
+                self.pool.shared.review_integration.clone(),
+            )
+            .await
+            {
+                errors.push(format!("{conversation_id}: {error}"));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(format!(
+                "failed to retire Plugin candidate from pooled Agents: {}",
+                errors.join("; ")
+            ));
+        }
+        *self.pool.agent_generation.write().await = retired;
+        Ok(())
+    }
+
     pub(crate) async fn prepare(&mut self, candidate: AgentPluginGeneration) -> Result<(), String> {
         self.prepare_inner(candidate, None).await
     }
@@ -208,6 +241,7 @@ impl PreparedAgentPoolPluginPublication<'_> {
                 &self.previous,
                 &candidate,
                 application_skill_repair.as_ref(),
+                self.pool.shared.review_integration.clone(),
             )
             .await
             {
@@ -218,6 +252,7 @@ impl PreparedAgentPoolPluginPublication<'_> {
                         &candidate,
                         &self.previous,
                         application_skill_repair.as_ref(),
+                        self.pool.shared.review_integration.clone(),
                     )
                     .await
                     {
@@ -264,6 +299,7 @@ impl PreparedAgentPoolPluginPublication<'_> {
                 &candidate,
                 &self.previous,
                 self.application_skill_repair.as_ref(),
+                self.pool.shared.review_integration.clone(),
             )
             .await
             {
@@ -1967,9 +2003,10 @@ impl AgentPool {
                 .lease_generation()
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             let layer_manager = memory_generation.layer_manager()?;
-            agent.install_memory_layer_manager(layer_manager);
+            let skill_authority = memory_generation.skill_mutation_authority()?;
+            agent.install_memory_layer_manager(layer_manager)?;
             agent.set_memory_trigger_sink(Some(review_integration.clone()));
-            agent.set_skill_curator(Some(review_integration.curator()));
+            agent.set_skill_mutation_authority(Some(skill_authority));
             let mut projector = crate::turn_context::EkoContextProjector::new(
                 crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
                 crate::turn_context::turn_prompt_context_registry(),
@@ -2002,7 +2039,18 @@ impl AgentPool {
         // 3. Install the exact plugin generation committed by PluginRuntime.
         let agent_generation = self.agent_generation.read().await.clone();
         for desc in &agent_generation.skill_descriptors {
-            agent.skill_registry_mut().register_descriptor(desc.clone());
+            if let Some(policy) = self.shared.review_integration.as_ref()
+                && !echo_agent::skills::external::SkillLoadPolicy::allows(
+                    policy.as_ref(), desc,
+                )
+                .await
+            {
+                continue;
+            }
+            agent
+                .register_skill_descriptor(desc.clone())
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
         register_plugin_agents(&mut agent, &agent_generation.plugin_agents)
             .await

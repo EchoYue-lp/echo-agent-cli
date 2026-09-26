@@ -2088,15 +2088,50 @@ impl AppChannelMessageHandler {
         let conversation_store = conversation_store.ok_or_else(|| {
             "ConversationStore is unavailable for exact channel runtime cleanup".to_string()
         })?;
-        echo_agent::state::clear_persisted_runtime_incarnation(
+        let receipt = echo_agent::state::clear_persisted_runtime_incarnation(
             conversation_store.as_ref(),
             runtime_state_store.as_ref(),
             conversation_id,
             runtime_state_id,
         )
         .await
-        .map(|receipt| receipt.checkpoint_removed)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        if runtime_state_id != conversation_id {
+            let authority = conversation_store
+                .get_projection_authority(runtime_state_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some(authority) = authority {
+                let delete = echo_agent::memory::ManagedConversationDelete::prepare(
+                    runtime_state_id,
+                    authority.epoch,
+                )
+                .map_err(|error| error.to_string())?;
+                let operation_id = delete.operation_id.clone();
+                let deleted = conversation_store
+                    .delete_managed_conversation(delete)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if deleted.operation_id != operation_id
+                    || !matches!(
+                        deleted.status,
+                        echo_agent::memory::ManagedConversationDeleteStatus::Deleted
+                            | echo_agent::memory::ManagedConversationDeleteStatus::AlreadyDeleted
+                    )
+                {
+                    return Err(format!(
+                        "channel runtime transcript deletion did not settle: {:?}",
+                        deleted.status
+                    ));
+                }
+            } else {
+                conversation_store
+                    .delete_conversation(runtime_state_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(receipt.checkpoint_removed)
     }
 
     fn session_fingerprint(channel_id: &str, chat_id: &str, sender_id: &str) -> String {

@@ -33,8 +33,12 @@ pub enum ConversationDeletionError {
     StoreUnavailable,
     #[error("conversation not found: {0}")]
     NotFound(String),
+    #[error("conversation already exists: {0}")]
+    AlreadyExists(String),
     #[error("conversation {0} is blocked by a pending aggregate deletion")]
     DeletionPending(String),
+    #[error("conversation {0} is blocked by a pending workspace handoff")]
+    HandoffPending(String),
     #[error("conversation {0} reappeared after its aggregate deletion was committed")]
     CommittedIdentityReappeared(String),
     #[error(
@@ -122,13 +126,15 @@ enum DeletionStep {
     Conversation,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeletionTombstone {
     schema_version: u32,
     conversation_id: String,
     created_at_ms: u64,
     completed: BTreeSet<DeletionStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_delete: Option<echo_agent::memory::ManagedConversationDelete>,
 }
 
 impl DeletionTombstone {
@@ -138,8 +144,113 @@ impl DeletionTombstone {
             conversation_id: conversation_id.to_string(),
             created_at_ms: echo_agent::utils::time::now_millis(),
             completed: BTreeSet::new(),
+            managed_delete: None,
         }
     }
+}
+
+async fn prepare_managed_delete(
+    store: &dyn ConversationStore,
+    conversation_id: &str,
+) -> Result<echo_agent::memory::ManagedConversationDelete, ConversationDeletionError> {
+    let authority = match store
+        .get_projection_authority(conversation_id)
+        .await
+        .map_err(|error| ConversationDeletionError::ConversationStore(error.to_string()))?
+    {
+        Some(authority) => authority,
+        None => {
+            let conversation = store
+                .get_conversation(conversation_id)
+                .await
+                .map_err(|error| ConversationDeletionError::ConversationStore(error.to_string()))?
+                .ok_or_else(|| ConversationDeletionError::NotFound(conversation_id.to_string()))?;
+            store
+                .ensure_projection_epoch(echo_agent::memory::EnsureConversationProjectionRequest {
+                    conversation: NewConversation {
+                        conversation_id: conversation.conversation_id,
+                        user_id: conversation.user_id,
+                        agent_type: conversation.agent_type,
+                        title: conversation.title,
+                    },
+                    expected_tombstone_epoch: None,
+                })
+                .await
+                .map_err(|error| ConversationDeletionError::ConversationStore(error.to_string()))?
+                .authority
+        }
+    };
+    if authority.lifecycle != echo_agent::memory::ConversationProjectionLifecycle::Live {
+        return Err(ConversationDeletionError::AmbiguousAuthorityCommit(
+            conversation_id.to_string(),
+        ));
+    }
+    echo_agent::memory::ManagedConversationDelete::prepare(conversation_id, authority.epoch)
+        .map_err(|error| ConversationDeletionError::ConversationStore(error.to_string()))
+}
+
+async fn delete_runtime_transcripts(
+    store: &dyn ConversationStore,
+    root_conversation_id: &str,
+    runtime_state_ids: &[String],
+) -> Result<(), ConversationDeletionError> {
+    for runtime_id in runtime_state_ids {
+        if runtime_id == root_conversation_id {
+            continue;
+        }
+        let authority = store
+            .get_projection_authority(runtime_id)
+            .await
+            .map_err(|error| ConversationDeletionError::ConversationStore(error.to_string()))?;
+        if let Some(authority) = authority {
+            let delete =
+                echo_agent::memory::ManagedConversationDelete::prepare(runtime_id, authority.epoch)
+                    .map_err(|error| {
+                        ConversationDeletionError::ConversationStore(error.to_string())
+                    })?;
+            let operation_id = delete.operation_id.clone();
+            let receipt = store
+                .delete_managed_conversation(delete)
+                .await
+                .map_err(|error| ConversationDeletionError::ConversationStore(error.to_string()))?;
+            if receipt.operation_id != operation_id
+                || !matches!(
+                    receipt.status,
+                    echo_agent::memory::ManagedConversationDeleteStatus::Deleted
+                        | echo_agent::memory::ManagedConversationDeleteStatus::AlreadyDeleted
+                )
+            {
+                return Err(ConversationDeletionError::ConversationStore(format!(
+                    "managed runtime transcript deletion did not settle: {:?}",
+                    receipt.status
+                )));
+            }
+        } else {
+            store
+                .delete_conversation(runtime_id)
+                .await
+                .map_err(|error| ConversationDeletionError::ConversationStore(error.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn require_managed_retirement_complete(
+    deleted: &echo_agent::state::PersistedConversationDeleteReceipt,
+) -> Result<(), ConversationDeletionError> {
+    if let Some(retirement) = deleted.retirement.as_ref()
+        && !matches!(
+            retirement.status,
+            echo_agent::state::ScopeRetirementStatus::Completed
+                | echo_agent::state::ScopeRetirementStatus::AlreadyCompleted
+        )
+    {
+        return Err(ConversationDeletionError::RuntimeState(format!(
+            "managed conversation retirement did not settle: {:?}",
+            retirement.status
+        )));
+    }
+    Ok(())
 }
 
 fn authority_commit_started(tombstone: &DeletionTombstone) -> bool {
@@ -171,6 +282,7 @@ struct DeletionTestBarrier {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DeletionIoFault {
     CreateRootBarrier,
+    InitialTombstone,
     RemoveFileBarrier,
 }
 
@@ -298,6 +410,11 @@ impl ConversationDeletionService {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_initial_tombstone_for_test(&self) {
+        self.fail_next_io(DeletionIoFault::InitialTombstone);
+    }
+
+    #[cfg(test)]
     fn take_io_fault(&self, expected: DeletionIoFault) -> bool {
         let mut fault = self
             .io_fault
@@ -383,7 +500,18 @@ impl ConversationDeletionService {
         conversation: NewConversation,
         workspace: Option<crate::state::ScopedWorkspaceIoReceipt>,
     ) -> Result<Conversation, ConversationDeletionError> {
-        self.write_conversation(store, conversation, false, workspace)
+        self.write_conversation(store, conversation, false, workspace, |_| Ok(()))
+            .await
+    }
+
+    pub(crate) async fn create_conversation_guarded(
+        &self,
+        store: &dyn ConversationStore,
+        conversation: NewConversation,
+        workspace: Option<crate::state::ScopedWorkspaceIoReceipt>,
+        guard: impl FnOnce(&str) -> Result<(), ConversationDeletionError>,
+    ) -> Result<Conversation, ConversationDeletionError> {
+        self.write_conversation(store, conversation, false, workspace, guard)
             .await
     }
 
@@ -393,7 +521,18 @@ impl ConversationDeletionService {
         conversation: NewConversation,
         workspace: Option<crate::state::ScopedWorkspaceIoReceipt>,
     ) -> Result<Conversation, ConversationDeletionError> {
-        self.write_conversation(store, conversation, true, workspace)
+        self.write_conversation(store, conversation, true, workspace, |_| Ok(()))
+            .await
+    }
+
+    pub(crate) async fn ensure_conversation_guarded(
+        &self,
+        store: &dyn ConversationStore,
+        conversation: NewConversation,
+        workspace: Option<crate::state::ScopedWorkspaceIoReceipt>,
+        guard: impl FnOnce(&str) -> Result<(), ConversationDeletionError>,
+    ) -> Result<Conversation, ConversationDeletionError> {
+        self.write_conversation(store, conversation, true, workspace, guard)
             .await
     }
 
@@ -424,11 +563,36 @@ impl ConversationDeletionService {
         turn_id: impl Into<String>,
         workspace: Option<crate::state::ScopedWorkspaceIoReceipt>,
     ) -> Result<ForegroundTurnLease, ConversationDeletionError> {
+        self.begin_foreground_turn_scoped_guarded(
+            foreground_turns,
+            workspace_id,
+            surface,
+            conversation_id,
+            turn_id,
+            workspace,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    // The product guard must run under the same identity lock as foreground registration.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn begin_foreground_turn_scoped_guarded(
+        &self,
+        foreground_turns: &ForegroundTurnControl,
+        workspace_id: &str,
+        surface: ForegroundTurnSurface,
+        conversation_id: &str,
+        turn_id: impl Into<String>,
+        workspace: Option<crate::state::ScopedWorkspaceIoReceipt>,
+        guard: impl FnOnce(&str) -> Result<(), ConversationDeletionError>,
+    ) -> Result<ForegroundTurnLease, ConversationDeletionError> {
         let conversation_id = validated_id(conversation_id)?.to_string();
         let registration = self.lock_registration(&conversation_id);
         let _identity_lock = registration.lock.lock().await;
         self.ensure_admission_allowed(&conversation_id, workspace)
             .await?;
+        guard(&conversation_id)?;
         foreground_turns
             .begin_scoped(workspace_id, surface, conversation_id, turn_id)
             .map_err(ConversationDeletionError::Foreground)
@@ -524,6 +688,7 @@ impl ConversationDeletionService {
                         context.artifact_config.clone(),
                         context.workspace_io_receipt.clone(),
                         identity,
+                        None,
                     )
                     .await
                 {
@@ -638,18 +803,69 @@ impl ConversationDeletionService {
         conversation: NewConversation,
         ensure: bool,
         workspace: Option<crate::state::ScopedWorkspaceIoReceipt>,
+        guard: impl FnOnce(&str) -> Result<(), ConversationDeletionError>,
     ) -> Result<Conversation, ConversationDeletionError> {
         let conversation_id = validated_id(&conversation.conversation_id)?.to_string();
         let registration = self.lock_registration(&conversation_id);
         let _identity_lock = registration.lock.lock().await;
         self.ensure_admission_allowed(&conversation_id, workspace)
             .await?;
-        let result = if ensure {
+        guard(&conversation_id)?;
+        if store.projection_capability()
+            == echo_agent::memory::ConversationProjectionCapability::AtomicV1
+        {
+            if !ensure
+                && store
+                    .get_conversation(&conversation_id)
+                    .await
+                    .map_err(|error| {
+                        ConversationDeletionError::ConversationStore(error.to_string())
+                    })?
+                    .is_some()
+            {
+                return Err(ConversationDeletionError::ConversationStore(format!(
+                    "conversation '{conversation_id}' already exists"
+                )));
+            }
+            let receipt = store
+                .ensure_projection_epoch(echo_agent::memory::EnsureConversationProjectionRequest {
+                    conversation,
+                    expected_tombstone_epoch: None,
+                })
+                .await
+                .map_err(|error| ConversationDeletionError::ConversationStore(error.to_string()))?;
+            let admitted = if ensure {
+                matches!(
+                    receipt.status,
+                    echo_agent::memory::ConversationProjectionEpochStatus::Created
+                        | echo_agent::memory::ConversationProjectionEpochStatus::AdoptedLegacy
+                        | echo_agent::memory::ConversationProjectionEpochStatus::Existing
+                )
+            } else {
+                receipt.status == echo_agent::memory::ConversationProjectionEpochStatus::Created
+            };
+            if !admitted {
+                return Err(ConversationDeletionError::ConversationStore(format!(
+                    "conversation projection epoch did not settle: {:?}",
+                    receipt.status
+                )));
+            }
+            return store
+                .get_conversation(&conversation_id)
+                .await
+                .map_err(|error| ConversationDeletionError::ConversationStore(error.to_string()))?
+                .ok_or_else(|| {
+                    ConversationDeletionError::ConversationStore(format!(
+                        "conversation '{conversation_id}' is absent after projection admission"
+                    ))
+                });
+        }
+        if ensure {
             store.ensure_conversation(conversation).await
         } else {
             store.create_conversation(conversation).await
-        };
-        result.map_err(|error| ConversationDeletionError::ConversationStore(error.to_string()))
+        }
+        .map_err(|error| ConversationDeletionError::ConversationStore(error.to_string()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -672,6 +888,7 @@ impl ConversationDeletionService {
         let identity = self.acquire_identity(conversation_id).await?;
         self.delete_with_identity(
             identity,
+            None,
             workspace_id,
             conversation_id,
             conversation_store,
@@ -693,6 +910,7 @@ impl ConversationDeletionService {
     pub(crate) async fn delete_with_identity(
         &self,
         identity: ConversationIdentityGuard,
+        suspension: Option<crate::foreground_turn::ForegroundConversationSuspension>,
         workspace_id: &str,
         conversation_id: &str,
         conversation_store: Option<Arc<dyn ConversationStore>>,
@@ -739,6 +957,7 @@ impl ConversationDeletionService {
                     artifact_config,
                     workspace_io_receipt,
                     identity,
+                    suspension,
                 )
                 .await;
             let durable_failure = result
@@ -780,9 +999,13 @@ impl ConversationDeletionService {
         artifact_config: Option<ToolOutputArtifactConfig>,
         workspace_io_receipt: crate::state::ScopedWorkspaceIoReceipt,
         _identity: ConversationIdentityGuard,
+        suspension: Option<crate::foreground_turn::ForegroundConversationSuspension>,
     ) -> Result<ConversationDeletionReceipt, ConversationDeletionError> {
-        let _foreground_suspension = foreground_turns
-            .suspend_conversation_admission_if_idle_scoped(&workspace_id, &conversation_id)?;
+        let _foreground_suspension = match suspension {
+            Some(suspension) => suspension,
+            None => foreground_turns
+                .suspend_conversation_admission_if_idle_scoped(&workspace_id, &conversation_id)?,
+        };
         let tombstone_path = self.tombstone_path(&conversation_id);
         let load_path = tombstone_path.clone();
         let load_id = conversation_id.clone();
@@ -967,6 +1190,23 @@ impl ConversationDeletionService {
         let store = conversation_store
             .as_ref()
             .ok_or(ConversationDeletionError::StoreUnavailable)?;
+        if runtime_state.is_some()
+            && store.projection_capability()
+                == echo_agent::memory::ConversationProjectionCapability::AtomicV1
+            && tombstone.managed_delete.is_none()
+        {
+            tombstone.managed_delete =
+                Some(prepare_managed_delete(store.as_ref(), &conversation_id).await?);
+            let prepared = tombstone.clone();
+            let prepared_path = tombstone_path.clone();
+            self.run_io(
+                DeletionIo::Flow(flow),
+                Some(workspace_io_receipt.clone()),
+                "persist managed conversation delete identity",
+                move |service| service.persist_tombstone(&prepared_path, &prepared),
+            )
+            .await?;
+        }
         self.complete_step_io(
             DeletionIo::Flow(flow),
             Some(workspace_io_receipt.clone()),
@@ -977,13 +1217,32 @@ impl ConversationDeletionService {
         .await?;
         match runtime_state.as_deref() {
             Some(runtime_state) => {
-                echo_agent::state::delete_persisted_conversation(
-                    store.as_ref(),
-                    runtime_state,
-                    &conversation_id,
-                )
-                .await
+                let deleted = match tombstone.managed_delete.clone() {
+                    Some(delete) => {
+                        echo_agent::state::delete_persisted_conversation_managed(
+                            store.as_ref(),
+                            runtime_state,
+                            delete,
+                        )
+                        .await
+                    }
+                    None => {
+                        echo_agent::state::delete_persisted_conversation(
+                            store.as_ref(),
+                            runtime_state,
+                            &conversation_id,
+                        )
+                        .await
+                    }
+                }
                 .map_err(|error| ConversationDeletionError::RuntimeState(error.to_string()))?;
+                require_managed_retirement_complete(&deleted)?;
+                delete_runtime_transcripts(
+                    store.as_ref(),
+                    &conversation_id,
+                    &deleted.runtime_state_ids,
+                )
+                .await?;
             }
             None => {
                 store
@@ -1063,13 +1322,28 @@ impl ConversationDeletionService {
         }
         match runtime_state {
             Some(runtime_state) => {
-                echo_agent::state::delete_persisted_conversation(
-                    store,
-                    runtime_state,
-                    conversation_id,
-                )
-                .await
+                let deleted = match tombstone.managed_delete.clone() {
+                    Some(delete) => {
+                        echo_agent::state::delete_persisted_conversation_managed(
+                            store,
+                            runtime_state,
+                            delete,
+                        )
+                        .await
+                    }
+                    None => {
+                        echo_agent::state::delete_persisted_conversation(
+                            store,
+                            runtime_state,
+                            conversation_id,
+                        )
+                        .await
+                    }
+                }
                 .map_err(|error| ConversationDeletionError::RuntimeState(error.to_string()))?;
+                require_managed_retirement_complete(&deleted)?;
+                delete_runtime_transcripts(store, conversation_id, &deleted.runtime_state_ids)
+                    .await?;
             }
             None if conversation_visible => {
                 return Err(ConversationDeletionError::AmbiguousAuthorityCommit(
@@ -1263,6 +1537,13 @@ impl ConversationDeletionService {
         path: &Path,
         tombstone: &DeletionTombstone,
     ) -> Result<(), ConversationDeletionError> {
+        #[cfg(test)]
+        if tombstone.completed.is_empty() && self.take_io_fault(DeletionIoFault::InitialTombstone) {
+            return Err(ConversationDeletionError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("injected initial tombstone persistence failure"),
+            });
+        }
         self.ensure_tombstone_root()?;
         let bytes = serde_json::to_vec(tombstone).map_err(|error| {
             ConversationDeletionError::CorruptTombstone {
@@ -1512,6 +1793,41 @@ mod tests {
         Ok(Arc::new(FileConversationStore::new(root)?))
     }
 
+    #[tokio::test]
+    async fn managed_conversation_ensure_is_repeatable_after_epoch_admission()
+    -> Result<(), Box<dyn Error>> {
+        let temp = tempfile::tempdir()?;
+        let store = file_store(&temp.path().join("conversations"))?;
+        let service = ConversationDeletionService::new(temp.path().join("deletions"));
+        let first = service
+            .ensure_conversation(store.as_ref(), conversation("repeated"), None)
+            .await?;
+        let before = store
+            .get_projection_authority("repeated")
+            .await?
+            .ok_or_else(|| {
+                std::io::Error::other("managed projection missing after first ensure")
+            })?;
+        let second = service
+            .ensure_conversation(store.as_ref(), conversation("repeated"), None)
+            .await?;
+        let after = store
+            .get_projection_authority("repeated")
+            .await?
+            .ok_or_else(|| {
+                std::io::Error::other("managed projection missing after second ensure")
+            })?;
+        assert_eq!(first.conversation_id, second.conversation_id);
+        assert_eq!(before.epoch, after.epoch);
+        assert!(
+            service
+                .create_conversation(store.as_ref(), conversation("repeated"), None)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
     fn router_context(
         root: &Path,
     ) -> (
@@ -1727,6 +2043,7 @@ mod tests {
             .await?;
         let path = service.tombstone_path(id);
         let mut tombstone = DeletionTombstone::new(id);
+        tombstone.managed_delete = Some(prepare_managed_delete(store.as_ref(), id).await?);
         tombstone
             .completed
             .insert(DeletionStep::ConversationCommitStarted);
@@ -1746,7 +2063,17 @@ mod tests {
         assert!(store.get_conversation(id).await?.is_none());
         assert!(store.get_conversation(runtime_id).await?.is_none());
         assert!(runtime_state.get_checkpoint(runtime_id).await?.is_none());
-        assert!(runtime_state.runtime_state_ids(id).await?.is_empty());
+        assert_eq!(
+            runtime_state.runtime_state_ids(id).await?,
+            vec![runtime_id.to_string()]
+        );
+        assert!(matches!(
+            runtime_state
+                .load_scope_authority(id)
+                .await?
+                .map(|scope| scope.lifecycle),
+            Some(echo_agent::state::RuntimeScopeLifecycle::Tombstoned)
+        ));
         assert!(!path.exists());
         Ok(())
     }
@@ -2181,7 +2508,20 @@ mod tests {
             assert!(store.get_conversation(runtime_id).await?.is_none());
             assert!(pool.lease_existing(runtime_id).await?.is_none());
         }
-        assert!(runtime_state.runtime_state_ids(id).await?.is_empty());
+        assert_eq!(
+            runtime_state.runtime_state_ids(id).await?,
+            runtime_ids
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            runtime_state
+                .load_scope_authority(id)
+                .await?
+                .map(|scope| scope.lifecycle),
+            Some(echo_agent::state::RuntimeScopeLifecycle::Tombstoned)
+        ));
         assert!(router.records(&inbox_target).await?.is_empty());
         assert!(!tool_artifact.path.exists());
         assert!(!user_input.exists());

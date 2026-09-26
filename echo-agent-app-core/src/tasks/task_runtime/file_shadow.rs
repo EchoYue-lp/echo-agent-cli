@@ -1338,7 +1338,7 @@ mod tests {
                         .map_err(|error| error.to_string())?
                         .ok_or_else(|| "checkpoint missing".to_string())?;
                     store
-                        .save(&frame.state, 999)
+                        .save(&frame.journal_identity, &frame.state, 999)
                         .map_err(|error| error.to_string())?;
                 }
                 "behind" => {}

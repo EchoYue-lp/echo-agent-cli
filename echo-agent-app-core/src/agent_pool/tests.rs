@@ -365,7 +365,7 @@ mod tests {
                         .load_messages(vec![echo_agent::llm::types::Message::user(
                             "incarnation-a history".to_string(),
                         )])
-                        .await;
+                        .await?;
                     agent.force_checkpoint().await
                 })
             })
@@ -1378,7 +1378,8 @@ mod tests {
         let primary_manager = manager_a.clone();
         primary
             .write(|agent| agent.install_memory_layer_manager(primary_manager))
-            .await;
+            .await
+            .map_err(|error| error.to_string())?;
         let pool = AgentPool::new_for_test(
             primary.clone(),
             Some(integration_a.clone()),

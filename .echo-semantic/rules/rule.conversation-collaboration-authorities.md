@@ -7,9 +7,9 @@ expectation: human_confirmed
 risk: high
 primary_focus: state_authority
 focus: [data_durability, time_lifecycle, failure_concurrency, contract_evidence]
-observed_at: source:87791a9dc0b2bb4484fff726fea064bd943e080f4f0e97b74d9d5821442c1e9a
+observed_at: source:caa0bf81fcda8d046037a8a1065adc31b7bb0652059b4e4c8e975d8831e26fc0
 behavior_refs: [behavior.side-conversation-lifecycle]
-code_refs: [echo-agent-app-core/src/state/config.rs, echo-agent-app-core/src/agent_router/router.rs, echo-agent-app-core/src/conversation_input.rs, echo-agent-app-core/src/foreground_turn.rs, echo-agent-app-core/src/conversation_deletion.rs, src/tauri/commands/conversations.rs, src/tauri/commands/chat.rs]
+code_refs: [echo-agent-app-core/src/state/config.rs, echo-agent-app-core/src/agent_router/router.rs, echo-agent-app-core/src/conversation_archive.rs, echo-agent-app-core/src/managed_conversation.rs, echo-agent-app-core/src/conversation_input.rs, echo-agent-app-core/src/foreground_turn.rs, echo-agent-app-core/src/conversation_deletion.rs, echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/state/workspace.rs, src/tauri/commands/conversations.rs, src/tauri/commands/chat.rs]
 evidence_refs: [evidence.side-conversation-preflight]
 finding_refs: []
 ---
@@ -18,7 +18,7 @@ finding_refs: []
 
 ## 不变量或唯一权威
 
-ConversationStore 是 transcript 权威，AgentRouter 是 Conversation inbox/group 权威，ConversationInputService 是 durable input frontier，ForegroundTurnControl 是活跃 turn admission/cancel 权威，ChatEventLog 是普通对话事件权威。
+ConversationStore 是 transcript 权威，AgentRouter 是 Conversation inbox/group 权威，ConversationInputService 是 durable input frontier，ForegroundTurnControl 是活跃 turn admission/cancel 权威，ChatEventLog 是普通对话事件权威；EKO conversation archive 只持有界面可见性与跨工作区交接事实，不改写 transcript。
 
 ## 适用行为
 

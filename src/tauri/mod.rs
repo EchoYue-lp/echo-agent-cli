@@ -264,6 +264,7 @@ pub fn build_tauri_app(
             commands::research::audit_systematic_review,
             commands::research::export_systematic_review,
             commands::panels::review_run,
+            commands::panels::get_review_receipt,
             commands::panels::list_evidence_candidates,
             commands::panels::evidence_candidate_action,
             commands::panels::curator_action,

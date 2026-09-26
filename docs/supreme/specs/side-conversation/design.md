@@ -45,9 +45,9 @@ EKO 的主对话承担长期目标、任务编排和用户持续交互。用户�
 
 ## 主 Agent 与支线通信
 
-- 主 Agent 与 Side Conversation 通过既有 `AgentRouter` Conversation 地址和 durable inbox 双向收发消息，不把通信包装成用户 transcript，也不新建 mailbox。
+- 主 Agent 与 Side Conversation 通过既有 `AgentRouter` Conversation 地址和 durable inbox 双向收发消息，不把内部投递伪装成用户指令，也不新建 mailbox。模型 canonical transcript 保留已执行的内部 turn；GUI 可见性由既有 conversation visibility 投影按精确消息 ID 决定。
 - 主 Agent 发往支线的消息在支线中作为来源明确的内部指令呈现；用户可查看其内容和投递状态。
-- 支线发回主 Agent 的内部消息默认不插入主对话时间线，以免制造噪音；左侧支线条目或主对话 header 只显示有界的未读/需关注状态。用户显式打开支线后可查看完整内容。
+- 支线发回主 Agent 的内部消息默认不出现在主 GUI 时间线，以免制造噪音；它仍属于主 Agent 的模型历史。左侧支线条目或主对话 header 只显示有界的未读/需关注状态，用户显式打开支线可查看完整内容。
 - Side Conversation 的最终回答不会因为 turn 完成而自动回传主对话。需要主 Agent 消费时，由主 Agent/支线显式调用既有消息能力，或由用户执行显式“发送给主对话”动作；两者都生成可追踪投递回执。
 
 ## GUI 交互与 surface 边界
@@ -84,7 +84,7 @@ EKO 的主对话承担长期目标、任务编排和用户持续交互。用户�
 
 ## 通用机制
 
-`echo-agent` 继续拥有 ConversationStore trait、FileConversationStore、Agent/Subagent 基础运行、消息与事件原语。Side Conversation 不要求 framework 理解 EKO 的左侧任务树、主对话隐藏 inbox、模型选择控件或产品父子关系，因此本设计不新增 framework 类型、字段、store 或状态机。
+`echo-agent` 继续拥有 ConversationStore trait、FileConversationStore、Agent/Subagent 基础运行、消息与事件原语。Side 专属左侧树、主对话 GUI 隐藏规则、模型选择和父子关系不进入 framework；框架为所有消费者提供的 managed import generation 与 checkpoint CAS 另见 framework ADR 0080。
 
 ## EKO 产品策略
 
@@ -102,10 +102,11 @@ Tauri 是 Side Conversation 唯一 surface adapter，只调用 app-core Side Con
 
 # 核心结构与数据流
 
-Side Conversation 使用两类既有权威组合，而不是新建聚合 store：
+Side Conversation 组合既有权威与一个已有的 EKO UI 投影文件，而不是新建 Agent runtime 或 transcript store：
 
 1. ConversationStore/FileConversationStore：Side Conversation 自身 metadata 与 committed transcript。
 2. AgentRouter AgentGroup/inbox：主对话 leader、Side Conversation member、模型/展示元数据和双向内部消息。
+3. Conversation visibility（既有 archive 文件）：内部投递 effect 前 intent 与结算后的精确 transcript 消息 ID；只影响 GUI 可见性，不拥有消息内容或投递结果。
 
 稳定地址是 `(workspace_id, conversation_id)`；父子关系以 group leader/member 表达。运行中 turn 继续使用 `(workspace_id, conversation_id, root_turn_id, active_turn_id)` 精确寻址；TaskRun/SubagentRun identity 不参与 Side Conversation 的普通 turn 取消。
 
@@ -132,7 +133,7 @@ flowchart LR
 
 恢复的数据流：
 
-- ConversationStore 恢复 transcript，AgentRouter 恢复 group 与 inbox，列表服务按 leader/member 投影父子树；
+- ConversationStore 恢复 transcript，AgentRouter 恢复 group 与 inbox，列表服务按 leader/member 投影父子树；visibility intent 在 GUI 读取前以 Router 的保留前沿、Store epoch 与精确消息行核对，证据不全则拒绝误投影。新内部投递先结算 visibility，再写 Router terminal，避免依赖会淘汰的 terminal 记录；
 - 打开支线时按 child conversation ID 恢复 Agent 和 ChatEventLog；首轮 user message 在 snapshot boundary 之后按持久 initial prompt 重建稳定 GUI message identity，快速完成或响应丢失重试不会重复显示；无法解析的 group member 显示为可清理的 degraded relation，不把其消息附到其它 conversation；
 - 未完成输入和 active turn 使用现有 durable frontier/foreground reconciliation，不创建 Side Conversation 专属恢复状态机。
 
@@ -169,7 +170,7 @@ EKO 有意不同：
 
 - Side Conversation 是长期可寻址的普通 conversation entity，用户可从左侧任务树反复打开，而不是只在运行面板中临时观察一个 dispatch；
 - 只继承 committed transcript 快照，不承诺复制未提交的流式增量；
-- 不自动把最终结果送回主 transcript，内部通信走隐藏 inbox，回传必须显式发生；
+- 不自动把最终结果送回主对话时间线；内部通信走既有 inbox，回传必须显式发生，执行后的内部 turn 仍在模型 canonical transcript；
 - 默认不创建 worktree，不把本地代码隔离绑定为聊天功能前提；
 - 不增加权限模式门控。一级深度限制是产品拓扑，不是本地安全策略。
 - 不在 TUI、CLI/JSONL 或 channel 暴露 Side Conversation；这些 surface 的普通会话与 Subagent 能力不受影响。
@@ -204,7 +205,7 @@ Side Conversation 的长期内容就是 conversation transcript。新增 store �
 
 ## AgentRouter inbox，而不是主 transcript 自动回写
 
-内部消息本来就有独立持久 inbox 和投递回执。复用它既满足主 Agent 双向通信，也避免把内部协调文本伪装成用户/assistant 历史。
+内部消息本来就有独立持久 inbox 和投递回执。复用它承担投递事实；已执行 turn 留在 ConversationStore 供模型恢复，已有 conversation visibility 文件仅保存 GUI 来源 intent/精确行 ID。主 GUI 隐藏这些行，Side GUI 标注；相同文本用户 turn 不会因内容匹配被误判。
 
 ## App-core 单一服务，而不是前端自建状态权威
 
@@ -229,11 +230,11 @@ Side Conversation 虽然只由 GUI 使用，仍涉及快照、删除、恢复和
 3. 主对话与多个支线可并发运行；任一支线的发送、队列和取消均按 exact conversation/turn identity 隔离，不影响其它对话；relation create 到首轮 foreground admission 之间不存在删除窗口。
 4. 左侧导航稳定呈现 Workspace -> 主对话 -> Side Conversation 层级；状态轮询不取消 transcript load，当前可见支线完成后不产生伪未读；并发 model/launch error/title/viewed 更新不互相覆盖；重启、切换 Workspace 和重新打开后父子关系不丢失、不串线。
 5. 打开支线可查看完整 Agent 时间线并继续多 turn 对话；模型修改只影响该支线后续 turn。
-6. 主 Agent 与支线可通过既有 AgentRouter 双向发送消息并获得 typed receipt；内部消息默认不插入主 transcript，支线最终回答不自动回写。
+6. 主 Agent 与支线可通过既有 AgentRouter 双向发送消息并获得 typed receipt；内部消息默认不显示在主 GUI 时间线，但保留在模型 canonical transcript，支线最终回答不自动回写。
 7. Side Conversation 不能创建嵌套 Side Conversation；GUI 隐藏创建入口，Tauri 只转发 typed request，app-core admission 在创建副作用前拒绝支线 parent。child 的普通 Task、Subagent 与工具能力不因此被禁用。
 8. 支线可重命名、更新、取消和删除；删除 child 不改变 parent，删除 parent 时明确展示并执行支线级联范围，失败返回可恢复 cleanup 状态。
 9. Side Conversation 只由 GUI/Tauri 暴露；仓库搜索与测试证明 TUI、CLI/JSONL、channel 没有 Side Conversation 专用命令、事件、帮助文本或 wire contract，且原有普通 `/fork` 行为保持不变。
-10. 没有新增 SQLite 依赖、关系表、SideConversationStore、第二 mailbox、第二 chat event log、第二 Agent executor 或并行 fork 状态机。
+10. 没有新增 SQLite 依赖、关系表、SideConversationStore、第二 mailbox、第二 chat event log、第二 Agent executor 或并行 fork 状态机；来源 ID 复用已有 EKO visibility 文件，不作为第二 transcript 权威。
 11. 现有 GUI 编辑/重新生成分支与 TUI `/fork` 不发布 Side Conversation 父子关系；它们作为不同用户意图的既有行为继续保留，并由回归测试证明未被 Side Conversation 改写。
 12. Rust focused tests覆盖快照截止、幂等创建、一级限制、投递失败、首轮 identity 恢复、metadata 并发 mutation、精确取消、删除级联和重启恢复；前端测试覆盖入口、快速完成/响应丢失去重、树投影、模型选择、状态/未读、workspace 隔离和无重叠布局；所有适用仓库门禁通过。
 13. 正式 ADR、产品文档与 GUI 帮助/契约同步；非 GUI surface 无 Side Conversation 文案，examples 与 website 的适用性检查有明确结论。
