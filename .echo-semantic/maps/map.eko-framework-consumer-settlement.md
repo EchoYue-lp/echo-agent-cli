@@ -76,7 +76,7 @@ GUI Review 显示 `persisted` 的 true/false/unknown 状态并返回 operation I
 
 ## 场景处置清单
 
-上述五类场景已映射源码、ADR、Rule 和工程测试；独立复审与远端 CI 未完成前，新增 Behavior/Rule 保持 needs_review。
+上述五类场景已映射源码、ADR、Rule 和工程测试，并通过独立复审；CLI 最终远端 CI 与主分支交付仍需单独结算。
 
 ## 未展开项
 

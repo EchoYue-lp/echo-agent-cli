@@ -64,7 +64,7 @@ coverage: []
 
 ## 未知与缺口
 
-Side Conversation 的 GUI/Tauri、app-core 和文件权威闭合已补充当前快照故障注入及独立复审。本地全量 Rust、GUI 和前端门禁已有候选证据；framework PR #174 虽然 CI 全绿，远端 main/CLI CI 和 Issue #38 关闭仍未完成。
+Side Conversation 的 GUI/Tauri、app-core 和文件权威闭合已补充当前快照故障注入及独立复审。本地全量 Rust、GUI 和前端门禁已有候选证据；framework PR #174 已 squash merge 至签名的 `1927a5fc`，其 Git tree 与已验证候选相同。CLI 远端 CI、CLI/main 交付和 Issue #38 关闭仍未完成。
 
 ## 闭合结论
 

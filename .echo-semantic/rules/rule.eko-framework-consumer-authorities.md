@@ -34,7 +34,7 @@ EKO 使用同一 generation-bound Review owner；Skill 使用框架 preview/appr
 
 ## 证据
 
-EKO ADR 0043-0046、框架 ADR 0058/0065/0069、定向故障注入、全 workspace 测试与 Clippy/GUI/前端门禁构成当前源码证据，远端 CI 与独立 Review 仍待完成。
+EKO ADR 0043-0046、框架 ADR 0058/0065/0069、定向故障注入、全 workspace 测试与 Clippy/GUI/前端门禁构成当前源码证据。独立 Review 已通过；CLI 最终远端 CI 与主分支交付仍待完成。
 
 ## 裁决记录
 

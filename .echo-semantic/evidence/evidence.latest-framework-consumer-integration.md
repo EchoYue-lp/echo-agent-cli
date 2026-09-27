@@ -61,8 +61,8 @@ source_refs:
   - web-frontend/src/components/evolution/EvolutionPanel.tsx
 supports: [behavior.background-review-caller-owned-settlement, rule.eko-framework-consumer-authorities]
 limitations:
-  - framework PR 174 虽然 7 项 CI 全绿但仍 OPEN，CLI 依赖的 remote main 尚未包含新合同
-  - echo-agent Issue 38 仍 OPEN，跨仓库主分支与最终 CI 尚未结算
+  - framework PR 174 已合并且签名有效；CLI 最终远端 CI、CLI/main 和顶层指针尚未结算
+  - echo-agent Issue 38 仍 OPEN，应用主分支与最终 CI 尚未结算
   - 本地 GUI feature 与前端测试通过，真实 Tauri 窗口视觉验收尚未执行
 ---
 
@@ -70,7 +70,7 @@ limitations:
 
 ## 支持的结论
 
-CLI 使用本工作区 framework 候选 `15c053c0f7c56fa0156466f876779fcc64e9c68b` 编译并运行；它已推送至 PR #174，尚未进入 framework main。Background Review 的 lazy handle 在 poll 前写 admission，owner 持有 generation、监督取消和 shutdown；outcome、Inbox、terminal 按顺序持久化，重启重放或记录中断与 Memory 效果归因。GUI-only Side Conversation 的入口与非 GUI 边界仍按 ADR 0042。
+CLI 使用本工作区 framework 候选 `15c053c0f7c56fa0156466f876779fcc64e9c68b` 编译并运行；PR #174 已 squash merge 为签名有效的 framework main `1927a5fc6783770f97d2d95cb24600c2f4cddfba`，两个提交的 Git tree 相同。Background Review 的 lazy handle 在 poll 前写 admission，owner 持有 generation、监督取消和 shutdown；outcome、Inbox、terminal 按顺序持久化，重启重放或记录中断与 Memory 效果归因。GUI-only Side Conversation 的入口与非 GUI 边界仍按 ADR 0042。
 
 ## 来源与范围
 
@@ -89,4 +89,4 @@ CLI 使用本工作区 framework 候选 `15c053c0f7c56fa0156466f876779fcc64e9c68
 
 ## 已知缺口
 
-这些命令仅证明本地候选工作树。Framework PR #174 的 7 项 CI 全绿且仍 OPEN；CLI CI、两个 MR 合并后的 exact main 和 Issue #38 远端关闭尚未结算，不得将本证据读成已经交付主分支。
+这些命令仅证明本地 CLI 候选工作树。Framework PR #174 的 7 项 CI 全绿，签名 squash 提交的 Git tree 与候选相同；CLI CI、CLI 与顶层 MR 合并后的 exact main 和 Issue #38 远端关闭尚未结算，不得将本证据读成 EKO 已交付主分支。
