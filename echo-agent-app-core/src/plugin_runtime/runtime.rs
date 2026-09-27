@@ -734,8 +734,10 @@ impl PluginRuntimeService {
         let previous_framework_receipt = state.framework_receipt.take();
         let previous_mcp_ownership = std::mem::take(&mut state.mcp_ownership);
         let mut ownership_guard = self.mcp_ownership.lock().await;
-        if let Some(receipt) = previous_framework_receipt.as_ref() {
-            self.integrator.rollback(&mut primary, receipt).await;
+        if let Some(receipt) = previous_framework_receipt.as_ref()
+            && let Err(error) = self.integrator.rollback(&mut primary, receipt).await
+        {
+            errors.push(format!("framework plugin rollback failed: {error}"));
         }
         unload_application_components(&mut primary, &previous_prepared).await;
         primary
@@ -1061,8 +1063,10 @@ impl PluginRuntimeService {
         self.agent_handle
             .write_async(|agent| {
                 Box::pin(async move {
-                    if let Some(receipt) = previous_framework_receipt.as_ref() {
-                        integrator.rollback(agent, receipt).await;
+                    if let Some(receipt) = previous_framework_receipt.as_ref()
+                        && let Err(error) = integrator.rollback(agent, receipt).await
+                    {
+                        tracing::error!(%error, "framework plugin rollback failed during unload");
                     }
                     unload_application_components(agent, &previous_prepared).await;
                     agent
@@ -1862,87 +1866,69 @@ impl PluginRuntimeService {
                 activation_errors.join("; ")
             )];
             errors.extend(state.lifecycle.deactivate_all());
-
-            let candidate_monitors = applied.prepared.monitors.clone();
-            let previous_monitors = applied.previous_prepared.monitors.clone();
-            let candidate_framework = applied
-                .wiring
-                .as_ref()
-                .map(|receipt| receipt.components_by_plugin.clone())
-                .unwrap_or_default();
-            let rollback = self
-                .replace_agent_components(
-                    &mut primary,
-                    applied.registry,
-                    candidate_framework,
-                    applied.framework_generation,
-                    applied.wiring,
-                    applied.mcp_ownership,
-                    applied.prepared,
-                    applied.previous_registry,
-                    applied.previous_framework_generation,
-                    applied.previous_mcp_declarations,
-                    applied.previous_prepared,
-                )
-                .await;
-            match rollback {
-                Ok(restored) => {
-                    if let Some(scheduler) = scheduler.as_ref()
-                        && let Err(error) = replace_plugin_monitors(
-                            scheduler,
-                            &candidate_monitors,
-                            &previous_monitors,
-                        )
-                        .await
-                    {
-                        errors.push(format!("rollback plugin monitors failed: {error}"));
-                    }
-                    {
-                        let mut current = self.lsp.manager.write().await;
-                        let mut candidate_lsp = std::mem::replace(&mut *current, previous_lsp);
-                        candidate_lsp.shutdown_all().await;
-                    }
-                    state.registry = restored.registry;
-                    state.framework_components = restored
-                        .wiring
-                        .as_ref()
-                        .map(|receipt| receipt.components_by_plugin.clone())
-                        .unwrap_or_default();
-                    state.framework_generation = restored.framework_generation;
-                    state.framework_receipt = restored.wiring;
-                    state.mcp_ownership = restored.mcp_ownership;
-                    state.prepared = restored.prepared;
-                    errors.extend(
-                        state
-                            .lifecycle
-                            .activate_enabled(previous_plugins.iter().map(String::as_str)),
-                    );
-                }
-                Err(failed) => {
-                    errors.push(format!(
-                        "rollback agent components failed: {}",
-                        failed.error
-                    ));
-                    previous_lsp.shutdown_all().await;
-                    state.registry = failed.registry;
-                    state.framework_components = failed.framework_components;
-                    state.framework_generation = failed.framework_generation;
-                    state.framework_receipt = failed.framework_receipt;
-                    state.mcp_ownership = failed.mcp_ownership;
-                    state.prepared = failed.prepared;
-                    errors.extend(
-                        state
-                            .lifecycle
-                            .activate_enabled(candidate_plugins.iter().map(String::as_str)),
-                    );
-                }
+            errors.extend(state.lifecycle.shutdown());
+            if let Some(scheduler) = scheduler.as_ref() {
+                errors.extend(
+                    remove_plugin_monitors_best_effort(scheduler, &applied.prepared.monitors)
+                        .await,
+                );
             }
-            if let Some(publication) = pool_publication.as_mut()
-                && let Err(error) = publication.rollback().await
+            if let Some(receipt) = applied.wiring.as_ref()
+                && let Err(error) = self.integrator.rollback(&mut primary, receipt).await
             {
-                errors.push(error);
+                errors.push(format!("failed to withdraw candidate framework components: {error}"));
             }
-            return Err(anyhow::anyhow!(errors.join("; ")));
+            unload_application_components(&mut primary, &applied.prepared).await;
+            primary
+                .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, None)
+                .await;
+            crate::runtime::configure_intent_router(&mut primary);
+            {
+                let mut ownership = self.mcp_ownership.lock().await;
+                release_plugin_mcp_claims(&mut ownership, &applied.mcp_ownership);
+            }
+            let retirement_revision = candidate_revision.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("Plugin generation revision exhausted during failed activation")
+            })?;
+            if let Some(publication) = pool_publication.as_mut() {
+                let retired = AgentPluginGeneration::new(
+                    retirement_revision,
+                    primary.skill_descriptors(),
+                    Vec::new(),
+                    None,
+                );
+                if let Err(error) = publication.retire_failed_candidate(retired).await {
+                    errors.push(error);
+                }
+            }
+            {
+                let mut current = self.lsp.manager.write().await;
+                let mut candidate_lsp = std::mem::replace(&mut *current, LspManager::new());
+                candidate_lsp.shutdown_all().await;
+            }
+            previous_lsp.shutdown_all().await;
+            state.registry = self.registry_for(binding.project_root.clone());
+            state.framework_components.clear();
+            state.framework_generation = None;
+            state.framework_receipt = None;
+            state.mcp_ownership.clear();
+            state.prepared = PreparedApplicationComponents::default();
+            state.active_theme = None;
+            state.active_output_style = None;
+            state.generation = retirement_revision;
+            if let Err(error) = persist_preferences(
+                &self.preferences_file,
+                &PluginPreferences {
+                    active_theme: None,
+                    active_output_style: None,
+                },
+            ) {
+                errors.push(format!("failed to persist retired Plugin preferences: {error}"));
+            }
+            return Err(anyhow::anyhow!(
+                "candidate Plugin generation failed activation and was retired: {}",
+                errors.join("; ")
+            ));
         }
 
         if let Some(publication) = pool_publication.as_mut() {
@@ -2087,8 +2073,10 @@ impl PluginRuntimeService {
             });
         }
 
-        if let Some(receipt) = previous_framework_receipt.as_ref() {
-            self.integrator.rollback(agent, receipt).await;
+        if let Some(receipt) = previous_framework_receipt.as_ref()
+            && let Err(error) = self.integrator.rollback(agent, receipt).await
+        {
+            tracing::error!(%error, "framework plugin rollback failed before replacement");
         }
         unload_application_components(agent, &previous_prepared).await;
         release_plugin_mcp_claims(&mut ownership_guard, &previous_mcp_ownership);
@@ -2180,8 +2168,10 @@ impl PluginRuntimeService {
                     Ok((candidate, wiring))
                 }
                 Err(error) => {
-                    if let Some(receipt) = wiring.as_ref() {
-                        self.integrator.rollback(agent, receipt).await;
+                    if let Some(receipt) = wiring.as_ref()
+                        && let Err(error) = self.integrator.rollback(agent, receipt).await
+                    {
+                        tracing::error!(%error, "framework plugin rollback failed after Subagent registration error");
                     }
                     unload_application_components(agent, &candidate_prepared).await;
                     Err((
@@ -2328,7 +2318,9 @@ impl PluginRuntimeService {
             config.merge(plugin_config.clone());
         }
         let mut manager = LspManager::new();
-        manager.load_config(&config);
+        manager
+            .load_config(&config)
+            .map_err(|error| anyhow::anyhow!("Plugin LSP config failed: {error}"))?;
         manager.set_project_root(&binding.project_root);
         let languages = manager
             .configured_languages()

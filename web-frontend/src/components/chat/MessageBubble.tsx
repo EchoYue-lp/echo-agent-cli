@@ -157,7 +157,7 @@ export const MessageBubble = memo(function MessageBubble({
   onRegenerate,
   onEditAndResend,
 }: MessageBubbleProps) {
-  const isUser = message.role === 'user';
+  const isUser = message.role === 'user' && !message.internalAgent;
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState(message.content);
 
@@ -354,6 +354,11 @@ export const MessageBubble = memo(function MessageBubble({
             sections. This is what makes it read as one continuous flow. */}
         {!isUser && (
           <div className="w-full space-y-2">
+            {message.internalAgent && (
+              <span className="inline-flex h-5 items-center rounded border border-[var(--border-primary)] px-1.5 text-[10px] font-medium text-[var(--text-tertiary)]">
+                Agent 内部消息
+              </span>
+            )}
             {hasExecutionProcess ? (
               <ExecutionProcessGroup completed={executionCompleted}>
                 {/* Thinking + tools */}

@@ -76,6 +76,9 @@ pub mod conversation_input {
 pub mod conversation_projection {
     pub use crate::conversation_projection::*;
 }
+pub mod managed_conversation {
+    pub use crate::managed_conversation::*;
+}
 pub mod data_root {
     pub use crate::data_root::*;
 }
@@ -171,6 +174,9 @@ pub mod runtime {
 }
 pub mod scheduler {
     pub use crate::scheduler::*;
+}
+pub mod side_conversation {
+    pub use crate::side_conversation::*;
 }
 pub mod skills_hub {
     pub use crate::skills_hub::*;

@@ -235,12 +235,21 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 .get_conversation(&conversation_id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Conversation '{conversation_id}' was not found"))?;
-            let stored = store.get_messages(&conversation_id).await?;
-            let messages = echo_agent::memory::restore_messages(&stored)?;
-            Ok::<_, anyhow::Error>((conversation, messages))
+            let state_store = runtime
+                .state_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Runtime state store is unavailable"))?;
+            let message_count = echo_agent_app_core::api::managed_conversation::resume_or_import(
+                store.as_ref(),
+                state_store.as_ref(),
+                &agent_handle,
+                &conversation_id,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>((conversation, message_count))
         }
         .await;
-        let (conversation, messages) = match restore_result {
+        let (conversation, message_count) = match restore_result {
             Ok(restored) => restored,
             Err(error) => {
                 #[cfg(feature = "tui")]
@@ -260,10 +269,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 return Err(anyhow::Error::new(receipt.into_error()));
             }
         };
-        let message_count = messages.len();
-        agent_handle
-            .read_async(|agent| Box::pin(async move { agent.load_messages(messages).await }))
-            .await;
         let short_id: String = conversation_id.chars().take(8).collect();
         let date: String = conversation.updated_at.chars().take(19).collect();
         tracing::info!(

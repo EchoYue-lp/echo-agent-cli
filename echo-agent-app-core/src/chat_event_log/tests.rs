@@ -528,15 +528,14 @@ mod tests {
             ToolExecutionRepository::open(temp.path().join("tools"))
                 .map_err(|error| error.to_string())?,
         );
-        for (offset, surface) in [
+        let surfaces = [
             ChatSurface::Gui,
             ChatSurface::Tui,
             ChatSurface::Cli,
             ChatSurface::Channel,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+            ChatSurface::Agent,
+        ];
+        for (offset, surface) in surfaces.into_iter().enumerate() {
             let captured = Arc::new(CapturingSink::default());
             let turn = format!("turn-{offset}");
             let sink = bind_surface_chat_sink(
@@ -598,13 +597,13 @@ mod tests {
                 .map_err(|error| error.to_string())?
                 .events
                 .len(),
-            12
+            surfaces.len().saturating_mul(3)
         );
         assert_eq!(
             tools
                 .summaries_for_conversation("workspace-1", "conversation-1")
                 .len(),
-            4
+            surfaces.len()
         );
         Ok(())
     }

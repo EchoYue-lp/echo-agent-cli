@@ -194,7 +194,7 @@ async fn settle_captured_plugin_targets(
     receipts
 }
 
-fn promote_curated_skill_artifact(
+async fn promote_curated_skill_artifact(
     echo_agent_dir: PathBuf,
     name: &str,
 ) -> Result<CuratedSkillArtifactCommit, String> {
@@ -247,23 +247,15 @@ fn promote_curated_skill_artifact(
             draft_path.display()
         )
     })?;
-    let wrote_artifact = match std::fs::read(&active_path) {
-        Ok(existing) if existing == draft => false,
+    let existing = match std::fs::read(&active_path) {
+        Ok(existing) if existing == draft => Some(existing),
         Ok(_) => {
             return Err(format!(
                 "refusing to overwrite a different active Skill artifact at {}",
                 active_path.display()
             ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            echo_agent::utils::fs::atomic_write(&active_path, &draft).map_err(|error| {
-                format!(
-                    "failed to commit curated Skill artifact '{}': {error}",
-                    active_path.display()
-                )
-            })?;
-            true
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(format!(
                 "failed to inspect active Skill artifact '{}': {error}",
@@ -271,48 +263,62 @@ fn promote_curated_skill_artifact(
             ));
         }
     };
-
-    match curator.promote_to_active_at(name, Some(&active_path)) {
-        Ok(true) => Ok(CuratedSkillArtifactCommit {
+    let authority = crate::evolution::review_integration::skill_mutation_authority(
+        &echo_agent_dir,
+    )
+    .map_err(|error| format!("failed to open Skill mutation authority: {error}"))?;
+    let mut after = state.clone();
+    let metadata = after
+        .skills
+        .get_mut(name)
+        .ok_or_else(|| format!("Skill '{name}' disappeared from curator state"))?;
+    metadata.lifecycle = echo_agent::evolution::SkillLifecycle::Active;
+    metadata.path = Some(
+        echo_agent::evolution::SkillFileMutation::canonical_path(&active_path)
+            .map_err(|error| format!("invalid active Skill path: {error}"))?,
+    );
+    metadata.last_modified_at = chrono::Utc::now();
+    let files = if existing.is_some() {
+        Vec::new()
+    } else {
+        vec![echo_agent::evolution::SkillFileMutation::new(
+            &active_path,
+            None,
+            Some(draft),
+        )
+        .map_err(|error| format!("failed to prepare Skill artifact: {error}"))?]
+    };
+    let request = echo_agent::evolution::SkillMutationRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        entity_key: name.to_string(),
+        kind: echo_agent::evolution::SkillMutationKind::Promote,
+        reason: "user requested curated Skill publication".to_string(),
+        files,
+        curator_before: state,
+        curator_after: after,
+        rollback_of: None,
+    };
+    let preview = authority
+        .preview(&request)
+        .map_err(|error| format!("failed to preview Skill promotion: {error}"))?;
+    let approval = echo_agent::evolution::SkillApprovalArtifact::new(
+        uuid::Uuid::new_v4().to_string(),
+        preview.operation_digest,
+        "eko:user-publish-curated-skill",
+        chrono::Utc::now(),
+    );
+    match authority.apply(request, approval).await.map_err(|error| error.to_string())? {
+        echo_agent::evolution::SkillMutationOutcome::Applied(_) => Ok(CuratedSkillArtifactCommit {
             active_path,
             load_root,
             idempotent: false,
         }),
-        Ok(false) => {
-            let concurrently_active = curator
-                .load_state()
-                .ok()
-                .and_then(|state| state.skills.get(name).cloned())
-                .is_some_and(|metadata| {
-                    metadata.lifecycle == echo_agent::evolution::SkillLifecycle::Active
-                });
-            if concurrently_active && active_path.is_file() {
-                return Ok(CuratedSkillArtifactCommit {
-                    active_path,
-                    load_root,
-                    idempotent: true,
-                });
-            }
-            if wrote_artifact {
-                let _ = echo_agent::utils::fs::remove_file_durable(&active_path);
-            }
-            Err(format!("Skill '{name}' is no longer in Draft state"))
-        }
-        Err(error) => {
-            let cleanup_error = if wrote_artifact {
-                echo_agent::utils::fs::remove_file_durable(&active_path)
-                    .err()
-                    .map(|cleanup| cleanup.to_string())
-            } else {
-                None
-            };
-            Err(match cleanup_error {
-                Some(cleanup) => format!(
-                    "failed to promote Skill '{name}': {error}; artifact cleanup failed: {cleanup}"
-                ),
-                None => format!("failed to promote Skill '{name}': {error}"),
-            })
-        }
+        echo_agent::evolution::SkillMutationOutcome::AlreadyApplied(_) => Ok(CuratedSkillArtifactCommit {
+            active_path,
+            load_root,
+            idempotent: true,
+        }),
+        outcome => Err(format!("Skill '{name}' promotion did not settle: {outcome:?}")),
     }
 }
 

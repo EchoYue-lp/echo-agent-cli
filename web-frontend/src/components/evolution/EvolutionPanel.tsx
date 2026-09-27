@@ -74,7 +74,7 @@ export function EvolutionPanel() {
       content: string;
       evidence: string;
       confidence: number;
-      persisted: boolean;
+      persisted: boolean | null;
     } | null;
     error?: string | null;
     evidence_candidate?: EvidenceCandidate | null;
@@ -225,7 +225,9 @@ export function EvolutionPanel() {
     try {
       const res = await evolutionApi.review();
       if (res.error && !res.success) {
-        setReviewError(res.error);
+        setReviewError(
+          res.review_operation_id ? `${res.error} · Review ${res.review_operation_id}` : res.error
+        );
       } else {
         setReviewResult(res);
         await loadEvidence(evidenceFilter);
@@ -1012,7 +1014,11 @@ export function EvolutionPanel() {
                 <div className="mt-1">证据: {reviewResult.candidate.evidence}</div>
                 <div className="mt-1">
                   置信度: {reviewResult.candidate.confidence.toFixed(2)} ·{' '}
-                  {reviewResult.candidate.persisted ? '已保存为草稿记忆' : '未自动保存'}
+                  {reviewResult.candidate.persisted === true
+                    ? '已保存为草稿记忆'
+                    : reviewResult.candidate.persisted === null
+                      ? '保存状态待确认'
+                      : '未自动保存'}
                 </div>
               </div>
             )}

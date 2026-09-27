@@ -292,7 +292,7 @@ describe('useTauriChat foreground turn recovery', () => {
       if (command === 'get_active_chat_turn') {
         return args?.conversationId ? null : activeSnapshot;
       }
-      if (command === 'save_conversation') return { success: true, id: 'conversation-new' };
+      if (command === 'create_conversation') return { kind: 'primary', id: 'conversation-new' };
       if (command === 'list_conversations') return [];
       if (command === 'send_chat_message') return { success: true };
       if (command === 'replay_chat_events') return emptyReplay();

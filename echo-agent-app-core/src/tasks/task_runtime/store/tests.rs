@@ -7617,7 +7617,7 @@ mod tests {
             .ok_or_else(|| "query checkpoint is missing".to_string())?;
         legacy.state.clear_query_projection_schema_for_test();
         checkpoints
-            .save(&legacy.state, legacy.sequence)
+            .save(&legacy.journal_identity, &legacy.state, legacy.sequence)
             .map_err(|error| error.to_string())?;
         let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
             .map_err(|error| error.to_string())?;
@@ -7654,7 +7654,7 @@ mod tests {
             .ok_or_else(|| "query checkpoint is missing".to_string())?;
         legacy.state.clear_query_projection_schema_for_test();
         checkpoints
-            .save(&legacy.state, legacy.sequence)
+            .save(&legacy.journal_identity, &legacy.state, legacy.sequence)
             .map_err(|error| error.to_string())?;
         std::fs::remove_file(artifact_history).map_err(|error| error.to_string())?;
         std::fs::remove_file(review_history).map_err(|error| error.to_string())?;

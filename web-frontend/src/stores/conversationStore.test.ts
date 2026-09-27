@@ -6,6 +6,10 @@ const mocks = vi.hoisted(() => ({
   restoreConversation: vi.fn(),
   branchConversation: vi.fn(),
   listConversations: vi.fn(),
+  createSideConversation: vi.fn(),
+  updateSideConversationModel: vi.fn(),
+  retrySideConversation: vi.fn(),
+  markSideConversationViewed: vi.fn(),
   updateConversation: vi.fn(),
   deleteConversation: vi.fn(),
   setArchived: vi.fn(),
@@ -16,6 +20,10 @@ vi.mock('../api/endpoints', () => ({
   sessionApi: { reset: mocks.resetSession },
   conversationApi: {
     list: mocks.listConversations,
+    createSide: mocks.createSideConversation,
+    updateSideModel: mocks.updateSideConversationModel,
+    retrySide: mocks.retrySideConversation,
+    markSideViewed: mocks.markSideConversationViewed,
     get: mocks.getConversation,
     save: vi.fn(),
     update: mocks.updateConversation,
@@ -39,12 +47,38 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function sideEntry() {
+  return {
+    group_id: 'side-group-1',
+    workspace_id: 'workspace-1',
+    parent_conversation_id: 'conversation-1',
+    conversation_id: 'side-1',
+    title: 'Explore tests',
+    model_id: 'provider:model',
+    snapshot_message_count: 2,
+    snapshot_last_message_id: 2,
+    created_at: '2026-09-15T00:00:00Z',
+    updated_at: '2026-09-15T00:00:00Z',
+    degraded: false,
+    status: 'completed' as const,
+    unread_count: 0,
+    launch_error: null,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.listToolExecutions.mockResolvedValue([]);
   mocks.restoreConversation.mockResolvedValue(undefined);
   mocks.listConversations.mockResolvedValue([]);
   mocks.updateConversation.mockResolvedValue(undefined);
+  mocks.retrySideConversation.mockResolvedValue({
+    creation: { duplicate: true, entry: { group_id: 'side-group-1' } },
+    first_turn: { kind: 'started', message_key: 'side-start-1', root_turn_id: 'side-start-1' },
+    initial_prompt: 'Retry the original prompt',
+    launch_error: null,
+  });
+  mocks.markSideConversationViewed.mockResolvedValue({ success: true });
   mocks.setArchived.mockResolvedValue({
     success: true,
     conversation_id: 'conversation-1',
@@ -60,10 +94,12 @@ beforeEach(() => {
   mocks.resetSession.mockResolvedValue(undefined);
   useChatStore.getState().clearMessages();
   useConversationStore.setState({
+    workspaceId: 'global',
     activeId: null,
     newConversationEpoch: 0,
     isLoading: false,
     conversations: [],
+    sideConversations: [],
     archivedConversationIds: [],
   });
 });
@@ -161,6 +197,26 @@ describe('conversation message identity', () => {
     expect(mocks.restoreConversation).not.toHaveBeenCalled();
   });
 
+  it('keeps an in-flight conversation load alive while the Side status list refreshes', async () => {
+    const pendingRecord = deferred<{ messages: SavedMessage[] }>();
+    const pendingList = deferred<never[]>();
+    mocks.getConversation.mockReturnValueOnce(pendingRecord.promise);
+    mocks.listConversations.mockReturnValueOnce(pendingList.promise);
+    useConversationStore.setState({ workspaceId: 'workspace-1' });
+
+    const load = useConversationStore.getState().loadConversation('side-1');
+    const refresh = useConversationStore.getState().init('workspace-1');
+    pendingRecord.resolve({ messages: [] });
+    await load;
+
+    expect(useConversationStore.getState()).toMatchObject({
+      activeId: 'side-1',
+      isLoading: false,
+    });
+    pendingList.resolve([]);
+    await refresh;
+  });
+
   it('opens a blank conversation immediately without resetting a running conversation agent', async () => {
     const pendingUpdate = deferred<undefined>();
     mocks.updateConversation.mockReturnValueOnce(pendingUpdate.promise);
@@ -193,6 +249,355 @@ describe('conversation message identity', () => {
     expect(mocks.branchConversation).toHaveBeenCalledWith('global', 'conversation-1', 2);
     expect(result).toEqual({ id: 'branch-1', targetContent: 'canonical user prompt' });
     expect(useConversationStore.getState().activeId).toBe('branch-1');
+  });
+
+  it('creates a Side Conversation under the active primary and opens the canonical child', async () => {
+    mocks.createSideConversation.mockResolvedValueOnce({
+      creation: {
+        duplicate: false,
+        entry: {
+          group_id: 'side-group-1',
+          workspace_id: 'workspace-1',
+          parent_conversation_id: 'conversation-1',
+          conversation_id: 'side-1',
+          title: 'Explore tests',
+          model_id: 'provider:model',
+          snapshot_message_count: 2,
+          snapshot_last_message_id: 2,
+          created_at: '2026-09-15T00:00:00Z',
+          updated_at: '2026-09-15T00:00:00Z',
+          degraded: false,
+          status: 'queued',
+          unread_count: 0,
+          launch_error: null,
+        },
+      },
+      first_turn: { kind: 'started', message_key: 'side-start-1', root_turn_id: 'side-start-1' },
+      initial_prompt: 'Explore the test strategy',
+      launch_error: null,
+    });
+    mocks.getConversation.mockResolvedValueOnce({ messages: [] });
+    useConversationStore.setState({
+      workspaceId: 'workspace-1',
+      activeId: 'conversation-1',
+      conversations: [],
+      sideConversations: [],
+    });
+
+    const created = await useConversationStore.getState().createSideConversation({
+      requestId: 'request-1',
+      prompt: 'Explore the test strategy',
+      title: 'Explore tests',
+      modelId: 'provider:model',
+    });
+
+    expect(mocks.createSideConversation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspace_id: 'workspace-1',
+        parent_conversation_id: 'conversation-1',
+        request_id: 'request-1',
+        prompt: 'Explore the test strategy',
+        title: 'Explore tests',
+        model_id: 'provider:model',
+      })
+    );
+    expect(created.conversation_id).toBe('side-1');
+    expect(useConversationStore.getState().activeId).toBe('side-1');
+    expect(useChatStore.getState().messages).toEqual([
+      expect.objectContaining({
+        id: 'side-start-1',
+        role: 'user',
+        content: 'Explore the test strategy',
+      }),
+    ]);
+  });
+
+  it('does not duplicate a fast completed initial prompt restored with its stable identity', async () => {
+    mocks.createSideConversation.mockResolvedValueOnce({
+      creation: { duplicate: false, entry: sideEntry() },
+      first_turn: {
+        kind: 'completed',
+        message_key: 'side-start:side-group-1',
+        root_turn_id: 'side-start:side-group-1',
+      },
+      initial_prompt: 'Explore the test strategy',
+      launch_error: null,
+    });
+    mocks.getConversation.mockResolvedValueOnce({
+      messages: [
+        {
+          message_id: 'side-start:side-group-1',
+          role: 'user',
+          content: 'Explore the test strategy',
+        },
+        { role: 'assistant', content: 'Finished quickly' },
+      ],
+    });
+    useConversationStore.setState({
+      workspaceId: 'workspace-1',
+      activeId: 'conversation-1',
+      conversations: [],
+      sideConversations: [],
+    });
+
+    await useConversationStore.getState().createSideConversation({
+      requestId: 'request-fast',
+      prompt: 'Explore the test strategy',
+    });
+
+    expect(
+      useChatStore
+        .getState()
+        .messages.filter((message) => message.content === 'Explore the test strategy')
+    ).toHaveLength(1);
+  });
+
+  it('does not duplicate the canonical prompt when a lost create response is retried', async () => {
+    mocks.createSideConversation.mockResolvedValueOnce({
+      creation: { duplicate: true, entry: sideEntry() },
+      first_turn: {
+        kind: 'completed',
+        message_key: 'side-start:side-group-1',
+        root_turn_id: 'side-start:side-group-1',
+      },
+      initial_prompt: 'Explore the test strategy',
+      launch_error: null,
+    });
+    mocks.getConversation.mockResolvedValueOnce({
+      messages: [
+        {
+          message_id: 'side-start:side-group-1',
+          role: 'user',
+          content: 'Explore the test strategy',
+        },
+        { role: 'assistant', content: 'Recovered result' },
+      ],
+    });
+    useConversationStore.setState({
+      workspaceId: 'workspace-1',
+      activeId: 'conversation-1',
+      conversations: [],
+      sideConversations: [],
+    });
+
+    await useConversationStore.getState().createSideConversation({
+      requestId: 'request-lost-response',
+      prompt: 'Explore the test strategy',
+    });
+
+    expect(mocks.createSideConversation).toHaveBeenCalledTimes(1);
+    expect(
+      useChatStore
+        .getState()
+        .messages.filter((message) => message.content === 'Explore the test strategy')
+    ).toHaveLength(1);
+  });
+
+  it('rejects nested Side Conversation creation before calling the backend', async () => {
+    useConversationStore.setState({
+      workspaceId: 'workspace-1',
+      activeId: 'side-1',
+      sideConversations: [
+        {
+          group_id: 'side-group-1',
+          workspace_id: 'workspace-1',
+          parent_conversation_id: 'conversation-1',
+          conversation_id: 'side-1',
+          title: 'Existing side',
+          model_id: null,
+          snapshot_message_count: 0,
+          snapshot_last_message_id: null,
+          created_at: '2026-09-15T00:00:00Z',
+          updated_at: '2026-09-15T00:00:00Z',
+          degraded: false,
+          status: 'idle',
+          unread_count: 0,
+          launch_error: null,
+        },
+      ],
+    });
+
+    await expect(
+      useConversationStore
+        .getState()
+        .createSideConversation({ requestId: 'nested-request', prompt: 'nested' })
+    ).rejects.toThrow('cannot create nested');
+    expect(mocks.createSideConversation).not.toHaveBeenCalled();
+  });
+
+  it('reloads the active Side Conversation after changing its model', async () => {
+    mocks.updateSideConversationModel.mockResolvedValueOnce({ success: true });
+    mocks.getConversation.mockResolvedValueOnce({ messages: [] });
+    useConversationStore.setState({
+      workspaceId: 'workspace-1',
+      activeId: 'side-1',
+      sideConversations: [
+        {
+          group_id: 'side-group-1',
+          workspace_id: 'workspace-1',
+          parent_conversation_id: 'conversation-1',
+          conversation_id: 'side-1',
+          title: 'Existing side',
+          model_id: 'provider:old',
+          snapshot_message_count: 0,
+          snapshot_last_message_id: null,
+          created_at: '2026-09-15T00:00:00Z',
+          updated_at: '2026-09-15T00:00:00Z',
+          degraded: false,
+          status: 'idle',
+          unread_count: 0,
+          launch_error: null,
+        },
+      ],
+    });
+
+    await useConversationStore.getState().updateSideConversationModel('side-1', 'provider:new');
+
+    expect(mocks.updateSideConversationModel).toHaveBeenCalledWith(
+      'workspace-1',
+      'side-1',
+      'provider:new'
+    );
+    expect(mocks.getConversation).toHaveBeenCalledWith('workspace-1', 'side-1');
+    expect(mocks.restoreConversation).toHaveBeenCalledWith('workspace-1', 'side-1');
+    expect(useConversationStore.getState().sideConversations[0]?.model_id).toBe('provider:new');
+  });
+
+  it('renames a Side Conversation through the shared conversation update contract', async () => {
+    useConversationStore.setState({
+      workspaceId: 'workspace-1',
+      conversations: [
+        {
+          id: 'side-1',
+          title: 'Old title',
+          lastMessage: '',
+          messageCount: 1,
+          createdAt: 1,
+          updatedAt: 2,
+          workspaceId: 'workspace-1',
+        },
+      ],
+      sideConversations: [
+        {
+          group_id: 'side-group-1',
+          workspace_id: 'workspace-1',
+          parent_conversation_id: 'conversation-1',
+          conversation_id: 'side-1',
+          title: 'Old title',
+          model_id: null,
+          snapshot_message_count: 1,
+          snapshot_last_message_id: 1,
+          created_at: '2026-09-15T00:00:00Z',
+          updated_at: '2026-09-15T00:00:00Z',
+          degraded: false,
+          status: 'idle',
+          unread_count: 0,
+          launch_error: null,
+        },
+      ],
+    });
+
+    await useConversationStore.getState().renameConversation('side-1', 'New title');
+
+    expect(mocks.updateConversation).toHaveBeenCalledWith('workspace-1', 'side-1', {
+      title: 'New title',
+    });
+    expect(useConversationStore.getState().conversations[0]?.title).toBe('New title');
+    expect(useConversationStore.getState().sideConversations[0]?.title).toBe('New title');
+  });
+
+  it('retries a failed initial prompt and reopens the Side Conversation', async () => {
+    mocks.getConversation.mockResolvedValueOnce({ messages: [] });
+    useConversationStore.setState({
+      workspaceId: 'workspace-1',
+      activeId: 'conversation-1',
+      sideConversations: [
+        {
+          group_id: 'side-group-1',
+          workspace_id: 'workspace-1',
+          parent_conversation_id: 'conversation-1',
+          conversation_id: 'side-1',
+          title: 'Failed side',
+          model_id: null,
+          snapshot_message_count: 1,
+          snapshot_last_message_id: 1,
+          created_at: '2026-09-15T00:00:00Z',
+          updated_at: '2026-09-15T00:00:00Z',
+          degraded: false,
+          status: 'failed',
+          unread_count: 0,
+          launch_error: 'model unavailable',
+        },
+      ],
+    });
+
+    await useConversationStore.getState().retrySideConversation('side-1');
+
+    expect(mocks.retrySideConversation).toHaveBeenCalledWith('workspace-1', 'side-1');
+    expect(mocks.getConversation).toHaveBeenCalledWith('workspace-1', 'side-1');
+    expect(useConversationStore.getState().activeId).toBe('side-1');
+  });
+
+  it('publishes a running hint so lifecycle polling starts for a later Side turn', () => {
+    useConversationStore.setState({
+      sideConversations: [
+        {
+          group_id: 'side-group-1',
+          workspace_id: 'workspace-1',
+          parent_conversation_id: 'conversation-1',
+          conversation_id: 'side-1',
+          title: 'Side',
+          model_id: null,
+          snapshot_message_count: 1,
+          snapshot_last_message_id: 1,
+          created_at: '2026-09-15T00:00:00Z',
+          updated_at: '2026-09-15T00:00:00Z',
+          degraded: false,
+          status: 'completed',
+          unread_count: 0,
+          launch_error: null,
+        },
+      ],
+    });
+
+    useConversationStore.getState().noteSideConversationTurnStarted('side-1');
+
+    expect(useConversationStore.getState().sideConversations[0]?.status).toBe('running');
+  });
+
+  it('persists the viewed marker when the active Side receives a newer unread projection', async () => {
+    useConversationStore.setState({ workspaceId: 'workspace-1', activeId: 'side-1' });
+    mocks.listConversations.mockResolvedValueOnce([
+      {
+        id: 1,
+        conversation_id: 'side-1',
+        title: 'Visible side',
+        message_count: 2,
+        created_at: '2026-09-15T00:00:00Z',
+        updated_at: '2026-09-15T00:01:00Z',
+        side_conversation: {
+          group_id: 'side-group-1',
+          workspace_id: 'workspace-1',
+          parent_conversation_id: 'conversation-1',
+          conversation_id: 'side-1',
+          title: 'Visible side',
+          model_id: null,
+          snapshot_message_count: 1,
+          snapshot_last_message_id: 1,
+          created_at: '2026-09-15T00:00:00Z',
+          updated_at: '2026-09-15T00:01:00Z',
+          degraded: false,
+          status: 'completed' as const,
+          unread_count: 1,
+          launch_error: null,
+        },
+      },
+    ]);
+
+    await useConversationStore.getState().init('workspace-1');
+
+    expect(useConversationStore.getState().sideConversations[0]?.unread_count).toBe(0);
+    expect(mocks.markSideConversationViewed).toHaveBeenCalledWith('workspace-1', 'side-1');
   });
 
   it('archives and restores conversations through the workspace-scoped application API', async () => {
@@ -242,5 +647,59 @@ describe('conversation message identity', () => {
 
     expect(mocks.deleteConversation).toHaveBeenCalledWith('workspace-1', 'conversation-1');
     expect(useConversationStore.getState().conversations).toEqual([]);
+  });
+
+  it('clears an active child when deleting its primary conversation', async () => {
+    mocks.deleteConversation.mockResolvedValueOnce({ cleanup_pending: false });
+    useConversationStore.setState({
+      workspaceId: 'workspace-1',
+      activeId: 'side-1',
+      conversations: [
+        {
+          id: 'conversation-1',
+          title: 'Primary',
+          lastMessage: '',
+          messageCount: 2,
+          createdAt: 1,
+          updatedAt: 2,
+          workspaceId: 'workspace-1',
+        },
+        {
+          id: 'side-1',
+          title: 'Side',
+          lastMessage: '',
+          messageCount: 1,
+          createdAt: 1,
+          updatedAt: 2,
+          workspaceId: 'workspace-1',
+        },
+      ],
+      sideConversations: [
+        {
+          group_id: 'side-group-1',
+          workspace_id: 'workspace-1',
+          parent_conversation_id: 'conversation-1',
+          conversation_id: 'side-1',
+          title: 'Side',
+          model_id: null,
+          snapshot_message_count: 1,
+          snapshot_last_message_id: 1,
+          created_at: '2026-09-15T00:00:00Z',
+          updated_at: '2026-09-15T00:00:00Z',
+          degraded: false,
+          status: 'idle',
+          unread_count: 0,
+          launch_error: null,
+        },
+      ],
+    });
+
+    await useConversationStore.getState().deleteConversation('conversation-1');
+
+    expect(useConversationStore.getState()).toMatchObject({
+      activeId: null,
+      conversations: [],
+      sideConversations: [],
+    });
   });
 });

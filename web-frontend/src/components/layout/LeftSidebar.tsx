@@ -12,7 +12,10 @@ import {
   X,
   ChevronDown,
   ChevronRight,
+  GitFork,
+  Pencil,
   Loader2,
+  RefreshCw,
   Archive,
 } from 'lucide-react';
 import { BrandIcon } from '../common/BrandIcon';
@@ -27,6 +30,15 @@ import { fileSystem } from '../../lib/tauri-bridge';
 import { workspaceIdForView } from '../../lib/viewAddress';
 
 const MAX_RECENT_CONVERSATIONS = 5;
+const SIDE_STATUS_LABEL = {
+  idle: '空闲',
+  queued: '排队',
+  running: '运行中',
+  completed: '已完成',
+  failed: '失败',
+  cancelled: '已取消',
+  degraded: '需清理',
+} as const;
 
 export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const theme = useUiStore((s) => s.theme);
@@ -41,17 +53,24 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const deleteWorkspace = useWorkspaceStore((s) => s.delete);
 
   const conversations = useConversationStore((s) => s.conversations);
+  const sideConversations = useConversationStore((s) => s.sideConversations);
   const activeConvId = useConversationStore((s) => s.activeId);
   const isConvLoading = useConversationStore((s) => s.isLoading);
   const loadConversation = useConversationStore((s) => s.loadConversation);
   const startNewConversation = useConversationStore((s) => s.startNew);
   const archiveConversation = useConversationStore((s) => s.archiveConversation);
+  const deleteConversation = useConversationStore((s) => s.deleteConversation);
+  const renameConversation = useConversationStore((s) => s.renameConversation);
+  const retrySideConversation = useConversationStore((s) => s.retrySideConversation);
 
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<ConversationListItem[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [showAllConvs, setShowAllConvs] = useState(false);
+  const [renamingSideId, setRenamingSideId] = useState<string | null>(null);
+  const [sideTitleDraft, setSideTitleDraft] = useState('');
+  const [isRenamingSide, setIsRenamingSide] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   // Debounced search across all conversation content
@@ -91,7 +110,24 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
 
   useEffect(() => {
     setShowAllConvs(false);
+    setRenamingSideId(null);
+    setSideTitleDraft('');
   }, [current?.id]);
+
+  useEffect(() => {
+    if (
+      isConvLoading ||
+      !sideConversations.some(
+        (conversation) => conversation.status === 'queued' || conversation.status === 'running'
+      )
+    ) {
+      return;
+    }
+    const interval = window.setInterval(() => {
+      void useConversationStore.getState().init(workspaceIdForView(current?.id));
+    }, 1200);
+    return () => window.clearInterval(interval);
+  }, [current?.id, isConvLoading, sideConversations]);
 
   // Always filter workspace names; search results come from API when searching
   const filtered = searchQuery.trim()
@@ -164,6 +200,54 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
     }
   };
 
+  const handleDeleteSideConversation = async (
+    id: string,
+    title: string,
+    event: React.MouseEvent
+  ) => {
+    event.stopPropagation();
+    if (!confirm(`确定删除支线对话“${title}”？主对话不会被删除。`)) return;
+    try {
+      await deleteConversation(id);
+      await useConversationStore.getState().init(workspaceIdForView(current?.id));
+    } catch (error) {
+      console.error('Delete Side Conversation failed:', error);
+    }
+  };
+
+  const startRenamingSideConversation = (id: string, title: string, event: React.MouseEvent) => {
+    event.stopPropagation();
+    setRenamingSideId(id);
+    setSideTitleDraft(title);
+  };
+
+  const commitSideConversationTitle = async (id: string) => {
+    const title = sideTitleDraft.trim();
+    if (!title || isRenamingSide) {
+      if (!title) setRenamingSideId(null);
+      return;
+    }
+    setIsRenamingSide(true);
+    try {
+      await renameConversation(id, title);
+      setRenamingSideId(null);
+      setSideTitleDraft('');
+    } catch (error) {
+      console.error('Rename Side Conversation failed:', error);
+    } finally {
+      setIsRenamingSide(false);
+    }
+  };
+
+  const handleRetrySideConversation = async (id: string, event: React.MouseEvent) => {
+    event.stopPropagation();
+    try {
+      await retrySideConversation(id);
+    } catch (error) {
+      console.error('Retry Side Conversation failed:', error);
+    }
+  };
+
   const getKindIcon = (kind: { type: string }) => {
     const k = getWorkspaceKind(kind.type);
     const Icon = k.icon;
@@ -171,7 +255,12 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   };
 
   // Conversations are loaded from the active workspace-scoped store after switchWorkspace.
-  const filteredConversations = conversations.filter((conversation) => !conversation.archived);
+  const sideConversationIds = new Set(
+    sideConversations.map((conversation) => conversation.conversation_id)
+  );
+  const filteredConversations = conversations.filter(
+    (conversation) => !conversation.archived && !sideConversationIds.has(conversation.id)
+  );
   const visibleConvs = current
     ? filteredConversations.slice(
         0,
@@ -403,51 +492,186 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                     </div>
                   )}
 
-                  {visibleConvs.map((conv) => (
-                    <div
-                      key={conv.id}
-                      className={`group relative rounded-md text-[12px] transition-colors
-                        ${
-                          activeConvId === conv.id
-                            ? 'bg-[var(--bg-sidebar-active)] font-medium text-[var(--text-primary)]'
-                            : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
-                        }`}
-                    >
-                      <button
-                        type="button"
-                        aria-label={`打开会话 ${conv.title || '新对话'}`}
-                        className="block w-full cursor-pointer px-2 py-1.5 pr-10 text-left"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void handleSelectConv(conv.id);
-                        }}
-                      >
-                        <div className="flex min-w-0 items-center gap-1.5">
-                          <MessageSquare
-                            size={11}
-                            className="shrink-0 text-[var(--text-tertiary)]"
-                          />
-                          <span className="min-w-0 flex-1 truncate">{conv.title || '新对话'}</span>
-                        </div>
-                        {conv.messageCount > 0 && (
-                          <div className="mt-0.5 pl-[17px] text-[10px] text-[var(--text-tertiary)]">
-                            {conv.messageCount} 条消息
-                          </div>
-                        )}
-                      </button>
-                      <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-                        <button
-                          type="button"
-                          onClick={(e) => handleArchiveConversation(conv.id, e)}
-                          className="rounded p-1 text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-                          title="归档会话"
-                          aria-label={`归档会话 ${conv.title || '新对话'}`}
+                  {visibleConvs.map((conv) => {
+                    const children = sideConversations.filter(
+                      (entry) => entry.parent_conversation_id === conv.id
+                    );
+                    return (
+                      <div key={conv.id}>
+                        <div
+                          className={`group relative rounded-md text-[12px] transition-colors
+                            ${
+                              activeConvId === conv.id
+                                ? 'bg-[var(--bg-sidebar-active)] font-medium text-[var(--text-primary)]'
+                                : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                            }`}
                         >
-                          <Archive size={11} />
-                        </button>
+                          <button
+                            type="button"
+                            aria-label={`打开会话 ${conv.title || '新对话'}`}
+                            className="block w-full cursor-pointer px-2 py-1.5 pr-10 text-left"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void handleSelectConv(conv.id);
+                            }}
+                          >
+                            <div className="flex min-w-0 items-center gap-1.5">
+                              <MessageSquare
+                                size={11}
+                                className="shrink-0 text-[var(--text-tertiary)]"
+                              />
+                              <span className="min-w-0 flex-1 truncate">
+                                {conv.title || '新对话'}
+                              </span>
+                            </div>
+                            {conv.messageCount > 0 && (
+                              <div className="mt-0.5 pl-[17px] text-[10px] text-[var(--text-tertiary)]">
+                                {conv.messageCount} 条消息
+                              </div>
+                            )}
+                          </button>
+                          <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                            <button
+                              type="button"
+                              onClick={(e) => handleArchiveConversation(conv.id, e)}
+                              className="rounded p-1 text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                              title="归档会话"
+                              aria-label={`归档会话 ${conv.title || '新对话'}`}
+                            >
+                              <Archive size={11} />
+                            </button>
+                          </div>
+                        </div>
+                        {children.map((child) => {
+                          const childMeta = conversations.find(
+                            (item) => item.id === child.conversation_id
+                          );
+                          return (
+                            <div
+                              key={child.conversation_id}
+                              className={`group relative ml-3 rounded-md border-l border-[var(--border-secondary)] pl-1 text-[11px] transition-colors ${
+                                activeConvId === child.conversation_id
+                                  ? 'bg-[var(--bg-sidebar-active)] font-medium text-[var(--text-primary)]'
+                                  : 'text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                              }`}
+                            >
+                              {renamingSideId === child.conversation_id ? (
+                                <input
+                                  autoFocus
+                                  value={sideTitleDraft}
+                                  maxLength={160}
+                                  disabled={isRenamingSide}
+                                  onClick={(event) => event.stopPropagation()}
+                                  onChange={(event) => setSideTitleDraft(event.target.value)}
+                                  onBlur={() =>
+                                    void commitSideConversationTitle(child.conversation_id)
+                                  }
+                                  onKeyDown={(event) => {
+                                    event.stopPropagation();
+                                    if (event.key === 'Enter') {
+                                      event.preventDefault();
+                                      void commitSideConversationTitle(child.conversation_id);
+                                    } else if (event.key === 'Escape') {
+                                      setRenamingSideId(null);
+                                      setSideTitleDraft('');
+                                    }
+                                  }}
+                                  aria-label={`重命名支线对话 ${child.title}`}
+                                  className="mx-2 my-1 h-6 w-[calc(100%_-_1rem)] rounded border border-[var(--accent)] bg-[var(--bg-primary)] px-1.5 text-[11px] text-[var(--text-primary)] outline-none disabled:opacity-60"
+                                />
+                              ) : (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      if (!child.degraded)
+                                        void handleSelectConv(child.conversation_id);
+                                    }}
+                                    disabled={child.degraded}
+                                    className={`flex min-h-7 w-full items-center gap-1.5 px-2 text-left disabled:cursor-not-allowed ${child.launch_error ? 'pr-16' : 'pr-12'}`}
+                                    aria-label={`打开支线对话 ${child.title}`}
+                                  >
+                                    <GitFork size={10} className="shrink-0 text-[var(--accent)]" />
+                                    <span className="min-w-0 flex-1 truncate">{child.title}</span>
+                                    <span
+                                      className={`shrink-0 text-[9px] ${child.status === 'failed' || child.status === 'degraded' ? 'text-[var(--color-error)]' : 'text-[var(--text-tertiary)]'}`}
+                                    >
+                                      {SIDE_STATUS_LABEL[child.status]}
+                                    </span>
+                                    {child.unread_count > 0 &&
+                                      activeConvId !== child.conversation_id && (
+                                        <span
+                                          className="min-w-3 shrink-0 rounded-full bg-[var(--accent)] px-1 text-center text-[8px] leading-3 text-white"
+                                          aria-label={`${child.unread_count} 条未读更新`}
+                                        >
+                                          {child.unread_count > 9 ? '9+' : child.unread_count}
+                                        </span>
+                                      )}
+                                    {!child.degraded && childMeta && childMeta.messageCount > 0 && (
+                                      <span className="shrink-0 text-[9px] text-[var(--text-tertiary)]">
+                                        {childMeta.messageCount}
+                                      </span>
+                                    )}
+                                  </button>
+                                  <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                                    {child.launch_error && (
+                                      <button
+                                        type="button"
+                                        onClick={(event) =>
+                                          void handleRetrySideConversation(
+                                            child.conversation_id,
+                                            event
+                                          )
+                                        }
+                                        className="flex h-5 w-5 items-center justify-center rounded text-[var(--color-error)] hover:bg-[var(--bg-hover)]"
+                                        title={`重试支线首轮：${child.launch_error}`}
+                                        aria-label={`重试支线对话 ${child.title}`}
+                                      >
+                                        <RefreshCw size={10} />
+                                      </button>
+                                    )}
+                                    {!child.degraded && (
+                                      <button
+                                        type="button"
+                                        onClick={(event) =>
+                                          startRenamingSideConversation(
+                                            child.conversation_id,
+                                            child.title,
+                                            event
+                                          )
+                                        }
+                                        className="flex h-5 w-5 items-center justify-center rounded text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                                        title="重命名支线对话"
+                                        aria-label={`重命名支线对话 ${child.title}`}
+                                      >
+                                        <Pencil size={10} />
+                                      </button>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={(event) =>
+                                        void handleDeleteSideConversation(
+                                          child.conversation_id,
+                                          child.title,
+                                          event
+                                        )
+                                      }
+                                      className="flex h-5 w-5 items-center justify-center rounded text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--color-error)]"
+                                      title="删除支线对话"
+                                      aria-label={`删除支线对话 ${child.title}`}
+                                    >
+                                      <Trash2 size={10} />
+                                    </button>
+                                  </div>
+                                </>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
 
                   {hasMoreConvs && (
                     <div className="mt-1 text-center">

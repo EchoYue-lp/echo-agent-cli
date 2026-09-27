@@ -166,6 +166,13 @@ and current `turn_id`.
 
 ## Task Runtime
 
+Background Review is a separate app-core lifecycle. GUI, TUI, and CLI pass the
+framework's lazy handle to a generation-bound owner, which durably admits the
+operation before polling it, retains the generation through evidence settlement,
+and cancels then awaits accepted work during shutdown. Startup reconciles
+unfinished receipts before publishing the primary Agent. See
+[ADR 0043](../adr/0043-background-review-owner.md).
+
 Framework `RuntimeTaskService` drives the production DAG. EKO supplies product
 policy, file-journal transactions, review/worktree behavior, and surface
 adapters. `PlanRevision` is the editable artifact; `TaskStatus` is execution

@@ -355,6 +355,46 @@
       "legacyRemoved": true
     },
     {
+      "legacyPath": "adr/0042-side-conversation.md",
+      "targetPath": "adr/0042-side-conversation.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0043-background-review-owner.md",
+      "targetPath": "adr/0043-background-review-owner.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0044-skill-mutation-integration.md",
+      "targetPath": "adr/0044-skill-mutation-integration.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0045-managed-conversation-lifecycle.md",
+      "targetPath": "adr/0045-managed-conversation-lifecycle.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0046-plugin-generation-fail-closed.md",
+      "targetPath": "adr/0046-plugin-generation-fail-closed.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
       "legacyPath": "architecture.md",
       "targetPath": "architecture/overview.md",
       "kind": "architecture",

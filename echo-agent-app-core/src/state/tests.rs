@@ -1244,6 +1244,454 @@ mod model_mutation_tests {
 }
 
 #[cfg(test)]
+mod side_conversation_lifecycle_tests {
+    use super::*;
+    use echo_agent::agent::ReactAgentBuilder;
+    use echo_agent::memory::{ConversationStore, FileConversationStore, NewConversation};
+    use echo_agent::testing::MockLlmClient;
+
+    const WORKSPACE_ID: &str = "global";
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        state: Arc<AppState>,
+        store: Arc<dyn ConversationStore>,
+        deletions: Arc<crate::conversation_deletion::ConversationDeletionService>,
+    }
+
+    async fn fixture() -> Result<Fixture, String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store: Arc<dyn ConversationStore> = Arc::new(
+            FileConversationStore::new(temp.path().join("conversations"))
+                .map_err(|error| error.to_string())?,
+        );
+        let runtime_state: Arc<dyn echo_agent::state::RuntimeStateStore> = Arc::new(
+            echo_agent::state::FileRuntimeStateStore::new(temp.path().join("runtime-state"))
+                .map_err(|error| error.to_string())?,
+        );
+        let primary = ReactAgentBuilder::new()
+            .llm_client(Arc::new(
+                MockLlmClient::new().with_responses(["side answer"]),
+            ))
+            .system_prompt("Side Conversation lifecycle test")
+            .build()
+            .map(AgentHandle::new)
+            .map_err(|error| error.to_string())?;
+        let pool = Arc::new(
+            crate::agent_pool::AgentPool::new_for_test(primary.clone(), None, None, 4, false)
+                .await,
+        );
+        pool.apply_conversation_store(Arc::clone(&store)).await;
+        pool.apply_state_store(Arc::clone(&runtime_state)).await;
+        let mcp = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
+            temp.path().join("mcp.json"),
+            Default::default(),
+        ));
+        let mut state = AppState::from_shared(
+            primary,
+            None,
+            Arc::new(crate::hitl::HitlDispatcher::new()),
+            Some(Arc::clone(&store)),
+            Some(Arc::clone(&runtime_state)),
+            Default::default(),
+            mcp,
+            crate::product_data_io::ProductDataIoService::new(),
+        )
+        .map_err(|error| error.to_string())?
+        .with_agent_router(Arc::new(crate::agent_router::AgentRouter::new(
+            temp.path().join("agent-router"),
+        )));
+        let deletions = Arc::new(
+            crate::conversation_deletion::ConversationDeletionService::new(
+                temp.path().join("conversation-deletions"),
+            ),
+        );
+        {
+            let mut binding = state.storage.conversation.write().await;
+            binding.deletions = Arc::clone(&deletions);
+        }
+        state.workspace.global_conversation.deletions = Arc::clone(&deletions);
+        state.storage.conversation_archive = Arc::new(
+            crate::conversation_archive::ConversationArchiveStore::open(
+                temp.path().join("conversation-archive.json"),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        state.storage.tool_executions = Arc::new(
+            crate::tool_execution::ToolExecutionRepository::open(temp.path().join("tools"))
+                .map_err(|error| error.to_string())?,
+        );
+        state.storage.chat_events = Arc::new(
+            crate::chat_event_log::ChatEventLog::open(
+                temp.path().join("chat-events"),
+                Default::default(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        state.set_pool(pool);
+        Ok(Fixture {
+            _temp: temp,
+            state: Arc::new(state),
+            store,
+            deletions,
+        })
+    }
+
+    async fn create_primary(store: &dyn ConversationStore, id: &str) -> Result<(), String> {
+        store
+            .ensure_projection_epoch(echo_agent::memory::EnsureConversationProjectionRequest {
+                conversation: NewConversation {
+                    conversation_id: id.to_string(),
+                    user_id: "eko".to_string(),
+                    agent_type: None,
+                    title: Some("Main".to_string()),
+                },
+                expected_tombstone_epoch: None,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn side_request(parent: &str, request_id: &str) -> crate::side_conversation::SideConversationCreateRequest {
+        crate::side_conversation::SideConversationCreateRequest {
+            workspace_id: WORKSPACE_ID.to_string(),
+            parent_conversation_id: parent.to_string(),
+            request_id: request_id.to_string(),
+            prompt: "Investigate the alternative".to_string(),
+            title: Some("Alternative".to_string()),
+            model_id: None,
+        }
+    }
+
+    fn settle_when_cancelled(
+        lease: crate::foreground_turn::ForegroundTurnLease,
+    ) -> tokio::task::JoinHandle<Result<(), String>> {
+        tokio::spawn(async move {
+            lease.cancellation_token().cancelled().await;
+            lease
+                .settle_after_observers(crate::chat_driver::TurnOutcome::Cancelled)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    #[tokio::test]
+    async fn side_snapshot_rejects_unsettled_internal_turn() -> Result<(), String> {
+        let fixture = fixture().await?;
+        create_primary(fixture.store.as_ref(), "main").await?;
+        let authority = fixture.store.get_projection_authority("main").await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "parent authority missing".to_string())?;
+        fixture.state.storage.conversation_archive.prepare_internal_turn(
+            WORKSPACE_ID, "main", authority.epoch, "pending-side-delivery", 0, "internal turn",
+        )?;
+        let result = fixture.state.create_side_conversation_owned(
+            side_request("main", "unsettled-parent"),
+        ).await;
+        assert!(result.is_err());
+        assert!(fixture.store.get_conversation(
+            &crate::side_conversation::SideConversationService::child_id_for_request(
+                &side_request("main", "unsettled-parent"),
+            ).map_err(|error| error.to_string())?
+        ).await.map_err(|error| error.to_string())?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn side_snapshot_retries_when_internal_turn_commits_between_reads()
+    -> Result<(), String> {
+        let fixture = fixture().await?;
+        create_primary(fixture.store.as_ref(), "main").await?;
+        let authority = fixture.store.get_projection_authority("main").await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "parent authority missing".to_string())?;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *fixture.state.side_snapshot_barrier.lock().await = Some((entered_tx, release_rx));
+        let request = side_request("main", "commit-during-snapshot");
+        let creating_state = Arc::clone(&fixture.state);
+        let creation = tokio::spawn(async move {
+            creating_state.create_side_conversation_owned(request).await
+        });
+        entered_rx.await.map_err(|_| "snapshot did not reach barrier".to_string())?;
+        fixture.state.storage.conversation_archive.prepare_internal_turn(
+            WORKSPACE_ID, "main", authority.epoch, "racing-internal", 0, "internal turn",
+        )?;
+        fixture.store.apply_transcript_projection(
+            echo_agent::memory::TranscriptProjectionBatch::prepare(
+                "main", authority.epoch, "racing-internal", 0,
+                vec![echo_agent::memory::StoredMessage {
+                    id: None,
+                    conversation_id: "main".to_string(),
+                    role: "user".to_string(),
+                    content: Some("internal turn".to_string()),
+                    attachments_json: None,
+                    tool_calls_json: None,
+                    tool_result_json: None,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                }],
+            ).map_err(|error| error.to_string())?,
+        ).await.map_err(|error| error.to_string())?;
+        let parent = fixture.store.get_messages("main").await
+            .map_err(|error| error.to_string())?;
+        let hidden = parent.iter().filter_map(|row| row.id).collect();
+        fixture.state.storage.conversation_archive.settle_internal_turn(
+            WORKSPACE_ID, "main", "racing-internal", hidden,
+        )?;
+        release_tx.send(()).map_err(|_| "snapshot barrier closed".to_string())?;
+        let created = creation.await.map_err(|error| error.to_string())??;
+        let child_rows = fixture.store.get_messages(&created.creation.entry.conversation_id).await
+            .map_err(|error| error.to_string())?;
+        assert!(child_rows.is_empty(), "internal turn entered the child snapshot");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_child_delete_and_parent_cascade_cancel_and_aggregate_cleanup()
+    -> Result<(), String> {
+        let fixture = fixture().await?;
+        create_primary(fixture.store.as_ref(), "main").await?;
+        let direct = fixture
+            .state
+            .create_side_conversation_owned(
+                side_request("main", "direct-child"),
+            )
+            .await?;
+        let direct_child = direct.creation.entry.conversation_id.clone();
+        drop(direct);
+        fixture
+            .state
+            .storage
+            .chat_events
+            .append(
+                WORKSPACE_ID,
+                Some(&direct_child),
+                "later-turn",
+                crate::chat_driver::ChatDriverEvent::TurnStatus {
+                    status: "failed".to_string(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            fixture
+                .state
+                .list_side_conversations_scoped(WORKSPACE_ID)
+                .await?
+                .first()
+                .map(|entry| entry.status),
+            Some(crate::side_conversation::SideConversationStatus::Failed)
+        );
+        let direct_lease = fixture
+            .state
+            .session
+            .foreground_turns
+            .begin_scoped(WORKSPACE_ID, crate::foreground_turn::ForegroundTurnSurface::Gui, &direct_child, "direct-turn")
+            .map_err(|error| error.to_string())?;
+        let direct_settlement = settle_when_cancelled(direct_lease);
+        fixture
+            .state
+            .delete_conversation_scoped(WORKSPACE_ID, &direct_child)
+            .await
+            .map_err(|error| error.to_string())?;
+        direct_settlement
+            .await
+            .map_err(|error| error.to_string())??;
+        assert!(
+            fixture
+                .store
+                .get_conversation("main")
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some()
+        );
+
+        let cascading = fixture
+            .state
+            .create_side_conversation_owned(side_request("main", "cascade-child"))
+            .await?;
+        let cascading_child = cascading.creation.entry.conversation_id.clone();
+        drop(cascading);
+        let cascading_lease = fixture
+            .state
+            .session
+            .foreground_turns
+            .begin_scoped(
+                WORKSPACE_ID,
+                crate::foreground_turn::ForegroundTurnSurface::Gui,
+                &cascading_child,
+                "cascade-turn",
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            fixture
+                .state
+                .list_side_conversations_scoped(WORKSPACE_ID)
+                .await?
+                .first()
+                .map(|entry| entry.status),
+            Some(crate::side_conversation::SideConversationStatus::Running)
+        );
+        let cascading_settlement = settle_when_cancelled(cascading_lease);
+        fixture
+            .deletions
+            .fail_next_tombstone_retirement_for_test();
+        let receipt = fixture
+            .state
+            .delete_conversation_scoped(WORKSPACE_ID, "main")
+            .await
+            .map_err(|error| error.to_string())?;
+        cascading_settlement
+            .await
+            .map_err(|error| error.to_string())??;
+        assert!(receipt.cleanup_pending);
+        assert!(
+            fixture
+                .store
+                .get_conversation("main")
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .get_conversation(&cascading_child)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(
+            fixture
+                .state
+                .list_side_conversations_scoped(WORKSPACE_ID)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parent_delete_serializes_with_side_creation_and_leaves_no_orphan()
+    -> Result<(), String> {
+        let fixture = fixture().await?;
+        create_primary(fixture.store.as_ref(), "main").await?;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        fixture
+            .deletions
+            .install_before_lineage_barrier(entered_tx, release_rx);
+        let deleting_state = Arc::clone(&fixture.state);
+        let deleting = tokio::spawn(async move {
+            deleting_state
+                .delete_conversation_scoped(WORKSPACE_ID, "main")
+                .await
+        });
+        entered_rx
+            .await
+            .map_err(|_| "parent deletion did not reach its identity barrier".to_string())?;
+
+        let request = side_request("main", "racing-child");
+        let child_id = crate::side_conversation::SideConversationService::child_id_for_request(
+            &request,
+        )
+        .map_err(|error| error.to_string())?;
+        let creating_state = Arc::clone(&fixture.state);
+        let mut creating = tokio::spawn(async move {
+            creating_state.create_side_conversation_owned(request).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut creating)
+                .await
+                .is_err(),
+            "side creation passed the parent identity guard"
+        );
+        release_tx
+            .send(())
+            .map_err(|_| "parent deletion barrier closed early".to_string())?;
+        deleting
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let create_result = creating.await.map_err(|error| error.to_string())?;
+        assert!(create_result.is_err());
+        assert!(
+            fixture
+                .store
+                .get_conversation(&child_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(
+            fixture
+                .state
+                .list_side_conversations_scoped(WORKSPACE_ID)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_gui_turn_admission_closes_the_post_create_delete_window()
+    -> Result<(), String> {
+        let fixture = fixture().await?;
+        create_primary(fixture.store.as_ref(), "main").await?;
+        let preparation = fixture
+            .state
+            .create_side_conversation_owned(side_request("main", "first-turn-race"))
+            .await?;
+        let child_id = preparation.creation.entry.conversation_id.clone();
+
+        let deleting_state = Arc::clone(&fixture.state);
+        let child_for_delete = child_id.clone();
+        let mut deleting = tokio::spawn(async move {
+            deleting_state
+                .delete_conversation_scoped(WORKSPACE_ID, &child_for_delete)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut deleting)
+                .await
+                .is_err(),
+            "child deletion passed the retained first-turn admission identity"
+        );
+
+        let lease = fixture
+            .state
+            .begin_side_conversation_gui_turn(preparation.admission, "side-start:first-turn-race")
+            .await
+            .map_err(|error| error.to_string())?;
+        let settlement = settle_when_cancelled(lease);
+        let receipt = deleting
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        settlement.await.map_err(|error| error.to_string())??;
+
+        assert!(!receipt.cleanup_pending);
+        assert!(
+            fixture
+                .store
+                .get_conversation(&child_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(
+            fixture
+                .state
+                .list_side_conversations_scoped(WORKSPACE_ID)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod workspace_transition_tests {
     use super::*;
     use echo_agent::agent::ReactAgentBuilder;
@@ -1749,11 +2197,14 @@ mod workspace_transition_tests {
                 .map_err(|error| error.to_string())?;
             host.resources()
                 .conversation_store()
-                .ensure_conversation(NewConversation {
-                    conversation_id: conversation_id.to_string(),
-                    user_id: "default".to_string(),
-                    agent_type: None,
-                    title: Some(conversation_id.to_string()),
+                .ensure_projection_epoch(echo_agent::memory::EnsureConversationProjectionRequest {
+                    conversation: NewConversation {
+                        conversation_id: conversation_id.to_string(),
+                        user_id: "default".to_string(),
+                        agent_type: None,
+                        title: Some(conversation_id.to_string()),
+                    },
+                    expected_tombstone_epoch: None,
                 })
                 .await
                 .map_err(|error| error.to_string())?;
@@ -1958,11 +2409,14 @@ mod workspace_transition_tests {
                 .map_err(|error| error.to_string())?;
             host.resources()
                 .conversation_store()
-                .ensure_conversation(NewConversation {
-                    conversation_id: conversation_id.to_string(),
-                    user_id: "default".to_string(),
-                    agent_type: None,
-                    title: Some(conversation_id.to_string()),
+                .ensure_projection_epoch(echo_agent::memory::EnsureConversationProjectionRequest {
+                    conversation: NewConversation {
+                        conversation_id: conversation_id.to_string(),
+                        user_id: "default".to_string(),
+                        agent_type: None,
+                        title: Some(conversation_id.to_string()),
+                    },
+                    expected_tombstone_epoch: None,
                 })
                 .await
                 .map_err(|error| error.to_string())?;
@@ -2130,10 +2584,28 @@ mod workspace_transition_tests {
             tool_result_json: None,
             created_at,
         });
-        target_store
-            .save_messages(&target.conversation_id, &transcript)
+        let additions = transcript.split_off(transcript.len().saturating_sub(2));
+        let authority = target_store
+            .get_projection_authority(&target.conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "target managed projection authority is missing".to_string())?;
+        let batch = echo_agent::memory::TranscriptProjectionBatch::prepare(
+            &target.conversation_id,
+            authority.epoch,
+            "fixture-transcript-crash-window",
+            0,
+            additions,
+        )
+        .map_err(|error| error.to_string())?;
+        let projection = target_store
+            .apply_transcript_projection(batch)
             .await
             .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            projection.status,
+            echo_agent::memory::TranscriptProjectionApplyStatus::Applied
+        ));
 
         assert!(
             state
@@ -2490,8 +2962,1309 @@ mod workspace_transition_tests {
             crate::tool_execution::ToolExecutionRepository::open(root.join("tool-executions"))
                 .map_err(|error| error.to_string())?,
         );
+        state.storage.conversation_archive = Arc::new(
+            crate::conversation_archive::ConversationArchiveStore::open(
+                root.join("conversation-visibility.json"),
+            )?,
+        );
+        state.agent_router = Arc::new(crate::agent_router::AgentRouter::new(root.join("router")));
         state.set_pool(Arc::clone(&seed_pool));
         Ok((Arc::new(state), seed_pool, plugin_runtime))
+    }
+
+    #[tokio::test]
+    async fn handoff_collision_preserves_both_workspace_conversations() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root_a = temp.path().join("workspace-a");
+        let root_b = temp.path().join("workspace-b");
+        std::fs::create_dir_all(&root_a).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&root_b).map_err(|error| error.to_string())?;
+        let (state, _, _) = extension_control_state(temp.path()).await?;
+        let workspace_a = state
+            .workspace
+            .registry
+            .create_at("workspace-a", crate::workspace::WorkspaceKind::General, root_a)
+            .map_err(|error| error.to_string())?;
+        let workspace_b = state
+            .workspace
+            .registry
+            .create_at("workspace-b", crate::workspace::WorkspaceKind::General, root_b)
+            .map_err(|error| error.to_string())?;
+        state
+            .switch_workspace(workspace_a)
+            .await
+            .map_err(|error| error.to_string())?;
+        state
+            .switch_workspace(workspace_b)
+            .await
+            .map_err(|error| error.to_string())?;
+        let destination = state
+            .chat_runtime_for_scope("workspace-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        let source = state
+            .chat_runtime_for_scope("workspace-b")
+            .await
+            .map_err(|error| error.to_string())?;
+        for (runtime, title) in [(&destination, "Keep"), (&source, "Move")] {
+            runtime
+                .ensure_conversation(echo_agent::memory::NewConversation {
+                    conversation_id: "same-id".to_string(),
+                    user_id: "test".to_string(),
+                    agent_type: None,
+                    title: Some(title.to_string()),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let operation = AppStateAgentControlOps::new(&state);
+        let result = crate::agent_control::AgentControlAppOps::handoff_conversation(
+            &operation,
+            crate::agent_control::AgentHandoffRequest {
+                workspace_id: "workspace-b".to_string(),
+                conversation_id: "same-id".to_string(),
+                destination_workspace_id: "workspace-a".to_string(),
+                follow_up: None,
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        for (runtime, title) in [(&destination, "Keep"), (&source, "Move")] {
+            let stored = runtime
+                .conversation_store()
+                .ok_or_else(|| "conversation store missing".to_string())?
+                .get_conversation("same-id")
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "conversation was deleted by collision".to_string())?;
+            assert_eq!(stored.title.as_deref(), Some(title));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_retired_destination_and_reappeared_source_fail_closed() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let state = handoff_recovery_fixture(temp.path()).await?;
+        let source = state.chat_runtime_for_scope("workspace-a").await
+            .map_err(|error| error.to_string())?;
+        source.ensure_conversation(echo_agent::memory::NewConversation {
+            conversation_id: "round-trip".to_string(),
+            user_id: "test".to_string(),
+            agent_type: None,
+            title: Some("Move".to_string()),
+        }).await.map_err(|error| error.to_string())?;
+        let operation = AppStateAgentControlOps::new(&state);
+        let forward = crate::agent_control::AgentHandoffRequest {
+            workspace_id: "workspace-a".to_string(),
+            conversation_id: "round-trip".to_string(),
+            destination_workspace_id: "workspace-b".to_string(),
+            follow_up: None,
+        };
+        crate::agent_control::AgentControlAppOps::handoff_conversation(&operation, forward.clone())
+            .await.map_err(|error| error.to_string())?;
+        let reverse = crate::agent_control::AgentHandoffRequest {
+            workspace_id: "workspace-b".to_string(),
+            conversation_id: "round-trip".to_string(),
+            destination_workspace_id: "workspace-a".to_string(),
+            follow_up: None,
+        };
+        assert!(crate::agent_control::AgentControlAppOps::handoff_conversation(&operation, reverse)
+            .await.is_err());
+        assert!(state.storage.conversation_archive.pending_handoffs()?.is_empty());
+        let source_store = source.conversation_store()
+            .ok_or_else(|| "source store missing".to_string())?;
+        let tombstone = source_store.get_projection_authority("round-trip").await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "source tombstone missing".to_string())?;
+        source_store.ensure_projection_epoch(
+            echo_agent::memory::EnsureConversationProjectionRequest {
+                conversation: echo_agent::memory::NewConversation {
+                    conversation_id: "round-trip".to_string(),
+                    user_id: "test".to_string(),
+                    agent_type: None,
+                    title: Some("Move".to_string()),
+                },
+                expected_tombstone_epoch: Some(tombstone.epoch),
+            },
+        ).await.map_err(|error| error.to_string())?;
+        assert!(crate::agent_control::AgentControlAppOps::handoff_conversation(&operation, forward)
+            .await.is_err());
+        let destination = state.chat_runtime_for_scope("workspace-b").await
+            .map_err(|error| error.to_string())?;
+        let authority = destination.conversation_store()
+            .ok_or_else(|| "destination store missing".to_string())?
+            .get_projection_authority("round-trip").await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "destination authority missing".to_string())?;
+        assert_eq!(authority.epoch, 2);
+        assert!(source_store.get_conversation("round-trip").await
+            .map_err(|error| error.to_string())?.is_some());
+        Ok(())
+    }
+
+    async fn handoff_recovery_fixture(
+        root: &std::path::Path,
+    ) -> Result<Arc<AppState>, String> {
+        let root_a = root.join("workspace-a");
+        let root_b = root.join("workspace-b");
+        std::fs::create_dir_all(&root_a).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&root_b).map_err(|error| error.to_string())?;
+        let (state, _, _) = extension_control_state(root).await?;
+        let workspace_a = state
+            .workspace
+            .registry
+            .create_at("workspace-a", crate::workspace::WorkspaceKind::General, root_a)
+            .map_err(|error| error.to_string())?;
+        let workspace_b = state
+            .workspace
+            .registry
+            .create_at("workspace-b", crate::workspace::WorkspaceKind::General, root_b)
+            .map_err(|error| error.to_string())?;
+        state.switch_workspace(workspace_a).await.map_err(|error| error.to_string())?;
+        state.switch_workspace(workspace_b).await.map_err(|error| error.to_string())?;
+        Ok(state)
+    }
+
+    async fn prepare_handoff_recovery_intent(
+        state: &Arc<AppState>,
+        conversation_id: &str,
+    ) -> Result<String, String> {
+        let source = state
+            .chat_runtime_for_scope("workspace-b")
+            .await
+            .map_err(|error| error.to_string())?;
+        let source_store = source
+            .conversation_store()
+            .ok_or_else(|| "source store missing".to_string())?;
+        let conversation = source_store
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "source conversation missing".to_string())?;
+        let rows = source_store
+            .get_messages(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let source_epoch = source_store.get_projection_authority(conversation_id).await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "source authority missing".to_string())?.epoch;
+        let destination = state.chat_runtime_for_scope("workspace-a").await
+            .map_err(|error| error.to_string())?;
+        let target_base_epoch = destination.conversation_store()
+            .ok_or_else(|| "destination store missing".to_string())?
+            .get_projection_authority(conversation_id).await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "destination authority missing".to_string())?.epoch;
+        let operation_id = crate::conversation_archive::ConversationArchiveStore::handoff_operation_id(
+            "workspace-b",
+            "workspace-a",
+            conversation_id,
+        )?;
+        state.storage.conversation_archive.prepare_handoff(
+            crate::conversation_archive::ConversationHandoffIntent {
+                operation_id: operation_id.clone(),
+                source_workspace_id: "workspace-b".to_string(),
+                destination_workspace_id: "workspace-a".to_string(),
+                conversation_id: conversation_id.to_string(),
+                source_epoch,
+                target_base_epoch,
+                source_fingerprint: AppStateAgentControlOps::handoff_source_fingerprint(
+                    &conversation,
+                    &rows,
+                )
+                .map_err(|error| error.to_string())?,
+                follow_up: None,
+                phase: crate::conversation_archive::ConversationHandoffPhase::Prepared,
+            },
+        )?;
+        Ok(operation_id)
+    }
+
+    #[tokio::test]
+    async fn handoff_recovers_prepared_target_before_import() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let state = handoff_recovery_fixture(temp.path()).await?;
+        let source = state
+            .chat_runtime_for_scope("workspace-b")
+            .await
+            .map_err(|error| error.to_string())?;
+        let destination = state
+            .chat_runtime_for_scope("workspace-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        for runtime in [&source, &destination] {
+            runtime
+                .ensure_conversation(echo_agent::memory::NewConversation {
+                    conversation_id: "prepared-cut".to_string(),
+                    user_id: "test".to_string(),
+                    agent_type: None,
+                    title: Some("Moved".to_string()),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let operation_id = prepare_handoff_recovery_intent(&state, "prepared-cut").await?;
+        assert!(crate::conversation_archive::ConversationArchiveStore::open(
+            temp.path().join("conversation-visibility.json")
+        )?
+        .handoff(&operation_id)?
+        .is_some());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            state.recover_pending_conversation_handoffs(),
+        )
+        .await
+        .map_err(|_| "prepared handoff recovery did not settle".to_string())??;
+        let authority = destination
+            .conversation_store()
+            .ok_or_else(|| "destination store missing".to_string())?
+            .get_projection_authority("prepared-cut")
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "destination authority missing".to_string())?;
+        assert_eq!(authority.epoch, 2);
+        assert!(source
+            .conversation_store()
+            .ok_or_else(|| "source store missing".to_string())?
+            .get_conversation("prepared-cut")
+            .await
+            .map_err(|error| error.to_string())?
+            .is_none());
+        assert!(state.storage.conversation_archive.handoff(&operation_id)?.is_none());
+        assert!(state.storage.conversation_archive.completed_handoff(&operation_id)?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_handoff_fences_both_turn_admissions_after_persist_failure()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let state = handoff_recovery_fixture(temp.path()).await?;
+        let source = state.chat_runtime_for_scope("workspace-b").await
+            .map_err(|error| error.to_string())?;
+        let destination = state.chat_runtime_for_scope("workspace-a").await
+            .map_err(|error| error.to_string())?;
+        for runtime in [&source, &destination] {
+            runtime.ensure_conversation(echo_agent::memory::NewConversation {
+                conversation_id: "fenced-cut".to_string(),
+                user_id: "test".to_string(),
+                agent_type: None,
+                title: Some("Move".to_string()),
+            }).await.map_err(|error| error.to_string())?;
+        }
+        let operation_id = prepare_handoff_recovery_intent(&state, "fenced-cut").await?;
+        state.storage.conversation_archive.fail_next_persist_for_test();
+        assert!(state.storage.conversation_archive.advance_handoff(
+            &operation_id,
+            crate::conversation_archive::ConversationHandoffPhase::TargetImported,
+        ).is_err());
+        for runtime in [&source, &destination] {
+            let turn = runtime.begin_turn(
+                &state.session.foreground_turns,
+                crate::foreground_turn::ForegroundTurnSurface::Gui,
+                "fenced-cut", "forbidden-turn",
+            ).await;
+            assert!(matches!(turn,
+                Err(crate::conversation_deletion::ConversationDeletionError::HandoffPending(_))));
+            assert!(matches!(runtime.begin_managed_replacement(
+                &state.session.foreground_turns, "fenced-cut",
+            ).await,
+                Err(crate::conversation_deletion::ConversationDeletionError::HandoffPending(_))));
+            assert!(matches!(runtime.ensure_conversation(
+                echo_agent::memory::NewConversation {
+                    conversation_id: "fenced-cut".to_string(),
+                    user_id: "test".to_string(),
+                    agent_type: None,
+                    title: Some("Move".to_string()),
+                },
+            ).await,
+                Err(crate::conversation_deletion::ConversationDeletionError::HandoffPending(_))));
+            assert!(matches!(runtime.create_conversation(
+                echo_agent::memory::NewConversation {
+                    conversation_id: "fenced-cut".to_string(),
+                    user_id: "test".to_string(),
+                    agent_type: None,
+                    title: Some("Move".to_string()),
+                },
+            ).await,
+                Err(crate::conversation_deletion::ConversationDeletionError::HandoffPending(_))));
+        }
+        state.recover_pending_conversation_handoffs().await?;
+        assert!(state.storage.conversation_archive.completed_handoff(&operation_id)?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_boot_retires_abandoned_intent_after_target_rollback()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let state = handoff_recovery_fixture(temp.path()).await?;
+        let source = state.chat_runtime_for_scope("workspace-b").await
+            .map_err(|error| error.to_string())?;
+        let destination = state.chat_runtime_for_scope("workspace-a").await
+            .map_err(|error| error.to_string())?;
+        for runtime in [&source, &destination] {
+            runtime.ensure_conversation(echo_agent::memory::NewConversation {
+                conversation_id: "rolled-back-cut".to_string(),
+                user_id: "test".to_string(),
+                agent_type: None,
+                title: Some("Move".to_string()),
+            }).await.map_err(|error| error.to_string())?;
+        }
+        let operation_id = prepare_handoff_recovery_intent(&state, "rolled-back-cut").await?;
+        let admission = destination.begin_handoff_recovery(
+            &state.session.foreground_turns, "rolled-back-cut",
+        ).await.map_err(|error| error.to_string())?;
+        state.delete_conversation_tree_with_runtime(
+            &destination, "rolled-back-cut", Some(admission),
+        ).await.map_err(|error| error.to_string())?;
+        state.recover_pending_conversation_handoffs().await?;
+        assert!(state.storage.conversation_archive.handoff(&operation_id)?.is_none());
+        assert!(source.conversation_store().ok_or_else(|| "source store missing".to_string())?
+            .get_conversation("rolled-back-cut").await.map_err(|error| error.to_string())?
+            .is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_recovers_imported_target_without_second_epoch() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let state = handoff_recovery_fixture(temp.path()).await?;
+        let source = state
+            .chat_runtime_for_scope("workspace-b")
+            .await
+            .map_err(|error| error.to_string())?;
+        let destination = state
+            .chat_runtime_for_scope("workspace-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        for runtime in [&source, &destination] {
+            runtime
+                .ensure_conversation(echo_agent::memory::NewConversation {
+                    conversation_id: "imported-cut".to_string(),
+                    user_id: "test".to_string(),
+                    agent_type: None,
+                    title: Some("Moved".to_string()),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let operation_id = prepare_handoff_recovery_intent(&state, "imported-cut").await?;
+        state.storage.conversation_archive.prepare_visibility_transfer(
+            "workspace-a",
+            "imported-cut",
+            crate::conversation_archive::VisibilityTransfer {
+                expected_epoch: 2,
+                hidden_rows: Vec::new(),
+            },
+        )?;
+        let execution = destination
+            .agent_for_handoff("imported-cut")
+            .await
+            .map_err(|error| error.to_string())?;
+        crate::managed_conversation::replace_and_resume(
+            destination
+                .conversation_store()
+                .ok_or_else(|| "destination store missing".to_string())?
+                .as_ref(),
+            destination
+                .runtime_state_store()
+                .ok_or_else(|| "destination runtime state missing".to_string())?
+                .as_ref(),
+            &execution.agent(),
+            "imported-cut",
+            &[],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        drop(execution);
+        state.internal_message_ids_scoped("workspace-a", "imported-cut").await?;
+        state.storage.conversation_archive.advance_handoff(
+            &operation_id,
+            crate::conversation_archive::ConversationHandoffPhase::TargetImported,
+        )?;
+        drop(source);
+        drop(destination);
+        drop(state);
+        let (state, _, _) = extension_control_state(temp.path()).await?;
+        for workspace in state.workspace.registry.list().map_err(|error| error.to_string())? {
+            state.switch_workspace(workspace).await.map_err(|error| error.to_string())?;
+        }
+        let source = state.chat_runtime_for_scope("workspace-b").await
+            .map_err(|error| error.to_string())?;
+        let destination = state.chat_runtime_for_scope("workspace-a").await
+            .map_err(|error| error.to_string())?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            state.recover_pending_conversation_handoffs(),
+        )
+        .await
+        .map_err(|_| "imported handoff recovery did not settle".to_string())??;
+        let authority = destination
+            .conversation_store()
+            .ok_or_else(|| "destination store missing".to_string())?
+            .get_projection_authority("imported-cut")
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "destination authority missing".to_string())?;
+        assert_eq!(authority.epoch, 2);
+        assert!(source
+            .conversation_store()
+            .ok_or_else(|| "source store missing".to_string())?
+            .get_conversation("imported-cut")
+            .await
+            .map_err(|error| error.to_string())?
+            .is_none());
+        assert!(state.storage.conversation_archive.handoff(&operation_id)?.is_none());
+        let request = crate::agent_control::AgentHandoffRequest {
+            workspace_id: "workspace-b".to_string(),
+            conversation_id: "imported-cut".to_string(),
+            destination_workspace_id: "workspace-a".to_string(),
+            follow_up: None,
+        };
+        let operation = AppStateAgentControlOps::new(&state);
+        let active_destination = destination.begin_turn(
+            &state.session.foreground_turns,
+            crate::foreground_turn::ForegroundTurnSurface::Gui,
+            "imported-cut", "active-after-handoff",
+        ).await.map_err(|error| error.to_string())?;
+        let repeated = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::agent_control::AgentControlAppOps::handoff_conversation(&operation, request),
+        ).await.map_err(|_| "completed handoff retry waited for destination turn".to_string())?
+        .map_err(|error| error.to_string())?;
+        active_destination.settle_after_observers(crate::chat_driver::TurnOutcome::Completed)
+            .await.map_err(|error| error.to_string())?;
+        assert_eq!(repeated["messages_migrated"], 0);
+        assert_eq!(repeated["follow_up_delivered"], false);
+        assert!(state.storage.conversation_archive.completed_handoff(&operation_id)?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_recovers_after_source_retirement_before_completion()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let state = handoff_recovery_fixture(temp.path()).await?;
+        let source = state.chat_runtime_for_scope("workspace-b").await
+            .map_err(|error| error.to_string())?;
+        let destination = state.chat_runtime_for_scope("workspace-a").await
+            .map_err(|error| error.to_string())?;
+        for runtime in [&source, &destination] {
+            runtime.ensure_conversation(echo_agent::memory::NewConversation {
+                conversation_id: "retired-cut".to_string(),
+                user_id: "test".to_string(),
+                agent_type: None,
+                title: Some("Moved".to_string()),
+            }).await.map_err(|error| error.to_string())?;
+        }
+        let operation_id = prepare_handoff_recovery_intent(&state, "retired-cut").await?;
+        state.storage.conversation_archive.prepare_visibility_transfer(
+            "workspace-a", "retired-cut",
+            crate::conversation_archive::VisibilityTransfer {
+                expected_epoch: 2,
+                hidden_rows: Vec::new(),
+            },
+        )?;
+        let execution = destination.agent_for_handoff("retired-cut").await
+            .map_err(|error| error.to_string())?;
+        crate::managed_conversation::replace_and_resume(
+            destination.conversation_store().ok_or_else(|| "destination store missing".to_string())?.as_ref(),
+            destination.runtime_state_store().ok_or_else(|| "destination runtime state missing".to_string())?.as_ref(),
+            &execution.agent(), "retired-cut", &[],
+        ).await.map_err(|error| error.to_string())?;
+        drop(execution);
+        state.internal_message_ids_scoped("workspace-a", "retired-cut").await?;
+        state.storage.conversation_archive.advance_handoff(
+            &operation_id, crate::conversation_archive::ConversationHandoffPhase::TargetImported,
+        )?;
+        let source_admission = source.begin_handoff_recovery(
+            &state.session.foreground_turns, "retired-cut",
+        ).await.map_err(|error| error.to_string())?;
+        state.delete_conversation_tree_with_runtime(
+            &source, "retired-cut", Some(source_admission),
+        ).await
+            .map_err(|error| error.to_string())?;
+        state.storage.conversation_archive.advance_handoff(
+            &operation_id, crate::conversation_archive::ConversationHandoffPhase::SourceRetired,
+        )?;
+        state.recover_pending_conversation_handoffs().await?;
+        let receipt = state.storage.conversation_archive.completed_handoff(&operation_id)?
+            .ok_or_else(|| "handoff completion receipt missing".to_string())?;
+        assert_eq!(receipt.message_count, 0);
+        assert!(state.storage.conversation_archive.handoff(&operation_id)?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_preserves_hidden_internal_rows_under_new_destination_ids()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root_a = temp.path().join("workspace-a");
+        let root_b = temp.path().join("workspace-b");
+        std::fs::create_dir_all(&root_a).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&root_b).map_err(|error| error.to_string())?;
+        let (state, _, _) = extension_control_state(temp.path()).await?;
+        let workspace_a = state
+            .workspace
+            .registry
+            .create_at("workspace-a", crate::workspace::WorkspaceKind::General, root_a)
+            .map_err(|error| error.to_string())?;
+        let workspace_b = state
+            .workspace
+            .registry
+            .create_at("workspace-b", crate::workspace::WorkspaceKind::General, root_b)
+            .map_err(|error| error.to_string())?;
+        state.switch_workspace(workspace_a).await.map_err(|error| error.to_string())?;
+        state.switch_workspace(workspace_b).await.map_err(|error| error.to_string())?;
+        let source = state.chat_runtime_for_scope("workspace-b").await.map_err(|error| error.to_string())?;
+        let source_store = source.conversation_store().ok_or_else(|| "source store missing".to_string())?;
+        source_store
+            .create_conversation(echo_agent::memory::NewConversation {
+                conversation_id: "move-hidden".to_string(),
+                user_id: "test".to_string(),
+                agent_type: None,
+                title: Some("Source".to_string()),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let rows = [
+            ("user", "ordinary input"),
+            ("user", "internal instruction"),
+            ("assistant", "internal result"),
+        ]
+        .into_iter()
+        .map(|(role, content)| echo_agent::memory::StoredMessage {
+            id: None,
+            conversation_id: "move-hidden".to_string(),
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            attachments_json: None,
+            tool_calls_json: None,
+            tool_result_json: None,
+            created_at: Utc::now().to_rfc3339(),
+        })
+        .collect::<Vec<_>>();
+        source_store.save_messages("move-hidden", &rows).await.map_err(|error| error.to_string())?;
+        let epoch = source_store
+            .ensure_projection_epoch(echo_agent::memory::EnsureConversationProjectionRequest {
+                conversation: echo_agent::memory::NewConversation {
+                    conversation_id: "move-hidden".to_string(),
+                    user_id: "test".to_string(),
+                    agent_type: None,
+                    title: Some("Source".to_string()),
+                },
+                expected_tombstone_epoch: None,
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .authority
+            .epoch;
+        let source_rows = source_store.get_messages("move-hidden").await.map_err(|error| error.to_string())?;
+        let hidden_ids = source_rows.iter().skip(1).filter_map(|row| row.id).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(hidden_ids.len(), 2);
+        state.storage.conversation_archive.prepare_internal_turn(
+            "workspace-b", "move-hidden", epoch, "delivery-source", 1, "internal instruction"
+        )?;
+        state.storage.conversation_archive.settle_internal_turn(
+            "workspace-b", "move-hidden", "delivery-source", hidden_ids
+        )?;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        source
+            .deletions
+            .install_before_lineage_barrier(entered_tx, release_rx);
+        let handoff_state = Arc::clone(&state);
+        let handoff = tokio::spawn(async move {
+            let operation = AppStateAgentControlOps::new(&handoff_state);
+            crate::agent_control::AgentControlAppOps::handoff_conversation(
+                &operation,
+                crate::agent_control::AgentHandoffRequest {
+                    workspace_id: "workspace-b".to_string(),
+                    conversation_id: "move-hidden".to_string(),
+                    destination_workspace_id: "workspace-a".to_string(),
+                    follow_up: None,
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx)
+            .await
+            .map_err(|_| "source retirement did not reach its lineage barrier".to_string())?
+            .map_err(|error| error.to_string())?;
+        assert!(state
+            .session
+            .foreground_turns
+            .begin_scoped(
+                "workspace-a",
+                crate::foreground_turn::ForegroundTurnSurface::Gui,
+                "move-hidden",
+                "racing-destination-turn",
+            )
+            .is_err());
+        release_tx.send(()).map_err(|_| "lineage barrier closed".to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(20), handoff)
+            .await
+            .map_err(|_| "handoff did not settle".to_string())?
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let destination = state.chat_runtime_for_scope("workspace-a").await.map_err(|error| error.to_string())?;
+        let destination_rows = destination
+            .conversation_store()
+            .ok_or_else(|| "destination store missing".to_string())?
+            .get_messages("move-hidden")
+            .await
+            .map_err(|error| error.to_string())?;
+        let destination_hidden = state.internal_message_ids_scoped("workspace-a", "move-hidden").await?;
+        assert_eq!(destination_rows.len(), 3);
+        assert_eq!(destination_hidden.len(), 2);
+        assert!(destination_rows.iter().skip(1).all(|row| row.id.is_some_and(|id| destination_hidden.contains(&id))));
+        assert!(source_store.get_conversation("move-hidden").await.map_err(|error| error.to_string())?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_invalid_import_rolls_back_only_new_destination() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root_a = temp.path().join("workspace-a");
+        let root_b = temp.path().join("workspace-b");
+        std::fs::create_dir_all(&root_a).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&root_b).map_err(|error| error.to_string())?;
+        let (state, _, _) = extension_control_state(temp.path()).await?;
+        let workspace_a = state
+            .workspace
+            .registry
+            .create_at("workspace-a", crate::workspace::WorkspaceKind::General, root_a)
+            .map_err(|error| error.to_string())?;
+        let workspace_b = state
+            .workspace
+            .registry
+            .create_at("workspace-b", crate::workspace::WorkspaceKind::General, root_b)
+            .map_err(|error| error.to_string())?;
+        state
+            .switch_workspace(workspace_a)
+            .await
+            .map_err(|error| error.to_string())?;
+        state
+            .switch_workspace(workspace_b)
+            .await
+            .map_err(|error| error.to_string())?;
+        let source = state
+            .chat_runtime_for_scope("workspace-b")
+            .await
+            .map_err(|error| error.to_string())?;
+        let source_store = source
+            .conversation_store()
+            .ok_or_else(|| "source store missing".to_string())?;
+        source_store
+            .create_conversation(echo_agent::memory::NewConversation {
+                conversation_id: "busy-source".to_string(),
+                user_id: "test".to_string(),
+                agent_type: None,
+                title: Some("Source".to_string()),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        source_store
+            .save_messages(
+                "busy-source",
+                &[echo_agent::memory::StoredMessage {
+                    id: None,
+                    conversation_id: "busy-source".to_string(),
+                    role: "invalid-role".to_string(),
+                    content: Some("cannot restore".to_string()),
+                    attachments_json: None,
+                    tool_calls_json: None,
+                    tool_result_json: None,
+                    created_at: Utc::now().to_rfc3339(),
+                }],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let operation = AppStateAgentControlOps::new(&state);
+        let request = crate::agent_control::AgentHandoffRequest {
+            workspace_id: "workspace-b".to_string(),
+            conversation_id: "busy-source".to_string(),
+            destination_workspace_id: "workspace-a".to_string(),
+            follow_up: None,
+        };
+        let active = state
+            .begin_conversation_turn_owned(
+                crate::foreground_turn::ForegroundTurnSurface::Gui,
+                "busy-source",
+                "active-turn",
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let active_result = crate::agent_control::AgentControlAppOps::handoff_conversation(
+            &operation,
+            request.clone(),
+        )
+        .await;
+        assert!(active_result.is_err());
+        let destination = state
+            .chat_runtime_for_scope("workspace-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(destination
+            .conversation_store()
+            .ok_or_else(|| "destination store missing".to_string())?
+            .get_conversation("busy-source")
+            .await
+            .map_err(|error| error.to_string())?
+            .is_none());
+        drop(active);
+        let result = crate::agent_control::AgentControlAppOps::handoff_conversation(
+            &operation,
+            request,
+        )
+        .await;
+        assert!(result.is_err());
+        let destination = state
+            .chat_runtime_for_scope("workspace-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(destination
+            .conversation_store()
+            .ok_or_else(|| "destination store missing".to_string())?
+            .get_conversation("busy-source")
+            .await
+            .map_err(|error| error.to_string())?
+            .is_none());
+        assert!(source_store
+            .get_conversation("busy-source")
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_source_retirement_failure_rolls_back_new_destination()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root_a = temp.path().join("workspace-a");
+        let root_b = temp.path().join("workspace-b");
+        std::fs::create_dir_all(&root_a).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&root_b).map_err(|error| error.to_string())?;
+        let (state, _, _) = extension_control_state(temp.path()).await?;
+        let workspace_a = state
+            .workspace
+            .registry
+            .create_at("workspace-a", crate::workspace::WorkspaceKind::General, root_a)
+            .map_err(|error| error.to_string())?;
+        let workspace_b = state
+            .workspace
+            .registry
+            .create_at("workspace-b", crate::workspace::WorkspaceKind::General, root_b)
+            .map_err(|error| error.to_string())?;
+        state.switch_workspace(workspace_a).await.map_err(|error| error.to_string())?;
+        state.switch_workspace(workspace_b).await.map_err(|error| error.to_string())?;
+        let source = state
+            .chat_runtime_for_scope("workspace-b")
+            .await
+            .map_err(|error| error.to_string())?;
+        source
+            .ensure_conversation(echo_agent::memory::NewConversation {
+                conversation_id: "source-fault".to_string(),
+                user_id: "test".to_string(),
+                agent_type: None,
+                title: Some("Source".to_string()),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        source.deletions.fail_next_initial_tombstone_for_test();
+        let operation = AppStateAgentControlOps::new(&state);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            crate::agent_control::AgentControlAppOps::handoff_conversation(
+                &operation,
+                crate::agent_control::AgentHandoffRequest {
+                    workspace_id: "workspace-b".to_string(),
+                    conversation_id: "source-fault".to_string(),
+                    destination_workspace_id: "workspace-a".to_string(),
+                    follow_up: None,
+                },
+            ),
+        )
+        .await
+        .map_err(|_| "faulted handoff did not settle".to_string())?;
+        assert!(result.is_err());
+        let destination = state
+            .chat_runtime_for_scope("workspace-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(destination
+            .conversation_store()
+            .ok_or_else(|| "destination store missing".to_string())?
+            .get_conversation("source-fault")
+            .await
+            .map_err(|error| error.to_string())?
+            .is_none());
+        assert!(source
+            .conversation_store()
+            .ok_or_else(|| "source store missing".to_string())?
+            .get_conversation("source-fault")
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_replacement_guard_blocks_new_turn_until_hydration_finishes()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let workspace_root = temp.path().join("workspace-a");
+        std::fs::create_dir_all(&workspace_root).map_err(|error| error.to_string())?;
+        let (state, _, _) = extension_control_state(temp.path()).await?;
+        let registered = state
+            .workspace
+            .registry
+            .create_at(
+                "workspace-a",
+                crate::workspace::WorkspaceKind::General,
+                workspace_root,
+            )
+            .map_err(|error| error.to_string())?;
+        state
+            .switch_workspace(registered)
+            .await
+            .map_err(|error| error.to_string())?;
+        let runtime = state
+            .chat_runtime_for_scope("workspace-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        runtime
+            .ensure_conversation(echo_agent::memory::NewConversation {
+                conversation_id: "replace-guard".to_string(),
+                user_id: "test".to_string(),
+                agent_type: None,
+                title: None,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let admission = runtime
+            .begin_managed_replacement(&state.session.foreground_turns, "replace-guard")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(state
+            .session
+            .foreground_turns
+            .begin_scoped(
+                "workspace-a",
+                crate::foreground_turn::ForegroundTurnSurface::Gui,
+                "replace-guard",
+                "blocked-turn",
+            )
+            .is_err());
+        drop(admission);
+        let accepted = state
+            .begin_conversation_turn_owned(
+                crate::foreground_turn::ForegroundTurnSurface::Gui,
+                "replace-guard",
+                "accepted-turn",
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(accepted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn branch_import_failure_releases_owners_before_aggregate_rollback()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("workspace-a");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let (state, _, _) = extension_control_state(temp.path()).await?;
+        let workspace = state
+            .workspace
+            .registry
+            .create_at("workspace-a", crate::workspace::WorkspaceKind::General, root)
+            .map_err(|error| error.to_string())?;
+        state
+            .switch_workspace(workspace)
+            .await
+            .map_err(|error| error.to_string())?;
+        let runtime = state
+            .chat_runtime_for_scope("workspace-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        runtime
+            .ensure_conversation(echo_agent::memory::NewConversation {
+                conversation_id: "failed-branch".to_string(),
+                user_id: "test".to_string(),
+                agent_type: None,
+                title: None,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let admission = runtime
+            .begin_managed_replacement(&state.session.foreground_turns, "failed-branch")
+            .await
+            .map_err(|error| error.to_string())?;
+        let execution = runtime
+            .agent_for("failed-branch")
+            .await
+            .map_err(|error| error.to_string())?;
+        let store = runtime
+            .conversation_store()
+            .ok_or_else(|| "conversation store missing".to_string())?;
+        let runtime_state = runtime
+            .runtime_state_store()
+            .ok_or_else(|| "runtime state store missing".to_string())?;
+        let failed = crate::managed_conversation::replace_and_resume(
+            store.as_ref(),
+            runtime_state.as_ref(),
+            &execution.agent(),
+            "failed-branch",
+            &[echo_agent::memory::StoredMessage {
+                id: None,
+                conversation_id: "failed-branch".to_string(),
+                role: "invalid-role".to_string(),
+                content: Some("invalid".to_string()),
+                attachments_json: None,
+                tool_calls_json: None,
+                tool_result_json: None,
+                created_at: Utc::now().to_rfc3339(),
+            }],
+        )
+        .await;
+        assert!(failed.is_err());
+        drop(execution);
+        drop(admission);
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.delete_conversation_scoped("workspace-a", "failed-branch"),
+        )
+        .await
+        .map_err(|_| "branch rollback waited on its own admission".to_string())?
+        .map_err(|error| error.to_string())?;
+        assert_eq!(receipt.conversation_id, "failed-branch");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_loss_before_first_transcript_row_settles_empty_visibility()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("workspace-a");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let (state, _, _) = extension_control_state(temp.path()).await?;
+        let workspace = state
+            .workspace
+            .registry
+            .create_at("workspace-a", crate::workspace::WorkspaceKind::General, root)
+            .map_err(|error| error.to_string())?;
+        state.switch_workspace(workspace).await.map_err(|error| error.to_string())?;
+        let runtime = state.chat_runtime_for_scope("workspace-a").await.map_err(|error| error.to_string())?;
+        let conversation = echo_agent::memory::NewConversation {
+            conversation_id: "empty-effect".to_string(),
+            user_id: "test".to_string(),
+            agent_type: None,
+            title: None,
+        };
+        let store = runtime.conversation_store().ok_or_else(|| "store missing".to_string())?;
+        let authority = store.ensure_projection_epoch(
+            echo_agent::memory::EnsureConversationProjectionRequest {
+                conversation,
+                expected_tombstone_epoch: None,
+            },
+        ).await.map_err(|error| error.to_string())?.authority;
+        let target = crate::agent_router::AgentAddress::new(
+            crate::workspace::WorkspaceId::from_raw("workspace-a".to_string()),
+            "empty-effect".to_string(),
+        );
+        let mut delivery = crate::agent_router::AgentMessage::agent_text(None, target.clone(), "inspect");
+        delivery.message_id = "empty-effect-delivery".to_string();
+        state.storage.conversation_archive.prepare_internal_turn(
+            "workspace-a", "empty-effect", authority.epoch, &delivery.message_id,
+            0, &render_agent_delivery_instruction(&delivery),
+        )?;
+        state.agent_router.enqueue(delivery).await.map_err(|error| error.to_string())?;
+        let claim = state.agent_router.claim_next(&target).await.map_err(|error| error.to_string())?
+            .ok_or_else(|| "claim missing".to_string())?;
+        state.agent_router.begin_injection(&claim, "lost-before-row").await.map_err(|error| error.to_string())?;
+        assert!(state.reconcile_agent_delivery_in_flight(
+            &target, &[], &tokio_util::sync::CancellationToken::new(),
+        ).await.map_err(|error| error.to_string())?);
+        let records = state.agent_router.records(&target).await.map_err(|error| error.to_string())?;
+        assert!(records.iter().any(|record| record.message_id == "empty-effect-delivery"
+            && record.terminal
+            && record.outcome == Some(crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown)));
+        assert!(state.storage.conversation_archive.pending_internal_turns("workspace-a", "empty-effect")?.is_empty());
+        assert!(state.internal_message_ids_scoped("workspace-a", "empty-effect").await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn side_to_primary_visibility_recovers_after_terminal_before_projection()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("workspace-a");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let (state, _, _) = extension_control_state(temp.path()).await?;
+        let workspace = state
+            .workspace
+            .registry
+            .create_at("workspace-a", crate::workspace::WorkspaceKind::General, root)
+            .map_err(|error| error.to_string())?;
+        state
+            .switch_workspace(workspace)
+            .await
+            .map_err(|error| error.to_string())?;
+        let runtime = state
+            .chat_runtime_for_scope("workspace-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        let store = runtime
+            .conversation_store()
+            .ok_or_else(|| "conversation store missing".to_string())?;
+        store
+            .create_conversation(echo_agent::memory::NewConversation {
+                conversation_id: "primary".to_string(),
+                user_id: "test".to_string(),
+                agent_type: None,
+                title: Some("Primary".to_string()),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let side = crate::side_conversation::SideConversationService::new(Arc::clone(
+            &state.agent_router,
+        ))
+        .create(
+            Arc::clone(&store),
+            crate::side_conversation::SideConversationCreateRequest {
+                workspace_id: "workspace-a".to_string(),
+                parent_conversation_id: "primary".to_string(),
+                request_id: "side-recovery".to_string(),
+                prompt: "inspect".to_string(),
+                title: None,
+                model_id: None,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let source = crate::agent_router::AgentAddress::new(
+            crate::workspace::WorkspaceId::from_raw("workspace-a".to_string()),
+            side.entry.conversation_id,
+        );
+        let target = crate::agent_router::AgentAddress::new(
+            crate::workspace::WorkspaceId::from_raw("workspace-a".to_string()),
+            "primary".to_string(),
+        );
+        let mut delivery = crate::agent_router::AgentMessage::agent_text(
+            Some(source),
+            target.clone(),
+            "side result",
+        );
+        delivery.message_id = "delivery-recovery".to_string();
+        assert!(state
+            .agent_delivery_involves_side_conversation(&delivery)
+            .await
+            .map_err(|error| error.to_string())?);
+        let instruction = render_agent_delivery_instruction(&delivery);
+        let epoch = store
+            .ensure_projection_epoch(echo_agent::memory::EnsureConversationProjectionRequest {
+                conversation: echo_agent::memory::NewConversation {
+                    conversation_id: "primary".to_string(),
+                    user_id: "test".to_string(),
+                    agent_type: None,
+                    title: Some("Primary".to_string()),
+                },
+                expected_tombstone_epoch: None,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        state
+            .storage
+            .conversation_archive
+            .prepare_internal_turn(
+                "workspace-a",
+                "primary",
+                epoch.authority.epoch,
+                &delivery.message_id,
+                0,
+                &instruction,
+            )?;
+        store
+            .apply_transcript_projection(echo_agent::memory::TranscriptProjectionBatch::prepare(
+                "primary",
+                epoch.authority.epoch,
+                "primary",
+                0,
+                vec![
+                    echo_agent::memory::StoredMessage {
+                        id: None,
+                        conversation_id: "primary".to_string(),
+                        role: "user".to_string(),
+                        content: Some(instruction),
+                        attachments_json: None,
+                        tool_calls_json: None,
+                        tool_result_json: None,
+                        created_at: Utc::now().to_rfc3339(),
+                    },
+                    echo_agent::memory::StoredMessage {
+                        id: None,
+                        conversation_id: "primary".to_string(),
+                        role: "assistant".to_string(),
+                        content: Some("acknowledged".to_string()),
+                        attachments_json: None,
+                        tool_calls_json: None,
+                        tool_result_json: None,
+                        created_at: Utc::now().to_rfc3339(),
+                    },
+                ],
+            ).map_err(|error| error.to_string())?)
+            .await
+            .map_err(|error| error.to_string())?;
+        state
+            .agent_router
+            .enqueue(delivery)
+            .await
+            .map_err(|error| error.to_string())?;
+        let claim = state
+            .agent_router
+            .claim_next(&target)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "delivery claim missing".to_string())?;
+        state
+            .agent_router
+            .begin_injection(&claim, "turn-recovery")
+            .await
+            .map_err(|error| error.to_string())?;
+        state
+            .agent_router
+            .mailbox_accepted(&claim, "turn-recovery")
+            .await
+            .map_err(|error| error.to_string())?;
+        state
+            .agent_router
+            .drained(&claim, "turn-recovery")
+            .await
+            .map_err(|error| error.to_string())?;
+        let committed = store
+            .get_messages("primary")
+            .await
+            .map_err(|error| error.to_string())?;
+        let committed_ids = committed
+            .iter()
+            .filter_map(|row| row.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        state
+            .storage
+            .conversation_archive
+            .fail_next_persist_for_test();
+        assert!(state
+            .storage
+            .conversation_archive
+            .settle_internal_turn(
+                "workspace-a",
+                "primary",
+                "delivery-recovery",
+                committed_ids.clone(),
+            )
+            .is_err());
+        assert!(state
+            .agent_router
+            .records(&target)
+            .await
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|record| record.message_id == "delivery-recovery" && !record.terminal));
+        assert!(state
+            .reconcile_agent_delivery_in_flight(
+                &target,
+                &[],
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .map_err(|error| error.to_string())?);
+        assert!(state
+            .agent_router
+            .records(&target)
+            .await
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|record| record.message_id == "delivery-recovery" && record.terminal));
+        let ids = state
+            .internal_message_ids_scoped("workspace-a", "primary")
+            .await?;
+        assert_eq!(ids, committed_ids);
+        assert!(state
+            .storage
+            .conversation_archive
+            .pending_internal_turns("workspace-a", "primary")?
+            .is_empty());
+        let reopened = crate::conversation_archive::ConversationArchiveStore::open(
+            temp.path().join("conversation-visibility.json"),
+        )?;
+        assert_eq!(reopened.internal_message_ids("workspace-a", "primary")?, ids);
+        for index in 0..4 {
+            let mut later = crate::agent_router::AgentMessage::agent_text(
+                None,
+                target.clone(),
+                "x".repeat(90_000),
+            );
+            later.message_id = format!("evict-terminal-{index}");
+            state
+                .agent_router
+                .enqueue(later)
+                .await
+                .map_err(|error| error.to_string())?;
+            let claim = state
+                .agent_router
+                .claim_next(&target)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "later delivery claim missing".to_string())?;
+            let turn_id = format!("eviction-turn-{index}");
+            state
+                .agent_router
+                .begin_injection(&claim, turn_id.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            state
+                .agent_router
+                .mailbox_accepted(&claim, turn_id.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            state
+                .agent_router
+                .drained(&claim, turn_id.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            state
+                .agent_router
+                .turn_settled(
+                    &claim,
+                    Some(turn_id),
+                    crate::agent_router::AgentDeliveryOutcome::Completed,
+                    true,
+                    None,
+                    false,
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        assert!(state
+            .agent_router
+            .records(&target)
+            .await
+            .map_err(|error| error.to_string())?
+            .iter()
+            .all(|record| record.message_id != "delivery-recovery"));
+        assert_eq!(
+            state
+                .internal_message_ids_scoped("workspace-a", "primary")
+                .await?,
+            ids
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2581,6 +4354,7 @@ mod workspace_transition_tests {
             conversation_store: runtime_a.conversation_store.clone(),
             runtime_state_store: runtime_a.runtime_state_store.clone(),
             deletions: Arc::clone(&runtime_a.deletions),
+            handoffs: Arc::clone(&runtime_a.handoffs),
         };
         drop(runtime_a);
         state
@@ -3147,10 +4921,12 @@ mod workspace_transition_tests {
         let located_a = memory_manager_a
             .locate("shared-memory")
             .await
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| "workspace A memory missing".to_string())?;
         let located_b = memory_manager_b
             .locate("shared-memory")
             .await
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| "workspace B memory missing".to_string())?;
         assert_eq!(located_a.1.content, "workspace A memory");
         assert_eq!(located_b.1.content, "workspace B memory");
@@ -3206,8 +4982,8 @@ mod workspace_transition_tests {
                 "workspace B deletion projection did not settle: {error}"
             ));
         }
-        assert!(memory_manager_b.locate("shared-memory").await.is_none());
-        assert!(memory_manager_a.locate("shared-memory").await.is_some());
+        assert!(memory_manager_b.locate("shared-memory").await.map_err(|error| error.to_string())?.is_none());
+        assert!(memory_manager_a.locate("shared-memory").await.map_err(|error| error.to_string())?.is_some());
         let pool_a = runtime_a
             .pool()
             .ok_or_else(|| "workspace A pool missing".to_string())?;

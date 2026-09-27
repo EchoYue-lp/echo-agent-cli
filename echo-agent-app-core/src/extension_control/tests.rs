@@ -4,6 +4,63 @@ mod tests {
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::testing::MockLlmClient;
 
+    async fn seed_curated_draft(
+        echo_agent_dir: &std::path::Path,
+        name: &str,
+        draft_path: &std::path::Path,
+    ) -> Result<(), String> {
+        use echo_agent::evolution::{
+            SkillApprovalArtifact, SkillMeta, SkillMutationKind, SkillMutationOutcome,
+            SkillMutationRequest,
+        };
+
+        let authority = crate::evolution::review_integration::skill_mutation_authority(
+            echo_agent_dir,
+        )
+        .map_err(|error| error.to_string())?;
+        let before = authority.curator().load_state().map_err(|error| error.to_string())?;
+        let mut after = before.clone();
+        let now = chrono::Utc::now();
+        after.skills.insert(
+            name.to_string(),
+            SkillMeta {
+                name: name.to_string(),
+                path: Some(
+                    echo_agent::evolution::SkillFileMutation::canonical_path(draft_path)
+                        .map_err(|error| error.to_string())?,
+                ),
+                lifecycle: echo_agent::evolution::SkillLifecycle::Draft,
+                created_at: now,
+                last_used_at: now,
+                last_modified_at: now,
+                pinned: false,
+                agent_created: true,
+                superseded_by: None,
+            },
+        );
+        let request = SkillMutationRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            entity_key: name.to_string(),
+            kind: SkillMutationKind::Draft,
+            reason: "test fixture Draft".to_string(),
+            files: Vec::new(),
+            curator_before: before,
+            curator_after: after,
+            rollback_of: None,
+        };
+        let preview = authority.preview(&request).map_err(|error| error.to_string())?;
+        let approval = SkillApprovalArtifact::new(
+            uuid::Uuid::new_v4().to_string(),
+            preview.operation_digest,
+            "eko:test-fixture",
+            now,
+        );
+        match authority.apply(request, approval).await.map_err(|error| error.to_string())? {
+            SkillMutationOutcome::Applied(_) | SkillMutationOutcome::AlreadyApplied(_) => Ok(()),
+            outcome => Err(format!("Draft fixture did not settle: {outcome:?}")),
+        }
+    }
+
     async fn skill_projection_present(
         agent: &crate::agent_handle::AgentHandle,
         name: &str,
@@ -165,8 +222,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn curated_skill_artifact_and_lifecycle_commit_are_idempotent() -> Result<(), String> {
+    #[tokio::test]
+    async fn curated_skill_artifact_and_lifecycle_commit_are_idempotent() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let echo_agent_dir = temp.path().join(".eko");
         let draft_path = echo_agent_dir.join("skills/_drafts/curated-fixture/SKILL.md");
@@ -179,18 +236,10 @@ mod tests {
             "---\nname: curated-fixture\ndescription: fixture\n---\nbody",
         )
         .map_err(|error| error.to_string())?;
+        seed_curated_draft(&echo_agent_dir, "curated-fixture", &draft_path).await?;
         let curator = crate::evolution::workspace_curator(&echo_agent_dir);
-        curator
-            .register_candidate_at("curated-fixture", Some(&draft_path))
-            .map_err(|error| error.to_string())?;
-        if !curator
-            .promote_to_draft_at("curated-fixture", Some(&draft_path))
-            .map_err(|error| error.to_string())?
-        {
-            return Err("fixture candidate did not become Draft".to_string());
-        }
 
-        let committed = promote_curated_skill_artifact(echo_agent_dir.clone(), "curated-fixture")?;
+        let committed = promote_curated_skill_artifact(echo_agent_dir.clone(), "curated-fixture").await?;
         assert!(!committed.idempotent);
         assert!(committed.active_path.is_file());
         let active = curator
@@ -201,7 +250,7 @@ mod tests {
             .map(|metadata| metadata.lifecycle);
         assert_eq!(active, Some(echo_agent::evolution::SkillLifecycle::Active));
 
-        let repeated = promote_curated_skill_artifact(echo_agent_dir, "curated-fixture")?;
+        let repeated = promote_curated_skill_artifact(echo_agent_dir, "curated-fixture").await?;
         assert!(repeated.idempotent);
         assert_eq!(repeated.active_path, committed.active_path);
         Ok(())
@@ -221,16 +270,8 @@ mod tests {
             "---\nname: curated-drop\ndescription: fixture\n---\nbody",
         )
         .map_err(|error| error.to_string())?;
+        seed_curated_draft(&echo_agent_dir, "curated-drop", &draft_path).await?;
         let curator = crate::evolution::workspace_curator(&echo_agent_dir);
-        curator
-            .register_candidate_at("curated-drop", Some(&draft_path))
-            .map_err(|error| error.to_string())?;
-        if !curator
-            .promote_to_draft_at("curated-drop", Some(&draft_path))
-            .map_err(|error| error.to_string())?
-        {
-            return Err("fixture candidate did not become Draft".to_string());
-        }
         let store = Arc::new(echo_agent::memory::InMemoryStore::new())
             as Arc<dyn echo_agent::memory::Store>;
         let integration = crate::evolution::ReviewIntegration::new(
@@ -358,13 +399,51 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         let old_scope = mcp_health_scope_key(&old_runtime).map_err(|error| error.to_string())?;
+        let retired_agent = Arc::downgrade(old_runtime.primary_agent().inner());
+        let retired_pool = old_runtime.pool().map(|pool| Arc::downgrade(&pool));
+        let old_review = old_runtime
+            .review_integration()
+            .ok_or_else(|| "old workspace ReviewIntegration is missing".to_string())?;
+        let retired_review = Arc::downgrade(&old_review);
+        let old_host = fixture
+            .state
+            .workspace
+            .runtimes
+            .get_or_open(workspace.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let retired_host = Arc::downgrade(&old_host);
+        drop(old_host);
+        let old_lease = old_review.lease_generation().map_err(|error| error.to_string())?;
+        let old_manager = old_lease.layer_manager().map_err(|error| error.to_string())?;
+        let retired_memory = Arc::downgrade(&old_manager);
+        drop(old_manager);
+        drop(old_lease);
+        drop(old_review);
         drop(old_runtime);
 
         fixture
             .state
             .delete_workspace_owned(&workspace.id)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("delete workspace before ABA: {error}"))?;
+        if let Some(old_manager) = retired_memory.upgrade() {
+            let projection = if let Some(review) = retired_review.upgrade() {
+                Some(review.settle_hot_memory_projection().await)
+            } else {
+                None
+            };
+            return Err(format!(
+                "retired workspace memory manager is still retained (strong_count={}, host={}, pool={}, agent={}, review={}, primary_bound={:?}, pool_bound={:?})",
+                Arc::strong_count(&old_manager),
+                retired_host.upgrade().map(|host| Arc::strong_count(&host)).unwrap_or(0),
+                retired_pool.as_ref().and_then(std::sync::Weak::upgrade).map(|pool| Arc::strong_count(&pool)).unwrap_or(0),
+                retired_agent.upgrade().map(|agent| Arc::strong_count(&agent)).unwrap_or(0),
+                retired_review.upgrade().map(|review| Arc::strong_count(&review)).unwrap_or(0),
+                projection.as_ref().map(|receipt| receipt.primary_bound),
+                projection.as_ref().map(|receipt| receipt.pool_bound),
+            ));
+        }
         let recreated = fixture
             .state
             .workspace
@@ -375,7 +454,7 @@ mod tests {
             .state
             .switch_workspace(recreated)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("switch to recreated workspace: {error}"))?;
         let new_runtime = fixture
             .state
             .current_control_runtime()

@@ -243,7 +243,7 @@ pub struct SharedResources {
     pub(crate) subagent_event_bus: echo_agent::subagent::SubagentEventBus,
     pub tool_manager: Option<Arc<echo_agent::tools::ToolManager>>,
     pub hook_registry: Option<Arc<tokio::sync::RwLock<echo_agent::skills::hooks::HookRegistry>>>,
-    pub sandbox_manager: Option<Arc<echo_agent::sandbox::SandboxManager>>,
+    pub sandbox_manager: Option<Arc<dyn echo_agent::sandbox::SandboxExecutor>>,
     pub store: Option<Arc<dyn echo_agent::memory::Store>>,
     pub conversation_store: Option<Arc<dyn echo_agent::memory::ConversationStore>>,
     pub run_store: Option<Arc<dyn echo_agent::trace::RunStore>>,

@@ -4,12 +4,14 @@
 //! Review Inbox. Semantic mutations require an explicit inbox action; scheduled
 //! deterministic maintenance remains owned by Dreaming.
 
+pub mod background_review_owner;
 pub mod dashboard;
 pub mod evidence;
 pub mod hook_fire;
 pub mod review_integration;
 pub mod rule_promoter;
 
+pub use background_review_owner::{BackgroundReviewReceipt, ReviewTerminal};
 pub use dashboard::{ActivityEntry, Dashboard, DashboardMetrics, MemoryStats, ToolDiagnostics};
 pub use evidence::{
     EvidenceAction, EvidenceCandidate, EvidenceCandidateDraft, EvidenceCandidateStatus,

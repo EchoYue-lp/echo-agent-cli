@@ -22,6 +22,9 @@ pub struct AgentPool {
     process_agent_execution: Arc<AgentExecutionGovernor>,
     config: PoolConfig,
     app_config: RwLock<EkoConfig>,
+    /// Child-local model selectors projected from AgentRouter Side
+    /// Conversation metadata. AgentRouter remains the durable authority.
+    conversation_model_overrides: RwLock<HashMap<String, String>>,
     /// Working directory applied to existing and future pooled agents.
     working_dir: RwLock<Option<std::path::PathBuf>>,
     /// Linked repository root used for project `AGENTS.md` and `.eko/skills/`.
@@ -75,6 +78,7 @@ pub(crate) struct PreparedAgentPoolModelPublication<'a> {
     _transition: AgentPoolWorkspaceTransition<'a>,
     _agents: tokio::sync::RwLockWriteGuard<'a, HashMap<String, PooledAgent>>,
     publications: Vec<infra::PreparedAgentModelPublication>,
+    retire_overridden_conversations: Vec<String>,
     app_config: EkoConfig,
     runtime: ModelRuntimeConfig,
 }
@@ -112,13 +116,17 @@ impl PreparedAgentPoolModelPublication<'_> {
         let Self {
             pool,
             _transition,
-            _agents,
+            mut _agents,
             publications,
+            retire_overridden_conversations,
             app_config,
             runtime,
         } = self;
         for publication in publications {
             publication.commit().await;
+        }
+        for conversation_id in retire_overridden_conversations {
+            _agents.remove(&conversation_id);
         }
         *pool.app_config.write().await = app_config;
         tracing::info!(
@@ -151,6 +159,39 @@ impl PreparedAgentPoolModelDeactivation<'_> {
 }
 
 impl PreparedAgentPoolPluginPublication<'_> {
+    pub(crate) async fn retire_failed_candidate(
+        &mut self,
+        retired: AgentPluginGeneration,
+    ) -> Result<(), String> {
+        let candidate = self.candidate.take().ok_or_else(|| {
+            "AgentPool has no prepared Plugin candidate to retire".to_string()
+        })?;
+        let mut errors = Vec::new();
+        let mut pooled_agents = self.agents.iter().collect::<Vec<_>>();
+        pooled_agents.sort_by(|left, right| left.0.cmp(right.0));
+        for (conversation_id, pooled) in pooled_agents {
+            if let Err(error) = replace_agent_plugin_generation(
+                &pooled.handle,
+                &candidate,
+                &retired,
+                None,
+                self.pool.shared.review_integration.clone(),
+            )
+            .await
+            {
+                errors.push(format!("{conversation_id}: {error}"));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(format!(
+                "failed to retire Plugin candidate from pooled Agents: {}",
+                errors.join("; ")
+            ));
+        }
+        *self.pool.agent_generation.write().await = retired;
+        Ok(())
+    }
+
     pub(crate) async fn prepare(&mut self, candidate: AgentPluginGeneration) -> Result<(), String> {
         self.prepare_inner(candidate, None).await
     }
@@ -200,6 +241,7 @@ impl PreparedAgentPoolPluginPublication<'_> {
                 &self.previous,
                 &candidate,
                 application_skill_repair.as_ref(),
+                self.pool.shared.review_integration.clone(),
             )
             .await
             {
@@ -210,6 +252,7 @@ impl PreparedAgentPoolPluginPublication<'_> {
                         &candidate,
                         &self.previous,
                         application_skill_repair.as_ref(),
+                        self.pool.shared.review_integration.clone(),
                     )
                     .await
                     {
@@ -256,6 +299,7 @@ impl PreparedAgentPoolPluginPublication<'_> {
                 &candidate,
                 &self.previous,
                 self.application_skill_repair.as_ref(),
+                self.pool.shared.review_integration.clone(),
             )
             .await
             {
@@ -425,6 +469,7 @@ impl AgentPool {
             process_agent_execution: PROCESS_AGENT_EXECUTION.clone(),
             config,
             app_config: RwLock::new(runtime.session_app_config.clone()),
+            conversation_model_overrides: RwLock::new(HashMap::new()),
             working_dir: RwLock::new(working_dir),
             project_root: RwLock::new(runtime.project_root.clone()),
             permission_mode: RwLock::new(PermissionMode::Default),
@@ -540,6 +585,7 @@ impl AgentPool {
             process_agent_execution: self.process_agent_execution.clone(),
             config: self.config.clone(),
             app_config: RwLock::new(self.app_config.read().await.clone()),
+            conversation_model_overrides: RwLock::new(HashMap::new()),
             working_dir: RwLock::new(Some(root.clone())),
             project_root: RwLock::new(project_root),
             permission_mode: RwLock::new(*self.permission_mode.read().await),
@@ -749,6 +795,7 @@ impl AgentPool {
                 enable_background_agent,
             },
             app_config: RwLock::new(app_config),
+            conversation_model_overrides: RwLock::new(HashMap::new()),
             working_dir: RwLock::new(None),
             project_root: RwLock::new(None),
             permission_mode: RwLock::new(PermissionMode::Default),
@@ -1083,6 +1130,66 @@ impl AgentPool {
         *self.app_config.write().await = app_config;
     }
 
+    /// Project one durable Side Conversation model selector into this pool.
+    ///
+    /// Changing the selector retires the cached child Agent before publishing
+    /// the new projection, so the next turn cannot reuse the old model.
+    pub async fn configure_side_conversation(
+        &self,
+        conversation_id: &str,
+        model_id: Option<&str>,
+    ) -> Result<(), PoolError> {
+        if !Self::is_conversation_agent(conversation_id) {
+            return Err(PoolError::AgentCreation(
+                "model override requires a foreground conversation id".to_string(),
+            ));
+        }
+        let normalized = model_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if let Some(selector) = normalized.as_deref() {
+            let app_config = self.app_config.read().await;
+            crate::model_config::resolve_runtime_model(&app_config, Some(selector))
+                .map_err(|error| PoolError::AgentCreation(error.to_string()))?;
+        }
+        let current = self
+            .conversation_model_overrides
+            .read()
+            .await
+            .get(conversation_id)
+            .cloned();
+        if current == normalized {
+            return Ok(());
+        }
+
+        let retirement = self.begin_conversation_retirement(conversation_id)?;
+        self.drain_conversation_retirement(&retirement).await?;
+        let mut overrides = self.conversation_model_overrides.write().await;
+        match normalized {
+            Some(model_id) => {
+                overrides.insert(conversation_id.to_string(), model_id);
+            }
+            None => {
+                overrides.remove(conversation_id);
+            }
+        }
+        drop(overrides);
+        drop(retirement);
+        Ok(())
+    }
+
+    pub async fn conversation_model_override(
+        &self,
+        conversation_id: &str,
+    ) -> Option<String> {
+        self.conversation_model_overrides
+            .read()
+            .await
+            .get(conversation_id)
+            .cloned()
+    }
+
     /// Publish the durable user MCP snapshot used by future conversation Agents
     /// and by workspace hosts opened after this generation commits.
     pub(crate) async fn update_mcp_config_snapshot(&self, snapshot: McpConfigFile) {
@@ -1148,9 +1255,15 @@ impl AgentPool {
                 .await?,
             );
         }
+        let model_overrides = self.conversation_model_overrides.read().await;
         let mut pooled_agents: Vec<(&String, &PooledAgent)> = agents.iter().collect();
         pooled_agents.sort_by(|left, right| left.0.cmp(right.0));
-        for (_, pooled) in pooled_agents {
+        let mut retire_overridden_conversations = Vec::new();
+        for (conversation_id, pooled) in pooled_agents {
+            if model_overrides.contains_key(conversation_id) {
+                retire_overridden_conversations.push(conversation_id.clone());
+                continue;
+            }
             publications.push(
                 infra::prepare_agent_model_publication(
                     &pooled.handle,
@@ -1167,6 +1280,7 @@ impl AgentPool {
             _transition: transition,
             _agents: agents,
             publications,
+            retire_overridden_conversations,
             app_config,
             runtime,
         })
@@ -1798,8 +1912,14 @@ impl AgentPool {
             .await
             .clone()
             .or_else(|| self.shared.state_store.clone());
+        let model = self
+            .conversation_model_overrides
+            .read()
+            .await
+            .get(conversation_id)
+            .cloned();
         let params = infra::AgentCreateParams {
-            model: None, // will use app_config default
+            model,
             system_prompt: None,
             project: project_root
                 .as_ref()
@@ -1851,7 +1971,7 @@ impl AgentPool {
             agent.set_hook_registry(hr.clone());
         }
         if let Some(ref sm) = self.shared.sandbox_manager {
-            agent.set_sandbox_manager(sm.clone());
+            agent.set_sandbox_executor(sm.clone());
         }
         if let Some(ref tt) = self.shared.token_tracker {
             agent.set_token_tracker(tt.clone());
@@ -1883,9 +2003,10 @@ impl AgentPool {
                 .lease_generation()
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             let layer_manager = memory_generation.layer_manager()?;
-            agent.install_memory_layer_manager(layer_manager);
+            let skill_authority = memory_generation.skill_mutation_authority()?;
+            agent.install_memory_layer_manager(layer_manager)?;
             agent.set_memory_trigger_sink(Some(review_integration.clone()));
-            agent.set_skill_curator(Some(review_integration.curator()));
+            agent.set_skill_mutation_authority(Some(skill_authority));
             let mut projector = crate::turn_context::EkoContextProjector::new(
                 crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
                 crate::turn_context::turn_prompt_context_registry(),
@@ -1918,7 +2039,18 @@ impl AgentPool {
         // 3. Install the exact plugin generation committed by PluginRuntime.
         let agent_generation = self.agent_generation.read().await.clone();
         for desc in &agent_generation.skill_descriptors {
-            agent.skill_registry_mut().register_descriptor(desc.clone());
+            if let Some(policy) = self.shared.review_integration.as_ref()
+                && !echo_agent::skills::external::SkillLoadPolicy::allows(
+                    policy.as_ref(), desc,
+                )
+                .await
+            {
+                continue;
+            }
+            agent
+                .register_skill_descriptor(desc.clone())
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
         register_plugin_agents(&mut agent, &agent_generation.plugin_agents)
             .await

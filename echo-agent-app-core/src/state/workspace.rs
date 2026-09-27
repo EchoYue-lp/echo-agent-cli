@@ -139,6 +139,7 @@ pub struct ScopedChatRuntime {
     conversation_store: Option<Arc<dyn ConversationStore>>,
     runtime_state_store: Option<Arc<dyn echo_agent::state::RuntimeStateStore>>,
     deletions: Arc<crate::conversation_deletion::ConversationDeletionService>,
+    handoffs: Arc<crate::conversation_archive::ConversationArchiveStore>,
 }
 
 /// Cloneable ownership receipt for product-data I/O started by an Agent turn.
@@ -457,6 +458,22 @@ impl ScopedChatRuntime {
         self.runtime_state_store.clone()
     }
 
+    fn ensure_handoff_admission_allowed(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), crate::conversation_deletion::ConversationDeletionError> {
+        if self
+            .handoffs
+            .has_pending_handoff_for(self.execution_scope.workspace_id(), conversation_id)
+            .map_err(crate::conversation_deletion::ConversationDeletionError::ConversationStore)?
+        {
+            return Err(crate::conversation_deletion::ConversationDeletionError::HandoffPending(
+                conversation_id.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Pin the exact runtime generation for Agent-owned product-data work.
     pub fn workspace_io_receipt(&self) -> ScopedWorkspaceIoReceipt {
         ScopedWorkspaceIoReceipt {
@@ -479,12 +496,132 @@ impl ScopedChatRuntime {
             .as_ref()
             .ok_or(crate::conversation_deletion::ConversationDeletionError::StoreUnavailable)?;
         self.deletions
-            .ensure_conversation(
+            .ensure_conversation_guarded(
                 store.as_ref(),
                 conversation,
                 Some(self.workspace_io_receipt()),
+                |id| self.ensure_handoff_admission_allowed(id),
             )
             .await
+    }
+
+    pub async fn create_conversation(
+        &self,
+        conversation: NewConversation,
+    ) -> std::result::Result<Conversation, crate::conversation_deletion::ConversationDeletionError>
+    {
+        let store = self.conversation_store.as_ref().ok_or(
+            crate::conversation_deletion::ConversationDeletionError::StoreUnavailable,
+        )?;
+        self.deletions.create_conversation_guarded(
+            store.as_ref(), conversation, Some(self.workspace_io_receipt()),
+            |id| self.ensure_handoff_admission_allowed(id),
+        ).await
+    }
+
+    /// Suspend all turn surfaces while one direct user command replaces a transcript.
+    pub async fn begin_managed_replacement(
+        &self,
+        foreground_turns: &crate::foreground_turn::ForegroundTurnControl,
+        conversation_id: &str,
+    ) -> std::result::Result<
+        crate::managed_conversation::ManagedConversationAdmission,
+        crate::conversation_deletion::ConversationDeletionError,
+    > {
+        let identity = self.deletions.acquire_identity(conversation_id).await?;
+        self.deletions
+            .ensure_admission_allowed(conversation_id, Some(self.workspace_io_receipt()))
+            .await?;
+        self.ensure_handoff_admission_allowed(conversation_id)?;
+        let suspension = foreground_turns.suspend_conversation_admission_if_idle_scoped(
+            self.execution_scope.workspace_id(),
+            conversation_id,
+        )?;
+        Ok(crate::managed_conversation::ManagedConversationAdmission::new(
+            self.execution_scope.workspace_id(),
+            conversation_id,
+            identity,
+            suspension,
+        ))
+    }
+
+    pub(crate) async fn begin_handoff_recovery(
+        &self,
+        foreground_turns: &crate::foreground_turn::ForegroundTurnControl,
+        conversation_id: &str,
+    ) -> std::result::Result<
+        crate::managed_conversation::ManagedConversationAdmission,
+        crate::conversation_deletion::ConversationDeletionError,
+    > {
+        let identity = self.deletions.acquire_identity(conversation_id).await?;
+        let suspension = foreground_turns.suspend_conversation_admission_if_idle_scoped(
+            self.execution_scope.workspace_id(),
+            conversation_id,
+        )?;
+        Ok(crate::managed_conversation::ManagedConversationAdmission::new(
+            self.execution_scope.workspace_id(),
+            conversation_id,
+            identity,
+            suspension,
+        ))
+    }
+
+    /// Strict creation for a cross-workspace transfer; the returned guard owns rollback scope.
+    pub async fn create_managed_conversation_under_admission(
+        &self,
+        admission: &crate::managed_conversation::ManagedConversationAdmission,
+        conversation: NewConversation,
+    ) -> std::result::Result<Conversation, crate::conversation_deletion::ConversationDeletionError> {
+        let store = self.conversation_store.as_ref().ok_or(
+            crate::conversation_deletion::ConversationDeletionError::StoreUnavailable,
+        )?;
+        let id = conversation.conversation_id.clone();
+        if !admission.matches(self.execution_scope.workspace_id(), &id) {
+            return Err(crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                "managed creation admission does not match destination identity".to_string(),
+            ));
+        }
+        if store
+            .get_conversation(&id)
+            .await
+            .map_err(|error| {
+                crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                    error.to_string(),
+                )
+            })?
+            .is_some()
+            || store.get_projection_authority(&id).await.map_err(|error| {
+                crate::conversation_deletion::ConversationDeletionError::ConversationStore(error.to_string())
+            })?.is_some()
+        {
+            return Err(crate::conversation_deletion::ConversationDeletionError::AlreadyExists(id));
+        }
+        let receipt = store
+            .ensure_projection_epoch(echo_agent::memory::EnsureConversationProjectionRequest {
+                conversation,
+                expected_tombstone_epoch: None,
+            })
+            .await
+            .map_err(|error| {
+                crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                    error.to_string(),
+                )
+            })?;
+        if receipt.status != echo_agent::memory::ConversationProjectionEpochStatus::Created {
+            return Err(crate::conversation_deletion::ConversationDeletionError::AlreadyExists(id));
+        }
+        let created = store
+            .get_conversation(&id)
+            .await
+            .map_err(|error| {
+                crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                    error.to_string(),
+                )
+            })?
+            .ok_or_else(|| {
+                crate::conversation_deletion::ConversationDeletionError::NotFound(id.clone())
+            })?;
+        Ok(created)
     }
 
     pub async fn begin_turn(
@@ -498,18 +635,33 @@ impl ScopedChatRuntime {
         crate::conversation_deletion::ConversationDeletionError,
     > {
         self.deletions
-            .begin_foreground_turn_scoped(
+            .begin_foreground_turn_scoped_guarded(
                 foreground_turns,
                 self.execution_scope.workspace_id(),
                 surface,
                 conversation_id,
                 turn_id,
                 Some(self.workspace_io_receipt()),
+                |id| self.ensure_handoff_admission_allowed(id),
             )
             .await
     }
 
     pub async fn agent_for(
+        &self,
+        conversation_id: &str,
+    ) -> std::result::Result<crate::agent_pool::AgentPoolExecutionLease, crate::agent_pool::PoolError>
+    {
+        if let Err(error) = self.ensure_handoff_admission_allowed(conversation_id) {
+            return Err(crate::agent_pool::PoolError::ConversationDeletionPending {
+                conversation_id: conversation_id.to_string(),
+                reason: error.to_string(),
+            });
+        }
+        self.agent_for_handoff(conversation_id).await
+    }
+
+    pub(crate) async fn agent_for_handoff(
         &self,
         conversation_id: &str,
     ) -> std::result::Result<crate::agent_pool::AgentPoolExecutionLease, crate::agent_pool::PoolError>

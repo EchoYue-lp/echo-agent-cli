@@ -134,7 +134,11 @@ fn plugin_mcp_declarations(
 fn require_applicable_generation(
     generation: Arc<PreparedPluginSet>,
 ) -> anyhow::Result<Arc<PreparedPluginSet>> {
-    if generation.is_applicable() {
+    if generation.is_applicable()
+        && !generation.diagnostics().iter().any(|diagnostic| {
+            diagnostic.severity() == echo_agent::plugin::PluginDiagnosticSeverity::Error
+        })
+    {
         return Ok(generation);
     }
     Err(anyhow::Error::new(PluginPreparationRejected {
@@ -159,7 +163,7 @@ impl std::fmt::Display for PluginPreparationRejected {
             .join("; ");
         write!(
             formatter,
-            "prepared plugin generation {} is not applicable: {}",
+            "prepared plugin generation {} was rejected by EKO policy: {}",
             self.generation, diagnostics
         )
     }

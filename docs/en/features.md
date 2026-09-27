@@ -15,6 +15,11 @@ projections, review/worktree behavior, and product presentation.
   and summary/sliding/adaptive compression use shared app-core services.
 - Framework `FileConversationStore` is the conversation authority; EKO adds
   workspace binding and UI projection.
+- The GUI Side Conversation layout copies the primary conversation's committed
+  context into a one-level, child-local Agent. AgentGroup metadata retains the
+  relationship, model, and unread marker, while Tauri remains the only surface
+  adapter. TUI, CLI/JSONL, and channels keep their existing conversation and
+  Subagent behavior and expose no Side Conversation-specific contract.
 
 Archived conversations are hidden from the active sidebar and managed from
 Settings -> Project data -> Archives. Restore is reversible; permanent

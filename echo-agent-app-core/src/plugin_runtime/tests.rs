@@ -593,11 +593,17 @@ done
         agent_has_application_skill(&future_enabled, name, source, false).await?;
 
         existing
-            .write(|agent| {
-                agent.skill_registry_mut().register_descriptor(descriptor);
-                crate::runtime::configure_intent_router(agent);
+            .write_async(|agent| {
+                Box::pin(async move {
+                    agent
+                        .register_skill_descriptor(descriptor)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    crate::runtime::configure_intent_router(agent);
+                    Ok::<(), String>(())
+                })
             })
-            .await;
+            .await?;
         agent_has_application_skill(&runtime.agent_handle, name, source, false).await?;
         agent_has_application_skill(&existing, name, source, true).await?;
 
@@ -619,7 +625,7 @@ done
     }
 
     #[tokio::test]
-    async fn failed_plugin_activation_restores_primary_and_pool_generation() -> Result<(), String> {
+    async fn failed_plugin_activation_retires_primary_and_pool_generation() -> Result<(), String> {
         let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
         let _first = write_fixture(temporary.path())?;
         let runtime = service(temporary.path()).await?;
@@ -657,14 +663,11 @@ done
                 "plugin activation failed for an unexpected reason: {error}"
             ));
         }
-        agent_has_plugin_generation(&runtime.agent_handle, "runtime-fixture", true).await?;
-        agent_has_plugin_generation(&existing, "runtime-fixture", true).await?;
+        agent_has_plugin_generation(&runtime.agent_handle, "runtime-fixture", false).await?;
+        agent_has_plugin_generation(&existing, "runtime-fixture", false).await?;
         agent_has_plugin_generation(&runtime.agent_handle, "rollback-candidate", false).await?;
         agent_has_plugin_generation(&existing, "rollback-candidate", false).await?;
-        assert_eq!(
-            pool.plugin_generation_revision_for_test().await,
-            previous_revision
-        );
+        assert!(pool.plugin_generation_revision_for_test().await > previous_revision);
 
         let future_lease = pool
             .acquire("rollback-future")
@@ -672,7 +675,7 @@ done
             .map_err(|error| error.to_string())?;
         let future = future_lease.agent();
         drop(future_lease);
-        agent_has_plugin_generation(&future, "runtime-fixture", true).await?;
+        agent_has_plugin_generation(&future, "runtime-fixture", false).await?;
         agent_has_plugin_generation(&future, "rollback-candidate", false).await?;
         Ok(())
     }
@@ -1046,7 +1049,7 @@ done
         let malformed = write_fixture(&second)?;
         std::fs::write(
             malformed.join("hooks/hooks.yaml"),
-            "PreToolUse: [not-a-hook-rule]\n",
+            "PreToolUse: [unterminated\n",
         )
         .map_err(|error| error.to_string())?;
         let runtime = default_service(&first).await?;
@@ -1272,7 +1275,7 @@ done
 
         std::fs::write(
             plugin.join("hooks/hooks.yaml"),
-            "PreToolUse: [this is not a hook rule]\n",
+            "PreToolUse: [unterminated\n",
         )
         .map_err(|error| error.to_string())?;
         let error = runtime
@@ -1412,7 +1415,7 @@ done
     }
 
     #[tokio::test]
-    async fn activation_failure_restores_previous_components_and_lifecycle() -> Result<(), String> {
+    async fn activation_failure_retires_previous_components_and_lifecycle() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let plugin = write_fixture(temp.path())?;
         let runtime = service(temp.path()).await?;
@@ -1443,15 +1446,12 @@ done
             .first()
             .and_then(|theme| theme.colors.get("accent"))
             .map(String::as_str);
-        assert_eq!(accent, Some("#5b8def"));
+        assert_eq!(accent, None);
         assert_eq!(counts.init.load(Ordering::SeqCst), 1);
-        assert_eq!(counts.activate.load(Ordering::SeqCst), 3);
-        assert_eq!(counts.deactivate.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.activate.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.deactivate.load(Ordering::SeqCst), 2);
         #[cfg(unix)]
-        assert_eq!(
-            runtime.lsp.manager.read().await.running_servers(),
-            ["fixture"]
-        );
+        assert!(runtime.lsp.manager.read().await.running_servers().is_empty());
         Ok(())
     }
 

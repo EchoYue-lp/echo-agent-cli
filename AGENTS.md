@@ -19,7 +19,9 @@ EKO 应用层:Rust workspace(`echo-agent-app-core` 应用核心 + Tauri 壳 `src
 
 **数据持久化:EKO 不需要 SQLite。** 对话历史/记忆用文件或内存实现;禁止引入或保留 SQLite 依赖(`SqliteStore`/`SqliteConversationStore`/echo-state 的 `sqlite` feature 在本仓库不启用)。禁止把"schema 迁移/前端契约"当作反对改动的理由——开发阶段无迁移负担,过时代码直接删。
 
-**多模式功能对等:TUI 与 GUI 是功能完全一样的完全体**,只是交互方式不同(对标 Claude Code 纯 TUI)。任何一方有的能力(复杂任务/plan/subagent/任务运行时/HITL/记忆/附件…),其它方也应有。代码里"X 模式 doesn't use Y"的注释/None 传参是**待补缺口,不是产品定位**;禁止以"某模式不需要"为由拒绝接入能力。
+**多模式核心能力对等:TUI 与 GUI 是功能完全一样的完全体**,只是交互方式不同(对标 Claude Code 纯 TUI)。复杂任务/plan/subagent/任务运行时/HITL/记忆/附件等核心 Agent 能力必须对等。代码里"X 模式 doesn't use Y"的注释/None 传参是**待补缺口,不是产品定位**;禁止以"某模式不需要"为由拒绝接入核心能力。
+
+只有依赖特定界面形态才成立的布局、窗口编排、侧栏或多面板交互可以由对应 surface 独有,但不得改变底层 Agent 能力、状态权威或其它 surface 已有行为。`Side Conversation` 是 GUI 的侧栏/并行面板能力:只由 GUI/Tauri 暴露创建、树形导航和支线管理入口,TUI、CLI/JSONL 与 channel 不新增 Side Conversation 专用命令或 wire contract,并保留已有普通 conversation、Subagent 和 `/fork` 行为。不得把这条例外扩展为其它核心能力不对等的理由。
 
 ## 统一术语:只有 Subagent,没有 Worker(强制)
 

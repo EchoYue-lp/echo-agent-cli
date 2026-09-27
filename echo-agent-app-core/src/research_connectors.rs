@@ -564,21 +564,47 @@ fn ingest_tool_output_with_status(
 }
 
 struct AutoIngestResearchTool {
-    inner: Box<dyn Tool>,
+    inner: std::sync::Arc<dyn Tool>,
     workspace_io_identity: crate::workspace::WorkspaceIoIdentity,
     product_data_io: crate::product_data_io::ProductDataIoService,
     #[cfg(test)]
     barrier: std::sync::Mutex<Option<AutoIngestTestBarrier>>,
 }
 
+trait IntoResearchToolArc {
+    fn into_tool_arc(self) -> std::sync::Arc<dyn Tool>;
+}
+
+impl IntoResearchToolArc for std::sync::Arc<dyn Tool> {
+    fn into_tool_arc(self) -> std::sync::Arc<dyn Tool> {
+        self
+    }
+}
+
+impl<T> IntoResearchToolArc for Box<T>
+where
+    T: Tool + 'static,
+{
+    fn into_tool_arc(self) -> std::sync::Arc<dyn Tool> {
+        let tool: std::sync::Arc<T> = std::sync::Arc::from(self);
+        tool
+    }
+}
+
+impl IntoResearchToolArc for Box<dyn Tool> {
+    fn into_tool_arc(self) -> std::sync::Arc<dyn Tool> {
+        std::sync::Arc::from(self)
+    }
+}
+
 impl AutoIngestResearchTool {
     fn new(
-        inner: Box<dyn Tool>,
+        inner: impl IntoResearchToolArc,
         workspace_io_identity: crate::workspace::WorkspaceIoIdentity,
         product_data_io: crate::product_data_io::ProductDataIoService,
     ) -> Self {
         Self {
-            inner,
+            inner: inner.into_tool_arc(),
             workspace_io_identity,
             product_data_io,
             #[cfg(test)]
@@ -588,13 +614,13 @@ impl AutoIngestResearchTool {
 
     #[cfg(test)]
     fn with_barrier(
-        inner: Box<dyn Tool>,
+        inner: impl IntoResearchToolArc,
         workspace_io_identity: crate::workspace::WorkspaceIoIdentity,
         product_data_io: crate::product_data_io::ProductDataIoService,
         barrier: AutoIngestTestBarrier,
     ) -> Self {
         Self {
-            inner,
+            inner: inner.into_tool_arc(),
             workspace_io_identity,
             product_data_io,
             barrier: std::sync::Mutex::new(Some(barrier)),

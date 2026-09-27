@@ -191,6 +191,12 @@ mod tests {
         for expected in ["task_create", "task_update", "task_list", "task_execute"] {
             assert!(after.iter().any(|name| name == expected));
         }
+        let weak_agent = Arc::downgrade(handle.inner());
+        drop(handle);
+        assert!(
+            weak_agent.upgrade().is_none(),
+            "task tools retained their owning Agent"
+        );
         Ok(())
     }
 }

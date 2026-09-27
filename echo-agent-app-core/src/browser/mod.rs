@@ -325,8 +325,10 @@ impl BrowserRuntime {
     pub async fn interrupt(&self) {
         for backend in [BrowserBackend::Managed, BrowserBackend::Chrome] {
             let client = self.client_slot(backend).write().await.take();
-            if let Some(client) = client {
-                client.close().await;
+            if let Some(client) = client
+                && let Err(error) = client.close().await
+            {
+                tracing::warn!(?backend, %error, "browser client close failed during interrupt");
             }
         }
     }
@@ -341,8 +343,10 @@ impl BrowserRuntime {
         self.inner.sessions.close_all().await;
         for backend in [BrowserBackend::Managed, BrowserBackend::Chrome] {
             let client = self.client_slot(backend).write().await.take();
-            if let Some(client) = client {
-                client.close().await;
+            if let Some(client) = client
+                && let Err(error) = client.close().await
+            {
+                tracing::warn!(?backend, %error, "browser client close failed during shutdown");
             }
         }
         tracing::info!("Playwright MCP browser runtimes stopped");
@@ -406,7 +410,9 @@ impl BrowserRuntime {
         .map_err(|_| BrowserError::Connection(format!("startup timed out after {timeout:?}")))?
         .map_err(|error| BrowserError::Connection(error.to_string()))?;
         if self.inner.shutdown.is_cancelled() {
-            client.close().await;
+            if let Err(error) = client.close().await {
+                tracing::warn!(?backend, %error, "browser client close failed after shutdown");
+            }
             return Err(BrowserError::Connection(
                 "browser runtime shut down during startup".to_string(),
             ));
@@ -1024,7 +1030,9 @@ impl BrowserRuntime {
                 result = first_call => result,
                 _ = cancel.cancelled() => {
                     self.invalidate_client(backend, &first).await;
-                    first.close().await;
+                    if let Err(error) = first.close().await {
+                        tracing::warn!(?backend, %error, "browser client close failed after cancellation");
+                    }
                     return Err(BrowserError::Cancelled);
                 }
             }
@@ -1041,7 +1049,9 @@ impl BrowserRuntime {
                     "Playwright MCP call failed after a possibly consequential action; not replaying"
                 );
                 self.invalidate_client(backend, &first).await;
-                first.close().await;
+                if let Err(error) = first.close().await {
+                    tracing::warn!(?backend, %error, "browser client close failed after consequential call");
+                }
                 Err(BrowserError::Connection(first_error.to_string()))
             }
             Err(first_error) => {
@@ -1052,7 +1062,9 @@ impl BrowserRuntime {
                     "Playwright MCP call failed; restarting browser sidecar"
                 );
                 self.invalidate_client(backend, &first).await;
-                first.close().await;
+                if let Err(error) = first.close().await {
+                    tracing::warn!(?backend, %error, "browser client close failed before retry");
+                }
                 let restarted = self.ensure_client(backend).await?;
                 let retry = restarted.call_tool(tool, arguments);
                 let result = if let Some(cancel) = cancel {
@@ -1060,7 +1072,9 @@ impl BrowserRuntime {
                         result = retry => result,
                         _ = cancel.cancelled() => {
                             self.invalidate_client(backend, &restarted).await;
-                            restarted.close().await;
+                            if let Err(error) = restarted.close().await {
+                                tracing::warn!(?backend, %error, "browser retry client close failed after cancellation");
+                            }
                             return Err(BrowserError::Cancelled);
                         }
                     }
@@ -1071,7 +1085,9 @@ impl BrowserRuntime {
                     Ok(result) => result,
                     Err(error) => {
                         self.invalidate_client(backend, &restarted).await;
-                        restarted.close().await;
+                        if let Err(error) = restarted.close().await {
+                            tracing::warn!(?backend, %error, "browser retry client close failed after tool error");
+                        }
                         return Err(BrowserError::Tool {
                             tool: tool.to_string(),
                             message: error.to_string(),

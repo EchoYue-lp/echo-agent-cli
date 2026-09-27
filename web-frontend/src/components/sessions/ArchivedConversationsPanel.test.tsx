@@ -49,6 +49,7 @@ describe('ArchivedConversationsPanel', () => {
     useConversationStore.setState({
       workspaceId: 'workspace-1',
       conversations: [],
+      sideConversations: [],
       archivedConversationIds: [],
       activeId: null,
       isLoading: false,

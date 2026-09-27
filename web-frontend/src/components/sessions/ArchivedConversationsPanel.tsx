@@ -7,6 +7,7 @@ import { useToastStore } from '../../stores/toastStore';
 export function ArchivedConversationsPanel() {
   const workspaceId = useConversationStore((state) => state.workspaceId);
   const conversations = useConversationStore((state) => state.conversations);
+  const sideConversations = useConversationStore((state) => state.sideConversations);
   const init = useConversationStore((state) => state.init);
   const restoreConversation = useConversationStore((state) => state.restoreConversation);
   const deleteConversation = useConversationStore((state) => state.deleteConversation);
@@ -36,7 +37,14 @@ export function ArchivedConversationsPanel() {
   };
 
   const remove = async (id: string) => {
-    if (!window.confirm('确定永久删除此会话？所有消息和运行记录将被清除。')) return;
+    const childCount = sideConversations.filter(
+      (entry) => entry.parent_conversation_id === id
+    ).length;
+    const scope =
+      childCount > 0
+        ? `此操作还会删除 ${childCount} 个支线对话及其消息和运行记录。`
+        : '所有消息和运行记录将被清除。';
+    if (!window.confirm(`确定永久删除此会话？${scope}`)) return;
     setLoading(true);
     try {
       await deleteConversation(id);

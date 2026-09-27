@@ -2,12 +2,199 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent::agent::Agent;
-use echo_agent::llm::types::{Message, Role};
 use echo_agent::memory::{NewConversation, StoredMessage};
 use echo_agent_app_core::api::conversation_projection::{AttachmentsPayload, SavedMessage};
 use echo_agent_app_core::api::state::ScopedChatRuntime;
+#[cfg(test)]
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConversationCreateRequest {
+    Primary {
+        id: String,
+        title: String,
+    },
+    Side {
+        parent_conversation_id: String,
+        request_id: String,
+        prompt: String,
+        title: Option<String>,
+        model_id: Option<String>,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConversationUpdateRequest {
+    Rename { title: String },
+    SideModel { model_id: Option<String> },
+    SideRetry,
+    SideViewed,
+}
+
+async fn known_side_first_turn(
+    state: &TauriState,
+    workspace_id: &str,
+    conversation_id: &str,
+    message_key: &str,
+) -> Result<Option<serde_json::Value>, IpcError> {
+    let active = state
+        .app_state
+        .session
+        .foreground_turns
+        .snapshots_for_conversation_scoped(workspace_id, conversation_id)
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    if active
+        .iter()
+        .any(|snapshot| snapshot.root_turn_id == message_key)
+    {
+        return Ok(Some(serde_json::json!({
+            "kind": "started",
+            "message_key": message_key,
+            "root_turn_id": message_key,
+        })));
+    }
+    let replay = state
+        .app_state
+        .storage
+        .chat_events
+        .replay(workspace_id, Some(conversation_id), message_key, 0)
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let terminal = replay
+        .events
+        .iter()
+        .filter(|event| event.root_turn_id == message_key)
+        .filter_map(|event| match &event.payload {
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::TurnStatus { status }
+                if matches!(status.as_str(), "completed" | "failed" | "cancelled") =>
+            {
+                Some((event.sequence, status.as_str()))
+            }
+            _ => None,
+        })
+        .max_by_key(|(sequence, _)| *sequence);
+    Ok(terminal.map(|(_, status)| {
+        serde_json::json!({
+            "kind": status,
+            "message_key": message_key,
+            "root_turn_id": message_key,
+        })
+    }))
+}
+
+fn normalize_side_first_turn(
+    value: &serde_json::Value,
+    message_key: &str,
+) -> Result<serde_json::Value, IpcError> {
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .filter(|kind| {
+            matches!(
+                *kind,
+                "started" | "queued" | "completed" | "failed" | "cancelled"
+            )
+        })
+        .ok_or_else(|| {
+            IpcError::Internal("Side Conversation first turn returned an invalid state".to_string())
+        })?;
+    Ok(serde_json::json!({
+        "kind": kind,
+        "message_key": message_key,
+        "root_turn_id": value
+            .get("root_turn_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(message_key),
+    }))
+}
+
+async fn launch_side_conversation_gui(
+    state: &TauriState,
+    app: tauri::AppHandle,
+    mut preparation: echo_agent_app_core::api::side_conversation::SideConversationLaunchPreparation,
+) -> Result<serde_json::Value, IpcError> {
+    let workspace_id = preparation.creation.entry.workspace_id.clone();
+    let conversation_id = preparation.creation.entry.conversation_id.clone();
+    let message_key = format!("side-start:{}", preparation.creation.entry.group_id);
+    let initial_prompt = preparation.prompt.clone();
+    let launch = async {
+        if let Some(existing) =
+            known_side_first_turn(state, &workspace_id, &conversation_id, &message_key).await?
+        {
+            return Ok(existing);
+        }
+        let result = super::chat::send_chat_message_inner_with_side_admission(
+            state,
+            app,
+            super::chat::SendChatMessageRequest::side_initial(
+                workspace_id.clone(),
+                conversation_id.clone(),
+                message_key.clone(),
+                preparation.prompt.clone(),
+            ),
+            Some(preparation.admission),
+        )
+        .await?;
+        normalize_side_first_turn(&result, &message_key)
+    }
+    .await;
+
+    match launch {
+        Ok(first_turn) => {
+            match state
+                .app_state
+                .set_side_conversation_launch_error(&workspace_id, &conversation_id, None)
+                .await
+            {
+                Ok(entry) => preparation.creation.entry = entry,
+                Err(error) => {
+                    return Ok(serde_json::json!({
+                        "creation": preparation.creation,
+                        "first_turn": first_turn,
+                        "initial_prompt": initial_prompt,
+                        "launch_error": format!("first turn started, but launch status persistence failed: {error}"),
+                    }));
+                }
+            }
+            Ok(serde_json::json!({
+                "creation": preparation.creation,
+                "first_turn": first_turn,
+                "initial_prompt": initial_prompt,
+                "launch_error": null,
+            }))
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            let persisted = state
+                .app_state
+                .set_side_conversation_launch_error(
+                    &workspace_id,
+                    &conversation_id,
+                    Some(detail.clone()),
+                )
+                .await;
+            match persisted {
+                Ok(entry) => preparation.creation.entry = entry,
+                Err(persist_error) => {
+                    return Ok(serde_json::json!({
+                        "creation": preparation.creation,
+                        "first_turn": null,
+                        "initial_prompt": initial_prompt,
+                        "launch_error": format!("{detail}; launch status persistence failed: {persist_error}"),
+                    }));
+                }
+            }
+            Ok(serde_json::json!({
+                "creation": preparation.creation,
+                "first_turn": null,
+                "initial_prompt": initial_prompt,
+                "launch_error": detail,
+            }))
+        }
+    }
+}
 
 async fn scoped_runtime(
     state: &TauriState,
@@ -30,6 +217,7 @@ async fn scoped_store(
         .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))
 }
 
+#[cfg(test)]
 fn pack_ui_projection(message: &mut SavedMessage) -> Option<String> {
     let has_display_content = message.content.is_some();
     let has_thinking = message.thinking_segments.is_some();
@@ -60,11 +248,13 @@ fn pack_ui_projection(message: &mut SavedMessage) -> Option<String> {
     .ok()
 }
 
+#[cfg(test)]
 fn is_framework_projection(raw: Option<&str>) -> bool {
     raw.and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
         .is_some_and(|value| value.get("_echo_message_version").is_some())
 }
 
+#[cfg(test)]
 fn merge_projection_json(canonical: Option<&str>, ui: Option<&str>) -> Option<String> {
     let Some(canonical) = canonical else {
         return ui.map(str::to_string);
@@ -86,6 +276,7 @@ fn merge_projection_json(canonical: Option<&str>, ui: Option<&str>) -> Option<St
     serde_json::to_string(&canonical_value).ok()
 }
 
+#[cfg(test)]
 fn project_saved_messages(
     conversation_id: &str,
     messages: Vec<SavedMessage>,
@@ -225,28 +416,114 @@ fn strip_branch_ui_references(raw: Option<String>) -> Option<String> {
 
 async fn load_agent_transcript(
     runtime: &ScopedChatRuntime,
+    foreground_turns: &echo_agent_app_core::api::foreground_turn::ForegroundTurnControl,
     conversation_id: &str,
-    stored: &[StoredMessage],
 ) -> Result<usize, IpcError> {
+    let _admission = runtime
+        .begin_managed_replacement(foreground_turns, conversation_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let store = runtime
+        .conversation_store()
+        .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
+    let runtime_state = runtime
+        .runtime_state_store()
+        .ok_or_else(|| IpcError::Internal("Runtime state store not available".to_string()))?;
     let agent_execution = runtime
         .agent_for(conversation_id)
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;
     let agent = agent_execution.agent();
-    let mut messages = echo_agent::memory::restore_messages(stored)
-        .map_err(|error| IpcError::Internal(error.to_string()))?;
-    let system_prompt = agent.read(|agent| agent.system_prompt().to_string()).await;
-    if !messages
-        .first()
-        .is_some_and(|message| message.role == Role::System)
-    {
-        messages.insert(0, Message::system(system_prompt));
+    echo_agent_app_core::api::managed_conversation::resume_or_import(
+        store.as_ref(),
+        runtime_state.as_ref(),
+        &agent,
+        conversation_id,
+    )
+    .await
+    .map_err(|error| IpcError::Internal(error.to_string()))
+}
+
+fn project_stored_message(message: StoredMessage) -> SavedMessage {
+    let internal_agent = echo_agent_app_core::api::side_conversation::is_internal_agent_message(
+        message.attachments_json.as_deref(),
+    );
+    let (
+        message_id,
+        display_content,
+        thinking_segments,
+        execution_steps,
+        execution_rounds,
+        attachments,
+    ) = message
+        .attachments_json
+        .as_deref()
+        .and_then(AttachmentsPayload::parse)
+        .map(|payload| {
+            let thinking_segments =
+                (!payload.thinking_segments.is_empty()).then_some(payload.thinking_segments);
+            let execution_steps =
+                (!payload.execution_steps.is_empty()).then_some(payload.execution_steps);
+            let attachments = (!payload.attachments.is_empty()).then_some(payload.attachments);
+            (
+                payload.message_id,
+                payload.display_content,
+                thinking_segments,
+                execution_steps,
+                payload.execution_rounds,
+                attachments,
+            )
+        })
+        .unwrap_or((None, None, None, None, None, None));
+
+    SavedMessage {
+        message_id,
+        role: message.role,
+        content: display_content.or(message.content),
+        internal_agent,
+        tool_calls: message
+            .tool_calls_json
+            .and_then(|value| serde_json::from_str(&value).ok()),
+        thinking_segments,
+        tool_result: message.tool_result_json,
+        execution_steps,
+        execution_rounds,
+        attachments,
     }
-    let message_count = messages.len().saturating_sub(1);
-    agent
-        .read_async(|agent| Box::pin(async move { agent.load_messages(messages).await }))
-        .await;
-    Ok(message_count)
+}
+
+fn project_conversation_messages(
+    stored: Vec<StoredMessage>,
+    side_initial_identity: Option<(usize, String, String)>,
+    internal_message_ids: &std::collections::HashSet<i64>,
+) -> Vec<SavedMessage> {
+    let mut side_initial_identity = side_initial_identity;
+    stored
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let internal_agent = message
+                .id
+                .is_some_and(|id| internal_message_ids.contains(&id));
+            let is_initial_side_user = side_initial_identity.as_ref().is_some_and(
+                |(snapshot_count, _, initial_prompt)| {
+                    index >= *snapshot_count
+                        && message.role == "user"
+                        && message.content.as_deref() == Some(initial_prompt.as_str())
+                        && !internal_agent
+                        && !echo_agent_app_core::api::side_conversation::is_internal_agent_message(
+                            message.attachments_json.as_deref(),
+                        )
+                },
+            );
+            let mut projected = project_stored_message(message);
+            projected.internal_agent |= internal_agent;
+            if is_initial_side_user && let Some((_, message_id, _)) = side_initial_identity.take() {
+                projected.message_id = Some(message_id);
+            }
+            projected
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -259,6 +536,7 @@ mod tests {
             message_id: Some(id.to_string()),
             role: role.to_string(),
             content: Some(content.to_string()),
+            internal_agent: false,
             tool_calls: None,
             thinking_segments: None,
             tool_result: None,
@@ -266,6 +544,185 @@ mod tests {
             execution_rounds: None,
             attachments: None,
         }
+    }
+
+    #[test]
+    fn conversation_create_request_uses_discriminated_primary_and_side_variants()
+    -> anyhow::Result<()> {
+        let primary: ConversationCreateRequest = serde_json::from_value(serde_json::json!({
+            "kind": "primary",
+            "id": "conversation-1",
+            "title": "Primary"
+        }))?;
+        assert!(
+            matches!(primary, ConversationCreateRequest::Primary { id, .. } if id == "conversation-1")
+        );
+
+        let side: ConversationCreateRequest = serde_json::from_value(serde_json::json!({
+            "kind": "side",
+            "parent_conversation_id": "conversation-1",
+            "request_id": "request-1",
+            "prompt": "Investigate",
+            "title": null,
+            "model_id": "provider:model"
+        }))?;
+        assert!(matches!(
+            side,
+            ConversationCreateRequest::Side {
+                parent_conversation_id,
+                model_id: Some(model_id),
+                ..
+            } if parent_conversation_id == "conversation-1" && model_id == "provider:model"
+        ));
+        let retry: ConversationUpdateRequest =
+            serde_json::from_value(serde_json::json!({"kind": "side_retry"}))?;
+        assert!(matches!(retry, ConversationUpdateRequest::SideRetry));
+        let viewed: ConversationUpdateRequest =
+            serde_json::from_value(serde_json::json!({"kind": "side_viewed"}))?;
+        assert!(matches!(viewed, ConversationUpdateRequest::SideViewed));
+        Ok(())
+    }
+
+    #[test]
+    fn side_first_turn_receipt_is_stable_for_started_and_queued_results() -> anyhow::Result<()> {
+        assert_eq!(
+            normalize_side_first_turn(
+                &serde_json::json!({"kind": "queued", "input_id": "input-1"}),
+                "side-start:group-1",
+            )?,
+            serde_json::json!({
+                "kind": "queued",
+                "message_key": "side-start:group-1",
+                "root_turn_id": "side-start:group-1",
+            })
+        );
+        assert!(
+            normalize_side_first_turn(
+                &serde_json::json!({"kind": "interrupt_prompt"}),
+                "side-start:group-1",
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stored_internal_agent_marker_projects_to_the_gui_contract() -> anyhow::Result<()> {
+        let stored = StoredMessage {
+            id: Some(1),
+            conversation_id: "side-1".to_string(),
+            role: "user".to_string(),
+            content: Some("internal instruction".to_string()),
+            attachments_json: Some(
+                serde_json::json!({"eko_visibility": "internal_agent"}).to_string(),
+            ),
+            tool_calls_json: None,
+            tool_result_json: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let projected = project_stored_message(stored);
+        assert!(projected.internal_agent);
+        assert_eq!(projected.content.as_deref(), Some("internal instruction"));
+        assert_eq!(
+            serde_json::to_value(projected)?
+                .get("internal_agent")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_message_ids_do_not_relabel_identical_user_text() {
+        let messages = [
+            ("user", "internal instruction"),
+            ("assistant", "internal result"),
+            ("user", "internal instruction"),
+            ("assistant", "later response"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (role, content))| StoredMessage {
+            id: i64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1)),
+            conversation_id: "side-1".to_string(),
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            attachments_json: None,
+            tool_calls_json: None,
+            tool_result_json: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        })
+        .collect();
+        let ids = std::collections::HashSet::from([1_i64, 2_i64]);
+        let projected = project_conversation_messages(messages, None, &ids);
+        assert_eq!(
+            projected
+                .iter()
+                .map(|message| message.internal_agent)
+                .collect::<Vec<_>>(),
+            vec![true, true, false, false]
+        );
+    }
+
+    #[test]
+    fn completed_side_first_prompt_recovers_its_stable_gui_identity() {
+        let stored = vec![
+            StoredMessage {
+                id: Some(1),
+                conversation_id: "side-1".to_string(),
+                role: "user".to_string(),
+                content: Some("inherited context".to_string()),
+                attachments_json: None,
+                tool_calls_json: None,
+                tool_result_json: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            StoredMessage {
+                id: Some(2),
+                conversation_id: "side-1".to_string(),
+                role: "user".to_string(),
+                content: Some("initial side prompt".to_string()),
+                attachments_json: None,
+                tool_calls_json: None,
+                tool_result_json: None,
+                created_at: "2026-01-01T00:01:00Z".to_string(),
+            },
+            StoredMessage {
+                id: Some(3),
+                conversation_id: "side-1".to_string(),
+                role: "assistant".to_string(),
+                content: Some("finished".to_string()),
+                attachments_json: None,
+                tool_calls_json: None,
+                tool_result_json: None,
+                created_at: "2026-01-01T00:02:00Z".to_string(),
+            },
+        ];
+
+        let projected = project_conversation_messages(
+            stored,
+            Some((
+                1,
+                "side-start:group-1".to_string(),
+                "initial side prompt".to_string(),
+            )),
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(
+            projected
+                .get(1)
+                .and_then(|message| message.message_id.as_deref()),
+            Some("side-start:group-1")
+        );
+        assert!(
+            projected
+                .first()
+                .is_some_and(|message| message.message_id.is_none())
+        );
     }
 
     #[test]
@@ -567,10 +1024,19 @@ pub async fn list_conversations(
         .map_err(IpcError::Internal)?;
     let archived_ids: std::collections::HashSet<&str> =
         archived_ids.iter().map(String::as_str).collect();
-    let list = list
+    let mut side_conversations = state
+        .app_state
+        .list_side_conversations_scoped(&workspace_id)
+        .await
+        .map_err(IpcError::Internal)?
+        .into_iter()
+        .map(|entry| (entry.conversation_id.clone(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut list = list
         .into_iter()
         .map(|item| {
             let archived = archived_ids.contains(item.conversation_id.as_str());
+            let side_conversation = side_conversations.remove(&item.conversation_id);
             serde_json::json!({
                 "id": item.id,
                 "conversation_id": item.conversation_id,
@@ -579,10 +1045,73 @@ pub async fn list_conversations(
                 "created_at": item.created_at,
                 "updated_at": item.updated_at,
                 "archived": archived,
+                "side_conversation": side_conversation,
             })
         })
         .collect::<Vec<_>>();
+    list.extend(side_conversations.into_values().map(|entry| {
+        serde_json::json!({
+            "id": -1,
+            "conversation_id": entry.conversation_id,
+            "title": entry.title,
+            "message_count": 0,
+            "created_at": entry.created_at,
+            "updated_at": entry.updated_at,
+            "archived": false,
+            "side_conversation": entry,
+        })
+    }));
     serde_json::to_value(list).map_err(|e| IpcError::Internal(e.to_string()))
+}
+
+#[tauri::command]
+pub async fn create_conversation(
+    state: tauri::State<'_, TauriState>,
+    app: tauri::AppHandle,
+    workspace_id: String,
+    request: ConversationCreateRequest,
+) -> Result<serde_json::Value, IpcError> {
+    match request {
+        ConversationCreateRequest::Primary { id, title } => {
+            let runtime = scoped_runtime(&state, &workspace_id).await?;
+            let conversation = runtime
+                .ensure_conversation(NewConversation {
+                    conversation_id: id,
+                    user_id: "default".to_string(),
+                    agent_type: None,
+                    title: Some(title),
+                })
+                .await
+                .map_err(|error| IpcError::Internal(error.to_string()))?;
+            Ok(serde_json::json!({
+                "kind": "primary",
+                "id": conversation.conversation_id,
+            }))
+        }
+        ConversationCreateRequest::Side {
+            parent_conversation_id,
+            request_id,
+            prompt,
+            title,
+            model_id,
+        } => {
+            let preparation = state
+                .app_state
+                .create_side_conversation_owned(
+                    echo_agent_app_core::api::side_conversation::SideConversationCreateRequest {
+                        workspace_id,
+                        parent_conversation_id,
+                        request_id,
+                        prompt,
+                        title,
+                        model_id,
+                    },
+                )
+                .await
+                .map_err(IpcError::Validation)?;
+            launch_side_conversation_gui(state.inner(), app, preparation).await
+        }
+    }
 }
 
 /// Set the EKO visibility state for one exact workspace conversation.
@@ -611,72 +1140,6 @@ pub async fn set_conversation_archived(
 }
 
 #[tauri::command]
-pub async fn save_conversation(
-    state: tauri::State<'_, TauriState>,
-    workspace_id: String,
-    id: String,
-    title: String,
-    messages: Vec<SavedMessage>,
-) -> Result<serde_json::Value, IpcError> {
-    let runtime = scoped_runtime(&state, &workspace_id).await?;
-    let store = runtime
-        .conversation_store()
-        .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
-
-    tracing::info!(
-        "[save_conversation] id={}, title={}, msgs={}",
-        id,
-        title,
-        messages.len()
-    );
-
-    // Check if conversation exists
-    let existing = store.get_conversation(&id).await.ok().flatten();
-
-    let is_new = existing.is_none();
-    if !is_new && !messages.is_empty() {
-        return Err(IpcError::Validation(
-            "conversation transcripts are owned by the Agent runtime".to_string(),
-        ));
-    }
-    let conversation_id = if let Some(conv) = existing {
-        store
-            .update_conversation(&conv.conversation_id, Some(&title), None, None)
-            .await
-            .map_err(|e| IpcError::Internal(e.to_string()))?;
-        conv.conversation_id
-    } else {
-        let new_conv = NewConversation {
-            conversation_id: id.clone(),
-            user_id: "default".to_string(),
-            agent_type: None,
-            title: Some(title),
-        };
-        let conv = runtime
-            .ensure_conversation(new_conv)
-            .await
-            .map_err(|e| IpcError::Internal(e.to_string()))?;
-        conv.conversation_id
-    };
-
-    // Bootstrap messages are accepted only while creating a new conversation.
-    // Once it exists, the Agent runtime is the sole transcript writer; a GUI
-    // autosave must never replace a canonical tool/multimodal transcript.
-    if is_new && !messages.is_empty() {
-        let stored = project_saved_messages(&conversation_id, messages, &[]);
-        store
-            .save_messages(&conversation_id, &stored)
-            .await
-            .map_err(|e| IpcError::Internal(e.to_string()))?;
-    }
-
-    Ok(serde_json::json!({
-        "success": true,
-        "id": conversation_id,
-    }))
-}
-
-#[tauri::command]
 pub async fn get_conversation(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
@@ -690,70 +1153,56 @@ pub async fn get_conversation(
         .map_err(|e| IpcError::Internal(e.to_string()))?
         .ok_or_else(|| IpcError::NotFound(format!("Conversation '{}' not found", id)))?;
 
-    let stored = store
+    let mut stored = store
         .get_messages(&conv.conversation_id)
         .await
         .map_err(|e| IpcError::Internal(e.to_string()))?;
-
-    // Convert StoredMessage -> SavedMessage for frontend
-    let messages: Vec<SavedMessage> = stored
+    let side_conversations =
+        echo_agent_app_core::api::side_conversation::SideConversationService::new(Arc::clone(
+            &state.app_state.agent_router,
+        ));
+    let side_relation = side_conversations
+        .relation_for_child(Arc::clone(&store), &workspace_id, &id)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let internal_message_ids = state
+        .app_state
+        .internal_message_ids_scoped(&workspace_id, &id)
+        .await
+        .map_err(IpcError::Internal)?
         .into_iter()
-        .map(|m| {
-            // Parse attachments_json which may contain thinking_segments +
-            // execution_steps + real attachments, or legacy plain array format.
-            let (
-                message_id,
-                display_content,
-                thinking_segments,
-                execution_steps,
-                execution_rounds,
-                attachments,
-            ) = m
-                .attachments_json
-                .as_deref()
-                .and_then(AttachmentsPayload::parse)
-                .map(|p| {
-                    let ts = if p.thinking_segments.is_empty() {
-                        None
-                    } else {
-                        Some(p.thinking_segments)
-                    };
-                    let es = if p.execution_steps.is_empty() {
-                        None
-                    } else {
-                        Some(p.execution_steps)
-                    };
-                    let att = if p.attachments.is_empty() {
-                        None
-                    } else {
-                        Some(p.attachments)
-                    };
-                    (
-                        p.message_id,
-                        p.display_content,
-                        ts,
-                        es,
-                        p.execution_rounds,
-                        att,
-                    )
-                })
-                .unwrap_or((None, None, None, None, None, None));
+        .collect::<std::collections::HashSet<_>>();
+    if side_relation.is_none() {
+        stored.retain(|message| {
+            !message
+                .id
+                .is_some_and(|id| internal_message_ids.contains(&id))
+                && !echo_agent_app_core::api::side_conversation::is_internal_agent_message(
+                    message.attachments_json.as_deref(),
+                )
+        });
+    } else {
+        state
+            .app_state
+            .mark_side_conversation_viewed(&workspace_id, &id)
+            .await
+            .map_err(IpcError::Internal)?;
+    }
 
-            SavedMessage {
-                message_id,
-                role: m.role,
-                content: display_content.or(m.content),
-                tool_calls: m
-                    .tool_calls_json
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-                thinking_segments,
-                tool_result: m.tool_result_json,
-                execution_steps,
-                execution_rounds,
-                attachments,
-            }
-        })
-        .collect();
+    // Convert canonical StoredMessage values into the GUI-only projection.
+    let side_initial_identity = match side_relation {
+        Some(entry) => Some((
+            entry.snapshot_message_count,
+            format!("side-start:{}", entry.group_id),
+            side_conversations
+                .initial_prompt_for_child(&workspace_id, &id)
+                .await
+                .map_err(|error| IpcError::Internal(error.to_string()))?,
+        )),
+        None => None,
+    };
+    let messages =
+        project_conversation_messages(stored, side_initial_identity, &internal_message_ids);
 
     Ok(serde_json::json!({
         "id": conv.id,
@@ -768,10 +1217,10 @@ pub async fn get_conversation(
 #[tauri::command]
 pub async fn update_conversation(
     state: tauri::State<'_, TauriState>,
+    app: tauri::AppHandle,
     workspace_id: String,
     id: String,
-    title: Option<String>,
-    messages: Option<Vec<SavedMessage>>,
+    request: ConversationUpdateRequest,
 ) -> Result<serde_json::Value, IpcError> {
     let store = scoped_store(&state, &workspace_id).await?;
 
@@ -781,16 +1230,79 @@ pub async fn update_conversation(
         .map_err(|e| IpcError::Internal(e.to_string()))?
         .ok_or_else(|| IpcError::NotFound(format!("Conversation '{}' not found", id)))?;
 
-    if messages.is_some() {
-        return Err(IpcError::Validation(
-            "conversation transcripts are owned by the Agent runtime".to_string(),
-        ));
+    match request {
+        ConversationUpdateRequest::Rename { title } => {
+            let runtime = scoped_runtime(&state, &workspace_id).await?;
+            let _admission = runtime
+                .begin_managed_replacement(&state.app_state.session.foreground_turns, &id)
+                .await
+                .map_err(|error| IpcError::Validation(error.to_string()))?;
+            let runtime_state = runtime.runtime_state_store().ok_or_else(|| {
+                IpcError::Internal("Runtime state store not available".to_string())
+            })?;
+            let execution = runtime
+                .agent_for(&id)
+                .await
+                .map_err(|error| IpcError::Validation(error.to_string()))?;
+            echo_agent_app_core::api::managed_conversation::resume_or_import(
+                store.as_ref(),
+                runtime_state.as_ref(),
+                &execution.agent(),
+                &id,
+            )
+            .await
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+            let side_conversations =
+                echo_agent_app_core::api::side_conversation::SideConversationService::new(
+                    Arc::clone(&state.app_state.agent_router),
+                );
+            let side_relation = side_conversations
+                .relation_for_child(Arc::clone(&store), &workspace_id, &id)
+                .await
+                .map_err(|error| IpcError::Internal(error.to_string()))?;
+            if side_relation.is_some() {
+                side_conversations
+                    .rename(store, &workspace_id, &id, &title)
+                    .await
+                    .map_err(|error| IpcError::Internal(error.to_string()))?;
+            } else {
+                echo_agent_app_core::api::managed_conversation::update_title(
+                    store.as_ref(),
+                    &conv.conversation_id,
+                    &title,
+                )
+                .await
+                .map_err(|error| IpcError::Internal(error.to_string()))?;
+            }
+        }
+        ConversationUpdateRequest::SideModel { model_id } => {
+            state
+                .app_state
+                .update_side_conversation_model(&workspace_id, &id, model_id)
+                .await
+                .map_err(IpcError::Validation)?;
+        }
+        ConversationUpdateRequest::SideRetry => {
+            let preparation = state
+                .app_state
+                .prepare_side_conversation_retry(&workspace_id, &id)
+                .await
+                .map_err(IpcError::Validation)?;
+            return launch_side_conversation_gui(state.inner(), app, preparation).await;
+        }
+        ConversationUpdateRequest::SideViewed => {
+            let marked = state
+                .app_state
+                .mark_side_conversation_viewed(&workspace_id, &id)
+                .await
+                .map_err(IpcError::Validation)?;
+            if !marked {
+                return Err(IpcError::Validation(
+                    "conversation is not a Side Conversation".to_string(),
+                ));
+            }
+        }
     }
-
-    store
-        .update_conversation(&conv.conversation_id, title.as_deref(), None, None)
-        .await
-        .map_err(|e| IpcError::Internal(e.to_string()))?;
 
     Ok(serde_json::json!({"success": true}))
 }
@@ -868,17 +1380,28 @@ pub async fn branch_conversation(
         })
         .await
         .map_err(|error| IpcError::Internal(error.to_string()))?;
-    if let Err(error) = store.save_messages(&branch_id, &prefix).await {
-        if let Err(cleanup_error) = state
-            .app_state
-            .delete_conversation_scoped(&workspace_id, &branch_id)
-            .await
-        {
-            tracing::warn!(conversation_id = %branch_id, %cleanup_error, "Failed to roll back incomplete conversation branch");
-        }
-        return Err(IpcError::Internal(error.to_string()));
-    }
-    if let Err(error) = load_agent_transcript(&runtime, &branch_id, &prefix).await {
+    let admission = runtime
+        .begin_managed_replacement(&state.app_state.session.foreground_turns, &branch_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let runtime_state = runtime
+        .runtime_state_store()
+        .ok_or_else(|| IpcError::Internal("Runtime state store not available".to_string()))?;
+    let branch_agent = runtime
+        .agent_for(&branch_id)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    if let Err(error) = echo_agent_app_core::api::managed_conversation::replace_and_resume(
+        store.as_ref(),
+        runtime_state.as_ref(),
+        &branch_agent.agent(),
+        &branch_id,
+        &prefix,
+    )
+    .await
+    {
+        drop(branch_agent);
+        drop(admission);
         if let Err(cleanup_error) = state
             .app_state
             .delete_conversation_scoped(&workspace_id, &branch_id)
@@ -886,7 +1409,7 @@ pub async fn branch_conversation(
         {
             tracing::warn!(conversation_id = %branch_id, %cleanup_error, "Failed to roll back unusable conversation branch");
         }
-        return Err(error);
+        return Err(IpcError::Internal(error.to_string()));
     }
 
     Ok(serde_json::json!({
@@ -966,6 +1489,11 @@ pub async fn restore_conversation(
     workspace_id: String,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
+    state
+        .app_state
+        .prepare_side_conversation_model(&workspace_id, &id)
+        .await
+        .map_err(IpcError::Validation)?;
     let runtime = scoped_runtime(&state, &workspace_id).await?;
     let store = runtime
         .conversation_store()
@@ -990,7 +1518,7 @@ pub async fn restore_conversation(
         .map_err(|error| IpcError::Internal(error.to_string()))?;
     let (message_count, readiness) = if active.is_empty() {
         (
-            load_agent_transcript(&runtime, &id, &stored).await?,
+            load_agent_transcript(&runtime, &state.app_state.session.foreground_turns, &id).await?,
             "ready",
         )
     } else {

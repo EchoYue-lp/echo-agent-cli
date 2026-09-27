@@ -27,6 +27,10 @@ export type {
   ConversationInputReceipt,
   ConversationInputSource,
   ExecEvent,
+  SideConversationCreateReceipt,
+  SideConversationCreateRequest,
+  SideConversationEntry,
+  SideConversationGroupMetadata,
 } from '../generated';
 import type {
   BackgroundCellState,
@@ -581,6 +585,8 @@ export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  /** AgentRouter coordination retained only in a Side Conversation view. */
+  internalAgent?: boolean;
   thinkingContent?: string; // deprecated, kept for history display
   thinkingSegments?: { content: string }[];
   attachments?: {
@@ -641,6 +647,7 @@ export interface SavedMessage {
   message_id?: string;
   role: string;
   content: string | null;
+  internal_agent?: boolean;
   tool_calls?: { id: string; name: string; arguments: string }[];
   thinking_segments?: string[];
   execution_steps?: { type: string; index?: number; call_id?: string }[];
@@ -677,6 +684,7 @@ export interface ConversationListItem {
   created_at: string;
   updated_at: string;
   archived?: boolean;
+  side_conversation?: import('../generated').SideConversationEntry | null;
 }
 
 // ── Sandbox types ──

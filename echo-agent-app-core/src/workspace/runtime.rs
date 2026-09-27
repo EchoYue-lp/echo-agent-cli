@@ -458,6 +458,22 @@ impl WorkspaceRuntimeHost {
                     workspace.opaque_product_data_generation(),
                     project_root.clone(),
                 ));
+                let review_generation = review_integration
+                    .lease_generation()
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                for receipt in review_generation
+                    .recover_background_reviews()
+                    .await
+                    .map_err(anyhow::Error::msg)?
+                {
+                    tracing::warn!(
+                        operation_id = %receipt.operation_id,
+                        run_id = %receipt.identity.run_id,
+                        result = ?receipt.result,
+                        "recovered unfinished workspace Background Review"
+                    );
+                }
+                drop(review_generation);
                 let workspace_io_identity = self.workspace_io_identity();
                 let (pool, plugin_runtime, _mcp_ownership) = seed_pool
                     .fork_for_workspace(WorkspaceAgentPoolResources {
@@ -596,7 +612,17 @@ impl WorkspaceRuntimeHost {
                 settlement
             }
         };
-        settlement.await.map_err(anyhow::Error::msg)
+        let result = settlement.await;
+        {
+            let mut owner = self
+                .shutdown_settlement
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workspace shutdown owner lock is poisoned"))?;
+            // The running shared future captures this host. Retain only its
+            // settled result so eviction can release the old file authorities.
+            *owner = Some(futures::future::ready(result.clone()).boxed().shared());
+        }
+        result.map_err(anyhow::Error::msg)
     }
 }
 
@@ -659,6 +685,19 @@ impl WorkspaceExecutionRuntime {
         if let Err(error) = self.pool.shutdown().await {
             errors.push(format!("AgentPool: {error}"));
         }
+        self.primary_agent
+            .write_async(|agent| {
+                Box::pin(async move {
+                    for name in ["remember", "recall", "search_memory", "forget"] {
+                        agent.remove_tool(name);
+                    }
+                    agent.context().lock().await.remove_memory_promoter();
+                    agent.set_memory_trigger_sink(None);
+                    agent.set_skill_load_policy(None);
+                    agent.set_skill_mutation_authority(None);
+                })
+            })
+            .await;
         if let Some(plugin_runtime) = self.plugin_runtime.as_ref()
             && let Err(error) = plugin_runtime.shutdown().await
         {
@@ -1051,11 +1090,11 @@ impl WorkspaceRuntimeRegistry {
                 activity.active_controls
             );
         }
-        host.shutdown_runtime().await?;
-        // Keep the closing guard uncommitted until shutdown succeeds. On a
-        // shutdown error its Drop implementation reopens the host so callers
-        // can retry or restore a failed project relink.
+        // Crossing into the owned shutdown settlement is irreversible. Keep
+        // the host sealed even when shutdown reports durable cleanup debt;
+        // only cancellation before this safe point may reopen admission.
         closing.commit();
+        host.shutdown_runtime().await?;
         hosts.remove(workspace_id);
         Ok(true)
     }

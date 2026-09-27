@@ -910,7 +910,8 @@ async fn drive_background_run(
         let manager = manager.clone();
         agent
             .write(|value| value.install_memory_layer_manager(manager))
-            .await;
+            .await
+            .map_err(|error| error.to_string())?;
     }
     let reviewer_llm = agent.read(|agent| agent.llm_client().cloned()).await;
     let plan_run_id = run_id.clone();

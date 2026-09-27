@@ -91,6 +91,27 @@ pub struct AgentGroupMember {
     pub label: Option<String>,
 }
 
+/// EKO metadata for one durable Side Conversation relation.
+///
+/// The transcript remains in `ConversationStore`. This value only extends the
+/// existing AgentRouter group authority with child-local configuration.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "SideConversationGroupMetadata")]
+pub struct SideConversationGroupMetadata {
+    pub request_payload_sha256: String,
+    /// Durable copy used only to retry an initial prompt that never reached the
+    /// AgentRouter inbox. The transcript remains the conversation authority.
+    pub initial_prompt: String,
+    pub model_id: Option<String>,
+    pub snapshot_message_count: usize,
+    #[ts(type = "number | null")]
+    pub snapshot_last_message_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_error: Option<String>,
+}
+
 /// Persistent cross-workspace address book. Execution remains owned by the
 /// leader's existing TaskRun and framework DAG runtime.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, TS)]
@@ -100,6 +121,8 @@ pub struct AgentGroup {
     pub name: String,
     pub leader: AgentAddress,
     pub members: Vec<AgentGroupMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_conversation: Option<SideConversationGroupMetadata>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -155,6 +178,53 @@ impl AgentGroup {
                 return Err(AgentRouterError::Validation(format!(
                     "Agent group contains duplicate Subagent role '{role}'"
                 )));
+            }
+        }
+        if self.side_conversation.is_none()
+            && self
+                .members
+                .iter()
+                .any(|member| member.subagent_role == "side-conversation")
+        {
+            return Err(AgentRouterError::Validation(
+                "Side Conversation is a reserved Subagent role".to_string(),
+            ));
+        }
+        if let Some(metadata) = self.side_conversation.as_ref() {
+            if self.members.len() != 1
+                || self
+                    .members
+                    .first()
+                    .is_none_or(|member| member.subagent_role != "side-conversation")
+            {
+                return Err(AgentRouterError::Validation(
+                    "Side Conversation group requires exactly one Side Conversation member"
+                        .to_string(),
+                ));
+            }
+            if metadata.request_payload_sha256.chars().count() != 64
+                || !metadata
+                    .request_payload_sha256
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            {
+                return Err(AgentRouterError::Validation(
+                    "Side Conversation request payload digest must be SHA-256".to_string(),
+                ));
+            }
+            if metadata
+                .model_id
+                .as_deref()
+                .is_some_and(|model_id| model_id.trim().is_empty())
+            {
+                return Err(AgentRouterError::Validation(
+                    "Side Conversation model id must not be empty".to_string(),
+                ));
+            }
+            if metadata.initial_prompt.trim().is_empty() {
+                return Err(AgentRouterError::Validation(
+                    "Side Conversation initial prompt must not be empty".to_string(),
+                ));
             }
         }
         Ok(())

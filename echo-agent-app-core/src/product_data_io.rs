@@ -291,6 +291,41 @@ impl ProductDataIoFlow {
         .await
     }
 
+    pub async fn run_async<T, F>(
+        &self,
+        operation: &'static str,
+        future: F,
+    ) -> Result<T, ProductDataIoError>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let nested_owner = {
+            let owner = self
+                .inner
+                .owner
+                .lock()
+                .map_err(|error| ProductDataIoError::Admission {
+                    operation,
+                    error: format!("product-data flow owner is poisoned: {error}"),
+                })?;
+            if owner.is_none() {
+                return Err(ProductDataIoError::Admission {
+                    operation,
+                    error: "product-data flow has already settled".to_string(),
+                });
+            }
+            self.inner.supervisor.admit_nested(operation)?
+        };
+        run_nested_async_with(
+            Arc::clone(&self.inner.supervisor),
+            nested_owner,
+            operation,
+            future,
+        )
+        .await
+    }
+
     pub fn settle(&self, failure: Option<String>) {
         let owner = self
             .inner
@@ -450,6 +485,43 @@ where
     result_rx
         .await
         .map_err(|_| ProductDataIoError::OwnerClosed { operation })?
+}
+
+async fn run_nested_async_with<T, F>(
+    _supervisor: Arc<ProductDataOperationSupervisor>,
+    owner: ProductDataOperation,
+    operation: &'static str,
+    future: F,
+) -> Result<T, ProductDataIoError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    let permit = PROCESS_PRODUCT_DATA_IO
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|error| ProductDataIoError::Admission {
+            operation,
+            error: error.to_string(),
+        })?;
+    #[cfg(test)]
+    let barrier = _supervisor.take_barrier(operation);
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _permit = permit;
+        #[cfg(test)]
+        if let Some(barrier) = barrier {
+            let _entered = barrier.entered.send(());
+            let _released = barrier.release.await;
+        }
+        let result = future.await;
+        owner.settle(None);
+        let _delivered = result_tx.send(result);
+    });
+    result_rx
+        .await
+        .map_err(|_| ProductDataIoError::OwnerClosed { operation })
 }
 
 /// Exact workspace authority shared by GUI, TUI, CLI, and channel product
