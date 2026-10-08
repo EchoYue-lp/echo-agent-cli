@@ -72,4 +72,22 @@ describe('GUI-only Side Conversation IPC adapter', () => {
     ).rejects.toThrow('requires the EKO desktop GUI');
     expect(bridge.apiInvoke).not.toHaveBeenCalled();
   });
+
+  it('distinguishes completed-turn Fork from edit/regenerate on the shared branch IPC', async () => {
+    bridge.apiInvoke.mockResolvedValue({ success: true, id: 'branch-1' });
+    await conversationApi.branch('workspace-1', 'conversation-1', 2);
+    await conversationApi.branch('workspace-1', 'conversation-1', 2, true);
+    expect(bridge.apiInvoke).toHaveBeenNthCalledWith(1, 'branch_conversation', {
+      workspaceId: 'workspace-1',
+      id: 'conversation-1',
+      userTurnIndex: 2,
+      includeTurn: false,
+    });
+    expect(bridge.apiInvoke).toHaveBeenNthCalledWith(2, 'branch_conversation', {
+      workspaceId: 'workspace-1',
+      id: 'conversation-1',
+      userTurnIndex: 2,
+      includeTurn: true,
+    });
+  });
 });

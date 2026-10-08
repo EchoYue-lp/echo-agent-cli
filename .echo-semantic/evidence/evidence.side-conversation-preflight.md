@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.side-conversation-preflight
 kind: evidence
-observed_at: source:caa0bf81fcda8d046037a8a1065adc31b7bb0652059b4e4c8e975d8831e26fc0
+observed_at: 6b162b6ab2aa13c8262fd6424ff089a692df70b5
 source_refs:
   - docs/supreme/specs/side-conversation/design.md
   - docs/supreme/specs/side-conversation/plans/plan_02_gui-side-conversation.md

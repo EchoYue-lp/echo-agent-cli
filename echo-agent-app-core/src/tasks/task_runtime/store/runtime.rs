@@ -2755,7 +2755,7 @@ impl TaskRuntimeStore {
     ) -> Result<RunCancellationRegistration, StoreError> {
         let registration_id = self
             .next_run_cancel_registration
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |current| current.checked_add(1),
@@ -5722,7 +5722,7 @@ impl TaskRuntimeStore {
             #[cfg(test)]
             if self
                 .fail_cell_terminal_remaining
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |remaining| remaining.checked_sub(1),

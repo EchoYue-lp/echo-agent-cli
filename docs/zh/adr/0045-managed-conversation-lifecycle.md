@@ -16,6 +16,7 @@
 
 ## 决策
 
+- GUI 显式 Fork 按钮为既有 `branch_conversation` 增加 `include_turn`：false 保留编辑/重新生成的目标用户回合前边界；true 复制到该回合已提交的最终回复。读取快照期间持有源会话 identity 与空闲回合准入。GUI 用户回合序号通过既有可见性投影排除内部 Agent 投递，canonical 工具历史仍完整保留。既有 managed import 协调器恢复新的普通会话后，GUI 刷新工作区列表并加载该会话，不启动另一轮模型调用；迟到响应不能覆盖更新的工作区/会话选择。这借鉴用户提供的 Codex 回复操作区，不新增 Side 关系或 Store。
 - EKO 在现有 conversation identity lock 内以 `ensure_projection_epoch` 作为唯一的 Managed 创建/确保操作，并在向 turn 发布前取得框架 projection epoch。tombstone 或 epoch 冲突是准入失败，不能暗中重建。
 - GUI 分支、Side 首轮快照、TUI 原有 fork/rewind/clear/resume，以及 REPL resume/reset/new/undo 共用应用协调器：导入 canonical 消息、CAS 对应 runtime 游标、再恢复 Agent。直接替换命令全程持有会话 identity lock 并暂停回合准入。若导入已提交而检查点尚未写入，只能用 Store 持久 locator 和精确消息重建并重放原请求；直接重试先结算这笔债，不再推进第二个 epoch。新导入在提交前验证检查点历史。
 - Rename 先修复导入债务，再使用框架 revision-fenced 元数据更新。跨工作区移动按固定顺序取得源/目标准入并严格证明目标 ID 不存在，导入并恢复目标 Agent 后，用持久、绑定目标 epoch 的可见性转移意图把源隐藏行映射到目标新 ID，再通过 EKO 聚合删除退休源会话。目标若已有退休的 runtime generation，则拒绝同名回迁；回迁需使用新的 conversation 身份。持久的 Prepared/TargetImported/SourceRetired handoff 意图在启动时重放，不导入第二个目标 epoch；follow-up 准入后保留绑定源 epoch 的完成收据，让成功响应丢失后的相同重试得到原结果。若源身份随后重现，旧收据显式报冲突而不返回假成功。未完成意图在调用方返回错误后仍阻止两端普通 turn、替换、创建和删除准入。目标准入保持关闭直到源退休或受控回滚完成；源退休结果不确定时保留目标并报告债务。

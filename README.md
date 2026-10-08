@@ -219,9 +219,15 @@ Browser、Sandbox、数据分析和论文/系统综述工作台。Workflow 和�
 已存在，但 React panel 尚未接入生产导航，不能算 GUI 完成。当前代码依据与尚在收口的
 缺口见 [功能总览](docs/zh/features.md)。
 
+完成回复下方的“分叉会话”可复制至该回合的完整上下文并打开一个普通新会话；原会话与
+带 `(branch)` 标题的新会话都保留在当前工作区会话列表，Fork 不会自动重发问题。
+
 Side Conversation 依赖 GUI 的侧栏树和并行视图，只通过 Tauri 提供创建、恢复与管理；
 TUI、CLI/JSONL 和 channel 保留普通 conversation、Subagent 与 `/fork` 行为，不增加该布局
 能力的专用命令或 wire contract。
+
+Agent 协作由模型工具和运行时自动完成，GUI 不提供手动消息或 Agent 组管理页面。
+用户通过 Sidechat、Forkchat 参与独立探索，并在现有对话与任务视图中查看结果。
 
 > **注意**：每个平台只能打包该平台原生的安装包。如需交叉编译请使用 CI/CD（如 GitHub Actions）。
 

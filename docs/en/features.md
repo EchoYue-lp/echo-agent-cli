@@ -15,11 +15,22 @@ projections, review/worktree behavior, and product presentation.
   and summary/sliding/adaptive compression use shared app-core services.
 - Framework `FileConversationStore` is the conversation authority; EKO adds
   workspace binding and UI projection.
+- Completed GUI replies provide Copy, Regenerate, and Fork conversation actions.
+  Fork copies history through the selected reply's complete user turn, including
+  canonical tool calls/results, and opens an idle ordinary conversation in the
+  current workspace list with a `(branch)` title. The source stays in the list;
+  later turns and hidden internal Agent deliveries are excluded. Edit/regenerate
+  still fork before the selected user turn and resend it.
 - The GUI Side Conversation layout copies the primary conversation's committed
   context into a one-level, child-local Agent. AgentGroup metadata retains the
   relationship, model, and unread marker, while Tauri remains the only surface
   adapter. TUI, CLI/JSONL, and channels keep their existing conversation and
   Subagent behavior and expose no Side Conversation-specific contract.
+
+Agent collaboration is organized automatically through model tools and the
+runtime. GUI provides no manual messaging, group administration or collaboration
+management page. Sidechat and Forkchat provide explicit user participation;
+existing conversation and task/Subagent views continue to present results.
 
 Archived conversations are hidden from the active sidebar and managed from
 Settings -> Project data -> Archives. Restore is reversible; permanent
@@ -46,7 +57,7 @@ review, worktree, and surface control. See [runtime architecture](./architecture
 
 EKO integrates transactional file edits, workspace diff, analytics execution,
 interactive terminal sessions, Browser/Chrome, workflow catalog, structured
-extraction, MCP, LSP, Tool output projections, Agent collaboration controls,
+extraction, MCP, LSP, Tool output projections, model-driven Agent collaboration controls,
 Hooks/Webhooks, Plugins, and Skills.
 
 `ExtensionControlService` is the EKO mutation admission for Skills, Plugins,

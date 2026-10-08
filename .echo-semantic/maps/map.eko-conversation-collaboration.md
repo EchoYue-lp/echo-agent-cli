@@ -4,15 +4,20 @@ id: map.eko-conversation-collaboration
 kind: capability_map
 title: EKO Conversation collaboration
 risk: high
-observed_at: source:caa0bf81fcda8d046037a8a1065adc31b7bb0652059b4e4c8e975d8831e26fc0
+observed_at: source:f96d8ee7fbc893913ba410ee992bdeb7e906fefbab84df09ef7719bf62dc79b3
 boundary_refs: [boundary.eko-conversation-collaboration]
-behavior_refs: [behavior.side-conversation-lifecycle]
+behavior_refs: [behavior.side-conversation-lifecycle, behavior.gui-conversation-fork, behavior.automatic-agent-collaboration-ui-boundary]
 rule_refs: [rule.conversation-collaboration-authorities]
-evidence_refs: [evidence.side-conversation-preflight]
-finding_refs: []
-audit_refs: []
+evidence_refs: [evidence.side-conversation-preflight, evidence.gui-conversation-fork, evidence.automatic-agent-collaboration-ui-retirement]
+finding_refs: [finding.manual-agent-collaboration-ui-retirement]
+audit_refs: [audit.automatic-agent-collaboration-ui-retirement]
 related_map_refs: []
 scenarios:
+  ordinary-conversation-gui-fork:
+    status: mapped
+    source_refs: [src/tauri/commands/conversations.rs, web-frontend/src/api/endpoints.ts, web-frontend/src/stores/conversationStore.ts, web-frontend/src/components/chat/ChatPanel.tsx, web-frontend/src/components/chat/MessageBubble.tsx]
+    rule_refs: [rule.conversation-collaboration-authorities]
+    evidence_refs: [evidence.gui-conversation-fork]
   conversation-transcript-persistence:
     status: mapped
     source_refs: [src/tauri/commands/conversations.rs, echo-agent-app-core/src/state/config.rs]
@@ -25,9 +30,9 @@ scenarios:
     evidence_refs: [evidence.side-conversation-preflight]
   agent-router-internal-messaging:
     status: mapped
-    source_refs: [echo-agent-app-core/src/agent_control.rs, echo-agent-app-core/src/agent_router/router.rs, src/tauri/commands/agent_router.rs]
+    source_refs: [echo-agent-app-core/src/agent_control.rs, echo-agent-app-core/src/agent_router/router.rs, echo-agent-app-core/src/state/app_state.rs, web-frontend/src/components/chat/ChatPanel.tsx, src/tauri/mod.rs]
     rule_refs: [rule.conversation-collaboration-authorities]
-    evidence_refs: [evidence.side-conversation-preflight]
+    evidence_refs: [evidence.side-conversation-preflight, evidence.automatic-agent-collaboration-ui-retirement]
   side-conversation-create-and-recover:
     status: mapped
     source_refs: [docs/supreme/specs/side-conversation/design.md, echo-agent-app-core/src/side_conversation.rs, echo-agent-app-core/src/conversation_archive.rs, echo-agent-app-core/src/managed_conversation.rs, echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/state/workspace.rs, echo-agent-app-core/src/state/tests.rs, src/tauri/commands/conversations.rs, web-frontend/src/stores/conversationStore.ts, web-frontend/src/generated/TurnVisibility.ts]
@@ -48,7 +53,7 @@ scenarios:
 
 ## 入口与输出
 
-GUI 通过 Tauri conversation commands 创建和管理 Side Conversation，模型侧 Agent control 继续负责内部消息；TUI、CLI/JSONL 和 channel 不增加 Side Conversation 专用入口。输出为 conversation transcript、typed receipt、事件投影和 GUI 左侧会话树。
+GUI 通过 Tauri conversation commands 创建和管理 Side Conversation，并通过同一 branch command 将完成回复 Fork 为列表中的独立普通会话。模型侧 Agent control 继续负责内部消息；TUI、CLI/JSONL 和 channel 不增加 Side Conversation 专用入口。输出为 conversation transcript、typed receipt、事件投影和 GUI 左侧会话树。
 
 ## 行为关系
 

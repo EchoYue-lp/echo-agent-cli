@@ -72,6 +72,8 @@ interface ConversationState {
   loadConversation: (id: string) => Promise<void>;
   /** Branch the canonical transcript immediately before one user turn. */
   branchCurrent: (userTurnIndex: number) => Promise<{ id: string; targetContent: string }>;
+  /** Copy through a completed reply, refresh the list, and open the ordinary fork. */
+  forkCurrent: (userTurnIndex: number) => Promise<string>;
   /** Create and immediately open a Side Conversation. */
   createSideConversation: (input: {
     requestId: string;
@@ -519,6 +521,25 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     set({ activeId: result.id, isLoading: false });
     await get().init(workspaceId);
     return { id: result.id, targetContent: result.target_content };
+  },
+
+  forkCurrent: async (userTurnIndex: number) => {
+    const sourceId = get().activeId;
+    const workspaceId = get().workspaceId;
+    const generation = loadGeneration;
+    if (!sourceId) throw new Error('No active conversation to fork');
+    const result = await conversationApi.branch(workspaceId, sourceId, userTurnIndex, true);
+    if (get().workspaceId !== workspaceId) return result.id;
+    await get().init(workspaceId);
+    // A late fork response must not take over a newer user selection.
+    if (
+      get().workspaceId === workspaceId &&
+      get().activeId === sourceId &&
+      generation === loadGeneration
+    ) {
+      await get().loadConversation(result.id);
+    }
+    return result.id;
   },
 
   createSideConversation: async ({ requestId, prompt, title, modelId }) => {

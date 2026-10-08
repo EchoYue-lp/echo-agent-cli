@@ -105,7 +105,7 @@ impl MemoryProjectionObserver {
     fn mark_dirty(&self) {
         let _ = self
             .revision
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
                 revision.checked_add(1)
             });
     }
@@ -1603,7 +1603,7 @@ impl ReviewIntegration {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             targets.primary = None;
             targets.pool = None;
-            let _advanced = self.hot_memory_projection.active_generation.fetch_update(
+            let _advanced = self.hot_memory_projection.active_generation.try_update(
                 Ordering::AcqRel,
                 Ordering::Acquire,
                 |generation| generation.checked_add(1),

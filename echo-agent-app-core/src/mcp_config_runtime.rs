@@ -669,7 +669,7 @@ impl McpConfigRuntime {
         *snapshot = candidate.clone();
         let previous_generation = self
             .generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_add(1))
             })
             .unwrap_or_else(|current| current);

@@ -251,6 +251,68 @@ describe('conversation message identity', () => {
     expect(useConversationStore.getState().activeId).toBe('branch-1');
   });
 
+  it('lists an ordinary fork beside its source and opens its committed reply', async () => {
+    useConversationStore.setState({ activeId: 'conversation-1' });
+    mocks.listConversations.mockResolvedValueOnce(
+      ['conversation-1', 'branch-1'].map((id) => ({
+        conversation_id: id,
+        title: id === 'branch-1' ? 'Original (branch)' : 'Original',
+        message_count: 2,
+        created_at: '2026-10-08T00:00:00Z',
+        updated_at: '2026-10-08T00:00:00Z',
+        archived: false,
+        side_conversation: null,
+      }))
+    );
+    mocks.getConversation.mockResolvedValueOnce({
+      messages: [
+        { role: 'user', content: 'original question' },
+        { role: 'assistant', content: 'selected reply' },
+      ],
+    });
+
+    const id = await useConversationStore.getState().forkCurrent(0);
+
+    expect(id).toBe('branch-1');
+    expect(mocks.branchConversation).toHaveBeenCalledWith('global', 'conversation-1', 0, true);
+    expect(useConversationStore.getState().conversations.map((item) => item.id)).toEqual([
+      'conversation-1',
+      'branch-1',
+    ]);
+    expect(useConversationStore.getState().sideConversations).toEqual([]);
+    expect(useConversationStore.getState().activeId).toBe('branch-1');
+    expect(useChatStore.getState().messages.map((item) => item.content)).toEqual([
+      'original question',
+      'selected reply',
+    ]);
+    expect(mocks.restoreConversation).toHaveBeenCalledWith('global', 'branch-1');
+  });
+
+  it('does not replace a newer conversation selection when Fork completes late', async () => {
+    const response = deferred<{ id: string }>();
+    mocks.branchConversation.mockReturnValueOnce(response.promise);
+    useConversationStore.setState({ activeId: 'conversation-1' });
+    const forking = useConversationStore.getState().forkCurrent(0);
+    useConversationStore.setState({ activeId: 'conversation-2' });
+    response.resolve({ id: 'branch-1' });
+    await forking;
+    expect(useConversationStore.getState().activeId).toBe('conversation-2');
+    expect(mocks.getConversation).not.toHaveBeenCalled();
+  });
+
+  it('preserves the source selection and transcript when Fork fails', async () => {
+    mocks.branchConversation.mockRejectedValueOnce(new Error('source turn is active'));
+    useConversationStore.setState({ activeId: 'conversation-1' });
+    useChatStore
+      .getState()
+      .replaceMessages([{ id: 'reply', role: 'assistant', content: 'original', timestamp: 1 }]);
+    await expect(useConversationStore.getState().forkCurrent(0)).rejects.toThrow(
+      'source turn is active'
+    );
+    expect(useConversationStore.getState().activeId).toBe('conversation-1');
+    expect(useChatStore.getState().messages.at(0)?.content).toBe('original');
+  });
+
   it('creates a Side Conversation under the active primary and opens the canonical child', async () => {
     mocks.createSideConversation.mockResolvedValueOnce({
       creation: {

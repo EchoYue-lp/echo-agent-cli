@@ -368,6 +368,7 @@ fn branch_prefix(
     stored: &[StoredMessage],
     user_turn_index: usize,
     conversation_id: &str,
+    include_turn: bool,
 ) -> Result<Vec<StoredMessage>, IpcError> {
     let mut current_user_index = 0usize;
     let boundary = stored.iter().position(|message| {
@@ -385,6 +386,34 @@ fn branch_prefix(
             "user turn index {user_turn_index} is outside the canonical transcript"
         ))
     })?;
+    let boundary = if include_turn {
+        let end = stored
+            .iter()
+            .enumerate()
+            .skip(boundary.saturating_add(1))
+            .find_map(|(index, message)| (message.role == "user").then_some(index))
+            .unwrap_or(stored.len());
+        // A fork includes a complete reply and its tool results, never a half-written turn.
+        let final_reply = stored.get(end.saturating_sub(1)).filter(|message| {
+            message.role == "assistant"
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| !content.trim().is_empty())
+                && message.tool_calls_json.as_deref().is_none_or(|calls| {
+                    serde_json::from_str::<Vec<serde_json::Value>>(calls)
+                        .is_ok_and(|calls| calls.is_empty())
+                })
+        });
+        if final_reply.is_none() {
+            return Err(IpcError::Validation(
+                "cannot fork a turn without a committed final reply".to_string(),
+            ));
+        }
+        end
+    } else {
+        boundary
+    };
     Ok(stored
         .iter()
         .take(boundary)
@@ -412,6 +441,18 @@ fn strip_branch_ui_references(raw: Option<String>) -> Option<String> {
     object.remove("execution_steps");
     object.remove("execution_rounds");
     serde_json::to_string(&value).ok().or(Some(raw))
+}
+
+fn retain_public_messages(
+    stored: &mut Vec<StoredMessage>,
+    internal_ids: &std::collections::HashSet<i64>,
+) {
+    stored.retain(|message| {
+        !message.id.is_some_and(|id| internal_ids.contains(&id))
+            && !echo_agent_app_core::api::side_conversation::is_internal_agent_message(
+                message.attachments_json.as_deref(),
+            )
+    });
 }
 
 async fn load_agent_transcript(
@@ -748,7 +789,7 @@ mod tests {
         })
         .collect::<Vec<_>>();
 
-        let prefix = branch_prefix(&stored, 1, "branch")?;
+        let prefix = branch_prefix(&stored, 1, "branch", false)?;
         assert_eq!(prefix.len(), 4);
         assert!(prefix.iter().any(|message| message.role == "tool"));
         assert!(
@@ -756,6 +797,59 @@ mod tests {
                 .iter()
                 .all(|message| { message.id.is_none() && message.conversation_id == "branch" })
         );
+        let fork = branch_prefix(&stored, 0, "fork", true)?;
+        assert_eq!(fork, branch_prefix(&stored, 1, "fork", false)?);
+        assert_eq!(
+            fork.last().and_then(|message| message.content.as_deref()),
+            Some("answer")
+        );
+        assert!(branch_prefix(&stored, 1, "incomplete", true).is_err());
+        assert!(branch_prefix(&stored, 2, "invalid", true).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn fork_prefix_excludes_internal_turns_and_future_replies() -> anyhow::Result<()> {
+        let mut stored = [
+            ("user", "same prompt"),
+            ("assistant", "first answer"),
+            ("user", "internal request"),
+            ("assistant", "internal result"),
+            ("user", "same prompt"),
+            ("assistant", "selected answer"),
+            ("user", "later prompt"),
+            ("assistant", "later answer"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (role, content))| StoredMessage {
+            id: i64::try_from(index).ok(),
+            conversation_id: "source".to_string(),
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            attachments_json: None,
+            tool_calls_json: None,
+            tool_result_json: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        })
+        .collect::<Vec<_>>();
+        retain_public_messages(&mut stored, &std::collections::HashSet::from([2, 3]));
+        let fork = branch_prefix(&stored, 1, "fork", true)?;
+        assert_eq!(fork.len(), 4);
+        assert_eq!(
+            fork.last().and_then(|message| message.content.as_deref()),
+            Some("selected answer")
+        );
+        assert!(
+            fork.iter()
+                .all(|message| message.id.is_none() && message.conversation_id == "fork")
+        );
+        assert!(!fork.iter().any(|message| {
+            message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("internal") || content.contains("later"))
+        }));
         Ok(())
     }
 
@@ -1173,14 +1267,7 @@ pub async fn get_conversation(
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
     if side_relation.is_none() {
-        stored.retain(|message| {
-            !message
-                .id
-                .is_some_and(|id| internal_message_ids.contains(&id))
-                && !echo_agent_app_core::api::side_conversation::is_internal_agent_message(
-                    message.attachments_json.as_deref(),
-                )
-        });
+        retain_public_messages(&mut stored, &internal_message_ids);
     } else {
         state
             .app_state
@@ -1307,10 +1394,11 @@ pub async fn update_conversation(
     Ok(serde_json::json!({"success": true}))
 }
 
-/// Create an immutable branch immediately before one persisted user turn.
+/// Create an immutable branch before a user turn, or through its complete reply.
 ///
 /// Edit/regenerate callers resend that user turn against the returned
-/// conversation. The source transcript remains untouched and the new pooled
+/// conversation. Explicit Fork includes the turn and leaves the new conversation idle.
+/// The source transcript remains untouched and the new pooled
 /// Agent receives the exact canonical prefix, including prior tool messages.
 #[tauri::command]
 pub async fn branch_conversation(
@@ -1318,20 +1406,13 @@ pub async fn branch_conversation(
     workspace_id: String,
     id: String,
     user_turn_index: usize,
+    include_turn: Option<bool>,
 ) -> Result<serde_json::Value, IpcError> {
-    if !state
-        .app_state
-        .session
-        .foreground_turns
-        .snapshots_for_conversation_scoped(&workspace_id, &id)
-        .map_err(|error| IpcError::Internal(error.to_string()))?
-        .is_empty()
-    {
-        return Err(IpcError::Validation(
-            "cannot branch a conversation while its turn is active".to_string(),
-        ));
-    }
     let runtime = scoped_runtime(&state, &workspace_id).await?;
+    let _source_admission = runtime
+        .begin_managed_replacement(&state.app_state.session.foreground_turns, &id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
     let store = runtime
         .conversation_store()
         .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
@@ -1340,10 +1421,20 @@ pub async fn branch_conversation(
         .await
         .map_err(|error| IpcError::Internal(error.to_string()))?
         .ok_or_else(|| IpcError::NotFound(format!("Conversation '{id}' not found")))?;
-    let stored = store
+    let mut stored = store
         .get_messages(&source.conversation_id)
         .await
         .map_err(|error| IpcError::Internal(error.to_string()))?;
+    // GUI turn ordinals count visible prompts. Keep internal delivery rows out of
+    // the ordinary fork so they cannot become user-authored messages in its list.
+    let internal_ids = state
+        .app_state
+        .internal_message_ids_scoped(&workspace_id, &id)
+        .await
+        .map_err(IpcError::Internal)?
+        .into_iter()
+        .collect();
+    retain_public_messages(&mut stored, &internal_ids);
     let target = stored
         .iter()
         .filter(|message| message.role == "user")
@@ -1365,7 +1456,12 @@ pub async fn branch_conversation(
             ))
         })?;
     let branch_id = format!("conv-{}", uuid::Uuid::new_v4());
-    let prefix = branch_prefix(&stored, user_turn_index, &branch_id)?;
+    let prefix = branch_prefix(
+        &stored,
+        user_turn_index,
+        &branch_id,
+        include_turn.unwrap_or(false),
+    )?;
     let title = source
         .title
         .as_deref()
