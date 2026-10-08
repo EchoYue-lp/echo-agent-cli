@@ -19,7 +19,7 @@ EKO 的主对话承担长期目标、任务编排和用户持续交互。用户�
 - framework `ConversationStore` 定义 `Conversation`、`ConversationMeta`、`StoredMessage` 与会话 CRUD；EKO 使用 `FileConversationStore`，manifest 与 committed message generation/JSONL 是持久化权威。
 - `AgentPool` 已按 `(workspace, conversation)` 提供独立 Agent，`send_chat_message`、`ConversationInputService`、`ForegroundTurnControl` 和 `ChatEventLog` 已支持并发多会话、持久输入、精确取消与事件恢复。
 - `AgentRouter` 已提供 Conversation 地址、持久 inbox、主从组关系和双向消息；`AgentControlService` 已支持 `agent_spawn`、`agent_resume`、`agent_group` 等模型侧能力。
-- GUI `branch_conversation` 当前复制选定用户 turn 之前的 committed transcript，服务于编辑/重新生成，并立即切换到新会话；TUI `/fork` 是已有的普通会话分叉。两者都不建立 Side Conversation 关系，但各自语义独立且继续保留。
+- GUI `branch_conversation` 复用 committed transcript：编辑/重新生成复制选定用户 turn 之前的历史，回复下方的显式 Fork 复制到该 turn 的完整回复并打开列表中的独立普通会话；TUI `/fork` 是已有的普通会话分叉。两者都不建立 Side Conversation 关系，但各自语义独立且继续保留。
 - 最新 `main` 中没有名为 `ConversationDomainData` 的 Rust/TypeScript 类型，也没有包含 parent edge 的消息 DAG；`StoredMessage` 是按 ID 排序的线性 transcript。设计不得把不存在的类型或 DAG 写成已实现事实，也不得仅为匹配旧方案命名而再造一套领域模型。
 
 因此，本设计把用户确认的“复用 ConversationDomainData、message DAG”收敛为可验证的实际约束：复用现有 Conversation domain、committed transcript 和文件日志；上下文继承使用不可变快照复制，父子关系复用 `AgentRouter` 的 `AgentGroup` 权威。未来若 framework 单独引入通用消息 DAG，可在不改变 Side Conversation 外部语义的前提下替换快照实现，但本 Outcome 不依赖该假设。
@@ -57,7 +57,7 @@ EKO 的主对话承担长期目标、任务编排和用户持续交互。用户�
 - 选中支线时中心区复用主 Agent 的时间线与 composer 视觉语言，但以 typed adapter 保留支线身份、模型选择、取消地址和内部消息来源。
 - 支线状态列表刷新与 transcript load 使用独立 generation；轮询不得取消正在打开的会话。当前可见支线收到新 committed 内容时，GUI 在本地清零未读并通过 typed conversation update 推进持久 viewed marker。
 - Side Conversation 只通过 GUI/Tauri 暴露；TUI、CLI/JSONL 与 channel 不注册 Side Conversation 创建、列表、打开或管理命令，也不增加相关 wire DTO。它们继续使用已有普通 conversation、Subagent 与 `/fork` 行为。
-- 现有 GUI `branch_conversation` 继续服务编辑/重新生成，TUI `/fork` 继续服务普通会话分叉。两者不发布 Side Conversation parent relation，因用户意图和展示模型不同，不与 Side Conversation 共用入口或冒充同一产品语义。
+- 现有 GUI `branch_conversation` 同时服务编辑/重新生成与完整回复 Fork，TUI `/fork` 继续服务普通会话分叉。两者不发布 Side Conversation parent relation，因用户意图和展示模型不同，不与 Side Conversation 共用入口或冒充同一产品语义。
 
 # 范围与非目标
 

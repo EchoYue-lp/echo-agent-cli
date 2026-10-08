@@ -14,6 +14,7 @@
 | 前台 turn 控制 | admission、steer、cancel、settlement 由 app-core 统一拥有                     | `echo-agent-app-core/src/foreground_turn.rs`    |
 | 会话追加输入   | 四个交互 surface 共用 durable frontier、tracked drain 与 exact terminal       | `echo-agent-app-core/src/conversation_input.rs` |
 | 会话历史       | framework `FileConversationStore` 为权威，EKO 只做 workspace 绑定和 UI 投影   | `echo-agent-app-core/src/workspace/runtime.rs`  |
+| 分叉会话       | GUI 完成回复下方提供“复制 / 重新生成 / 分叉会话”；Fork 包含该回复所在的完整回合和工具记录，打开带 `(branch)` 标题的独立普通会话，刷新当前工作区列表并保留原会话；后续回合及隐藏内部消息不复制。编辑/重新生成仍在目标用户回合前分叉并重发 | `src/tauri/commands/conversations.rs`、`web-frontend/src/components/chat/ChatPanel.tsx` |
 | 支线对话       | GUI 专属侧栏布局；committed context 快照、一级 Subagent 关系、独立模型/turn 与隐藏内部消息，TUI/CLI/channel 无专用入口 | `echo-agent-app-core/src/side_conversation.rs`、`web-frontend/src/components/chat/SideConversationDialog.tsx` |
 | 会话归档       | 侧边栏只显示未归档会话；“设置 -> 项目数据 -> 归档”可恢复或永久删除 | `echo-agent-app-core/src/conversation_archive.rs`、`web-frontend/src/components/sessions/ArchivedConversationsPanel.tsx` |
 | 附件与长输入   | 上传文件、长粘贴和超预算文本落到 workspace artifact，再按引用读取             | `echo-agent-app-core/src/attachments.rs`        |

@@ -15,6 +15,12 @@ projections, review/worktree behavior, and product presentation.
   and summary/sliding/adaptive compression use shared app-core services.
 - Framework `FileConversationStore` is the conversation authority; EKO adds
   workspace binding and UI projection.
+- Completed GUI replies provide Copy, Regenerate, and Fork conversation actions.
+  Fork copies history through the selected reply's complete user turn, including
+  canonical tool calls/results, and opens an idle ordinary conversation in the
+  current workspace list with a `(branch)` title. The source stays in the list;
+  later turns and hidden internal Agent deliveries are excluded. Edit/regenerate
+  still fork before the selected user turn and resend it.
 - The GUI Side Conversation layout copies the primary conversation's committed
   context into a one-level, child-local Agent. AgentGroup metadata retains the
   relationship, model, and unread marker, while Tauri remains the only surface

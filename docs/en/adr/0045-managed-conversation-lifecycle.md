@@ -16,6 +16,16 @@ The latest framework refuses legacy transcript writes and aggregate deletion whe
 
 ## Decision
 
+- The explicit GUI Fork action extends `branch_conversation` with `include_turn`:
+  false retains the edit/regenerate boundary before a user turn; true copies
+  through that turn's committed final reply. The source identity and idle-turn
+  admission remain held while reading the snapshot. GUI-visible prompt ordinals
+  exclude internal Agent deliveries using the existing visibility projection;
+  canonical tool history is retained. The existing managed import coordinator
+  hydrates the new ordinary conversation, then GUI refreshes the workspace list
+  and loads it without starting another model turn. A late response cannot
+  replace a newer workspace/conversation selection. This follows the supplied
+  Codex reply-action reference and adds no Side relationship or new Store.
 - Under the existing conversation identity lock, EKO uses `ensure_projection_epoch` as the sole managed create/ensure operation before publishing a turn. A tombstoned or conflicting epoch is a failed admission, not an implicit recreation.
 - GUI branches, Side first-turn snapshots, ordinary TUI fork/rewind/clear/resume, and REPL resume/reset/new/undo use one application coordinator to import canonical rows, CAS a matching runtime cursor, and hydrate the Agent. Direct replacement commands hold the existing conversation identity lock and suspend turn admission until hydration settles. A committed import with no checkpoint is recovered only by reconstructing and replaying the Store's durable locator and exact rows; direct retries first settle that debt rather than advancing another epoch. EKO validates checkpoint history before committing a new import.
 - Rename uses the framework's revision-fenced metadata update only after any import debt is repaired. Cross-workspace move strictly proves the destination identity absent under ordered source/destination admission, imports and hydrates it, maps hidden source rows to new destination IDs using a durable epoch-bound visibility transfer, then retires the source through EKO aggregate deletion. A destination with a retired runtime generation is rejected; a return move requires a new conversation identity. A durable Prepared/TargetImported/SourceRetired handoff intent is replayed during startup without importing a second destination epoch; after follow-up admission, a completed receipt binds the source epoch and preserves exact retry results across response loss. If the source identity later reappears, an old receipt fails closed rather than reporting false success. Pending intents fence ordinary turn, replacement, creation, and deletion admission on both sides, including after a caller error. Destination admission stays closed through source retirement or controlled rollback; ambiguous source retirement retains the destination and reports debt.

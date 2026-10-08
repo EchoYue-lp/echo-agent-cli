@@ -7,7 +7,7 @@ expectation: human_confirmed
 risk: high
 primary_focus: state_authority
 focus: [data_durability, time_lifecycle, failure_concurrency, contract_evidence]
-observed_at: source:caa0bf81fcda8d046037a8a1065adc31b7bb0652059b4e4c8e975d8831e26fc0
+observed_at: 6b162b6ab2aa13c8262fd6424ff089a692df70b5
 behavior_refs: [behavior.background-review-caller-owned-settlement]
 code_refs: [echo-agent-app-core/src/evolution/background_review_owner.rs, echo-agent-app-core/src/evolution/review_integration.rs, echo-agent-app-core/src/conversation_archive.rs, echo-agent-app-core/src/conversation_deletion.rs, echo-agent-app-core/src/managed_conversation.rs, echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/state/workspace.rs, echo-agent-app-core/src/extension_control/policy.rs, echo-agent-app-core/src/plugin_runtime/runtime.rs, echo-agent-app-core/src/workspace/runtime.rs]
 evidence_refs: [evidence.latest-framework-consumer-integration]

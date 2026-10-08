@@ -3,8 +3,8 @@ schema_version: 1
 id: baseline.repository
 kind: baseline
 source_snapshot:
-  base_revision: d65c47a44d6f1fb2351b6f00dd78940bc8c971af
-  content_digest: caa0bf81fcda8d046037a8a1065adc31b7bb0652059b4e4c8e975d8831e26fc0
+  base_revision: 6b162b6ab2aa13c8262fd6424ff089a692df70b5
+  content_digest: e310dee0cb79fe7ee6d4072248885201202320e426d217bcf97b3e5e600558a0
 inventory_closure: open
 behavior_model_closure: open
 map_refs: [map.eko-conversation-collaboration, map.eko-framework-consumer-settlement]
@@ -56,7 +56,7 @@ coverage: []
 
 ## 能力图与边界
 
-已建立 EKO Conversation collaboration 与最新 framework consumer settlement 两个边界。前者保留 GUI Side Conversation 的原始交付快照；后者覆盖 Background Review caller-owned 生命周期及最新框架下 Skill/Plugin、Managed conversation、workspace 与 Scheduler 的应用适配。
+已建立 EKO Conversation collaboration 与最新 framework consumer settlement 两个边界。Side Conversation 与 framework consumer 的既有对象绑定可恢复的 main revision，本次 GUI Fork 及受影响 Map/Rule 绑定当前候选源码。后者覆盖 Background Review caller-owned 生命周期及最新框架下 Skill/Plugin、Managed conversation、workspace 与 Scheduler 的应用适配。
 
 ## 覆盖网格
 
@@ -64,8 +64,8 @@ coverage: []
 
 ## 未知与缺口
 
-Side Conversation 的 GUI/Tauri、app-core 和文件权威闭合已补充当前快照故障注入及独立复审。本地全量 Rust、GUI 和前端门禁已有候选证据；framework PR #174 已 squash merge 至签名的 `1927a5fc`，其 Git tree 与已验证候选相同。CLI 远端 CI、CLI/main 交付和 Issue #38 关闭仍未完成。
+既有 Side Conversation 与 framework consumer 的验证范围保留在历史 Evidence 中，不以本次源码摘要冒充重新验收。本次 GUI Fork 由新的 Behavior/Evidence 记录按钮、完整回合快照、独立列表条目与迟到选择保护；本地候选门禁不等于远端合并或原生 Tauri 窗口验收。
 
 ## 闭合结论
 
-当前基线结构与路径分类可作为后续增量依据；新增 consumer Behavior/Rule 的当前候选已独立复审，全仓其它能力的库存闭合与行为模型闭合仍为 open。
+当前基线结构与路径分类可作为后续增量依据；GUI Fork 的当前候选单独绑定测试证据，全仓其它能力的库存闭合与行为模型闭合仍为 open。

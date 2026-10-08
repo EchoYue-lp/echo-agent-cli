@@ -1695,8 +1695,46 @@ mod side_conversation_lifecycle_tests {
 mod workspace_transition_tests {
     use super::*;
     use echo_agent::agent::ReactAgentBuilder;
+    use echo_agent::llm::{ChatChunk, ChatRequest, ChatResponse, LlmClient};
     use echo_agent::memory::{ConversationStore, FileConversationStore, StoredMessage};
     use echo_agent::testing::MockLlmClient;
+
+    /// Keep the real streaming turn open until the live delivery owns a mailbox receipt.
+    /// A fixed provider delay can expire before injection under full-suite load.
+    struct ParkedReplyClient {
+        inner: MockLlmClient,
+        entered: tokio::sync::Notify,
+        release: CancellationToken,
+    }
+
+    impl LlmClient for ParkedReplyClient {
+        fn chat(
+            &self,
+            request: ChatRequest,
+        ) -> futures::future::BoxFuture<'_, echo_agent::error::Result<ChatResponse>> {
+            self.inner.chat(request)
+        }
+
+        fn chat_stream(
+            &self,
+            request: ChatRequest,
+        ) -> futures::future::BoxFuture<
+            '_,
+            echo_agent::error::Result<
+                futures::stream::BoxStream<'static, echo_agent::error::Result<ChatChunk>>,
+            >,
+        > {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.cancelled().await;
+                self.inner.chat_stream(request).await
+            })
+        }
+
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+    }
 
     struct ParkedWorkspaceDeleteHook {
         browser: Arc<crate::browser::BrowserRuntime>,
@@ -2668,13 +2706,15 @@ mod workspace_transition_tests {
             .await
             .map_err(|error| error.to_string())?;
         let active_agent = execution.agent();
+        let active_model = Arc::new(ParkedReplyClient {
+            inner: MockLlmClient::new()
+                .with_responses(["active turn draft", "active turn after steer"]),
+            entered: tokio::sync::Notify::new(),
+            release: CancellationToken::new(),
+        });
         active_agent
             .write(|agent| {
-                agent.set_llm_client(Arc::new(
-                    MockLlmClient::new()
-                        .with_responses(["active turn draft", "active turn after steer"])
-                        .with_delay(std::time::Duration::from_secs(1)),
-                ));
+                agent.set_llm_client(active_model.clone());
             })
             .await;
         let spill_dir = crate::prepared_turn::resolve_user_input_spill_dir(Some(
@@ -2716,7 +2756,12 @@ mod workspace_transition_tests {
             )
             .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            active_model.entered.notified(),
+        )
+        .await
+        .map_err(|_| "target turn never entered the streaming provider".to_string())?;
         let mut live_message = crate::agent_router::AgentMessage::user_text(
             None,
             target.clone(),
@@ -2727,9 +2772,27 @@ mod workspace_transition_tests {
             .send_agent_message_owned(live_message)
             .await
             .map_err(|error| error.to_string())?;
-        // Wall-clock budget must tolerate full-suite parallel load: the
-        // steered target turn settles in seconds when idle but can exceed a
-        // tight 5s deadline while other test binaries compete for cores.
+        // Release the provider only after durable mailbox acceptance, so this
+        // fixture proves live consumption rather than racing a wall-clock sleep.
+        let accepted_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let record = state
+                .agent_router
+                .records(&target)
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|record| record.message_id == "live-steer");
+            if record.is_some_and(|record| record.mailbox_accepted_at.is_some()) {
+                break;
+            }
+            if tokio::time::Instant::now() >= accepted_deadline {
+                active_model.release.cancel();
+                return Err("live Agent delivery never reached mailbox acceptance".to_string());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        active_model.release.cancel();
         let live_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let live_record = loop {
             let record = state

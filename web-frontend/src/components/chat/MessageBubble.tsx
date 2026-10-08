@@ -1,6 +1,17 @@
 import { useMemo, useState, memo } from 'react';
 import type { ChatMessage } from '../../types/api';
-import { Bot, Copy, Check, RefreshCw, Pencil, X, ArrowUp, File, Download } from 'lucide-react';
+import {
+  Bot,
+  Copy,
+  Check,
+  RefreshCw,
+  GitFork,
+  Pencil,
+  X,
+  ArrowUp,
+  File,
+  Download,
+} from 'lucide-react';
 import MarkdownContent from '../common/MarkdownContent';
 import { ThinkingSegment } from './ThinkingSegment';
 import { ParallelExecutionBlock, visibleSubagentRuns } from './ParallelExecutionBlock';
@@ -14,6 +25,8 @@ interface MessageBubbleProps {
   message: ChatMessage;
   onRegenerate?: (messageId: string) => void;
   onEditAndResend?: (messageId: string, newContent: string) => void;
+  onFork?: (messageId: string) => void;
+  forkDisabled?: boolean;
 }
 
 function formatFileSize(bytes: number): string {
@@ -156,6 +169,8 @@ export const MessageBubble = memo(function MessageBubble({
   message,
   onRegenerate,
   onEditAndResend,
+  onFork,
+  forkDisabled,
 }: MessageBubbleProps) {
   const isUser = message.role === 'user' && !message.internalAgent;
   const [editing, setEditing] = useState(false);
@@ -391,23 +406,6 @@ export const MessageBubble = memo(function MessageBubble({
             {/* Final text — no left border, plain markdown flow */}
             {message.content && (
               <div className="group/msg relative">
-                {!message.isStreaming && !editing && (
-                  <div className="absolute -top-3 right-0 z-10 flex gap-0.5 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-1 py-0.5 opacity-0 shadow-[var(--shadow-md)] transition-all duration-200 group-hover/msg:opacity-100 group-hover/msg:-translate-y-0.5">
-                    <ActionButton
-                      icon={<Copy size={13} />}
-                      label="复制"
-                      onClick={() => copyToClipboard(message.content)}
-                      copyMode
-                    />
-                    {onRegenerate && (
-                      <ActionButton
-                        icon={<RefreshCw size={13} />}
-                        label="重新生成"
-                        onClick={() => onRegenerate(message.id)}
-                      />
-                    )}
-                  </div>
-                )}
                 {editing ? (
                   <div className="rounded-lg border-2 border-[var(--accent)] bg-[var(--bg-primary)] px-4 py-3 shadow-[var(--shadow-md)]">
                     <textarea
@@ -449,6 +447,31 @@ export const MessageBubble = memo(function MessageBubble({
                     )}
                   </div>
                 )}
+                {!message.isStreaming && !editing && (
+                  <div className="mt-2 flex items-center gap-0.5 text-[var(--text-tertiary)]">
+                    <ActionButton
+                      icon={<Copy size={13} />}
+                      label="复制"
+                      onClick={() => copyToClipboard(message.content)}
+                      copyMode
+                    />
+                    {onRegenerate && (
+                      <ActionButton
+                        icon={<RefreshCw size={13} />}
+                        label="重新生成"
+                        onClick={() => onRegenerate(message.id)}
+                      />
+                    )}
+                    {onFork && !message.internalAgent && (
+                      <ActionButton
+                        icon={<GitFork size={13} />}
+                        label="分叉会话"
+                        onClick={() => onFork(message.id)}
+                        disabled={forkDisabled || !executionCompleted}
+                      />
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -463,11 +486,13 @@ function ActionButton({
   label,
   onClick,
   copyMode,
+  disabled = false,
 }: {
   icon: React.ReactNode;
   label: string;
   onClick: () => void;
   copyMode?: boolean;
+  disabled?: boolean;
 }) {
   const [done, setDone] = useState(false);
   const handleClick = (e: React.MouseEvent) => {
@@ -481,7 +506,9 @@ function ActionButton({
   return (
     <button
       onClick={handleClick}
-      className={`flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] transition-colors ${done ? 'text-[var(--color-success)]' : 'text-[var(--text-tertiary)] hover:text-[var(--text-primary)]'}`}
+      disabled={disabled}
+      aria-label={label}
+      className={`flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${done ? 'text-[var(--color-success)]' : 'text-[var(--text-tertiary)] hover:text-[var(--text-primary)]'}`}
       title={label}
     >
       {done ? <Check size={13} /> : icon}

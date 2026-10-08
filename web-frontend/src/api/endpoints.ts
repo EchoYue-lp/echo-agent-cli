@@ -716,7 +716,7 @@ export const conversationApi = {
           request: { kind: 'rename', title: data.title },
         })
       : put<{ success: boolean }>(`/conversations/${id}`, data),
-  branch: (workspaceId: string, id: string, userTurnIndex: number) =>
+  branch: (workspaceId: string, id: string, userTurnIndex: number, includeTurn = false) =>
     isTauri()
       ? apiInvoke<{
           success: boolean;
@@ -724,14 +724,17 @@ export const conversationApi = {
           source_id: string;
           message_count: number;
           target_content: string;
-        }>('branch_conversation', { workspaceId, id, userTurnIndex })
+        }>('branch_conversation', { workspaceId, id, userTurnIndex, includeTurn })
       : post<{
           success: boolean;
           id: string;
           source_id: string;
           message_count: number;
           target_content: string;
-        }>(`/conversations/${id}/branch`, { user_turn_index: userTurnIndex }),
+        }>(`/conversations/${id}/branch`, {
+          user_turn_index: userTurnIndex,
+          include_turn: includeTurn,
+        }),
   delete: (workspaceId: string, id: string) =>
     isTauri()
       ? apiInvoke<{

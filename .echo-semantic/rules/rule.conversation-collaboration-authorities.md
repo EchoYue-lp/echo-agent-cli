@@ -7,10 +7,10 @@ expectation: human_confirmed
 risk: high
 primary_focus: state_authority
 focus: [data_durability, time_lifecycle, failure_concurrency, contract_evidence]
-observed_at: source:caa0bf81fcda8d046037a8a1065adc31b7bb0652059b4e4c8e975d8831e26fc0
-behavior_refs: [behavior.side-conversation-lifecycle]
+observed_at: source:e310dee0cb79fe7ee6d4072248885201202320e426d217bcf97b3e5e600558a0
+behavior_refs: [behavior.side-conversation-lifecycle, behavior.gui-conversation-fork]
 code_refs: [echo-agent-app-core/src/state/config.rs, echo-agent-app-core/src/agent_router/router.rs, echo-agent-app-core/src/conversation_archive.rs, echo-agent-app-core/src/managed_conversation.rs, echo-agent-app-core/src/conversation_input.rs, echo-agent-app-core/src/foreground_turn.rs, echo-agent-app-core/src/conversation_deletion.rs, echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/state/workspace.rs, src/tauri/commands/conversations.rs, src/tauri/commands/chat.rs]
-evidence_refs: [evidence.side-conversation-preflight]
+evidence_refs: [evidence.side-conversation-preflight, evidence.gui-conversation-fork]
 finding_refs: []
 ---
 
@@ -34,7 +34,7 @@ Side Conversation 只组合现有权威；Tauri/GUI adapter 不拥有复制器�
 
 ## 证据
 
-app-core 与 Tauri/GUI 的真实调用路径、保持不变的 GUI branch 与 TUI fork、Agent control ADR、Side Conversation Design 和 GUI-only Plan 提供边界依据。
+app-core 与 Tauri/GUI 的真实调用路径、GUI branch 的编辑/重新生成与完整回合 Fork、既有 TUI fork、Agent control ADR 和 Side Conversation Design 提供边界依据。
 
 ## 裁决记录
 

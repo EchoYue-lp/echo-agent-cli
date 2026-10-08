@@ -4,15 +4,20 @@ id: map.eko-conversation-collaboration
 kind: capability_map
 title: EKO Conversation collaboration
 risk: high
-observed_at: source:caa0bf81fcda8d046037a8a1065adc31b7bb0652059b4e4c8e975d8831e26fc0
+observed_at: source:e310dee0cb79fe7ee6d4072248885201202320e426d217bcf97b3e5e600558a0
 boundary_refs: [boundary.eko-conversation-collaboration]
-behavior_refs: [behavior.side-conversation-lifecycle]
+behavior_refs: [behavior.side-conversation-lifecycle, behavior.gui-conversation-fork]
 rule_refs: [rule.conversation-collaboration-authorities]
-evidence_refs: [evidence.side-conversation-preflight]
+evidence_refs: [evidence.side-conversation-preflight, evidence.gui-conversation-fork]
 finding_refs: []
 audit_refs: []
 related_map_refs: []
 scenarios:
+  ordinary-conversation-gui-fork:
+    status: mapped
+    source_refs: [src/tauri/commands/conversations.rs, web-frontend/src/api/endpoints.ts, web-frontend/src/stores/conversationStore.ts, web-frontend/src/components/chat/ChatPanel.tsx, web-frontend/src/components/chat/MessageBubble.tsx]
+    rule_refs: [rule.conversation-collaboration-authorities]
+    evidence_refs: [evidence.gui-conversation-fork]
   conversation-transcript-persistence:
     status: mapped
     source_refs: [src/tauri/commands/conversations.rs, echo-agent-app-core/src/state/config.rs]
@@ -48,7 +53,7 @@ scenarios:
 
 ## 入口与输出
 
-GUI 通过 Tauri conversation commands 创建和管理 Side Conversation，模型侧 Agent control 继续负责内部消息；TUI、CLI/JSONL 和 channel 不增加 Side Conversation 专用入口。输出为 conversation transcript、typed receipt、事件投影和 GUI 左侧会话树。
+GUI 通过 Tauri conversation commands 创建和管理 Side Conversation，并通过同一 branch command 将完成回复 Fork 为列表中的独立普通会话。模型侧 Agent control 继续负责内部消息；TUI、CLI/JSONL 和 channel 不增加 Side Conversation 专用入口。输出为 conversation transcript、typed receipt、事件投影和 GUI 左侧会话树。
 
 ## 行为关系
 

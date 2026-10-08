@@ -8,7 +8,7 @@ risk: high
 primary_focus: time_lifecycle
 focus: [state_authority, data_durability, failure_concurrency, contract_evidence]
 boundary: boundary.eko-framework-consumer-settlement
-observed_at: source:caa0bf81fcda8d046037a8a1065adc31b7bb0652059b4e4c8e975d8831e26fc0
+observed_at: 6b162b6ab2aa13c8262fd6424ff089a692df70b5
 code_refs: [echo-agent-app-core/src/evolution/background_review_owner.rs, echo-agent-app-core/src/evolution/review_integration.rs, echo-agent-app-core/src/runtime.rs, echo-agent-app-core/src/workspace/runtime.rs, src/tauri/commands/panels.rs, src/cli/cmd_impls/evolution.rs, src/tui/events.rs]
 rule_refs: [rule.eko-framework-consumer-authorities]
 evidence_refs: [evidence.latest-framework-consumer-integration]

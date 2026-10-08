@@ -78,6 +78,8 @@ export function ChatPanel() {
   const [failureToastDismissed, setFailureToastDismissed] = useState(false);
   const [agentMessagesOpen, setAgentMessagesOpen] = useState(false);
   const [sideConversationOpen, setSideConversationOpen] = useState(false);
+  const [isForking, setIsForking] = useState(false);
+  const forkInProgress = useRef(false);
   const [configuredModels, setConfiguredModels] = useState<ConfiguredModel[]>([]);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const workspaceMenuRef = useRef<HTMLDivElement>(null);
@@ -160,11 +162,11 @@ export function ChatPanel() {
       ? messageIndex
       : chatStore.messages
           .slice(0, messageIndex)
-          .findLastIndex((message) => message.role === 'user');
+          .findLastIndex((message) => message.role === 'user' && !message.internalAgent);
     if (userMessageIndex < 0 || chatStore.messages[userMessageIndex]?.role !== 'user') return;
     const userTurnIndex = chatStore.messages
       .slice(0, userMessageIndex)
-      .filter((message) => message.role === 'user').length;
+      .filter((message) => message.role === 'user' && !message.internalAgent).length;
     const userMessage = chatStore.messages[userMessageIndex];
     if (!userMessage) return;
     const content = newContent ?? userMessage.content;
@@ -215,6 +217,33 @@ export function ChatPanel() {
 
   const handleEditAndResend = (messageId: string, newContent: string) => {
     void branchAndResend(messageId, newContent);
+  };
+
+  const handleFork = async (messageId: string) => {
+    if (forkInProgress.current || isStreaming) return;
+    const currentMessages = useChatStore.getState().messages;
+    const messageIndex = currentMessages.findIndex((message) => message.id === messageId);
+    const promptIndex = currentMessages
+      .slice(0, messageIndex)
+      .findLastIndex((message) => message.role === 'user' && !message.internalAgent);
+    if (messageIndex < 0 || promptIndex < 0) return;
+    const userTurnIndex = currentMessages
+      .slice(0, promptIndex)
+      .filter((message) => message.role === 'user' && !message.internalAgent).length;
+    forkInProgress.current = true;
+    setIsForking(true);
+    try {
+      const id = await useConversationStore.getState().forkCurrent(userTurnIndex);
+      if (useConversationStore.getState().activeId === id) {
+        useContextPaneStore.getState().reset();
+      }
+    } catch (error) {
+      console.error('Failed to fork conversation:', error);
+      useToastStore.getState().addToast('error', '分叉会话失败，请重试');
+    } finally {
+      forkInProgress.current = false;
+      setIsForking(false);
+    }
   };
 
   const handleScroll = useCallback(() => {
@@ -473,6 +502,8 @@ export function ChatPanel() {
                       message={msg}
                       onRegenerate={handleRegenerate}
                       onEditAndResend={handleEditAndResend}
+                      onFork={activeConversationId ? handleFork : undefined}
+                      forkDisabled={isStreaming || isForking}
                     />
                   </div>
                 );
