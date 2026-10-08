@@ -226,6 +226,9 @@ Side Conversation 依赖 GUI 的侧栏树和并行视图，只通过 Tauri 提�
 TUI、CLI/JSONL 和 channel 保留普通 conversation、Subagent 与 `/fork` 行为，不增加该布局
 能力的专用命令或 wire contract。
 
+Agent 协作由模型工具和运行时自动完成，GUI 不提供手动消息或 Agent 组管理页面。
+用户通过 Sidechat、Forkchat 参与独立探索，并在现有对话与任务视图中查看结果。
+
 > **注意**：每个平台只能打包该平台原生的安装包。如需交叉编译请使用 CI/CD（如 GitHub Actions）。
 
 ### Feature Flags 说明

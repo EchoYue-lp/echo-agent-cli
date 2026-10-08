@@ -65,6 +65,8 @@ launcher 不再维护跨 TaskRun metadata DAG 或轮询器。CLI 使用 `/tasks 
 
 ### Extension Control Authority
 
+Agent 间通信和协作组编排由 AI 使用工具自动完成，GUI 不提供人工消息、组管理或协作动态控制台。用户通过 Sidechat/Forkchat 参与独立探索，现有对话与任务/Subagent 视图继续呈现执行和结果；模型工具、消息结算及其它 surface 的控制能力保留。
+
 `ExtensionControlService` 是 Skills、Plugins、MCP、Hooks、LSP、Browser 的 EKO mutation
 admission，并把真实执行委托给既有 specialist owner。它不建立第二套 registry、manager 或
 store。

@@ -395,6 +395,14 @@
       "legacyRemoved": true
     },
     {
+      "legacyPath": "adr/0047-automatic-agent-collaboration.md",
+      "targetPath": "adr/0047-automatic-agent-collaboration.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
       "legacyPath": "architecture.md",
       "targetPath": "architecture/overview.md",
       "kind": "architecture",

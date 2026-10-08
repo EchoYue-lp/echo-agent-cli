@@ -4,13 +4,13 @@ id: map.eko-conversation-collaboration
 kind: capability_map
 title: EKO Conversation collaboration
 risk: high
-observed_at: source:e310dee0cb79fe7ee6d4072248885201202320e426d217bcf97b3e5e600558a0
+observed_at: source:f96d8ee7fbc893913ba410ee992bdeb7e906fefbab84df09ef7719bf62dc79b3
 boundary_refs: [boundary.eko-conversation-collaboration]
-behavior_refs: [behavior.side-conversation-lifecycle, behavior.gui-conversation-fork]
+behavior_refs: [behavior.side-conversation-lifecycle, behavior.gui-conversation-fork, behavior.automatic-agent-collaboration-ui-boundary]
 rule_refs: [rule.conversation-collaboration-authorities]
-evidence_refs: [evidence.side-conversation-preflight, evidence.gui-conversation-fork]
-finding_refs: []
-audit_refs: []
+evidence_refs: [evidence.side-conversation-preflight, evidence.gui-conversation-fork, evidence.automatic-agent-collaboration-ui-retirement]
+finding_refs: [finding.manual-agent-collaboration-ui-retirement]
+audit_refs: [audit.automatic-agent-collaboration-ui-retirement]
 related_map_refs: []
 scenarios:
   ordinary-conversation-gui-fork:
@@ -30,9 +30,9 @@ scenarios:
     evidence_refs: [evidence.side-conversation-preflight]
   agent-router-internal-messaging:
     status: mapped
-    source_refs: [echo-agent-app-core/src/agent_control.rs, echo-agent-app-core/src/agent_router/router.rs, src/tauri/commands/agent_router.rs]
+    source_refs: [echo-agent-app-core/src/agent_control.rs, echo-agent-app-core/src/agent_router/router.rs, echo-agent-app-core/src/state/app_state.rs, web-frontend/src/components/chat/ChatPanel.tsx, src/tauri/mod.rs]
     rule_refs: [rule.conversation-collaboration-authorities]
-    evidence_refs: [evidence.side-conversation-preflight]
+    evidence_refs: [evidence.side-conversation-preflight, evidence.automatic-agent-collaboration-ui-retirement]
   side-conversation-create-and-recover:
     status: mapped
     source_refs: [docs/supreme/specs/side-conversation/design.md, echo-agent-app-core/src/side_conversation.rs, echo-agent-app-core/src/conversation_archive.rs, echo-agent-app-core/src/managed_conversation.rs, echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/state/workspace.rs, echo-agent-app-core/src/state/tests.rs, src/tauri/commands/conversations.rs, web-frontend/src/stores/conversationStore.ts, web-frontend/src/generated/TurnVisibility.ts]

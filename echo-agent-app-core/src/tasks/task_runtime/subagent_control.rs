@@ -182,7 +182,7 @@ impl SubagentControlService {
     #[cfg(test)]
     fn consume_reservation_failure(&self) -> bool {
         self.reservation_failures
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |remaining| remaining.checked_sub(1),
@@ -198,7 +198,7 @@ impl SubagentControlService {
     #[cfg(test)]
     fn consume_settlement_failure(&self) -> bool {
         self.settlement_failures
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |remaining| remaining.checked_sub(1),

@@ -25,6 +25,8 @@ EKO 应用层:Rust workspace(`echo-agent-app-core` 应用核心 + Tauri 壳 `src
 
 ## 统一术语:只有 Subagent,没有 Worker(强制)
 
+Agent 协作由 AI 使用既有工具和运行时自动组织,包括跨会话通信、主/子 Subagent 消息和组编排。GUI 不提供手动选地址、发送协作消息、维护 Agent 组或管理投递收据的页面/控制台。用户参与并行探索使用 Sidechat 或 Forkchat;既有对话、任务/Subagent 结果呈现及 HITL 保持其核心能力。
+
 产品/领域/运行时模型和代码术语中只有 `Subagent`,标准关系 `TaskRun → PlanTask → SubagentRun`。禁止新增 worker 命名(类型、字段、函数、事件、注释、文档、UI 文案);触及遗留 worker 命名必须随手迁移为 subagent。仅第三方固定 wire name 可在最小适配边界保留。
 
 ## Rust 编码硬性约束(最高优先级)

@@ -897,7 +897,7 @@ impl AnalysisRunSupervisor {
     ) {
         let sequence = self
             .completion_sequence
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
                 |current| current.checked_add(1),

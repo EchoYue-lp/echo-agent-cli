@@ -373,7 +373,7 @@ impl CommandCellRuntimeService {
                         let injected_failure = owner.upgrade().is_some_and(|owner| {
                             owner
                                 .command_cell_watch_recovery_failures
-                                .fetch_update(
+                                .try_update(
                                     std::sync::atomic::Ordering::AcqRel,
                                     std::sync::atomic::Ordering::Acquire,
                                     |remaining| remaining.checked_sub(1),

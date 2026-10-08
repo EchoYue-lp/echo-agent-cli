@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.gui-conversation-fork
 kind: evidence
-observed_at: source:e310dee0cb79fe7ee6d4072248885201202320e426d217bcf97b3e5e600558a0
+observed_at: 8bd2a6f08117cde61037b583000c71ab820e73ce
 source_refs: [src/tauri/commands/conversations.rs, web-frontend/src/components/chat/ChatPanel.tsx, web-frontend/src/components/chat/MessageBubble.tsx, web-frontend/src/components/chat/MessageBubble.fork.test.tsx, web-frontend/src/stores/conversationStore.ts, web-frontend/src/stores/conversationStore.test.ts, web-frontend/src/api/endpoints.ts, web-frontend/src/api/endpoints.sideConversation.test.ts, docs/en/adr/0045-managed-conversation-lifecycle.md, docs/supreme/specs/side-conversation/design.md, echo-agent-app-core/src/state/tests.rs]
 supports: [behavior.gui-conversation-fork, rule.conversation-collaboration-authorities]
 limitations: [该证据绑定当前候选源码，尚非远端合并后的验收, 浏览器视觉检查不证明原生 Tauri 端到端运行]

@@ -21,14 +21,12 @@ import {
   Globe2,
   GripVertical,
   GitFork,
-  MessagesSquare,
   MoreHorizontal,
   PanelRightOpen,
   Workflow,
   X,
 } from 'lucide-react';
 import { providerApi } from '../../api/endpoints';
-import { AgentMessageDialog } from './AgentMessageDialog';
 import type { Attachment } from '../../types/api';
 import type { QueuedChatInput } from '../../hooks/useTauriChat';
 import { useContextPaneStore } from '../../stores/contextPaneStore';
@@ -76,7 +74,6 @@ export function ChatPanel() {
 
   // ── 按需卡片状态 ──
   const [failureToastDismissed, setFailureToastDismissed] = useState(false);
-  const [agentMessagesOpen, setAgentMessagesOpen] = useState(false);
   const [sideConversationOpen, setSideConversationOpen] = useState(false);
   const [isForking, setIsForking] = useState(false);
   const forkInProgress = useRef(false);
@@ -366,15 +363,6 @@ export function ChatPanel() {
                 <span className="h-2 w-2 rounded-full bg-[var(--accent)]" />
                 <span>{runStatusLabel(runStatus, isStreaming)}</span>
               </div>
-              <button
-                type="button"
-                onClick={() => setAgentMessagesOpen(true)}
-                className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-                title="Agent 消息"
-                aria-label="打开 Agent 消息"
-              >
-                <MessagesSquare size={15} />
-              </button>
               <div ref={workspaceMenuRef} className="relative">
                 <button
                   type="button"
@@ -565,7 +553,6 @@ export function ChatPanel() {
           </div>
         )}
       </AgentPane>
-      <AgentMessageDialog isOpen={agentMessagesOpen} onClose={() => setAgentMessagesOpen(false)} />
       <SideConversationDialog
         isOpen={sideConversationOpen}
         onClose={() => setSideConversationOpen(false)}

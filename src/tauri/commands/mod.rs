@@ -6,7 +6,6 @@
 //! - Convert errors to `IpcError`
 //! - Return DTOs
 
-pub mod agent_router;
 pub mod analysis;
 pub mod browser;
 pub mod chat;
