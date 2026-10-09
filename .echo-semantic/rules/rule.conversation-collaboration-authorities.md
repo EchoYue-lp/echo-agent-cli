@@ -7,7 +7,7 @@ expectation: human_confirmed
 risk: high
 primary_focus: state_authority
 focus: [data_durability, time_lifecycle, failure_concurrency, contract_evidence]
-observed_at: source:f96d8ee7fbc893913ba410ee992bdeb7e906fefbab84df09ef7719bf62dc79b3
+observed_at: 40fd80447cdf3d7627399af0b2069a8b4da5327a
 behavior_refs: [behavior.side-conversation-lifecycle, behavior.gui-conversation-fork, behavior.automatic-agent-collaboration-ui-boundary]
 code_refs: [echo-agent-app-core/src/state/config.rs, echo-agent-app-core/src/agent_router/router.rs, echo-agent-app-core/src/conversation_archive.rs, echo-agent-app-core/src/managed_conversation.rs, echo-agent-app-core/src/conversation_input.rs, echo-agent-app-core/src/foreground_turn.rs, echo-agent-app-core/src/conversation_deletion.rs, echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/state/workspace.rs, src/tauri/commands/conversations.rs, src/tauri/commands/chat.rs]
 evidence_refs: [evidence.side-conversation-preflight, evidence.gui-conversation-fork, evidence.automatic-agent-collaboration-ui-retirement]

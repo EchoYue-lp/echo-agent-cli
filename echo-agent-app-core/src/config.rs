@@ -71,7 +71,7 @@ fn default_eko_agent_settings() -> AgentSettings {
         max_tool_output_tokens: 0,
         token_limit: 0,
         compress_strategy: "summary".to_string(),
-        compress_window: 20,
+        compress_window: 0, // Automatic token tail; positive values use legacy message caps.
         subagent_timeout_secs: 600,
         ..AgentSettings::default()
     }

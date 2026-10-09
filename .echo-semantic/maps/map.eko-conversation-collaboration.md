@@ -4,7 +4,7 @@ id: map.eko-conversation-collaboration
 kind: capability_map
 title: EKO Conversation collaboration
 risk: high
-observed_at: source:f96d8ee7fbc893913ba410ee992bdeb7e906fefbab84df09ef7719bf62dc79b3
+observed_at: 40fd80447cdf3d7627399af0b2069a8b4da5327a
 boundary_refs: [boundary.eko-conversation-collaboration]
 behavior_refs: [behavior.side-conversation-lifecycle, behavior.gui-conversation-fork, behavior.automatic-agent-collaboration-ui-boundary]
 rule_refs: [rule.conversation-collaboration-authorities]

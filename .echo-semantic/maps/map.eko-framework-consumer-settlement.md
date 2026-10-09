@@ -4,7 +4,7 @@ id: map.eko-framework-consumer-settlement
 kind: capability_map
 title: EKO framework consumer settlement
 risk: high
-observed_at: 6b162b6ab2aa13c8262fd6424ff089a692df70b5
+observed_at: source:5d3ba9b74a2f9cd70a70fd463540a054b06fa06bc7e2ce1314a6a248b47757e7
 boundary_refs: [boundary.eko-framework-consumer-settlement]
 behavior_refs: [behavior.background-review-caller-owned-settlement]
 rule_refs: [rule.eko-framework-consumer-authorities]
@@ -13,6 +13,11 @@ finding_refs: []
 audit_refs: []
 related_map_refs: [map.eko-conversation-collaboration]
 scenarios:
+  compression-product-policy:
+    status: mapped
+    source_refs: [echo-agent-app-core/src/config.rs, echo-agent-app-core/src/manual_compression.rs, echo-agent-app-core/src/tasks/task_runtime/compact_context.rs, src/cli/cmd_impls/context.rs, src/cli/channels.rs, src/tui/commands.rs, src/tui/events.rs, src/tauri/commands/panels.rs, web-frontend/src/api/endpoints.ts, web-frontend/src/types/api.ts, web-frontend/src/components/compress/CompressPanel.tsx]
+    rule_refs: [rule.eko-framework-consumer-authorities]
+    evidence_refs: [evidence.compression-product-policy]
   background-review-admission-and-recovery:
     status: mapped
     source_refs: [echo-agent-app-core/src/evolution/background_review_owner.rs, echo-agent-app-core/src/evolution/review_integration.rs, echo-agent-app-core/src/runtime.rs, echo-agent-app-core/src/workspace/runtime.rs]

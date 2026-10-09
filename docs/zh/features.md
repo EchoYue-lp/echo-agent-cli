@@ -18,7 +18,7 @@
 | 支线对话       | GUI 专属侧栏布局；committed context 快照、一级 Subagent 关系、独立模型/turn 与隐藏内部消息，TUI/CLI/channel 无专用入口 | `echo-agent-app-core/src/side_conversation.rs`、`web-frontend/src/components/chat/SideConversationDialog.tsx` |
 | 会话归档       | 侧边栏只显示未归档会话；“设置 -> 项目数据 -> 归档”可恢复或永久删除 | `echo-agent-app-core/src/conversation_archive.rs`、`web-frontend/src/components/sessions/ArchivedConversationsPanel.tsx` |
 | 附件与长输入   | 上传文件、长粘贴和超预算文本落到 workspace artifact，再按引用读取             | `echo-agent-app-core/src/attachments.rs`        |
-| 上下文压缩     | summary/sliding/adaptive 策略、手动压缩、usage/context 投影                   | `echo-agent-app-core/src/manual_compression.rs` |
+| 上下文压缩     | summary/hybrid/sliding/adaptive 策略、默认 token 近期窗口、跨 surface focus/cancel 与 goal/recovery 投影 | `echo-agent-app-core/src/manual_compression.rs` |
 
 ## 任务与 Subagent
 

@@ -639,6 +639,13 @@ export interface CompressResponse {
   messages_after: number;
   tokens_saved: number;
   message: string;
+  tokens_before?: number;
+  tokens_after?: number;
+  checkpoint?: {
+    strategy: string;
+    protected_count: number;
+    compression_duration_ms: number;
+  } | null;
 }
 
 // ── Conversation persistence types ──

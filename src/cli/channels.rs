@@ -2710,7 +2710,6 @@ impl AppChannelMessageHandler {
                     .unwrap_or_else(|error| format!("Workflow command failed: {error}")),
             ),
             "/compact" | "/compress" => {
-                let keep_messages = if command == "/compress" { 6 } else { 12 };
                 let focus = (!argument.is_empty()).then(|| argument.to_string());
                 let runtime = match self.app_state.current_control_runtime().await {
                     Ok(runtime) => runtime,
@@ -2835,7 +2834,6 @@ impl AppChannelMessageHandler {
                                     &compression_turn_id,
                                     &agent,
                                     focus,
-                                    keep_messages,
                                     workspace_io_receipt,
                                     Some(lease.cancellation_token()),
                                 )

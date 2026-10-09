@@ -4,7 +4,7 @@ id: baseline.repository
 kind: baseline
 source_snapshot:
   base_revision: 6b162b6ab2aa13c8262fd6424ff089a692df70b5
-  content_digest: f96d8ee7fbc893913ba410ee992bdeb7e906fefbab84df09ef7719bf62dc79b3
+  content_digest: 5d3ba9b74a2f9cd70a70fd463540a054b06fa06bc7e2ce1314a6a248b47757e7
 inventory_closure: open
 behavior_model_closure: open
 map_refs: [map.eko-conversation-collaboration, map.eko-framework-consumer-settlement]

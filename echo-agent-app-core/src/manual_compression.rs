@@ -15,7 +15,6 @@ pub struct ManualCompressionRequest {
     pub conversation_id: String,
     pub surface: ForegroundTurnSurface,
     pub focus: Option<String>,
-    pub keep_messages: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -127,7 +126,6 @@ impl AppState {
         let product_data_io = self.session.product_data_io.clone();
         let chat_events = self.storage.chat_events.clone();
         let focus = request.focus;
-        let keep_messages = request.keep_messages;
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         self.session
             .foreground_turns
@@ -141,14 +139,14 @@ impl AppState {
                     turn_id,
                     agent,
                     focus,
-                    keep_messages,
                     workspace_io_receipt,
-                    None,
+                    Some(lease.cancellation_token()),
                 )
                 .await;
                 drop(execution);
                 let outcome = match &result {
                     Ok(_) => TurnOutcome::Completed,
+                    Err(ManualCompressionError::Cancelled) => TurnOutcome::Cancelled,
                     Err(error) => {
                         TurnOutcome::Failed(AgentFailure::message(error.code(), error.to_string()))
                     }
@@ -188,7 +186,6 @@ impl AppState {
         turn_id: &str,
         agent: &crate::agent_handle::AgentHandle,
         focus: Option<String>,
-        keep_messages: usize,
         workspace_io_receipt: crate::state::ScopedWorkspaceIoReceipt,
         cancel: Option<echo_agent::agent::CancellationToken>,
     ) -> Result<ManualCompressionReceipt, ManualCompressionError> {
@@ -201,7 +198,6 @@ impl AppState {
             turn_id.to_string(),
             agent.clone(),
             focus,
-            keep_messages,
             workspace_io_receipt,
             cancel,
         )
@@ -219,7 +215,6 @@ async fn start_manual_compression_owned(
     turn_id: String,
     agent: crate::agent_handle::AgentHandle,
     focus: Option<String>,
-    keep_messages: usize,
     workspace_io_receipt: crate::state::ScopedWorkspaceIoReceipt,
     cancel: Option<echo_agent::agent::CancellationToken>,
 ) -> Result<ManualCompressionReceipt, ManualCompressionError> {
@@ -246,7 +241,6 @@ async fn start_manual_compression_owned(
             turn_id,
             agent,
             focus,
-            keep_messages,
             workspace_io_receipt,
             cancel,
         )
@@ -275,36 +269,27 @@ async fn run_manual_compression_flow(
     turn_id: String,
     agent: crate::agent_handle::AgentHandle,
     focus: Option<String>,
-    keep_messages: usize,
     workspace_io_receipt: crate::state::ScopedWorkspaceIoReceipt,
     cancel: Option<echo_agent::agent::CancellationToken>,
 ) -> Result<ManualCompressionReceipt, ManualCompressionError> {
     let focus = focus.filter(|value| !value.trim().is_empty());
+    let provider_cancel = cancel.clone();
     let compression = agent.read_async(|agent| {
         Box::pin(async move {
-            if let Some(focus) = focus {
-                agent
-                    .force_compress_with_focus_and_hooks(&focus, keep_messages, "manual")
-                    .await
-            } else {
-                agent.force_compress_context().await
-            }
+            agent
+                .force_compress_context_with_options(focus.as_deref(), provider_cancel)
+                .await
         })
     });
-    tokio::pin!(compression);
-    let compression = match cancel {
-        Some(cancel) => {
-            tokio::select! {
-                biased;
-                result = &mut compression => result,
-                _ = cancel.cancelled() => return Err(ManualCompressionError::Cancelled),
-            }
-        }
-        None => compression.await,
-    };
+    // Await the framework owner even on cancellation; dropping this future
+    // could abandon provider cleanup or an accepted context transform.
+    let compression = compression.await;
     let (stats, checkpoint) = match compression {
         Ok(result) => result,
         Err(error) => {
+            if cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
+                return Err(ManualCompressionError::Cancelled);
+            }
             let detail = error.to_string();
             return Err(ManualCompressionError::Compression(detail));
         }
@@ -438,6 +423,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_surface_focus_uses_installed_policy_and_journals_once()
+    -> Result<(), Box<dyn Error>> {
+        use echo_agent::compression::compressor::SummaryCompressor;
+        use echo_agent::llm::types::Message;
+        for surface in [
+            ForegroundTurnSurface::Cli,
+            ForegroundTurnSurface::Tui,
+            ForegroundTurnSurface::Gui,
+            ForegroundTurnSurface::Channel,
+        ] {
+            let id = format!("focus-{}", uuid::Uuid::new_v4());
+            let (state, _temp) = state_fixture(&id).await?;
+            let llm = Arc::new(MockLlmClient::new().with_response("A sufficiently detailed checkpoint preserving earlier decisions, work and continuation evidence."));
+            let provider = llm.clone();
+            state
+                .connection
+                .agent
+                .read_async(|agent| {
+                    Box::pin(async move {
+                        agent
+                            .set_compressor(
+                                SummaryCompressor::new(provider, 20).with_recent_token_budget(12),
+                            )
+                            .await;
+                        let mut context = agent.context().lock().await;
+                        context.push(Message::user("old history ".repeat(100)));
+                        context.push(Message::assistant("old result ".repeat(100)));
+                        context.push(Message::user("current exact instruction🚀".to_string()));
+                    })
+                })
+                .await;
+            let receipt = state
+                .compress_conversation_owned(ManualCompressionRequest {
+                    workspace_id: "global".to_string(),
+                    conversation_id: id.clone(),
+                    surface,
+                    focus: Some("keep exact evidence".to_string()),
+                })
+                .await?;
+            let checkpoint = receipt
+                .checkpoint
+                .ok_or_else(|| std::io::Error::other("checkpoint missing"))?;
+            assert_eq!(checkpoint.strategy, "Summary");
+            assert_eq!(
+                checkpoint.focus_instructions.as_deref(),
+                Some("keep exact evidence")
+            );
+            assert!(
+                llm.last_messages()
+                    .is_some_and(|messages| messages.iter().any(|message| message
+                        .content
+                        .as_text()
+                        .is_some_and(|text| text.contains("keep exact evidence"))))
+            );
+            let replay = state.storage.chat_events.replay(
+                "global",
+                Some(&id),
+                &receipt.envelope.root_turn_id,
+                0,
+            )?;
+            assert_eq!(replay.events.len(), 1);
+            assert!(
+                state
+                    .connection
+                    .agent
+                    .read_async(|agent| Box::pin(async move {
+                        agent
+                            .context()
+                            .lock()
+                            .await
+                            .messages()
+                            .iter()
+                            .any(|message| {
+                                message.content.as_text_ref() == Some("current exact instruction🚀")
+                            })
+                    }))
+                    .await
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_compression_keeps_context_and_returns_typed_cancel()
+    -> Result<(), Box<dyn Error>> {
+        let id = "manual-pre-cancel";
+        let (state, _temp) = state_fixture(id).await?;
+        let agent = state.connection.agent.clone();
+        let before = agent
+            .read_async(|agent| {
+                Box::pin(async move { agent.context().lock().await.messages().len() })
+            })
+            .await;
+        let cancel = echo_agent::agent::CancellationToken::new();
+        cancel.cancel();
+        let result = state
+            .compress_conversation_with_agent(
+                "global",
+                id,
+                id,
+                "cancel-turn",
+                &agent,
+                None,
+                crate::state::ScopedWorkspaceIoReceipt::global_for_test("."),
+                Some(cancel),
+            )
+            .await;
+        assert!(matches!(result, Err(ManualCompressionError::Cancelled)));
+        let after = agent
+            .read_async(|agent| {
+                Box::pin(async move { agent.context().lock().await.messages().len() })
+            })
+            .await;
+        assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn successful_noop_compression_is_still_journaled() -> Result<(), Box<dyn Error>> {
         let id = "manual-compression-noop";
         let (state, _temp) = state_fixture(id).await?;
@@ -447,7 +550,6 @@ mod tests {
                 conversation_id: id.to_string(),
                 surface: ForegroundTurnSurface::Cli,
                 focus: None,
-                keep_messages: 12,
             })
             .await?;
 
@@ -473,6 +575,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_cancel_settles_as_cancelled_on_every_surface() -> Result<(), Box<dyn Error>> {
+        struct WaitForCancellation(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+        impl echo_agent::compression::ContextCompressor for WaitForCancellation {
+            fn compress(
+                &self,
+                input: echo_agent::compression::CompressionInput,
+            ) -> futures::future::BoxFuture<
+                '_,
+                echo_agent::error::Result<echo_agent::compression::CompressionOutput>,
+            > {
+                if let Ok(mut sender) = self.0.lock()
+                    && let Some(sender) = sender.take()
+                {
+                    let _sent = sender.send(());
+                }
+                Box::pin(async move {
+                    let cancel = input.cancel_token.ok_or_else(|| {
+                        echo_agent::error::ReactError::Other(
+                            "missing provider cancel token".to_string(),
+                        )
+                    })?;
+                    cancel.cancelled().await;
+                    Err(echo_agent::error::AgentError::Cancelled("provider".to_string()).into())
+                })
+            }
+        }
+        for surface in [
+            ForegroundTurnSurface::Cli,
+            ForegroundTurnSurface::Tui,
+            ForegroundTurnSurface::Gui,
+            ForegroundTurnSurface::Channel,
+        ] {
+            let id = format!("owned-cancel-{}", uuid::Uuid::new_v4());
+            let (state, _temp) = state_fixture(&id).await?;
+            let state = Arc::new(state);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            state
+                .connection
+                .agent
+                .read_async(|agent| {
+                    Box::pin(async move {
+                        agent
+                            .set_compressor(WaitForCancellation(std::sync::Mutex::new(Some(
+                                started_tx,
+                            ))))
+                            .await
+                    })
+                })
+                .await;
+            let operation_state = state.clone();
+            let operation_id = id.clone();
+            let operation = tokio::spawn(async move {
+                operation_state
+                    .compress_conversation_owned(ManualCompressionRequest {
+                        workspace_id: "global".to_string(),
+                        conversation_id: operation_id,
+                        surface,
+                        focus: None,
+                    })
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), started_rx).await??;
+            let snapshot = state
+                .session
+                .foreground_turns
+                .snapshot(surface, &id)
+                .ok_or_else(|| std::io::Error::other("foreground root missing"))?;
+            let waiter = state.session.foreground_turns.request_root_cancel(
+                surface,
+                &id,
+                &snapshot.root_turn_id,
+            )?;
+            let terminal =
+                tokio::time::timeout(std::time::Duration::from_secs(5), waiter.wait()).await??;
+            assert!(matches!(terminal.outcome, TurnOutcome::Cancelled));
+            assert!(matches!(
+                operation.await?,
+                Err(ManualCompressionError::Cancelled)
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn mismatched_agent_identity_fails_closed_and_releases_admission()
     -> Result<(), Box<dyn Error>> {
         let (state, _temp) = state_fixture("actual-conversation").await?;
@@ -482,7 +668,6 @@ mod tests {
                 conversation_id: "requested-conversation".to_string(),
                 surface: ForegroundTurnSurface::Tui,
                 focus: None,
-                keep_messages: 12,
             })
             .await
             .err()
@@ -527,7 +712,6 @@ mod tests {
                     "manual-compression-barrier-turn",
                     &agent,
                     None,
-                    12,
                     crate::state::ScopedWorkspaceIoReceipt::global_for_test("."),
                     Some(operation_cancel),
                 )
@@ -574,7 +758,6 @@ mod tests {
                     conversation_id: id.to_string(),
                     surface: ForegroundTurnSurface::Gui,
                     focus: None,
-                    keep_messages: 12,
                 })
                 .await
         });
@@ -624,7 +807,6 @@ mod tests {
                 "manual-compression-journal-debt-turn",
                 &agent,
                 None,
-                12,
                 crate::state::ScopedWorkspaceIoReceipt::global_for_test("."),
                 None,
             )
