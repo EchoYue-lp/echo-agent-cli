@@ -18,6 +18,35 @@ concurrency:
 # before merge. CI keeps a bounded Linux build/test signal and an independent
 # Node LTS frontend run that compiles the checked-in TypeScript contracts.
 jobs:
+  linux-kill-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trace external kill argument parsing without sending signals
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y strace
+          python3 -u <<'PY'
+          import os, pathlib, subprocess
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          output = subprocess.run(["/usr/bin/kill", "--version"], text=True, capture_output=True)
+          (root / "kill-version.txt").write_text(output.stdout + output.stderr)
+          child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+          try:
+              (root / "kill-target.txt").write_text(f"pid={child.pid} pgid={os.getpgid(child.pid)} expected=-{child.pid}\n")
+              for name, arguments in [("original", ["-KILL", f"-{child.pid}"]), ("delimited", ["-KILL", "--", f"-{child.pid}"])]:
+                  result = subprocess.run(["strace", "-e", "trace=kill", "-e", "inject=kill:error=EPERM", "-o", str(root / f"kill-{name}.trace"), "/usr/bin/kill", *arguments], text=True, capture_output=True, timeout=10)
+                  (root / f"kill-{name}.output").write_text(f"exit={result.returncode}\n" + result.stdout + result.stderr)
+          finally:
+              child.kill()
+              child.wait(timeout=5)
+          PY
+      - name: Preserve kill parsing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-kill-probe
+          path: ${{ runner.temp }}/kill-*
   # Lint and tests compile different feature sets. Give each its own bounded
   # runner budget so cold lint/check work cannot consume the test deadline.
   linux-quality:
