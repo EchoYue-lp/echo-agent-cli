@@ -161,7 +161,7 @@ jobs:
               print(f"BATCH COMPLETE in {time.monotonic()-started:.2f}s", flush=True)
           assert completed == names
           print(f"ALL {len(names)} discovered tests covered exactly once (including harness-ignored tests).", flush=True)
-          
+
           PY_DIAG
       - name: Preserve temporary test batch diagnosis
         if: always()
