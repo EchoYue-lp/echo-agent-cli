@@ -111,65 +111,608 @@ jobs:
           name: core-compile-diagnosis
           path: ${{ runner.temp }}/core-compile.log
           if-no-files-found: warn
-      - name: Diagnose all app-core tests in isolated batches
-        timeout-minutes: 15
+      - name: Prepare test manifest and diagnostic helper
         env:
           TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
         run: |
-          python3 -u <<'PY_DIAG'
-          import json, os, pathlib, re, subprocess, sys, time
-          def run(args):
-              p = subprocess.run(args, text=True, capture_output=True)
-              if p.returncode:
-                  print(p.stdout, flush=True)
-                  print(p.stderr, flush=True)
-                  raise SystemExit(p.returncode)
-              return p.stdout
-          data = run(["cargo", "test", "-p", "echo-agent-app-core", "--lib", "--locked", "--no-run", "--message-format=json"])
-          binaries = []
-          for line in data.splitlines():
-              item = json.loads(line)
-              if item.get("reason") == "compiler-artifact" and item.get("profile", {}).get("test") and item.get("executable"):
-                  binaries.append(item["executable"])
-          assert len(binaries) == 1, binaries
-          binary = binaries[0]
-          listing = run([binary, "--list"])
+          python3 -u <<'PY_PREP'
+          import json, os, pathlib, subprocess
+          p = subprocess.run(["cargo", "test", "-p", "echo-agent-app-core", "--lib", "--locked", "--no-run", "--message-format=json"], text=True, capture_output=True, check=True)
+          executables = [item["executable"] for line in p.stdout.splitlines() if (item := json.loads(line)).get("reason") == "compiler-artifact" and item.get("profile", {}).get("test") and item.get("executable")]
+          assert len(executables) == 1
+          binary = executables[0]
+          listing = subprocess.check_output([binary, "--list"], text=True)
           names = [line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test")]
-          assert names and len(names) == len(set(names))
-          log_root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "core-test-batches"
-          log_root.mkdir(exist_ok=True)
-          (log_root / "test-manifest.json").write_text(json.dumps(names, indent=2))
-          completed = []
-          for index in range(0, len(names), 40):
-              group = names[index:index+40]
-              print(f"BATCH {index//40 + 1}: {len(group)} tests, {group[0]} .. {group[-1]}", flush=True)
-              started = time.monotonic()
-              try:
-                  p = subprocess.run([binary, "--test", "--exact", "--test-threads=2", *group], text=True, capture_output=True, timeout=120)
-              except subprocess.TimeoutExpired as error:
-                  print(f"BATCH TIMEOUT after 120s: {group}", flush=True)
-                  (log_root / f"batch-{index//40 + 1}.log").write_bytes((error.stdout or b"") + (error.stderr or b""))
-                  raise SystemExit(124)
-              output = p.stdout + p.stderr
-              (log_root / f"batch-{index//40 + 1}.log").write_text(output)
-              print(output, flush=True)
-              if p.returncode:
-                  raise SystemExit(p.returncode)
-              summary = re.search(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured;", output)
-              assert summary and int(summary[1]) + int(summary[3]) == len(group), "incomplete test coverage"
-              completed.extend(group)
-              print(f"BATCH COMPLETE in {time.monotonic()-started:.2f}s", flush=True)
-          assert completed == names
-          print(f"ALL {len(names)} discovered tests covered exactly once (including harness-ignored tests).", flush=True)
+          assert len(names) == 1603 and len(set(names)) == len(names), "diagnostic manifest changed"
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "core-test-batches"
+          root.mkdir(exist_ok=True)
+          (root / "manifest.json").write_text(json.dumps({"binary": binary, "names": names}, indent=2))
+          print(f"Manifest preserved: {len(names)} tests", flush=True)
 
-          PY_DIAG
-      - name: Preserve temporary test batch diagnosis
-        if: always()
+          PY_PREP
+          cat > "$RUNNER_TEMP/diagnose-batch.py" <<'PY_BATCH'
+          import json, os, pathlib, re, signal, subprocess, sys, time
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "core-test-batches"
+          manifest = json.loads((root / "manifest.json").read_text())
+          index = int(sys.argv[1])
+          group = manifest["names"][index*40:(index+1)*40]
+          assert group
+          print(f"Batch {index+1}: {group}", flush=True)
+          start = time.monotonic()
+          # This diagnostic owns a fresh process group. Timeout cleanup must close
+          # descendants' pipe handles so an interrupted batch can publish its evidence.
+          p = subprocess.Popen([manifest["binary"], "--test", "--exact", "--test-threads=2", *group], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+          try:
+              output, _ = p.communicate(timeout=120)
+          except subprocess.TimeoutExpired:
+              os.killpg(p.pid, signal.SIGKILL)
+              output, _ = p.communicate(timeout=10)
+              (root / f"batch-{index+1:02d}.log").write_text(output)
+              print(output, flush=True)
+              print("BATCH TIMEOUT", flush=True)
+              raise SystemExit(124)
+          (root / f"batch-{index+1:02d}.log").write_text(output)
+          print(output, flush=True)
+          if p.returncode:
+              raise SystemExit(p.returncode)
+          summaries = re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured;", output)
+          assert summaries
+          summary = summaries[-1]
+          assert int(summary[0]) + int(summary[2]) == len(group), "incomplete test coverage"
+          (root / f"batch-{index+1:02d}.json").write_text(json.dumps({"names": group, "passed": int(summary[0]), "ignored": int(summary[2]), "seconds": time.monotonic()-start}))
+          print(f"BATCH COMPLETE in {time.monotonic()-start:.2f}s", flush=True)
+
+          PY_BATCH
+      - name: Preserve exact diagnostic test manifest
         uses: actions/upload-artifact@v4
         with:
-          name: core-test-batch-diagnosis
-          path: ${{ runner.temp }}/core-test-batches
+          name: core-test-manifest
+          path: ${{ runner.temp }}/core-test-batches/manifest.json
+      - name: Diagnose test batch 01
+        id: batch01
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 0
+      - name: Preserve test batch 01
+        if: always() && steps.batch01.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-01
+          path: ${{ runner.temp }}/core-test-batches/batch-01.*
           if-no-files-found: warn
+      - name: Diagnose test batch 02
+        id: batch02
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 1
+      - name: Preserve test batch 02
+        if: always() && steps.batch02.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-02
+          path: ${{ runner.temp }}/core-test-batches/batch-02.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 03
+        id: batch03
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 2
+      - name: Preserve test batch 03
+        if: always() && steps.batch03.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-03
+          path: ${{ runner.temp }}/core-test-batches/batch-03.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 04
+        id: batch04
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 3
+      - name: Preserve test batch 04
+        if: always() && steps.batch04.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-04
+          path: ${{ runner.temp }}/core-test-batches/batch-04.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 05
+        id: batch05
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 4
+      - name: Preserve test batch 05
+        if: always() && steps.batch05.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-05
+          path: ${{ runner.temp }}/core-test-batches/batch-05.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 06
+        id: batch06
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 5
+      - name: Preserve test batch 06
+        if: always() && steps.batch06.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-06
+          path: ${{ runner.temp }}/core-test-batches/batch-06.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 07
+        id: batch07
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 6
+      - name: Preserve test batch 07
+        if: always() && steps.batch07.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-07
+          path: ${{ runner.temp }}/core-test-batches/batch-07.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 08
+        id: batch08
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 7
+      - name: Preserve test batch 08
+        if: always() && steps.batch08.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-08
+          path: ${{ runner.temp }}/core-test-batches/batch-08.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 09
+        id: batch09
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 8
+      - name: Preserve test batch 09
+        if: always() && steps.batch09.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-09
+          path: ${{ runner.temp }}/core-test-batches/batch-09.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 10
+        id: batch10
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 9
+      - name: Preserve test batch 10
+        if: always() && steps.batch10.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-10
+          path: ${{ runner.temp }}/core-test-batches/batch-10.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 11
+        id: batch11
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 10
+      - name: Preserve test batch 11
+        if: always() && steps.batch11.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-11
+          path: ${{ runner.temp }}/core-test-batches/batch-11.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 12
+        id: batch12
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 11
+      - name: Preserve test batch 12
+        if: always() && steps.batch12.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-12
+          path: ${{ runner.temp }}/core-test-batches/batch-12.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 13
+        id: batch13
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 12
+      - name: Preserve test batch 13
+        if: always() && steps.batch13.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-13
+          path: ${{ runner.temp }}/core-test-batches/batch-13.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 14
+        id: batch14
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 13
+      - name: Preserve test batch 14
+        if: always() && steps.batch14.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-14
+          path: ${{ runner.temp }}/core-test-batches/batch-14.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 15
+        id: batch15
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 14
+      - name: Preserve test batch 15
+        if: always() && steps.batch15.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-15
+          path: ${{ runner.temp }}/core-test-batches/batch-15.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 16
+        id: batch16
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 15
+      - name: Preserve test batch 16
+        if: always() && steps.batch16.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-16
+          path: ${{ runner.temp }}/core-test-batches/batch-16.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 17
+        id: batch17
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 16
+      - name: Preserve test batch 17
+        if: always() && steps.batch17.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-17
+          path: ${{ runner.temp }}/core-test-batches/batch-17.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 18
+        id: batch18
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 17
+      - name: Preserve test batch 18
+        if: always() && steps.batch18.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-18
+          path: ${{ runner.temp }}/core-test-batches/batch-18.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 19
+        id: batch19
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 18
+      - name: Preserve test batch 19
+        if: always() && steps.batch19.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-19
+          path: ${{ runner.temp }}/core-test-batches/batch-19.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 20
+        id: batch20
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 19
+      - name: Preserve test batch 20
+        if: always() && steps.batch20.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-20
+          path: ${{ runner.temp }}/core-test-batches/batch-20.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 21
+        id: batch21
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 20
+      - name: Preserve test batch 21
+        if: always() && steps.batch21.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-21
+          path: ${{ runner.temp }}/core-test-batches/batch-21.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 22
+        id: batch22
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 21
+      - name: Preserve test batch 22
+        if: always() && steps.batch22.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-22
+          path: ${{ runner.temp }}/core-test-batches/batch-22.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 23
+        id: batch23
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 22
+      - name: Preserve test batch 23
+        if: always() && steps.batch23.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-23
+          path: ${{ runner.temp }}/core-test-batches/batch-23.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 24
+        id: batch24
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 23
+      - name: Preserve test batch 24
+        if: always() && steps.batch24.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-24
+          path: ${{ runner.temp }}/core-test-batches/batch-24.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 25
+        id: batch25
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 24
+      - name: Preserve test batch 25
+        if: always() && steps.batch25.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-25
+          path: ${{ runner.temp }}/core-test-batches/batch-25.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 26
+        id: batch26
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 25
+      - name: Preserve test batch 26
+        if: always() && steps.batch26.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-26
+          path: ${{ runner.temp }}/core-test-batches/batch-26.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 27
+        id: batch27
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 26
+      - name: Preserve test batch 27
+        if: always() && steps.batch27.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-27
+          path: ${{ runner.temp }}/core-test-batches/batch-27.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 28
+        id: batch28
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 27
+      - name: Preserve test batch 28
+        if: always() && steps.batch28.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-28
+          path: ${{ runner.temp }}/core-test-batches/batch-28.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 29
+        id: batch29
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 28
+      - name: Preserve test batch 29
+        if: always() && steps.batch29.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-29
+          path: ${{ runner.temp }}/core-test-batches/batch-29.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 30
+        id: batch30
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 29
+      - name: Preserve test batch 30
+        if: always() && steps.batch30.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-30
+          path: ${{ runner.temp }}/core-test-batches/batch-30.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 31
+        id: batch31
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 30
+      - name: Preserve test batch 31
+        if: always() && steps.batch31.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-31
+          path: ${{ runner.temp }}/core-test-batches/batch-31.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 32
+        id: batch32
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 31
+      - name: Preserve test batch 32
+        if: always() && steps.batch32.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-32
+          path: ${{ runner.temp }}/core-test-batches/batch-32.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 33
+        id: batch33
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 32
+      - name: Preserve test batch 33
+        if: always() && steps.batch33.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-33
+          path: ${{ runner.temp }}/core-test-batches/batch-33.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 34
+        id: batch34
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 33
+      - name: Preserve test batch 34
+        if: always() && steps.batch34.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-34
+          path: ${{ runner.temp }}/core-test-batches/batch-34.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 35
+        id: batch35
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 34
+      - name: Preserve test batch 35
+        if: always() && steps.batch35.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-35
+          path: ${{ runner.temp }}/core-test-batches/batch-35.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 36
+        id: batch36
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 35
+      - name: Preserve test batch 36
+        if: always() && steps.batch36.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-36
+          path: ${{ runner.temp }}/core-test-batches/batch-36.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 37
+        id: batch37
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 36
+      - name: Preserve test batch 37
+        if: always() && steps.batch37.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-37
+          path: ${{ runner.temp }}/core-test-batches/batch-37.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 38
+        id: batch38
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 37
+      - name: Preserve test batch 38
+        if: always() && steps.batch38.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-38
+          path: ${{ runner.temp }}/core-test-batches/batch-38.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 39
+        id: batch39
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 38
+      - name: Preserve test batch 39
+        if: always() && steps.batch39.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-39
+          path: ${{ runner.temp }}/core-test-batches/batch-39.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 40
+        id: batch40
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 39
+      - name: Preserve test batch 40
+        if: always() && steps.batch40.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-40
+          path: ${{ runner.temp }}/core-test-batches/batch-40.*
+          if-no-files-found: warn
+      - name: Diagnose test batch 41
+        id: batch41
+        timeout-minutes: 3
+        env:
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: python3 -u "$RUNNER_TEMP/diagnose-batch.py" 40
+      - name: Preserve test batch 41
+        if: always() && steps.batch41.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-41
+          path: ${{ runner.temp }}/core-test-batches/batch-41.*
+          if-no-files-found: warn
+      - name: Verify complete diagnostic coverage
+        run: |
+          python3 - <<'PY_VERIFY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "core-test-batches"
+          manifest = json.loads((root / "manifest.json").read_text())
+          names = []
+          for path in sorted(root.glob("batch-*.json")):
+              names.extend(json.loads(path.read_text())["names"])
+          assert names == manifest["names"], "missing or duplicate test coverage"
+          print(f"All {len(names)} tests covered once.")
+          PY_VERIFY
 
   linux-rust:
     # Preserve the existing combined required-check name. A cancelled, failed,
