@@ -18,7 +18,9 @@ concurrency:
 # before merge. CI keeps a bounded Linux build/test signal and an independent
 # Node LTS frontend run that compiles the checked-in TypeScript contracts.
 jobs:
-  linux-rust:
+  # Lint and tests compile different feature sets. Give each its own bounded
+  # runner budget so cold lint/check work cannot consume the test deadline.
+  linux-quality:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -57,12 +59,65 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
           cargo check -p echo-agent-app-core --no-default-features --locked
+
+  linux-app-core-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Checkout echo-agent (sibling path dependency)
+        uses: actions/checkout@v6
+        with:
+          repository: EchoYue-lp/echo-agent
+          # Framework changes merge first, so the application always validates
+          # against the current public framework surface.
+          ref: main
+          path: echo-agent
+      - name: Prepare sibling path dependency
+        run: ln -s "$GITHUB_WORKSPACE/echo-agent" "$GITHUB_WORKSPACE/../echo-agent"
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
       - name: Test application core on Linux
         env:
           # ts-rs export tests must not overwrite the checked-in bindings. Some
           # cross-crate wire types need curated imports that ts-rs 9 cannot infer.
           TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
         run: cargo test -p echo-agent-app-core --lib --locked
+
+  linux-rust:
+    # Preserve the existing combined required-check name. A cancelled, failed,
+    # or skipped prerequisite must never produce a successful Linux gate.
+    needs: [linux-quality, linux-app-core-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require both Linux signals
+        env:
+          QUALITY_RESULT: ${{ needs['linux-quality'].result }}
+          TEST_RESULT: ${{ needs['linux-app-core-tests'].result }}
+        run: |
+          if [[ "$QUALITY_RESULT" != "success" || "$TEST_RESULT" != "success" ]]; then
+            echo "Linux gates incomplete: quality=$QUALITY_RESULT tests=$TEST_RESULT"
+            exit 1
+          fi
 
   frontend:
     runs-on: ubuntu-latest
