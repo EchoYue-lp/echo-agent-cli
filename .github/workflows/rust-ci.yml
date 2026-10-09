@@ -104,13 +104,6 @@ jobs:
           /usr/bin/time -v timeout --signal=INT --kill-after=30s 20m \
             cargo test -p echo-agent-app-core --lib --locked --no-run \
             2>&1 | tee "$RUNNER_TEMP/core-compile.log"
-      - name: Test application core on Linux
-        timeout-minutes: 8
-        env:
-          # ts-rs export tests must not overwrite the checked-in bindings. Some
-          # cross-crate wire types need curated imports that ts-rs 9 cannot infer.
-          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
-        run: cargo test -p echo-agent-app-core --lib --locked
       - name: Preserve temporary compile diagnosis
         if: always()
         uses: actions/upload-artifact@v4
@@ -118,6 +111,16 @@ jobs:
           name: core-compile-diagnosis
           path: ${{ runner.temp }}/core-compile.log
           if-no-files-found: warn
+      - name: Test application core on Linux
+        timeout-minutes: 8
+        env:
+          # Temporary diagnosis: bound harness parallelism while retaining all tests.
+          RUST_TEST_THREADS: "2"
+          # ts-rs export tests must not overwrite the checked-in bindings. Some
+          # cross-crate wire types need curated imports that ts-rs 9 cannot infer.
+          TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
+        run: cargo test -p echo-agent-app-core --lib --locked
+
 
   linux-rust:
     # Preserve the existing combined required-check name. A cancelled, failed,
