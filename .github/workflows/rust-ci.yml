@@ -111,16 +111,65 @@ jobs:
           name: core-compile-diagnosis
           path: ${{ runner.temp }}/core-compile.log
           if-no-files-found: warn
-      - name: Test application core on Linux
-        timeout-minutes: 8
+      - name: Diagnose all app-core tests in isolated batches
+        timeout-minutes: 15
         env:
-          # Temporary diagnosis: bound harness parallelism while retaining all tests.
-          RUST_TEST_THREADS: "2"
-          # ts-rs export tests must not overwrite the checked-in bindings. Some
-          # cross-crate wire types need curated imports that ts-rs 9 cannot infer.
           TS_RS_EXPORT_DIR: ${{ runner.temp }}/ts-rs
-        run: cargo test -p echo-agent-app-core --lib --locked
-
+        run: |
+          python3 -u <<'PY_DIAG'
+          import json, os, pathlib, re, subprocess, sys, time
+          def run(args):
+              p = subprocess.run(args, text=True, capture_output=True)
+              if p.returncode:
+                  print(p.stdout, flush=True)
+                  print(p.stderr, flush=True)
+                  raise SystemExit(p.returncode)
+              return p.stdout
+          data = run(["cargo", "test", "-p", "echo-agent-app-core", "--lib", "--locked", "--no-run", "--message-format=json"])
+          binaries = []
+          for line in data.splitlines():
+              item = json.loads(line)
+              if item.get("reason") == "compiler-artifact" and item.get("profile", {}).get("test") and item.get("executable"):
+                  binaries.append(item["executable"])
+          assert len(binaries) == 1, binaries
+          binary = binaries[0]
+          listing = run([binary, "--list"])
+          names = [line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test")]
+          assert names and len(names) == len(set(names))
+          log_root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "core-test-batches"
+          log_root.mkdir(exist_ok=True)
+          (log_root / "test-manifest.json").write_text(json.dumps(names, indent=2))
+          completed = []
+          for index in range(0, len(names), 40):
+              group = names[index:index+40]
+              print(f"BATCH {index//40 + 1}: {len(group)} tests, {group[0]} .. {group[-1]}", flush=True)
+              started = time.monotonic()
+              try:
+                  p = subprocess.run([binary, "--test", "--exact", "--test-threads=2", *group], text=True, capture_output=True, timeout=120)
+              except subprocess.TimeoutExpired as error:
+                  print(f"BATCH TIMEOUT after 120s: {group}", flush=True)
+                  (log_root / f"batch-{index//40 + 1}.log").write_bytes((error.stdout or b"") + (error.stderr or b""))
+                  raise SystemExit(124)
+              output = p.stdout + p.stderr
+              (log_root / f"batch-{index//40 + 1}.log").write_text(output)
+              print(output, flush=True)
+              if p.returncode:
+                  raise SystemExit(p.returncode)
+              summary = re.search(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured;", output)
+              assert summary and int(summary[1]) + int(summary[3]) == len(group), "incomplete test coverage"
+              completed.extend(group)
+              print(f"BATCH COMPLETE in {time.monotonic()-started:.2f}s", flush=True)
+          assert completed == names
+          print(f"ALL {len(names)} discovered tests covered exactly once (including harness-ignored tests).", flush=True)
+          
+          PY_DIAG
+      - name: Preserve temporary test batch diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-batch-diagnosis
+          path: ${{ runner.temp }}/core-test-batches
+          if-no-files-found: warn
 
   linux-rust:
     # Preserve the existing combined required-check name. A cancelled, failed,
