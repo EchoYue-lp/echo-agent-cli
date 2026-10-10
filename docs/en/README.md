@@ -12,5 +12,7 @@ the gate before publishing:
 node ../../scripts/check-docs-parity.mjs
 ```
 
-Framework capabilities are documented in the sibling `echo-agent` repository;
-this tree describes EKO application policy and composition.
+Framework capabilities are documented in the sibling `echo-agent` repository. The cross-language
+SDKs, protocol contracts, and Host adapters live in the independent
+[`echo-agent-sdk`](https://github.com/EchoYue-lp/echo-agent-sdk) repository; this tree describes EKO
+application policy and composition.

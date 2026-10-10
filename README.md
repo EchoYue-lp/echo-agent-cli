@@ -2,6 +2,9 @@
 
 > 一个基于 [echo-agent](https://github.com/EchoYue-lp/echo-agent) 的通用 AI Agent 产品，支持 Coding、数据分析和学术研究三大核心能力。
 
+框架的跨语言 SDK 产品（Rust Host/Protocol、TypeScript、Python、Java 以及版本化合同）维护在独立的
+[echo-agent-sdk](https://github.com/EchoYue-lp/echo-agent-sdk) 仓库；EKO 只负责应用层组合与产品策略。
+
 [![Rust](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/license/mit)
 
