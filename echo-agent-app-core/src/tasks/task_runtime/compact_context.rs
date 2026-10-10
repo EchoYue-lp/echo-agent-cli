@@ -368,9 +368,19 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
     // narrowed context cannot silently drop them.
     if !recent_constraints.is_empty() {
         out.push_str("Recent user constraints:\n");
-        for steer in recent_constraints.iter().rev().take(4) {
-            let text: String = steer.text.chars().take(200).collect();
-            out.push_str(&format!("- (turn {}) {text}\n", steer.turn_id));
+        // The journal already bounds user-authored steers. A second 200-char
+        // cut here could remove the actual restriction after a long preamble.
+        // Retain the last four recorded excerpts in chronological order so
+        // later corrections remain visibly later than the instruction they amend.
+        for steer in recent_constraints
+            .iter()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            out.push_str(&format!("- (turn {}) {}\n", steer.turn_id, steer.text));
         }
         out.push('\n');
     }
@@ -1059,6 +1069,63 @@ mod tests {
         context.apply_projections(&outside);
         if context.has_projection(RUNTIME_RECOVERY_MARKER) {
             return Err("outside scope must remove the runtime capsule".to_string());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn goal_and_recorded_constraints_survive_real_compression_and_refresh()
+    -> Result<(), String> {
+        use echo_agent::compression::compressor::SlidingWindowCompressor;
+        let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+        let store = seed_projection_store("compression-run", "keep the original goal")?;
+        let constraint = format!("{}必须保留结尾限制🚀", "背景介绍".repeat(80));
+        store
+            .record_run_steer("compression-run", "first-steer", &constraint)
+            .map_err(|error| error.to_string())?;
+        let _registration = registry.register("compression-run", store);
+        let projector = TaskRuntimeContextProjector::new(registry);
+        let mut context = ContextManager::builder(8_000)
+            .compressor(SlidingWindowCompressor::new(20).with_recent_token_budget(40))
+            .build();
+        for _ in 0..3 {
+            context.apply_projections(
+                &projector
+                    .project(&projection_context(Some("compression-run")))
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+            context.push(Message::assistant("old execution output ".repeat(500)));
+            context.push(Message::user("continue current work".to_string()));
+            context
+                .force_compress(20)
+                .await
+                .map_err(|error| error.to_string())?;
+            let texts = context
+                .messages()
+                .iter()
+                .filter_map(|message| message.content.as_text())
+                .collect::<Vec<_>>();
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text.contains("keep the original goal"))
+            );
+            assert!(texts.iter().any(|text| text.contains(&constraint)));
+            assert_eq!(
+                texts
+                    .iter()
+                    .filter(|text| text.contains(RUNTIME_GOAL_MARKER))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                texts
+                    .iter()
+                    .filter(|text| text.contains(RUNTIME_RECOVERY_MARKER))
+                    .count(),
+                1
+            );
         }
         Ok(())
     }

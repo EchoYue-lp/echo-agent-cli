@@ -64,14 +64,23 @@ the EKO YAML schema therefore does not accept the framework's generic
 
 ## Agent and Compression
 
+`/compress [focus]` and `/compact [focus]` use the installed policy. TUI accepts
+the same focus text; the GUI provides an optional field. The ineffective
+`keep_messages` option is removed. One request can expand the soft recent
+allowance; exceeding the hard input budget fails explicitly. The GUI 75% hint
+is advisory. Pre-model admission accounts for tool/format overhead and protected
+context. TaskRuntime projections preserve the goal, recovery state and recent
+user steers; ConversationStore retains full history.
+See [ADR 0048](./adr/0048-context-compression-product-policy.md).
+
 | Field | Meaning |
 | --- | --- |
 | `max_iterations` | Maximum ReAct iterations for one turn; `0` means no product cap |
 | `tool_timeout_ms` | Timeout for one tool call |
 | `max_tool_output_tokens` | Context budget for one tool result; full output can be persisted as an artifact |
 | `token_limit` | Explicit compression threshold; `0` uses model/application policy |
-| `compress_strategy` | `summary`, `sliding`, or `adaptive` |
-| `compress_window` | Number of recent messages retained during compression |
+| `compress_strategy` | `summary`, `hybrid`, `sliding`, or `adaptive` |
+| `compress_window` | Default `0`: recent turns use 25% of the window, capped at 20K tokens. A positive value explicitly selects the legacy message cap |
 | `subagent_timeout_secs` | Default Subagent timeout; `0` means no timeout |
 
 EKO layered workspace memory is file-backed. The application does not enable

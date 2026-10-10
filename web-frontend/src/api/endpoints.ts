@@ -596,11 +596,12 @@ export const sandboxApi = {
 };
 
 export const compressApi = {
-  trigger: (workspaceId: string, options?: { keep_messages?: number; conversation_id?: string }) =>
+  trigger: (workspaceId: string, options?: { focus?: string; conversation_id?: string }) =>
     isTauri()
       ? apiInvoke<CompressResponse>('compress_context', {
           workspaceId,
           conversationId: options?.conversation_id,
+          focus: options?.focus,
         })
       : post<CompressResponse>('/compress', options),
   getStats: (workspaceId: string, conversationId?: string) =>

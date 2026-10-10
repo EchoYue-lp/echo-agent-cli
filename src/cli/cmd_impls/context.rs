@@ -329,7 +329,6 @@ cmd!(
 async fn run_manual_compression(
     ctx: &CommandContext,
     args: &[&str],
-    keep_messages: usize,
     label: &str,
 ) -> CommandOutcome {
     let (Some(app_state), Some(conversation_id)) =
@@ -354,7 +353,6 @@ async fn run_manual_compression(
                 conversation_id: conversation_id.clone(),
                 surface: echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
                 focus,
-                keep_messages,
             },
         )
         .await
@@ -388,7 +386,7 @@ async fn run_manual_compression(
 }
 
 async fn cmd_compress(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    run_manual_compression(ctx, args, 6, "Compressed").await
+    run_manual_compression(ctx, args, "Compressed").await
 }
 // NOTE: No /cp alias — /cp belongs to /compact only
 cmd!(
@@ -402,14 +400,14 @@ cmd!(
 // ── CompactCommand ────────────────────────────────────────────────────
 
 async fn cmd_compact(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    run_manual_compression(ctx, args, 12, "Compact").await
+    run_manual_compression(ctx, args, "Compact").await
 }
 cmd!(
     CompactCommand,
     "compact",
     ["cp"],
     CommandCategory::Context,
-    "Lightweight context compaction",
+    "Compress context using the configured strategy",
     cmd_compact
 );
 

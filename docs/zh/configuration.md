@@ -58,7 +58,7 @@ agent:
   max_tool_output_tokens: 8000
   token_limit: 0
   compress_strategy: "summary"
-  compress_window: 20
+  compress_window: 0
   subagent_timeout_secs: 600
 
 mcp:
@@ -138,6 +138,13 @@ configured_models:
 
 ## Agent 与压缩
 
+`/compress [重点]` 与 `/compact [重点]` 都使用当前配置的策略；TUI 支持同样的重点文本，
+GUI 压缩面板提供可选输入框。旧 `keep_messages` 参数已移除，命令不覆盖已安装的预算。
+最新请求超过软预算时原文可以扩展保留，超过硬输入预算则报错。GUI 的 75% 提示只是建议；
+实际压缩在模型调用前扣除工具/格式定义与 protected 内容后判断。
+Goal、recovery capsule 和最近用户 steer 由 TaskRuntime projection 保留，完整历史仍由
+ConversationStore 保存。详见 [ADR 0048](./adr/0048-context-compression-product-policy.md)。
+
 工具、workspace memory 与 human-loop 是 EKO 固定启用的完整 Agent 能力；EKO YAML 不接受
 framework 通用的 `enable_tools`、`enable_memory`、`enable_human_in_loop` 开关。
 
@@ -147,8 +154,8 @@ framework 通用的 `enable_tools`、`enable_memory`、`enable_human_in_loop` �
 | `tool_timeout_ms`        | 单次工具调用超时                                             |
 | `max_tool_output_tokens` | 单个工具结果进入模型上下文的预算，完整输出仍可落盘恢复       |
 | `token_limit`            | 显式上下文压缩阈值；`0` 使用模型窗口/应用策略                |
-| `compress_strategy`      | `summary`、`sliding` 或 `adaptive`                           |
-| `compress_window`        | 压缩时保留的近期消息数                                       |
+| `compress_strategy`      | `summary`、`hybrid`、`sliding` 或 `adaptive`                  |
+| `compress_window`        | 默认 `0`：近期原文按窗口 25%、至多 20K token 选择完整 turn；正数显式使用旧消息条数上限 |
 | `subagent_timeout_secs`  | Subagent 派发默认超时；`0` 表示无超时                        |
 
 EKO 的 workspace memory 由文件化 layered memory 管理。不要在应用配置里启用 SQLite

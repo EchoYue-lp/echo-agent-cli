@@ -698,6 +698,7 @@ pub async fn compress_context(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
     conversation_id: Option<String>,
+    focus: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     let conversation_id = match conversation_id.filter(|value| !value.trim().is_empty()) {
         Some(conversation_id) => conversation_id,
@@ -718,8 +719,7 @@ pub async fn compress_context(
                 workspace_id,
                 conversation_id,
                 surface: echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
-                focus: None,
-                keep_messages: 12,
+                focus,
             },
         )
         .await
@@ -737,6 +737,9 @@ pub async fn compress_context(
         "messages_before": receipt.messages_before,
         "messages_after": receipt.messages_after,
         "tokens_saved": receipt.tokens_saved(),
+        "tokens_before": receipt.tokens_before,
+        "tokens_after": receipt.tokens_after,
+        "checkpoint": receipt.checkpoint,
     }))
 }
 
@@ -790,7 +793,7 @@ pub async fn get_compression_stats(
             })
         })
         .await;
-    let needs_compression = token_limit > 0 && current_tokens > token_limit * 3 / 4;
+    let needs_compression = token_limit > 0 && current_tokens > token_limit.saturating_mul(3) / 4;
 
     Ok(serde_json::json!({
         "message_count": message_count,

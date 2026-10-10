@@ -403,6 +403,14 @@
       "legacyRemoved": true
     },
     {
+      "legacyPath": "adr/0048-context-compression-product-policy.md",
+      "targetPath": "adr/0048-context-compression-product-policy.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
       "legacyPath": "architecture.md",
       "targetPath": "architecture/overview.md",
       "kind": "architecture",

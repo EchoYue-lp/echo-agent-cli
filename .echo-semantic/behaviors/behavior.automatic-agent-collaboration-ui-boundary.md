@@ -8,7 +8,7 @@ risk: high
 primary_focus: trigger_input
 focus: [state_authority, contract_evidence]
 boundary: boundary.eko-conversation-collaboration
-observed_at: source:f96d8ee7fbc893913ba410ee992bdeb7e906fefbab84df09ef7719bf62dc79b3
+observed_at: 40fd80447cdf3d7627399af0b2069a8b4da5327a
 code_refs: [AGENTS.md, README.md, docs/en/features.md, docs/zh/features.md, docs/en/adr/0047-automatic-agent-collaboration.md, docs/zh/adr/0047-automatic-agent-collaboration.md, web-frontend/src/components/chat/ChatPanel.tsx, web-frontend/src/api/endpoints.ts, src/tauri/commands/mod.rs, src/tauri/mod.rs, echo-agent-app-core/src/agent_control.rs, echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/tasks/task_runtime/subagent_control.rs]
 rule_refs: [rule.conversation-collaboration-authorities]
 evidence_refs: [evidence.automatic-agent-collaboration-ui-retirement]
