@@ -4,7 +4,7 @@ id: map.eko-framework-consumer-settlement
 kind: capability_map
 title: EKO framework consumer settlement
 risk: high
-observed_at: source:5d3ba9b74a2f9cd70a70fd463540a054b06fa06bc7e2ce1314a6a248b47757e7
+observed_at: source:621b3930bfef37174da8309c6fde5c06dd749fd2be9cb4d48fdaf1e8c63628b1
 boundary_refs: [boundary.eko-framework-consumer-settlement]
 behavior_refs: [behavior.background-review-caller-owned-settlement]
 rule_refs: [rule.eko-framework-consumer-authorities]
@@ -13,6 +13,10 @@ finding_refs: []
 audit_refs: []
 related_map_refs: [map.eko-conversation-collaboration]
 scenarios:
+  independent-linux-validation-budgets:
+    status: mapped
+    source_refs: [.github/workflows/rust-ci.yml]
+    evidence_refs: [evidence.linux-validation-budgets]
   compression-product-policy:
     status: mapped
     source_refs: [echo-agent-app-core/src/config.rs, echo-agent-app-core/src/manual_compression.rs, echo-agent-app-core/src/tasks/task_runtime/compact_context.rs, src/cli/cmd_impls/context.rs, src/cli/channels.rs, src/tui/commands.rs, src/tui/events.rs, src/tauri/commands/panels.rs, web-frontend/src/api/endpoints.ts, web-frontend/src/types/api.ts, web-frontend/src/components/compress/CompressPanel.tsx]

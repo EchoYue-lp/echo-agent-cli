@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.compression-product-policy
 kind: evidence
-observed_at: source:5d3ba9b74a2f9cd70a70fd463540a054b06fa06bc7e2ce1314a6a248b47757e7
+observed_at: source:621b3930bfef37174da8309c6fde5c06dd749fd2be9cb4d48fdaf1e8c63628b1
 source_refs: [echo-agent-app-core/src/config.rs, echo-agent-app-core/src/manual_compression.rs, echo-agent-app-core/src/tasks/task_runtime/compact_context.rs, src/cli/cmd_impls/context.rs, src/cli/channels.rs, src/tui/commands.rs, src/tui/events.rs, src/tauri/commands/panels.rs, web-frontend/src/api/endpoints.ts, web-frontend/src/types/api.ts, web-frontend/src/components/compress/CompressPanel.tsx, config/eko.example.yaml, docs/zh/configuration.md, docs/en/configuration.md, docs/zh/features.md, docs/en/features.md, docs/zh/architecture/persistence.md, docs/en/architecture/persistence.md, docs/zh/adr/0048-context-compression-product-policy.md, docs/en/adr/0048-context-compression-product-policy.md]
 supports: [asset.eko-conversation-authorities, rule.eko-framework-consumer-authorities]
 limitations: [Local candidate is not merged; depends on framework compression branch; native UI and external provider acceptance are not established]
