@@ -4924,8 +4924,7 @@ async fn handle_slash_command(
                                 .to_string(),
                             conversation_id: conversation_id.clone(),
                             surface: ForegroundTurnSurface::Tui,
-                            focus: None,
-                            keep_messages: 12,
+                            focus: (!args.trim().is_empty()).then(|| args.trim().to_string()),
                         },
                     )
                     .await,

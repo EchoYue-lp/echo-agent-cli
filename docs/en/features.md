@@ -12,7 +12,9 @@ projections, review/worktree behavior, and product presentation.
   conversations. Keyed execution admission is provided by framework
   `KeyedExecutionAdmission`.
 - Foreground admission, steer, cancel, settlement, durable input, attachments,
-  and summary/sliding/adaptive compression use shared app-core services.
+  and summary/hybrid/sliding/adaptive compression use shared app-core services.
+  The default recent window is token-based; manual focus/cancellation and
+  protected TaskRuntime goal/recovery projections share the same product policy.
 - Framework `FileConversationStore` is the conversation authority; EKO adds
   workspace binding and UI projection.
 - Completed GUI replies provide Copy, Regenerate, and Fork conversation actions.

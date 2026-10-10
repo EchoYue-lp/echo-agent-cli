@@ -46,6 +46,13 @@ root or the application package.
 
 ## Authorities
 
+The framework owns compression selection and the bounded active window.
+EKO uses replaceable protected TaskRuntime goal/recovery projections. The latest
+four recorded steer excerpts retain their journal-bounded text in chronological
+order. The app-core owner settles the manual-compression journal safe point after
+a successful transform, including caller drop or cancellation.
+See [ADR 0048](../adr/0048-context-compression-product-policy.md).
+
 - Framework `ConversationStore` owns the durable conversation transcript.
 - Framework runtime state owns the compact checkpoint needed to resume an
   in-flight turn.

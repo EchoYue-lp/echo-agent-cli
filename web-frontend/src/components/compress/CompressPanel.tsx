@@ -31,6 +31,7 @@ export function CompressPanel() {
   const [lastCompress, setLastCompress] = useState<CompressResponse | null>(null);
   const [compressing, setCompressing] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [focus, setFocus] = useState('');
   const contextWindow = useChatStore((s) => s.contextWindow);
   const usageAccumulator = useChatStore((s) => s.usageAccumulator);
   const subagentRuns = useSubagentRunStore((s) => s.runs);
@@ -58,6 +59,7 @@ export function CompressPanel() {
     try {
       const res = await compressApi.trigger(workspaceId, {
         conversation_id: targetConversationId,
+        focus: focus.trim() || undefined,
       });
       if (res.success) {
         setLastCompress(res);
@@ -200,6 +202,19 @@ export function CompressPanel() {
       )}
 
       {/* Compress button */}
+      <input
+        value={focus}
+        onChange={(event) => setFocus(event.target.value)}
+        aria-label="压缩重点"
+        placeholder="压缩时重点保留的内容（可选）"
+        disabled={compressing}
+        className="w-full rounded-lg border px-3 py-2 text-xs"
+        style={{
+          borderColor: 'var(--border-primary)',
+          background: 'var(--bg-hover)',
+          color: 'var(--text-primary)',
+        }}
+      />
       <button
         onClick={compress}
         disabled={compressing}
@@ -241,6 +256,12 @@ export function CompressPanel() {
               上次压缩
             </span>
           </div>
+          {lastCompress.checkpoint && (
+            <div className="mb-2 text-xs" style={{ color: 'var(--text-secondary)' }}>
+              {lastCompress.checkpoint.strategy} · 保留 {lastCompress.checkpoint.protected_count}{' '}
+              条关键上下文
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-2 text-xs">
             <div className="rounded-lg p-2 text-center" style={{ background: 'var(--bg-hover)' }}>
               <div style={{ color: 'var(--text-tertiary)' }}>消息数</div>

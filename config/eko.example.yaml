@@ -39,7 +39,7 @@ agent:
   max_tool_output_tokens: 8000 # 单个工具结果进入模型上下文的 Token 上限
   token_limit: 0              # 0 = 使用模型上下文窗口或应用默认值
   compress_strategy: "summary" # 语义检查点 + 近期原文；可选 sliding / hybrid / adaptive
-  compress_window: 20
+  compress_window: 0          # 0 = 近期原文 token 预算（窗口的 25%，至多 20K）；正数为旧消息条数上限
 
 # ── MCP 配置 ─────────────────────────────────────────────────────
 mcp:

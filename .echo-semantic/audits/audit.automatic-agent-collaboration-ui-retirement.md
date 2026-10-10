@@ -5,15 +5,15 @@ kind: audit
 boundary_ref: boundary.eko-conversation-collaboration
 lens: trigger_input
 freshness: examined
-revision: source:f96d8ee7fbc893913ba410ee992bdeb7e906fefbab84df09ef7719bf62dc79b3
+revision: 40fd80447cdf3d7627399af0b2069a8b4da5327a
 finding_refs: [finding.manual-agent-collaboration-ui-retirement]
 challenges:
   runtime-tools-removed-with-ui:
-    revision: source:f96d8ee7fbc893913ba410ee992bdeb7e906fefbab84df09ef7719bf62dc79b3
+    revision: 40fd80447cdf3d7627399af0b2069a8b4da5327a
     source_refs: [echo-agent-app-core/src/agent_control.rs, echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/tasks/task_runtime/subagent_control.rs]
     evidence_refs: [evidence.automatic-agent-collaboration-ui-retirement]
   side-fork-entry-lost:
-    revision: source:f96d8ee7fbc893913ba410ee992bdeb7e906fefbab84df09ef7719bf62dc79b3
+    revision: 40fd80447cdf3d7627399af0b2069a8b4da5327a
     source_refs: [web-frontend/src/components/chat/ChatPanel.tsx, web-frontend/src/components/chat/MessageBubble.tsx]
     evidence_refs: [evidence.automatic-agent-collaboration-ui-retirement]
 ---

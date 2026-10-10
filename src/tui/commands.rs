@@ -69,6 +69,7 @@ pub enum SlashCommand {
     ArchiveSession,
     RestoreSession,
     DeleteSession,
+    #[strum(serialize = "compress", serialize = "cp", to_string = "compact")]
     Compact,
     Copy,
     OpenArtifact,
