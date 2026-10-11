@@ -65,6 +65,7 @@ pub struct AgentPool {
 
 pub(crate) struct AgentPoolWorkspaceTransition<'a> {
     pool: &'a AgentPool,
+    #[cfg(test)]
     committed: bool,
 }
 
@@ -372,33 +373,6 @@ impl AgentPoolWorkspaceTransition<'_> {
             "AgentPool: cleared for workspace transition"
         );
     }
-
-    pub(crate) async fn publish_instruction_snapshot(
-        &self,
-        expected_pool: &Arc<AgentPool>,
-        snapshot: crate::unified_memory::InstructionProjectionSnapshot,
-    ) -> Result<(), String> {
-        if !std::ptr::eq(self.pool, expected_pool.as_ref()) {
-            return Err("instruction snapshot targets a different AgentPool".to_string());
-        }
-        if !self.committed {
-            return Err(
-                "instruction snapshot cannot publish before the pool transition commits"
-                    .to_string(),
-            );
-        }
-        if !self.pool.agents.read().await.is_empty() {
-            return Err(
-                "instruction snapshot cannot publish while retired pool agents remain".to_string(),
-            );
-        }
-        tracing::info!(
-            revision = snapshot.revision(),
-            "AgentPool: workspace instruction projection generation committed"
-        );
-        *self.pool.instruction_projection.write().await = Some(snapshot);
-        Ok(())
-    }
 }
 
 impl Drop for AgentPoolWorkspaceTransition<'_> {
@@ -410,6 +384,14 @@ impl Drop for AgentPoolWorkspaceTransition<'_> {
 }
 
 impl AgentPool {
+    /// Bootstrap may already own this workspace's Review admission and Store.
+    /// Hosts must reuse that owner rather than create another admission lock.
+    pub(crate) fn shared_review_integration(
+        &self,
+    ) -> Option<Arc<crate::evolution::ReviewIntegration>> {
+        self.shared.review_integration.clone()
+    }
+
     pub(crate) fn retain_for_supervised_run(
         self: &Arc<Self>,
         key: String,
@@ -499,7 +481,9 @@ impl AgentPool {
             .bind_agent_pool(Arc::downgrade(&pool))
             .await?;
         if let Some(review_integration) = runtime.review_integration.as_ref() {
-            review_integration.bind_rule_projection_pool(&pool).await?;
+            review_integration
+                .bind_rule_projection_pool_for_project(&pool, runtime.project_root.clone())
+                .await?;
         }
 
         // Pre-create background agent if enabled
@@ -1793,6 +1777,7 @@ impl AgentPool {
         drop(agents);
         let transition = AgentPoolWorkspaceTransition {
             pool: self,
+            #[cfg(test)]
             committed: false,
         };
 

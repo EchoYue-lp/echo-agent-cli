@@ -2457,10 +2457,16 @@ impl AppState {
         })
         .await
         .map_err(|error| anyhow::anyhow!("workspace link task failed: {error}"))??;
-        if had_loaded_runtime {
+        let execution_generation_changed = workspace.root != previous_workspace.root
+            || workspace.project_root != previous_workspace.project_root
+            || workspace.opaque_product_data_generation()
+                != previous_workspace.opaque_product_data_generation();
+        if had_loaded_runtime && execution_generation_changed {
             // A linked project root is part of the execution generation. Retire
             // the idle host only after the registry commit succeeds, so an
-            // invalid project path cannot destroy the current runtime.
+            // invalid project path cannot destroy the current runtime. Linking
+            // the same project keeps the shared Review owner and its admission;
+            // the focus/configuration refresh below still runs on that host.
             if let Err(error) = self
                 .workspace
                 .runtimes

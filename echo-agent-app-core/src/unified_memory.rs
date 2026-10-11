@@ -244,7 +244,7 @@ pub(crate) fn load_instruction_projection_strict_with_state(
 }
 
 /// Publish an already-read snapshot. This function never touches disk, so all
-/// targets in one generation receive byte-identical content.
+/// targets using the same project context receive byte-identical content.
 pub(crate) async fn apply_instruction_projection_snapshot(
     agent: &mut echo_agent::agent::ReactAgent,
     snapshot: &InstructionProjectionSnapshot,

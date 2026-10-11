@@ -4,13 +4,13 @@ id: map.eko-framework-consumer-settlement
 kind: capability_map
 title: EKO framework consumer settlement
 risk: high
-observed_at: source:621b3930bfef37174da8309c6fde5c06dd749fd2be9cb4d48fdaf1e8c63628b1
+observed_at: source:2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3
 boundary_refs: [boundary.eko-framework-consumer-settlement]
 behavior_refs: [behavior.background-review-caller-owned-settlement]
 rule_refs: [rule.eko-framework-consumer-authorities]
-evidence_refs: [evidence.latest-framework-consumer-integration]
-finding_refs: []
-audit_refs: []
+evidence_refs: [evidence.latest-framework-consumer-integration, evidence.background-review-entry-repair, evidence.background-review-entry-verification]
+finding_refs: [finding.background-review-entry-settlement]
+audit_refs: [audit.background-review-entry-independent-rereview]
 related_map_refs: [map.eko-conversation-collaboration]
 scenarios:
   independent-linux-validation-budgets:
@@ -26,7 +26,7 @@ scenarios:
     status: mapped
     source_refs: [echo-agent-app-core/src/evolution/background_review_owner.rs, echo-agent-app-core/src/evolution/review_integration.rs, echo-agent-app-core/src/runtime.rs, echo-agent-app-core/src/workspace/runtime.rs]
     rule_refs: [rule.eko-framework-consumer-authorities]
-    evidence_refs: [evidence.latest-framework-consumer-integration]
+    evidence_refs: [evidence.latest-framework-consumer-integration, evidence.background-review-entry-repair, evidence.background-review-entry-verification]
   review-surface-result:
     status: mapped
     source_refs: [src/tauri/commands/panels.rs, src/cli/cmd_impls/evolution.rs, src/tui/events.rs, web-frontend/src/api/endpoints.ts, web-frontend/src/components/evolution/EvolutionPanel.tsx]

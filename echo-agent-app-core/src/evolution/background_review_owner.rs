@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256};
 
 use super::evidence::{EvidenceCandidate, EvidenceStore, capture_review_outcome};
 
+const MEMORY_FACT_FINGERPRINT: &str = "memory-fact-v1:";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ReviewEvent {
@@ -298,7 +300,13 @@ impl ReviewReceiptStore {
         let memory_persisted = match (memory_before, memory_after.as_deref()) {
             (None, None) => Some(false),
             (None, Some(_)) => Some(true),
-            (Some(before), Some(after)) if before != after => Some(true),
+            (Some(before), Some(after))
+                if before.starts_with(MEMORY_FACT_FINGERPRINT)
+                    && after.starts_with(MEMORY_FACT_FINGERPRINT)
+                    && before != after =>
+            {
+                Some(true)
+            }
             (Some(_), _) => None,
         };
         let result = ReviewTerminal::Interrupted {
@@ -379,9 +387,18 @@ pub async fn memory_fingerprint(
         .map_err(|error| error.to_string())?;
     entry
         .map(|(_, entry)| {
-            let bytes = serde_json::to_vec(&(entry.content, entry.meta))
-                .map_err(|error| error.to_string())?;
-            Ok(format!("{:x}", Sha256::digest(bytes)))
+            // Recall telemetry is not a Memory fact mutation. The versioned
+            // prefix also keeps older full-metadata receipts from confirming a
+            // new write merely because the fingerprint algorithm changed.
+            let mut meta = entry.meta;
+            meta.recall_count = 0;
+            meta.last_recalled_at = None;
+            let bytes =
+                serde_json::to_vec(&(entry.content, meta)).map_err(|error| error.to_string())?;
+            Ok(format!(
+                "{MEMORY_FACT_FINGERPRINT}{:x}",
+                Sha256::digest(bytes)
+            ))
         })
         .transpose()
 }
@@ -556,6 +573,139 @@ mod tests {
                 memory_persisted: None,
                 ..
             })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recall_telemetry_does_not_attribute_an_old_memory_write() -> Result<(), String> {
+        use echo_agent::memory::TypedMemoryStore;
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join(".eko");
+        let store = Arc::new(InMemoryStore::new()) as Arc<dyn Store>;
+        let manager = manager(&root, store.clone())?;
+        let identity = ReviewIdentity::for_run("recall-only");
+        manager
+            .write_memory(
+                &identity.persistence_key,
+                "previous review memory",
+                MemoryMeta::new(
+                    MemoryType::UserPreference,
+                    MemorySource::ExplicitSave,
+                    "test",
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let before = memory_fingerprint(&manager, &identity.persistence_key).await?;
+        let (_, entry) = manager
+            .locate(&identity.persistence_key)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "old memory missing".to_string())?;
+        let mut meta = entry.meta;
+        meta.recall_count = meta.recall_count.saturating_add(1);
+        meta.last_recalled_at = Some(12345);
+        TypedMemoryStore::new(store)
+            .update_meta(
+                echo_agent::evolution::layer::WARM_NAMESPACE,
+                &identity.persistence_key,
+                meta,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let receipts = ReviewReceiptStore::open(&root)?;
+        receipts.admit(
+            "recall-operation".into(),
+            identity.clone(),
+            "scope",
+            "generation",
+            before.clone(),
+        )?;
+        let terminal = receipts
+            .settle_interrupted(
+                "recall-operation",
+                &identity,
+                before.as_deref(),
+                &manager,
+                "cancelled before writing".into(),
+            )
+            .await?;
+        assert!(matches!(
+            terminal,
+            ReviewTerminal::Interrupted {
+                memory_persisted: None,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_fingerprint_cannot_confirm_a_new_memory_write() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join(".eko");
+        let manager = manager(&root, Arc::new(InMemoryStore::new()))?;
+        let identity = ReviewIdentity::for_run("legacy-receipt");
+        manager
+            .write_memory(
+                &identity.persistence_key,
+                "old value",
+                MemoryMeta::new(
+                    MemoryType::UserPreference,
+                    MemorySource::ExplicitSave,
+                    "test",
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let (_, old) = manager
+            .locate(&identity.persistence_key)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "old memory missing".to_string())?;
+        let legacy = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(old.content, old.meta)).map_err(|error| error.to_string())?
+            )
+        );
+        manager
+            .write_memory(
+                &identity.persistence_key,
+                "value after interruption",
+                MemoryMeta::new(
+                    MemoryType::UserPreference,
+                    MemorySource::ExplicitSave,
+                    "test",
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let receipts = ReviewReceiptStore::open(&root)?;
+        receipts.admit(
+            "legacy-operation".into(),
+            identity.clone(),
+            "scope",
+            "generation",
+            Some(legacy.clone()),
+        )?;
+        let terminal = receipts
+            .settle_interrupted(
+                "legacy-operation",
+                &identity,
+                Some(&legacy),
+                &manager,
+                "process interrupted".into(),
+            )
+            .await?;
+        assert!(matches!(
+            terminal,
+            ReviewTerminal::Interrupted {
+                memory_persisted: None,
+                ..
+            }
         ));
         Ok(())
     }

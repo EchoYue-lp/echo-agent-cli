@@ -502,8 +502,14 @@ impl ApplicationLifecycleOwner {
                 receipt.record("task hook dispatcher", error);
             }
         }
-        if let Some(state) = self.app_state.as_ref()
-            && let Err(error) = state.shutdown_command_cells().await
+        // Bootstrap rollback has no AppState yet. The command service owns a
+        // ProductData flow, so both paths must settle it before the aggregate join.
+        if let Some(state) = self.app_state.as_ref() {
+            if let Err(error) = state.shutdown_command_cells().await {
+                receipt.record("command cells", error);
+            }
+        } else if let Some(runtime) = self.command_cell_runtime.as_ref()
+            && let Err(error) = runtime.shutdown().await
         {
             receipt.record("command cells", error);
         }
@@ -530,14 +536,10 @@ impl ApplicationLifecycleOwner {
         {
             receipt.record("agent pool", error);
         }
-        if let Some(state) = self.app_state.as_ref() {
-            if let Err(error) = state.terminal.close_all().await {
-                receipt.record("terminal sessions", error);
-            }
-        } else if let Some(runtime) = self.command_cell_runtime.as_ref()
-            && let Err(error) = runtime.shutdown().await
+        if let Some(state) = self.app_state.as_ref()
+            && let Err(error) = state.terminal.close_all().await
         {
-            receipt.record("command cells", error);
+            receipt.record("terminal sessions", error);
         }
 
         if let Some(runtime) = self.plugin_runtime.as_ref()
@@ -1168,23 +1170,46 @@ impl AgentRuntime {
         // identical to the store path resolution done in `create_agent`.
         let (_, review_echo_agent_dir) =
             infra::resolve_memory_store_paths(params.working_dir.as_deref());
-        let review_integration = agent_handle
-            .read(|a| a.store().cloned())
-            .await
-            .map(|store| {
-                Arc::new(ReviewIntegration::new_with_project_root(
+        // Only the manifest at the Store's exact data root may provide the
+        // durable workspace identity. Ancestor discovery could assign a child
+        // project's Store to another root, and malformed manifests must never
+        // silently downgrade pending workspace debt to global ownership.
+        let review_workspace = match bootstrap_review_workspace(&review_echo_agent_dir) {
+            Ok(workspace) => workspace,
+            Err(error) => return Err(rollback_composition(bootstrap_lifecycle, error).await),
+        };
+        let review_echo_agent_dir = review_workspace
+            .as_ref()
+            .map(|workspace| crate::workspace::layout::WorkspaceLayout::state_dir(&workspace.root))
+            .unwrap_or(review_echo_agent_dir);
+        let review_store = agent_handle.read(|a| a.store().cloned()).await;
+        let review_integration = review_store.map(|store| {
+            Arc::new(match review_workspace.as_ref() {
+                Some(workspace) => ReviewIntegration::new_scoped_with_project_root(
+                    ReviewConfig::default(),
+                    review_echo_agent_dir.clone(),
+                    store,
+                    workspace.id.to_string(),
+                    workspace.opaque_product_data_generation(),
+                    workspace.project_root.clone(),
+                ),
+                None => ReviewIntegration::new_with_project_root(
                     ReviewConfig::default(),
                     review_echo_agent_dir.clone(),
                     store,
                     project_root.clone(),
-                ))
-            });
+                ),
+            })
+        });
         if review_integration.is_some() {
             tracing::info!("ReviewIntegration created for session");
         }
         if let Some(review_integration) = &review_integration {
             bootstrap_lifecycle.bind_review_integration(review_integration.clone());
-            review_integration.bind_rule_projection_primary(agent_handle.clone());
+            review_integration.bind_rule_projection_primary_for_project(
+                agent_handle.clone(),
+                project_root.clone(),
+            );
             let execution_scope = params.execution_scope.clone().unwrap_or_else(|| {
                 crate::workspace::WorkspaceExecutionScope::global(
                     params
@@ -1406,6 +1431,42 @@ impl AgentRuntime {
     }
 }
 
+fn bootstrap_review_workspace(
+    echo_agent_dir: &std::path::Path,
+) -> anyhow::Result<Option<crate::workspace::Workspace>> {
+    let manifest = echo_agent_dir.join("workspace.json");
+    let data = match std::fs::read_to_string(&manifest) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "Failed to read Background Review workspace identity at {}: {error}",
+                manifest.display()
+            ));
+        }
+    };
+    let mut workspace: crate::workspace::Workspace =
+        serde_json::from_str(&data).map_err(|error| {
+            anyhow::anyhow!(
+                "Invalid Background Review workspace identity at {}: {error}",
+                manifest.display()
+            )
+        })?;
+    let root = echo_agent_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Background Review data root has no workspace parent"))?
+        .canonicalize()?;
+    if workspace.root.canonicalize()? != root {
+        anyhow::bail!(
+            "Background Review workspace manifest {} belongs to a different root",
+            manifest.display()
+        );
+    }
+    workspace.root = root;
+    workspace.refresh_product_data_generation();
+    Ok(Some(workspace))
+}
+
 /// Rebuild EKO intent routing from one agent's committed skill catalog.
 pub(crate) fn configure_intent_router(
     agent: &mut echo_agent::agent::ReactAgent,
@@ -1522,6 +1583,588 @@ pub(crate) async fn register_lsp_tools(
 mod tests {
     use super::*;
     use echo_agent::intent::IntentClassifier;
+
+    fn run_isolated_bootstrap_test(name: &str) -> anyhow::Result<bool> {
+        if std::env::var_os("EKO_BOOTSTRAP_ISOLATED").is_some() {
+            return Ok(false);
+        }
+        let temp = tempfile::tempdir()?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", name, "--nocapture"])
+            .env("EKO_BOOTSTRAP_ISOLATED", "1")
+            .env("EKO_DATA_DIR", temp.path().join("user-data"))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "isolated bootstrap test failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        Ok(true)
+    }
+
+    async fn bootstrap_review_fixture(
+        root: Option<PathBuf>,
+        fixture_dir: &std::path::Path,
+    ) -> anyhow::Result<AgentRuntime> {
+        bootstrap_review_fixture_with_project(root, None, fixture_dir).await
+    }
+
+    async fn bootstrap_review_fixture_with_project(
+        root: Option<PathBuf>,
+        project: Option<String>,
+        fixture_dir: &std::path::Path,
+    ) -> anyhow::Result<AgentRuntime> {
+        let browser = crate::browser::BrowserRuntime::start(crate::browser::BrowserConfig {
+            enabled: false,
+            extension_enabled: false,
+            session_dir: fixture_dir.join("browser-sessions"),
+            ..Default::default()
+        })
+        .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            AgentRuntime::bootstrap(
+                &EkoConfig::default(),
+                AgentCreateParams {
+                    working_dir: root,
+                    project,
+                    browser_runtime: Some(browser.clone()),
+                    state_store: Some(Arc::new(echo_agent::state::FileRuntimeStateStore::new(
+                        fixture_dir.join("runtime-state"),
+                    )?)),
+                    ..Default::default()
+                },
+                fixture_dir.join("missing-mcp.json"),
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("bootstrap did not settle within 15 seconds"))?;
+        if result.is_err() {
+            browser.shutdown().await;
+        }
+        result
+    }
+
+    async fn projected_test_instructions(agent: &AgentHandle) -> String {
+        let context = agent.read(|agent| agent.context().clone()).await;
+        context
+            .lock()
+            .await
+            .messages()
+            .iter()
+            .filter_map(|message| message.content.as_text_ref())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn bootstrap_keeps_explicit_project_context_with_workspace_memory_owner()
+    -> anyhow::Result<()> {
+        use crate::workspace::{
+            WorkspaceKind, layout::WorkspaceLayout, registry::WorkspaceRegistry,
+        };
+
+        if run_isolated_bootstrap_test(
+            "runtime::tests::bootstrap_keeps_explicit_project_context_with_workspace_memory_owner",
+        )? {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(temp.path().join("workspaces"))?;
+        let workspace = registry.create_at(
+            "explicit-project",
+            WorkspaceKind::General,
+            temp.path().join("workspace"),
+        )?;
+        let linked_project = temp.path().join("linked-project");
+        let explicit_project = temp.path().join("explicit-project");
+        std::fs::create_dir_all(linked_project.join(".git"))?;
+        std::fs::create_dir_all(explicit_project.join(".git"))?;
+        std::fs::write(
+            linked_project.join("AGENTS.md"),
+            "LINKED_PROJECT_P_INSTRUCTION",
+        )?;
+        std::fs::write(
+            explicit_project.join("AGENTS.md"),
+            "EXPLICIT_PROJECT_Q_INSTRUCTION",
+        )?;
+        let workspace = registry.link_project(&workspace.id, linked_project)?;
+        let explicit_project = explicit_project.canonicalize()?;
+        let runtime = bootstrap_review_fixture_with_project(
+            Some(workspace.root.clone()),
+            Some(explicit_project.display().to_string()),
+            temp.path(),
+        )
+        .await?;
+        assert_eq!(runtime.project_root.as_ref(), Some(&explicit_project));
+        let prompt = projected_test_instructions(&runtime.agent_handle).await;
+        let review = runtime
+            .review_integration
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("bootstrap Review owner is missing"))?;
+        let generation = review.lease_generation()?;
+        assert!(
+            generation
+                .matches_workspace_binding(
+                    &WorkspaceLayout::state_dir(&workspace.root.canonicalize()?),
+                    workspace.id.as_str(),
+                    &workspace.opaque_product_data_generation(),
+                )
+                .map_err(anyhow::Error::msg)?
+        );
+        let memory_store = generation.memory_store();
+        drop(generation);
+        let pool = runtime
+            .init_pool(
+                crate::agent_pool::PoolConfig {
+                    enable_background_agent: false,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await?;
+        pool.set_llm_client_override_for_test(Arc::new(echo_agent::testing::MockLlmClient::new()))
+            .await;
+        let existing_seed = pool.acquire("explicit-existing").await?;
+        let existing_seed_agent = existing_seed.agent();
+        drop(existing_seed);
+        let hosts = crate::workspace::runtime::WorkspaceRuntimeRegistry::new();
+        let host = hosts.get_or_open(workspace).await?;
+        let execution = host.get_or_open_execution(&pool).await?;
+        assert!(Arc::ptr_eq(review, &execution.review_integration()));
+        let workspace_pool = execution.pool();
+        let existing_workspace = workspace_pool.acquire("linked-existing").await?;
+        let existing_workspace_agent = existing_workspace.agent();
+        drop(existing_workspace);
+        let rule = "EXPLICIT_AND_LINKED_COMMON_RULE";
+        echo_agent::memory::TypedMemoryStore::new(memory_store)
+            .put_typed(
+                echo_agent::evolution::layer::WARM_NAMESPACE,
+                "explicit-project-rule",
+                rule,
+                echo_agent::memory::MemoryMeta::new(
+                    echo_agent::memory::MemoryType::ProjectFact,
+                    echo_agent::memory::MemorySource::ExplicitSave,
+                    "explicit-project-regression",
+                )
+                .with_confidence(0.99),
+            )
+            .await?;
+        review
+            .promote_rule(&crate::evolution::rule_promoter::RuleProposal {
+                memory_key: "explicit-project-rule".to_string(),
+                namespace: echo_agent::evolution::layer::WARM_NAMESPACE
+                    .iter()
+                    .map(|part| (*part).to_string())
+                    .collect(),
+                rule_text: format!("- **Project fact**: {rule}"),
+                confidence: 0.99,
+                memory_type: echo_agent::memory::MemoryType::ProjectFact,
+                proposed_at: chrono::Utc::now(),
+                reason: "one memory owner must retain each execution project's context".to_string(),
+            })
+            .await?;
+        let future_seed = pool.acquire("explicit-future").await?;
+        let future_seed_agent = future_seed.agent();
+        drop(future_seed);
+        let future_workspace = workspace_pool.acquire("linked-future").await?;
+        let future_workspace_agent = future_workspace.agent();
+        drop(future_workspace);
+        let seed_prompts = [
+            projected_test_instructions(&runtime.agent_handle).await,
+            projected_test_instructions(&existing_seed_agent).await,
+            projected_test_instructions(&future_seed_agent).await,
+        ];
+        let workspace_prompts = [
+            projected_test_instructions(&execution.primary_agent()).await,
+            projected_test_instructions(&existing_workspace_agent).await,
+            projected_test_instructions(&future_workspace_agent).await,
+        ];
+        hosts.shutdown().await?;
+        let mut lifecycle = runtime.lifecycle_owner(tokio_util::sync::CancellationToken::new());
+        lifecycle.bind_pool(pool);
+        lifecycle
+            .settle(ApplicationLifecycleReason::Shutdown, None)
+            .await
+            .into_result()?;
+        assert!(
+            prompt.contains("EXPLICIT_PROJECT_Q_INSTRUCTION"),
+            "bootstrap lost explicit project Q instructions; linked project P loaded: {}",
+            prompt.contains("LINKED_PROJECT_P_INSTRUCTION")
+        );
+        assert!(
+            !prompt.contains("LINKED_PROJECT_P_INSTRUCTION"),
+            "bootstrap installed another target's linked-project instructions"
+        );
+        for text in seed_prompts {
+            assert!(
+                text.contains("EXPLICIT_PROJECT_Q_INSTRUCTION"),
+                "seed lost explicit project context"
+            );
+            assert!(
+                !text.contains("LINKED_PROJECT_P_INSTRUCTION"),
+                "seed acquired Host project instructions"
+            );
+            assert!(text.contains(rule), "seed missed shared rule promotion");
+        }
+        for text in workspace_prompts {
+            assert!(
+                text.contains("LINKED_PROJECT_P_INSTRUCTION"),
+                "Host lost linked project context"
+            );
+            assert!(
+                !text.contains("EXPLICIT_PROJECT_Q_INSTRUCTION"),
+                "Host acquired seed project instructions"
+            );
+            assert!(text.contains(rule), "Host missed shared rule promotion");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_recovers_workspace_review_before_publishing_runtime() -> anyhow::Result<()> {
+        use crate::evolution::background_review_owner::{ReviewReceiptStore, ReviewTerminal};
+        use crate::workspace::{
+            WorkspaceKind, layout::WorkspaceLayout, registry::WorkspaceRegistry,
+        };
+
+        if run_isolated_bootstrap_test(
+            "runtime::tests::bootstrap_recovers_workspace_review_before_publishing_runtime",
+        )? {
+            return Ok(());
+        }
+
+        let temp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(temp.path().join("workspaces"))?;
+        let workspace = registry.create_at(
+            "restart-workspace",
+            WorkspaceKind::General,
+            temp.path().join("workspace"),
+        )?;
+        let state_dir = WorkspaceLayout::state_dir(&workspace.root);
+        let receipts = ReviewReceiptStore::open(&state_dir).map_err(anyhow::Error::msg)?;
+        receipts
+            .admit(
+                "workspace-before-exit".to_string(),
+                echo_agent::evolution::ReviewIdentity::for_run("workspace-review"),
+                workspace.id.as_str(),
+                &workspace.opaque_product_data_generation(),
+                None,
+            )
+            .map_err(anyhow::Error::msg)?;
+        drop(receipts);
+
+        let runtime = bootstrap_review_fixture(Some(workspace.root.clone()), temp.path()).await?;
+        let receipt = ReviewReceiptStore::open(&state_dir)
+            .map_err(anyhow::Error::msg)?
+            .receipt("workspace-before-exit")
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("workspace recovery lost the admitted operation"))?;
+        assert_eq!(receipt.authority_scope, workspace.id.as_str());
+        assert!(matches!(
+            receipt.terminal,
+            Some(ReviewTerminal::Interrupted { .. })
+        ));
+        let services = ApplicationServices::compose(
+            &runtime,
+            None,
+            None,
+            echo_agent::tools::permission::PermissionMode::Default,
+        )
+        .await?;
+        let host = services
+            .app_state
+            .workspace
+            .runtimes
+            .get_or_open(workspace.clone())
+            .await?;
+        let execution = host.get_or_open_execution(&services.pool).await?;
+        let bootstrap_review = runtime
+            .review_integration
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("bootstrap Review owner is missing"))?;
+        assert!(Arc::ptr_eq(
+            bootstrap_review,
+            &execution.review_integration()
+        ));
+        assert!(
+            services
+                .app_state
+                .review_integration
+                .as_ref()
+                .is_some_and(|review| Arc::ptr_eq(bootstrap_review, review))
+        );
+        let primary_store = runtime
+            .agent_handle
+            .read(|agent| agent.store().cloned())
+            .await
+            .ok_or_else(|| anyhow::anyhow!("bootstrap memory store is missing"))?;
+        let workspace_store = execution
+            .primary_agent()
+            .read(|agent| agent.store().cloned())
+            .await
+            .ok_or_else(|| anyhow::anyhow!("workspace memory store is missing"))?;
+        assert!(Arc::ptr_eq(&primary_store, &workspace_store));
+        services
+            .settle(ApplicationLifecycleReason::Shutdown, None)
+            .await
+            .into_result()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_recovers_project_review_with_global_identity() -> anyhow::Result<()> {
+        use crate::evolution::background_review_owner::{ReviewReceiptStore, ReviewTerminal};
+        use crate::workspace::layout::WorkspaceLayout;
+
+        if run_isolated_bootstrap_test(
+            "runtime::tests::bootstrap_recovers_project_review_with_global_identity",
+        )? {
+            return Ok(());
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("plain-project");
+        std::fs::create_dir_all(&root)?;
+        let state_dir = WorkspaceLayout::state_dir(&root);
+        let receipts = ReviewReceiptStore::open(&state_dir).map_err(anyhow::Error::msg)?;
+        receipts
+            .admit(
+                "global-before-exit".to_string(),
+                echo_agent::evolution::ReviewIdentity::for_run("global-review"),
+                "global",
+                "global",
+                None,
+            )
+            .map_err(anyhow::Error::msg)?;
+        drop(receipts);
+        let runtime = bootstrap_review_fixture(Some(root), temp.path()).await?;
+        let receipt = ReviewReceiptStore::open(&state_dir)
+            .map_err(anyhow::Error::msg)?
+            .receipt("global-before-exit")
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("global recovery lost the admitted operation"))?;
+        assert_eq!(receipt.authority_scope, "global");
+        assert_eq!(receipt.workspace_generation, "global");
+        assert!(matches!(
+            receipt.terminal,
+            Some(ReviewTerminal::Interrupted { .. })
+        ));
+        runtime
+            .lifecycle_owner(tokio_util::sync::CancellationToken::new())
+            .settle(ApplicationLifecycleReason::Shutdown, None)
+            .await
+            .into_result()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_refuses_foreign_workspace_review_without_publishing_runtime()
+    -> anyhow::Result<()> {
+        use crate::evolution::background_review_owner::ReviewReceiptStore;
+        use crate::workspace::{
+            WorkspaceKind, layout::WorkspaceLayout, registry::WorkspaceRegistry,
+        };
+
+        if run_isolated_bootstrap_test(
+            "runtime::tests::bootstrap_refuses_foreign_workspace_review_without_publishing_runtime",
+        )? {
+            return Ok(());
+        }
+
+        let temp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(temp.path().join("workspaces"))?;
+        let workspace = registry.create_at(
+            "foreign-review",
+            WorkspaceKind::General,
+            temp.path().join("workspace"),
+        )?;
+        let state_dir = WorkspaceLayout::state_dir(&workspace.root);
+        let receipts = ReviewReceiptStore::open(&state_dir).map_err(anyhow::Error::msg)?;
+        receipts
+            .admit(
+                "foreign-before-exit".to_string(),
+                echo_agent::evolution::ReviewIdentity::for_run("foreign-review"),
+                workspace.id.as_str(),
+                "foreign-generation",
+                None,
+            )
+            .map_err(anyhow::Error::msg)?;
+        let error = match bootstrap_review_fixture(Some(workspace.root), temp.path()).await {
+            Ok(runtime) => {
+                runtime
+                    .lifecycle_owner(tokio_util::sync::CancellationToken::new())
+                    .settle(ApplicationLifecycleReason::Shutdown, None)
+                    .await
+                    .into_result()?;
+                anyhow::bail!("bootstrap published an Agent with foreign recovery debt");
+            }
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("different workspace generation"));
+        assert!(
+            receipts
+                .receipt("foreign-before-exit")
+                .map_err(anyhow::Error::msg)?
+                .is_some_and(|receipt| receipt.terminal.is_none())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_cwd_recovers_workspace_and_global_review_owners() -> anyhow::Result<()> {
+        use crate::evolution::background_review_owner::{ReviewReceiptStore, ReviewTerminal};
+        use crate::workspace::{
+            WorkspaceKind, layout::WorkspaceLayout, registry::WorkspaceRegistry,
+        };
+
+        let temp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(temp.path().join("workspaces"))?;
+        let workspace = registry.create_at(
+            "cwd-review",
+            WorkspaceKind::General,
+            temp.path().join("workspace"),
+        )?;
+        let state_dir = WorkspaceLayout::state_dir(&workspace.root);
+        let receipts = ReviewReceiptStore::open(&state_dir).map_err(anyhow::Error::msg)?;
+        receipts
+            .admit(
+                "cwd-before-exit".to_string(),
+                echo_agent::evolution::ReviewIdentity::for_run("cwd-review"),
+                workspace.id.as_str(),
+                &workspace.opaque_product_data_generation(),
+                None,
+            )
+            .map_err(anyhow::Error::msg)?;
+        drop(receipts);
+
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "runtime::tests::bootstrap_workspace_cwd_child",
+                "--nocapture",
+            ])
+            .current_dir(&workspace.root)
+            .env("EKO_BOOTSTRAP_WORKSPACE_FIXTURE", temp.path())
+            .env("EKO_DATA_DIR", temp.path().join("child-data"))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "fresh-process bootstrap failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let receipt = ReviewReceiptStore::open(&state_dir)
+            .map_err(anyhow::Error::msg)?
+            .receipt("cwd-before-exit")
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("fresh-process recovery lost its receipt"))?;
+        assert_eq!(
+            receipt.workspace_generation,
+            workspace.opaque_product_data_generation()
+        );
+        assert!(matches!(
+            receipt.terminal,
+            Some(ReviewTerminal::Interrupted { .. })
+        ));
+
+        let global_cwd = temp.path().join("outside-project");
+        std::fs::create_dir_all(&global_cwd)?;
+        let global_root = temp.path().join("global-data");
+        let receipts = ReviewReceiptStore::open(&global_root).map_err(anyhow::Error::msg)?;
+        receipts
+            .admit(
+                "global-cwd-before-exit".to_string(),
+                echo_agent::evolution::ReviewIdentity::for_run("global-cwd-review"),
+                "global",
+                "global",
+                None,
+            )
+            .map_err(anyhow::Error::msg)?;
+        drop(receipts);
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "runtime::tests::bootstrap_workspace_cwd_child",
+                "--nocapture",
+            ])
+            .current_dir(&global_cwd)
+            .env("EKO_BOOTSTRAP_WORKSPACE_FIXTURE", temp.path())
+            .env("EKO_DATA_DIR", &global_root)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "global-root bootstrap failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt = ReviewReceiptStore::open(&global_root)
+            .map_err(anyhow::Error::msg)?
+            .receipt("global-cwd-before-exit")
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("global-root bootstrap lost its receipt"))?;
+        assert_eq!(receipt.authority_scope, "global");
+        assert_eq!(receipt.workspace_generation, "global");
+        assert!(matches!(
+            receipt.terminal,
+            Some(ReviewTerminal::Interrupted { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_workspace_cwd_child() -> anyhow::Result<()> {
+        let Some(fixture_dir) = std::env::var_os("EKO_BOOTSTRAP_WORKSPACE_FIXTURE") else {
+            return Ok(());
+        };
+        let runtime = bootstrap_review_fixture(None, &PathBuf::from(fixture_dir)).await?;
+        runtime
+            .lifecycle_owner(tokio_util::sync::CancellationToken::new())
+            .settle(ApplicationLifecycleReason::Shutdown, None)
+            .await
+            .into_result()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rollback_settles_command_flow_before_product_data_join() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let product_data_io = crate::product_data_io::ProductDataIoService::new();
+        let chat_events = Arc::new(crate::chat_event_log::ChatEventLog::open(
+            temp.path().join("events"),
+            crate::chat_event_log::ChatEventRetention::default(),
+        )?);
+        let command_cells =
+            crate::tasks::task_runtime::command_cells::CommandCellRuntimeService::new(
+                Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox()),
+                chat_events,
+                product_data_io.clone(),
+            )
+            .map_err(anyhow::Error::msg)?;
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.bind_product_data_io(product_data_io);
+        owner.bind_command_cell_runtime(command_cells);
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            owner.settle(
+                ApplicationLifecycleReason::BootstrapRollback,
+                Some(anyhow::anyhow!("injected recovery failure")),
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("rollback waited for its own command-cell flow"))?;
+        assert_eq!(
+            receipt.primary_error.as_deref(),
+            Some("injected recovery failure")
+        );
+        assert!(
+            receipt.failures.is_empty(),
+            "rollback left cleanup failures: {receipt}"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn lifecycle_broadcasts_root_cancel_before_joining_background_tasks() {
