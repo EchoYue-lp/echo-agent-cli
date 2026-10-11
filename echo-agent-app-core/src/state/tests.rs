@@ -4533,6 +4533,123 @@ mod workspace_transition_tests {
     }
 
     #[tokio::test]
+    async fn linking_the_same_project_keeps_the_shared_review_owner_and_focus() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let registry = Arc::new(WorkspaceRegistry::with_base_dir(
+            temp.path().join("registry"),
+        )?);
+        let workspace = registry.create_at(
+            "same-link",
+            crate::workspace::WorkspaceKind::General,
+            temp.path().join("workspace"),
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project)?;
+        let project = project.canonicalize()?;
+        let workspace = registry.link_project(&workspace.id, project.clone())?;
+        let store = Arc::new(echo_agent::memory::FileStore::new(
+            crate::workspace::layout::WorkspaceLayout::memory_store(&workspace.root),
+        )?) as Arc<dyn echo_agent::memory::Store>;
+        let review = Arc::new(
+            crate::evolution::ReviewIntegration::new_scoped_with_project_root(
+                echo_agent::evolution::ReviewConfig::default(),
+                crate::workspace::layout::WorkspaceLayout::state_dir(
+                    &workspace.root.canonicalize()?,
+                ),
+                store.clone(),
+                workspace.id.to_string(),
+                workspace.opaque_product_data_generation(),
+                workspace.project_root.clone(),
+            ),
+        );
+        let primary = AgentHandle::new(
+            ReactAgentBuilder::new()
+                .llm_client(Arc::new(MockLlmClient::new()))
+                .store(store.clone())
+                .system_prompt("same-project link regression")
+                .build()?,
+        );
+        let seed = Arc::new(
+            crate::agent_pool::AgentPool::new_for_test(
+                primary.clone(),
+                Some(review.clone()),
+                Some(store),
+                2,
+                false,
+            )
+            .await,
+        );
+        let mut state = AppState::from_shared(
+            primary,
+            None,
+            Arc::new(crate::hitl::HitlDispatcher::new()),
+            None,
+            None,
+            Default::default(),
+            Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
+                temp.path().join("mcp.json"),
+                Default::default(),
+            )),
+            crate::product_data_io::ProductDataIoService::new(),
+        )?;
+        state.workspace.registry = registry;
+        state = state.with_review_integration(Some(review.clone()));
+        state.set_pool(seed.clone());
+        let state = Arc::new(state);
+        state.switch_workspace(workspace.clone()).await?;
+        let host = state
+            .workspace
+            .runtimes
+            .loaded_host(&workspace.id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("focused Host is missing"))?;
+        let execution = host.get_or_open_execution(&seed).await?;
+        assert!(Arc::ptr_eq(&review, &execution.review_integration()));
+        let original_generation = workspace.opaque_product_data_generation();
+
+        let linked = state.link_current_workspace_project_owned(project).await?;
+        assert_eq!(linked.opaque_product_data_generation(), original_generation);
+        assert!(
+            state
+                .current_workspace()
+                .await
+                .is_some_and(|current| current.id == workspace.id)
+        );
+        let same_host = state
+            .workspace
+            .runtimes
+            .loaded_host(&workspace.id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("idempotent link removed the focused Host"))?;
+        assert!(Arc::ptr_eq(&host, &same_host));
+        assert!(Arc::ptr_eq(
+            &review,
+            &same_host
+                .get_or_open_execution(&seed)
+                .await?
+                .review_integration()
+        ));
+        let generation = review.lease_generation()?;
+        assert!(
+            generation
+                .matches_workspace_binding(
+                    crate::workspace::layout::WorkspaceLayout::state_dir(
+                        &workspace.root.canonicalize()?
+                    )
+                    .as_path(),
+                    workspace.id.as_str(),
+                    &original_generation,
+                )
+                .map_err(anyhow::Error::msg)?
+        );
+        drop(generation);
+        state.shutdown_workspace_runtimes().await?;
+        seed.shutdown().await.map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn focus_changes_preserve_independent_running_workspace_hosts()
     -> std::result::Result<(), String> {
         let process_cwd = std::env::current_dir().map_err(|error| error.to_string())?;

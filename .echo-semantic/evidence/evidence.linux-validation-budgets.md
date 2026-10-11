@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.linux-validation-budgets
 kind: evidence
-observed_at: source:621b3930bfef37174da8309c6fde5c06dd749fd2be9cb4d48fdaf1e8c63628b1
+observed_at: source:2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3
 source_refs: [.github/workflows/rust-ci.yml]
 supports: [map.eko-framework-consumer-settlement]
 limitations: [Exact-head remote acceptance pending; no historical cancellation causality claim]

@@ -450,39 +450,64 @@ impl WorkspaceRuntimeHost {
                 let task_runtime = self.task_runtime().await?;
                 let workspace = self.workspace().await;
                 let project_root = workspace.project_root.clone();
-                let review_integration = Arc::new(ReviewIntegration::new_scoped_with_project_root(
-                    echo_agent::evolution::ReviewConfig::default(),
-                    self.resources.state_dir().to_path_buf(),
-                    self.resources.memory_store(),
-                    workspace.id.to_string(),
-                    workspace.opaque_product_data_generation(),
-                    project_root.clone(),
-                ));
-                let review_generation = review_integration
-                    .lease_generation()
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                for receipt in review_generation
-                    .recover_background_reviews()
-                    .await
-                    .map_err(anyhow::Error::msg)?
-                {
-                    tracing::warn!(
-                        operation_id = %receipt.operation_id,
-                        run_id = %receipt.identity.run_id,
-                        result = ?receipt.result,
-                        "recovered unfinished workspace Background Review"
-                    );
+                let inherited_review = seed_pool
+                    .shared_review_integration()
+                    .map(|owner| {
+                        let generation = owner
+                            .lease_generation()
+                            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                        Ok::<_, anyhow::Error>((owner, generation))
+                    })
+                    .transpose()?;
+                let (review_integration, review_generation, recover_reviews) = match inherited_review {
+                    Some((owner, generation))
+                        if generation.matches_workspace_binding(
+                            self.resources.state_dir(),
+                            workspace.id.as_str(),
+                            &workspace.opaque_product_data_generation(),
+                        ).map_err(anyhow::Error::msg)? => (owner, generation, false),
+                    _ => {
+                        let owner = Arc::new(ReviewIntegration::new_scoped_with_project_root(
+                            echo_agent::evolution::ReviewConfig::default(),
+                            self.resources.state_dir().to_path_buf(),
+                            self.resources.memory_store(),
+                            workspace.id.to_string(),
+                            workspace.opaque_product_data_generation(),
+                            project_root.clone(),
+                        ));
+                        let generation = owner
+                            .lease_generation()
+                            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                        (owner, generation, true)
+                    }
+                };
+                // Replaying a reused owner's pending receipt would interrupt
+                // a live Review. Bootstrap already recovered this exact owner;
+                // even after Host retirement its closed admission stays closed.
+                if recover_reviews {
+                    for receipt in review_generation
+                        .recover_background_reviews()
+                        .await
+                        .map_err(anyhow::Error::msg)?
+                    {
+                        tracing::warn!(
+                            operation_id = %receipt.operation_id,
+                            run_id = %receipt.identity.run_id,
+                            result = ?receipt.result,
+                            "recovered unfinished workspace Background Review"
+                        );
+                    }
                 }
-                drop(review_generation);
+                let memory_store = review_generation.memory_store();
                 let workspace_io_identity = self.workspace_io_identity();
                 let (pool, plugin_runtime, _mcp_ownership) = seed_pool
                     .fork_for_workspace(WorkspaceAgentPoolResources {
                         root: self.root().to_path_buf(),
                         project_root: project_root.clone(),
-                        kind: workspace.kind,
+                        kind: workspace.kind.clone(),
                         conversation_store: self.resources.conversation_store(),
                         state_store: self.resources.runtime_state_store(),
-                        memory_store: self.resources.memory_store(),
+                        memory_store,
                         task_runtime_store: task_runtime.clone(),
                         review_integration: review_integration.clone(),
                         execution_scope: self.execution_scope(),
@@ -497,17 +522,28 @@ impl WorkspaceRuntimeHost {
                 review_integration.set_evolution_observer(evolution_observer);
                 review_integration.bind_rule_projection_pool(&pool).await?;
                 let memory_projection = review_integration.settle_hot_memory_projection().await;
-                if memory_projection.status
+                let publication_error = if memory_projection.status
                     == crate::evolution::review_integration::MemoryProjectionSettlementStatus::Degraded
                 {
-                    anyhow::bail!(
+                    Some(format!(
                         "workspace hot-memory projection failed: {}",
                         memory_projection
                             .error
                             .unwrap_or_else(|| "unknown projection error".to_string())
-                    );
-                }
-                Ok::<Arc<WorkspaceExecutionRuntime>, anyhow::Error>(Arc::new(
+                    ))
+                } else {
+                    match review_generation.matches_workspace_binding(
+                        self.resources.state_dir(),
+                        workspace.id.as_str(),
+                        &workspace.opaque_product_data_generation(),
+                    ) {
+                        Ok(true) => None,
+                        Ok(false) => Some("workspace Review identity changed before publication".to_string()),
+                        Err(error) => Some(error),
+                    }
+                };
+                drop(review_generation);
+                let execution = Arc::new(
                     WorkspaceExecutionRuntime {
                         primary_agent,
                         pool,
@@ -515,7 +551,17 @@ impl WorkspaceRuntimeHost {
                         review_integration,
                         plugin_runtime,
                     },
-                ))
+                );
+                // Shutdown can close a borrowed owner while the pool is being
+                // prepared. Never publish that generation or leave its newly
+                // constructed pool running after the publication fence fails.
+                if let Some(error) = publication_error {
+                    return match execution.shutdown().await {
+                        Ok(()) => Err(anyhow::Error::msg(error)),
+                        Err(cleanup) => Err(anyhow::anyhow!("{error}; workspace preparation cleanup: {cleanup}")),
+                    };
+                }
+                Ok::<Arc<WorkspaceExecutionRuntime>, anyhow::Error>(execution)
             })
             .await?;
         Ok(Arc::clone(runtime))
@@ -1468,6 +1514,87 @@ mod tests {
             std::env::current_dir().map_err(|error| error.to_string())?,
             process_cwd
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_host_preserves_closed_seed_review_owner_after_retirement()
+    -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("shared-review");
+        std::fs::create_dir_all(&root)?;
+        let root = root.canonicalize()?;
+        let workspace = workspace("shared-review", root.clone());
+        let store = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
+        let review = Arc::new(ReviewIntegration::new_scoped_with_project_root(
+            echo_agent::evolution::ReviewConfig::default(),
+            WorkspaceLayout::state_dir(&root),
+            store.clone(),
+            workspace.id.to_string(),
+            workspace.opaque_product_data_generation(),
+            None,
+        ));
+        let primary = echo_agent::agent::ReactAgentBuilder::new()
+            .llm_client(Arc::new(MockLlmClient::new()))
+            .store(store.clone())
+            .system_prompt("shared review seed")
+            .build()?;
+        let seed = Arc::new(
+            AgentPool::new_for_test(
+                AgentHandle::new(primary),
+                Some(review.clone()),
+                Some(store.clone()),
+                2,
+                false,
+            )
+            .await,
+        );
+        let registry = WorkspaceRuntimeRegistry::new();
+        let host = registry.get_or_open(workspace.clone()).await?;
+        let execution = host.get_or_open_execution(&seed).await?;
+        assert!(Arc::ptr_eq(&review, &execution.review_integration()));
+        let installed = execution
+            .primary_agent()
+            .read(|agent| agent.store().cloned())
+            .await
+            .ok_or_else(|| anyhow::anyhow!("workspace memory store is missing"))?;
+        assert!(Arc::ptr_eq(&store, &installed));
+        assert!(registry.shutdown_and_evict_if_idle(&workspace.id).await?);
+        drop(execution);
+        drop(host);
+
+        let host = registry.get_or_open(workspace).await?;
+        let error = host
+            .get_or_open_execution(&seed)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("Host reopening bypassed closed Review admission"))?;
+        assert!(error.to_string().contains("Review owner is closed"));
+        assert!(
+            host.execution.get().is_none(),
+            "closed Review owner published an Agent"
+        );
+        let shared_review = seed
+            .shared_review_integration()
+            .ok_or_else(|| anyhow::anyhow!("seed lost its shared Review owner"))?;
+        assert!(Arc::ptr_eq(&review, &shared_review));
+        let reviewer = echo_agent::evolution::BackgroundReviewer::new(
+            echo_agent::evolution::BackgroundReviewConfig::default(),
+            Arc::new(MockLlmClient::new()),
+            None,
+            None,
+        );
+        let result = shared_review
+            .lease_generation()
+            .map_err(anyhow::Error::from)?
+            .track_background_review(reviewer.review_by_run_id("after-retirement"))
+            .await;
+        assert!(
+            result.is_err(),
+            "Host reopening must not bypass closed Review admission"
+        );
+        registry.shutdown().await?;
+        seed.shutdown().await.map_err(anyhow::Error::msg)?;
         Ok(())
     }
 

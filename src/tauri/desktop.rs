@@ -64,7 +64,7 @@ fn install_panic_hook() {
     }));
 }
 
-/// Run the Tauri desktop app and report startup failures to a crash log.
+/// Run the Tauri desktop app and report lifecycle failures to a crash log.
 pub async fn run_desktop_entry() -> anyhow::Result<()> {
     // Must run before crash_log_path(), logging, or any Store resolves a path.
     crate::configure_data_root()?;
@@ -94,7 +94,7 @@ pub async fn run_desktop_entry() -> anyhow::Result<()> {
         Err(error) => {
             let log_path = crash_log_path();
             let message = format!(
-                "EKO failed to start at {}\n\nError: {:?}\n",
+                "EKO failed at {}\n\nError: {:?}\n",
                 chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
                 error
             );
@@ -107,7 +107,7 @@ pub async fn run_desktop_entry() -> anyhow::Result<()> {
                 let _ = Command::new("osascript")
                     .arg("-e")
                     .arg(format!(
-                        "display dialog \"EKO failed to start.\\n\\n\
+                        "display dialog \"EKO failed.\\n\\n\
                          Error: {}\\n\\n\
                          Crash log: {}\" \
                          with title \"EKO\" buttons {{\"OK\"}} default button \"OK\"",
@@ -200,23 +200,51 @@ async fn run_desktop() -> anyhow::Result<()> {
         },
         async move { bridge_join.join().await },
     )?;
-    let tauri_result = crate::tauri::build_tauri_app(
-        state.clone(),
+    let builder = crate::tauri::build_tauri_app(
+        state,
         runtime.browser_runtime.clone(),
         services.subagent_projection.clone(),
-        bridge_supervisor.clone(),
+        bridge_supervisor,
+    );
+    run_desktop_with_settlement(
+        move || {
+            let app = builder.build(tauri_context)?;
+            // App::run exits the process, bypassing our application owner.
+            // Returning the loop keeps Tokio alive until every accepted service
+            // settles. Repeated exit requests still produce only one return.
+            Ok(app.run_return(|_, _| {}))
+        },
+        move |primary_error| {
+            services.settle(
+                echo_agent_app_core::api::runtime::ApplicationLifecycleReason::Shutdown,
+                primary_error,
+            )
+        },
     )
-    .run(tauri_context);
+    .await
+}
 
-    let primary_error = tauri_result
-        .err()
-        .map(|error| anyhow::anyhow!("error while running Tauri application: {error}"));
-    let receipt = services
-        .settle(
-            echo_agent_app_core::api::runtime::ApplicationLifecycleReason::Shutdown,
-            primary_error,
-        )
-        .await;
+async fn run_desktop_with_settlement<Run, Settle, Settlement>(
+    run: Run,
+    settle: Settle,
+) -> anyhow::Result<()>
+where
+    Run: FnOnce() -> anyhow::Result<i32>,
+    Settle: FnOnce(Option<anyhow::Error>) -> Settlement,
+    Settlement: std::future::Future<Output = echo_agent_app_core::api::runtime::ApplicationLifecycleReceipt>,
+{
+    let primary_error = match run() {
+        Ok(0) => None,
+        Ok(code) => Some(anyhow::anyhow!(
+            "Tauri application exited with status {code}"
+        )),
+        Err(error) => Some(anyhow::anyhow!(
+            "error while running Tauri application: {error}"
+        )),
+    };
+    // The same boundary handles builder failures and normal loop completion;
+    // neither path may return before the existing service owner joins.
+    let receipt = settle(primary_error).await;
     receipt.into_result().map_err(anyhow::Error::new)
 }
 
@@ -232,6 +260,16 @@ fn parse_desktop_args(args: impl IntoIterator<Item = OsString>) -> Result<cli::A
 #[cfg(test)]
 mod tests {
     use super::*;
+    use echo_agent_app_core::api::runtime::{
+        ApplicationLifecycleError, ApplicationLifecycleOwner, ApplicationLifecycleReason,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
     #[test]
     fn desktop_args_preserve_explicit_mcp_override() -> anyhow::Result<()> {
@@ -257,6 +295,185 @@ mod tests {
             .map(OsString::from),
         )?;
         assert_eq!(args.mcp_config.as_deref(), Some("/tmp/eko-mcp.json"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn desktop_returning_loop_settles_once_after_repeated_exit_requests() -> anyhow::Result<()>
+    {
+        let cancel = CancellationToken::new();
+        let mut owner = ApplicationLifecycleOwner::new(cancel.clone());
+        let exit_requests = Arc::new(AtomicUsize::new(0));
+        let begins = Arc::new(AtomicUsize::new(0));
+        let joins = Arc::new(AtomicUsize::new(0));
+        let begin_count = begins.clone();
+        let join_count = joins.clone();
+        owner.track_external_owner(
+            "desktop test service",
+            move || {
+                begin_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            async move {
+                join_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        let requested = exit_requests.clone();
+
+        run_desktop_with_settlement(
+            move || {
+                // Model several requests observed by a returning event loop.
+                // Its one return, rather than each request, triggers settlement.
+                for _ in 0..3 {
+                    requested.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(0)
+            },
+            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+        )
+        .await?;
+
+        assert_eq!(exit_requests.load(Ordering::SeqCst), 3);
+        assert_eq!(begins.load(Ordering::SeqCst), 1);
+        assert_eq!(joins.load(Ordering::SeqCst), 1);
+        assert!(cancel.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn desktop_exit_waits_for_cancelled_service_to_finish() -> anyhow::Result<()> {
+        let mut owner = ApplicationLifecycleOwner::new(CancellationToken::new());
+        let bridges = Arc::new(crate::tauri::state::TauriBridgeSupervisor::new());
+        let reservation = bridges.reserve()?;
+        let cancel = bridges.cancellation_token();
+        let (cancel_seen_tx, cancel_seen_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let joined = Arc::new(AtomicUsize::new(0));
+        let joined_count = joined.clone();
+        reservation.track(tokio::spawn(async move {
+            cancel.cancelled().await;
+            let _ = cancel_seen_tx.send(());
+            let _ = release_rx.await;
+            joined_count.fetch_add(1, Ordering::SeqCst);
+        }));
+        let bridge_begin = bridges.clone();
+        owner.track_external_owner(
+            "Tauri event bridges",
+            move || {
+                bridge_begin.begin_shutdown();
+                Ok(())
+            },
+            async move { bridges.join().await },
+        );
+        let exit = tokio::spawn(run_desktop_with_settlement(
+            || Ok(0),
+            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+        ));
+
+        timeout(TEST_TIMEOUT, cancel_seen_rx).await??;
+        let still_waiting = !exit.is_finished();
+        release_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("desktop service ended before release"))?;
+        timeout(TEST_TIMEOUT, exit).await???;
+
+        assert!(still_waiting);
+        assert_eq!(joined.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn desktop_builder_failure_still_cancels_and_joins_services() -> anyhow::Result<()> {
+        let cancel = CancellationToken::new();
+        let mut owner = ApplicationLifecycleOwner::new(cancel.clone());
+        let joins = Arc::new(AtomicUsize::new(0));
+        let joined_count = joins.clone();
+        owner.track_external_owner("desktop service", || Ok(()), async move {
+            joined_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let error = run_desktop_with_settlement(
+            || Err(anyhow::anyhow!("desktop builder failed")),
+            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("desktop builder failure was reported as success"))?;
+        let error = error
+            .downcast_ref::<ApplicationLifecycleError>()
+            .ok_or_else(|| anyhow::anyhow!("desktop error lost its lifecycle receipt"))?;
+
+        assert!(cancel.is_cancelled());
+        assert_eq!(joins.load(Ordering::SeqCst), 1);
+        assert!(error.receipt.failures.is_empty());
+        assert!(
+            error
+                .receipt
+                .primary_error
+                .as_deref()
+                .is_some_and(|message| message.contains("desktop builder failed"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn desktop_cleanup_failure_is_reported_after_later_services_join() -> anyhow::Result<()> {
+        let mut owner = ApplicationLifecycleOwner::new(CancellationToken::new());
+        owner.track_external_owner(
+            "failed desktop service",
+            || Err("desktop admission failed".to_string()),
+            async { Err("desktop join failed".to_string()) },
+        );
+        let joins = Arc::new(AtomicUsize::new(0));
+        let joined_count = joins.clone();
+        owner.track_external_owner("later desktop service", || Ok(()), async move {
+            joined_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let error = run_desktop_with_settlement(
+            || Ok(0),
+            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("desktop cleanup failure was reported as success"))?;
+        let error = error
+            .downcast_ref::<ApplicationLifecycleError>()
+            .ok_or_else(|| anyhow::anyhow!("desktop error lost its lifecycle receipt"))?;
+
+        assert_eq!(joins.load(Ordering::SeqCst), 1);
+        assert!(error.receipt.primary_error.is_none());
+        assert_eq!(error.receipt.failures.len(), 2);
+        assert!(error.receipt.failures.iter().all(|failure| {
+            failure.owner == "failed desktop service" && failure.error.contains("desktop")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn desktop_nonzero_exit_is_not_reported_as_success() -> anyhow::Result<()> {
+        let cancel = CancellationToken::new();
+        let owner = ApplicationLifecycleOwner::new(cancel.clone());
+        let error = run_desktop_with_settlement(
+            || Ok(17),
+            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("nonzero desktop exit was reported as success"))?;
+        let error = error
+            .downcast_ref::<ApplicationLifecycleError>()
+            .ok_or_else(|| anyhow::anyhow!("desktop error lost its lifecycle receipt"))?;
+
+        assert!(cancel.is_cancelled());
+        assert!(error.receipt.failures.is_empty());
+        assert_eq!(
+            error.receipt.primary_error.as_deref(),
+            Some("Tauri application exited with status 17")
+        );
         Ok(())
     }
 }

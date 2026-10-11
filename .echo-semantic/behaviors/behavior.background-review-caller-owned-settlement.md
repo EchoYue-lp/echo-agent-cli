@@ -11,8 +11,8 @@ boundary: boundary.eko-framework-consumer-settlement
 observed_at: 6b162b6ab2aa13c8262fd6424ff089a692df70b5
 code_refs: [echo-agent-app-core/src/evolution/background_review_owner.rs, echo-agent-app-core/src/evolution/review_integration.rs, echo-agent-app-core/src/runtime.rs, echo-agent-app-core/src/workspace/runtime.rs, src/tauri/commands/panels.rs, src/cli/cmd_impls/evolution.rs, src/tui/events.rs]
 rule_refs: [rule.eko-framework-consumer-authorities]
-evidence_refs: [evidence.latest-framework-consumer-integration]
-finding_refs: []
+evidence_refs: [evidence.latest-framework-consumer-integration, evidence.background-review-entry-repair, evidence.background-review-entry-verification]
+finding_refs: [finding.background-review-entry-settlement]
 ---
 
 # Caller-owned Background Review settlement
@@ -20,6 +20,10 @@ finding_refs: []
 ## 重要承诺
 
 EKO 在框架惰性 Review 首次 poll 前持久准入，持有 generation 直到 outcome、Inbox 和 terminal 结算；调用方退出、应用关闭和进程恢复不能让已写入 Memory 完全无人观察。
+
+2026-10-11 的入口复核重新打开 framework Issue #38：正常桌面退出和
+workspace cwd 的 bootstrap 恢复仍存在缺口，当前修复及最终门禁见
+finding.background-review-entry-settlement。历史已交付证据不替代本次验收。
 
 ## 当前行为
 
