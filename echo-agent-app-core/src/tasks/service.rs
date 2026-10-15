@@ -82,6 +82,15 @@ impl TaskAgentLease {
 }
 
 impl super::task_runtime::store::RunDriverExecutionReceipt for TaskAgentLease {
+    fn observe_unsettled(&self, run_id: &str, execution_id: Option<&str>) {
+        if let Some(receipt) = self.pool_receipt.as_ref() {
+            super::task_runtime::store::RunDriverExecutionReceipt::observe_unsettled(
+                receipt,
+                run_id,
+                execution_id,
+            );
+        }
+    }
     fn release(mut self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
         Box::pin(async move {
             if let Some(receipt) = self.pool_receipt.take() {
@@ -264,7 +273,7 @@ impl BackgroundTaskService {
             .lease_active_workspace_generation()?;
         let registration = self
             .task_runtime_store
-            .register_run_driver::<()>(admission, generation_lease)?;
+            .register_observed_run_driver::<()>(admission, generation_lease)?;
         let conversation_id = format!("background:{}:{}", request.source, uuid::Uuid::new_v4());
         let goal = if request.description.trim().is_empty() {
             request.prompt
@@ -348,7 +357,7 @@ impl BackgroundTaskService {
             .lease_active_workspace_generation()?;
         let registration = self
             .task_runtime_store
-            .register_run_driver::<()>(admission, generation_lease)?;
+            .register_observed_run_driver::<()>(admission, generation_lease)?;
         let conversation_id = format!("background:{source_id}:{}", uuid::Uuid::new_v4());
         let goal = if description.trim().is_empty() {
             "composite"
@@ -418,7 +427,10 @@ impl BackgroundTaskService {
         &self,
         run_id: String,
         prompt: String,
-        registration: super::task_runtime::store::RegisteredRunDriver<()>,
+        registration: super::task_runtime::store::RegisteredRunDriver<
+            (),
+            super::task_runtime::store::RunDriverFailure,
+        >,
         cancel: echo_agent::agent::CancellationToken,
     ) -> anyhow::Result<()> {
         let store = self.task_runtime_store.clone();
@@ -471,7 +483,7 @@ impl BackgroundTaskService {
             .lease_active_workspace_generation()?;
         let registration = self
             .task_runtime_store
-            .register_run_driver::<()>(admission, generation_lease)?;
+            .register_observed_run_driver::<()>(admission, generation_lease)?;
         let run_id = id.to_string();
         let store = self.task_runtime_store.clone();
         let agent_provider = self.agent_provider.clone();
@@ -695,7 +707,7 @@ impl BackgroundTaskService {
                 .lease_active_workspace_generation()?;
             let mut registration = self
                 .task_runtime_store
-                .register_run_driver::<()>(admission, generation_lease)?;
+                .register_observed_run_driver::<()>(admission, generation_lease)?;
             let prompt = metadata.prompt.unwrap_or(run.goal);
             registration.mark_preparation_started();
             if run.status == TaskRunStatus::Paused {
@@ -808,7 +820,7 @@ async fn drive_background_run(
     prompt: String,
     cancel: CancellationToken,
     mut receipt_owner: super::task_runtime::store::RunDriverReceiptOwner,
-) -> Result<(), String> {
+) -> Result<(), super::task_runtime::store::RunDriverFailure> {
     let blocking = TaskRuntimeOperation::new(store.clone());
     if cancel.is_cancelled() {
         let failure_run_id = run_id.clone();
@@ -849,7 +861,7 @@ async fn drive_background_run(
                     })
                     .await
                     .map_err(|settlement| settlement.to_string())?;
-                return Err(message);
+                return Err(message.into());
             }
         }
     };
@@ -872,7 +884,7 @@ async fn drive_background_run(
             })
             .await
             .map_err(|settlement| settlement.to_string())?;
-        return Err(message);
+        return Err(message.into());
     }
     let memory_generation = review_integration
         .as_ref()
@@ -880,7 +892,7 @@ async fn drive_background_run(
         .transpose()
         .map_err(|error| format!("memory generation unavailable: {error}"))?;
     if let Some(generation) = memory_generation.as_ref() {
-        receipt_owner.retain(generation.clone());
+        receipt_owner.retain(generation.clone())?;
     }
     let layer_manager = memory_generation
         .as_ref()
@@ -901,11 +913,11 @@ async fn drive_background_run(
                 })
                 .await
                 .map_err(|settlement| settlement.to_string())?;
-            return Err(message);
+            return Err(message.into());
         }
     };
     let agent = lease.agent();
-    receipt_owner.retain(lease);
+    receipt_owner.retain(lease)?;
     if let Some(manager) = layer_manager.as_ref() {
         let manager = manager.clone();
         agent
@@ -952,6 +964,14 @@ async fn drive_background_run(
         .await
     };
     if let Err(error) = result {
+        if matches!(
+            &error,
+            super::task_runtime::executor::ExecError::Framework(
+                echo_agent::error::ReactError::ExecutionNotSettled { .. }
+            )
+        ) {
+            return Err(error.into());
+        }
         let message = error.to_string();
         let failure_run_id = run_id.clone();
         let failure_store = store;
@@ -963,7 +983,7 @@ async fn drive_background_run(
             })
             .await
             .map_err(|settlement| settlement.to_string())?;
-        return Err(message);
+        return Err(message.into());
     }
     Ok(())
 }

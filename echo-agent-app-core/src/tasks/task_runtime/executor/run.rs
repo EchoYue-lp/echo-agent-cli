@@ -325,6 +325,14 @@ pub async fn execute_run(
                 "paused",
             );
         }
+        Err(e)
+            if matches!(
+                e,
+                ExecError::Framework(echo_agent::error::ReactError::ExecutionNotSettled { .. })
+            ) =>
+        {
+            // Observation is not a run resolution or a retry instruction.
+        }
         Err(e) => {
             emit_exec(
                 trace_sink.as_ref(),

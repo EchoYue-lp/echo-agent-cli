@@ -4,49 +4,160 @@ id: map.eko-framework-consumer-settlement
 kind: capability_map
 title: EKO framework consumer settlement
 risk: high
-observed_at: source:2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3
-boundary_refs: [boundary.eko-framework-consumer-settlement]
-behavior_refs: [behavior.background-review-caller-owned-settlement]
-rule_refs: [rule.eko-framework-consumer-authorities]
-evidence_refs: [evidence.latest-framework-consumer-integration, evidence.background-review-entry-repair, evidence.background-review-entry-verification]
-finding_refs: [finding.background-review-entry-settlement]
-audit_refs: [audit.background-review-entry-independent-rereview]
-related_map_refs: [map.eko-conversation-collaboration]
+observed_at: source:215699889c9c12b8702566e900205bc6e2f73d00e83993834c0688cafa6e7464
+boundary_refs:
+- boundary.eko-framework-consumer-settlement
+behavior_refs:
+- behavior.background-review-caller-owned-settlement
+- behavior.shared-turn-observation-retains-owner
+- behavior.task-unknown-owner-admission-fence
+- behavior.analysis-original-owner-settlement-retry
+rule_refs:
+- rule.eko-framework-consumer-authorities
+evidence_refs:
+- evidence.latest-framework-consumer-integration
+- evidence.background-review-entry-repair
+- evidence.background-review-entry-verification
+- evidence.cancellation-observation-consumer
+finding_refs:
+- finding.background-review-entry-settlement
+audit_refs:
+- audit.background-review-entry-independent-rereview
+- audit.cancellation-observation-time-lifecycle
+- audit.cancellation-observation-data-durability
+- audit.cancellation-observation-failure-concurrency
+related_map_refs:
+- map.eko-conversation-collaboration
 scenarios:
   independent-linux-validation-budgets:
     status: mapped
-    source_refs: [.github/workflows/rust-ci.yml]
-    evidence_refs: [evidence.linux-validation-budgets]
+    source_refs:
+    - .github/workflows/rust-ci.yml
+    evidence_refs:
+    - evidence.linux-validation-budgets
   compression-product-policy:
     status: mapped
-    source_refs: [echo-agent-app-core/src/config.rs, echo-agent-app-core/src/manual_compression.rs, echo-agent-app-core/src/tasks/task_runtime/compact_context.rs, src/cli/cmd_impls/context.rs, src/cli/channels.rs, src/tui/commands.rs, src/tui/events.rs, src/tauri/commands/panels.rs, web-frontend/src/api/endpoints.ts, web-frontend/src/types/api.ts, web-frontend/src/components/compress/CompressPanel.tsx]
-    rule_refs: [rule.eko-framework-consumer-authorities]
-    evidence_refs: [evidence.compression-product-policy]
+    source_refs:
+    - echo-agent-app-core/src/config.rs
+    - echo-agent-app-core/src/manual_compression.rs
+    - echo-agent-app-core/src/tasks/task_runtime/compact_context.rs
+    - src/cli/cmd_impls/context.rs
+    - src/cli/channels.rs
+    - src/tui/commands.rs
+    - src/tui/events.rs
+    - src/tauri/commands/panels.rs
+    - web-frontend/src/api/endpoints.ts
+    - web-frontend/src/types/api.ts
+    - web-frontend/src/components/compress/CompressPanel.tsx
+    rule_refs:
+    - rule.eko-framework-consumer-authorities
+    evidence_refs:
+    - evidence.compression-product-policy
   background-review-admission-and-recovery:
     status: mapped
-    source_refs: [echo-agent-app-core/src/evolution/background_review_owner.rs, echo-agent-app-core/src/evolution/review_integration.rs, echo-agent-app-core/src/runtime.rs, echo-agent-app-core/src/workspace/runtime.rs]
-    rule_refs: [rule.eko-framework-consumer-authorities]
-    evidence_refs: [evidence.latest-framework-consumer-integration, evidence.background-review-entry-repair, evidence.background-review-entry-verification]
+    source_refs:
+    - echo-agent-app-core/src/evolution/background_review_owner.rs
+    - echo-agent-app-core/src/evolution/review_integration.rs
+    - echo-agent-app-core/src/runtime.rs
+    - echo-agent-app-core/src/workspace/runtime.rs
+    rule_refs:
+    - rule.eko-framework-consumer-authorities
+    evidence_refs:
+    - evidence.latest-framework-consumer-integration
+    - evidence.background-review-entry-repair
+    - evidence.background-review-entry-verification
   review-surface-result:
     status: mapped
-    source_refs: [src/tauri/commands/panels.rs, src/cli/cmd_impls/evolution.rs, src/tui/events.rs, web-frontend/src/api/endpoints.ts, web-frontend/src/components/evolution/EvolutionPanel.tsx]
-    rule_refs: [rule.eko-framework-consumer-authorities]
-    evidence_refs: [evidence.latest-framework-consumer-integration]
+    source_refs:
+    - src/tauri/commands/panels.rs
+    - src/cli/cmd_impls/evolution.rs
+    - src/tui/events.rs
+    - web-frontend/src/api/endpoints.ts
+    - web-frontend/src/components/evolution/EvolutionPanel.tsx
+    rule_refs:
+    - rule.eko-framework-consumer-authorities
+    evidence_refs:
+    - evidence.latest-framework-consumer-integration
   skill-and-plugin-lifecycle:
     status: mapped
-    source_refs: [echo-agent-app-core/src/evolution/review_integration.rs, echo-agent-app-core/src/extension_control/policy.rs, echo-agent-app-core/src/plugin_runtime/runtime.rs, echo-agent-app-core/src/agent_pool/generation.rs]
-    rule_refs: [rule.eko-framework-consumer-authorities]
-    evidence_refs: [evidence.latest-framework-consumer-integration]
+    source_refs:
+    - echo-agent-app-core/src/evolution/review_integration.rs
+    - echo-agent-app-core/src/extension_control/policy.rs
+    - echo-agent-app-core/src/plugin_runtime/runtime.rs
+    - echo-agent-app-core/src/agent_pool/generation.rs
+    rule_refs:
+    - rule.eko-framework-consumer-authorities
+    evidence_refs:
+    - evidence.latest-framework-consumer-integration
   managed-conversation-and-workspace-retirement:
     status: mapped
-    source_refs: [echo-agent-app-core/src/conversation_archive.rs, echo-agent-app-core/src/conversation_deletion.rs, echo-agent-app-core/src/managed_conversation.rs, echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/state/workspace.rs, echo-agent-app-core/src/workspace/runtime.rs, echo-agent-app-core/src/tasks/task_runtime/task_execute_tool.rs, src/cli/channels.rs]
-    rule_refs: [rule.eko-framework-consumer-authorities]
-    evidence_refs: [evidence.latest-framework-consumer-integration]
+    source_refs:
+    - echo-agent-app-core/src/conversation_archive.rs
+    - echo-agent-app-core/src/conversation_deletion.rs
+    - echo-agent-app-core/src/managed_conversation.rs
+    - echo-agent-app-core/src/state/app_state.rs
+    - echo-agent-app-core/src/state/workspace.rs
+    - echo-agent-app-core/src/workspace/runtime.rs
+    - echo-agent-app-core/src/tasks/task_runtime/task_execute_tool.rs
+    - src/cli/channels.rs
+    rule_refs:
+    - rule.eko-framework-consumer-authorities
+    evidence_refs:
+    - evidence.latest-framework-consumer-integration
   scheduler-and-task-claim-adaptation:
     status: mapped
-    source_refs: [echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/tasks/task_runtime/executor/dispatch.rs, echo-agent-app-core/src/tasks/task_runtime/run_authority.rs]
-    rule_refs: [rule.eko-framework-consumer-authorities]
-    evidence_refs: [evidence.latest-framework-consumer-integration]
+    source_refs:
+    - echo-agent-app-core/src/state/app_state.rs
+    - echo-agent-app-core/src/tasks/task_runtime/executor/dispatch.rs
+    - echo-agent-app-core/src/tasks/task_runtime/run_authority.rs
+    rule_refs:
+    - rule.eko-framework-consumer-authorities
+    evidence_refs:
+    - evidence.latest-framework-consumer-integration
+  shared-turn-observation-retains-owner:
+    status: needs_review
+    source_refs:
+    - echo-agent-app-core/src/chat_driver.rs
+    - echo-agent-app-core/src/foreground_turn.rs
+    - echo-agent-app-core/src/conversation_input.rs
+    - echo-agent-app-core/src/tasks/task_runtime/continuation.rs
+    behavior_refs:
+    - behavior.shared-turn-observation-retains-owner
+    rule_refs:
+    - rule.eko-framework-consumer-authorities
+    evidence_refs:
+    - evidence.cancellation-observation-consumer
+    unknown: 当前具名aggregate与cron typed-roundtrip各1pass、编译零warning；其余strong例、TUI/GUI条件与最终F消费者未验，上游scheduler occurrence观察结算未闭。
+    next_step: 先闭直接caller typed保留与上游scheduler观察结算缺口；Root租约重跑零警告focused及相关strong例，随后正式语义/消费者门禁。
+  task-unknown-owner-admission-fence:
+    status: needs_review
+    source_refs:
+    - echo-agent-app-core/src/tasks/task_runtime/store/runtime.rs
+    - echo-agent-app-core/src/tasks/task_runtime/store/workspace.rs
+    - echo-agent-app-core/src/tasks/task_runtime/event_rebuild.rs
+    - echo-agent-app-core/src/tasks/task_runtime/store/tests.rs
+    - echo-agent-app-core/src/scheduler/runner.rs
+    behavior_refs:
+    - behavior.task-unknown-owner-admission-fence
+    rule_refs:
+    - rule.eko-framework-consumer-authorities
+    evidence_refs:
+    - evidence.cancellation-observation-consumer
+    unknown: 当前具名aggregate与cron typed-roundtrip各1pass、编译零warning；其余strong例、TUI/GUI条件与最终F消费者未验，上游scheduler occurrence观察结算未闭。
+    next_step: 先闭直接caller typed保留与上游scheduler观察结算缺口；Root租约重跑零警告focused及相关strong例，随后正式语义/消费者门禁。
+  analysis-original-owner-settlement-retry:
+    status: needs_review
+    source_refs:
+    - echo-agent-app-core/src/analysis.rs
+    - echo-agent-app-core/src/product_data_io.rs
+    behavior_refs:
+    - behavior.analysis-original-owner-settlement-retry
+    rule_refs:
+    - rule.eko-framework-consumer-authorities
+    evidence_refs:
+    - evidence.cancellation-observation-consumer
+    unknown: 当前具名aggregate与cron typed-roundtrip各1pass、编译零warning；其余strong例、TUI/GUI条件与最终F消费者未验，上游scheduler occurrence观察结算未闭。
+    next_step: 先闭直接caller typed保留与上游scheduler观察结算缺口；Root租约重跑零警告focused及相关strong例，随后正式语义/消费者门禁。
 ---
 
 # EKO framework consumer settlement
@@ -90,3 +201,7 @@ GUI Review 显示 `persisted` 的 true/false/unknown 状态并返回 operation I
 ## 未展开项
 
 框架 API 新增、生产安装验证、真实 Tauri 窗口视觉验收和 Issue #38 远端关闭不由本地图的源码快照单独证明。
+
+## B 消费增量当前性
+
+仅新增三个needs_review场景；旧独立处置不改。当前dirty源身份不证明行为验收，既有Background Review证据不自动关闭新B义务。

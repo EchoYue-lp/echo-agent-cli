@@ -13,6 +13,8 @@
 //! old `(&str, Option<&Message>)` pair has been replaced by the single
 //! `PreparedUserTurn`.
 
+pub use crate::tasks::task_runtime::store::RunDriverFailure as ChatTurnError;
+
 use echo_agent::agent::{Agent, AgentEvent, AgentHandle, EventEnvelope, EventIdentity};
 use echo_agent::prelude::Message;
 use echo_agent::runtime::{
@@ -333,7 +335,7 @@ pub async fn drive_chat(
     agent: &AgentHandle,
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
-) -> Result<TurnOutcome, String> {
+) -> Result<TurnOutcome, ChatTurnError> {
     drive_chat_turn(agent, turn, res, None)
         .await
         .map(|receipt| receipt.outcome)
@@ -349,7 +351,7 @@ pub async fn drive_chat_turn(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: Option<RunTurnBinding>,
-) -> Result<TurnReceipt, String> {
+) -> Result<TurnReceipt, ChatTurnError> {
     drive_chat_turn_with_input_observer(agent, turn, res, binding, None).await
 }
 
@@ -359,11 +361,11 @@ pub async fn drive_chat_turn_with_input_observer(
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: Option<RunTurnBinding>,
     input_observer: Option<InputReceiptObserver>,
-) -> Result<TurnReceipt, String> {
+) -> Result<TurnReceipt, ChatTurnError> {
     match drive_chat_turn_dispatch(agent, turn, res, binding, input_observer).await? {
         RunTurnDriveOutcome::Driven(receipt) => Ok(*receipt),
         RunTurnDriveOutcome::Deferred => {
-            Err("RunTurn continuation deferred before model execution".to_string())
+            Err("RunTurn continuation deferred before model execution".into())
         }
     }
 }
@@ -373,7 +375,7 @@ pub(crate) async fn drive_chat_continuation_turn(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: RunTurnBinding,
-) -> Result<RunTurnDriveOutcome, String> {
+) -> Result<RunTurnDriveOutcome, ChatTurnError> {
     drive_chat_turn_dispatch(agent, turn, res, Some(binding), None).await
 }
 
@@ -383,7 +385,7 @@ async fn drive_chat_turn_dispatch(
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: Option<RunTurnBinding>,
     input_observer: Option<InputReceiptObserver>,
-) -> Result<RunTurnDriveOutcome, String> {
+) -> Result<RunTurnDriveOutcome, ChatTurnError> {
     wait_for_previous_continuation_driver(&res, binding.as_ref()).await?;
     match prepare_chat_execution(turn, res, binding).await? {
         ChatExecutionPreparation::Ready(prepared) => {
@@ -407,7 +409,7 @@ pub async fn drive_pooled_chat<Configure, ConfigureFuture>(
     configure: Configure,
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
-) -> Result<TurnOutcome, String>
+) -> Result<TurnOutcome, ChatTurnError>
 where
     Configure: FnOnce(AgentHandle) -> ConfigureFuture,
     ConfigureFuture: std::future::Future<Output = Result<(), String>>,
@@ -427,7 +429,7 @@ pub(crate) async fn drive_pooled_chat_turn<Configure, ConfigureFuture>(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: impl Into<Option<RunTurnBinding>>,
-) -> Result<TurnReceipt, String>
+) -> Result<TurnReceipt, ChatTurnError>
 where
     Configure: FnOnce(AgentHandle) -> ConfigureFuture,
     ConfigureFuture: std::future::Future<Output = Result<(), String>>,
@@ -437,7 +439,7 @@ where
     {
         RunTurnDriveOutcome::Driven(receipt) => Ok(*receipt),
         RunTurnDriveOutcome::Deferred => {
-            Err("RunTurn continuation deferred before model execution".to_string())
+            Err("RunTurn continuation deferred before model execution".into())
         }
     }
 }
@@ -449,7 +451,7 @@ pub(crate) async fn drive_pooled_chat_continuation_turn<Configure, ConfigureFutu
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: RunTurnBinding,
-) -> Result<RunTurnDriveOutcome, String>
+) -> Result<RunTurnDriveOutcome, ChatTurnError>
 where
     Configure: FnOnce(AgentHandle) -> ConfigureFuture,
     ConfigureFuture: std::future::Future<Output = Result<(), String>>,
@@ -464,7 +466,7 @@ async fn drive_pooled_chat_turn_dispatch<Configure, ConfigureFuture>(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: Option<RunTurnBinding>,
-) -> Result<RunTurnDriveOutcome, String>
+) -> Result<RunTurnDriveOutcome, ChatTurnError>
 where
     Configure: FnOnce(AgentHandle) -> ConfigureFuture,
     ConfigureFuture: std::future::Future<Output = Result<(), String>>,
@@ -484,7 +486,7 @@ where
             prepared
                 .reject_before_driver_start("continuation cancelled during pool admission")
                 .await?;
-            return Err("continuation cancelled during pool admission".to_string());
+            return Err("continuation cancelled during pool admission".into());
         }
         result = pool.acquire(pool_key) => result,
     } {
@@ -492,7 +494,7 @@ where
         Err(error) => {
             let message = format!("AgentPool admission failed: {error}");
             prepared.reject_before_driver_start(&message).await?;
-            return Err(message);
+            return Err(message.into());
         }
     };
     let agent = execution.agent();
@@ -503,13 +505,13 @@ where
             prepared
                 .reject_before_driver_start("continuation cancelled during agent configuration")
                 .await?;
-            return Err("continuation cancelled during agent configuration".to_string());
+            return Err("continuation cancelled during agent configuration".into());
         }
         result = configure(agent.clone()) => result,
     };
     if let Err(error) = configuration {
         prepared.reject_before_driver_start(&error).await?;
-        return Err(error);
+        return Err(error.into());
     }
     drive_prepared_chat(agent, turn, *prepared, Some(execution), None)
         .await
@@ -554,7 +556,7 @@ struct PreparedChatExecution {
     formal_run_id: String,
     binding: RunTurnBinding,
     task_driver_registration:
-        Option<crate::tasks::task_runtime::store::RegisteredRunDriver<TurnReceipt>>,
+        Option<crate::tasks::task_runtime::store::RegisteredRunDriver<TurnReceipt, ChatTurnError>>,
     resources: std::sync::Arc<crate::chat_resources::ChatResources>,
     cancel: echo_agent::agent::CancellationToken,
     sink: std::sync::Arc<dyn ChatSink>,
@@ -689,7 +691,7 @@ async fn prepare_chat_execution(
                 .lease_active_workspace_generation()
                 .map_err(|error| format!("task runtime generation admission failed: {error}"))?;
             let registration = store
-                .register_run_driver::<TurnReceipt>(admission, generation)
+                .register_observed_run_driver::<TurnReceipt>(admission, generation)
                 .map_err(|error| format!("chat driver registration failed: {error}"))?;
             Some(registration)
         }
@@ -882,7 +884,7 @@ async fn drive_prepared_chat(
     mut prepared: PreparedChatExecution,
     pool_execution: Option<crate::agent_pool::AgentPoolExecutionLease>,
     input_observer: Option<InputReceiptObserver>,
-) -> Result<TurnReceipt, String> {
+) -> Result<TurnReceipt, ChatTurnError> {
     let continuation_dispatch_owned = prepared.binding.transcript_visibility
         == TurnVisibility::Internal
         && matches!(
@@ -930,10 +932,10 @@ async fn drive_prepared_chat(
         let waiter = registration.start(move |mut receipt_owner| async move {
             let driver_execution_context = receipt_owner.execution_context_id();
             if let Some(generation) = owned_resources.memory_generation.as_ref() {
-                receipt_owner.retain(generation.clone());
+                receipt_owner.retain(generation.clone())?;
             }
             if let Some(execution) = pool_execution {
-                receipt_owner.retain(execution);
+                receipt_owner.retain(execution)?;
             }
             let _projection_registration =
                 crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
@@ -983,6 +985,13 @@ async fn drive_prepared_chat(
         )
         .await
     };
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(ChatTurnError::is_observation)
+    {
+        return result;
+    }
     if prepared.drives_task_run
         && !continuation_dispatch_owned
         && let Some(store) = prepared.store.as_ref()
@@ -1035,7 +1044,8 @@ async fn drive_prepared_chat(
                     return Err(format!(
                         "foreground TaskRun {} lost its continuation launcher",
                         prepared.formal_run_id
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -1072,7 +1082,7 @@ struct RegisteredTurnDriver {
     input_observer: Option<InputReceiptObserver>,
 }
 
-async fn drive_registered_turn(driver: RegisteredTurnDriver) -> Result<TurnReceipt, String> {
+async fn drive_registered_turn(driver: RegisteredTurnDriver) -> Result<TurnReceipt, ChatTurnError> {
     if let Some(progress) = driver.foreground_progress.as_ref() {
         progress.bind_run_turn(&driver.run_id, &driver.binding.turn_id);
     }
@@ -1102,9 +1112,12 @@ async fn drive_registered_turn(driver: RegisteredTurnDriver) -> Result<TurnRecei
     let outcome = match result.as_ref() {
         Ok(outcome) => outcome,
         Err(error) => {
+            if error.is_observation() {
+                return result;
+            }
             fallback = TurnReceipt::failed(
                 driver.binding.turn_id,
-                echo_agent::error::AgentFailure::message("chat_driver", error.clone()),
+                echo_agent::error::AgentFailure::message("chat_driver", error.to_string()),
             )
             .map_err(|failure| failure.to_string())?;
             &fallback
@@ -1378,7 +1391,7 @@ impl EkoTurnEventSink {
         &self,
         receipt: TurnReceipt,
         framework_terminal: TurnOutcome,
-    ) -> Result<TurnReceipt, String> {
+    ) -> Result<TurnReceipt, ChatTurnError> {
         let mut state = self
             .state
             .lock()
@@ -1575,7 +1588,7 @@ async fn drive_chat_inner(
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     scope: ChatTurnModelScope,
     input_observer: Option<InputReceiptObserver>,
-) -> Result<TurnReceipt, String> {
+) -> Result<TurnReceipt, ChatTurnError> {
     let ChatTurnModelScope {
         turn_id,
         bound_run_id,
@@ -1698,6 +1711,7 @@ async fn drive_chat_inner(
                 Ok(()),
             )
         };
+        let receipt = receipt.map_err(ChatTurnError::from)?;
         let effective_terminal =
             effective_terminal_after_input_observer(receipt.outcome.clone(), observer_result);
         eko_sink.finish(receipt, effective_terminal)
@@ -1931,7 +1945,8 @@ mod tests {
             None,
             Some(input_observer),
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         Ok((outcome, chat_sink))
     }
 
@@ -2090,7 +2105,8 @@ mod tests {
             },
             None,
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         let TurnOutcome::Failed(failure) = &outcome.outcome else {
             return Err(format!("expected typed setup failure, got {outcome:?}"));
         };
@@ -2400,7 +2416,9 @@ mod tests {
         receipt.completion_tokens = 7;
         receipt.llm_calls = 1;
         receipt.compaction_count = 1;
-        let outcome = adapter.finish(receipt, TurnOutcome::Completed)?;
+        let outcome = adapter
+            .finish(receipt, TurnOutcome::Completed)
+            .map_err(|error| error.to_string())?;
         assert_eq!(outcome.outcome, TurnOutcome::Completed);
         assert_eq!(outcome.prompt_tokens, 11);
         assert_eq!(outcome.completion_tokens, 7);
@@ -2456,7 +2474,9 @@ mod tests {
         assert!(error.to_string().contains("downstream_disconnect"));
 
         let receipt = test_turn_receipt("rejected-turn", TurnOutcome::Cancelled)?;
-        let outcome = adapter.finish(receipt, TurnOutcome::Cancelled)?;
+        let outcome = adapter
+            .finish(receipt, TurnOutcome::Cancelled)
+            .map_err(|error| error.to_string())?;
         assert!(matches!(
             outcome.outcome,
             TurnOutcome::Failed(ref failure) if failure.code == "downstream_disconnect"
@@ -2554,7 +2574,9 @@ mod tests {
         };
         assert!(error.to_string().contains("sink_projector_closed"));
         let receipt = test_turn_receipt("closed-projector-turn", TurnOutcome::Cancelled)?;
-        let outcome = adapter.finish(receipt, TurnOutcome::Cancelled)?;
+        let outcome = adapter
+            .finish(receipt, TurnOutcome::Cancelled)
+            .map_err(|error| error.to_string())?;
         assert!(matches!(
             outcome.outcome,
             TurnOutcome::Failed(ref failure) if failure.code == "sink_projector_closed"
@@ -2729,7 +2751,7 @@ mod tests {
             Ok(outcome) => return Err(format!("closed TaskRuntime admitted {outcome:?}")),
             Err(error) => error,
         };
-        assert!(error.contains("admission"));
+        assert!(error.to_string().contains("admission"));
         assert!(!configured.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(pool.pool_size().await, 0);
         Ok(())
@@ -3090,7 +3112,8 @@ mod tests {
         );
         winner
             .await
-            .map_err(|error| format!("winner task failed: {error}"))??;
+            .map_err(|error| format!("winner task failed: {error}"))?
+            .map_err(|error| error.to_string())?;
         // ADR 0037: a completed turn on a run that never committed a plan
         // settles as Completed at turn end (previously it spun continuation
         // turns until RepeatedBlocker paused the run).
@@ -3195,7 +3218,8 @@ mod tests {
                 expected_resume: None,
             },
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         assert!(matches!(outcome, RunTurnDriveOutcome::Deferred));
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -3360,7 +3384,8 @@ mod tests {
                 "resume-turn",
             )),
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
 
         let run = wait_for_run_status(
             &store,
@@ -3435,7 +3460,8 @@ mod tests {
                 human_loop_provider: None,
             }),
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         let unchanged_starts = store
             .list_events("existing-goal", 0)
             .map_err(|error| error.to_string())?
@@ -3660,7 +3686,9 @@ mod tests {
             memory_generation: None,
             human_loop_provider: None,
         });
-        let outcome = drive_chat(&agent, &make_turn("run the task graph"), resources).await?;
+        let outcome = drive_chat(&agent, &make_turn("run the task graph"), resources)
+            .await
+            .map_err(|error| error.to_string())?;
         if outcome != TurnOutcome::Completed {
             return Err(format!("task graph turn ended {outcome:?}"));
         }
@@ -3863,7 +3891,8 @@ mod tests {
         let outcome = tokio::time::timeout(TASK_EXECUTE_RECEIPT_TEST_TIMEOUT, drive)
             .await
             .map_err(|_| "pooled chat driver did not settle".to_string())?
-            .map_err(|error| error.to_string())??;
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
         assert_eq!(outcome, TurnOutcome::Completed);
         assert_eq!(store.active_run_driver_receipt_count()?, 0);
         store
@@ -3916,7 +3945,9 @@ mod tests {
             memory_generation: None,
             human_loop_provider: None,
         });
-        let outcome = drive_chat(&agent, &make_turn("hi"), res).await?;
+        let outcome = drive_chat(&agent, &make_turn("hi"), res)
+            .await
+            .map_err(|error| error.to_string())?;
         assert_eq!(outcome, TurnOutcome::Completed);
         // The agent's FinalAnswer is streamed through the sink.
         assert!(
@@ -4054,7 +4085,9 @@ mod tests {
             human_loop_provider: None,
         });
 
-        let outcome = drive_chat(&agent, &make_turn("start"), resources).await?;
+        let outcome = drive_chat(&agent, &make_turn("start"), resources)
+            .await
+            .map_err(|error| error.to_string())?;
         let TurnOutcome::Failed(failure) = outcome else {
             return Err(format!("expected failed turn, got {outcome:?}"));
         };
@@ -4169,7 +4202,9 @@ mod tests {
         // identity matches the turn-derived formal run) and drives it to a
         // successful completion; the old "abandoned Pending run fails" path no
         // longer exists because no turn executes outside the runtime.
-        let outcome = drive_chat(&agent, &make_turn("continue"), res).await?;
+        let outcome = drive_chat(&agent, &make_turn("continue"), res)
+            .await
+            .map_err(|error| error.to_string())?;
         assert_eq!(outcome, echo_agent::runtime::TurnOutcome::Completed);
         let settled_run = store
             .get_run(&run_id)
@@ -4262,7 +4297,9 @@ mod tests {
             human_loop_provider: None,
         });
         let turn = make_turn("hi there");
-        drive_chat(&agent, &turn, res).await?;
+        drive_chat(&agent, &turn, res)
+            .await
+            .map_err(|error| error.to_string())?;
         let messages = mock
             .last_messages()
             .ok_or_else(|| "LLM was not called".to_string())?;
@@ -4334,7 +4371,9 @@ mod tests {
             human_loop_provider: None,
         });
 
-        drive_chat(&agent, &make_turn("probe"), resources).await?;
+        drive_chat(&agent, &make_turn("probe"), resources)
+            .await
+            .map_err(|error| error.to_string())?;
         let actual = observed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4402,7 +4441,10 @@ mod tests {
         .await
         .err()
         .ok_or_else(|| "mismatched workspace scope was accepted".to_string())?;
-        if !error.contains("does not match TaskRuntime workspace") {
+        if !error
+            .to_string()
+            .contains("does not match TaskRuntime workspace")
+        {
             return Err(format!("unexpected scope mismatch error: {error}"));
         }
         let observer = tokio::time::timeout(std::time::Duration::from_secs(1), observer_rx)

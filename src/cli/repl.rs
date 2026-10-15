@@ -109,6 +109,14 @@ impl ActiveReplTurn {
             .as_ref()
             .map(tokio::task::JoinHandle::is_finished)
             .unwrap_or(true)
+            && self
+                .control
+                .snapshot_scoped(
+                    &self.workspace_id,
+                    echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Cli,
+                    &self.conversation_id,
+                )
+                .is_none_or(|snapshot| snapshot.root_turn_id != self.turn_id)
     }
 }
 
@@ -2825,11 +2833,12 @@ fn spawn_prepared_repl_turn(
     ));
     let (completion_tx, completion) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
+        lease.retain(scoped_runtime_guard.clone());
         let _ = live_output.print_user_message(&input.message);
         let _ = live_output.emit("Connecting to model...");
         let result = match input.task_run_resume {
             Some(resume) if resume_is_continuation => {
-                let _pool_execution = pool_execution;
+                lease.retain_execution(pool_execution);
                 echo_agent_app_core::api::foreground_turn::drive_foreground_chat_turn(
                     lease,
                     &agent_owned,
@@ -2840,26 +2849,28 @@ fn spawn_prepared_repl_turn(
                 .await
             }
             Some(resume) => {
-                let trace_sink =
-                    echo_agent_app_core::api::chat_driver::subagent_trace_sink_for(&resources.sink);
-                let launch = match resources.store.clone() {
-                    Some(store) => {
-                        echo_agent_app_core::api::tasks::task_runtime::launch_task_run_resume(
-                            store,
-                            resume,
-                            agent_owned,
-                            Some(pool_execution),
-                            scoped_runtime_guard.review_integration(),
-                            Some(trace_sink),
-                            lease.cancellation_token(),
-                            Some(scoped_runtime_guard.workspace_io_invocation()),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())
-                    }
-                    None => Err("TaskRuntime store is unavailable".to_string()),
-                };
-                let turn_outcome = match launch {
+                async {
+                    let trace_sink = echo_agent_app_core::api::chat_driver::subagent_trace_sink_for(
+                        &resources.sink,
+                    );
+                    let launch = match resources.store.clone() {
+                        Some(store) => {
+                            echo_agent_app_core::api::tasks::task_runtime::launch_task_run_resume(
+                                store,
+                                resume,
+                                agent_owned,
+                                Some(pool_execution),
+                                scoped_runtime_guard.review_integration(),
+                                Some(trace_sink),
+                                lease.cancellation_token(),
+                                Some(scoped_runtime_guard.workspace_io_invocation()),
+                            )
+                            .await
+                            .map_err(echo_agent_app_core::api::chat_driver::ChatTurnError::from)
+                        }
+                        None => Err("TaskRuntime store is unavailable".into()),
+                    };
+                    let turn_outcome = match launch {
                     Ok(launch) => match launch.wait().await {
                         Ok(
                             echo_agent_app_core::api::tasks::task_runtime::RunOutcome::Completed,
@@ -2873,18 +2884,36 @@ fn spawn_prepared_repl_turn(
                                 format!("planned resume ended with {other:?}"),
                             ),
                         ),
+                        Err(error) if error.is_observation() => {
+                            lease.retain_observation(error.clone());
+                            return Err(error);
+                        }
                         Err(error) => echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
-                            echo_agent::error::AgentFailure::message("planned_resume", error),
+                            echo_agent::error::AgentFailure::message(
+                                "planned_resume",
+                                error.to_string(),
+                            ),
                         ),
                     },
+                    Err(error) if error.is_observation() => {
+                        lease.retain_observation(error.clone());
+                        return Err(error);
+                    }
                     Err(error) => echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
-                        echo_agent::error::AgentFailure::message("planned_resume", error),
+                        echo_agent::error::AgentFailure::message(
+                            "planned_resume",
+                            error.to_string(),
+                        ),
                     ),
                 };
-                settle_repl_planned_resume(lease, turn_outcome).await
+                    settle_repl_planned_resume(lease, turn_outcome)
+                        .await
+                        .map_err(echo_agent_app_core::api::chat_driver::ChatTurnError::from)
+                }
+                .await
             }
             None => {
-                let _pool_execution = pool_execution;
+                lease.retain_execution(pool_execution);
                 match (
                     conversation_inputs.clone(),
                     conversation_input_attempt.clone(),
@@ -2956,6 +2985,12 @@ fn spawn_prepared_repl_turn(
                 }
             }
         };
+        if let Some(error) = result.as_ref().err().filter(|error| error.is_observation()) {
+            let _ = live_output.emit(error.to_string());
+            let _ = completion_tx.send(());
+            return 0;
+        }
+        let result = result.map_err(|error| error.to_string());
         if durable_input_attempt && !input_drained.load(Ordering::Acquire) {
             if let Err(error) = turn.cleanup_resources(&spill_dir) {
                 tracing::warn!(%error, "failed to clean undrained CLI initial input resources");

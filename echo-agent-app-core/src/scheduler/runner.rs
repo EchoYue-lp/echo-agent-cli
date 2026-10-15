@@ -13,7 +13,10 @@
 use crate::agent_handle::AgentHandle;
 use crate::agent_pool::AgentPool;
 use crate::tasks::task_runtime::TaskRuntimeStore;
-use crate::tasks::task_runtime::executor::{create_unattended_run, drive_existing_cron_run};
+use crate::tasks::task_runtime::executor::{
+    ExecError, create_unattended_run, drive_existing_cron_run,
+};
+use crate::tasks::task_runtime::store::RunDriverFailure;
 use echo_agent::agent::CancellationToken;
 use echo_agent::scheduler::{
     CronTask, CronTaskStore, FireFn, SchedulerRunner as FrameworkSchedulerRunner,
@@ -98,7 +101,7 @@ fn build_fire_fn_with_cancel(
                 ))
             })?;
             let mut registration = store
-                .register_run_driver::<String>(admission, generation_lease)
+                .register_observed_run_driver::<String>(admission, generation_lease)
                 .map_err(|error| {
                     echo_agent::error::ReactError::Other(format!(
                         "cron TaskRun driver registration failed: {error}"
@@ -129,7 +132,7 @@ fn build_fire_fn_with_cancel(
                     .transpose()
                     .map_err(|error| format!("cron memory generation unavailable: {error}"))?;
                 if let Some(generation) = memory_generation.as_ref() {
-                    receipt_owner.retain(generation.clone());
+                    receipt_owner.retain(generation.clone())?;
                 }
                 let layer_manager = memory_generation
                     .as_ref()
@@ -146,7 +149,7 @@ fn build_fire_fn_with_cancel(
                             .await
                             .map_err(|error| format!("cron pool acquire failed: {error}"))?;
                         let agent = acquired.agent();
-                        receipt_owner.retain(pool.retain_for_supervised_run(run_key, acquired));
+                        receipt_owner.retain(pool.retain_for_supervised_run(run_key, acquired))?;
                         register_task_execute_on_agent(&agent, owned_store.clone()).await;
                         agent
                     }
@@ -170,7 +173,7 @@ fn build_fire_fn_with_cancel(
                     owned_cancel,
                 )
                 .await
-                .map_err(|error| format!("cron run failed: {error}"));
+                .map_err(cron_execution_error);
                 let settled_run_id = result?;
                 if let Some(emitter) = webhook_emitter.as_ref() {
                     emitter.emit(crate::webhook::WebhookEvent::CronTaskCompleted {
@@ -186,13 +189,23 @@ fn build_fire_fn_with_cancel(
             });
             match waiter.await {
                 Ok(Ok(result)) => Ok(result),
-                Ok(Err(error)) => Err(echo_agent::error::ReactError::Other(error)),
+                Ok(Err(error)) => Err(error.into_react_error()),
                 Err(error) => Err(echo_agent::error::ReactError::Other(format!(
                     "cron TaskRun result waiter failed: {error}"
                 ))),
             }
         }) as futures::future::BoxFuture<'static, echo_agent::error::Result<String>>
     })
+}
+
+// Add ordinary cron context only after preserving the typed observation.
+// The existing supervisor must see unknown ownership before any failure policy.
+fn cron_execution_error(error: ExecError) -> RunDriverFailure {
+    let ordinary = format!("cron run failed: {error}");
+    match RunDriverFailure::from(error) {
+        observation @ RunDriverFailure::Observation { .. } => observation,
+        RunDriverFailure::Error(_) => RunDriverFailure::Error(ordinary),
+    }
 }
 
 /// Register `task_execute` on a cron run's pool-acquired Agent. The normal
@@ -253,6 +266,25 @@ mod tests {
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::testing::MockLlmClient;
 
+    #[test]
+    fn cron_observation_round_trip_keeps_exact_identity_and_ordinary_error_context() {
+        let original = echo_agent::error::ReactError::ExecutionNotSettled {
+            run_id: "cron-original-run".into(),
+            execution_id: Some("cron-original-execution".into()),
+        };
+        let typed = cron_execution_error(ExecError::Framework(original));
+        assert!(
+            matches!(&typed, RunDriverFailure::Observation { run_id, execution_id } if run_id == "cron-original-run" && execution_id.as_deref() == Some("cron-original-execution"))
+        );
+        assert!(
+            matches!(typed.into_react_error(), echo_agent::error::ReactError::ExecutionNotSettled { run_id, execution_id } if run_id == "cron-original-run" && execution_id.as_deref() == Some("cron-original-execution"))
+        );
+        let ordinary = cron_execution_error(ExecError::Other("provider unavailable".into()));
+        assert!(
+            matches!(ordinary.into_react_error(), echo_agent::error::ReactError::Other(message) if message == "cron run failed: provider unavailable")
+        );
+    }
+
     /// Cron 必须经 supervised TaskRuntime driver（在 store 建 run）。mock LLM
     /// 返回纯文本时，driver 的 direct 分支自动转 Completed。
     #[tokio::test]
@@ -265,6 +297,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let handle = AgentHandle::new(agent);
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         let workspace = tempfile::tempdir().map_err(|error| error.to_string())?;
         store
             .rebind_shadow_root(workspace.path().join("tasks"), "cron-workspace")
@@ -303,6 +336,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let handle = AgentHandle::new(agent);
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None, None);
 
         let task = CronTask::new("plan", "*/5 * * * *", "[plan] do the thing");
@@ -332,6 +366,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let handle = AgentHandle::new(agent);
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None, None);
 
         let task = CronTask::new("failing", "*/5 * * * *", "run this");
@@ -353,6 +388,7 @@ mod tests {
             .build()
             .map_err(|error| error.to_string())?;
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         let scheduler_cancel = CancellationToken::new();
         scheduler_cancel.cancel();
         let fire_fn = build_fire_fn_with_cancel(
@@ -384,6 +420,7 @@ mod tests {
             .build()
             .map_err(|error| error.to_string())?;
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         let (reservation_started, release_reservation) =
             store.park_next_run_driver_admission_for_test()?;
         let fire_fn = build_fire_fn(

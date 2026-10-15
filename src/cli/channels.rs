@@ -538,7 +538,7 @@ impl ChannelSessionCoordinator {
         tasks.tasks.spawn_on(
             async move {
                 let settlement = waiter.wait().await.map_err(|error| error.to_string())?;
-                let _ = terminal_tx.send(settlement.outcome);
+                let _ = terminal_tx.send(Ok(settlement.outcome));
                 let kick = match slot.kick() {
                     Ok(kick) => Some(kick),
                     Err(input_pump::ChannelInputPumpError::ShuttingDown) => None,
@@ -887,7 +887,10 @@ fn channel_render_event_stream(
     mut driver_rx: tokio::sync::mpsc::Receiver<ChannelRenderEvent>,
     mut prompt_rx: tokio::sync::broadcast::Receiver<String>,
     mut terminal_rx: tokio::sync::oneshot::Receiver<
-        echo_agent_app_core::api::chat_driver::TurnOutcome,
+        Result<
+            echo_agent_app_core::api::chat_driver::TurnOutcome,
+            echo_agent_app_core::api::chat_driver::ChatTurnError,
+        >,
     >,
     stream_drop_guard: ChannelStreamDropGuard,
 ) -> futures::stream::BoxStream<'static, echo_agent::error::Result<ChannelRenderEvent>> {
@@ -916,14 +919,14 @@ fn channel_render_event_stream(
                 },
                 terminal = &mut terminal_rx, if terminal_open => {
                     terminal_open = false;
-                    terminal_outcome = Some(terminal.unwrap_or_else(|_| {
-                        echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
-                            echo_agent::error::AgentFailure::message(
-                                "foreground_supervisor",
-                                "channel foreground owner ended without a terminal receipt",
-                            ),
-                        )
-                    }));
+                    match terminal {
+                        Ok(Ok(outcome)) => terminal_outcome = Some(outcome),
+                        Ok(Err(error)) => { yield Err(error.into_react_error()); break; }
+                        Err(_) => {
+                            yield Err(echo_agent::error::ReactError::Other("channel foreground owner ended without a physical terminal receipt".to_string()));
+                            break;
+                        }
+                    }
                 }
             }
             // The single foreground owner spans every finite continuation turn.
@@ -1330,6 +1333,7 @@ impl input_pump::ChannelInputPumpAdapter for ChannelInputPumpAdapter {
             );
             let terminal_service = self.app_state.conversation_inputs();
             let terminal_attempt = item.attempt.clone();
+            lease.retain_execution(execution);
             let outcome = echo_agent_app_core::api::foreground_turn::drive_foreground_chat_with_ingress(
                 lease,
                 &agent,
@@ -1363,9 +1367,8 @@ impl input_pump::ChannelInputPumpAdapter for ChannelInputPumpAdapter {
                 },
             )
             .await
-            .map_err(input_pump::ChannelInputExecutionError::after_driver)?;
-            drop(execution);
-            let _ = terminal_tx.send(outcome);
+            .map_err(input_pump::ChannelInputExecutionError::from_driver_error)?;
+            let _ = terminal_tx.send(Ok(outcome));
             Ok(())
         })
     }
@@ -1574,7 +1577,7 @@ impl AppChannelMessageHandler {
                         submitted.identity.input_id
                     )))
                     .await;
-                let _ = reply.terminal_tx.send(failure);
+                let _ = reply.terminal_tx.send(Ok(failure));
                 return Ok(ChannelLiveInputRoute::Routed);
             }
         };
@@ -1775,13 +1778,13 @@ impl AppChannelMessageHandler {
                         }),
                     ),
                 );
-                let _ = reply.terminal_tx.send(failure);
+                let _ = reply.terminal_tx.send(Ok(failure));
                 Ok(ChannelLiveInputRoute::Routed)
             }
             ConversationInputPhase::Cancelled => {
-                let _ = reply
-                    .terminal_tx
-                    .send(echo_agent_app_core::api::chat_driver::TurnOutcome::Cancelled);
+                let _ = reply.terminal_tx.send(Ok(
+                    echo_agent_app_core::api::chat_driver::TurnOutcome::Cancelled,
+                ));
                 Ok(ChannelLiveInputRoute::Routed)
             }
             ConversationInputPhase::Persisted
@@ -1803,7 +1806,7 @@ impl AppChannelMessageHandler {
                         "channel input did not reach a safe replay boundary",
                     ),
                 );
-                let _ = reply.terminal_tx.send(failure);
+                let _ = reply.terminal_tx.send(Ok(failure));
                 Ok(ChannelLiveInputRoute::Routed)
             }
         }
@@ -4651,7 +4654,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                                     return;
                                 }
                             };
-                            let _delivered = terminal_tx.send(outcome);
+                            let _delivered = terminal_tx.send(Ok(outcome));
                             return;
                         }
                     };
@@ -4699,7 +4702,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                                         return;
                                     }
                                 };
-                                let _delivered = terminal_tx.send(outcome);
+                                let _delivered = terminal_tx.send(Ok(outcome));
                                 return;
                             }
                         };
@@ -4743,9 +4746,9 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                                         .map(|receipt| receipt.invocation()),
                                 )
                                 .await
-                                .map_err(|error| error.to_string())
+                                .map_err(echo_agent_app_core::api::chat_driver::ChatTurnError::from)
                             }
-                            None => Err("TaskRuntime store is unavailable".to_string()),
+                            None => Err("TaskRuntime store is unavailable".into()),
                         };
                             let outcome = match launch {
                             Ok(launch) => match launch.wait().await {
@@ -4761,17 +4764,27 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                                         format!("planned resume ended with {other:?}"),
                                     ),
                                 ),
+                                Err(error) if error.is_observation() => {
+                                    foreground_lease.retain_observation(error.clone());
+                                    let _ = terminal_tx.send(Err(error));
+                                    return;
+                                }
                                 Err(error) => {
                                     echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
                                         echo_agent::error::AgentFailure::message(
                                             "planned_resume",
-                                            error,
+                                            error.to_string(),
                                         ),
                                     )
                                 }
                             },
+                            Err(error) if error.is_observation() => {
+                                foreground_lease.retain_observation(error.clone());
+                                let _ = terminal_tx.send(Err(error));
+                                return;
+                            }
                             Err(error) => echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
-                                echo_agent::error::AgentFailure::message("planned_resume", error),
+                                echo_agent::error::AgentFailure::message("planned_resume", error.to_string()),
                             ),
                         };
                             match settle_channel_turn_after_input_observers(
@@ -4790,7 +4803,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                     } else {
                         match explicit_binding {
                             Some(binding) => {
-                                drive_foreground_pooled_chat_turn(
+                                match drive_foreground_pooled_chat_turn(
                                     foreground_lease,
                                     pool,
                                     agent_conv_owned,
@@ -4799,7 +4812,10 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                                     res,
                                     binding,
                                 )
-                                .await
+                                .await {
+                                    Ok(outcome) => outcome,
+                                    Err(error) => { let _ = terminal_tx.send(Err(error)); return; }
+                                }
                             }
                             None => {
                                 let outcome = echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
@@ -4828,7 +4844,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                         &active_surface_id_for_owner,
                         &active_turn_id,
                     );
-                    let _delivered = terminal_tx.send(outcome);
+                    let _delivered = terminal_tx.send(Ok(outcome));
                 });
         if let Err(error) = supervision {
             Self::clear_active_turn(&self.active_turns, &active_surface_id, &turn_id);
@@ -7489,7 +7505,7 @@ mod tests {
         let (_prompt_tx, prompt_rx) = tokio::sync::broadcast::channel::<String>(1);
         let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
         terminal_tx
-            .send(TurnOutcome::Completed)
+            .send(Ok(TurnOutcome::Completed))
             .map_err(|_| "channel terminal receiver closed".to_string())?;
         drop(driver_tx);
         let cancellation = echo_agent::agent::CancellationToken::new();
@@ -7548,7 +7564,7 @@ mod tests {
             super::ChannelStreamDropGuard(cancellation),
         );
         terminal_tx
-            .send(TurnOutcome::Completed)
+            .send(Ok(TurnOutcome::Completed))
             .map_err(|_| "channel terminal receiver closed".to_string())?;
         prompt_tx
             .send("Approve continuation?".to_string())

@@ -192,7 +192,10 @@ async fn drive_owned_agent_turn(
                 .mode(TurnMode::Execute)
                 .cancel(cancel)
                 .invocation(invocation);
-            let receipt = AgentTurnDriver.drive(&*agent, request, &sink).await;
+            let receipt = AgentTurnDriver
+                .drive(&*agent, request, &sink)
+                .await
+                .map_err(ExecError::from)?;
             let observation = sink.finish(receipt.final_answer.as_deref());
             Ok((receipt, observation))
         },
@@ -338,13 +341,10 @@ pub async fn drive_agent_run(
             );
         }
         turn_receipt.outcome = terminal;
-        let persisted = super::turn_lifecycle::persist_run_turn_terminal(
-            &blocking,
-            run_id,
-            &turn_receipt,
-        )
-        .await
-        .map_err(ExecError::Other)?;
+        let persisted =
+            super::turn_lifecycle::persist_run_turn_terminal(&blocking, run_id, &turn_receipt)
+                .await
+                .map_err(ExecError::Other)?;
         let decision = super::turn_lifecycle::decide_after_persisted_run_turn(
             &blocking,
             &store,
@@ -547,14 +547,9 @@ async fn materialize_direct_completion(
         suggested_tasks: Vec::new(),
         created_at: chrono::Utc::now(),
     };
-    super::revisioned_runtime::commit_direct_completion(
-        store.clone(),
-        plan,
-        summary,
-        final_answer,
-    )
-    .await
-    .map_err(|error| ExecError::Other(format!("commit direct TaskPlan: {error}")))?;
+    super::revisioned_runtime::commit_direct_completion(store.clone(), plan, summary, final_answer)
+        .await
+        .map_err(|error| ExecError::Other(format!("commit direct TaskPlan: {error}")))?;
     Ok(())
 }
 

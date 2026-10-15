@@ -37,14 +37,18 @@ pub(crate) struct ContinuationCompletion {
 
 #[derive(Debug)]
 pub(crate) struct ContinuationCompletionWaiter {
-    completion_rx: tokio::sync::watch::Receiver<Option<ContinuationCompletion>>,
+    completion_rx: tokio::sync::watch::Receiver<
+        Option<Result<ContinuationCompletion, crate::chat_driver::ChatTurnError>>,
+    >,
 }
 
 impl ContinuationCompletionWaiter {
-    pub(crate) async fn wait(mut self) -> Result<ContinuationCompletion, String> {
+    pub(crate) async fn wait(
+        mut self,
+    ) -> Result<ContinuationCompletion, crate::chat_driver::ChatTurnError> {
         loop {
             if let Some(completion) = self.completion_rx.borrow().clone() {
-                return Ok(completion);
+                return completion;
             }
             self.completion_rx.changed().await.map_err(|_| {
                 "continuation owner ended without publishing completion".to_string()
@@ -119,7 +123,9 @@ struct RegisteredLauncher {
 
 struct ActiveDispatch {
     generation: u64,
-    completion_tx: tokio::sync::watch::Sender<Option<ContinuationCompletion>>,
+    completion_tx: tokio::sync::watch::Sender<
+        Option<Result<ContinuationCompletion, crate::chat_driver::ChatTurnError>>,
+    >,
     cancel: CancellationToken,
 }
 
@@ -272,7 +278,9 @@ impl TaskContinuationRuntime {
         run_id: String,
         origin: RunTurnOrigin,
         generation: u64,
-        completion_tx: tokio::sync::watch::Sender<Option<ContinuationCompletion>>,
+        completion_tx: tokio::sync::watch::Sender<
+            Option<Result<ContinuationCompletion, crate::chat_driver::ChatTurnError>>,
+        >,
         dispatch_cancel: CancellationToken,
     ) {
         let handle = match tokio::runtime::Handle::try_current() {
@@ -338,7 +346,9 @@ impl TaskContinuationRuntime {
         run_id: String,
         mut origin: RunTurnOrigin,
         dispatch_generation: u64,
-        completion_tx: tokio::sync::watch::Sender<Option<ContinuationCompletion>>,
+        completion_tx: tokio::sync::watch::Sender<
+            Option<Result<ContinuationCompletion, crate::chat_driver::ChatTurnError>>,
+        >,
         dispatch_cancel: CancellationToken,
     ) {
         let Some(store) = self.store.upgrade() else {
@@ -587,12 +597,18 @@ impl TaskContinuationRuntime {
                     return;
                 }
                 Err(error) => {
+                    if error.is_observation() {
+                        // Keep the exact active dispatch/launcher generation;
+                        // no token step or replacement execution is admitted.
+                        completion_tx.send_replace(Some(Err(error)));
+                        return;
+                    }
                     tracing::warn!(run_id, %error, "long-horizon continuation turn failed");
                     let terminal = if dispatch_cancel.is_cancelled() {
                         store.wait_for_run_driver_idle(&run_id).await;
                         stopped_terminal_for_run(&store, &run_id, terminal).await
                     } else {
-                        continuation_failure("continuation_driver", error)
+                        continuation_failure("continuation_driver", error.to_string())
                     };
                     self.finish_dispatch(
                         &run_id,
@@ -617,7 +633,9 @@ impl TaskContinuationRuntime {
         remove_launcher: bool,
         reason: ContinuationCompletionReason,
         terminal: crate::chat_driver::TurnOutcome,
-        completion_tx: tokio::sync::watch::Sender<Option<ContinuationCompletion>>,
+        completion_tx: tokio::sync::watch::Sender<
+            Option<Result<ContinuationCompletion, crate::chat_driver::ChatTurnError>>,
+        >,
     ) {
         let mut state = self
             .state
@@ -652,7 +670,7 @@ impl TaskContinuationRuntime {
         match finish {
             DispatchSettlement::Stale => {}
             DispatchSettlement::Complete => {
-                completion_tx.send_replace(Some(ContinuationCompletion { terminal, reason }));
+                completion_tx.send_replace(Some(Ok(ContinuationCompletion { terminal, reason })));
             }
             DispatchSettlement::Restart(next_generation) => {
                 if let Some(dispatch_cancel) = restart_cancel {
@@ -664,13 +682,13 @@ impl TaskContinuationRuntime {
                         dispatch_cancel,
                     );
                 } else {
-                    completion_tx.send_replace(Some(ContinuationCompletion {
+                    completion_tx.send_replace(Some(Ok(ContinuationCompletion {
                         terminal: continuation_failure(
                             "continuation_dispatch",
                             "restarted continuation lost its dispatch cancellation capability",
                         ),
                         reason: ContinuationCompletionReason::Stopped,
-                    }));
+                    })));
                 }
             }
         }
@@ -807,6 +825,16 @@ impl TaskContinuationRuntime {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.active.get(run_id).is_some_and(|active| {
+                active.completion_tx.borrow().as_ref().is_some_and(|value| {
+                    value
+                        .as_ref()
+                        .err()
+                        .is_some_and(crate::chat_driver::ChatTurnError::is_observation)
+                })
+            }) {
+                return;
+            }
             let launcher = state.launchers.remove(run_id);
             state.pending_wakeups.remove(run_id);
             let dispatch_cancel = state.active.get(run_id).map(|active| active.cancel.clone());
@@ -832,7 +860,29 @@ impl TaskContinuationRuntime {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let launchers = std::mem::take(&mut state.launchers);
+            let protected = state
+                .active
+                .iter()
+                .filter(|(_, active)| {
+                    active.completion_tx.borrow().as_ref().is_some_and(|value| {
+                        value
+                            .as_ref()
+                            .err()
+                            .is_some_and(crate::chat_driver::ChatTurnError::is_observation)
+                    })
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let retired_ids = state
+                .launchers
+                .keys()
+                .filter(|id| !protected.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let launchers = retired_ids
+                .into_iter()
+                .filter_map(|id| state.launchers.remove(&id))
+                .collect::<Vec<_>>();
             state.pending_wakeups.clear();
             let dispatch_cancels = state
                 .active
@@ -862,7 +912,7 @@ async fn drive_continuation_turn(
     run_id: String,
     binding: RunTurnBinding,
     cancel: CancellationToken,
-) -> Result<crate::chat_driver::RunTurnDriveOutcome, String> {
+) -> Result<crate::chat_driver::RunTurnDriveOutcome, crate::chat_driver::ChatTurnError> {
     let turn_id = binding.turn_id.clone();
     let resources = Arc::new(ChatResources {
         execution_scope: launcher.resources.execution_scope.clone(),
@@ -1483,7 +1533,8 @@ mod tests {
         let completion = tokio::time::timeout(std::time::Duration::from_secs(2), completion_waiter)
             .await
             .map_err(|_| "dispatch did not complete after exact RunDriver release".to_string())?
-            .map_err(|error| error.to_string())??;
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
         assert_eq!(completion.reason, ContinuationCompletionReason::Stopped);
         assert_eq!(
             completion.terminal,
@@ -1754,7 +1805,10 @@ mod tests {
 
         let (first_completion, second_completion) =
             tokio::join!(first.completion.wait(), second.completion.wait());
-        assert_eq!(first_completion?, second_completion?);
+        assert_eq!(
+            first_completion.map_err(|error| error.to_string())?,
+            second_completion.map_err(|error| error.to_string())?
+        );
         Ok(())
     }
 
@@ -1822,7 +1876,11 @@ mod tests {
             ContinueRequestOutcome::Running(request) => request,
             other => return Err(format!("deferred request was not accepted: {other:?}")),
         };
-        let completion = request.completion.wait().await?;
+        let completion = request
+            .completion
+            .wait()
+            .await
+            .map_err(|error| error.to_string())?;
         assert_eq!(completion.reason, ContinuationCompletionReason::Deferred);
         assert!(
             renderer_dropped.load(std::sync::atomic::Ordering::SeqCst),
@@ -1872,7 +1930,8 @@ mod tests {
         let completion =
             tokio::time::timeout(std::time::Duration::from_secs(2), request.completion.wait())
                 .await
-                .map_err(|_| "RetryAt cancellation did not complete dispatch".to_string())??;
+                .map_err(|_| "RetryAt cancellation did not complete dispatch".to_string())?
+                .map_err(|error| error.to_string())?;
         assert_eq!(completion.reason, ContinuationCompletionReason::Stopped);
         assert_eq!(
             completion.terminal,
@@ -1918,7 +1977,8 @@ mod tests {
         let completion =
             tokio::time::timeout(std::time::Duration::from_secs(2), request.completion.wait())
                 .await
-                .map_err(|_| "RetryAt pause did not complete dispatch".to_string())??;
+                .map_err(|_| "RetryAt pause did not complete dispatch".to_string())?
+                .map_err(|error| error.to_string())?;
         assert_eq!(completion.reason, ContinuationCompletionReason::Stopped);
         assert_eq!(
             completion.terminal,
@@ -2029,7 +2089,10 @@ mod tests {
         drop_release_tx
             .send(())
             .map_err(|_| "renderer Drop release receiver closed".to_string())?;
-        let completion = waiter.await.map_err(|error| error.to_string())??;
+        let completion = waiter
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
         assert_eq!(completion.reason, ContinuationCompletionReason::Deferred);
         Ok(())
     }

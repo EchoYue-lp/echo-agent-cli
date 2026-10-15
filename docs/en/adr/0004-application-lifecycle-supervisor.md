@@ -21,6 +21,33 @@ Product-data I/O uses the shared owned flow and bounded blocking adapter.
 Semaphore capacity is not an operation owner. Caller cancellation only drops a
 waiter; accepted work continues to durable settlement.
 
+### Unsettled execution observations
+
+`ExecutionNotSettled` is an observation of the original execution, not a failure
+or cancellation receipt. The shared foreground, TaskRun and analysis owners
+retain their original generation, pool, memory and I/O receipts; surfaces use
+existing error presentation without publishing a terminal or replaying work.
+A live cancellation registration also remains nonterminal before its driver
+starts. Shutdown reports unresolved ownership and does not release it.
+
+Before work, the existing Task journal or private analysis-directory intent
+records the original owner identity. Restart admission honors that fact. Only
+matching physical completion permits durable terminal recording and intent
+cleanup. Known completion with failed persistence uses the same owner's
+serialized cleanup retry; it never runs the Agent or tool again. Foreign
+unknown execution without a completion source remains explicitly fenced.
+
+
+The original application-generation root strongly retains the same lifecycle
+Owner and execution receipt bundles; child registries and progress links are
+Weak. Its real cleanup producer drains independent ordinary flows and pool
+leases, then reports unresolved exact ownership without closing dependencies
+still needed by it. A metadata-only publication cannot be a fake final receipt.
+The existing typed lifecycle error retains this root even after Runtime/Services
+are dropped. Genuine same-owner evidence resumes only original cleanup; only
+actual completion releases resources. Opaque workspace I/O guards retain their
+original counter, while full scoped controls keep their Host/Task/Tool services.
+
 ## Consequences
 
 Every process-level resource must bind an owner at creation and provide a

@@ -57,6 +57,20 @@ generation；旧 driver 的延迟 Drop 不能清理新 owner，dirty driver 异�
 设计参考 Tokio graceful shutdown 的通用模式：`CancellationToken` 负责取消广播，任务集合负责
 等待完成。EKO 继续复用这些原语，但 application admission、surface 顺序和产品回执留在 app-core。
 
+### 未结算执行的观察
+
+`ExecutionNotSettled` 是对原执行的观察，不是失败或取消回执。共享 foreground、TaskRun 与
+analysis owner 保留原 generation、pool、memory 和 I/O receipts；各 surface 只用既有错误呈现，
+不发终态、不重放执行。driver 尚未启动时，已有的 live cancellation registration 也不能作为
+已取消的证明。shutdown 报告未确认的所有权，不据此释放资源。
+
+接纳工作前，原 Task journal 或 analysis 目录内的私有 intent 记录原 owner 身份，重启准入继续
+检查同一事实。只有匹配的物理完成才能记录 durable terminal 并清 intent。已完成但持久化失败
+由同一 owner 串行重试原清理，不重新运行 Agent 或工具；无完成来源的 foreign unknown 保持 fence。
+
+
+原应用 generation 根强持同一个生命周期 Owner 与原执行资源束；子系统索引与进度回边仅 Weak。真实清理 producer 先结算独立普通 flow/配额，再报告仍未结算的精确 owner，不关闭它依赖的 Agent/工具等资源。元数据观察不能伪作最终收据。原 typed 生命周期错误在 Runtime/Services 释放后仍持有该根；只有原 owner 的真实完成证据才推进同一清理并释放资源。opaque workspace I/O guard 仅保原计数，完整 scoped control 仍保 Host/Task/Tool 能力。
+
 ## Consequences
 
 - GUI、TUI、CLI/JSONL 和 channel 使用相同的 shutdown/rollback 语义。

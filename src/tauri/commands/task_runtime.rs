@@ -763,13 +763,20 @@ async fn resume_continuation_run(
     let spawned_run_id = run_id.clone();
     let status_store = store;
     tokio::spawn(async move {
-        let _pool_execution = pool_execution;
+        lease.retain_execution(pool_execution);
         let outcome = echo_agent_app_core::api::foreground_turn::drive_foreground_chat_turn(
             lease, &agent, &turn, resources, binding,
         )
         .await;
         if let Err(error) = outcome.as_ref() {
             tracing::warn!(%error, run_id = %spawned_run_id, "long-horizon GUI resume failed");
+        }
+        if outcome
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.is_observation())
+        {
+            return;
         }
         let terminal_run_id = spawned_run_id.clone();
         let terminal_status = TaskRuntimeOperation::new(status_store)
@@ -909,9 +916,11 @@ async fn spawn_tauri_task_retry(
             Ok(memory_generation)
         },
         move |memory_generation, mut receipt_owner| async move {
-            let _pool_execution = pool_execution;
             if let Some(generation) = memory_generation.as_ref() {
-                receipt_owner.retain(generation.clone());
+                receipt_owner.retain(generation.clone())?;
+            }
+            if let Some(execution) = pool_execution {
+                receipt_owner.retain(execution)?;
             }
             let run_store = primary_agent.read(|agent| agent.run_store().cloned()).await;
             let reviewer_llm = primary_agent
@@ -939,7 +948,7 @@ async fn spawn_tauri_task_retry(
                 }
                 Err(error) => {
                     tracing::error!(run_id = %driver_run_id, %error, "retried run executor error");
-                    return Err(error.to_string());
+                    return Err(echo_agent_app_core::api::chat_driver::ChatTurnError::from(error));
                 }
             }
             Ok(())

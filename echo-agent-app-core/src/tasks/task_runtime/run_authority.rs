@@ -953,6 +953,7 @@ impl RunAuthority {
             match projection.todo_query_projection() {
                 Ok(snapshot) => Ok(Some(snapshot)),
                 Err(RebuildError::NoRunCreated) => Ok(None),
+                Err(error) => Err(ShadowError::Rebuild(error.to_string())),
             }
         })
     }
@@ -969,6 +970,7 @@ impl RunAuthority {
             match projection.completion_gate_projection() {
                 Ok(snapshot) => Ok(Some(snapshot)),
                 Err(RebuildError::NoRunCreated) => Ok(None),
+                Err(error) => Err(ShadowError::Rebuild(error.to_string())),
             }
         })
     }
@@ -1175,6 +1177,7 @@ impl RunAuthority {
             let rebuilt = match projection.rebuilt_plan() {
                 Ok(rebuilt) => rebuilt,
                 Err(RebuildError::NoRunCreated) => return Ok(()),
+                Err(error) => return Err(ShadowError::Rebuild(error.to_string())),
             };
             create_dir_all_durable(run_directory)
                 .map_err(|error| projection_degraded(current, error))?;

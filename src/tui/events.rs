@@ -2231,7 +2231,7 @@ async fn dispatch_turn(
         .clone()
         .map(|attempt| (app_state.conversation_inputs(), attempt));
     if let Err(error) = foreground_turns.supervise(lease, move |lease| async move {
-        let _scoped_runtime_guard = scoped_runtime_guard;
+        lease.retain(scoped_runtime_guard);
         let outcome = match std::panic::AssertUnwindSafe(send_to_agent(
             &agent_owned,
             prepared,
@@ -2248,10 +2248,16 @@ async fn dispatch_turn(
         .catch_unwind()
         .await
         {
-            Ok(outcome) => outcome,
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) if error.is_observation() => {
+                let _ = agent_tx.send(AgentEvent::Notice(error.to_string()));
+                return;
+            }
+            Ok(Err(error)) => TurnOutcome::Failed(echo_agent::error::AgentFailure::message("foreground_turn", error.to_string())),
             Err(_) => {
-                tracing::error!(turn_id = %settled_turn_id, "TUI foreground driver panicked");
-                TurnOutcome::Cancelled
+                tracing::error!(turn_id = %settled_turn_id, "TUI foreground driver panicked without a physical receipt");
+                let _ = agent_tx.send(AgentEvent::Notice("Foreground settlement is unknown; the original turn remains owned.".to_string()));
+                return;
             }
         };
         let _ = agent_tx.send(AgentEvent::TurnSettled {
@@ -3305,7 +3311,7 @@ async fn send_to_agent(
     turn: echo_agent_app_core::api::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<echo_agent_app_core::api::chat_resources::ChatResources>,
     context: TuiAgentTurnContext,
-) -> TurnOutcome {
+) -> Result<TurnOutcome, echo_agent_app_core::api::chat_driver::ChatTurnError> {
     use echo_agent_app_core::api::foreground_turn::{
         drive_foreground_chat, drive_foreground_chat_turn, drive_foreground_chat_with_ingress,
     };
@@ -3337,8 +3343,8 @@ async fn send_to_agent(
                     .map(|receipt| receipt.invocation()),
             )
             .await
-            .map_err(|error| error.to_string()),
-            None => Err("TaskRuntime store is unavailable".to_string()),
+            .map_err(echo_agent_app_core::api::chat_driver::ChatTurnError::from),
+            None => Err("TaskRuntime store is unavailable".into()),
         };
         let outcome = match result {
             Ok(launch) => match launch.wait().await {
@@ -3352,19 +3358,27 @@ async fn send_to_agent(
                     "planned_resume",
                     format!("planned resume ended with {other:?}"),
                 )),
+                Err(error) if error.is_observation() => {
+                    lease.retain_observation(error.clone());
+                    return Err(error);
+                }
                 Err(error) => TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
                     "planned_resume",
-                    error,
+                    error.to_string(),
                 )),
             },
+            Err(error) if error.is_observation() => {
+                lease.retain_observation(error.clone());
+                return Err(error);
+            }
             Err(error) => TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
                 "planned_resume",
-                error,
+                error.to_string(),
             )),
         };
-        return settle_planned_resume_foreground(lease, outcome).await;
+        return Ok(settle_planned_resume_foreground(lease, outcome).await);
     }
-    let _pool_execution = pool_execution;
+    lease.retain_execution(pool_execution);
     let result = if let Some(binding) = run_turn_binding {
         drive_foreground_chat_turn(lease, agent, &turn, res, binding).await
     } else if let Some((service, attempt)) = input_observation {
@@ -3402,13 +3416,7 @@ async fn send_to_agent(
     } else {
         drive_foreground_chat(lease, agent, &turn, res).await
     };
-    result.unwrap_or_else(|error| {
-        tracing::warn!(%error, "TUI foreground chat failed");
-        TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
-            "foreground_turn",
-            error,
-        ))
-    })
+    result
 }
 
 fn run_turn_binding_for_request(
@@ -6798,9 +6806,11 @@ async fn start_tui_task_retry_driver(
                     })
             },
             move |memory_generation, mut receipt_owner| async move {
-                let _pool_execution = pool_execution;
                 if let Some(generation) = memory_generation.as_ref() {
-                    receipt_owner.retain(generation.clone());
+                    receipt_owner.retain(generation.clone())?;
+                }
+                if let Some(execution) = pool_execution {
+                    receipt_owner.retain(execution)?;
                 }
                 let reviewer_llm = agent.read(|value| value.llm_client().cloned()).await;
                 let run_store = agent.read(|value| value.run_store().cloned()).await;
@@ -6819,7 +6829,7 @@ async fn start_tui_task_retry_driver(
                 .await;
                 if let Err(error) = result {
                     tracing::error!(run_id = %preparation_run_id, %error, "TUI task retry driver failed");
-                    return Err(error.to_string());
+                    return Err(echo_agent_app_core::api::chat_driver::ChatTurnError::from(error));
                 }
                 Ok(())
             },

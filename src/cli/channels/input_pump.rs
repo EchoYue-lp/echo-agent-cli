@@ -35,8 +35,12 @@ impl ChannelReplyCorrelation {
 pub(super) struct ChannelInputReplyRoute {
     pub(super) render_tx: tokio::sync::mpsc::Sender<ChannelRenderEvent>,
     pub(super) lifecycle_cursor: Arc<Mutex<u64>>,
-    pub(super) terminal_tx:
-        tokio::sync::oneshot::Sender<echo_agent_app_core::api::chat_driver::TurnOutcome>,
+    pub(super) terminal_tx: tokio::sync::oneshot::Sender<
+        Result<
+            echo_agent_app_core::api::chat_driver::TurnOutcome,
+            echo_agent_app_core::api::chat_driver::ChatTurnError,
+        >,
+    >,
 }
 
 impl ChannelInputReplyRoute {
@@ -49,8 +53,12 @@ impl ChannelInputReplyRoute {
 pub(super) struct ChannelInputReplyReceiver {
     pub(super) correlation: ChannelReplyCorrelation,
     pub(super) render_rx: tokio::sync::mpsc::Receiver<ChannelRenderEvent>,
-    pub(super) terminal_rx:
-        tokio::sync::oneshot::Receiver<echo_agent_app_core::api::chat_driver::TurnOutcome>,
+    pub(super) terminal_rx: tokio::sync::oneshot::Receiver<
+        Result<
+            echo_agent_app_core::api::chat_driver::TurnOutcome,
+            echo_agent_app_core::api::chat_driver::ChatTurnError,
+        >,
+    >,
 }
 
 pub(super) fn channel_input_reply_route(
@@ -538,13 +546,26 @@ pub(super) trait ChannelInputPumpAdapter: Send + Sync + 'static {
 pub(super) struct ChannelInputExecutionError {
     reason: String,
     reply: Option<ChannelInputReplyRoute>,
+    observation: Option<echo_agent_app_core::api::chat_driver::ChatTurnError>,
 }
 
 impl ChannelInputExecutionError {
+    pub(super) fn from_driver_error(
+        error: echo_agent_app_core::api::chat_driver::ChatTurnError,
+    ) -> Self {
+        let observation = error.is_observation().then(|| error.clone());
+        Self {
+            reason: error.to_string(),
+            reply: None,
+            observation,
+        }
+    }
+
     pub(super) fn before_driver(reason: impl Into<String>, reply: ChannelInputReplyRoute) -> Self {
         Self {
             reason: reason.into(),
             reply: Some(reply),
+            observation: None,
         }
     }
 
@@ -552,6 +573,7 @@ impl ChannelInputExecutionError {
         Self {
             reason: reason.into(),
             reply: None,
+            observation: None,
         }
     }
 }
@@ -684,6 +706,9 @@ where
             continue;
         };
         if let Err(mut error) = adapter.execute_claimed(&item, reply).await {
+            if let Some(observation) = error.observation {
+                return Err(ChannelInputPumpError::DurableDebt(observation.to_string()));
+            }
             if let Err(recovery) =
                 recover_claimed_until_durable(adapter.as_ref(), &item, &error.reason).await
             {
@@ -1296,9 +1321,9 @@ mod tests {
                         ChannelInputExecutionError::after_driver(error.to_string())
                     })?;
                 self.executions.fetch_add(1, Ordering::SeqCst);
-                let _ = reply
-                    .terminal_tx
-                    .send(echo_agent_app_core::api::chat_driver::TurnOutcome::Completed);
+                let _ = reply.terminal_tx.send(Ok(
+                    echo_agent_app_core::api::chat_driver::TurnOutcome::Completed,
+                ));
                 Ok(())
             })
         }
@@ -1561,9 +1586,9 @@ mod tests {
                     ));
                 }
                 self.available.store(0, Ordering::SeqCst);
-                let _ = reply
-                    .terminal_tx
-                    .send(echo_agent_app_core::api::chat_driver::TurnOutcome::Completed);
+                let _ = reply.terminal_tx.send(Ok(
+                    echo_agent_app_core::api::chat_driver::TurnOutcome::Completed,
+                ));
                 Ok(())
             })
         }

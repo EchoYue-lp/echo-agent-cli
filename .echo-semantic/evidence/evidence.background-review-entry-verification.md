@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.background-review-entry-verification
 kind: evidence
-observed_at: source:2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3
+observed_at: f57b90a2b0962fa5561f8839a3df70be1f261ffa
 source_refs: [src/tauri/desktop.rs, echo-agent-app-core/src/runtime.rs, echo-agent-app-core/src/workspace/runtime.rs, echo-agent-app-core/src/evolution/review_integration.rs, echo-agent-app-core/src/evolution/background_review_owner.rs, echo-agent-app-core/src/state/tests.rs]
 supports: [finding.background-review-entry-settlement, behavior.background-review-caller-owned-settlement]
 limitations:
@@ -65,3 +65,5 @@ the frozen source and the 94-test receipt. Their scopes and snapshot anchors are
 recorded in audit.background-review-entry-independent-rereview. Remote CI and
 delivery must still be recorded. Tauri restart/setup panic and complete
 cleanup of early post-fork initialization errors are not proven by these tests.
+
+历史观察归属：原 `source:2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3` 经官方源码摘要函数与 Git `f57b90a2b0962fa5561f8839a3df70be1f261ffa` 精确对应；本次只恢复同一历史切点的可恢复版本锚，不代表当前源码重验。原 source_refs、锚点、roles 与状态保持。

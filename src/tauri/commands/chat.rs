@@ -979,6 +979,10 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
         // files re-read from disk via refs). Background runs created by
         // create_complex_task pick up attachments via ChatResources.attachments
         // (already bound above).
+        let held_execution = Arc::new(std::sync::Mutex::new(Some(pool_execution)));
+        foreground_lease.retain_execution(held_execution.clone());
+        let held_browser = Arc::new(tokio::sync::Mutex::new(Some(browser_approval_registration)));
+        foreground_lease.retain(held_browser.clone());
         let outcome =
             echo_agent_app_core::api::foreground_turn::drive_foreground_chat_with_ingress(
                 foreground_lease,
@@ -1008,6 +1012,14 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
                 },
             )
             .await;
+        if outcome
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.is_observation())
+        {
+            tracing::warn!(error = %outcome.as_ref().err().map(ToString::to_string).unwrap_or_default(), "GUI turn remains physically unsettled");
+            return;
+        }
         let terminal_status = match &outcome {
             Ok(terminal_outcome) => {
                 let status = terminal_outcome.status();
@@ -1032,8 +1044,13 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
                 })
             })
             .await;
-        browser_approval_registration.close().await;
-        drop(pool_execution);
+        if let Some(registration) = held_browser.lock().await.take() {
+            registration.close().await;
+        }
+        held_execution
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         tracing::info!(
             elapsed_ms = start.elapsed().as_millis() as u64,
             status = %terminal_status,

@@ -78,6 +78,22 @@ The task tools remain `task_create`, `task_update`, `task_list`, and
 surface-local state mutation is introduced. The former interaction-mode surface
 was removed by F4; task graph execution remains explicit through `task_execute`.
 
+### Physical settlement and lossless execution facts
+
+The framework's exact-claim interruption request is persisted before signalling
+the original cancellation token. Submission does not settle the claim or emit a
+TaskRun terminal. The eventual framework CAS receipt determines the committed
+status, including a stronger interruption that wins over a late dispatch result.
+
+The internal spec/execution join and discardable checkpoint retain the complete
+canonical `TaskExecution`, including an absent versus explicit-null result and
+`interruption_requested`. Graph commits and execution events preserve those
+facts in the same journal. Older query checkpoints are replayed from that
+journal; `TaskSpec` and `TodoItem` IPC remain unchanged. An unresolved original
+physical-owner intent blocks boot recovery and duplicate execution rather than
+being converted into another Task status.
+
+
 ## Consequences
 
 - Retrying and paused execution survive restart without being flattened to

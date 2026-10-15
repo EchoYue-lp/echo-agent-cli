@@ -36,12 +36,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use echo_agent::agent::AgentHandle;
+use echo_agent::agent::CancellationToken;
 use echo_agent::agent::admission::{
     KeyedExecutionAdmission, KeyedExecutionAdmissionError, KeyedExecutionLease,
     KeyedExecutionRetirement,
 };
-use echo_agent::agent::AgentHandle;
-use echo_agent::agent::CancellationToken;
 use tokio::sync::RwLock;
 
 use crate::config::EkoConfig;
@@ -250,8 +250,7 @@ pub struct SharedResources {
     pub token_tracker: Option<Arc<echo_agent::tokenizer::TokenUsageTracker>>,
     pub permission_service: Option<Arc<echo_agent::human_loop::service::PermissionService>>,
     pub state_store: Option<Arc<dyn echo_agent::state::RuntimeStateStore>>,
-    pub tool_execution_pipeline:
-        Option<Arc<echo_agent::agent::ToolExecutionPipeline>>,
+    pub tool_execution_pipeline: Option<Arc<echo_agent::agent::ToolExecutionPipeline>>,
     pub review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
     /// TaskRuntime store handle. When present, pool agents get the task
     /// management tools (task_create/task_update/task_list) registered so
@@ -339,28 +338,88 @@ struct PooledAgent {
 
 struct AgentPoolAdmission {
     framework: Arc<KeyedExecutionAdmission>,
+    // Observation projection of exact existing leases; framework still owns
+    // every actual keyed/process permit and its release.
+    leases: std::sync::Mutex<PoolLeaseObservations>,
+    progress: tokio::sync::watch::Sender<u64>,
+    lifecycle_retention:
+        std::sync::RwLock<std::sync::Weak<crate::runtime::ApplicationLifecycleRetention>>,
+}
+
+#[derive(Default)]
+struct PoolLeaseObservations {
+    next: u64,
+    live: std::collections::BTreeMap<u64, PoolLeaseObservation>,
+}
+
+struct PoolLeaseObservation {
+    key: String,
+    owner: Option<(String, Option<String>)>,
 }
 
 impl Default for AgentPoolAdmission {
     fn default() -> Self {
         Self {
             framework: Arc::new(KeyedExecutionAdmission::default()),
+            leases: std::sync::Mutex::new(PoolLeaseObservations::default()),
+            progress: tokio::sync::watch::channel(0).0,
+            lifecycle_retention: std::sync::RwLock::new(std::sync::Weak::new()),
         }
     }
 }
 
 impl AgentPoolAdmission {
+    fn notify_progress(&self) {
+        self.progress
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+        let root = self
+            .lifecycle_retention
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade();
+        if let Some(root) = root {
+            root.note_progress();
+        }
+    }
+
     fn issue_process_scoped(
         self: &Arc<Self>,
         key: &str,
         agent: AgentHandle,
         governor: &Arc<AgentExecutionGovernor>,
     ) -> Result<AgentPoolExecutionLease, PoolError> {
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| PoolError::ExecutionLeaseCapacity)?;
+        if leases
+            .live
+            .values()
+            .any(|entry| entry.key == key && entry.owner.is_some())
+        {
+            return Err(PoolError::ConversationRetirementPending {
+                conversation_id: key.to_string(),
+            });
+        }
+        let token = leases
+            .next
+            .checked_add(1)
+            .ok_or(PoolError::ExecutionLeaseCapacity)?;
         let framework_lease = self
             .framework
             .issue_process_scoped(key, &governor.semaphore)
             .map_err(PoolError::from)?;
+        leases.next = token;
+        leases.live.insert(
+            token,
+            PoolLeaseObservation {
+                key: key.to_string(),
+                owner: None,
+            },
+        );
+        drop(leases);
         Ok(AgentPoolExecutionLease {
+            token: Some(token),
             agent,
             admission: Some((Arc::clone(self), key.to_string())),
             framework_lease: Some(framework_lease),
@@ -379,7 +438,10 @@ impl AgentPoolAdmission {
         self: &Arc<Self>,
         key: &str,
     ) -> Result<AgentPoolRetirementAdmission, PoolError> {
-        let framework = self.framework.begin_retirement(key).map_err(PoolError::from)?;
+        let framework = self
+            .framework
+            .begin_retirement(key)
+            .map_err(PoolError::from)?;
         Ok(AgentPoolRetirementAdmission {
             admission: Arc::clone(self),
             framework: Some(framework),
@@ -401,6 +463,67 @@ impl AgentPoolAdmission {
 
     fn active_count(&self) -> usize {
         self.framework.active_count()
+    }
+
+    fn observe_unsettled(&self, token: u64, run: &str, execution: Option<&str>) {
+        let changed = {
+            let mut leases = self.leases.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(entry) = leases.live.get_mut(&token) {
+                let owner = Some((run.to_string(), execution.map(str::to_string)));
+                if entry.owner == owner { false } else { entry.owner = owner; true }
+            } else { false }
+        };
+        if changed { self.notify_progress(); }
+    }
+
+    fn has_unsettled(&self) -> bool {
+        self.leases
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .live
+            .values()
+            .any(|entry| entry.owner.is_some())
+    }
+
+    async fn join_known(&self) -> Result<(), String> {
+        let mut progress = self.progress.subscribe();
+        loop {
+            let observation = {
+                let leases = self.leases.lock().map_err(|error| error.to_string())?;
+                if leases.live.values().any(|entry| entry.owner.is_none()) {
+                    None
+                } else {
+                    Some(
+                        leases
+                            .live
+                            .values()
+                            .filter_map(|entry| entry.owner.as_ref())
+                            .map(|(run, execution)| {
+                                format!(
+                                    "run={run} execution={}",
+                                    execution.as_deref().unwrap_or("unknown")
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            };
+            if let Some(unknown) = observation {
+                if !unknown.is_empty() {
+                    return Err(format!(
+                        "original pool execution remains physically unsettled: {}",
+                        unknown.join("; ")
+                    ));
+                }
+                // Metadata cannot replace the actual framework permit drain.
+                self.framework.wait_until_idle().await;
+                return Ok(());
+            }
+            progress
+                .changed()
+                .await
+                .map_err(|_| "original pool progress channel closed".to_string())?;
+        }
     }
 }
 
@@ -456,6 +579,7 @@ impl Drop for AgentPoolRetirementAdmission {
 /// receipt to drop before clearing or rebinding pooled agents.
 #[must_use]
 pub struct AgentPoolExecutionLease {
+    token: Option<u64>,
     agent: AgentHandle,
     admission: Option<(Arc<AgentPoolAdmission>, String)>,
     framework_lease: Option<KeyedExecutionLease>,
@@ -468,6 +592,7 @@ impl AgentPoolExecutionLease {
 
     pub(crate) fn unpooled(agent: AgentHandle) -> Self {
         Self {
+            token: None,
             agent,
             admission: None,
             framework_lease: None,
@@ -475,31 +600,61 @@ impl AgentPoolExecutionLease {
     }
 
     fn owns(&self, admission: &Arc<AgentPoolAdmission>, key: &str) -> bool {
-        self.admission
-            .as_ref()
-            .is_some_and(|(owner, owned_key)| {
-                Arc::ptr_eq(owner, admission)
-                    && owned_key == key
-                    && self
-                        .framework_lease
-                        .as_ref()
-                        .is_some_and(|lease| lease.owns(&admission.framework, key))
-            })
+        self.admission.as_ref().is_some_and(|(owner, owned_key)| {
+            Arc::ptr_eq(owner, admission)
+                && owned_key == key
+                && self
+                    .framework_lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.owns(&admission.framework, key))
+        })
     }
 }
 
 impl Drop for AgentPoolExecutionLease {
     fn drop(&mut self) {
-        self.admission.take();
+        let admission = self.admission.take();
+        if let (Some((owner, _)), Some(token)) = (admission.as_ref(), self.token.take()) {
+            owner
+                .leases
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .live
+                .remove(&token);
+        }
         self.framework_lease.take();
+        if let Some((owner, _)) = admission {
+            owner.notify_progress();
+        }
     }
 }
 
 impl crate::tasks::task_runtime::store::RunDriverExecutionReceipt for AgentPoolExecutionLease {
+    fn observe_unsettled(&self, run_id: &str, execution_id: Option<&str>) {
+        if let (Some((admission, _)), Some(token)) = (self.admission.as_ref(), self.token) {
+            admission.observe_unsettled(token, run_id, execution_id);
+        }
+    }
+
     fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
         Box::pin(async move {
             drop(self);
         })
+    }
+}
+
+// GUI holds this same lease cell until original turn/HITL cleanup. The
+// observation projection must mark its actual token without taking the lease.
+impl crate::tasks::task_runtime::store::RunDriverExecutionReceipt
+    for Arc<std::sync::Mutex<Option<AgentPoolExecutionLease>>>
+{
+    fn observe_unsettled(&self, run_id: &str, execution_id: Option<&str>) {
+        if let Some(execution) = self.lock().unwrap_or_else(|error| error.into_inner()).as_ref() {
+            crate::tasks::task_runtime::store::RunDriverExecutionReceipt::observe_unsettled(execution, run_id, execution_id);
+        }
+    }
+    fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
+        Box::pin(async move { drop(self); })
     }
 }
 
@@ -513,6 +668,15 @@ pub(crate) struct OwnedRunPoolReceipt {
 }
 
 impl crate::tasks::task_runtime::store::RunDriverExecutionReceipt for OwnedRunPoolReceipt {
+    fn observe_unsettled(&self, run_id: &str, execution_id: Option<&str>) {
+        if let Some(execution) = self.execution.as_ref() {
+            crate::tasks::task_runtime::store::RunDriverExecutionReceipt::observe_unsettled(
+                execution,
+                run_id,
+                execution_id,
+            );
+        }
+    }
     fn release(mut self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
         Box::pin(async move {
             if let Some(execution) = self.execution.take() {

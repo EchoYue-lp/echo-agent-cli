@@ -2,15 +2,48 @@
 schema_version: 1
 id: rule.eko-framework-consumer-authorities
 kind: rule
-status: verified
+status: needs_review
 expectation: human_confirmed
 risk: high
 primary_focus: state_authority
-focus: [data_durability, time_lifecycle, failure_concurrency, contract_evidence]
-observed_at: 6b162b6ab2aa13c8262fd6424ff089a692df70b5
-behavior_refs: [behavior.background-review-caller-owned-settlement]
-code_refs: [echo-agent-app-core/src/evolution/background_review_owner.rs, echo-agent-app-core/src/evolution/review_integration.rs, echo-agent-app-core/src/conversation_archive.rs, echo-agent-app-core/src/conversation_deletion.rs, echo-agent-app-core/src/managed_conversation.rs, echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/state/workspace.rs, echo-agent-app-core/src/extension_control/policy.rs, echo-agent-app-core/src/plugin_runtime/runtime.rs, echo-agent-app-core/src/workspace/runtime.rs]
-evidence_refs: [evidence.latest-framework-consumer-integration]
+focus:
+- data_durability
+- time_lifecycle
+- failure_concurrency
+- contract_evidence
+observed_at: source:215699889c9c12b8702566e900205bc6e2f73d00e83993834c0688cafa6e7464
+behavior_refs:
+- behavior.background-review-caller-owned-settlement
+- behavior.shared-turn-observation-retains-owner
+- behavior.task-unknown-owner-admission-fence
+- behavior.analysis-original-owner-settlement-retry
+code_refs:
+- echo-agent-app-core/src/evolution/background_review_owner.rs
+- echo-agent-app-core/src/evolution/review_integration.rs
+- echo-agent-app-core/src/conversation_archive.rs
+- echo-agent-app-core/src/conversation_deletion.rs
+- echo-agent-app-core/src/managed_conversation.rs
+- echo-agent-app-core/src/state/app_state.rs
+- echo-agent-app-core/src/state/workspace.rs
+- echo-agent-app-core/src/extension_control/policy.rs
+- echo-agent-app-core/src/plugin_runtime/runtime.rs
+- echo-agent-app-core/src/workspace/runtime.rs
+- echo-agent-app-core/src/agent_pool/admission.rs
+- echo-agent-app-core/src/agent_pool/pool.rs
+- echo-agent-app-core/src/analysis.rs
+- echo-agent-app-core/src/chat_driver.rs
+- echo-agent-app-core/src/conversation_input.rs
+- echo-agent-app-core/src/foreground_turn.rs
+- echo-agent-app-core/src/product_data_io.rs
+- echo-agent-app-core/src/runtime.rs
+- echo-agent-app-core/src/tasks/task_runtime/continuation.rs
+- echo-agent-app-core/src/tasks/task_runtime/event_rebuild.rs
+- echo-agent-app-core/src/tasks/task_runtime/store/runtime.rs
+- echo-agent-app-core/src/tasks/task_runtime/store/tests.rs
+- echo-agent-app-core/src/tasks/task_runtime/store/workspace.rs
+evidence_refs:
+- evidence.latest-framework-consumer-integration
+- evidence.cancellation-observation-consumer
 finding_refs: []
 ---
 
@@ -39,3 +72,7 @@ EKO ADR 0043-0046、框架 ADR 0058/0065/0069、定向故障注入、全 workspa
 ## 裁决记录
 
 框架与应用分层沿仓库 AGENTS 的强制规则：跨产品通用机制在框架，本地 EKO 策略和 UI/文件工作区收据在应用；项目开发期不保留旧 API 兼容。
+
+## B 消费新增不变量
+
+Framework physical receipt/claim CAS唯一；观察不终态化。原Task/analysis/foreground保owner与effect前durable intent；未知拒重复，真实terminal IO债务只同identity重写清理。aggregate普通工作必须真实drain、未知原owner可达、无Strong自环。新增范围尚需当前强tests/aggregate实现，Rule整体needs_review，不撤销旧历史验证也不将旧证据推广到B。

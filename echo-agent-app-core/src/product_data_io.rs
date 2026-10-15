@@ -20,7 +20,8 @@ static PROCESS_PRODUCT_DATA_IO: LazyLock<Arc<Semaphore>> =
 
 struct ProductDataOperationState {
     admission_open: bool,
-    active: usize,
+    active: std::collections::BTreeMap<u64, Option<String>>,
+    next_operation_id: u64,
     failures: Vec<String>,
     failure_overflow: usize,
 }
@@ -49,6 +50,8 @@ impl ProductDataOperationState {
 struct ProductDataOperationSupervisor {
     state: Mutex<ProductDataOperationState>,
     settled: tokio::sync::watch::Sender<u64>,
+    lifecycle_retention:
+        std::sync::RwLock<std::sync::Weak<crate::runtime::ApplicationLifecycleRetention>>,
     #[cfg(test)]
     barrier: Mutex<Option<ProductDataIoTestBarrier>>,
 }
@@ -61,16 +64,31 @@ struct ProductDataIoTestBarrier {
 }
 
 impl ProductDataOperationSupervisor {
+    fn notify_progress(&self) {
+        self.settled
+            .send_modify(|version| *version = version.saturating_add(1));
+        let root = self
+            .lifecycle_retention
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade();
+        if let Some(root) = root {
+            root.note_progress();
+        }
+    }
+
     fn new() -> Self {
         let (settled, _initial_receiver) = tokio::sync::watch::channel(0);
         Self {
             state: Mutex::new(ProductDataOperationState {
                 admission_open: true,
-                active: 0,
+                active: std::collections::BTreeMap::new(),
+                next_operation_id: 0,
                 failures: Vec::new(),
                 failure_overflow: 0,
             }),
             settled,
+            lifecycle_retention: std::sync::RwLock::new(std::sync::Weak::new()),
             #[cfg(test)]
             barrier: Mutex::new(None),
         }
@@ -80,37 +98,20 @@ impl ProductDataOperationSupervisor {
         self: &Arc<Self>,
         operation: &'static str,
     ) -> Result<ProductDataOperation, ProductDataIoError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|error| ProductDataIoError::Admission {
-                operation,
-                error: format!("product-data operation registry is poisoned: {error}"),
-            })?;
-        if !state.admission_open {
-            return Err(ProductDataIoError::Admission {
-                operation,
-                error: "application shutdown has closed product-data admission".to_string(),
-            });
-        }
-        state.active =
-            state
-                .active
-                .checked_add(1)
-                .ok_or_else(|| ProductDataIoError::Admission {
-                    operation,
-                    error: "product-data active operation capacity is exhausted".to_string(),
-                })?;
-        Ok(ProductDataOperation {
-            supervisor: Arc::clone(self),
-            operation,
-            settled: false,
-        })
+        self.admit_operation(operation, false)
     }
 
     fn admit_nested(
         self: &Arc<Self>,
         operation: &'static str,
+    ) -> Result<ProductDataOperation, ProductDataIoError> {
+        self.admit_operation(operation, true)
+    }
+
+    fn admit_operation(
+        self: &Arc<Self>,
+        operation: &'static str,
+        nested: bool,
     ) -> Result<ProductDataOperation, ProductDataIoError> {
         let mut state = self
             .state
@@ -119,17 +120,24 @@ impl ProductDataOperationSupervisor {
                 operation,
                 error: format!("product-data operation registry is poisoned: {error}"),
             })?;
-        state.active =
-            state
-                .active
-                .checked_add(1)
-                .ok_or_else(|| ProductDataIoError::Admission {
-                    operation,
-                    error: "product-data active operation capacity is exhausted".to_string(),
-                })?;
+        if !nested && !state.admission_open {
+            return Err(ProductDataIoError::Admission {
+                operation,
+                error: "application shutdown has closed product-data admission".to_string(),
+            });
+        }
+        let id = state.next_operation_id.checked_add(1).ok_or_else(|| {
+            ProductDataIoError::Admission {
+                operation,
+                error: "product-data operation identity capacity is exhausted".to_string(),
+            }
+        })?;
+        state.next_operation_id = id;
+        state.active.insert(id, None);
         Ok(ProductDataOperation {
             supervisor: Arc::clone(self),
             operation,
+            id,
             settled: false,
         })
     }
@@ -145,7 +153,15 @@ impl ProductDataOperationSupervisor {
         loop {
             let outcome = {
                 let state = self.state.lock().map_err(|error| error.to_string())?;
-                (state.active == 0).then(|| state.failure_receipt())
+                if state.active.values().all(Option::is_some) {
+                    let mut failures = state.failure_receipt();
+                    failures.extend(state.active.values().filter_map(|identity| identity.as_ref()).map(|identity| {
+                        format!("product-data original owner is not physically settled: {identity}")
+                    }));
+                    Some(failures)
+                } else {
+                    None
+                }
             };
             if let Some(failures) = outcome {
                 return if failures.is_empty() {
@@ -201,9 +217,30 @@ impl ProductDataIoService {
         self.supervisor.begin_shutdown()
     }
 
+    pub(crate) fn bind_lifecycle_retention(
+        &self,
+        root: &Arc<crate::runtime::ApplicationLifecycleRetention>,
+    ) {
+        *self
+            .supervisor
+            .lifecycle_retention
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(root);
+    }
+
     pub async fn join_shutdown(&self) -> Result<(), String> {
         self.begin_shutdown()?;
         self.supervisor.join_shutdown().await
+    }
+
+    pub(crate) fn has_unsettled_flows(&self) -> bool {
+        self.supervisor
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active
+            .values()
+            .any(Option::is_some)
     }
 
     pub fn begin_owned_flow(
@@ -326,6 +363,28 @@ impl ProductDataIoFlow {
         .await
     }
 
+    /// Mark only this original parent flow as retained. Nested operations keep
+    /// their own live IDs, so an actual write cannot be hidden by this marker.
+    fn retain_unsettled(&self, identity: String) {
+        let owner = self
+            .inner
+            .owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(owner) = owner.as_ref() {
+            let mut state = owner
+                .supervisor
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(retained) = state.active.get_mut(&owner.id) {
+                *retained = Some(identity);
+            }
+        }
+        drop(owner);
+        self.inner.supervisor.notify_progress();
+    }
+
     pub fn settle(&self, failure: Option<String>) {
         let owner = self
             .inner
@@ -348,21 +407,20 @@ impl Default for ProductDataIoService {
 struct ProductDataOperation {
     supervisor: Arc<ProductDataOperationSupervisor>,
     operation: &'static str,
+    id: u64,
     settled: bool,
 }
 
 impl ProductDataOperation {
     fn settle(mut self, failure: Option<String>) {
         if let Ok(mut state) = self.supervisor.state.lock() {
-            state.active = state.active.saturating_sub(1);
+            state.active.remove(&self.id);
             if let Some(failure) = failure {
                 state.record_failure(format!("{}: {failure}", self.operation));
             }
         }
         self.settled = true;
-        self.supervisor
-            .settled
-            .send_modify(|version| *version = version.saturating_add(1));
+        self.supervisor.notify_progress();
     }
 }
 
@@ -372,12 +430,10 @@ impl Drop for ProductDataOperation {
             return;
         }
         if let Ok(mut state) = self.supervisor.state.lock() {
-            state.active = state.active.saturating_sub(1);
+            state.active.remove(&self.id);
             state.record_failure(format!("{}: operation owner dropped", self.operation));
         }
-        self.supervisor
-            .settled
-            .send_modify(|version| *version = version.saturating_add(1));
+        self.supervisor.notify_progress();
     }
 }
 
@@ -674,6 +730,70 @@ impl ScopedProductData {
             .await
     }
 
+    pub(crate) fn retain_analysis_resource<
+        T: crate::tasks::task_runtime::store::RunDriverExecutionReceipt + 'static,
+    >(
+        &self,
+        analysis_id: &str,
+        resource: T,
+    ) -> Result<(), T> {
+        let key = analysis_cancel_key(self.workspace_id(), analysis_id);
+        let Some(entry) = self.analysis_runs.entries.get(&key) else {
+            return Err(resource);
+        };
+        if entry.receipt.workspace_generation != self.generation() {
+            return Err(resource);
+        }
+        entry
+            .retained_resources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(Box::new(resource));
+        Ok(())
+    }
+
+    pub(crate) fn retain_analysis_cleanup(
+        &self,
+        analysis_id: &str,
+        intent: crate::analysis::AnalysisOwnerIntent,
+        no_effect: bool,
+        result: Result<crate::analysis::AnalysisDocument, String>,
+    ) {
+        let key = analysis_cancel_key(self.workspace_id(), analysis_id);
+        if let Some(entry) = self.analysis_runs.entries.get(&key) {
+            *entry
+                .cleanup_evidence
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(AnalysisCleanupEvidence {
+                intent,
+                no_effect,
+                result,
+                pending_settlement: None,
+            });
+        }
+    }
+
+    pub(crate) fn retain_analysis_pending_settlement(
+        &self,
+        analysis_id: &str,
+        intent: crate::analysis::AnalysisOwnerIntent,
+        pending: crate::analysis::PendingAnalysisSettlement,
+        error: String,
+    ) {
+        let key = analysis_cancel_key(self.workspace_id(), analysis_id);
+        if let Some(entry) = self.analysis_runs.entries.get(&key) {
+            *entry
+                .cleanup_evidence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(AnalysisCleanupEvidence {
+                intent,
+                no_effect: false,
+                result: Err(error),
+                pending_settlement: Some(pending),
+            });
+        }
+    }
+
     pub fn start_analysis(
         &self,
         analysis_id: &str,
@@ -732,6 +852,42 @@ impl ScopedProductData {
         .await
         .map_err(|error| AnalysisRunControlError::Execution(error.to_string()))?
         .map_err(|error| AnalysisRunControlError::Execution(error.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_analysis_monitor_barrier_fixture(
+        &self,
+        analysis_id: &str,
+        runner_release: tokio::sync::oneshot::Receiver<()>,
+        before_publication: futures::future::BoxFuture<'static, ()>,
+    ) -> Result<AnalysisRunReceipt, AnalysisRunControlError> {
+        let flow = self
+            .begin_runtime_flow("original analysis monitor boundary fixture")
+            .map_err(|error| AnalysisRunControlError::Execution(error.to_string()))?;
+        let receipt = self.analysis_runs.start_owned(
+            self.clone(),
+            analysis_id,
+            Arc::new(CancellationToken::new()),
+            Some(flow),
+            async move {
+                runner_release.await.map_err(|error| error.to_string())?;
+                Err("genuine fixture runner physically completed".to_string())
+            },
+        )?;
+        let entry = self
+            .analysis_runs
+            .entries
+            .iter()
+            .find(|entry| entry.value().receipt.owner_id == receipt.owner_id)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| {
+                AnalysisRunControlError::Execution("original fixture entry missing".into())
+            })?;
+        *entry
+            .before_terminal_publication
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(before_publication);
+        Ok(receipt)
     }
 
     #[cfg(test)]
@@ -837,10 +993,17 @@ pub enum AnalysisRunControlError {
     CleanupFailed { analysis_id: String, error: String },
     #[error("analysis operation failed: {0}")]
     Execution(String),
+    #[error("analysis execution for run {run_id} is not physically settled")]
+    Observation {
+        run_id: String,
+        execution_id: Option<String>,
+    },
 }
 
 #[derive(Default)]
 pub struct AnalysisRunSupervisor {
+    lifecycle_retention:
+        std::sync::RwLock<std::sync::Weak<crate::runtime::ApplicationLifecycleRetention>>,
     entries: dashmap::DashMap<String, Arc<AnalysisRunEntry>>,
     completed: dashmap::DashMap<String, CompletedAnalysisRun>,
     completion_sequence: std::sync::atomic::AtomicU64,
@@ -862,8 +1025,52 @@ struct AnalysisRunEntry {
     phase: std::sync::atomic::AtomicU8,
     exclusive: bool,
     terminal: std::sync::Mutex<Option<AnalysisTaskTerminal>>,
+    retained_resources: std::sync::Mutex<
+        Vec<Box<dyn crate::tasks::task_runtime::store::RunDriverExecutionReceipt>>,
+    >,
+    cleanup_evidence: std::sync::Mutex<Option<AnalysisCleanupEvidence>>,
+    #[cfg(test)]
+    cleanup_test_hook: std::sync::Mutex<Option<Box<dyn FnOnce() -> Result<(), String> + Send>>>,
+    #[cfg(test)]
+    before_terminal_publication: std::sync::Mutex<Option<futures::future::BoxFuture<'static, ()>>>,
+    retained_flow: std::sync::Mutex<Option<ProductDataIoFlow>>,
     _monitor: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     settled: tokio::sync::Notify,
+}
+
+impl AnalysisRunEntry {
+    fn observe_unsettled(&self) {
+        let identity = format!(
+            "analysis={} original-owner={} workspace={} generation={}",
+            self.receipt.analysis_id,
+            self.receipt.owner_id,
+            self.receipt.workspace_id,
+            self.receipt.workspace_generation
+        );
+        if let Some(flow) = self
+            .retained_flow
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            flow.retain_unsettled(identity);
+        }
+        let resources = self
+            .retained_resources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for resource in resources.iter() {
+            resource.observe_unsettled(&self.receipt.owner_id, None);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AnalysisCleanupEvidence {
+    intent: crate::analysis::AnalysisOwnerIntent,
+    no_effect: bool,
+    result: Result<crate::analysis::AnalysisDocument, String>,
+    pending_settlement: Option<crate::analysis::PendingAnalysisSettlement>,
 }
 
 struct AnalysisDeleteReceipt {
@@ -886,9 +1093,144 @@ impl Drop for AnalysisDeleteReceipt {
 enum AnalysisTaskTerminal {
     Joined(Box<Result<crate::analysis::AnalysisDocument, String>>),
     CleanupFailed(String),
+    Observation {
+        run_id: String,
+        execution_id: Option<String>,
+    },
 }
 
 impl AnalysisRunSupervisor {
+    pub(crate) fn bind_lifecycle_retention(
+        &self,
+        root: &Arc<crate::runtime::ApplicationLifecycleRetention>,
+    ) {
+        *self
+            .lifecycle_retention
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(root);
+    }
+
+    fn notify_lifecycle_progress(&self) {
+        let root = self
+            .lifecycle_retention
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade();
+        if let Some(root) = root {
+            root.note_progress();
+        }
+    }
+
+    pub(crate) fn retry_retained_cleanup(&self) -> Vec<String> {
+        let entries = self
+            .entries
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect::<Vec<_>>();
+        let mut errors = Vec::new();
+        for (key, entry) in entries {
+            if let Some(control) = entry._control.as_ref() {
+                if let Err(error) = self.retry_known_cleanup(control.data_root(), &key, &entry) {
+                    errors.push(error.to_string());
+                }
+            }
+        }
+        errors
+    }
+
+    pub(crate) fn has_retained_owners(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
+    fn retry_known_cleanup(
+        &self,
+        data_root: &std::path::Path,
+        key: &str,
+        entry: &Arc<AnalysisRunEntry>,
+    ) -> Result<(), AnalysisRunControlError> {
+        // Keep this original entry's cleanup claim through persistence and
+        // publication. A second observer must not retain stale write authority
+        // after a replacement analysis owner has been admitted.
+        let mut cleanup_claim = entry
+            .cleanup_evidence
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(mut evidence) = cleanup_claim.as_ref().cloned() else {
+            return Ok(());
+        };
+        // The runner exposes pending I/O before returning. Its original
+        // monitor must publish CleanupFailed first, otherwise the monitor's
+        // late original Err could overwrite a recovered completion.
+        let monitor_published_failure = matches!(
+            entry
+                .terminal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref(),
+            Some(AnalysisTaskTerminal::CleanupFailed(_))
+        );
+        if entry.phase.load(std::sync::atomic::Ordering::Acquire) != PHASE_CLEANUP_FAILED
+            || !monitor_published_failure
+        {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(hook) = entry
+            .cleanup_test_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            hook().map_err(AnalysisRunControlError::Execution)?;
+        }
+        if let Some(pending) = evidence.pending_settlement.as_ref() {
+            evidence.result = Ok(crate::analysis::retry_analysis_settlement(pending).map_err(
+                |error| AnalysisRunControlError::CleanupFailed {
+                    analysis_id: entry.receipt.analysis_id.clone(),
+                    error: error.to_string(),
+                },
+            )?);
+        }
+        let cleanup = if evidence.no_effect {
+            crate::analysis::reject_unstarted_analysis_owner(data_root, &evidence.intent)
+        } else {
+            crate::analysis::acknowledge_analysis_owner_intent(data_root, &evidence.intent)
+        };
+        cleanup.map_err(|error| AnalysisRunControlError::CleanupFailed {
+            analysis_id: entry.receipt.analysis_id.clone(),
+            error: error.to_string(),
+        })?;
+        // Evidence came from the original producer, not a caller retry.
+        cleanup_claim.take();
+        if let Some(flow) = entry
+            .retained_flow
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            flow.settle(evidence.result.as_ref().err().cloned());
+        }
+        entry
+            .retained_resources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        *entry
+            .terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(AnalysisTaskTerminal::Joined(
+            Box::new(evidence.result.clone()),
+        ));
+        entry
+            .phase
+            .store(PHASE_JOINED, std::sync::atomic::Ordering::Release);
+        self.publish_completed(key, entry, evidence.result);
+        entry.settled.notify_waiters();
+        drop(cleanup_claim);
+        self.notify_lifecycle_progress();
+        Ok(())
+    }
+
     fn publish_completed(
         &self,
         active_key: &str,
@@ -975,6 +1317,17 @@ impl AnalysisRunSupervisor {
                         receipt,
                         timeout_seconds: ANALYSIS_DRAIN_TIMEOUT.as_secs(),
                     },
+                    Ok(AnalysisTaskTerminal::Observation {
+                        run_id,
+                        execution_id,
+                    }) => AnalysisCancelReceipt::CleanupFailed {
+                        receipt,
+                        error: AnalysisRunControlError::Observation {
+                            run_id,
+                            execution_id,
+                        }
+                        .to_string(),
+                    },
                     Ok(AnalysisTaskTerminal::CleanupFailed(error)) => {
                         AnalysisCancelReceipt::CleanupFailed { receipt, error }
                     }
@@ -988,6 +1341,9 @@ impl AnalysisRunSupervisor {
                     }
                 }
             };
+            if !matches!(&outcome, AnalysisCancelReceipt::Joined { .. }) {
+                entry.observe_unsettled();
+            }
             receipts.push(outcome);
         }
         receipts
@@ -1019,11 +1375,8 @@ impl AnalysisRunSupervisor {
                 Some(runner_cancel),
             )
             .await
-            .map_err(|error| error.to_string())
-            .inspect(|_| runner_flow.settle(None))
-            .inspect_err(|error| runner_flow.settle(Some(error.clone())))
         };
-        self.start_owned(
+        self.start_owned_observed(
             product_data,
             analysis_id,
             cancel,
@@ -1032,6 +1385,7 @@ impl AnalysisRunSupervisor {
         )
     }
 
+    #[cfg(test)]
     fn start_owned<F>(
         self: &Arc<Self>,
         product_data: ScopedProductData,
@@ -1043,6 +1397,29 @@ impl AnalysisRunSupervisor {
     where
         F: std::future::Future<Output = Result<crate::analysis::AnalysisDocument, String>>
             + Send
+            + 'static,
+    {
+        self.start_owned_observed(
+            product_data,
+            analysis_id,
+            cancel,
+            product_data_flow,
+            async move { future.await.map_err(crate::analysis::AnalysisError::from) },
+        )
+    }
+
+    fn start_owned_observed<F>(
+        self: &Arc<Self>,
+        product_data: ScopedProductData,
+        analysis_id: &str,
+        cancel: Arc<CancellationToken>,
+        product_data_flow: Option<ProductDataIoFlow>,
+        future: F,
+    ) -> Result<AnalysisRunReceipt, AnalysisRunControlError>
+    where
+        F: std::future::Future<
+                Output = Result<crate::analysis::AnalysisDocument, crate::analysis::AnalysisError>,
+            > + Send
             + 'static,
     {
         let key = analysis_cancel_key(product_data.workspace_id(), analysis_id);
@@ -1059,9 +1436,20 @@ impl AnalysisRunSupervisor {
             phase: std::sync::atomic::AtomicU8::new(PHASE_STARTED),
             exclusive: false,
             terminal: std::sync::Mutex::new(None),
+            retained_resources: std::sync::Mutex::new(Vec::new()),
+            cleanup_evidence: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            cleanup_test_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            before_terminal_publication: std::sync::Mutex::new(None),
+            retained_flow: std::sync::Mutex::new(None),
             _monitor: std::sync::Mutex::new(None),
             settled: tokio::sync::Notify::new(),
         });
+        *entry
+            .retained_flow
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = product_data_flow.clone();
         let admission = self
             .admission
             .lock()
@@ -1106,13 +1494,91 @@ impl AnalysisRunSupervisor {
         let monitor_key = key.clone();
         let monitor = runtime.spawn(async move {
             let terminal = match runner.await {
-                Ok(result) => AnalysisTaskTerminal::Joined(Box::new(result)),
+                Ok(Err(crate::analysis::AnalysisError::Observation {
+                    run_id,
+                    execution_id,
+                })) => AnalysisTaskTerminal::Observation {
+                    run_id,
+                    execution_id,
+                },
+                Ok(result) => {
+                    // A failed durable cleanup leaves the same owner admitted;
+                    // a returned future alone cannot clear the private intent.
+                    let fence_check = monitored_entry
+                        ._control
+                        .as_ref()
+                        .map(|control| {
+                            control
+                                .data_root()
+                                .join("analysis")
+                                .join(&monitored_entry.receipt.analysis_id)
+                                .join(".physical-owner-intent.json")
+                                .try_exists()
+                        })
+                        .unwrap_or(Ok(false));
+                    let fenced = fence_check.as_ref().map_or(true, |present| *present);
+                    if fenced {
+                        AnalysisTaskTerminal::CleanupFailed(
+                            result
+                                .as_ref()
+                                .err()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| {
+                                    "analysis owner intent is still retained".to_string()
+                                }),
+                        )
+                    } else {
+                        monitored_entry
+                            .retained_resources
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .clear();
+                        if let Some(flow) = product_data_flow.as_ref() {
+                            flow.settle(result.as_ref().err().map(ToString::to_string));
+                        }
+                        monitored_entry
+                            .retained_flow
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .take();
+                        AnalysisTaskTerminal::Joined(Box::new(
+                            result.map_err(|error| error.to_string()),
+                        ))
+                    }
+                }
                 Err(error) => AnalysisTaskTerminal::CleanupFailed(error.to_string()),
             };
+            if matches!(
+                &terminal,
+                AnalysisTaskTerminal::CleanupFailed(_) | AnalysisTaskTerminal::Observation { .. }
+            ) {
+                monitored_entry.observe_unsettled();
+                if let Some(flow) = product_data_flow.as_ref() {
+                    flow.retain_unsettled(format!(
+                        "analysis={} run-owner={} workspace={} generation={}",
+                        monitored_entry.receipt.analysis_id,
+                        monitored_entry.receipt.owner_id,
+                        monitored_entry.receipt.workspace_id,
+                        monitored_entry.receipt.workspace_generation,
+                    ));
+                }
+            }
+            #[cfg(test)]
+            {
+                let barrier = monitored_entry
+                    .before_terminal_publication
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+                if let Some(barrier) = barrier {
+                    barrier.await;
+                }
+            }
             monitored_entry.phase.store(
                 match &terminal {
                     AnalysisTaskTerminal::Joined(_) => PHASE_JOINED,
-                    AnalysisTaskTerminal::CleanupFailed(_) => PHASE_CLEANUP_FAILED,
+                    AnalysisTaskTerminal::CleanupFailed(_)
+                    | AnalysisTaskTerminal::Observation { .. } => PHASE_CLEANUP_FAILED,
                 },
                 std::sync::atomic::Ordering::Release,
             );
@@ -1130,6 +1596,9 @@ impl AnalysisRunSupervisor {
             *stored = Some(terminal);
             drop(stored);
             monitored_entry.settled.notify_waiters();
+            // Pool/flow releases above may wake cleanup before this commit.
+            // The actual terminal publication is the final progress boundary.
+            monitor_supervisor.notify_lifecycle_progress();
         });
         let mut monitor_owner = entry
             ._monitor
@@ -1164,6 +1633,7 @@ impl AnalysisRunSupervisor {
             return result.map_err(AnalysisRunControlError::Execution);
         }
         let (key, entry) = self.entry_for_receipt(product_data, receipt)?;
+        self.retry_known_cleanup(product_data.data_root(), &key, &entry)?;
         let terminal = wait_terminal(&entry).await;
         match terminal {
             AnalysisTaskTerminal::Joined(result) => {
@@ -1171,6 +1641,13 @@ impl AnalysisRunSupervisor {
                 self.ack_completed(receipt);
                 (*result).map_err(AnalysisRunControlError::Execution)
             }
+            AnalysisTaskTerminal::Observation {
+                run_id,
+                execution_id,
+            } => Err(AnalysisRunControlError::Observation {
+                run_id,
+                execution_id,
+            }),
             AnalysisTaskTerminal::CleanupFailed(error) => {
                 Err(AnalysisRunControlError::CleanupFailed {
                     analysis_id: receipt.analysis_id.clone(),
@@ -1200,6 +1677,7 @@ impl AnalysisRunSupervisor {
             });
         }
         let (key, entry) = self.entry_for_receipt(product_data, receipt)?;
+        self.retry_known_cleanup(product_data.data_root(), &key, &entry)?;
         let terminal = entry
             .terminal
             .lock()
@@ -1226,6 +1704,13 @@ impl AnalysisRunSupervisor {
                     }),
                 }
             }
+            Some(AnalysisTaskTerminal::Observation {
+                run_id,
+                execution_id,
+            }) => Err(AnalysisRunControlError::Observation {
+                run_id,
+                execution_id,
+            }),
             Some(AnalysisTaskTerminal::CleanupFailed(error)) => {
                 Ok(AnalysisWaitReceipt::CleanupFailed {
                     receipt: receipt.clone(),
@@ -1242,6 +1727,7 @@ impl AnalysisRunSupervisor {
     ) -> Result<AnalysisCancelReceipt, AnalysisRunControlError> {
         let receipt = self.receipt(product_data, analysis_id)?;
         let (key, entry) = self.entry_for_receipt(product_data, &receipt)?;
+        self.retry_known_cleanup(product_data.data_root(), &key, &entry)?;
         let _ = entry.phase.compare_exchange(
             PHASE_STARTED,
             PHASE_DRAINING,
@@ -1268,6 +1754,13 @@ impl AnalysisRunSupervisor {
                     execution_error: (*result).err(),
                 })
             }
+            AnalysisTaskTerminal::Observation {
+                run_id,
+                execution_id,
+            } => Err(AnalysisRunControlError::Observation {
+                run_id,
+                execution_id,
+            }),
             AnalysisTaskTerminal::CleanupFailed(error) => {
                 Ok(AnalysisCancelReceipt::CleanupFailed { receipt, error })
             }
@@ -1294,6 +1787,13 @@ impl AnalysisRunSupervisor {
             phase: std::sync::atomic::AtomicU8::new(phase),
             exclusive: true,
             terminal: std::sync::Mutex::new(None),
+            retained_resources: std::sync::Mutex::new(Vec::new()),
+            cleanup_evidence: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            cleanup_test_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            before_terminal_publication: std::sync::Mutex::new(None),
+            retained_flow: std::sync::Mutex::new(None),
             _monitor: std::sync::Mutex::new(None),
             settled: tokio::sync::Notify::new(),
         });
@@ -1461,6 +1961,55 @@ mod tests {
     use std::time::Duration;
 
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn product_data_shutdown_drains_normal_nested_work_before_retained_flow_observation()
+    -> Result<(), String> {
+        let service = super::ProductDataIoService::new();
+        let flow = service
+            .begin_owned_flow("original analysis flow")
+            .map_err(|error| error.to_string())?;
+        let nested = flow.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let normal = tokio::spawn(async move {
+            nested
+                .run_async("accepted actual nested operation", async move {
+                    let _ = entered_tx.send(());
+                    release_rx
+                        .await
+                        .map_err(|_| "normal operation release disappeared".to_string())
+                })
+                .await
+                .map_err(|error| error.to_string())?
+        });
+        entered_rx
+            .await
+            .map_err(|_| "normal operation never started".to_string())?;
+        flow.retain_unsettled("exact-original-analysis-owner".to_string());
+        service.begin_shutdown()?;
+        assert!(service.begin_owned_flow("new work after seal").is_err());
+        {
+            let first_waiter = service.join_shutdown();
+            tokio::pin!(first_waiter);
+            assert!(futures::poll!(first_waiter.as_mut()).is_pending());
+        }
+
+        release_tx
+            .send(())
+            .map_err(|_| "normal operation was abandoned".to_string())?;
+        normal.await.map_err(|error| error.to_string())??;
+        let error = service
+            .join_shutdown()
+            .await
+            .err()
+            .ok_or("retained owner was called idle")?;
+        assert!(error.contains("exact-original-analysis-owner"));
+        // This is the original flow's explicit completion, not observer loss.
+        flow.settle(None);
+        service.join_shutdown().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn blocking_product_data_io_keeps_async_heartbeat_responsive() -> Result<(), String> {
@@ -1651,6 +2200,112 @@ mod tests {
     }
 
     #[test]
+    fn analysis_cleanup_observers_serialize_and_stale_entry_cannot_touch_new_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let created = crate::analysis::create_analysis(
+            root.path(),
+            "serialized cleanup",
+            crate::analysis::AnalysisLanguage::Python,
+        )?;
+        let id = created.manifest.analysis_id;
+        let directory = root.path().join("analysis").join(&id);
+        let intent_value = serde_json::json!({"run_id":"original-run","analysis_id":id,"workspace_generation":"generation-a","owner_id":"original-owner","execution_id":null});
+        let intent: crate::analysis::AnalysisOwnerIntent =
+            serde_json::from_value(intent_value.clone())?;
+        std::fs::write(
+            directory.join(".physical-owner-intent.json"),
+            serde_json::to_vec(&intent_value)?,
+        )?;
+        let supervisor = Arc::new(super::AnalysisRunSupervisor::default());
+        let key = super::analysis_cancel_key("workspace-a", &id);
+        let mut entry = analysis_entry("original-owner");
+        Arc::get_mut(&mut entry)
+            .ok_or("entry unexpectedly shared")?
+            .receipt
+            .analysis_id = id.clone();
+        *entry
+            .cleanup_evidence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(super::AnalysisCleanupEvidence {
+            intent,
+            no_effect: true,
+            result: Err("pre-effect preparation rejected".to_string()),
+            pending_settlement: None,
+        });
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *entry
+            .cleanup_test_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
+            entered_tx.send(()).map_err(|e| e.to_string())?;
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|e| e.to_string())
+        }));
+        supervisor.entries.insert(key.clone(), entry.clone());
+        // Pending writes are visible before the original monitor finishes.
+        // A poll in either publication window cannot race its old result.
+        supervisor.retry_known_cleanup(root.path(), &key, &entry)?;
+        assert!(directory.join(".physical-owner-intent.json").is_file());
+        entry.phase.store(
+            super::PHASE_CLEANUP_FAILED,
+            std::sync::atomic::Ordering::Release,
+        );
+        supervisor.retry_known_cleanup(root.path(), &key, &entry)?;
+        assert!(directory.join(".physical-owner-intent.json").is_file());
+        *entry.terminal.lock().unwrap_or_else(|e| e.into_inner()) = Some(
+            super::AnalysisTaskTerminal::CleanupFailed("original durable write failed".to_string()),
+        );
+        let owner = supervisor.clone();
+        let entry_a = entry.clone();
+        let key_a = key.clone();
+        let data_root = root.path().to_path_buf();
+        let first =
+            std::thread::spawn(move || owner.retry_known_cleanup(&data_root, &key_a, &entry_a));
+        entered_rx.recv_timeout(std::time::Duration::from_secs(5))?;
+        let original_claim_held = matches!(
+            entry.cleanup_evidence.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        release_tx.send(())?;
+        first
+            .join()
+            .map_err(|_| "cleanup observer thread panicked")??;
+        assert!(
+            original_claim_held,
+            "an in-flight cleanup observer must not expose its pending write authority"
+        );
+        let new_intent = serde_json::json!({"run_id":"replacement-run","analysis_id":id,"workspace_generation":"generation-a","owner_id":"replacement-owner","execution_id":null});
+        let original_new_bytes = serde_json::to_vec(&new_intent)?;
+        std::fs::write(
+            directory.join(".physical-owner-intent.json"),
+            &original_new_bytes,
+        )?;
+        std::fs::write(directory.join("result.json"), "中文🙂 replacement output")?;
+        let replacement = analysis_entry("replacement-owner");
+        supervisor.entries.insert(key.clone(), replacement.clone());
+        // A second observer of the old entry sees cleanup already consumed.
+        supervisor.retry_known_cleanup(root.path(), &key, &entry)?;
+        assert_eq!(
+            std::fs::read(directory.join(".physical-owner-intent.json"))?,
+            original_new_bytes
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("result.json"))?,
+            "中文🙂 replacement output"
+        );
+        assert!(
+            supervisor
+                .entries
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current.value(), &replacement))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn stale_analysis_cleanup_does_not_remove_replacement_owner() {
         let entries = dashmap::DashMap::new();
         let key = super::analysis_cancel_key("workspace-a", "shared");
@@ -1753,6 +2408,13 @@ mod tests {
             phase: std::sync::atomic::AtomicU8::new(super::PHASE_STARTED),
             exclusive: false,
             terminal: std::sync::Mutex::new(None),
+            retained_resources: std::sync::Mutex::new(Vec::new()),
+            cleanup_evidence: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            cleanup_test_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            before_terminal_publication: std::sync::Mutex::new(None),
+            retained_flow: std::sync::Mutex::new(None),
             _monitor: std::sync::Mutex::new(None),
             settled: tokio::sync::Notify::new(),
         })

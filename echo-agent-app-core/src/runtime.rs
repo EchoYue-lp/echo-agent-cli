@@ -19,6 +19,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use futures::FutureExt;
+
 use crate::agent_handle::AgentHandle;
 use crate::config::EkoConfig;
 use crate::evolution::ReviewIntegration;
@@ -57,12 +59,32 @@ pub struct ApplicationLifecycleFailure {
 /// Typed aggregate returned by every EKO root (GUI, TUI, CLI/JSONL, channel).
 /// A primary surface/bootstrap error is kept separate from teardown failures so
 /// launchers never mistake a failed application for a successful cleanup.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ApplicationLifecycleReceipt {
     pub reason: ApplicationLifecycleReason,
     pub primary_error: Option<String>,
     pub failures: Vec<ApplicationLifecycleFailure>,
+    // Rust ownership only; public diagnostic fields and wire shapes are unchanged.
+    continuation: Option<Arc<ApplicationLifecycleRetention>>,
 }
+
+impl std::fmt::Debug for ApplicationLifecycleReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApplicationLifecycleReceipt")
+            .field("reason", &self.reason)
+            .field("primary_error", &self.primary_error)
+            .field("failures", &self.failures)
+            .finish()
+    }
+}
+impl PartialEq for ApplicationLifecycleReceipt {
+    fn eq(&self, other: &Self) -> bool {
+        self.reason == other.reason
+            && self.primary_error == other.primary_error
+            && self.failures == other.failures
+    }
+}
+impl Eq for ApplicationLifecycleReceipt {}
 
 impl ApplicationLifecycleReceipt {
     fn new(reason: ApplicationLifecycleReason, primary_error: Option<anyhow::Error>) -> Self {
@@ -70,6 +92,7 @@ impl ApplicationLifecycleReceipt {
             reason,
             primary_error: primary_error.map(|error| error.to_string()),
             failures: Vec::new(),
+            continuation: None,
         }
     }
 
@@ -81,7 +104,19 @@ impl ApplicationLifecycleReceipt {
     }
 
     pub fn is_clean(&self) -> bool {
-        self.primary_error.is_none() && self.failures.is_empty()
+        self.continuation.is_none() && self.primary_error.is_none() && self.failures.is_empty()
+    }
+
+    fn record_retained(&mut self, owner: impl Into<String>, error: impl std::fmt::Display) {
+        let failure = ApplicationLifecycleFailure {
+            owner: owner.into(),
+            error: error.to_string(),
+        };
+        // Re-observing the same retained owner does not append the same
+        // diagnostic forever. Original normal-phase failure ordering is kept.
+        if !self.failures.contains(&failure) {
+            self.failures.push(failure);
+        }
     }
 
     pub fn into_result(self) -> Result<(), ApplicationLifecycleError> {
@@ -151,18 +186,205 @@ struct ApplicationExternalOwner {
     name: String,
     begin: Option<ApplicationLifecycleBegin>,
     join: ApplicationLifecycleJoin,
+    join_panicked: bool,
+}
+
+#[derive(Clone)]
+struct LifecyclePublication {
+    receipt: ApplicationLifecycleReceipt,
+    final_receipt: bool,
+}
+
+#[derive(Default)]
+struct LifecycleContinuationState {
+    owner: Option<(ApplicationLifecycleOwner, ApplicationLifecycleReceipt)>,
+    polling: bool,
+    revision: u64,
+}
+
+/// Private resource projection of the original application-generation owner.
+/// Child registries hold Weak links only; no cached publication owns this root.
+pub(crate) struct ApplicationLifecycleRetention {
+    state: std::sync::Mutex<LifecycleContinuationState>,
+    publications: tokio::sync::watch::Sender<Option<LifecyclePublication>>,
+    driver_resources:
+        std::sync::Mutex<Vec<Arc<crate::tasks::task_runtime::store::RunDriverResources>>>,
+    claimed: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    before_no_runtime_publication: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl ApplicationLifecycleRetention {
+    #[cfg(test)]
+    pub(crate) fn resource_scope_for_test() -> Arc<Self> {
+        Self::new()
+    }
+
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new(LifecycleContinuationState::default()),
+            publications: tokio::sync::watch::channel(None).0,
+            driver_resources: std::sync::Mutex::new(Vec::new()),
+            claimed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            before_no_runtime_publication: std::sync::Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn retain_driver(
+        &self,
+        resources: Arc<crate::tasks::task_runtime::store::RunDriverResources>,
+    ) {
+        let mut owned = self
+            .driver_resources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        owned.retain(|current| !current.is_released());
+        owned.push(resources);
+    }
+
+    pub(crate) fn release_driver(
+        self: &Arc<Self>,
+        resources: &Arc<crate::tasks::task_runtime::store::RunDriverResources>,
+    ) {
+        self.driver_resources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|current| !Arc::ptr_eq(current, resources));
+        self.note_progress();
+    }
+
+    pub(crate) fn note_progress(self: &Arc<Self>) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.revision = state.revision.saturating_add(1);
+        }
+        self.kick();
+    }
+
+    fn kick(self: &Arc<Self>) {
+        let (owner, receipt, revision) = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.polling {
+                return;
+            }
+            let Some((owner, receipt)) = state.owner.take() else {
+                return;
+            };
+            state.polling = true;
+            (owner, receipt, state.revision)
+        };
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let mut observation = receipt.clone();
+                observation.record(
+                    "application lifecycle",
+                    format!("settlement requires a Tokio runtime: {error}"),
+                );
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                state.owner = Some((owner, receipt));
+                drop(state);
+                #[cfg(test)]
+                {
+                    let hook = self
+                        .before_no_runtime_publication
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                self.publications.send_replace(Some(LifecyclePublication {
+                    receipt: observation,
+                    final_receipt: false,
+                }));
+                // Publication is inside the same single-flight claim even
+                // when this caller has no Tokio runtime.
+                let retry = {
+                    let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                    state.polling = false;
+                    state.revision != revision
+                };
+                if retry {
+                    self.kick();
+                }
+                return;
+            }
+        };
+        let root = self.clone();
+        let poll: futures::future::BoxFuture<'static, ()> = Box::pin(async move {
+            // Borrow the original Owner across cleanup. Unwinding a foreign
+            // future must not consume/drop all the other retained resources.
+            let mut owner = owner;
+            let mut fallback = receipt.clone();
+            let (retained, mut receipt) =
+                match std::panic::AssertUnwindSafe(owner.join_owned(receipt))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        owner.cleanup_panicked = true;
+                        fallback.record_retained(
+                            "application lifecycle",
+                            "original cleanup panicked; ownership remains unknown and retained",
+                        );
+                        (true, fallback)
+                    }
+                };
+            receipt.continuation = None;
+            let final_receipt = !retained;
+            {
+                let mut state = root.state.lock().unwrap_or_else(|error| error.into_inner());
+                if retained {
+                    state.owner = Some((owner, receipt.clone()));
+                }
+                // Keep the single-flight claim until publication. Otherwise a
+                // new progress callback could publish final, then be overwritten
+                // by this older retained observation.
+            }
+            root.publications.send_replace(Some(LifecyclePublication {
+                receipt,
+                final_receipt,
+            }));
+            let retry = {
+                let mut state = root.state.lock().unwrap_or_else(|error| error.into_inner());
+                state.polling = false;
+                !final_receipt && state.revision != revision
+            };
+            // One AgentRuntime is one application generation. Keep its owner
+            // admission sealed; repeated observers use this same publication,
+            // never a new generation on a channel still held by old observers.
+            if retry {
+                root.kick();
+            }
+        });
+        runtime.spawn(poll);
+    }
 }
 
 #[derive(Clone)]
 pub struct ApplicationLifecycleSettlement {
-    result: tokio::sync::watch::Receiver<Option<ApplicationLifecycleReceipt>>,
+    result: tokio::sync::watch::Receiver<Option<LifecyclePublication>>,
     fallback: ApplicationLifecycleReceipt,
+    retention: Arc<ApplicationLifecycleRetention>,
 }
 
 impl ApplicationLifecycleSettlement {
     pub async fn wait(mut self) -> ApplicationLifecycleReceipt {
+        if self.result.borrow().is_some() {
+            self.retention.note_progress();
+        } else {
+            self.retention.kick();
+        }
         loop {
-            if let Some(receipt) = self.result.borrow().clone() {
+            if let Some(publication) = self.result.borrow().clone() {
+                let mut receipt = publication.receipt;
+                if !publication.final_receipt {
+                    receipt.continuation = Some(self.retention.clone());
+                }
                 return receipt;
             }
             if self.result.changed().await.is_err() {
@@ -171,6 +393,7 @@ impl ApplicationLifecycleSettlement {
                     "application lifecycle",
                     "settlement owner ended before publishing its receipt",
                 );
+                fallback.continuation = Some(self.retention);
                 return fallback;
             }
         }
@@ -184,6 +407,14 @@ impl ApplicationLifecycleSettlement {
 /// strict two-phase boundary: first close admission/broadcast cancellation,
 /// then await every accepted owner and aggregate all failures.
 pub struct ApplicationLifecycleOwner {
+    retention: std::sync::Weak<ApplicationLifecycleRetention>,
+    // Present only before start_join transfers the strong root to the real
+    // producer/Settlement; always None while this Owner is stored in root.
+    initial_retention: Option<Arc<ApplicationLifecycleRetention>>,
+    normal_drained: bool,
+    begin_receipt: Option<ApplicationLifecycleReceipt>,
+    primary_closed: bool,
+    cleanup_panicked: bool,
     root_cancel: tokio_util::sync::CancellationToken,
     app_state: Option<Arc<AppState>>,
     primary_agent: Option<AgentHandle>,
@@ -209,7 +440,24 @@ pub struct ApplicationLifecycleOwner {
 
 impl ApplicationLifecycleOwner {
     pub fn new(root_cancel: tokio_util::sync::CancellationToken) -> Self {
+        let retention = ApplicationLifecycleRetention::new();
+        retention
+            .claimed
+            .store(true, std::sync::atomic::Ordering::Release);
+        Self::with_retention(root_cancel, retention)
+    }
+
+    fn with_retention(
+        root_cancel: tokio_util::sync::CancellationToken,
+        retention: Arc<ApplicationLifecycleRetention>,
+    ) -> Self {
         Self {
+            retention: Arc::downgrade(&retention),
+            initial_retention: Some(retention),
+            normal_drained: false,
+            begin_receipt: None,
+            primary_closed: false,
+            cleanup_panicked: false,
             root_cancel,
             app_state: None,
             primary_agent: None,
@@ -233,6 +481,14 @@ impl ApplicationLifecycleOwner {
     }
 
     pub fn bind_app_state(&mut self, state: Arc<AppState>) {
+        if let Some(root) = self.retention.upgrade() {
+            state.workspace.runtimes.bind_lifecycle_retention(&root);
+            state
+                .session
+                .foreground_turns
+                .bind_lifecycle_retention(&root);
+            state.session.analysis_runs.bind_lifecycle_retention(&root);
+        }
         self.app_state = Some(state);
     }
 
@@ -241,10 +497,16 @@ impl ApplicationLifecycleOwner {
     }
 
     pub fn bind_pool(&mut self, pool: Arc<crate::agent_pool::AgentPool>) {
+        if let Some(root) = self.retention.upgrade() {
+            pool.bind_lifecycle_retention(&root);
+        }
         self.pool = Some(pool);
     }
 
     pub fn bind_task_runtime(&mut self, store: Arc<crate::tasks::task_runtime::TaskRuntimeStore>) {
+        if let Some(root) = self.retention.upgrade() {
+            store.bind_lifecycle_retention(&root);
+        }
         self.task_runtime_store = Some(store);
     }
 
@@ -288,6 +550,9 @@ impl ApplicationLifecycleOwner {
         &mut self,
         product_data_io: crate::product_data_io::ProductDataIoService,
     ) {
+        if let Some(root) = self.retention.upgrade() {
+            product_data_io.bind_lifecycle_retention(&root);
+        }
         self.product_data_io = Some(product_data_io);
     }
 
@@ -330,6 +595,7 @@ impl ApplicationLifecycleOwner {
             name: name.into(),
             begin: Some(Box::new(begin)),
             join: Box::pin(join),
+            join_panicked: false,
         });
     }
 
@@ -398,6 +664,10 @@ impl ApplicationLifecycleOwner {
                 receipt.record(owner.name.clone(), error);
             }
         }
+        // Metadata only: never cache a root-bearing public observation here.
+        let mut begun = receipt.clone();
+        begun.continuation = None;
+        self.begin_receipt = Some(begun);
         receipt
     }
 
@@ -406,28 +676,32 @@ impl ApplicationLifecycleOwner {
     /// cannot abandon shutdown or its typed receipt.
     pub fn start_join(
         mut self,
-        receipt: ApplicationLifecycleReceipt,
+        mut receipt: ApplicationLifecycleReceipt,
     ) -> ApplicationLifecycleSettlement {
         self.armed = false;
+        let retention = self
+            .initial_retention
+            .take()
+            .or_else(|| self.retention.upgrade())
+            .unwrap_or_else(ApplicationLifecycleRetention::new);
+        self.retention = Arc::downgrade(&retention);
+        receipt.continuation = None;
         let fallback = receipt.clone();
-        let (result_tx, result) = tokio::sync::watch::channel(None);
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                runtime.spawn(async move {
-                    let receipt = self.join_owned(receipt).await;
-                    result_tx.send_replace(Some(receipt));
-                });
-            }
-            Err(error) => {
-                let mut receipt = receipt;
-                receipt.record(
-                    "application lifecycle",
-                    format!("settlement requires a Tokio runtime: {error}"),
-                );
-                result_tx.send_replace(Some(receipt));
-            }
+        let result = retention.publications.subscribe();
+        retention.publications.send_replace(None);
+        {
+            let mut state = retention
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.owner = Some((self, receipt));
         }
-        ApplicationLifecycleSettlement { result, fallback }
+        retention.kick();
+        ApplicationLifecycleSettlement {
+            result,
+            fallback,
+            retention,
+        }
     }
 
     /// Await all work accepted before [`Self::begin_shutdown`]. Earlier failures
@@ -437,9 +711,16 @@ impl ApplicationLifecycleOwner {
     }
 
     async fn join_owned(
-        mut self,
+        &mut self,
         mut receipt: ApplicationLifecycleReceipt,
-    ) -> ApplicationLifecycleReceipt {
+    ) -> (bool, ApplicationLifecycleReceipt) {
+        if self.cleanup_panicked {
+            receipt.record_retained(
+                "application lifecycle",
+                "original cleanup panicked; no physical completion evidence",
+            );
+            return (true, receipt);
+        }
         if !self.shutdown_begun {
             receipt.record(
                 "application lifecycle",
@@ -449,69 +730,96 @@ impl ApplicationLifecycleOwner {
             receipt.failures.extend(begin_receipt.failures);
         }
 
-        // Phase two: settle accepted work. Continue after every failure so one
-        // broken owner cannot suppress cleanup of later process resources.
-        if let Some(state) = self.app_state.as_ref() {
-            if let Err(error) = state.shutdown_agent_deliveries().await {
-                receipt.record("Agent deliveries", error);
+        if !self.normal_drained {
+            // Phase two: settle accepted work. Continue after every failure so one
+            // broken owner cannot suppress cleanup of later process resources.
+            if let Some(state) = self.app_state.as_ref() {
+                if let Err(error) = state.shutdown_agent_deliveries().await {
+                    receipt.record("Agent deliveries", error);
+                }
+                if let Err(error) = state.session.foreground_turns.shutdown().await {
+                    receipt.record("foreground turns", error);
+                }
+                record_analysis_cleanup_outcomes(
+                    &mut receipt,
+                    state.join_analysis_run_shutdown().await,
+                );
+                if let Err(error) = state.shutdown_model_mutations().await {
+                    receipt.record("model mutations", error);
+                }
             }
-            if let Err(error) = state.session.foreground_turns.shutdown().await {
-                receipt.record("foreground turns", error);
-            }
-            record_analysis_cleanup_outcomes(
-                &mut receipt,
-                state.join_analysis_run_shutdown().await,
-            );
-            if let Err(error) = state.shutdown_model_mutations().await {
-                receipt.record("model mutations", error);
-            }
-        }
 
-        for task in std::mem::take(&mut self.background_tasks) {
-            if let Err(error) = task.handle.await {
-                receipt.record(task.name, error);
+            for task in std::mem::take(&mut self.background_tasks) {
+                if let Err(error) = task.handle.await {
+                    receipt.record(task.name, error);
+                }
             }
-        }
-        for owner in std::mem::take(&mut self.external_owners) {
-            if let Err(error) = owner.join.await {
-                receipt.record(owner.name, error);
+            for owner in &mut self.external_owners {
+                // Do not additionally drop the poisoned future or the original
+                // outer Owner/bundles. Foreign unwind may already have destroyed
+                // its own internal locals; that is not recoverable proof.
+                // Never repoll this future.
+                match std::panic::AssertUnwindSafe(owner.join.as_mut())
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => receipt.record(owner.name.clone(), error),
+                    Err(_) => {
+                        owner.join_panicked = true;
+                        receipt.record_retained(owner.name.clone(), "original external owner join panicked; resources retained without a physical receipt");
+                    }
+                }
             }
-        }
-        if let Some(integration) = self.review_integration.as_ref()
-            && let Err(error) = integration.shutdown_background_reviews().await
-        {
-            receipt.record("background reviews", error);
-        }
-        if let Some(state) = self.app_state.as_ref() {
-            if let Err(error) = state.join_workspace_transition().await {
-                receipt.record("workspace transition", error);
+            self.external_owners.retain(|owner| owner.join_panicked);
+            if let Some(integration) = self.review_integration.as_ref()
+                && let Err(error) = integration.shutdown_background_reviews().await
+            {
+                receipt.record("background reviews", error);
             }
-            if let Err(error) = state.shutdown_scheduler().await {
-                receipt.record("scheduler", error);
+            if let Some(state) = self.app_state.as_ref() {
+                if let Err(error) = state.join_workspace_transition().await {
+                    receipt.record("workspace transition", error);
+                }
+                if let Err(error) = state.shutdown_scheduler().await {
+                    receipt.record("scheduler", error);
+                }
             }
-        }
 
-        if let Some(store) = self.task_runtime_store.as_ref() {
-            if let Err(error) = store.shutdown_run_drivers().await {
-                receipt.record("TaskRun drivers", error);
+            if let Some(store) = self.task_runtime_store.as_ref() {
+                if let Err(error) = store.shutdown_run_drivers().await {
+                    receipt.record("TaskRun drivers", error);
+                }
+                if let Err(error) = store.shutdown_operations().await {
+                    receipt.record("TaskRuntime operations", error);
+                }
+                if let Err(error) = store.shutdown_hook_events().await {
+                    receipt.record("task hook dispatcher", error);
+                }
             }
-            if let Err(error) = store.shutdown_operations().await {
-                receipt.record("TaskRuntime operations", error);
-            }
-            if let Err(error) = store.shutdown_hook_events().await {
-                receipt.record("task hook dispatcher", error);
-            }
-        }
-        // Bootstrap rollback has no AppState yet. The command service owns a
-        // ProductData flow, so both paths must settle it before the aggregate join.
-        if let Some(state) = self.app_state.as_ref() {
-            if let Err(error) = state.shutdown_command_cells().await {
+            // Bootstrap rollback has no AppState yet. The command service owns a
+            // ProductData flow, so both paths must settle it before the aggregate join.
+            if let Some(state) = self.app_state.as_ref() {
+                if let Err(error) = state.shutdown_command_cells().await {
+                    receipt.record("command cells", error);
+                }
+            } else if let Some(runtime) = self.command_cell_runtime.as_ref()
+                && let Err(error) = runtime.shutdown().await
+            {
                 receipt.record("command cells", error);
             }
-        } else if let Some(runtime) = self.command_cell_runtime.as_ref()
-            && let Err(error) = runtime.shutdown().await
-        {
-            receipt.record("command cells", error);
+            self.normal_drained = true;
+        }
+        // A resumed owner retries only original known cleanup debt, never Agent work.
+        if let Some(store) = self.task_runtime_store.as_ref() {
+            if let Err(error) = store.retry_run_settlement_debts().await {
+                receipt.record_retained("TaskRun cleanup debt", error);
+            }
+        }
+        if let Some(state) = self.app_state.as_ref() {
+            for error in state.session.analysis_runs.retry_retained_cleanup() {
+                receipt.record_retained("analysis original cleanup debt", error);
+            }
         }
         // Product-data admission was sealed in phase one. Extension mutations
         // hold an owned flow while their durable commit and specialist fanout
@@ -520,7 +828,64 @@ impl ApplicationLifecycleOwner {
         if let Some(product_data_io) = self.product_data_io.as_ref()
             && let Err(error) = product_data_io.join_shutdown().await
         {
-            receipt.record("product-data I/O", error);
+            receipt.record_retained("product-data I/O", error);
+        }
+        // Stop the producer that can mutate Agent configuration before asking
+        // the same Agent's close authority to drain. Tool/plugin/MCP/browser
+        // dependencies themselves stay alive until that close actually succeeds.
+        if let Some(watcher) = self.config_watcher.take() {
+            if let Err(error) = watcher.shutdown().await {
+                receipt.record_retained("config watcher", error);
+            }
+        }
+        let mut uncertain = self.external_owners.iter().any(|owner| owner.join_panicked);
+        if let Some(state) = self.app_state.as_ref() {
+            if let Err(error) = state.workspace.runtimes.join_known_shutdown().await {
+                receipt.record_retained("workspace execution owners", error);
+            }
+            uncertain |= state.session.foreground_turns.has_retained_observation();
+            uncertain |= state.session.analysis_runs.has_retained_owners();
+            uncertain |= state.workspace.runtimes.has_unsettled_owners().await;
+        }
+        if let Some(store) = self.task_runtime_store.as_ref() {
+            uncertain |= store.has_unsettled_driver_resources();
+        }
+        if let Some(pool) = self.pool.as_ref() {
+            if let Err(error) = pool.join_known_executions().await {
+                receipt.record_retained("AgentPool original owners", error);
+            }
+            uncertain |= pool.has_unsettled_executions();
+        }
+        if let Some(io) = self.product_data_io.as_ref() {
+            uncertain |= io.has_unsettled_flows();
+        }
+        // A shared Agent/ToolManager is a dependency of an uncertain original
+        // execution. Do not close it merely to manufacture a drained receipt.
+        // Independent C flows/leases/hosts above still received their real joins.
+        if !uncertain && !self.primary_closed {
+            if let Some(agent) = self.primary_agent.as_ref() {
+                match agent
+                    .read_async(|agent| Box::pin(async move { agent.close().await }))
+                    .await
+                {
+                    Ok(()) => self.primary_closed = true,
+                    Err(error) => {
+                        uncertain = true;
+                        receipt.record_retained("primary Agent original close", error);
+                    }
+                }
+            } else {
+                self.primary_closed = true;
+            }
+        }
+        if uncertain {
+            receipt.record_retained(
+                "application lifecycle",
+                "original execution ownership is not physically settled; resources retained",
+            );
+            // Keep the original Owner, AppState and dependency resources; the
+            // publication is observation only, never a final drained receipt.
+            return (true, receipt);
         }
         #[cfg(test)]
         if let Some(started) = self.specialist_teardown_started.take() {
@@ -547,30 +912,18 @@ impl ApplicationLifecycleOwner {
         {
             receipt.record("plugin runtime", error);
         }
-        if let Some(watcher) = self.config_watcher.as_ref()
-            && let Err(error) = watcher.shutdown().await
-        {
-            receipt.record("config watcher", error);
-        }
         if let Some(runtime) = self.mcp_config_runtime.as_ref() {
             runtime.shutdown().await;
         }
         if let Some(runtime) = self.browser_runtime.as_ref() {
             runtime.shutdown().await;
         }
-        if let Some(agent) = self.primary_agent.as_ref()
-            && let Err(error) = agent
-                .read_async(|agent| Box::pin(async move { agent.close().await }))
-                .await
-        {
-            receipt.record("primary Agent", error);
-        }
         if let Some(service) = self.subagent_projection.as_ref()
             && let Err(error) = service.shutdown_and_join().await
         {
             receipt.record("Subagent event projection", error);
         }
-        receipt
+        (false, receipt)
     }
 
     pub async fn settle(
@@ -588,14 +941,29 @@ impl Drop for ApplicationLifecycleOwner {
         if !self.armed {
             return;
         }
-        self.root_cancel.cancel();
-        for task in self.background_tasks.drain(..) {
-            task.handle.abort();
-        }
-        if let Some(service) = self.subagent_projection.as_ref() {
-            service.abort();
-        }
-        self.external_owners.clear();
+        // Armed owners still hold their initial root. A cancelled bootstrap or
+        // owning surface future must hand the ORIGINAL value into real cleanup,
+        // not abort tasks and then mistake Drop for physical completion.
+        let root = self
+            .initial_retention
+            .clone()
+            .or_else(|| self.retention.upgrade());
+        let Some(root) = root else {
+            self.root_cancel.cancel();
+            return;
+        };
+        let mut empty = Self::with_retention(self.root_cancel.clone(), root);
+        empty.armed = false;
+        let mut original = std::mem::replace(self, empty);
+        original.armed = false;
+        let receipt = if original.shutdown_begun {
+            original.begin_receipt.take().unwrap_or_else(|| {
+                ApplicationLifecycleReceipt::new(ApplicationLifecycleReason::Shutdown, None)
+            })
+        } else {
+            original.begin_shutdown(ApplicationLifecycleReason::Shutdown, None)
+        };
+        let _settlement = original.start_join(receipt);
     }
 }
 
@@ -603,6 +971,7 @@ impl Drop for ApplicationLifecycleOwner {
 ///
 /// Created once at application startup and lives for the entire process lifetime.
 pub struct AgentRuntime {
+    lifecycle_retention: Arc<ApplicationLifecycleRetention>,
     pub agent_handle: AgentHandle,
     pub model_consumers: crate::infra::AgentModelConsumers,
     pub hitl_dispatcher: Arc<HitlDispatcher>,
@@ -656,6 +1025,17 @@ pub struct ApplicationServices {
     pub subagent_projection:
         Arc<crate::subagent_event_projection::SubagentEnvelopeProjectionService>,
     lifecycle: Option<ApplicationLifecycleOwner>,
+    lifecycle_retention: Arc<ApplicationLifecycleRetention>,
+}
+
+impl Drop for ApplicationServices {
+    fn drop(&mut self) {
+        // Owner::drop transfers its original fields/receipt into real cleanup.
+        // This also covers an owning join/settle future dropped before poll.
+        if let Some(owner) = self.lifecycle.take() {
+            drop(owner);
+        }
+    }
 }
 
 impl ApplicationServices {
@@ -671,7 +1051,7 @@ impl ApplicationServices {
         initial_pool_permission: echo_agent::tools::permission::PermissionMode,
     ) -> anyhow::Result<Self> {
         let root_cancel = tokio_util::sync::CancellationToken::new();
-        let mut lifecycle = runtime.lifecycle_owner(root_cancel.clone());
+        let mut lifecycle = runtime.lifecycle_owner(root_cancel.clone())?;
         infra::inject_conversation_store(&runtime.agent_handle, &conversation_store);
 
         let webhook_emitter = Arc::new(crate::webhook::WebhookEmitter::from_config(
@@ -865,6 +1245,7 @@ impl ApplicationServices {
             pool,
             subagent_projection,
             lifecycle: Some(lifecycle),
+            lifecycle_retention: runtime.lifecycle_retention.clone(),
         })
     }
 
@@ -903,6 +1284,7 @@ impl ApplicationServices {
         mut self,
         mut receipt: ApplicationLifecycleReceipt,
     ) -> ApplicationLifecycleReceipt {
+        let _original_root = self.lifecycle_retention.clone();
         match self.lifecycle.take() {
             Some(lifecycle) => lifecycle.join(receipt).await,
             None => {
@@ -917,6 +1299,7 @@ impl ApplicationServices {
         reason: ApplicationLifecycleReason,
         primary_error: Option<anyhow::Error>,
     ) -> ApplicationLifecycleReceipt {
+        let _original_root = self.lifecycle_retention.clone();
         match self.lifecycle.take() {
             Some(lifecycle) => lifecycle.settle(reason, primary_error).await,
             None => {
@@ -946,8 +1329,35 @@ impl AgentRuntime {
     pub fn lifecycle_owner(
         &self,
         root_cancel: tokio_util::sync::CancellationToken,
-    ) -> ApplicationLifecycleOwner {
-        let mut owner = ApplicationLifecycleOwner::new(root_cancel);
+    ) -> anyhow::Result<ApplicationLifecycleOwner> {
+        if self
+            .lifecycle_retention
+            .claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            let mut receipt = self
+                .lifecycle_retention
+                .publications
+                .borrow()
+                .as_ref()
+                .map(|publication| publication.receipt.clone())
+                .unwrap_or_else(|| {
+                    ApplicationLifecycleReceipt::new(ApplicationLifecycleReason::Shutdown, None)
+                });
+            receipt.record("application generation", "lifecycle owner was already established; observe its original settlement instead of admitting another owner");
+            receipt.continuation = Some(self.lifecycle_retention.clone());
+            return Err(anyhow::Error::new(receipt.into_error()));
+        }
+        let mut owner = ApplicationLifecycleOwner::with_retention(
+            root_cancel,
+            self.lifecycle_retention.clone(),
+        );
         owner.bind_primary_agent(self.agent_handle.clone());
         owner.bind_plugin_runtime(self.plugin_runtime.clone());
         owner.bind_mcp_config_runtime(self.mcp_config_runtime.clone());
@@ -957,7 +1367,7 @@ impl AgentRuntime {
         if let Some(integration) = self.review_integration.as_ref() {
             owner.bind_review_integration(integration.clone());
         }
-        owner
+        Ok(owner)
     }
 
     /// Bootstrap the agent runtime.
@@ -1394,9 +1804,17 @@ impl AgentRuntime {
         // plugin publications reuse this exact builder for primary and pool.
         let keyword_classifier = agent_handle.write(configure_intent_router).await;
 
+        let lifecycle_retention = bootstrap_lifecycle
+            .retention
+            .upgrade()
+            .unwrap_or_else(ApplicationLifecycleRetention::new);
+        lifecycle_retention
+            .claimed
+            .store(false, std::sync::atomic::Ordering::Release);
         bootstrap_lifecycle.disarm();
 
         Ok(Self {
+            lifecycle_retention,
             agent_handle,
             model_consumers,
             hitl_dispatcher,
@@ -1782,7 +2200,7 @@ mod tests {
             projected_test_instructions(&future_workspace_agent).await,
         ];
         hosts.shutdown().await?;
-        let mut lifecycle = runtime.lifecycle_owner(tokio_util::sync::CancellationToken::new());
+        let mut lifecycle = runtime.lifecycle_owner(tokio_util::sync::CancellationToken::new())?;
         lifecycle.bind_pool(pool);
         lifecycle
             .settle(ApplicationLifecycleReason::Shutdown, None)
@@ -1952,7 +2370,7 @@ mod tests {
             Some(ReviewTerminal::Interrupted { .. })
         ));
         runtime
-            .lifecycle_owner(tokio_util::sync::CancellationToken::new())
+            .lifecycle_owner(tokio_util::sync::CancellationToken::new())?
             .settle(ApplicationLifecycleReason::Shutdown, None)
             .await
             .into_result()?;
@@ -1994,7 +2412,7 @@ mod tests {
         let error = match bootstrap_review_fixture(Some(workspace.root), temp.path()).await {
             Ok(runtime) => {
                 runtime
-                    .lifecycle_owner(tokio_util::sync::CancellationToken::new())
+                    .lifecycle_owner(tokio_util::sync::CancellationToken::new())?
                     .settle(ApplicationLifecycleReason::Shutdown, None)
                     .await
                     .into_result()?;
@@ -2120,7 +2538,7 @@ mod tests {
         };
         let runtime = bootstrap_review_fixture(None, &PathBuf::from(fixture_dir)).await?;
         runtime
-            .lifecycle_owner(tokio_util::sync::CancellationToken::new())
+            .lifecycle_owner(tokio_util::sync::CancellationToken::new())?
             .settle(ApplicationLifecycleReason::Shutdown, None)
             .await
             .into_result()?;
@@ -2350,6 +2768,519 @@ mod tests {
         if !receipt.is_clean() {
             return Err(format!("unexpected lifecycle receipt: {receipt}"));
         }
+        Ok(())
+    }
+
+    struct RootDropProof(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for RootDropProof {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl crate::tasks::task_runtime::store::RunDriverExecutionReceipt for RootDropProof {
+        fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
+            Box::pin(async move {
+                drop(self);
+            })
+        }
+    }
+
+    async fn runtime_services_for_retention_test()
+    -> anyhow::Result<(tempfile::TempDir, AgentRuntime, ApplicationServices)> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project)?;
+        let mut config = EkoConfig::default();
+        config.model.default_model_id = Some("fixture:test-model".to_string());
+        config.model_providers.insert(
+            "fixture".to_string(),
+            crate::config::ModelProviderConfig {
+                base_url: Some("http://127.0.0.1:9/v1".to_string()),
+                requires_api_key: false,
+                ..Default::default()
+            },
+        );
+        config
+            .configured_models
+            .push(crate::config::ConfiguredModel {
+                id: "fixture:test-model".to_string(),
+                provider: "fixture".to_string(),
+                model: "test-model".to_string(),
+                ..Default::default()
+            });
+        let browser = crate::browser::BrowserRuntime::start(crate::browser::BrowserConfig {
+            enabled: false,
+            extension_enabled: false,
+            session_dir: temp.path().join("browser"),
+            ..Default::default()
+        })
+        .await;
+        let runtime = AgentRuntime::bootstrap(
+            &config,
+            AgentCreateParams {
+                working_dir: Some(project),
+                browser_runtime: Some(browser),
+                ..Default::default()
+            },
+            temp.path().join("missing-mcp.json"),
+        )
+        .await?;
+        let services = ApplicationServices::compose(
+            &runtime,
+            None,
+            None,
+            echo_agent::tools::permission::PermissionMode::Default,
+        )
+        .await?;
+        Ok((temp, runtime, services))
+    }
+
+    #[tokio::test]
+    async fn aggregate_no_runtime_observation_keeps_single_flight_until_publication()
+    -> anyhow::Result<()> {
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        let receipt = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        let root = owner
+            .initial_retention
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("original root missing"))?;
+        owner.armed = false;
+        root.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .owner = Some((owner, receipt));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *root
+            .before_no_runtime_publication
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Box::new(move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        }));
+        let foreign = root.clone();
+        let thread = std::thread::spawn(move || foreign.kick());
+        entered_rx.await?;
+        root.note_progress();
+        tokio::task::yield_now().await;
+        assert!(
+            root.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .polling
+        );
+        assert!(root.publications.borrow().is_none());
+        release_tx.send(())?;
+        thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("test owner thread panicked"))?;
+        root.kick();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !root
+                .publications
+                .borrow()
+                .as_ref()
+                .is_some_and(|published| published.final_receipt)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(
+            root.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .owner
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_foreign_join_unwind_retains_explicit_bundle_and_drains_later_owner()
+    -> anyhow::Result<()> {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let original = RootDropProof(dropped.clone());
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completion = completed.clone();
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        let store = Arc::new(crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()?);
+        owner.bind_task_runtime(store.clone());
+        store.create_run(
+            "panic-original",
+            "global",
+            "conversation",
+            "message",
+            crate::tasks::task_runtime::DomainProfile::General,
+            "goal",
+            "task",
+            crate::tasks::task_runtime::AttendedMode::Attended,
+        )?;
+        store.transition_run(
+            "panic-original",
+            crate::tasks::task_runtime::TaskRunStatus::Running,
+        )?;
+        let client =
+            Arc::new(echo_agent::testing::MockLlmClient::new().with_model_name("test-model"));
+        let agent = crate::agent_handle::AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("test-model")
+                .llm_client(client.clone())
+                .build()?,
+        );
+        let weak_agent = Arc::downgrade(agent.inner());
+        let pool =
+            Arc::new(crate::agent_pool::AgentPool::new_for_test(agent, None, None, 2, false).await);
+        pool.set_llm_client_override_for_test(client).await;
+        owner.bind_pool(pool.clone());
+        let execution = pool.acquire("panic-original").await?;
+        let explicit_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let explicit_proof = explicit_dropped.clone();
+        let admission = store.reserve_run_driver_admission(
+            "panic-original".into(),
+            echo_agent::agent::CancellationToken::new(),
+        )?;
+        let registered = store.register_observed_run_driver::<()>(
+            admission,
+            store.lease_active_workspace_generation()?,
+        )?;
+        let observed = registered
+            .start(move |mut resources| async move {
+                resources.retain(RootDropProof(explicit_proof))?;
+                resources.retain(execution)?;
+                Err(crate::chat_driver::ChatTurnError::Observation {
+                    run_id: "panic-original".into(),
+                    execution_id: None,
+                })
+            })
+            .await?;
+        assert!(matches!(
+            observed,
+            Err(crate::chat_driver::ChatTurnError::Observation { .. })
+        ));
+        owner.track_external_owner(
+            "foreign original",
+            || Ok(()),
+            futures::future::poll_fn(move |_| {
+                // This specific poll_fn fixture retains its own capture. The
+                // framework makes no such guarantee for arbitrary async unwinding.
+                std::hint::black_box(&original);
+                std::panic::resume_unwind(Box::new("actual foreign poll unwind"))
+            }),
+        );
+        owner.track_external_owner("independent actual owner", || Ok(()), async move {
+            completion.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        });
+        let receipt = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        let settlement = owner.start_join(receipt);
+        let receipt =
+            tokio::time::timeout(std::time::Duration::from_secs(2), settlement.clone().wait())
+                .await?;
+        assert!(!receipt.is_clean());
+        assert!(receipt.continuation.is_some());
+        assert!(!explicit_dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(pool.active_execution_count(), 1);
+        assert!(weak_agent.upgrade().is_some());
+        assert_eq!(
+            store
+                .active_run_driver_receipt_count()
+                .map_err(anyhow::Error::msg)?,
+            2
+        );
+        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+        let repeated =
+            tokio::time::timeout(std::time::Duration::from_secs(2), settlement.clone().wait())
+                .await?;
+        assert!(repeated.continuation.is_some());
+        assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+        // No matching proof exists: only dropping ALL test-owned roots releases
+        // captures; this is not a physical-completion or recovery assertion.
+        drop(receipt);
+        drop(repeated);
+        drop(settlement);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_analysis_final_publication_resumes_original_root_without_waiter_retry()
+    -> anyhow::Result<()> {
+        const NAME: &str = "runtime::tests::aggregate_analysis_final_publication_resumes_original_root_without_waiter_retry";
+        if run_isolated_bootstrap_test(NAME)? {
+            return Ok(());
+        }
+        let (_temp, runtime, mut services) = runtime_services_for_retention_test().await?;
+        let analysis = services.app_state.session.analysis_runs.clone();
+        let data = services
+            .app_state
+            .product_data_for_scope("global", "global")
+            .await?;
+        let (runner_release, runner_held) = tokio::sync::oneshot::channel();
+        let (at_publication, publication_held) = tokio::sync::oneshot::channel();
+        let (publish, publication_release) = tokio::sync::oneshot::channel();
+        let _original = data.start_analysis_monitor_barrier_fixture(
+            "original-monitor",
+            runner_held,
+            Box::pin(async move {
+                let _ = at_publication.send(());
+                let _ = publication_release.await;
+            }),
+        )?;
+        runner_release
+            .send(())
+            .map_err(|_| anyhow::anyhow!("original runner vanished"))?;
+        publication_held.await?;
+        let initial = services.begin_shutdown(ApplicationLifecycleReason::Shutdown, None)?;
+        // Exercise the original 30-second monitor drain budget, unchanged.
+        let observation =
+            tokio::time::timeout(std::time::Duration::from_secs(35), services.join(initial))
+                .await?;
+        let root = observation.continuation.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("root did not retain unfinished analysis publication")
+        })?;
+        assert!(
+            runtime
+                .lifecycle_retention
+                .publications
+                .borrow()
+                .as_ref()
+                .is_some_and(|published| !published.final_receipt)
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while root
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .polling
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        publish
+            .send(())
+            .map_err(|_| anyhow::anyhow!("original monitor vanished"))?;
+        // Observe the original publication only. Do not call Settlement.wait(),
+        // kick() or note_progress() to hide a missing post-commit wakeup.
+        let mut final_publication = root.publications.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if final_publication
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|publication| publication.final_receipt)
+                {
+                    break;
+                }
+                final_publication
+                    .changed()
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        assert!(!analysis.has_retained_owners());
+        drop(data);
+        drop(observation);
+        drop(runtime);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn typed_shutdown_error_alone_retains_original_root_until_matching_backend_completion()
+    -> anyhow::Result<()> {
+        const NAME: &str = "runtime::tests::typed_shutdown_error_alone_retains_original_root_until_matching_backend_completion";
+        if run_isolated_bootstrap_test(NAME)? {
+            return Ok(());
+        }
+        let (temp, runtime, mut services) = runtime_services_for_retention_test().await?;
+        let store = services
+            .app_state
+            .tasks
+            .runtime
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("store absent"))?;
+        let weak_root = Arc::downgrade(&runtime.lifecycle_retention);
+        let weak_state = Arc::downgrade(&services.app_state);
+        let weak_analysis = Arc::downgrade(&services.app_state.session.analysis_runs);
+        let weak_agent = Arc::downgrade(runtime.agent_handle.inner());
+        store.create_run(
+            "root-unknown",
+            "global",
+            "conversation",
+            "message",
+            crate::tasks::task_runtime::DomainProfile::General,
+            "goal",
+            "task",
+            crate::tasks::task_runtime::AttendedMode::Attended,
+        )?;
+        store.transition_run(
+            "root-unknown",
+            crate::tasks::task_runtime::TaskRunStatus::Running,
+        )?;
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (scope_tx, scope_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend_effects = effects.clone();
+        let backend = tokio::spawn(async move {
+            let owner = scope_rx.await?;
+            finish_rx.await?;
+            backend_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<String, tokio::sync::oneshot::error::RecvError>(owner)
+        });
+        let admission = store.reserve_run_driver_admission(
+            "root-unknown".to_string(),
+            echo_agent::agent::CancellationToken::new(),
+        )?;
+        let registration = store.register_observed_run_driver::<()>(
+            admission,
+            store.lease_active_workspace_generation()?,
+        )?;
+        let proof = dropped.clone();
+        let observed = registration
+            .start(move |mut owner| async move {
+                owner.retain(RootDropProof(proof))?;
+                let _ = scope_tx.send(owner.execution_context_id());
+                Err(crate::chat_driver::ChatTurnError::Observation {
+                    run_id: "root-unknown".to_string(),
+                    execution_id: None,
+                })
+            })
+            .await?;
+        assert!(
+            matches!(observed, Err(crate::chat_driver::ChatTurnError::Observation { ref run_id, .. }) if run_id == "root-unknown")
+        );
+        let normal = runtime
+            .product_data_io
+            .begin_owned_flow("independent actual normal write")?;
+        let (normal_entered, entered) = tokio::sync::oneshot::channel();
+        let (normal_release, normal_hold) = tokio::sync::oneshot::channel();
+        let output = temp.path().join("normal-output");
+        let output_task = output.clone();
+        let normal_task = tokio::spawn(async move {
+            let result = normal
+                .run_async("write original normal output", async move {
+                    let _ = normal_entered.send(());
+                    normal_hold.await.map_err(|error| error.to_string())?;
+                    tokio::fs::write(output_task, "normal 中文🙂")
+                        .await
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            normal.settle(result.as_ref().err().map(ToString::to_string));
+            result
+        });
+        entered.await?;
+        let initial = services.begin_shutdown(ApplicationLifecycleReason::Shutdown, None)?;
+        let receipt = {
+            let join = services.join(initial);
+            tokio::pin!(join);
+            assert!(futures::poll!(join.as_mut()).is_pending());
+            normal_release
+                .send(())
+                .map_err(|_| anyhow::anyhow!("normal producer vanished"))?;
+            let completed_normal_write = normal_task.await??;
+            completed_normal_write.map_err(anyhow::Error::msg)?;
+            assert_eq!(tokio::fs::read_to_string(output).await?, "normal 中文🙂");
+            tokio::time::timeout(std::time::Duration::from_secs(3), join).await?
+        };
+        let error = anyhow::Error::new(receipt.into_error());
+        drop(runtime);
+        let lifecycle = error
+            .downcast_ref::<ApplicationLifecycleError>()
+            .ok_or_else(|| anyhow::anyhow!("typed lifecycle error lost"))?;
+        let root = lifecycle
+            .receipt
+            .continuation
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("typed error lost original root"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while Arc::strong_count(root) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(weak_state.upgrade().is_some());
+        assert!(weak_analysis.upgrade().is_some());
+        assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(store.begin_workspace_transition().await.is_err());
+        assert!(
+            store
+                .reserve_run_driver_admission(
+                    "root-unknown".to_string(),
+                    echo_agent::agent::CancellationToken::new()
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.get_run("root-unknown")?.map(|run| run.status),
+            Some(crate::tasks::task_runtime::TaskRunStatus::Running)
+        );
+        {
+            let original_agent = weak_agent
+                .upgrade()
+                .ok_or_else(|| anyhow::anyhow!("original Agent was destroyed"))?;
+            assert!(
+                original_agent
+                    .read()
+                    .await
+                    .tool_names()
+                    .iter()
+                    .any(|name| name == "task_create")
+            );
+        }
+        let observer = ApplicationLifecycleSettlement {
+            result: root.publications.subscribe(),
+            fallback: lifecycle.receipt.clone(),
+            retention: root.clone(),
+        };
+        finish_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("original backend disappeared"))?;
+        let owner = backend.await??;
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        store
+            .complete_joined_owner_for_test("root-unknown", &owner)
+            .await?;
+        let _receipt =
+            tokio::time::timeout(std::time::Duration::from_secs(3), observer.wait()).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let final_published = root
+                    .publications
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|publication| publication.final_receipt);
+                if final_published {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            store.get_run("root-unknown")?.map(|run| run.status),
+            Some(crate::tasks::task_runtime::TaskRunStatus::Completed)
+        );
+        drop(store);
+        drop(_receipt);
+        drop(error);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak_root.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(weak_state.upgrade().is_none());
+        assert!(weak_analysis.upgrade().is_none());
+        assert!(weak_agent.upgrade().is_none());
         Ok(())
     }
 

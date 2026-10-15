@@ -32,9 +32,9 @@ async fn execute_runtime_plan<W: TaskDispatcher + 'static>(
         },
     );
     let outcome = runtime_tasks
-        .execute(run_id, parent_cancel)
+        .execute_to_settlement(run_id, parent_cancel)
         .await
-        .map_err(|error| ExecError::Other(error.to_string()))?;
+        .map_err(ExecError::from)?;
     let terminal_status = match &outcome {
         echo_agent::tasks::RuntimeDagOutcome::Failed { .. } => Some(TaskRunStatus::Failed),
         echo_agent::tasks::RuntimeDagOutcome::Stalled { .. } => Some(TaskRunStatus::Failed),

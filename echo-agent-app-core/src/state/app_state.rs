@@ -53,19 +53,19 @@ pub struct AppState {
     /// Application operations (spawn/resume/handoff) for the agent control
     /// plane. Set once on the first Arc-backed registration; the shared
     /// ToolManager then exposes them to every pooled conversation Agent.
-    agent_control_ops: Arc<
-        std::sync::OnceLock<Arc<dyn crate::agent_control::AgentControlAppOps>>,
-    >,
+    agent_control_ops: Arc<std::sync::OnceLock<Arc<dyn crate::agent_control::AgentControlAppOps>>>,
     /// Owned lifetime for asynchronous inbox consumers.
     pub agent_deliveries: Arc<crate::agent_router::AgentDeliverySupervisor>,
     /// Product projections that must be retired before workspace metadata can
     /// be released and the same identity recreated.
     workspace_delete_hook: Option<Arc<dyn WorkspaceDeleteHook>>,
     #[cfg(test)]
-    side_snapshot_barrier: tokio::sync::Mutex<Option<(
-        tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<()>,
-    )>>,
+    side_snapshot_barrier: tokio::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 impl AppState {
@@ -761,27 +761,32 @@ impl AppState {
             .await
             .map_err(|error| error.to_string())?
             .map(|authority| authority.epoch);
-        self.storage
-            .conversation_archive
-            .ensure_internal_epoch(workspace_id, conversation_id, epoch)?;
+        self.storage.conversation_archive.ensure_internal_epoch(
+            workspace_id,
+            conversation_id,
+            epoch,
+        )?;
         if self
             .storage
             .conversation_archive
             .pending_visibility_transfer(workspace_id, conversation_id)?
             .is_some()
         {
-            let committed_epoch = epoch
-                .ok_or_else(|| "visibility transfer has no committed conversation epoch".to_string())?;
+            let committed_epoch = epoch.ok_or_else(|| {
+                "visibility transfer has no committed conversation epoch".to_string()
+            })?;
             let rows = store
                 .get_messages(conversation_id)
                 .await
                 .map_err(|error| error.to_string())?;
-            self.storage.conversation_archive.settle_visibility_transfer(
-                workspace_id,
-                conversation_id,
-                committed_epoch,
-                &rows,
-            )?;
+            self.storage
+                .conversation_archive
+                .settle_visibility_transfer(
+                    workspace_id,
+                    conversation_id,
+                    committed_epoch,
+                    &rows,
+                )?;
         }
         let pending = self
             .storage
@@ -809,9 +814,7 @@ impl AppState {
                         format!("internal turn {delivery_id} lost its delivery record")
                     })?;
                 let instruction = render_agent_delivery_instruction(&record.payload);
-                let cutoff = record
-                    .turn_settled_at
-                    .unwrap_or_else(chrono::Utc::now);
+                let cutoff = record.turn_settled_at.unwrap_or_else(chrono::Utc::now);
                 let committed = crate::conversation_archive::committed_internal_turn_ids(
                     &messages,
                     &intent,
@@ -825,12 +828,14 @@ impl AppState {
                         &delivery_id,
                         ids,
                     )?,
-                    (false, None) if record.terminal => self.storage.conversation_archive.settle_internal_turn(
-                        workspace_id,
-                        conversation_id,
-                        &delivery_id,
-                        std::collections::BTreeSet::new(),
-                    )?,
+                    (false, None) if record.terminal => {
+                        self.storage.conversation_archive.settle_internal_turn(
+                            workspace_id,
+                            conversation_id,
+                            &delivery_id,
+                            std::collections::BTreeSet::new(),
+                        )?
+                    }
                     (_, None) if !record.terminal => continue,
                     _ => {
                         return Err(format!(
@@ -868,20 +873,19 @@ impl AppState {
         let store = runtime
             .conversation_store()
             .ok_or_else(|| "conversation store is unavailable".to_string())?;
-        let mut entries = crate::side_conversation::SideConversationService::new(Arc::clone(
-            &self.agent_router,
-        ))
-            .list_for_workspace(store, workspace_id)
-            .await
-            .map_err(|error| error.to_string())?;
+        let mut entries =
+            crate::side_conversation::SideConversationService::new(Arc::clone(&self.agent_router))
+                .list_for_workspace(store, workspace_id)
+                .await
+                .map_err(|error| error.to_string())?;
         for entry in &mut entries {
             if !entry.degraded
                 && !self
-                .session
-                .foreground_turns
-                .snapshots_for_conversation_scoped(workspace_id, &entry.conversation_id)
-                .map_err(|error| error.to_string())?
-                .is_empty()
+                    .session
+                    .foreground_turns
+                    .snapshots_for_conversation_scoped(workspace_id, &entry.conversation_id)
+                    .map_err(|error| error.to_string())?
+                    .is_empty()
             {
                 entry.status = crate::side_conversation::SideConversationStatus::Running;
                 continue;
@@ -928,22 +932,18 @@ impl AppState {
         let store = runtime
             .conversation_store()
             .ok_or_else(|| "conversation store is unavailable".to_string())?;
-        let relation = crate::side_conversation::SideConversationService::new(Arc::clone(
-            &self.agent_router,
-        ))
-        .relation_for_child(store, workspace_id, conversation_id)
-        .await
-        .map_err(|error| error.to_string())?;
+        let relation =
+            crate::side_conversation::SideConversationService::new(Arc::clone(&self.agent_router))
+                .relation_for_child(store, workspace_id, conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
         let Some(relation) = relation else {
             return Ok(false);
         };
         if let Some(pool) = runtime.pool() {
-            pool.configure_side_conversation(
-                conversation_id,
-                relation.model_id.as_deref(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+            pool.configure_side_conversation(conversation_id, relation.model_id.as_deref())
+                .await
+                .map_err(|error| error.to_string())?;
         }
         Ok(true)
     }
@@ -959,13 +959,11 @@ impl AppState {
         let store = runtime
             .conversation_store()
             .ok_or_else(|| "conversation store is unavailable".to_string())?;
-        let service = crate::side_conversation::SideConversationService::new(Arc::clone(
-            &self.agent_router,
-        ));
-        let child_id = crate::side_conversation::SideConversationService::child_id_for_request(
-            &request,
-        )
-        .map_err(|error| error.to_string())?;
+        let service =
+            crate::side_conversation::SideConversationService::new(Arc::clone(&self.agent_router));
+        let child_id =
+            crate::side_conversation::SideConversationService::child_id_for_request(&request)
+                .map_err(|error| error.to_string())?;
         let _parent_identity = runtime
             .deletions
             .acquire_identity(&request.parent_conversation_id)
@@ -997,15 +995,12 @@ impl AppState {
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "parent conversation has no managed projection epoch".to_string())?;
             let hidden_before = self
-                .internal_message_ids_scoped(
-                    &request.workspace_id,
-                    &request.parent_conversation_id,
-                )
+                .internal_message_ids_scoped(&request.workspace_id, &request.parent_conversation_id)
                 .await?;
-            let pending_before = self.storage.conversation_archive.pending_internal_turns(
-                &request.workspace_id,
-                &request.parent_conversation_id,
-            )?;
+            let pending_before = self
+                .storage
+                .conversation_archive
+                .pending_internal_turns(&request.workspace_id, &request.parent_conversation_id)?;
             #[cfg(test)]
             if let Some((entered, release)) = self.side_snapshot_barrier.lock().await.take() {
                 let _ = entered.send(());
@@ -1016,15 +1011,12 @@ impl AppState {
                 .await
                 .map_err(|error| error.to_string())?;
             let hidden_after = self
-                .internal_message_ids_scoped(
-                    &request.workspace_id,
-                    &request.parent_conversation_id,
-                )
+                .internal_message_ids_scoped(&request.workspace_id, &request.parent_conversation_id)
                 .await?;
-            let pending_after = self.storage.conversation_archive.pending_internal_turns(
-                &request.workspace_id,
-                &request.parent_conversation_id,
-            )?;
+            let pending_after = self
+                .storage
+                .conversation_archive
+                .pending_internal_turns(&request.workspace_id, &request.parent_conversation_id)?;
             let after = store
                 .get_projection_authority(&request.parent_conversation_id)
                 .await
@@ -1051,17 +1043,19 @@ impl AppState {
             )
             .await
             .map_err(|error| error.to_string())?;
-        Ok(crate::side_conversation::SideConversationLaunchPreparation {
-            admission: crate::side_conversation::SideConversationLaunchAdmission {
-                workspace_id: creation.entry.workspace_id.clone(),
-                parent_conversation_id: creation.entry.parent_conversation_id.clone(),
-                conversation_id: child_id,
-                _parent_identity,
-                _child_identity,
+        Ok(
+            crate::side_conversation::SideConversationLaunchPreparation {
+                admission: crate::side_conversation::SideConversationLaunchAdmission {
+                    workspace_id: creation.entry.workspace_id.clone(),
+                    parent_conversation_id: creation.entry.parent_conversation_id.clone(),
+                    conversation_id: child_id,
+                    _parent_identity,
+                    _child_identity,
+                },
+                creation,
+                prompt,
             },
-            creation,
-            prompt,
-        })
+        )
     }
 
     pub async fn prepare_side_conversation_retry(
@@ -1076,9 +1070,8 @@ impl AppState {
         let store = runtime
             .conversation_store()
             .ok_or_else(|| "conversation store is unavailable".to_string())?;
-        let service = crate::side_conversation::SideConversationService::new(Arc::clone(
-            &self.agent_router,
-        ));
+        let service =
+            crate::side_conversation::SideConversationService::new(Arc::clone(&self.agent_router));
         let initial_entry = service
             .relation_for_child(Arc::clone(&store), workspace_id, conversation_id)
             .await
@@ -1124,25 +1117,29 @@ impl AppState {
         let prompt = service
             .initial_prompt_for_child(workspace_id, conversation_id)
             .await;
-        Ok(crate::side_conversation::SideConversationLaunchPreparation {
-            admission: crate::side_conversation::SideConversationLaunchAdmission {
-                workspace_id: workspace_id.to_string(),
-                parent_conversation_id,
-                conversation_id: conversation_id.to_string(),
-                _parent_identity: parent_identity,
-                _child_identity: child_identity,
+        Ok(
+            crate::side_conversation::SideConversationLaunchPreparation {
+                admission: crate::side_conversation::SideConversationLaunchAdmission {
+                    workspace_id: workspace_id.to_string(),
+                    parent_conversation_id,
+                    conversation_id: conversation_id.to_string(),
+                    _parent_identity: parent_identity,
+                    _child_identity: child_identity,
+                },
+                creation,
+                prompt: prompt.map_err(|error| error.to_string())?,
             },
-            creation,
-            prompt: prompt.map_err(|error| error.to_string())?,
-        })
+        )
     }
 
     pub async fn begin_side_conversation_gui_turn(
         &self,
         admission: crate::side_conversation::SideConversationLaunchAdmission,
         turn_id: impl Into<String>,
-    ) -> Result<crate::foreground_turn::ForegroundTurnLease, crate::conversation_deletion::ConversationDeletionError>
-    {
+    ) -> Result<
+        crate::foreground_turn::ForegroundTurnLease,
+        crate::conversation_deletion::ConversationDeletionError,
+    > {
         let runtime = self
             .chat_runtime_for_scope(&admission.workspace_id)
             .await
@@ -1165,29 +1162,24 @@ impl AppState {
                 Some(runtime.workspace_io_receipt()),
             )
             .await?;
-        let store = runtime.conversation_store().ok_or(
-            crate::conversation_deletion::ConversationDeletionError::StoreUnavailable,
-        )?;
-        let relation = crate::side_conversation::SideConversationService::new(Arc::clone(
-            &self.agent_router,
-        ))
-        .relation_for_child(
-            store,
-            &admission.workspace_id,
-            &admission.conversation_id,
-        )
-        .await
-        .map_err(|error| {
-            crate::conversation_deletion::ConversationDeletionError::ConversationStore(
-                error.to_string(),
-            )
-        })?
-        .filter(|entry| entry.parent_conversation_id == admission.parent_conversation_id)
-        .ok_or_else(|| {
-            crate::conversation_deletion::ConversationDeletionError::NotFound(
-                admission.conversation_id.clone(),
-            )
-        })?;
+        let store = runtime
+            .conversation_store()
+            .ok_or(crate::conversation_deletion::ConversationDeletionError::StoreUnavailable)?;
+        let relation =
+            crate::side_conversation::SideConversationService::new(Arc::clone(&self.agent_router))
+                .relation_for_child(store, &admission.workspace_id, &admission.conversation_id)
+                .await
+                .map_err(|error| {
+                    crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                        error.to_string(),
+                    )
+                })?
+                .filter(|entry| entry.parent_conversation_id == admission.parent_conversation_id)
+                .ok_or_else(|| {
+                    crate::conversation_deletion::ConversationDeletionError::NotFound(
+                        admission.conversation_id.clone(),
+                    )
+                })?;
         let lease = self
             .session
             .foreground_turns
@@ -1226,12 +1218,7 @@ impl AppState {
             .conversation_store()
             .ok_or_else(|| "conversation store is unavailable".to_string())?;
         crate::side_conversation::SideConversationService::new(Arc::clone(&self.agent_router))
-            .set_launch_error(
-                store,
-                workspace_id,
-                conversation_id,
-                launch_error,
-            )
+            .set_launch_error(store, workspace_id, conversation_id, launch_error)
             .await
             .map_err(|error| error.to_string())
     }
@@ -1254,12 +1241,11 @@ impl AppState {
         let store = runtime
             .conversation_store()
             .ok_or_else(|| "conversation store is unavailable".to_string())?;
-        let entry = crate::side_conversation::SideConversationService::new(Arc::clone(
-            &self.agent_router,
-        ))
-        .update_model(store, workspace_id, conversation_id, model_id)
-        .await
-        .map_err(|error| error.to_string())?;
+        let entry =
+            crate::side_conversation::SideConversationService::new(Arc::clone(&self.agent_router))
+                .update_model(store, workspace_id, conversation_id, model_id)
+                .await
+                .map_err(|error| error.to_string())?;
         if let Some(pool) = runtime.pool() {
             pool.configure_side_conversation(conversation_id, entry.model_id.as_deref())
                 .await
@@ -1389,9 +1375,8 @@ impl AppState {
             .conversation_store()
             .ok_or(crate::conversation_deletion::ConversationDeletionError::StoreUnavailable)?;
         let workspace_id = runtime.execution_scope().workspace_id();
-        let service = crate::side_conversation::SideConversationService::new(Arc::clone(
-            &self.agent_router,
-        ));
+        let service =
+            crate::side_conversation::SideConversationService::new(Arc::clone(&self.agent_router));
         let handoff_owned = admission.is_some();
         let (identity, source_suspension) = match admission {
             Some(admission)
@@ -1407,18 +1392,25 @@ impl AppState {
                     ),
                 );
             }
-            None => (runtime.deletions.acquire_identity(conversation_id).await?, None),
+            None => (
+                runtime.deletions.acquire_identity(conversation_id).await?,
+                None,
+            ),
         };
         if !handoff_owned
             && self
                 .storage
                 .conversation_archive
                 .has_pending_handoff_for(workspace_id, conversation_id)
-                .map_err(crate::conversation_deletion::ConversationDeletionError::ConversationStore)?
+                .map_err(
+                    crate::conversation_deletion::ConversationDeletionError::ConversationStore,
+                )?
         {
-            return Err(crate::conversation_deletion::ConversationDeletionError::HandoffPending(
-                conversation_id.to_string(),
-            ));
+            return Err(
+                crate::conversation_deletion::ConversationDeletionError::HandoffPending(
+                    conversation_id.to_string(),
+                ),
+            );
         }
         let relation = service
             .relation_for_child(Arc::clone(&store), workspace_id, conversation_id)
@@ -1485,12 +1477,8 @@ impl AppState {
                 })?
                 .is_some();
             if !child_exists {
-                self.delete_degraded_side_relation(
-                    &service,
-                    workspace_id,
-                    &child.conversation_id,
-                )
-                .await?;
+                self.delete_degraded_side_relation(&service, workspace_id, &child.conversation_id)
+                    .await?;
                 drop(child_identity);
                 continue;
             }
@@ -1546,15 +1534,15 @@ impl AppState {
                     error.to_string(),
                 )
             })?;
-        let delivery_retirement = self
-            .agent_deliveries
-            .retire_target(target)
-            .await
-            .map_err(|error| {
-                crate::conversation_deletion::ConversationDeletionError::AgentRouter(
-                    error.to_string(),
-                )
-            })?;
+        let delivery_retirement =
+            self.agent_deliveries
+                .retire_target(target)
+                .await
+                .map_err(|error| {
+                    crate::conversation_deletion::ConversationDeletionError::AgentRouter(
+                        error.to_string(),
+                    )
+                })?;
         router_retirement.purge().await.map_err(|error| {
             crate::conversation_deletion::ConversationDeletionError::AgentRouter(error.to_string())
         })?;
@@ -1588,11 +1576,13 @@ impl AppState {
             return Ok(false);
         };
         if snapshots.len() != 1 {
-            return Err(crate::conversation_deletion::ConversationDeletionError::Foreground(
-                crate::foreground_turn::ForegroundTurnError::ActiveConversationTurns {
-                    conversation_id: conversation_id.to_string(),
-                },
-            ));
+            return Err(
+                crate::conversation_deletion::ConversationDeletionError::Foreground(
+                    crate::foreground_turn::ForegroundTurnError::ActiveConversationTurns {
+                        conversation_id: conversation_id.to_string(),
+                    },
+                ),
+            );
         }
         let waiter = self.session.foreground_turns.request_root_cancel_scoped(
             workspace_id,
@@ -1687,7 +1677,10 @@ impl AppState {
         for receipt in &receipts {
             self.storage
                 .conversation_archive
-                .remove(runtime.execution_scope().workspace_id(), &receipt.conversation_id)
+                .remove(
+                    runtime.execution_scope().workspace_id(),
+                    &receipt.conversation_id,
+                )
                 .map_err(
                     crate::conversation_deletion::ConversationDeletionError::ConversationStore,
                 )?;
@@ -1711,7 +1704,11 @@ impl AppState {
             )
             .await;
             if let Err(error) = result
-                && self.storage.conversation_archive.handoff(&operation_id)?.is_some()
+                && self
+                    .storage
+                    .conversation_archive
+                    .handoff(&operation_id)?
+                    .is_some()
             {
                 return Err(format!("handoff {operation_id} recovery failed: {error}"));
             }
@@ -1738,7 +1735,7 @@ impl AppState {
         let resolver: Arc<dyn crate::tasks::task_runtime::TaskExecutionTargetResolver> =
             Arc::new(WorkspaceTaskExecutionTargetResolver {
                 workspace_registry: Arc::clone(&self.workspace.registry),
-                runtimes: Arc::clone(&self.workspace.runtimes),
+                runtimes: Arc::downgrade(&self.workspace.runtimes),
                 seed_pool: Arc::downgrade(seed_pool),
                 agent_router: Arc::clone(&self.agent_router),
             });
@@ -1937,9 +1934,7 @@ impl AppState {
                     }
                 };
             let workspace_receipt = ScopedWorkspaceIoReceipt {
-                _lifetime: ScopedRuntimeLifetime::Workspace {
-                    _lease: control_lease,
-                },
+                _lifetime: Some(control_lease.io_lifetime()),
                 identity: host.workspace_io_identity(),
             };
             let store = match host.task_runtime().await {
@@ -2422,9 +2417,13 @@ impl AppState {
         // incarnation, otherwise exact wait/cancel and file CAS become stale.
         self.ensure_workspace_idle_for_delete_inner(&workspace_id)
             .await?;
-        let previous_workspace = self.workspace.registry.open(&workspace_id).map_err(|error| {
-            anyhow::anyhow!("failed to capture workspace before project relink: {error}")
-        })?;
+        let previous_workspace = self
+            .workspace
+            .registry
+            .open(&workspace_id)
+            .map_err(|error| {
+                anyhow::anyhow!("failed to capture workspace before project relink: {error}")
+            })?;
         let requested_project_root = project_root.canonicalize().map_err(|error| {
             anyhow::anyhow!(
                 "Project root cannot be resolved ({}): {error}",
@@ -3613,10 +3612,14 @@ impl AppState {
     ) -> Result<(), AgentMessageSendError> {
         let runtime = self.chat_runtime_for_agent(target).await?;
         let store = runtime.conversation_store().ok_or_else(|| {
-            AgentMessageSendError::Conversation("target conversation store is unavailable".to_string())
+            AgentMessageSendError::Conversation(
+                "target conversation store is unavailable".to_string(),
+            )
         })?;
         let runtime_state = runtime.runtime_state_store().ok_or_else(|| {
-            AgentMessageSendError::Conversation("target runtime state store is unavailable".to_string())
+            AgentMessageSendError::Conversation(
+                "target runtime state store is unavailable".to_string(),
+            )
         })?;
         if runtime_state
             .load_runtime_state(&target.conversation_id, &target.conversation_id)
@@ -3637,7 +3640,9 @@ impl AppState {
             )
             .await
             .map_err(|error| AgentMessageSendError::Conversation(error.to_string()))?;
-            if settlement.status != echo_agent::memory::TranscriptProjectionSettlementStatus::Settled {
+            if settlement.status
+                != echo_agent::memory::TranscriptProjectionSettlementStatus::Settled
+            {
                 return Err(AgentMessageSendError::Conversation(
                     "owner-lost transcript projection remains unsettled".to_string(),
                 ));
@@ -3909,18 +3914,26 @@ impl AppState {
         Ok(true)
     }
 
+    fn retain_cold_delivery_execution(
+        lease: &crate::foreground_turn::ForegroundTurnLease,
+        execution: crate::agent_pool::AgentPoolExecutionLease,
+    ) -> Arc<std::sync::Mutex<Option<crate::agent_pool::AgentPoolExecutionLease>>> {
+        // This cell only has synchronous take/observation operations. It must
+        // share the exact lease hook used by GUI, not silently miss a busy lock.
+        let execution = Arc::new(std::sync::Mutex::new(Some(execution)));
+        lease.retain_execution(execution.clone());
+        execution
+    }
+
     async fn deliver_agent_message_cold(
         self: &Arc<Self>,
         target: &crate::agent_router::AgentAddress,
         shutdown: &CancellationToken,
     ) -> Result<bool, AgentMessageSendError> {
         let runtime = self.chat_runtime_for_agent(target).await?;
-        self.prepare_side_conversation_model(
-            target.workspace_id.as_str(),
-            &target.conversation_id,
-        )
-        .await
-        .map_err(AgentMessageSendError::Workspace)?;
+        self.prepare_side_conversation_model(target.workspace_id.as_str(), &target.conversation_id)
+            .await
+            .map_err(AgentMessageSendError::Workspace)?;
         let Some(claim) = self.agent_router.claim_next(target).await? else {
             return Ok(true);
         };
@@ -4142,11 +4155,15 @@ impl AppState {
                             receipt.turn_id()
                         ))
                     } else {
-                        let accepted = receipt.wait_for_accepted().await;
+                        let accepted = receipt
+                            .wait_for_accepted()
+                            .await
+                            .map_err(|error| error.to_string())?;
                         let drained_state = match accepted {
-                            echo_agent::runtime::TurnInputState::Accepted => {
-                                receipt.wait_for_drained().await
-                            }
+                            echo_agent::runtime::TurnInputState::Accepted => receipt
+                                .wait_for_drained()
+                                .await
+                                .map_err(|error| error.to_string())?,
                             state => state,
                         };
                         match drained_state {
@@ -4180,6 +4197,7 @@ impl AppState {
                 })
             },
         );
+        let execution = Self::retain_cold_delivery_execution(&lease, execution);
         let driver = crate::foreground_turn::drive_foreground_chat_with_input_observer(
             lease,
             &agent,
@@ -4196,6 +4214,13 @@ impl AppState {
             }
             outcome = &mut driver => outcome,
         };
+        if let Some(error) = outcome
+            .as_ref()
+            .err()
+            .filter(|error| error.is_observation())
+        {
+            return Err(AgentMessageSendError::Workspace(error.to_string()));
+        }
         let effect_cutoff = chrono::Utc::now();
         let input_drained = observation_rx.await.unwrap_or_else(|_| {
             Err("cold Agent delivery input observer ended without a receipt".to_string())
@@ -4267,7 +4292,7 @@ impl AppState {
                 .await?;
             return Ok(true);
         }
-        drop(execution);
+        execution.lock().unwrap_or_else(|error| error.into_inner()).take();
         self.settle_internal_delivery_visibility(
             &runtime,
             target,
@@ -4345,7 +4370,7 @@ impl AppState {
                         Some(root_turn_id),
                         crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown,
                         true,
-                        agent_delivery_unknown_reason(error),
+                        agent_delivery_unknown_reason(error.to_string()),
                         false,
                         None,
                     )
@@ -4397,7 +4422,9 @@ impl AppState {
             ));
         }
         let store = runtime.conversation_store().ok_or_else(|| {
-            AgentMessageSendError::Conversation("target conversation store is unavailable".to_string())
+            AgentMessageSendError::Conversation(
+                "target conversation store is unavailable".to_string(),
+            )
         })?;
         let messages = store
             .get_messages(conversation_id)
@@ -4429,9 +4456,8 @@ impl AppState {
         &self,
         message: &crate::agent_router::AgentMessage,
     ) -> Result<bool, AgentMessageSendError> {
-        let service = crate::side_conversation::SideConversationService::new(Arc::clone(
-            &self.agent_router,
-        ));
+        let service =
+            crate::side_conversation::SideConversationService::new(Arc::clone(&self.agent_router));
         if service
             .is_side_conversation(
                 message.to.workspace_id.as_str(),
@@ -5591,11 +5617,8 @@ fn prepare_model_mutation(
                 .is_some_and(|runtime| runtime.id == model_id);
             let activates_upserted_model =
                 mutation.set_default || updates_active_model || became_first_default;
-            let runtime = crate::model_config::resolve_runtime_model(
-                &config,
-                Some(&model_id),
-            )
-            .map_err(|error| ModelMutationError::Validation(error.to_string()))?;
+            let runtime = crate::model_config::resolve_runtime_model(&config, Some(&model_id))
+                .map_err(|error| ModelMutationError::Validation(error.to_string()))?;
             let prepared = crate::infra::prepare_runtime_llm(&runtime)
                 .map_err(ModelMutationError::Validation)?;
             Ok(PreparedModelMutation {
@@ -5649,9 +5672,8 @@ fn prepare_model_mutation(
             })
         }
         ModelMutationRequest::SetDefault(selector) => {
-            let selected =
-                crate::model_config::resolve_runtime_model(current, Some(&selector))
-                    .map_err(|error| ModelMutationError::Validation(error.to_string()))?;
+            let selected = crate::model_config::resolve_runtime_model(current, Some(&selector))
+                .map_err(|error| ModelMutationError::Validation(error.to_string()))?;
             let mut config = current.clone();
             let runtime = crate::model_config::set_default_model(&mut config, &selected.id)
                 .map_err(ModelMutationError::Validation)?;
@@ -5840,9 +5862,8 @@ impl AppStateAgentControlOps {
         conversation: &Conversation,
         messages: &[echo_agent::memory::StoredMessage],
     ) -> Result<String, crate::agent_control::AgentControlError> {
-        let bytes = serde_json::to_vec(&(conversation, messages)).map_err(|error| {
-            crate::agent_control::AgentControlError::Runtime(error.to_string())
-        })?;
+        let bytes = serde_json::to_vec(&(conversation, messages))
+            .map_err(|error| crate::agent_control::AgentControlError::Runtime(error.to_string()))?;
         Ok(format!(
             "{:x}",
             <sha2::Sha256 as sha2::Digest>::digest(bytes)
@@ -5868,11 +5889,16 @@ impl AppStateAgentControlOps {
         operation_id: &str,
         message_count: usize,
     ) -> Result<serde_json::Value, crate::agent_control::AgentControlError> {
-        let intent = state.storage.conversation_archive.handoff(operation_id)
+        let intent = state
+            .storage
+            .conversation_archive
+            .handoff(operation_id)
             .map_err(crate::agent_control::AgentControlError::Runtime)?
-            .ok_or_else(|| crate::agent_control::AgentControlError::Runtime(
-                "handoff completion lost its durable intent".to_string(),
-            ))?;
+            .ok_or_else(|| {
+                crate::agent_control::AgentControlError::Runtime(
+                    "handoff completion lost its durable intent".to_string(),
+                )
+            })?;
         state
             .storage
             .conversation_archive
@@ -5884,16 +5910,11 @@ impl AppStateAgentControlOps {
         let mut follow_up_delivered = false;
         if let Some(text) = request.follow_up.as_deref() {
             let address = crate::agent_router::AgentAddress::new(
-                crate::workspace::WorkspaceId::from_raw(
-                    request.destination_workspace_id.clone(),
-                ),
+                crate::workspace::WorkspaceId::from_raw(request.destination_workspace_id.clone()),
                 request.conversation_id.clone(),
             );
-            let mut message = crate::agent_router::AgentMessage::agent_text(
-                None,
-                address,
-                text.to_string(),
-            );
+            let mut message =
+                crate::agent_router::AgentMessage::agent_text(None, address, text.to_string());
             message.message_id = format!("handoff-followup:{operation_id}");
             state
                 .send_agent_message_owned(message)
@@ -5917,7 +5938,6 @@ impl AppStateAgentControlOps {
             .map_err(crate::agent_control::AgentControlError::Runtime)?;
         Ok(Self::handoff_result(request, &completed))
     }
-
 }
 
 impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
@@ -5930,13 +5950,11 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
     > {
         let weak = self.state.clone();
         Box::pin(async move {
-            let state = weak
-                .upgrade()
-                .ok_or_else(|| {
-                    crate::agent_control::AgentControlError::Runtime(
-                        "app state unavailable".to_string(),
-                    )
-                })?;
+            let state = weak.upgrade().ok_or_else(|| {
+                crate::agent_control::AgentControlError::Runtime(
+                    "app state unavailable".to_string(),
+                )
+            })?;
             let workspace_id = match request.workspace_id.as_deref() {
                 Some(id) if !id.trim().is_empty() => id.to_string(),
                 _ => state
@@ -5949,9 +5967,12 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                     .workspace_id()
                     .to_string(),
             };
-            let runtime = state.chat_runtime_for_scope(&workspace_id).await.map_err(|error| {
-                crate::agent_control::AgentControlError::Runtime(error.to_string())
-            })?;
+            let runtime = state
+                .chat_runtime_for_scope(&workspace_id)
+                .await
+                .map_err(|error| {
+                    crate::agent_control::AgentControlError::Runtime(error.to_string())
+                })?;
             let conversation_id = format!("spawn-{}", uuid::Uuid::new_v4().as_simple());
             let title = request
                 .title
@@ -5978,7 +5999,8 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                     .first_message
                     .clone()
                     .unwrap_or_else(|| request.goal.clone());
-                let message = crate::agent_router::AgentMessage::agent_text(None, address.clone(), text);
+                let message =
+                    crate::agent_router::AgentMessage::agent_text(None, address.clone(), text);
                 state
                     .send_agent_message_owned(message)
                     .await
@@ -6004,22 +6026,20 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
     > {
         let weak = self.state.clone();
         Box::pin(async move {
-            let state = weak
-                .upgrade()
-                .ok_or_else(|| {
-                    crate::agent_control::AgentControlError::Runtime(
-                        "app state unavailable".to_string(),
-                    )
-                })?;
+            let state = weak.upgrade().ok_or_else(|| {
+                crate::agent_control::AgentControlError::Runtime(
+                    "app state unavailable".to_string(),
+                )
+            })?;
             let address = crate::agent_router::AgentAddress::new(
                 crate::workspace::WorkspaceId::from_raw(request.workspace_id.clone()),
                 request.conversation_id.clone(),
             );
             match request.resume_policy {
                 crate::agent_control::AgentResumePolicy::Followup => {
-                    let text = request.text.unwrap_or_else(|| {
-                        "请继续之前的工作:汇报当前状态并接着推进。".to_string()
-                    });
+                    let text = request
+                        .text
+                        .unwrap_or_else(|| "请继续之前的工作:汇报当前状态并接着推进。".to_string());
                     let message =
                         crate::agent_router::AgentMessage::agent_text(None, address.clone(), text);
                     state
@@ -6043,15 +6063,10 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                     })?;
                     // Resolve the workspace-scoped task runtime and pooled
                     // conversation agent, then relaunch the paused run.
-                    let runtime = state
-                        .current_chat_runtime_inner()
-                        .await
-                        .map_err(|error| {
-                            crate::agent_control::AgentControlError::Runtime(error.to_string())
-                        })?;
-                    if runtime.execution_scope().workspace_id()
-                        != request.workspace_id.as_str()
-                    {
+                    let runtime = state.current_chat_runtime_inner().await.map_err(|error| {
+                        crate::agent_control::AgentControlError::Runtime(error.to_string())
+                    })?;
+                    if runtime.execution_scope().workspace_id() != request.workspace_id.as_str() {
                         return Err(crate::agent_control::AgentControlError::Invalid(format!(
                             "task_run resume is bound to the current workspace ({}); target {} requires a handoff or direct workspace focus",
                             runtime.execution_scope().workspace_id(),
@@ -6069,27 +6084,28 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                             "workspace has no AgentPool".to_string(),
                         )
                     })?;
-                    let pool_execution = pool
-                        .acquire(&request.conversation_id)
+                    let pool_execution =
+                        pool.acquire(&request.conversation_id)
+                            .await
+                            .map_err(|error| {
+                                crate::agent_control::AgentControlError::Runtime(error.to_string())
+                            })?;
+                    let run_state =
+                        crate::tasks::task_runtime::executor::TaskRuntimeOperation::new(
+                            Arc::clone(&store),
+                        )
+                        .run_store("load resume run state", move |store| {
+                            store.get_run_state(&probe_run_id)
+                        })
                         .await
                         .map_err(|error| {
                             crate::agent_control::AgentControlError::Runtime(error.to_string())
+                        })?
+                        .ok_or_else(|| {
+                            crate::agent_control::AgentControlError::Invalid(format!(
+                                "run {run_id} not found"
+                            ))
                         })?;
-                    let run_state = crate::tasks::task_runtime::executor::TaskRuntimeOperation::new(
-                        Arc::clone(&store),
-                    )
-                    .run_store("load resume run state", move |store| {
-                        store.get_run_state(&probe_run_id)
-                    })
-                    .await
-                    .map_err(|error| {
-                        crate::agent_control::AgentControlError::Runtime(error.to_string())
-                    })?
-                    .ok_or_else(|| {
-                        crate::agent_control::AgentControlError::Invalid(format!(
-                            "run {run_id} not found"
-                        ))
-                    })?;
                     let expected =
                         crate::tasks::task_runtime::types::TaskRunResumeIdentity::capture(
                             &run_state,
@@ -6109,11 +6125,8 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                         crate::agent_control::AgentControlError::Runtime(error.to_string())
                     })?;
                     if let Some(text) = request.text {
-                        let note = crate::agent_router::AgentMessage::agent_text(
-                            None,
-                            address,
-                            text,
-                        );
+                        let note =
+                            crate::agent_router::AgentMessage::agent_text(None, address, text);
                         let _ = state.send_agent_message_owned(note).await;
                     }
                     Ok(serde_json::json!({
@@ -6138,13 +6151,11 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
     > {
         let weak = self.state.clone();
         Box::pin(async move {
-            let state = weak
-                .upgrade()
-                .ok_or_else(|| {
-                    crate::agent_control::AgentControlError::Runtime(
-                        "app state unavailable".to_string(),
-                    )
-                })?;
+            let state = weak.upgrade().ok_or_else(|| {
+                crate::agent_control::AgentControlError::Runtime(
+                    "app state unavailable".to_string(),
+                )
+            })?;
             if request.workspace_id == request.destination_workspace_id {
                 return Err(crate::agent_control::AgentControlError::Invalid(
                     "destination workspace must differ from the source".to_string(),
@@ -6194,12 +6205,19 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                 )
             })?;
             if let Some(completed) = completed_handoff.as_ref() {
-                let _source_identity = source_runtime.deletions.acquire_identity(&request.conversation_id)
-                    .await.map_err(|error| {
+                let _source_identity = source_runtime
+                    .deletions
+                    .acquire_identity(&request.conversation_id)
+                    .await
+                    .map_err(|error| {
                         crate::agent_control::AgentControlError::Runtime(error.to_string())
                     })?;
-                if source_store.get_conversation(&request.conversation_id).await
-                    .map_err(|error| crate::agent_control::AgentControlError::Runtime(error.to_string()))?
+                if source_store
+                    .get_conversation(&request.conversation_id)
+                    .await
+                    .map_err(|error| {
+                        crate::agent_control::AgentControlError::Runtime(error.to_string())
+                    })?
                     .is_some()
                 {
                     return Err(crate::agent_control::AgentControlError::Invalid(
@@ -6220,71 +6238,84 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                     "destination conversation store is unavailable".to_string(),
                 )
             })?;
-            let (source_admission, destination_admission) = if request.workspace_id
-                < request.destination_workspace_id
-            {
-                let source = if existing_handoff.is_some() {
-                    source_runtime.begin_handoff_recovery(
-                        &state.session.foreground_turns,
-                        &request.conversation_id,
-                    ).await
-                } else {
-                    source_runtime.begin_managed_replacement(
-                        &state.session.foreground_turns,
-                        &request.conversation_id,
-                    ).await
-                }
+            let (source_admission, destination_admission) =
+                if request.workspace_id < request.destination_workspace_id {
+                    let source = if existing_handoff.is_some() {
+                        source_runtime
+                            .begin_handoff_recovery(
+                                &state.session.foreground_turns,
+                                &request.conversation_id,
+                            )
+                            .await
+                    } else {
+                        source_runtime
+                            .begin_managed_replacement(
+                                &state.session.foreground_turns,
+                                &request.conversation_id,
+                            )
+                            .await
+                    }
                     .map_err(|error| {
                         crate::agent_control::AgentControlError::Invalid(error.to_string())
                     })?;
-                let destination = if existing_handoff.is_some() {
-                    destination_runtime.begin_handoff_recovery(
-                        &state.session.foreground_turns,
-                        &request.conversation_id,
-                    ).await
-                } else {
-                    destination_runtime.begin_managed_replacement(
-                        &state.session.foreground_turns,
-                        &request.conversation_id,
-                    )
-                    .await
-                }
+                    let destination = if existing_handoff.is_some() {
+                        destination_runtime
+                            .begin_handoff_recovery(
+                                &state.session.foreground_turns,
+                                &request.conversation_id,
+                            )
+                            .await
+                    } else {
+                        destination_runtime
+                            .begin_managed_replacement(
+                                &state.session.foreground_turns,
+                                &request.conversation_id,
+                            )
+                            .await
+                    }
                     .map_err(|error| {
                         crate::agent_control::AgentControlError::Invalid(error.to_string())
                     })?;
-                (source, destination)
-            } else {
-                let destination = if existing_handoff.is_some() {
-                    destination_runtime.begin_handoff_recovery(
-                        &state.session.foreground_turns,
-                        &request.conversation_id,
-                    ).await
+                    (source, destination)
                 } else {
-                    destination_runtime.begin_managed_replacement(
-                        &state.session.foreground_turns,
-                        &request.conversation_id,
-                    )
-                    .await
-                }
+                    let destination = if existing_handoff.is_some() {
+                        destination_runtime
+                            .begin_handoff_recovery(
+                                &state.session.foreground_turns,
+                                &request.conversation_id,
+                            )
+                            .await
+                    } else {
+                        destination_runtime
+                            .begin_managed_replacement(
+                                &state.session.foreground_turns,
+                                &request.conversation_id,
+                            )
+                            .await
+                    }
                     .map_err(|error| {
                         crate::agent_control::AgentControlError::Invalid(error.to_string())
                     })?;
-                let source = if existing_handoff.is_some() {
-                    source_runtime.begin_handoff_recovery(
-                        &state.session.foreground_turns,
-                        &request.conversation_id,
-                    ).await
-                } else {
-                    source_runtime.begin_managed_replacement(
-                        &state.session.foreground_turns,
-                        &request.conversation_id,
-                    ).await
-                }
+                    let source = if existing_handoff.is_some() {
+                        source_runtime
+                            .begin_handoff_recovery(
+                                &state.session.foreground_turns,
+                                &request.conversation_id,
+                            )
+                            .await
+                    } else {
+                        source_runtime
+                            .begin_managed_replacement(
+                                &state.session.foreground_turns,
+                                &request.conversation_id,
+                            )
+                            .await
+                    }
                     .map_err(|error| {
                         crate::agent_control::AgentControlError::Invalid(error.to_string())
                     })?;
-                (source, destination)
-            };
+                    (source, destination)
+                };
             let source_conversation = source_store
                 .get_conversation(&request.conversation_id)
                 .await
@@ -6321,11 +6352,12 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                             "handoff source and destination are both absent".to_string(),
                         )
                     })?;
-                let destination_state = destination_runtime.runtime_state_store().ok_or_else(|| {
-                    crate::agent_control::AgentControlError::Runtime(
-                        "destination runtime state store is unavailable".to_string(),
-                    )
-                })?;
+                let destination_state =
+                    destination_runtime.runtime_state_store().ok_or_else(|| {
+                        crate::agent_control::AgentControlError::Runtime(
+                            "destination runtime state store is unavailable".to_string(),
+                        )
+                    })?;
                 let destination_execution = destination_runtime
                     .agent_for_handoff(&destination.conversation_id)
                     .await
@@ -6366,13 +6398,17 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                 )
                 .await;
             };
-            let source_epoch = source_authority.as_ref().filter(|authority| {
-                authority.lifecycle == echo_agent::memory::ConversationProjectionLifecycle::Live
-            }).map(|authority| authority.epoch).ok_or_else(|| {
-                crate::agent_control::AgentControlError::Runtime(
-                    "handoff source has no live managed epoch".to_string(),
-                )
-            })?;
+            let source_epoch = source_authority
+                .as_ref()
+                .filter(|authority| {
+                    authority.lifecycle == echo_agent::memory::ConversationProjectionLifecycle::Live
+                })
+                .map(|authority| authority.epoch)
+                .ok_or_else(|| {
+                    crate::agent_control::AgentControlError::Runtime(
+                        "handoff source has no live managed epoch".to_string(),
+                    )
+                })?;
             let messages = source_store
                 .get_messages(&request.conversation_id)
                 .await
@@ -6380,11 +6416,10 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                     crate::agent_control::AgentControlError::Runtime(error.to_string())
                 })?;
             let source_fingerprint = Self::handoff_source_fingerprint(&conversation, &messages)?;
-            if existing_handoff
-                .as_ref()
-                .is_some_and(|intent| intent.source_fingerprint != source_fingerprint
-                    || intent.source_epoch != source_epoch)
-            {
+            if existing_handoff.as_ref().is_some_and(|intent| {
+                intent.source_fingerprint != source_fingerprint
+                    || intent.source_epoch != source_epoch
+            }) {
                 return Err(crate::agent_control::AgentControlError::Runtime(
                     "handoff source changed after its durable snapshot was prepared".to_string(),
                 ));
@@ -6425,17 +6460,23 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
             if existing_handoff.as_ref().is_some_and(|intent| {
                 target_existing.is_none()
                     && target_authority.as_ref().is_some_and(|authority| {
-                        authority.lifecycle == echo_agent::memory::ConversationProjectionLifecycle::Deleted
+                        authority.lifecycle
+                            == echo_agent::memory::ConversationProjectionLifecycle::Deleted
                             && authority.epoch >= intent.target_base_epoch
                     })
             }) {
-                state.storage.conversation_archive.abandon_handoff(&handoff_operation_id)
+                state
+                    .storage
+                    .conversation_archive
+                    .abandon_handoff(&handoff_operation_id)
                     .map_err(crate::agent_control::AgentControlError::Runtime)?;
                 return Err(crate::agent_control::AgentControlError::Invalid(
                     "previous handoff attempt rolled back; submit a new request".to_string(),
                 ));
             }
-            let target_base_epoch = existing_handoff.as_ref().map_or(1, |intent| intent.target_base_epoch);
+            let target_base_epoch = existing_handoff
+                .as_ref()
+                .map_or(1, |intent| intent.target_base_epoch);
             if existing_handoff.is_none() {
                 if target_existing.is_some() || target_authority.is_some() {
                     return Err(crate::agent_control::AgentControlError::Invalid(
@@ -6489,11 +6530,14 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                 let acquired = destination_store
                     .get_projection_authority(&conversation.conversation_id)
                     .await?
-                    .ok_or_else(|| anyhow::anyhow!("destination projection authority is missing"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("destination projection authority is missing")
+                    })?;
                 let destination_rows = destination_store
                     .get_messages(&conversation.conversation_id)
                     .await?;
-                let imported_epoch = target_base_epoch.checked_add(1)
+                let imported_epoch = target_base_epoch
+                    .checked_add(1)
                     .ok_or_else(|| anyhow::anyhow!("handoff destination epoch overflow"))?;
                 if acquired.epoch == target_base_epoch {
                     if !destination_rows.is_empty()
@@ -6502,7 +6546,9 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                                 != crate::conversation_archive::ConversationHandoffPhase::Prepared
                         })
                     {
-                        anyhow::bail!("prepared handoff destination has unexpected transcript state");
+                        anyhow::bail!(
+                            "prepared handoff destination has unexpected transcript state"
+                        );
                     }
                     state
                         .storage
@@ -6520,7 +6566,9 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                     let locator = destination_store
                         .get_latest_managed_import(&conversation.conversation_id)
                         .await?
-                        .ok_or_else(|| anyhow::anyhow!("handoff destination has no import receipt"))?;
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("handoff destination has no import receipt")
+                        })?;
                     if locator.expected_epoch != target_base_epoch
                         || locator.applied_epoch != imported_epoch
                         || locator.generation_id != conversation.conversation_id
@@ -6532,14 +6580,17 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                             &messages,
                         )
                     {
-                        anyhow::bail!("handoff destination differs from its prepared source snapshot");
+                        anyhow::bail!(
+                            "handoff destination differs from its prepared source snapshot"
+                        );
                     }
                 } else {
                     anyhow::bail!("handoff destination epoch is not the prepared generation");
                 }
-                let destination_state = destination_runtime.runtime_state_store().ok_or_else(|| {
-                    anyhow::anyhow!("destination runtime state store is unavailable")
-                })?;
+                let destination_state =
+                    destination_runtime.runtime_state_store().ok_or_else(|| {
+                        anyhow::anyhow!("destination runtime state store is unavailable")
+                    })?;
                 let destination_execution = destination_runtime
                     .agent_for_handoff(&conversation.conversation_id)
                     .await?;
@@ -6574,17 +6625,22 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                 let expected_ids = hidden_rows
                     .iter()
                     .map(|(index, digest)| {
-                        let row = imported_rows
-                            .get(*index)
-                            .ok_or_else(|| anyhow::anyhow!("handoff hidden destination row is missing"))?;
-                        if echo_agent::memory::transcript_projection_message_digest(row)? != *digest {
+                        let row = imported_rows.get(*index).ok_or_else(|| {
+                            anyhow::anyhow!("handoff hidden destination row is missing")
+                        })?;
+                        if echo_agent::memory::transcript_projection_message_digest(row)? != *digest
+                        {
                             anyhow::bail!("handoff hidden destination row changed");
                         }
-                        row.id.ok_or_else(|| anyhow::anyhow!("handoff hidden destination row has no ID"))
+                        row.id.ok_or_else(|| {
+                            anyhow::anyhow!("handoff hidden destination row has no ID")
+                        })
                     })
                     .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
                 if mapped_ids != expected_ids {
-                    anyhow::bail!("handoff destination visibility does not match source hidden rows");
+                    anyhow::bail!(
+                        "handoff destination visibility does not match source hidden rows"
+                    );
                 }
                 Ok::<(), anyhow::Error>(())
             }
@@ -6599,16 +6655,21 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                             Some(destination_admission),
                         )
                         .await;
-                    return Err(crate::agent_control::AgentControlError::Runtime(match rollback {
-                        Ok(_) => {
-                            state.storage.conversation_archive.abandon_handoff(&handoff_operation_id)
-                                .map_err(crate::agent_control::AgentControlError::Runtime)?;
-                            format!("destination import failed: {error}")
-                        }
-                        Err(rollback_error) => format!(
-                            "destination import failed: {error}; rollback failed: {rollback_error}; handoff debt retained"
-                        ),
-                    }));
+                    return Err(crate::agent_control::AgentControlError::Runtime(
+                        match rollback {
+                            Ok(_) => {
+                                state
+                                    .storage
+                                    .conversation_archive
+                                    .abandon_handoff(&handoff_operation_id)
+                                    .map_err(crate::agent_control::AgentControlError::Runtime)?;
+                                format!("destination import failed: {error}")
+                            }
+                            Err(rollback_error) => format!(
+                                "destination import failed: {error}; rollback failed: {rollback_error}; handoff debt retained"
+                            ),
+                        },
+                    ));
                 }
                 drop(destination_admission);
                 return Err(crate::agent_control::AgentControlError::Runtime(format!(
@@ -6657,16 +6718,21 @@ impl crate::agent_control::AgentControlAppOps for AppStateAgentControlOps {
                             Some(destination_admission),
                         )
                         .await;
-                    return Err(crate::agent_control::AgentControlError::Runtime(match rollback {
-                        Ok(_) => {
-                            state.storage.conversation_archive.abandon_handoff(&handoff_operation_id)
-                                .map_err(crate::agent_control::AgentControlError::Runtime)?;
-                            format!("source conversation retirement failed: {error}")
-                        }
-                        Err(rollback_error) => format!(
-                            "source conversation retirement failed: {error}; destination rollback failed: {rollback_error}; handoff debt retained"
-                        ),
-                    }));
+                    return Err(crate::agent_control::AgentControlError::Runtime(
+                        match rollback {
+                            Ok(_) => {
+                                state
+                                    .storage
+                                    .conversation_archive
+                                    .abandon_handoff(&handoff_operation_id)
+                                    .map_err(crate::agent_control::AgentControlError::Runtime)?;
+                                format!("source conversation retirement failed: {error}")
+                            }
+                            Err(rollback_error) => format!(
+                                "source conversation retirement failed: {error}; destination rollback failed: {rollback_error}; handoff debt retained"
+                            ),
+                        },
+                    ));
                 }
                 drop(destination_admission);
                 return Err(crate::agent_control::AgentControlError::Runtime(format!(

@@ -3,8 +3,8 @@ schema_version: 1
 id: baseline.repository
 kind: baseline
 source_snapshot:
-  base_revision: ff27188e828c1685337dfd6fcc80b207a6456d6a
-  content_digest: 2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3
+  base_revision: a88d247c0a87557093d723c24c2349c875b8e6b9
+  content_digest: 215699889c9c12b8702566e900205bc6e2f73d00e83993834c0688cafa6e7464
 inventory_closure: open
 behavior_model_closure: open
 map_refs: [map.eko-conversation-collaboration, map.eko-framework-consumer-settlement]
@@ -69,3 +69,7 @@ coverage: []
 ## 闭合结论
 
 当前基线结构与路径分类可作为后续增量依据；GUI Fork 的当前候选单独绑定测试证据，全仓其它能力的库存闭合与行为模型闭合仍为 open。
+
+## Cancellation observation 开发 checkpoint
+
+当前任务以可恢复a88d247为前置，仅刷新实际非语义源码摘要。原owner typed observation、durable fence与聚合保留的三个场景仍为needs_review、三个lens仍stale；有限源码独审与两条focused测试不等于宽行为Finding/最终消费者闭合。当前构建借public f0a中间framework切点；TUI/GUI条件、其余强例、最终F main和全量门禁仍待。库存与行为模型仍open，不以本checkpoint收缩或删除既有义务。

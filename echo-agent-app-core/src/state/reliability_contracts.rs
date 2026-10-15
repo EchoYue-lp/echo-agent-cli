@@ -72,7 +72,10 @@ impl echo_agent::state::RuntimeStateStore for CheckpointReadBarrier {
         &'a self,
         scope_id: &'a str,
         runtime_state_id: &'a str,
-    ) -> BoxFuture<'a, echo_agent::error::Result<Option<echo_agent::state::ManagedRuntimeStateSnapshot>>> {
+    ) -> BoxFuture<
+        'a,
+        echo_agent::error::Result<Option<echo_agent::state::ManagedRuntimeStateSnapshot>>,
+    > {
         self.inner.load_runtime_state(scope_id, runtime_state_id)
     }
 
@@ -81,9 +84,15 @@ impl echo_agent::state::RuntimeStateStore for CheckpointReadBarrier {
         context: echo_agent::memory::PersistenceCallContext,
         scope_id: &'a str,
         runtime_state_id: &'a str,
-    ) -> BoxFuture<'a, echo_agent::error::Result<Option<echo_agent::state::ManagedRuntimeStateSnapshot>>> {
+    ) -> BoxFuture<
+        'a,
+        echo_agent::error::Result<Option<echo_agent::state::ManagedRuntimeStateSnapshot>>,
+    > {
         Box::pin(async move {
-            if !self.intercepted.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            if !self
+                .intercepted
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
                 self.entered.notify_one();
                 self.release.notified().await;
                 if self.fail {
@@ -102,24 +111,30 @@ impl echo_agent::state::RuntimeStateStore for CheckpointReadBarrier {
         &'a self,
         context: echo_agent::memory::PersistenceCallContext,
         scope_id: &'a str,
-    ) -> BoxFuture<'a, echo_agent::error::Result<Option<echo_agent::state::RuntimeScopeAuthority>>> {
-        self.inner.load_scope_authority_with_context(context, scope_id)
+    ) -> BoxFuture<'a, echo_agent::error::Result<Option<echo_agent::state::RuntimeScopeAuthority>>>
+    {
+        self.inner
+            .load_scope_authority_with_context(context, scope_id)
     }
 
     fn compare_and_save_checkpoint_with_context<'a>(
         &'a self,
         context: echo_agent::memory::PersistenceCallContext,
         request: echo_agent::state::RuntimeCheckpointCasRequest,
-    ) -> BoxFuture<'a, echo_agent::error::Result<echo_agent::state::RuntimeCheckpointCasReceipt>> {
-        self.inner.compare_and_save_checkpoint_with_context(context, request)
+    ) -> BoxFuture<'a, echo_agent::error::Result<echo_agent::state::RuntimeCheckpointCasReceipt>>
+    {
+        self.inner
+            .compare_and_save_checkpoint_with_context(context, request)
     }
 
     fn acknowledge_transcript_projection_with_context<'a>(
         &'a self,
         context: echo_agent::memory::PersistenceCallContext,
         request: echo_agent::state::RuntimeTranscriptAckRequest,
-    ) -> BoxFuture<'a, echo_agent::error::Result<echo_agent::state::RuntimeCheckpointCasReceipt>> {
-        self.inner.acknowledge_transcript_projection_with_context(context, request)
+    ) -> BoxFuture<'a, echo_agent::error::Result<echo_agent::state::RuntimeCheckpointCasReceipt>>
+    {
+        self.inner
+            .acknowledge_transcript_projection_with_context(context, request)
     }
 
     fn get_checkpoint<'a>(
@@ -581,9 +596,8 @@ async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> a
     let task_store = runtime
         .task_runtime()
         .ok_or_else(|| anyhow::anyhow!("target runtime has no TaskRuntimeStore"))?;
-    let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(
-        "active-target-turn",
-    );
+    let run_id =
+        crate::tasks::task_runtime::task_tools::formal_run_id_for_turn("active-target-turn");
     let recorded = crate::tasks::task_runtime::TaskRuntimeOperation::new(task_store)
         .run_store("load live user steer contract", move |store| {
             store.get_run_state(&run_id)
@@ -1617,11 +1631,7 @@ async fn f1_cold_acceptance_waits_for_real_context_drain() -> anyhow::Result<()>
             )
             .await
     });
-    tokio::time::timeout(
-        COLD_DELIVERY_TEST_TIMEOUT,
-        barrier.wait_until_entered(),
-    )
-    .await?;
+    tokio::time::timeout(COLD_DELIVERY_TEST_TIMEOUT, barrier.wait_until_entered()).await?;
 
     let accepted = state
         .agent_router
@@ -1699,11 +1709,7 @@ async fn f1_cold_terminal_before_drain_fails_without_drained_replay() -> anyhow:
             )
             .await
     });
-    tokio::time::timeout(
-        COLD_DELIVERY_TEST_TIMEOUT,
-        barrier.wait_until_entered(),
-    )
-    .await?;
+    tokio::time::timeout(COLD_DELIVERY_TEST_TIMEOUT, barrier.wait_until_entered()).await?;
     assert_eq!(
         state
             .agent_router

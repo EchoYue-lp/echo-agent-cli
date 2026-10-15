@@ -135,7 +135,8 @@ mod tests {
             TurnRequest::new(turn_identity(&run.run_id, turn_id)?, "test").mode(TurnMode::Execute);
         Ok(AgentTurnDriver
             .drive(&ScriptedTurnAgent::new(script), request, &sink)
-            .await)
+            .await
+            .map_err(|error| error.to_string())?)
     }
 
     fn compiled_task_prompt(
@@ -315,7 +316,8 @@ mod tests {
             .mode(TurnMode::Execute);
         let receipt = AgentTurnDriver
             .drive(&ScriptedTurnAgent::new(usage_script), request, &sink)
-            .await;
+            .await
+            .map_err(|error| error.to_string())?;
 
         assert!(matches!(receipt.outcome, TurnOutcome::Completed));
         assert_eq!(receipt.prompt_tokens, 3);
@@ -601,6 +603,8 @@ mod tests {
             failure_fingerprint: None,
             status: echo_agent::tasks::TaskStatus::Pending,
             claim: None,
+            result: None,
+            interruption_requested: None,
             sort_order: 0,
         }
     }
@@ -1082,18 +1086,16 @@ Read the runtime path and found one missing branch.
             .get_summary(&run_id, "direct-answer")
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "direct completion summary missing".to_string())?;
-        assert!(
-            summary.outcome.evidence.iter().any(|evidence| {
-                evidence.kind == "tool_result"
-                    && evidence.subject == "read_file"
-                    && evidence
-                        .attributes
-                        .get("args")
-                        .and_then(|args| args.get("path"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("README.md")
-            })
-        );
+        assert!(summary.outcome.evidence.iter().any(|evidence| {
+            evidence.kind == "tool_result"
+                && evidence.subject == "read_file"
+                && evidence
+                    .attributes
+                    .get("args")
+                    .and_then(|args| args.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("README.md")
+        }));
         assert_eq!(
             summary.outcome.touched_files.read,
             vec!["README.md".to_string()]
@@ -1406,8 +1408,7 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn task_runtime_operation_keeps_async_heartbeat_responsive() -> Result<(), String>
-    {
+    async fn task_runtime_operation_keeps_async_heartbeat_responsive() -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let operation = TaskRuntimeOperation::new(store);
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -2416,7 +2417,10 @@ Read the runtime path and found one missing branch.
         )
         .await
         .map_err(|error| error.to_string())?;
-        assert!(matches!(launch.wait().await?, RunOutcome::Completed));
+        assert!(matches!(
+            launch.wait().await.map_err(|error| error.to_string())?,
+            RunOutcome::Completed
+        ));
         assert!(
             store
                 .get_plan("direct-resume")

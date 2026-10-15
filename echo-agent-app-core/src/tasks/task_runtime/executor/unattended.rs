@@ -492,13 +492,8 @@ async fn execute_task(
                     terminal_status = ?sub_result.outcome.status,
                     "task_runtime: read-only subagent settled"
                 );
-                finalize_subagent_execution(
-                    blocking.clone(),
-                    &run_id,
-                    &execution_id,
-                    sub_result,
-                )
-                .await
+                finalize_subagent_execution(blocking.clone(), &run_id, &execution_id, sub_result)
+                    .await
             }
             Err(e) => {
                 tracing::warn!(
@@ -558,19 +553,16 @@ async fn execute_task(
                     terminal_status = ?sub_result.outcome.status,
                     "task_runtime: writer subagent settled"
                 );
-                finalize_subagent_execution(
-                    blocking.clone(),
-                    &run_id,
-                    &execution_id,
-                    sub_result,
-                )
-                .await
+                finalize_subagent_execution(blocking.clone(), &run_id, &execution_id, sub_result)
+                    .await
             }
-            Err(error) => Err(if task_cancel.is_cancelled() {
-                ExecutionFailure::cancelled("task cancelled")
-            } else {
-                error
-            }),
+            Err(error) => Err(
+                if error.observation.is_none() && task_cancel.is_cancelled() {
+                    ExecutionFailure::cancelled("task cancelled")
+                } else {
+                    error
+                },
+            ),
         }
     } else {
         let compiler = crate::subagent_prompt::EkoSubagentPromptCompiler;
@@ -724,6 +716,9 @@ async fn execute_task(
             })
         }
         Err(failure) => {
+            if failure.observation.is_some() {
+                return Err(TaskDispatchFailure::from_execution(task_id, failure));
+            }
             let status = failure.status;
             let message = failure.message;
             let usage = failure.usage;
@@ -822,6 +817,7 @@ async fn execute_task(
                     message,
                     usage,
                     agent_failure,
+                    observation: None,
                 },
             ))
         }
@@ -845,7 +841,10 @@ struct RawSuggestedTask {
 fn parse_suggested_tasks(text: &str) -> Vec<SuggestedTask> {
     let mut out = Vec::new();
     for object in echo_agent::subagent::parse_json_objects(text) {
-        let Some(values) = object.get("suggested_tasks").and_then(|value| value.as_array()) else {
+        let Some(values) = object
+            .get("suggested_tasks")
+            .and_then(|value| value.as_array())
+        else {
             continue;
         };
         for value in values {
@@ -1558,7 +1557,13 @@ async fn run_main_agent_task(
                 .mode(TurnMode::Execute)
                 .cancel(cancel)
                 .invocation(invocation);
-                let receipt = AgentTurnDriver.drive(agent, request, &sink).await;
+                let receipt =
+                    AgentTurnDriver
+                        .drive(agent, request, &sink)
+                        .await
+                        .map_err(|error| {
+                            ExecutionFailure::with_react_error(error, "primary task observation")
+                        })?;
                 let usage = receipt.usage();
                 let observation = sink.finish(receipt.final_answer.as_deref());
 
@@ -1607,11 +1612,7 @@ async fn run_main_agent_task(
                         ))
                         .with_usage(usage.clone())
                     })?;
-                Ok((
-                    outcome,
-                    observation.output,
-                    usage,
-                ))
+                Ok((outcome, observation.output, usage))
             })
         })
         .await
