@@ -3379,7 +3379,7 @@ async fn send_to_agent(
         return Ok(settle_planned_resume_foreground(lease, outcome).await);
     }
     lease.retain_execution(pool_execution);
-    let result = if let Some(binding) = run_turn_binding {
+    if let Some(binding) = run_turn_binding {
         drive_foreground_chat_turn(lease, agent, &turn, res, binding).await
     } else if let Some((service, attempt)) = input_observation {
         let observer_service = service.clone();
@@ -3415,8 +3415,7 @@ async fn send_to_agent(
         .await
     } else {
         drive_foreground_chat(lease, agent, &turn, res).await
-    };
-    result
+    }
 }
 
 fn run_turn_binding_for_request(

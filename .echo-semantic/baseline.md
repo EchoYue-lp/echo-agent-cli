@@ -3,8 +3,8 @@ schema_version: 1
 id: baseline.repository
 kind: baseline
 source_snapshot:
-  base_revision: ccf700ad4bed0fe4c84a1b376af97236a5b06cc7
-  content_digest: 482a04666faee98961db90b77d432be9e00c19801887dd3e71c7773e0dd9fdf1
+  base_revision: f57b90a2b0962fa5561f8839a3df70be1f261ffa
+  content_digest: bd75b49f18a60ada507be1bb1609d9a9e4e52b6f4def9101a859d6f66cc231aa
 inventory_closure: open
 behavior_model_closure: open
 map_refs: [map.eko-conversation-collaboration, map.eko-framework-consumer-settlement]
@@ -45,6 +45,8 @@ coverage: []
 ---
 
 # EKO application semantic baseline
+
+2026-10-17 primary checkpoint仅刷新当前非语义源码摘要，base保已公开main祖先f57；原c874源码482a摘要已由官方source_digest_at_revision核同。GUI/channel两独立red→after/4控制共6pass、具名cron1pass与17file独审/Clippy零warning均属有限证据；完整workspace/GUI/精main CI未完，原needs_review/stale/库存与行为open不关闭。三依赖为人的精确risk_accepted，不冒修复或原audit0。
 
 ## 源码快照
 

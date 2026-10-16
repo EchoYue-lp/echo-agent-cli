@@ -1018,6 +1018,9 @@ struct CompletedAnalysisRun {
     result: Result<crate::analysis::AnalysisDocument, String>,
 }
 
+#[cfg(test)]
+type AnalysisCleanupTestHook = Box<dyn FnOnce() -> Result<(), String> + Send>;
+
 struct AnalysisRunEntry {
     receipt: AnalysisRunReceipt,
     _control: Option<ScopedWorkspaceControl>,
@@ -1030,7 +1033,7 @@ struct AnalysisRunEntry {
     >,
     cleanup_evidence: std::sync::Mutex<Option<AnalysisCleanupEvidence>>,
     #[cfg(test)]
-    cleanup_test_hook: std::sync::Mutex<Option<Box<dyn FnOnce() -> Result<(), String> + Send>>>,
+    cleanup_test_hook: std::sync::Mutex<Option<AnalysisCleanupTestHook>>,
     #[cfg(test)]
     before_terminal_publication: std::sync::Mutex<Option<futures::future::BoxFuture<'static, ()>>>,
     retained_flow: std::sync::Mutex<Option<ProductDataIoFlow>>,
@@ -1129,10 +1132,10 @@ impl AnalysisRunSupervisor {
             .collect::<Vec<_>>();
         let mut errors = Vec::new();
         for (key, entry) in entries {
-            if let Some(control) = entry._control.as_ref() {
-                if let Err(error) = self.retry_known_cleanup(control.data_root(), &key, &entry) {
-                    errors.push(error.to_string());
-                }
+            if let Some(control) = entry._control.as_ref()
+                && let Err(error) = self.retry_known_cleanup(control.data_root(), &key, &entry)
+            {
+                errors.push(error.to_string());
             }
         }
         errors

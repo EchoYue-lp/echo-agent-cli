@@ -64,6 +64,12 @@ analysis owner 保留原 generation、pool、memory 和 I/O receipts；各 surfa
 不发终态、不重放执行。driver 尚未启动时，已有的 live cancellation registration 也不能作为
 已取消的证明。shutdown 报告未确认的所有权，不据此释放资源。
 
+channel renderer 将既有 app-core observation 无损转回框架错误，保留 run/execution 身份。
+GUI planned resume 先保留同一 foreground lease，再返回未结算观察；不得进入普通 Failed
+结算分支。
+launch 准备阶段遇到未结算的 durable owner fence 也遵循同一规则。foreground settlement
+waiter 保留 typed run/execution 身份并传给 channel notifier；该观察不触发普通 input-pump kick。
+
 接纳工作前，原 Task journal 或 analysis 目录内的私有 intent 记录原 owner 身份，重启准入继续
 检查同一事实。只有匹配的物理完成才能记录 durable terminal 并清 intent。已完成但持久化失败
 由同一 owner 串行重试原清理，不重新运行 Agent 或工具；无完成来源的 foreign unknown 保持 fence。

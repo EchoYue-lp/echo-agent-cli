@@ -568,14 +568,6 @@ impl ChannelInputExecutionError {
             observation: None,
         }
     }
-
-    pub(super) fn after_driver(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-            reply: None,
-            observation: None,
-        }
-    }
 }
 
 /// Drain until the injected durable authority reports an empty frontier whose
@@ -1305,11 +1297,15 @@ mod tests {
                 self.service
                     .mailbox_accepted(attempt.clone())
                     .await
-                    .map_err(|error| ChannelInputExecutionError::after_driver(error.to_string()))?;
+                    .map_err(|error| {
+                        ChannelInputExecutionError::from_driver_error(error.to_string().into())
+                    })?;
                 self.service
                     .drained(attempt.clone())
                     .await
-                    .map_err(|error| ChannelInputExecutionError::after_driver(error.to_string()))?;
+                    .map_err(|error| {
+                        ChannelInputExecutionError::from_driver_error(error.to_string().into())
+                    })?;
                 self.service
                     .turn_settled(
                         attempt,
@@ -1318,7 +1314,7 @@ mod tests {
                     )
                     .await
                     .map_err(|error| {
-                        ChannelInputExecutionError::after_driver(error.to_string())
+                        ChannelInputExecutionError::from_driver_error(error.to_string().into())
                     })?;
                 self.executions.fetch_add(1, Ordering::SeqCst);
                 let _ = reply.terminal_tx.send(Ok(
@@ -1400,7 +1396,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert!(matches!(
             outcome,
-            echo_agent_app_core::api::chat_driver::TurnOutcome::Completed
+            Ok(echo_agent_app_core::api::chat_driver::TurnOutcome::Completed)
         ));
         assert_eq!(adapter.claims.load(Ordering::SeqCst), 1);
         assert_eq!(adapter.executions.load(Ordering::SeqCst), 1);
@@ -1639,7 +1635,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert!(matches!(
             outcome,
-            echo_agent_app_core::api::chat_driver::TurnOutcome::Completed
+            Ok(echo_agent_app_core::api::chat_driver::TurnOutcome::Completed)
         ));
         assert_eq!(adapter.executions.load(Ordering::SeqCst), 2);
         assert_eq!(adapter.recoveries.load(Ordering::SeqCst), 1);

@@ -517,7 +517,10 @@ impl ChannelSessionCoordinator {
         &self,
         waiter: echo_agent_app_core::api::foreground_turn::ForegroundTurnSettlementWaiter,
         terminal_tx: tokio::sync::oneshot::Sender<
-            echo_agent_app_core::api::chat_driver::TurnOutcome,
+            Result<
+                echo_agent_app_core::api::chat_driver::TurnOutcome,
+                echo_agent_app_core::api::chat_driver::ChatTurnError,
+            >,
         >,
         slot: Arc<
             input_pump::ChannelInputPumpSlot<
@@ -537,7 +540,23 @@ impl ChannelSessionCoordinator {
         }
         tasks.tasks.spawn_on(
             async move {
-                let settlement = waiter.wait().await.map_err(|error| error.to_string())?;
+                let settlement = match waiter.wait().await {
+                    Ok(settlement) => settlement,
+                    Err(ForegroundTurnError::Observation {
+                        run_id,
+                        execution_id,
+                    }) => {
+                        // An observation cannot kick replay or publish a terminal.
+                        let _ = terminal_tx.send(Err(
+                            echo_agent_app_core::api::chat_driver::ChatTurnError::Observation {
+                                run_id,
+                                execution_id,
+                            },
+                        ));
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
                 let _ = terminal_tx.send(Ok(settlement.outcome));
                 let kick = match slot.kick() {
                     Ok(kick) => Some(kick),
@@ -7475,6 +7494,115 @@ mod tests {
             assert!(token.len() <= super::CHANNEL_TOKEN_COALESCE_BYTES);
             assert!(token.is_char_boundary(token.len()));
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn channel_observation_preserves_identity_without_terminal() -> Result<(), String> {
+        use echo_agent::error::ReactError;
+        use echo_agent_app_core::api::chat_driver::ChatTurnError;
+        use echo_agent_app_core::api::foreground_turn::{
+            ForegroundTurnControl, ForegroundTurnSurface,
+        };
+        use futures::StreamExt;
+
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let state = echo_agent_app_core::api::state::AppState::from_shared(
+            channel_test_agent(std::time::Duration::ZERO)?,
+            None,
+            Arc::new(echo_agent_app_core::api::hitl::HitlDispatcher::new()),
+            None,
+            None,
+            Default::default(),
+            Arc::new(
+                echo_agent_app_core::api::mcp_config_runtime::McpConfigRuntime::from_snapshot(
+                    temporary.path().join("mcp.json"),
+                    echo_agent::mcp::McpConfigFile::default(),
+                ),
+            ),
+            echo_agent_app_core::api::product_data_io::ProductDataIoService::new(),
+        )
+        .map_err(|error| error.to_string())?;
+        let control = ForegroundTurnControl::default();
+        let lease = control
+            .begin_scoped(
+                "workspace-observed",
+                ForegroundTurnSurface::Channel,
+                "conversation-observed",
+                "turn-observed",
+            )
+            .map_err(|error| error.to_string())?;
+        let waiter = control
+            .settlement_waiter_scoped(
+                "workspace-observed",
+                ForegroundTurnSurface::Channel,
+                "conversation-observed",
+                "turn-observed",
+            )
+            .map_err(|error| error.to_string())?;
+        let coordinator = super::ChannelSessionCoordinator::new();
+        let adapter = Arc::new(super::ChannelInputPumpAdapter {
+            app_state: Arc::new(state),
+            foreground_turns: control.clone(),
+            address: echo_agent_app_core::api::conversation_input::ConversationInputAddress {
+                workspace_id: "workspace-observed".to_string(),
+                conversation_id: "conversation-observed".to_string(),
+            },
+            agent_conversation_id: "agent-conversation-observed".to_string(),
+            cache_id: "observed-cache".to_string(),
+            hitl: Arc::new(super::ChannelHumanLoopProvider::new()),
+        });
+        let (_driver_tx, driver_rx) = tokio::sync::mpsc::channel(1);
+        let (_prompt_tx, prompt_rx) = tokio::sync::broadcast::channel::<String>(1);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        coordinator.start_post_settlement_input_task(
+            waiter,
+            terminal_tx,
+            Arc::new(super::input_pump::ChannelInputPumpSlot::default()),
+            adapter,
+        )?;
+        lease.retain_observation(ChatTurnError::Observation {
+            run_id: "channel-original-run".to_string(),
+            execution_id: Some("channel-original-execution".to_string()),
+        });
+        let notifier = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            coordinator.join_input_pumps(),
+        )
+        .await
+        .map_err(|_| "channel observation notifier did not return".to_string())?;
+        drop(lease);
+        let mut stream = super::channel_render_event_stream(
+            driver_rx,
+            prompt_rx,
+            terminal_rx,
+            super::ChannelStreamDropGuard(echo_agent::agent::CancellationToken::new()),
+        );
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .map_err(|_| "channel observation did not return".to_string())?
+            .ok_or_else(|| "channel ended without observation".to_string())?;
+        assert!(matches!(
+            observed,
+            Err(ReactError::ExecutionNotSettled { run_id, execution_id })
+                if run_id == "channel-original-run"
+                    && execution_id.as_deref() == Some("channel-original-execution")
+        ));
+        assert!(stream.next().await.is_none());
+        assert!(
+            notifier.is_ok(),
+            "observation is not notifier failure: {notifier:?}"
+        );
+        assert!(
+            control
+                .snapshot_scoped(
+                    "workspace-observed",
+                    ForegroundTurnSurface::Channel,
+                    "conversation-observed"
+                )
+                .is_some()
+        );
         Ok(())
     }
 

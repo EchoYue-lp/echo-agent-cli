@@ -66,6 +66,23 @@ pub(crate) struct AnalysisOwnerIntent {
     execution_id: Option<String>,
 }
 
+// Named projections of the same admitted owner; neither creates a supervisor
+// nor changes the durable intent or original cleanup slot.
+#[derive(Clone)]
+struct AnalysisOwnerObservation {
+    intent: AnalysisOwnerIntent,
+    execution_started: Arc<std::sync::atomic::AtomicBool>,
+    pending_settlement: Arc<std::sync::Mutex<Option<PendingAnalysisSettlement>>>,
+}
+
+#[derive(Default)]
+struct AnalysisExecutionContext<'a> {
+    runtime: Option<&'a crate::analysis_runtime::PreparedAnalyticsRuntime>,
+    prepare_managed_runtime: bool,
+    product_data: Option<&'a crate::product_data_io::ProductDataIoFlow>,
+    owner: Option<AnalysisOwnerObservation>,
+}
+
 pub(crate) fn require_analysis_owner_settled(root: &Path, id: &str) -> AnalysisResult<()> {
     let directory = analysis_dir(root, id)?;
     let path = directory.join(OWNER_INTENT_FILE);
@@ -544,14 +561,16 @@ pub async fn run_analysis_with_product_data(
         product_data.data_root(),
         analysis_id,
         cancel,
-        None,
-        true,
-        Some(flow),
-        Some((
-            intent.clone(),
-            execution_started.clone(),
-            pending_settlement.clone(),
-        )),
+        AnalysisExecutionContext {
+            runtime: None,
+            prepare_managed_runtime: true,
+            product_data: Some(flow),
+            owner: Some(AnalysisOwnerObservation {
+                intent: intent.clone(),
+                execution_started: execution_started.clone(),
+                pending_settlement: pending_settlement.clone(),
+            }),
+        },
     )
     .await;
     if result.is_ok() {
@@ -596,25 +615,24 @@ pub async fn run_analysis_with_product_data(
             );
             return Err(error);
         }
-    } else if !matches!(&result, Err(AnalysisError::Observation { .. })) {
-        if let Some(pending) = pending_settlement
+    } else if !matches!(&result, Err(AnalysisError::Observation { .. }))
+        && let Some(pending) = pending_settlement
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
-        {
-            // The original tool has returned a real result. Retain its exact
-            // pending durable writes; a later poll only retries these writes.
-            product_data.retain_analysis_pending_settlement(
-                analysis_id,
-                intent,
-                pending,
-                result
-                    .as_ref()
-                    .err()
-                    .map(ToString::to_string)
-                    .unwrap_or_default(),
-            );
-        }
+    {
+        // The original tool has returned a real result. Retain its exact
+        // pending durable writes; a later poll only retries these writes.
+        product_data.retain_analysis_pending_settlement(
+            analysis_id,
+            intent,
+            pending,
+            result
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        );
     }
     result
 }
@@ -631,10 +649,12 @@ async fn run_analysis(
         workspace_root,
         analysis_id,
         cancel,
-        None,
-        false,
-        None,
-        None,
+        AnalysisExecutionContext {
+            runtime: None,
+            prepare_managed_runtime: false,
+            product_data: None,
+            owner: None,
+        },
     )
     .await
 }
@@ -644,19 +664,16 @@ async fn run_analysis_with_runtime(
     workspace_root: &Path,
     analysis_id: &str,
     cancel: Option<Arc<CancellationToken>>,
-    runtime: Option<&crate::analysis_runtime::PreparedAnalyticsRuntime>,
-    prepare_managed_runtime: bool,
-    product_data: Option<&crate::product_data_io::ProductDataIoFlow>,
-    intent: Option<(
-        AnalysisOwnerIntent,
-        Arc<std::sync::atomic::AtomicBool>,
-        Arc<std::sync::Mutex<Option<PendingAnalysisSettlement>>>,
-    )>,
+    context: AnalysisExecutionContext<'_>,
 ) -> AnalysisResult<AnalysisDocument> {
-    let pending_settlement = intent
-        .as_ref()
-        .map(|(owner, _, slot)| (owner.clone(), slot.clone()));
-    let execution_started = intent.as_ref().map(|(_, started, _)| started.clone());
+    let AnalysisExecutionContext {
+        runtime,
+        prepare_managed_runtime,
+        product_data,
+        owner: intent,
+    } = context;
+    let pending_settlement = intent.clone();
+    let execution_started = intent.as_ref().map(|owner| owner.execution_started.clone());
     let timer = Instant::now();
     let root = workspace_root.to_path_buf();
     let id = analysis_id.to_string();
@@ -671,7 +688,7 @@ async fn run_analysis_with_runtime(
         let parameters_sha256 = hash_json(&document.manifest.parameters)?;
         let run_id = intent
             .as_ref()
-            .map(|(intent, _, _)| intent.run_id.clone())
+            .map(|owner| owner.intent.run_id.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let started_at = Utc::now();
         Ok(PreparedAnalysisRun {
@@ -713,9 +730,12 @@ async fn run_analysis_with_runtime(
             prepared,
             terminal,
             timer,
-            None,
-            product_data,
-            pending_settlement,
+            AnalysisExecutionContext {
+                runtime: None,
+                product_data,
+                owner: pending_settlement,
+                ..Default::default()
+            },
         )
         .await?;
         return Err(AnalysisError::Execution(detail));
@@ -757,9 +777,12 @@ async fn run_analysis_with_runtime(
                     prepared,
                     terminal,
                     timer,
-                    None,
-                    product_data,
-                    pending_settlement,
+                    AnalysisExecutionContext {
+                        runtime: None,
+                        product_data,
+                        owner: pending_settlement,
+                        ..Default::default()
+                    },
                 )
                 .await;
             }
@@ -815,9 +838,12 @@ async fn run_analysis_with_runtime(
         prepared,
         terminal,
         timer,
-        runtime,
-        product_data,
-        pending_settlement,
+        AnalysisExecutionContext {
+            runtime,
+            product_data,
+            owner: pending_settlement,
+            ..Default::default()
+        },
     )
     .await
 }
@@ -909,13 +935,14 @@ async fn settle_analysis_run(
     prepared: PreparedAnalysisRun,
     terminal: AnalysisTerminal,
     timer: Instant,
-    runtime: Option<&crate::analysis_runtime::PreparedAnalyticsRuntime>,
-    product_data: Option<&crate::product_data_io::ProductDataIoFlow>,
-    owner_pending: Option<(
-        AnalysisOwnerIntent,
-        Arc<std::sync::Mutex<Option<PendingAnalysisSettlement>>>,
-    )>,
+    context: AnalysisExecutionContext<'_>,
 ) -> AnalysisResult<AnalysisDocument> {
+    let AnalysisExecutionContext {
+        runtime,
+        product_data,
+        owner: owner_pending,
+        ..
+    } = context;
     let pending = PendingAnalysisSettlement {
         root: workspace_root.to_path_buf(),
         analysis_id: analysis_id.to_string(),
@@ -927,10 +954,13 @@ async fn settle_analysis_run(
             .map(|runtime| runtime.environment.clone())
             .unwrap_or_default(),
         runtime_profile: runtime.map(|runtime| runtime.profile.id.clone()),
-        owner_intent: owner_pending.as_ref().map(|(owner, _)| owner.clone()),
+        owner_intent: owner_pending.as_ref().map(|owner| owner.intent.clone()),
     };
-    if let Some((_, slot)) = owner_pending.as_ref() {
-        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(pending.clone());
+    if let Some(owner) = owner_pending.as_ref() {
+        *owner
+            .pending_settlement
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(pending.clone());
     }
     let result = run_analysis_io(product_data, "settle analysis execution", move || {
         retry_analysis_settlement(&pending)
@@ -1595,14 +1625,16 @@ mod tests {
             root.path(),
             &id,
             None,
-            None,
-            false,
-            None,
-            Some((
-                intent.clone(),
-                started.clone(),
-                Arc::new(std::sync::Mutex::new(None)),
-            )),
+            AnalysisExecutionContext {
+                runtime: None,
+                prepare_managed_runtime: false,
+                product_data: None,
+                owner: Some(AnalysisOwnerObservation {
+                    intent: intent.clone(),
+                    execution_started: started.clone(),
+                    pending_settlement: Arc::new(std::sync::Mutex::new(None)),
+                }),
+            },
         )
         .await;
         assert!(result.is_err());
@@ -1636,14 +1668,16 @@ mod tests {
             root.path(),
             &id,
             None,
-            None,
-            false,
-            None,
-            Some((
-                intent.clone(),
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Arc::new(std::sync::Mutex::new(None)),
-            )),
+            AnalysisExecutionContext {
+                runtime: None,
+                prepare_managed_runtime: false,
+                product_data: None,
+                owner: Some(AnalysisOwnerObservation {
+                    intent: intent.clone(),
+                    execution_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    pending_settlement: Arc::new(std::sync::Mutex::new(None)),
+                }),
+            },
         )
         .await?;
         assert_eq!(
@@ -1719,14 +1753,16 @@ mod tests {
                 root.path(),
                 &id,
                 None,
-                None,
-                false,
-                None,
-                Some((
-                    intent.clone(),
-                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                    pending.clone(),
-                )),
+                AnalysisExecutionContext {
+                    runtime: None,
+                    prepare_managed_runtime: false,
+                    product_data: None,
+                    owner: Some(AnalysisOwnerObservation {
+                        intent: intent.clone(),
+                        execution_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        pending_settlement: pending.clone(),
+                    }),
+                },
             )
             .await;
             assert!(
@@ -2210,10 +2246,12 @@ mod tests {
             workspace.path(),
             &created.manifest.analysis_id,
             Some(cancel),
-            None,
-            true,
-            None,
-            None,
+            AnalysisExecutionContext {
+                runtime: None,
+                prepare_managed_runtime: true,
+                product_data: None,
+                owner: None,
+            },
         )
         .await?;
         let run = completed
@@ -2259,10 +2297,12 @@ mod tests {
             workspace.path(),
             &created.manifest.analysis_id,
             None,
-            Some(&prepared),
-            false,
-            None,
-            None,
+            AnalysisExecutionContext {
+                runtime: Some(&prepared),
+                prepare_managed_runtime: false,
+                product_data: None,
+                owner: None,
+            },
         )
         .await?;
         let run = completed

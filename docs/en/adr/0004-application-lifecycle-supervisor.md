@@ -30,6 +30,14 @@ existing error presentation without publishing a terminal or replaying work.
 A live cancellation registration also remains nonterminal before its driver
 starts. Shutdown reports unresolved ownership and does not release it.
 
+The channel renderer converts the existing app-core observation back to the
+framework error without losing run/execution identity. GUI planned resume
+retains the same foreground lease before returning an unsettled observation;
+it never sends that observation through the ordinary Failed settlement branch.
+The same rule applies when launch preparation encounters an unresolved durable
+owner fence. Foreground settlement waiters preserve the typed run/execution
+identity through channel notification and skip the ordinary input-pump kick.
+
 Before work, the existing Task journal or private analysis-directory intent
 records the original owner identity. Restart admission honors that fact. Only
 matching physical completion permits durable terminal recording and intent

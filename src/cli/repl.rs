@@ -4357,7 +4357,8 @@ mod tests {
         let outcome = echo_agent_app_core::api::foreground_turn::drive_foreground_chat(
             lease, &agent, &turn, resources,
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         if !matches!(
             outcome,
             TurnOutcome::Failed(ref failure) if failure.code == "downstream_disconnect"

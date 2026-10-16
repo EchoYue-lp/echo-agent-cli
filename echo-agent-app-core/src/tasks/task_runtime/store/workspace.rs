@@ -390,7 +390,9 @@ impl RunDriverFailure {
     pub fn is_observation(&self) -> bool {
         matches!(self, Self::Observation { .. })
     }
-    pub(crate) fn into_react_error(self) -> echo_agent::error::ReactError {
+    /// Preserve the nonterminal identity when a surface returns to framework
+    /// streaming APIs; string conversion is only for final presentation.
+    pub fn into_react_error(self) -> echo_agent::error::ReactError {
         match self {
             Self::Observation {
                 run_id,

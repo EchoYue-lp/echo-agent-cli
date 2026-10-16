@@ -4,7 +4,7 @@ id: map.eko-framework-consumer-settlement
 kind: capability_map
 title: EKO framework consumer settlement
 risk: high
-observed_at: source:482a04666faee98961db90b77d432be9e00c19801887dd3e71c7773e0dd9fdf1
+observed_at: source:bd75b49f18a60ada507be1bb1609d9a9e4e52b6f4def9101a859d6f66cc231aa
 boundary_refs:
 - boundary.eko-framework-consumer-settlement
 behavior_refs:
@@ -21,6 +21,7 @@ evidence_refs:
 - evidence.cancellation-observation-consumer
 finding_refs:
 - finding.background-review-entry-settlement
+- finding.cli-upstream-dependency-risks
 audit_refs:
 - audit.background-review-entry-independent-rereview
 - audit.cancellation-observation-time-lifecycle
@@ -223,4 +224,4 @@ Scheduler/Task claim原场景因B关闭语义受影响而转needs_review；旧ma
 
 ## CF988 当前任务 checkpoint
 
-当前有限 source/receipt Review 为 C0/I0/M0；同 clean CF988 下的 canonical compose、Running/Paused 混合恢复、existing-run identity negative 三 case 各 1pass。原 owner、run 锁、validator 与普通恢复仍为唯一权威，详见共用 Evidence 对各 epoch 的区分。原九例是公开中间 3ded 的历史证据，未借为 CF988 九例重跑。新 cron/完整六加 GUI 二尚未执行；三 B 场景 needs_review、三 lens stale 和仓库闭合 open 保留。人的三项上游告警政策未裁决、无 ignore，不作完整交付声明。
+CF988三原focused各1pass，后继具名cron1pass及primary冻结副本surface两个独立red→after/正常普通控制共6pass均见共用Evidence。17file独审和测试非语义增量C0/I0/M0，all-targetClippy零warning通过。九例保3ded历史身份，不扩为CF988重跑。完整workspace/GUI、JSONL/精main CI待完成；三B场景needs_review、三lens stale、仓库闭合open保留。三依赖由人接受当前精版本风险并延期升级，Finding为risk_accepted而非resolved；精确门禁仍待验证，不冒原audit0。

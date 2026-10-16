@@ -133,10 +133,10 @@ mod tests {
         );
         let request =
             TurnRequest::new(turn_identity(&run.run_id, turn_id)?, "test").mode(TurnMode::Execute);
-        Ok(AgentTurnDriver
+        AgentTurnDriver
             .drive(&ScriptedTurnAgent::new(script), request, &sink)
             .await
-            .map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())
     }
 
     fn compiled_task_prompt(

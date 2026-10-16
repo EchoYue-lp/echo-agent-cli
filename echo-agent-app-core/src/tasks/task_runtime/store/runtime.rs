@@ -1456,8 +1456,8 @@ impl TaskRuntimeStore {
             .await?;
             result = settled_result;
             if release_receipts {
-                if let Some(intent) = intent.as_ref() {
-                    if let Err(error) = settlement_store.acknowledge_physical_owner_intent(intent) {
+                if let Some(intent) = intent.as_ref()
+                    && let Err(error) = settlement_store.acknowledge_physical_owner_intent(intent) {
                         settlement_store.observe_run_driver_resources(driver_token, &run_id, intent.execution_id.as_deref());
                         if let (Some(generation_lease), Some(cancellation_registration)) = (generation_lease.take(), cancellation_registration.take()) {
                             settlement_store.run_driver_supervisor.lock().unwrap_or_else(|error| error.into_inner()).uncertain_drivers.insert(driver_token, RetainedUncertainDriver {
@@ -1472,7 +1472,6 @@ impl TaskRuntimeStore {
                         let _ = result_sender.send(Err(E::from(error.to_string())));
                         return Ok((driver_token, Ok(())));
                     }
-                }
                 settlement_store.release_run_driver_receipts(driver_token).await;
             }
             match result {

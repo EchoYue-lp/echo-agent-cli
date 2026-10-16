@@ -2,9 +2,20 @@
 schema_version: 1
 id: evidence.cancellation-observation-consumer
 kind: evidence
-observed_at: source:482a04666faee98961db90b77d432be9e00c19801887dd3e71c7773e0dd9fdf1
+observed_at: source:bd75b49f18a60ada507be1bb1609d9a9e4e52b6f4def9101a859d6f66cc231aa
 source_refs:
 - echo-agent-app-core/src/state/config.rs
+- echo-agent-app-core/src/state/tests.rs
+- echo-agent-app-core/src/tasks/task_runtime/executor/dispatch.rs
+- echo-agent-app-core/src/tasks/task_runtime/executor/run.rs
+- echo-agent-app-core/src/tasks/task_runtime/executor/tests.rs
+- src/cli/repl.rs
+- src/cli/channels.rs
+- src/tauri/commands/task_runtime.rs
+- src/tui/events.rs
+- Cargo.toml
+- Cargo.lock
+- .github/workflows/rust-ci.yml
 - echo-agent-app-core/src/agent_router/tests.rs
 - echo-agent-app-core/src/agent_pool/admission.rs
 - echo-agent-app-core/src/agent_pool/pool.rs
@@ -111,4 +122,22 @@ cold增量d212/64及首编修正e2ea/64均由原独立reader源审C0/I0/M0。Roo
 
 混合恢复用例 1pass 覆盖 Running/Paused 两状态、普通两 run 恢复计数、protected journal/cell/guidance/interrupt 保持、错误 ack 拒绝和畸形 intent 报错；Paused/pending 扩展不追认为旧 before 已红。另 1pass 验证 canonical domain/route/attended/Goal 与原 trace、错误 active workspace/conversation/root 拒绝且 journal 不变；三类 negative 不是三个额外 tests。三个 focused top-level case 不叠加隔离子进程计数。
 
-当前真实 Cargo.lock 与同次干净 CF988 helper 新生成的 registry-origin view 均只有 3 个 denied upstream warnings；4 个 rustls 漏洞、yanked chacha20 及可正常升级的其它告警已从这个命名数据库切点消失。RustSec 缓存与官方 live Git HEAD/tree 已核同一身份；online fetch I/O 失败仍保留，不能称默认在线 gate 通过。未配置忽略，人的 A/B 尚未裁决。完整六项、GUI 两项、新 cron 与最终 main/CI 均待完成；三 broad behavior/scenario 的 needs_review 与三审查 lens 的 stale 保留，globalClosure 未检查。
+该历史切点的真实锁和CF988 helper registry-origin view均有3个denied warnings，原online fetch错误不作通过。后继人已明确保留版本并延期升级，具名cron和surface证据见末节；宽场景needs_review、三个lens stale与globalClosure未检查不变。
+
+## Primary surface checkpoint, 2026-10-17
+
+用户要求C无损迁入primary CLI：940tracked文件和13文件补丁逐hash一致，C仅备份。P真实apply_patch成功，pre-edit记录root=P/host=codex/两个允许目标对应；仅证明编辑准入，不是Stop或native GUI全验。
+
+channel真实ForegroundControl→waiter→notifier→renderer case编译后1fail/0pass，exact run/execution观察丢失。GUI独立case经官方FileEventJournal持久pending intent→重开原Store→真实launch返回RecoveryBlocked→实际错误结算函数，1fail/0pass，foreground误清为Failed。GUI首轮private counter编译错误不是行为红，改用既有is_run_active后才到业务断言。两有效before均sourceDrift=[]/CF988clean不变，原bin、patch与receipt保留。
+
+同原路径修复后单条Cargo命令exact选6case：两个same AFTER、GUI普通error、channel正常terminal/continuation prompt/planned-resume steer控制，实际6pass/0fail/0ignore，exit0、零warning/sourceDrift=[]/CF不变。独审15file diff d9dc99870d5a263f205ab0552b895358d343618466eb8c657f82c84cc3d65738为C0/I0/M0。4测试lint整理被独审确认为非语义增量，原结论继续有效；17file diff8784617790cc7380fad83dd76bd4d575727fa3f3f8797b9ec3f9dac3dbbdb3c2的原workspace/all-target/all-feature Clippy -D warnings重跑真实0/零warning。所有旧101及来源检查失败保原件，不改写通过。
+
+这些验证在P冻结副本执行，940tracked字节/mode一致，四canonical相对Cargo路径不变，兄弟framework symlink实际指向clean CF9886502/treeaee79a54。官方metadata --all-features --locked --offline为0/stderr空，8framework+3vendor canonical来源全CF、锁8e951不变；主框架Exa未采用/修改。先前unsupported Cargo paths警告的尝试不作通过依据。副本不是P原生Cargo或CI。
+
+P `.echo-semantic/local/cli-cancellation-observation-consumer/`保primary-channel-notifier-before-v2、primary-gui-launch-before-v2、primary-surface-after-controls、primary-alltarget-clippy/v2各log/run/receipt及independent/increment review。具名cron消费者另CF988真实1pass/0fail/0ignore并独审限定通过；正常/unknown两控制同一顶层case，测试owned async backend/permit，不是OS/pool/memory或无source晚恢复证明。takeover-cron-cf988-unfinished原件保原C执行身份。
+
+## Three dependency risks accepted by the user
+
+人已明确保持glib0.18.5、proc-macro-error1.0.4、bincode1.3.3并延期升级。dependency-risk-decision.md和finding.cli-upstream-dependency-risks绑定精版本/registry checksum/消费者。风险未修复，unfiltered真实锁/registry-origin扫描仍1/3warnings，online fetch失败另存。没有宽泛ignore或SDK/framework特例移植；精确接受门禁仍待验证，不冒audit0或CI通过。
+
+宽B场景、三个stale lens、完整workspace/GUI、JSONL与精main CI不借此关闭，Plan保持ready，全局库存/行为闭合open。无前端实现变化，不额外本地frontend矩阵，CI原frontend保留；私有lint整理不改变examples/官网说明，既有examples由all-target编译链覆盖，后续完整门禁仍适用。

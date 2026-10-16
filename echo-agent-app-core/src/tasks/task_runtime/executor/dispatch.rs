@@ -1193,7 +1193,7 @@ struct TaskDispatchFailure {
     status: SubagentStatus,
     message: String,
     agent_failure: Option<echo_agent::error::AgentFailure>,
-    observation: Option<super::store::RunDriverFailure>,
+    observation: Option<Box<super::store::RunDriverFailure>>,
 }
 
 impl TaskDispatchFailure {
@@ -1223,14 +1223,14 @@ impl TaskDispatchFailure {
             status: failure.status,
             message: failure.message,
             agent_failure: failure.agent_failure,
-            observation: failure.observation,
+            observation: failure.observation.map(Box::new),
         }
     }
 
     fn into_react(self) -> echo_agent::error::ReactError {
         use echo_agent::error::AgentError;
         if let Some(observation) = self.observation {
-            return observation.into_react_error();
+            return (*observation).into_react_error();
         }
         match self.status {
             SubagentStatus::Cancelled => {

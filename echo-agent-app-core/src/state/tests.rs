@@ -2443,7 +2443,7 @@ mod workspace_transition_tests {
         // Invoke the exact private binding used by deliver_agent_message_cold.
         let cell = AppState::retain_cold_delivery_execution(&lease, original);
         let (release, held) = tokio::sync::oneshot::channel();
-        let backend = tokio::spawn(async move { held.await });
+        let backend = tokio::spawn(held);
         lease.retain_observation(crate::chat_driver::ChatTurnError::Observation { run_id: "cold-original-run".into(), execution_id: Some("cold-original-execution".into()) });
         drop(lease);
         {

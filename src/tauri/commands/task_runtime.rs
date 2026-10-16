@@ -490,6 +490,24 @@ fn internal<E: std::fmt::Display>(e: E) -> IpcError {
     IpcError::Internal(e.to_string())
 }
 
+async fn settle_gui_resume_error(
+    lease: echo_agent_app_core::api::foreground_turn::ForegroundTurnLease,
+    error: echo_agent_app_core::api::chat_driver::ChatTurnError,
+) -> Result<(), echo_agent_app_core::api::foreground_turn::ForegroundTurnError> {
+    if error.is_observation() {
+        // Preparation and execution waits share the original foreground owner;
+        // neither an unresolved fence nor an observer result is a terminal.
+        lease.retain_observation(error);
+        return Ok(());
+    }
+    lease
+        .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
+            echo_agent::error::AgentFailure::message("planned_resume", error.to_string()),
+        ))
+        .await
+        .map(|_| ())
+}
+
 /// Resume a paused run. Transitions `Paused → Running` and re-launches the
 /// executor, which re-reads the plan from the store and skips already-completed
 /// tasks.
@@ -572,13 +590,12 @@ pub async fn resume_task_run(
     {
         Ok(launch) => launch,
         Err(error) => {
-            lease
-                .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
-                    echo_agent::error::AgentFailure::message("planned_resume", error.to_string()),
-                ))
+            let driver_error = echo_agent_app_core::api::chat_driver::ChatTurnError::from(error);
+            let error = internal(&driver_error);
+            settle_gui_resume_error(lease, driver_error)
                 .await
                 .map_err(internal)?;
-            return Err(internal(error));
+            return Err(error);
         }
     };
     tokio::spawn(async move {
@@ -602,9 +619,10 @@ pub async fn resume_task_run(
             }
             Err(error) => {
                 tracing::error!(run_id = %launched_run_id, %error, "resumed run executor error");
-                echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
-                    echo_agent::error::AgentFailure::message("planned_resume", error),
-                )
+                if let Err(error) = settle_gui_resume_error(lease, error).await {
+                    tracing::error!(run_id = %launched_run_id, %error, "resumed run foreground settlement failed");
+                }
+                return;
             }
         };
         if let Err(error) = lease.settle_after_observers(outcome).await {
@@ -993,6 +1011,7 @@ pub async fn update_tasks(
             IpcError::Validation(error.to_string())
         }
         echo_agent::tasks::TaskRevisionError::GraphNotFound { .. }
+        | echo_agent::tasks::TaskRevisionError::StoreUnsupported { .. }
         | echo_agent::tasks::TaskRevisionError::Backend { .. } => internal(error),
     })
 }
@@ -1075,6 +1094,141 @@ mod tests {
     use echo_agent::llm::{ChatChunk, ChatRequest, ChatResponse, LlmClient};
     use futures::future::BoxFuture;
     use futures::stream::{self, BoxStream};
+
+    #[tokio::test]
+    async fn gui_resume_pending_owner_rejection_keeps_foreground_nonterminal() -> anyhow::Result<()>
+    {
+        use echo_agent::state::journal::{EventJournal, FileEventJournal};
+        use echo_agent::utils::fs::FileDurability;
+        use echo_agent_app_core::api::chat_driver::ChatTurnError;
+        use echo_agent_app_core::api::foreground_turn::{
+            ForegroundTurnControl, ForegroundTurnSurface,
+        };
+        use echo_agent_app_core::api::tasks::task_runtime::{
+            TaskRunResumeIdentity, launch_task_run_resume,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        store.create_run(
+            "gui-owner",
+            "test",
+            "gui-conversation",
+            "message",
+            DomainProfile::General,
+            "preserve original owner",
+            "agent_task_plan",
+            AttendedMode::Attended,
+        )?;
+        store.transition_run("gui-owner", TaskRunStatus::Running)?;
+        store.transition_run("gui-owner", TaskRunStatus::Paused)?;
+        drop(store);
+        // Persist an unresolved original-owner fact with the official journal
+        // before reopening; this is a restart fixture, not completion evidence.
+        let journal_path = directory.path().join("gui-owner/events.jsonl");
+        let journal =
+            FileEventJournal::<serde_json::Value>::open(&journal_path, FileDurability::SyncData)?;
+        journal
+            .append(serde_json::json!({
+                "run_id":"gui-owner", "task_id":null, "step_id":"original-execution",
+                "event_type":"recovery_blocked", "timestamp":chrono::Utc::now(),
+                "payload":{"physical_owner_intent":{
+                    "run_id":"gui-owner", "owner_id":"original-owner",
+                    "execution_id":"original-execution", "workspace_id":"test",
+                    "physical_terminal_observed":false
+                }}
+            }))
+            .map_err(|error| anyhow::anyhow!("persist original owner: {error:?}"))?;
+        drop(journal);
+        let store = Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+            directory.path(),
+        )?);
+        let snapshot = store
+            .get_run_state("gui-owner")?
+            .ok_or_else(|| anyhow::anyhow!("original run absent"))?;
+        let expected = TaskRunResumeIdentity::capture(&snapshot);
+        let before = std::fs::read(&journal_path)?;
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin_scoped(
+            "test",
+            ForegroundTurnSurface::Gui,
+            "gui-conversation",
+            "resume-turn",
+        )?;
+        let error = launch_task_run_resume(
+            store.clone(),
+            expected,
+            test_agent().map_err(anyhow::Error::msg)?,
+            None,
+            None,
+            None,
+            lease.cancellation_token(),
+            None,
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("unresolved owner unexpectedly admitted"))?;
+        assert!(
+            matches!(&error, echo_agent_app_core::api::tasks::task_runtime::StoreError::RecoveryBlocked { run_id, .. } if run_id == "gui-owner")
+        );
+        let error = ChatTurnError::from(error);
+        assert!(
+            matches!(&error, ChatTurnError::Observation {run_id, execution_id:None} if run_id == "gui-owner")
+        );
+        settle_gui_resume_error(lease, error).await?;
+        assert_eq!(std::fs::read(&journal_path)?, before);
+        assert!(!store.is_run_active("gui-owner"));
+        assert!(
+            control
+                .snapshot_scoped("test", ForegroundTurnSurface::Gui, "gui-conversation")
+                .is_some(),
+            "GUI launch rejection projected original pending ownership as a Failed terminal"
+        );
+        assert_eq!(
+            store
+                .get_run("gui-owner")?
+                .ok_or_else(|| anyhow::anyhow!("original run disappeared"))?
+                .status,
+            TaskRunStatus::Paused
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gui_resume_ordinary_error_keeps_failed_settlement() -> anyhow::Result<()> {
+        use echo_agent_app_core::api::chat_driver::{ChatTurnError, TurnOutcome};
+        use echo_agent_app_core::api::foreground_turn::{
+            ForegroundTurnControl, ForegroundTurnSurface,
+        };
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin_scoped(
+            "test",
+            ForegroundTurnSurface::Gui,
+            "ordinary",
+            "ordinary-resume",
+        )?;
+        let waiter = control.settlement_waiter_scoped(
+            "test",
+            ForegroundTurnSurface::Gui,
+            "ordinary",
+            "ordinary-resume",
+        )?;
+        settle_gui_resume_error(
+            lease,
+            ChatTurnError::Error("ordinary preparation failure".into()),
+        )
+        .await?;
+        let result = waiter.wait().await?;
+        assert!(
+            matches!(result.outcome, TurnOutcome::Failed(failure) if failure.message == "ordinary preparation failure")
+        );
+        assert!(
+            control
+                .snapshot_scoped("test", ForegroundTurnSurface::Gui, "ordinary")
+                .is_none()
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn task_runtime_scope_validation_fails_closed() -> Result<(), String> {

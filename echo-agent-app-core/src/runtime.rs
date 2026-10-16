@@ -781,10 +781,10 @@ impl ApplicationLifecycleOwner {
             {
                 receipt.record("background reviews", error);
             }
-            if let Some(state) = self.app_state.as_ref() {
-                if let Err(error) = state.join_workspace_transition().await {
-                    receipt.record("workspace transition", error);
-                }
+            if let Some(state) = self.app_state.as_ref()
+                && let Err(error) = state.join_workspace_transition().await
+            {
+                receipt.record("workspace transition", error);
             }
         }
         // Re-observe the original slot on every real continuation poll. A
@@ -826,10 +826,10 @@ impl ApplicationLifecycleOwner {
             self.normal_drained = true;
         }
         // A resumed owner retries only original known cleanup debt, never Agent work.
-        if let Some(store) = self.task_runtime_store.as_ref() {
-            if let Err(error) = store.retry_run_settlement_debts().await {
-                receipt.record_retained("TaskRun cleanup debt", error);
-            }
+        if let Some(store) = self.task_runtime_store.as_ref()
+            && let Err(error) = store.retry_run_settlement_debts().await
+        {
+            receipt.record_retained("TaskRun cleanup debt", error);
         }
         if let Some(state) = self.app_state.as_ref() {
             for error in state.session.analysis_runs.retry_retained_cleanup() {
@@ -848,10 +848,10 @@ impl ApplicationLifecycleOwner {
         // Stop the producer that can mutate Agent configuration before asking
         // the same Agent's close authority to drain. Tool/plugin/MCP/browser
         // dependencies themselves stay alive until that close actually succeeds.
-        if let Some(watcher) = self.config_watcher.take() {
-            if let Err(error) = watcher.shutdown().await {
-                receipt.record_retained("config watcher", error);
-            }
+        if let Some(watcher) = self.config_watcher.take()
+            && let Err(error) = watcher.shutdown().await
+        {
+            receipt.record_retained("config watcher", error);
         }
         let mut uncertain =
             scheduler_uncertain || self.external_owners.iter().any(|owner| owner.join_panicked);

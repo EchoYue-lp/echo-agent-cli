@@ -136,6 +136,11 @@ pub enum ForegroundTurnError {
     LeaseOwnerMismatch,
     #[error("foreground driver settlement failed: {0}")]
     DriverSettlement(String),
+    #[error("execution for run {run_id} is not physically settled")]
+    Observation {
+        run_id: String,
+        execution_id: Option<String>,
+    },
 }
 
 enum ForegroundRetainedResource {
@@ -1529,7 +1534,16 @@ impl ForegroundTurnSettlementWaiter {
     pub async fn wait(mut self) -> Result<ForegroundTurnSettlement, ForegroundTurnError> {
         loop {
             if let Some(error) = self.observation_rx.borrow().as_ref() {
-                return Err(ForegroundTurnError::DriverSettlement(error.to_string()));
+                return Err(match error {
+                    ChatTurnError::Observation {
+                        run_id,
+                        execution_id,
+                    } => ForegroundTurnError::Observation {
+                        run_id: run_id.clone(),
+                        execution_id: execution_id.clone(),
+                    },
+                    other => ForegroundTurnError::DriverSettlement(other.to_string()),
+                });
             }
             if let Some(settlement) = self.settlement_rx.borrow().clone() {
                 return Ok(settlement);
@@ -2137,7 +2151,7 @@ mod tests {
         let cell = Arc::new(Mutex::new(Some(unknown)));
         lease.retain_execution(cell.clone());
         let (release, held) = tokio::sync::oneshot::channel();
-        let backend = tokio::spawn(async move { held.await });
+        let backend = tokio::spawn(held);
         lease.retain_observation(ChatTurnError::Observation {
             run_id: "original-run".into(),
             execution_id: Some("original-backend".into()),

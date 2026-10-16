@@ -11,7 +11,7 @@ focus:
 - time_lifecycle
 - failure_concurrency
 - contract_evidence
-observed_at: source:482a04666faee98961db90b77d432be9e00c19801887dd3e71c7773e0dd9fdf1
+observed_at: source:bd75b49f18a60ada507be1bb1609d9a9e4e52b6f4def9101a859d6f66cc231aa
 behavior_refs:
 - behavior.background-review-caller-owned-settlement
 - behavior.shared-turn-observation-retains-owner
@@ -19,6 +19,15 @@ behavior_refs:
 - behavior.analysis-original-owner-settlement-retry
 code_refs:
 - echo-agent-app-core/src/state/config.rs
+- echo-agent-app-core/src/state/tests.rs
+- echo-agent-app-core/src/tasks/task_runtime/executor/dispatch.rs
+- echo-agent-app-core/src/tasks/task_runtime/executor/run.rs
+- echo-agent-app-core/src/tasks/task_runtime/executor/tests.rs
+- src/cli/repl.rs
+- src/cli/channels.rs
+- src/cli/channels/input_pump.rs
+- src/tauri/commands/task_runtime.rs
+- src/tui/events.rs
 - echo-agent-app-core/src/agent_router/tests.rs
 - echo-agent-app-core/src/evolution/background_review_owner.rs
 - echo-agent-app-core/src/evolution/review_integration.rs
@@ -48,7 +57,7 @@ code_refs:
 evidence_refs:
 - evidence.latest-framework-consumer-integration
 - evidence.cancellation-observation-consumer
-finding_refs: []
+finding_refs: [finding.cli-upstream-dependency-risks]
 ---
 
 # EKO framework consumer authorities
@@ -88,5 +97,7 @@ Framework physical receipt/claim CAS唯一；观察不终态化。原Task/analys
 
 
 ## CF988 定向实施补充
+
+后继primary切片：同一ForegroundTurnSettlementWaiter只对真实Observation保留run/execution，channel notifier传typed错误后不kick；GUI launch准备和执行等待共享原foreground错误结算，观察仅retain，普通错误保持Failed。两个独立行为red→samecase after及4普通/正常控制共6pass，17file独审/非语义增量确认和Clippy零warning通过；完整门禁/宽Rule仍未闭。三依赖精确风险接受由具名Finding/人的Decision引用拥有，不推广为SDK/framework例外或放宽工程门禁。
 
 合法 unresolved physical-owner intent 是精确 run 的待观察事实，批次恢复在原 run 锁内跳过其状态/cell/control 写入并继续无关 run；真实存储/畸形证据错误仍报错。Running/Paused/guidance 共享原证据与精确 ack，不新增恢复器或权威。canonical compose 先绑定原三个 Weak 子组件，最终强 Arc 接管复用同一 helper。existing-run continuation 保留 canonical domain/route/attended/Goal/profile，仍用入口实际 active workspace/conversation/root 经原 immutable validator；trace 用返回原值。三 focused 实际通过及独立复审只支持此有限 checkpoint，不能替完整矩阵、新 cron、依赖政策或 main CI。
