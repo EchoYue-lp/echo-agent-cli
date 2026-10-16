@@ -4,7 +4,7 @@ id: map.eko-framework-consumer-settlement
 kind: capability_map
 title: EKO framework consumer settlement
 risk: high
-observed_at: source:b1f3c278483f857325923b3cd1a00b06fb514c40e2dedd6e7d39aa356a058b97
+observed_at: source:482a04666faee98961db90b77d432be9e00c19801887dd3e71c7773e0dd9fdf1
 boundary_refs:
 - boundary.eko-framework-consumer-settlement
 behavior_refs:
@@ -132,7 +132,8 @@ scenarios:
     - rule.eko-framework-consumer-authorities
     evidence_refs:
     - evidence.cancellation-observation-consumer
-    unknown: 历史f0a结果保留；public3ded/CLI2203随后原九具名strong已9pass/0fail/0ignore、零warning，另原Handle/Root两例已过；其它未覆盖B义务、TUI/GUI、最终Fmain与CLI cron E2E未验。
+    unknown: 历史f0a结果保留；public3ded/CLI2203随后原九具名strong已9pass/0fail/0ignore、零warning，另原Handle/Root两例已过；其它未覆盖B义务、TUI/GUI、最终Fmain与CLI
+      cron E2E未验。
     next_step: 保留原九有限fixture边界，完成其余适用B验证、CLI cron E2E和最终公开F消费者，再执行正式门禁。
   task-unknown-owner-admission-fence:
     status: needs_review
@@ -148,7 +149,8 @@ scenarios:
     - rule.eko-framework-consumer-authorities
     evidence_refs:
     - evidence.cancellation-observation-consumer
-    unknown: 历史f0a结果保留；public3ded/CLI2203随后原九具名strong已9pass/0fail/0ignore、零warning，另原Handle/Root两例已过；其它未覆盖B义务、TUI/GUI、最终Fmain与CLI cron E2E未验。
+    unknown: 历史f0a结果保留；public3ded/CLI2203随后原九具名strong已9pass/0fail/0ignore、零warning，另原Handle/Root两例已过；其它未覆盖B义务、TUI/GUI、最终Fmain与CLI
+      cron E2E未验。
     next_step: 保留原九有限fixture边界，完成其余适用B验证、CLI cron E2E和最终公开F消费者，再执行正式门禁。
   analysis-original-owner-settlement-retry:
     status: needs_review
@@ -161,7 +163,8 @@ scenarios:
     - rule.eko-framework-consumer-authorities
     evidence_refs:
     - evidence.cancellation-observation-consumer
-    unknown: 历史f0a结果保留；public3ded/CLI2203随后原九具名strong已9pass/0fail/0ignore、零warning，另原Handle/Root两例已过；其它未覆盖B义务、TUI/GUI、最终Fmain与CLI cron E2E未验。
+    unknown: 历史f0a结果保留；public3ded/CLI2203随后原九具名strong已9pass/0fail/0ignore、零warning，另原Handle/Root两例已过；其它未覆盖B义务、TUI/GUI、最终Fmain与CLI
+      cron E2E未验。
     next_step: 保留原九有限fixture边界，完成其余适用B验证、CLI cron E2E和最终公开F消费者，再执行正式门禁。
 ---
 
@@ -216,3 +219,8 @@ Scheduler/Task claim原场景因B关闭语义受影响而转needs_review；旧ma
 
 
 原九strong名单现已在CLI2203/public3ded实际9/0/0，并获原raw/输入守卫独立有限复核；当前不再标该名单从未执行。测试内晚fact注入、asyncflow与OS effect差别等限制见共用Evidence。此更新只同步当前事实，不刷新未变source摘要、不改变needs_review或关闭宽义务。
+
+
+## CF988 当前任务 checkpoint
+
+当前有限 source/receipt Review 为 C0/I0/M0；同 clean CF988 下的 canonical compose、Running/Paused 混合恢复、existing-run identity negative 三 case 各 1pass。原 owner、run 锁、validator 与普通恢复仍为唯一权威，详见共用 Evidence 对各 epoch 的区分。原九例是公开中间 3ded 的历史证据，未借为 CF988 九例重跑。新 cron/完整六加 GUI 二尚未执行；三 B 场景 needs_review、三 lens stale 和仓库闭合 open 保留。人的三项上游告警政策未裁决、无 ignore，不作完整交付声明。

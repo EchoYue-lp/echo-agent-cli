@@ -1158,18 +1158,35 @@ fn ensure_bound_task_run(
 ) -> Result<(), crate::tasks::task_runtime::StoreError> {
     use crate::tasks::task_runtime::{AttendedMode, DomainProfile, TaskRunStatus};
 
-    let execution_profile = store
-        .get_run_state(run_id)?
-        .map(|snapshot| snapshot.execution_profile)
-        .unwrap_or_else(crate::tasks::task_runtime::TaskRunExecutionProfile::conversation_turn);
+    let existing = store.get_run_state(run_id)?;
+    // A continuation consumes the original run identity. Its internal prompt
+    // is not a new attended request and must not rewrite route or domain.
+    // The existing store validator still checks workspace/conversation/root.
+    let (domain_profile, route, attended_mode, run_goal, execution_profile) =
+        match existing.as_ref() {
+            Some(snapshot) => (
+                snapshot.run.domain_profile,
+                snapshot.run.route.as_str(),
+                snapshot.run.attended_mode,
+                snapshot.run.goal.as_str(),
+                snapshot.execution_profile,
+            ),
+            None => (
+                DomainProfile::General,
+                "agent_task_plan",
+                AttendedMode::Attended,
+                goal,
+                crate::tasks::task_runtime::TaskRunExecutionProfile::conversation_turn(),
+            ),
+        };
     let run = store.create_run_for_active_workspace_with_profile(
         run_id,
         conversation_id.unwrap_or("message:task"),
         turn_id,
-        DomainProfile::General,
-        goal,
-        "agent_task_plan",
-        AttendedMode::Attended,
+        domain_profile,
+        run_goal,
+        route,
+        attended_mode,
         execution_profile,
     )?;
     if !attachments.is_empty() {
@@ -1185,8 +1202,8 @@ fn ensure_bound_task_run(
                 RuntimeEventKind::RunStarted,
                 serde_json::json!({
                     "conversation_id": conversation_id,
-                    "goal": goal,
-                    "route": "agent_task_plan",
+                    "goal": &run.goal,
+                    "route": &run.route,
                 }),
             ));
         }
@@ -1745,6 +1762,121 @@ impl ChatSink for ChannelChatSink {
 mod tests {
     use super::*;
     use crate::tasks::task_runtime::TaskRunStatus;
+
+    #[test]
+    fn existing_run_continuation_preserves_identity_and_rejects_foreign_bindings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, RunPlanPolicy, TaskRunExecutionProfile, TaskRuntimeStore,
+        };
+        let directory = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        let workspace = store.active_workspace_id();
+        let original = store.create_run_with_profile(
+            "original-unattended",
+            &workspace,
+            "original-conversation",
+            "original-root",
+            DomainProfile::DataAnalysis,
+            "original user Goal",
+            "agent_autonomous",
+            AttendedMode::Unattended,
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+        )?;
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<ExecEvent>::new()));
+        let sink_events = events.clone();
+        let trace_sink: crate::tasks::task_runtime::task_tools::TraceSink =
+            std::sync::Arc::new(move |event| {
+                if let Ok(mut events) = sink_events.lock() {
+                    events.push(event);
+                }
+            });
+        ensure_bound_task_run(
+            &store,
+            &original.run_id,
+            Some("original-conversation"),
+            "original-root",
+            "internal continuation instruction",
+            &[],
+            Some(&trace_sink),
+        )?;
+        let actual = store
+            .get_run(&original.run_id)?
+            .ok_or("original run disappeared")?;
+        assert_eq!(actual.domain_profile, original.domain_profile);
+        assert_eq!(actual.route, original.route);
+        assert_eq!(actual.attended_mode, original.attended_mode);
+        assert_eq!(actual.goal, original.goal);
+        let traces = events.lock().map_err(|_| "trace lock poisoned")?.clone();
+        assert_eq!(traces.len(), 1);
+        let started = traces.first().ok_or("original run-start event missing")?;
+        assert_eq!(started.event, RuntimeEventKind::RunStarted);
+        assert_eq!(
+            started
+                .payload
+                .get("goal")
+                .and_then(serde_json::Value::as_str),
+            Some("original user Goal")
+        );
+        assert_eq!(
+            started
+                .payload
+                .get("route")
+                .and_then(serde_json::Value::as_str),
+            Some("agent_autonomous")
+        );
+        let before = serde_json::to_value(store.list_events(&original.run_id, 0)?)?;
+        for (conversation, root) in [
+            ("wrong-conversation", "original-root"),
+            ("original-conversation", "wrong-root"),
+        ] {
+            assert!(
+                ensure_bound_task_run(
+                    &store,
+                    &original.run_id,
+                    Some(conversation),
+                    root,
+                    "internal continuation instruction",
+                    &[],
+                    None
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(store.list_events(&original.run_id, 0)?)?,
+            before
+        );
+        store.create_run_with_profile(
+            "foreign-workspace",
+            "another-workspace",
+            "original-conversation",
+            "original-root",
+            DomainProfile::DataAnalysis,
+            "foreign Goal",
+            "agent_autonomous",
+            AttendedMode::Unattended,
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+        )?;
+        let foreign_before = serde_json::to_value(store.list_events("foreign-workspace", 0)?)?;
+        assert!(
+            ensure_bound_task_run(
+                &store,
+                "foreign-workspace",
+                Some("original-conversation"),
+                "original-root",
+                "internal continuation instruction",
+                &[],
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(store.list_events("foreign-workspace", 0)?)?,
+            foreign_before
+        );
+        Ok(())
+    }
 
     #[test]
     fn product_event_wire_contract_preserves_canonical_identity_and_payloads() -> Result<(), String>

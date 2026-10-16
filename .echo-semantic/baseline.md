@@ -3,8 +3,8 @@ schema_version: 1
 id: baseline.repository
 kind: baseline
 source_snapshot:
-  base_revision: 5cd9eff0b92d076699d04b07d4a8a1c19e3fcdd4
-  content_digest: b1f3c278483f857325923b3cd1a00b06fb514c40e2dedd6e7d39aa356a058b97
+  base_revision: ccf700ad4bed0fe4c84a1b376af97236a5b06cc7
+  content_digest: 482a04666faee98961db90b77d432be9e00c19801887dd3e71c7773e0dd9fdf1
 inventory_closure: open
 behavior_model_closure: open
 map_refs: [map.eko-conversation-collaboration, map.eko-framework-consumer-settlement]

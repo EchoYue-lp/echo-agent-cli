@@ -8,7 +8,7 @@ carrier: markdown
 
 ## 状态
 
-Approved for bounded implementation: Root authorized this CLI adapter and SDKcap independently reviewed the full behavior and durable-fence increment with C0/I0/M0. Implementation and its engineering evidence remain pending; upstream API source is still being integrated. This document specifies the EKO adapter only and does not replace framework ADR0088 or the framework physical-settlement design.
+Approved for the same bounded implementation. The public framework main is now 9886502c83d6b1f6fa9212eb221db0e5874deaee, consumed through the unchanged canonical relative paths. Current CLI source and actual receipts passed an independent focused checkpoint review (C0/I0/M0): canonical cold-workspace compose, mixed protected/ordinary Running and Paused recovery, and existing-run identity preservation with foreign binding rejection each passed one case. The canonical fixture separately exposed the existing-run adapter identity conflict and, on its corrected baseline, the original late lifecycle binding failure; their evidence epochs remain distinct. The accepted ownership, data-flow and acceptance constraints in the four Plan-bound chapters below are unchanged. Full six plus GUI two, the new cron case, dependency-policy acceptance and exact main CI remain pending; no dependency exception has been authorized. This document specifies the EKO adapter only and does not replace framework ADR0088 or the framework physical-settlement design.
 
 ## 问题与目标
 

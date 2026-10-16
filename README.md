@@ -472,6 +472,15 @@ cargo test --workspace
 
 > **说明**：为避免混淆，日常开发也建议分别检查 TUI 与 GUI 入口；不要把 TUI/GUI 当成同一个打包产物处理。
 
+### CI 依赖审计
+
+CI 只由 `main` 推送触发；任务分支先按 [AGENTS.md](AGENTS.md) 完成本地适用门禁。
+`linux-quality` 先用官方 `cargo-audit` 扫描本仓库真实 `Cargo.lock`，再复用同次检出的
+framework `scripts/generate-vendored-media-audit-lock.py` 与其 `vendor/registry-origins.toml`，
+以 `--lockfile` 指向本仓库锁、`--output` 指向新的临时文件，追加同一官方 scanner 审计。
+临时视图只恢复三个 bundled parent 的原 registry source/checksum 归属，保留真实锁的其它节点和依赖边，
+实际构建锁保持原样。Python 3.11+ 仅用于这项开发审计工具，不是 EKO 运行依赖。
+
 ### GUI 前端开发
 
 `web-frontend/` 目录包含 GUI 的前端代码（React + Tailwind CSS），由 Tauri 桌面应用嵌入：

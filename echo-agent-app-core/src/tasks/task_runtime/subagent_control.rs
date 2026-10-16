@@ -1625,6 +1625,13 @@ pub(super) fn reconcile_subagent_guidance_at_boot(
     for run in runs {
         let run_id = run.run_id.clone();
         reconciled = reconciled.saturating_add(store.with_run_lock(&run_id, || {
+            // Restart is not proof that this original physical owner ended.
+            if !store
+                .unsettled_physical_owner_intents_locked(&run_id)?
+                .is_empty()
+            {
+                return Ok(0);
+            }
             let events = store.list_events(&run_id, 0)?;
             let mut settlements = Vec::new();
             for state in fold_command_states(&events)?.into_values() {

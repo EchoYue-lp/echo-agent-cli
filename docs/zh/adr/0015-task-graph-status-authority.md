@@ -35,3 +35,5 @@ framework 的 exact-claim interruption request 先持久化，再信号通知原
 
 `RunStateSnapshot.tasks` 直接保存 framework `TaskExecution`，不再定义 EKO 镜像类型；`PlanTask`
 只在读取 plan specification 和 execution projection 时临时组合，`TodoItem` 仍是单向 UI 投影。
+
+启动恢复将合法未结算 physical-owner intent 视为该精确 run 的待观察事实：在原 run 锁内保留 run、command cell 及待处理 Subagent 控制事实，继续恢复其它无关历史 run；畸形 intent 和真实存储错误仍报错。批次恢复和单 run 准入共用原证据读取与精确物理确认路径，不允许重放或合成终态收据。 continuation 消费既有 run 的 domain、route、attended mode、Goal 与 execution profile，内部续接指令不是新用户目标；实际 active workspace 与调用方 conversation/root 仍经原不可变身份校验，错配继续拒绝，RunStarted 投影使用返回的原 goal/route。

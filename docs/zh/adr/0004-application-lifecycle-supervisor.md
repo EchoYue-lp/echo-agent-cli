@@ -79,3 +79,5 @@ analysis owner 保留原 generation、pool、memory 和 I/O receipts；各 surfa
 - 新增进程级资源必须在创建成功后立即绑定 owner，并提供无等待的 phase-one cancel/close 与可等待的
   phase-two settlement。
 - `echo-website` 和 framework examples 不受影响；这是 EKO 应用内部生命周期，不改变公开框架 API。
+
+ApplicationServices 的标准组装在 TaskRun 启动恢复或应用 scheduler producer 接纳工作前，先为借用 AppState 的 workspace registry、foreground turns 和 analysis supervisor 接入同一生命周期 root；最终 AppState Arc 通过同一 helper 接管强引用。冷 workspace store 准入原 driver 不得依赖 compose 已返回。

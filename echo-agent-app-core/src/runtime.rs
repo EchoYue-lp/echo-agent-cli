@@ -480,7 +480,7 @@ impl ApplicationLifecycleOwner {
         }
     }
 
-    pub fn bind_app_state(&mut self, state: Arc<AppState>) {
+    fn bind_app_state_components(&self, state: &AppState) {
         if let Some(root) = self.retention.upgrade() {
             state.workspace.runtimes.bind_lifecycle_retention(&root);
             state
@@ -489,6 +489,10 @@ impl ApplicationLifecycleOwner {
                 .bind_lifecycle_retention(&root);
             state.session.analysis_runs.bind_lifecycle_retention(&root);
         }
+    }
+
+    pub fn bind_app_state(&mut self, state: Arc<AppState>) {
+        self.bind_app_state_components(&state);
         self.app_state = Some(state);
     }
 
@@ -1100,6 +1104,10 @@ impl ApplicationServices {
             Ok(state) => state,
             Err(error) => return Err(rollback_composition(lifecycle, error).await),
         };
+        // Cold workspace boot recovery may admit an original driver before
+        // compose returns. Its stores must inherit this same root first; the
+        // final AppState Arc below only transfers strong ownership.
+        lifecycle.bind_app_state_components(&state);
         if let Some(active_model) = runtime.active_runtime_model.as_ref() {
             state = state.with_active_model_id(active_model.id.clone());
         }

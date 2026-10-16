@@ -166,78 +166,137 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn physical_owner_intent_survives_restart_and_blocks_recovery_and_replay()
+    #[tokio::test]
+    async fn physical_owner_intent_survives_restart_and_blocks_recovery_and_replay()
     -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
-        store.create_run(
-            "owner-run",
-            "global",
-            "conversation",
-            "message",
-            DomainProfile::General,
-            "goal",
-            "task",
-            AttendedMode::Attended,
-        )?;
-        store.transition_run("owner-run", TaskRunStatus::Running)?;
-        let intent = PhysicalOwnerIntent {
-            run_id: "owner-run".to_string(),
-            owner_id: "原始-owner".to_string(),
-            execution_id: Some("original-execution".to_string()),
-            workspace_id: "global".to_string(),
-            physical_terminal_observed: false,
-        };
-        store.begin_physical_owner_intent(&intent)?;
-        let before = store.list_events("owner-run", 0)?;
-        drop(store);
-        let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
-            directory.path(),
-        )?);
-        assert!(matches!(
-            store.recover_incomplete(),
-            Err(StoreError::RecoveryBlocked { .. })
-        ));
-        assert!(matches!(
-            store.boot_auto_resume_decision("owner-run", true, true),
-            Err(StoreError::RecoveryBlocked { .. })
-        ));
-        assert!(matches!(
-            store.reserve_run_driver_admission(
-                "owner-run".to_string(),
-                echo_agent::agent::CancellationToken::new()
-            ),
-            Err(StoreError::RecoveryBlocked { .. })
-        ));
-        assert_eq!(
-            store.get_run("owner-run")?.map(|run| run.status),
-            Some(TaskRunStatus::Running)
-        );
-        assert_eq!(store.list_events("owner-run", 0)?.len(), before.len());
-        let mut wrong = intent.clone();
-        wrong.execution_id = Some("replacement".to_string());
-        assert!(store.acknowledge_physical_owner_intent(&wrong).is_err());
-        assert_eq!(
-            store.unresolved_physical_owner_intents("owner-run")?,
-            vec![intent.clone()]
-        );
-        assert!(store.acknowledge_physical_owner_intent(&intent).is_err());
-        let intent = store.record_physical_owner_completion(&intent)?;
-        store.acknowledge_physical_owner_intent(&intent)?;
-        assert!(
-            store
-                .unresolved_physical_owner_intents("owner-run")?
-                .is_empty()
-        );
-        assert!(
-            store
-                .reserve_run_driver_admission(
+        for protected_status in [TaskRunStatus::Running, TaskRunStatus::Paused] {
+            let directory = tempfile::tempdir()?;
+            let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+            let create_ordinary = |run_id: &str| -> Result<(), StoreError> {
+                store.create_run(run_id, "global", "ordinary-conversation", "message", DomainProfile::General, "ordinary goal", "task", AttendedMode::Attended)?;
+                store.transition_run(run_id, TaskRunStatus::Running)?;
+                Ok(())
+            };
+            create_ordinary("ordinary-before")?;
+            store.create_run(
+                "owner-run",
+                "global",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "goal",
+                "task",
+                AttendedMode::Attended,
+            )?;
+            store.transition_run("owner-run", TaskRunStatus::Running)?;
+            if protected_status == TaskRunStatus::Paused {
+                store.transition_run("owner-run", protected_status)?;
+            }
+            let intent = PhysicalOwnerIntent {
+                run_id: "owner-run".to_string(),
+                owner_id: "原始-owner".to_string(),
+                execution_id: Some("original-execution".to_string()),
+                workspace_id: "global".to_string(),
+                physical_terminal_observed: false,
+            };
+            store.begin_physical_owner_intent(&intent)?;
+            store.record_background_cell_started(
+                "owner-run", "protected-cell", "original cell", "command-hash",
+                None, Some("original-execution"), Some("original-call"),
+            )?;
+            // Persist pending command facts only, not a fabricated terminal receipt.
+            for (command_id, kind) in [
+                ("protected-guidance", RuntimeEventKind::SubagentGuidanceQueued),
+                ("protected-interrupt", RuntimeEventKind::SubagentInterruptRequested),
+            ] {
+                store.commit_runtime_event(RuntimeJournalEvent::for_append(
+                    "owner-run", Some("protected-task"), Some("original-execution"), kind,
+                    serde_json::json!({
+                        "run_id": "owner-run", "task_id": "protected-task",
+                        "execution_id": "original-execution", "plan_revision": 1,
+                        "attempt": 1, "command_id": command_id, "actor_source": "cli",
+                        "kind": if kind == RuntimeEventKind::SubagentGuidanceQueued { Some("live_message") } else { None },
+                        "instruction": "preserve original owner",
+                    }),
+                ))?;
+            }
+            // Creation order puts the protected run between independent runs.
+            create_ordinary("ordinary-after")?;
+            let before = store.list_events("owner-run", 0)?;
+            drop(store);
+            let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+                directory.path(),
+            )?);
+            let reconciler =
+                crate::tasks::task_runtime::TaskRunBootReconciler::for_store(&store);
+            assert_eq!(reconciler.recover_once().await?, 2);
+            let candidates = reconciler.paused_candidates().await?;
+            let candidate_ids = candidates
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut expected = std::collections::BTreeSet::from(["ordinary-before", "ordinary-after"]);
+            if protected_status == TaskRunStatus::Paused { expected.insert("owner-run"); }
+            assert_eq!(candidate_ids, expected);
+            for run_id in ["ordinary-before", "ordinary-after"] {
+                assert_eq!(
+                    store.get_run(run_id)?.map(|run| run.status),
+                    Some(TaskRunStatus::Paused)
+                );
+                assert!(reconciler.decision(run_id, true, true).await.is_ok());
+            }
+            assert_eq!(reconciler.recover_once().await?, 2);
+            assert!(matches!(
+                store.boot_auto_resume_decision("owner-run", true, true),
+                Err(StoreError::RecoveryBlocked { .. })
+            ));
+            assert!(matches!(
+                store.reserve_run_driver_admission(
                     "owner-run".to_string(),
                     echo_agent::agent::CancellationToken::new()
-                )
-                .is_ok()
-        );
+                ),
+                Err(StoreError::RecoveryBlocked { .. })
+            ));
+            assert_eq!(
+                store.get_run("owner-run")?.map(|run| run.status),
+                Some(protected_status)
+            );
+            assert_eq!(
+                serde_json::to_value(store.list_events("owner-run", 0)?)?,
+                serde_json::to_value(before)?
+            );
+            assert!(store.list_background_cells("owner-run")?.iter().any(|cell| cell.cell_id == "protected-cell" && cell.is_active()));
+            let mut wrong = intent.clone();
+            wrong.execution_id = Some("replacement".to_string());
+            assert!(store.acknowledge_physical_owner_intent(&wrong).is_err());
+            assert_eq!(
+                store.unresolved_physical_owner_intents("owner-run")?,
+                vec![intent.clone()]
+            );
+            assert!(store.acknowledge_physical_owner_intent(&intent).is_err());
+            let intent = store.record_physical_owner_completion(&intent)?;
+            store.acknowledge_physical_owner_intent(&intent)?;
+            assert!(
+                store
+                    .unresolved_physical_owner_intents("owner-run")?
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .reserve_run_driver_admission(
+                        "owner-run".to_string(),
+                        echo_agent::agent::CancellationToken::new()
+                    )
+                    .is_ok()
+            );
+            store.create_run("corrupt-owner", "global", "conversation", "message", DomainProfile::General, "goal", "task", AttendedMode::Attended)?;
+            store.transition_run("corrupt-owner", TaskRunStatus::Running)?;
+            store.commit_runtime_event(RuntimeJournalEvent::for_append(
+                "corrupt-owner", None, None, RuntimeEventKind::RecoveryBlocked,
+                serde_json::json!({ "physical_owner_intent": "malformed original fact" }),
+            ))?;
+            assert!(store.recover_incomplete().is_err(), "malformed owner facts must not be silently skipped");
+        }
         Ok(())
     }
 

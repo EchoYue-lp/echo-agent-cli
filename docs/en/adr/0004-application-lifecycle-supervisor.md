@@ -54,3 +54,5 @@ Every process-level resource must bind an owner at creation and provide a
 non-waiting close plus a waitable settlement. Framework cancellation primitives
 are reused, while EKO admission order, surface hooks, and product receipts stay
 in app-core.
+
+Canonical ApplicationServices composition binds the same lifecycle root to the borrowed AppState's workspace registry, foreground turns and analysis supervisor before TaskRun boot recovery or an application scheduler producer can admit work. The final AppState Arc transfers strong ownership through the same binding helper; cold workspace stores never depend on compose having returned before admitting their original driver.

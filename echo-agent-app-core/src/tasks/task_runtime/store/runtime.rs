@@ -4745,7 +4745,10 @@ impl TaskRuntimeStore {
     }
 
     // Caller owns the original per-run mutex; no recursive acquisition.
-    fn require_physical_owner_settled_locked(&self, run_id: &str) -> Result<(), StoreError> {
+    pub(super) fn unsettled_physical_owner_intents_locked(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<PhysicalOwnerIntent>, StoreError> {
         let mut intents = self.unresolved_physical_owner_intents(run_id)?;
         if self.confirm_run_settled(run_id).is_ok() {
             for intent in intents
@@ -4756,6 +4759,11 @@ impl TaskRuntimeStore {
             }
             intents = self.unresolved_physical_owner_intents(run_id)?;
         }
+        Ok(intents)
+    }
+
+    fn require_physical_owner_settled_locked(&self, run_id: &str) -> Result<(), StoreError> {
+        let intents = self.unsettled_physical_owner_intents_locked(run_id)?;
         if intents.is_empty() {
             return Ok(());
         }
@@ -4877,7 +4885,6 @@ impl TaskRuntimeStore {
         let zombies = self.list_runs_in(INTERRUPTED)?;
         let mut recovered = 0_usize;
         for run in &zombies {
-            self.require_physical_owner_settled(&run.run_id)?;
             let changed = match run.status {
                 TaskRunStatus::Running => self.recover_interrupted_run(run)?,
                 TaskRunStatus::Paused => self.recover_paused_orphan_cells(run)?,
@@ -4892,48 +4899,60 @@ impl TaskRuntimeStore {
     }
 
     fn recover_paused_orphan_cells(&self, run: &TaskRun) -> Result<bool, StoreError> {
-        let active = self
-            .list_background_cells(&run.run_id)?
-            .into_iter()
-            .filter(BackgroundCellState::is_active)
-            .collect::<Vec<_>>();
-        if active.is_empty() {
-            return Ok(false);
-        }
-        for cell in active {
-            let artifact_interrupted =
-                cell.artifact_status == BackgroundCellArtifactStatus::Writing;
-            self.record_background_cell_finished(
-                &run.run_id,
-                &cell.cell_id,
-                &cell.name,
-                BackgroundCellPhase::Failed,
-                Some(BackgroundCellTerminalCause::Interrupted),
-                Some("command cell was interrupted by process restart"),
-                None,
-                if artifact_interrupted {
-                    BackgroundCellArtifactStatus::Failed
-                } else {
-                    cell.artifact_status
-                },
-                if artifact_interrupted {
-                    Some("artifact finalization was interrupted by process restart")
-                } else {
-                    cell.artifact_message.as_deref()
-                },
-                cell.total_output_bytes,
-                cell.output_truncated,
-                cell.output_excerpt.as_deref(),
-                cell.artifact_path.as_deref(),
-                cell.artifact_sha256.as_deref(),
-                cell.call_id.as_deref(),
-            )?;
-        }
-        Ok(true)
+        self.with_run_lock(&run.run_id, || {
+            // A valid retained owner is a per-run boot disposition. It must
+            // preserve cells, not abort independent recovery in this store.
+            if !self.unsettled_physical_owner_intents_locked(&run.run_id)?.is_empty() {
+                return Ok(false);
+            }
+            let active = self
+                .list_background_cells(&run.run_id)?
+                .into_iter()
+                .filter(BackgroundCellState::is_active)
+                .collect::<Vec<_>>();
+            if active.is_empty() {
+                return Ok(false);
+            }
+            for cell in active {
+                let artifact_interrupted =
+                    cell.artifact_status == BackgroundCellArtifactStatus::Writing;
+                self.record_background_cell_finished_locked(
+                    &run.run_id,
+                    &cell.cell_id,
+                    &cell.name,
+                    BackgroundCellPhase::Failed,
+                    Some(BackgroundCellTerminalCause::Interrupted),
+                    Some("command cell was interrupted by process restart"),
+                    None,
+                    if artifact_interrupted {
+                        BackgroundCellArtifactStatus::Failed
+                    } else {
+                        cell.artifact_status
+                    },
+                    if artifact_interrupted {
+                        Some("artifact finalization was interrupted by process restart")
+                    } else {
+                        cell.artifact_message.as_deref()
+                    },
+                    cell.total_output_bytes,
+                    cell.output_truncated,
+                    cell.output_excerpt.as_deref(),
+                    cell.artifact_path.as_deref(),
+                    cell.artifact_sha256.as_deref(),
+                    cell.call_id.as_deref(),
+                )?;
+            }
+            Ok(true)
+        })
     }
 
     fn recover_interrupted_run(&self, run: &TaskRun) -> Result<bool, StoreError> {
         self.with_run_lock(&run.run_id, || {
+            // Unknown belongs to this exact owner; other historical runs
+            // retain the existing recovery path. Malformed facts still error.
+            if !self.unsettled_physical_owner_intents_locked(&run.run_id)?.is_empty() {
+                return Ok(false);
+            }
             let state = self
                 .get_run_state(&run.run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run.run_id.clone()))?;
@@ -6373,84 +6392,108 @@ impl TaskRuntimeStore {
         call_id: Option<&str>,
     ) -> Result<(), StoreError> {
         self.with_run_lock(run_id, || {
-            self.get_run(run_id)?
-                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
-            #[cfg(test)]
-            if self
-                .fail_cell_terminal_remaining
-                .try_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |remaining| remaining.checked_sub(1),
-                )
-                .is_ok()
-            {
-                return Err(StoreError::InvalidPlan(
-                    "injected BackgroundCellFinished append failure".to_string(),
-                ));
-            }
-            let retention = echo_agent::utils::retention::ContentRetentionPolicy {
-                max_string_chars: 1_200,
-                ..Default::default()
-            };
-            let payload = serde_json::json!({
-                "cell_id": cell_id,
-                "name": retention.sanitize_text(name),
-                "phase": phase,
-                "terminal_cause": terminal_cause,
-                "terminal_message": terminal_message.map(|text| retention.sanitize_text(text)),
-                "exit_code": exit_code,
-                "artifact_status": artifact_status,
-                "artifact_message": artifact_message.map(|text| retention.sanitize_text(text)),
-                "total_output_bytes": total_output_bytes,
-                "output_truncated": output_truncated,
-                "output_excerpt": output_excerpt.map(|text| retention.sanitize_text(text)),
-                "artifact_path": artifact_path,
-                "artifact_sha256": artifact_sha256,
-                "call_id": call_id,
-            });
-            let existing = self
-                .list_background_cells(run_id)?
-                .into_iter()
-                .find(|cell| cell.cell_id == cell_id && !cell.is_active());
-            if let Some(existing) = existing {
-                if existing.phase != phase
-                    || existing.terminal_cause != terminal_cause
-                    || existing.terminal_message.as_deref()
-                        != terminal_message
-                            .map(|text| retention.sanitize_text(text))
-                            .as_deref()
-                    || existing.exit_code != exit_code
-                    || existing.artifact_status != artifact_status
-                    || existing.artifact_message.as_deref()
-                        != artifact_message
-                            .map(|text| retention.sanitize_text(text))
-                            .as_deref()
-                    || existing.total_output_bytes != total_output_bytes
-                    || existing.output_truncated != output_truncated
-                    || existing.output_excerpt.as_deref()
-                        != output_excerpt
-                            .map(|text| retention.sanitize_text(text))
-                            .as_deref()
-                    || existing.artifact_path.as_deref() != artifact_path
-                    || existing.artifact_sha256.as_deref() != artifact_sha256
-                    || existing.call_id.as_deref() != call_id
-                {
-                    return Err(StoreError::InvalidPlan(format!(
-                        "conflicting BackgroundCellFinished fact for cell {cell_id}"
-                    )));
-                }
-            } else {
-                self.commit_runtime_event(RuntimeJournalEvent::for_append(
-                    run_id,
-                    None,
-                    call_id,
-                    RuntimeEventKind::BackgroundCellFinished,
-                    payload,
-                ))?;
-            }
-            Ok(())
+            self.record_background_cell_finished_locked(run_id, cell_id, name, phase, terminal_cause, terminal_message, exit_code, artifact_status, artifact_message, total_output_bytes, output_truncated, output_excerpt, artifact_path, artifact_sha256, call_id)
         })
+    }
+
+    // Reuse the same terminal publication while boot recovery already holds
+    // the original run lock; do not recursively acquire that mutex.
+    #[allow(clippy::too_many_arguments)]
+    fn record_background_cell_finished_locked(
+        &self,
+        run_id: &str,
+        cell_id: &str,
+        name: &str,
+        phase: BackgroundCellPhase,
+        terminal_cause: Option<BackgroundCellTerminalCause>,
+        terminal_message: Option<&str>,
+        exit_code: Option<i32>,
+        artifact_status: BackgroundCellArtifactStatus,
+        artifact_message: Option<&str>,
+        total_output_bytes: u64,
+        output_truncated: bool,
+        output_excerpt: Option<&str>,
+        artifact_path: Option<&str>,
+        artifact_sha256: Option<&str>,
+        call_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.get_run(run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        #[cfg(test)]
+        if self
+            .fail_cell_terminal_remaining
+            .try_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(StoreError::InvalidPlan(
+                "injected BackgroundCellFinished append failure".to_string(),
+            ));
+        }
+        let retention = echo_agent::utils::retention::ContentRetentionPolicy {
+            max_string_chars: 1_200,
+            ..Default::default()
+        };
+        let payload = serde_json::json!({
+            "cell_id": cell_id,
+            "name": retention.sanitize_text(name),
+            "phase": phase,
+            "terminal_cause": terminal_cause,
+            "terminal_message": terminal_message.map(|text| retention.sanitize_text(text)),
+            "exit_code": exit_code,
+            "artifact_status": artifact_status,
+            "artifact_message": artifact_message.map(|text| retention.sanitize_text(text)),
+            "total_output_bytes": total_output_bytes,
+            "output_truncated": output_truncated,
+            "output_excerpt": output_excerpt.map(|text| retention.sanitize_text(text)),
+            "artifact_path": artifact_path,
+            "artifact_sha256": artifact_sha256,
+            "call_id": call_id,
+        });
+        let existing = self
+            .list_background_cells(run_id)?
+            .into_iter()
+            .find(|cell| cell.cell_id == cell_id && !cell.is_active());
+        if let Some(existing) = existing {
+            if existing.phase != phase
+                || existing.terminal_cause != terminal_cause
+                || existing.terminal_message.as_deref()
+                    != terminal_message
+                        .map(|text| retention.sanitize_text(text))
+                        .as_deref()
+                || existing.exit_code != exit_code
+                || existing.artifact_status != artifact_status
+                || existing.artifact_message.as_deref()
+                    != artifact_message
+                        .map(|text| retention.sanitize_text(text))
+                        .as_deref()
+                || existing.total_output_bytes != total_output_bytes
+                || existing.output_truncated != output_truncated
+                || existing.output_excerpt.as_deref()
+                    != output_excerpt
+                        .map(|text| retention.sanitize_text(text))
+                        .as_deref()
+                || existing.artifact_path.as_deref() != artifact_path
+                || existing.artifact_sha256.as_deref() != artifact_sha256
+                || existing.call_id.as_deref() != call_id
+            {
+                return Err(StoreError::InvalidPlan(format!(
+                    "conflicting BackgroundCellFinished fact for cell {cell_id}"
+                )));
+            }
+        } else {
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
+                run_id,
+                None,
+                call_id,
+                RuntimeEventKind::BackgroundCellFinished,
+                payload,
+            ))?;
+        }
+        Ok(())
     }
 
     pub fn list_artifacts(&self, run_id: &str) -> Result<Vec<Artifact>, StoreError> {

@@ -1456,6 +1456,102 @@ done
     }
 
     #[tokio::test]
+    async fn canonical_compose_binds_cold_workspace_owner_before_boot_dispatch() -> anyhow::Result<()> {
+        const NAME: &str = "plugin_runtime::tests::canonical_compose_binds_cold_workspace_owner_before_boot_dispatch";
+        if std::env::var_os("EKO_BOOTSTRAP_ISOLATED").is_none() {
+            let directory = tempfile::tempdir()?;
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", NAME, "--nocapture"])
+                .env("EKO_BOOTSTRAP_ISOLATED", "1")
+                .env("EKO_DATA_DIR", directory.path().join("user-data"))
+                .output()?;
+            assert!(output.status.success(), "isolated compose failed: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return Ok(());
+        }
+        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).with_test_writer().try_init();
+        use crate::runtime::{AgentRuntime, ApplicationLifecycleReason, ApplicationServices};
+        use crate::tasks::task_runtime::{AttendedMode, DomainProfile, RunPlanPolicy, TaskRunExecutionProfile, TaskRunStatus, TaskRuntimeStore};
+        use crate::workspace::{WorkspaceKind, layout::WorkspaceLayout, registry::WorkspaceRegistry};
+
+        let directory = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::new()?;
+        let workspace = registry.create_at("cold-compose", WorkspaceKind::General, directory.path().join("cold"))?;
+        let task_root = WorkspaceLayout::tasks(&workspace.root);
+        let store = TaskRuntimeStore::open_for_workspace(&task_root, workspace.id.to_string())?;
+        store.create_run_with_profile("cold-original", &workspace.id.to_string(), "cold-conversation", "cold-message", DomainProfile::General, "Reply once with the requested result", "agent_autonomous", AttendedMode::Unattended, TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect))?;
+        store.configure_run_continuation("cold-original", true, true, None, None)?;
+        store.transition_run("cold-original", TaskRunStatus::Running)?;
+        drop(store);
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_entered = entered.clone();
+        let handler_release = release.clone();
+        let handler_calls = calls.clone();
+        let router = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move || {
+            let entered = handler_entered.clone();
+            let release = handler_release.clone();
+            let calls = handler_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                entered.notify_one();
+                if let Ok(permit) = release.acquire().await { permit.forget(); }
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], "data: {\"id\":\"cold-original-response\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"original completed\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"cold-original-response\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (server_stop, server_stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move { axum::serve(listener, router).with_graceful_shutdown(async { let _ = server_stopped.await; }).await });
+        let mut config = crate::config::EkoConfig::default();
+        config.model.default_model_id = Some("fixture:test-model".to_string());
+        config.model_providers.insert("fixture".to_string(), crate::config::ModelProviderConfig { base_url: Some(format!("http://{address}/v1")), requires_api_key: false, ..Default::default() });
+        config.configured_models.push(crate::config::ConfiguredModel { id: "fixture:test-model".to_string(), provider: "fixture".to_string(), model: "test-model".to_string(), ..Default::default() });
+        let project = directory.path().join("project");
+        std::fs::create_dir_all(&project)?;
+        let browser = crate::browser::BrowserRuntime::start(crate::browser::BrowserConfig { enabled: false, extension_enabled: false, session_dir: directory.path().join("browser"), ..Default::default() }).await;
+        let runtime = Arc::new(AgentRuntime::bootstrap(&config, crate::infra::AgentCreateParams { working_dir: Some(project), browser_runtime: Some(browser), ..Default::default() }, directory.path().join("missing-mcp.json")).await?);
+        // The real plugin scheduler read guard lets pool initialization and
+        // boot admission proceed, but holds compose before its late state bind.
+        let plugin = runtime.plugin_runtime.clone();
+        let scheduler_guard = plugin.scheduler.read().await;
+        let runtime_for_compose = runtime.clone();
+        let compose = tokio::spawn(async move { ApplicationServices::compose(&runtime_for_compose, None, None, echo_agent::tools::permission::PermissionMode::Default).await });
+        let reached_boot_resume = AtomicBool::new(false);
+        let reached_late_bind = AtomicBool::new(false);
+        let observation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let cold = TaskRuntimeStore::open_for_workspace(&task_root, workspace.id.to_string())?;
+                let resumed = cold.list_events("cold-original", 0)?.iter().any(|event| event.event_type == crate::tasks::task_runtime::RuntimeEventKind::RunContinuationResumed);
+                if resumed { reached_boot_resume.store(true, Ordering::SeqCst); }
+                if resumed && plugin.state.try_lock().is_err() { reached_late_bind.store(true, Ordering::SeqCst); break; }
+                tokio::task::yield_now().await;
+            }
+            entered.notified().await;
+            Ok::<_, anyhow::Error>(())
+        }).await;
+        let compose_was_held = !compose.is_finished();
+        // Always release the actual provider and plugin locks, and join the
+        // real compose/shutdown/server before reporting a failed observation.
+        release.add_permits(16);
+        drop(scheduler_guard);
+        let services = compose.await??;
+        let shutdown = services.settle(ApplicationLifecycleReason::Shutdown, None).await;
+        let _ = server_stop.send(());
+        server.await??;
+        shutdown.into_result()?;
+        assert!(compose_was_held, "compose bypassed its original scheduler bind barrier");
+        if observation.is_err() {
+            let cold = TaskRuntimeStore::open_for_workspace(&task_root, workspace.id.to_string())?;
+            eprintln!("compose observation phases: boot_resumed={} late_bind={} provider_calls={} run={:?} journal={}", reached_boot_resume.load(Ordering::SeqCst), reached_late_bind.load(Ordering::SeqCst), calls.load(Ordering::SeqCst), cold.get_run("cold-original")?, serde_json::to_string(&cold.list_events("cold-original", 0)?)?);
+        }
+        observation??;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "cold boot must dispatch the original run exactly once");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn scheduler_binding_uses_the_same_lock_order_as_reload() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let runtime = service(temp.path()).await?;

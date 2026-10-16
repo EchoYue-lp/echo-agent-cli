@@ -11,7 +11,7 @@ focus:
 - time_lifecycle
 - failure_concurrency
 - contract_evidence
-observed_at: source:b1f3c278483f857325923b3cd1a00b06fb514c40e2dedd6e7d39aa356a058b97
+observed_at: source:482a04666faee98961db90b77d432be9e00c19801887dd3e71c7773e0dd9fdf1
 behavior_refs:
 - behavior.background-review-caller-owned-settlement
 - behavior.shared-turn-observation-retains-owner
@@ -43,6 +43,8 @@ code_refs:
 - echo-agent-app-core/src/tasks/task_runtime/store/runtime.rs
 - echo-agent-app-core/src/tasks/task_runtime/store/tests.rs
 - echo-agent-app-core/src/tasks/task_runtime/store/workspace.rs
+- echo-agent-app-core/src/plugin_runtime/tests.rs
+- echo-agent-app-core/src/tasks/task_runtime/subagent_control.rs
 evidence_refs:
 - evidence.latest-framework-consumer-integration
 - evidence.cancellation-observation-consumer
@@ -69,7 +71,7 @@ EKO 使用同一 generation-bound Review owner；Skill 使用框架 preview/appr
 
 ## 证据
 
-EKO ADR 0043-0046、框架 ADR 0058/0065/0069、定向故障注入、全 workspace 测试与 Clippy/GUI/前端门禁构成当前源码证据。独立 Review 已通过；CLI 最终远端 CI 与主分支交付仍待完成。
+EKO ADR 0043-0046 与框架 ADR 0058/0065/0069 是既有机制的设计依据；本次 CF988 的当前执行证据限于共用 Evidence 明确记录的三个 focused case 及独立复审。历史门禁不替代当前完整 workspace、Clippy/GUI/前端适用门禁，最终远端 CI 与主分支交付仍待完成。
 
 ## 裁决记录
 
@@ -83,3 +85,8 @@ Framework physical receipt/claim CAS唯一；观察不终态化。原Task/analys
 ## Scheduler 原 slot 观察
 
 同一应用代际的原SchedulerHandle只在同Mutex内借用shutdown；Err或借用等待取消保slot、onlyOk清。原Root每次poll复观并保unknown依赖，不以loop.is_finished/空slot/旧normal_drained推物理结算。此源与两具名case有界通过，不闭合Rule其余B义务及最终消费者门禁。
+
+
+## CF988 定向实施补充
+
+合法 unresolved physical-owner intent 是精确 run 的待观察事实，批次恢复在原 run 锁内跳过其状态/cell/control 写入并继续无关 run；真实存储/畸形证据错误仍报错。Running/Paused/guidance 共享原证据与精确 ack，不新增恢复器或权威。canonical compose 先绑定原三个 Weak 子组件，最终强 Arc 接管复用同一 helper。existing-run continuation 保留 canonical domain/route/attended/Goal/profile，仍用入口实际 active workspace/conversation/root 经原 immutable validator；trace 用返回原值。三 focused 实际通过及独立复审只支持此有限 checkpoint，不能替完整矩阵、新 cron、依赖政策或 main CI。

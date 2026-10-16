@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.cancellation-observation-consumer
 kind: evidence
-observed_at: source:b1f3c278483f857325923b3cd1a00b06fb514c40e2dedd6e7d39aa356a058b97
+observed_at: source:482a04666faee98961db90b77d432be9e00c19801887dd3e71c7773e0dd9fdf1
 source_refs:
 - echo-agent-app-core/src/state/config.rs
 - echo-agent-app-core/src/agent_router/tests.rs
@@ -27,21 +27,31 @@ source_refs:
 - echo-agent-app-core/src/workspace/runtime.rs
 - docs/supreme/specs/cancellation-observation-consumer/design.md
 - docs/supreme/specs/cancellation-observation-consumer/plans/plan_01_consumer.md
+- echo-agent-app-core/src/plugin_runtime/tests.rs
+- echo-agent-app-core/src/tasks/task_runtime/subagent_control.rs
 supports:
 - behavior.shared-turn-observation-retains-owner
 - behavior.task-unknown-owner-admission-fence
 - behavior.analysis-original-owner-settlement-retry
 - rule.eko-framework-consumer-authorities
 limitations:
-- Earlier public f0a focused results remain historical; the Scheduler increment passed two cases and a later exact existing nine-case list passed on public development3ded; neither is final main acceptance.
-- Scheduler source/two before-after receipts and the later nine existing-case raw/guards passed bounded independent review; this is not cron end-to-end or full B acceptance.
-- Canonical relative paths currently resolve public framework3dedb9a; final framework-main consumer and applicable whole gates remain pending.
-- No full workspace/GUI/remote/main delivery claim.
+- Earlier public f0a/3ded focused and nine-case results remain historical; they are
+  not final CF988/full acceptance.
+- Current CF988 with unchanged Git status qualified only three distinct focused cases and independent
+  source/receipt review; new cron case and full six plus GUI two remain unexecuted.
+- CLI real-lock and same-CF canonical registry-origin cached scans each report zero
+  vulnerabilities and exactly three denied upstream warnings on the named live-matched
+  database epoch; policy A/B is undecided and default online audit has not passed.
+- No complete workspace/GUI/remote-main delivery or repository-wide closure is claimed.
 ---
 
 # Cancellation observation consumer
 
 ## 支持的结论
+
+当前 checkpoint（CF988）：三个不同 focused case 各真实 1pass/0fail、零编译 warning、运行前后无源码漂移；独立实现与原件复审 C0/I0/M0。合法 unknown 逐 run 保留而不阻断普通恢复，原 existing-run identity/Goal 与入口错配校验保持，canonical compose 在真实 driver 准入前接同一 root。它不代表新 cron、全量矩阵或主分支交付通过。下文旧 cut 是按 epoch 保存的历史记录，当前完成边界以本段和最后 checkpoint 为准。
+
+历史切点记录：
 
 原69a1首审五类Important经原reader有限增量收束：typed joinloss、live before-start取消、analysis pre-effect rollback、真正tool完成后的持久写入/ack债务、原run锁递归、旧cleanup污染newowner以及monitor晚发布竞争。bb919源审不等于测试绿。新增aggregate原total flow/lease等待与Owner Drop/Strong回边已在候选源码中收束。原Root强持实际资源、子系统仅Weak，opaque guard保counter、full控制保Host服务；真实weakRoot/Host回归尚未执行。
 
@@ -91,3 +101,14 @@ cold增量d212/64及首编修正e2ea/64均由原独立reader源审C0/I0/M0。Roo
 范围仍受fixture限制：typed-error持根用例在同backend先release/join后由测试写匹配physical completion/私有pending事实，不证明production无source能自动获取晚收据；normal异步flow不等于外部OS effect。foreign future的内部locals可能已自行析构，catch只证明框架没有额外丢弃显式外层Owner/bundle，也不建立任意opaque guard无环承诺。cold delivery用例验证原生产绑定helper/cell，不是整个GUI投递E2E。重启用例验证现有durable intent拒重放，不以应用重启推断进程已停。
 
 旧f0a与5cd9/2203提交材料中“九例待运行”属于当时事实；当前摘要不再列该名单为从未执行。源码/非语义摘要未改变，baseline不重复刷新，Plan仍ready、宽场景needs_review/原lens stale保持；最终framework main消费者、适用whole/TUI/GUI、CLI cron E2E和其它未覆盖B义务仍待，不以九例关闭整个Outcome。
+
+
+## CF988 当前定向 checkpoint
+
+原材料中 b1f3c278 内容摘要已用官方 source_digest_at_revision 精确重算为当前不可变 Git ccf700ad4bed0fe4c84a1b376af97236a5b06cc7 的源码身份；该历史证明不改写成当前 dirty 源码的行为通过。当前源码和三份 after 的 303 Rust/build 输入逐字段一致，新增双语 ADR 为文档同步。原件保持在 `.echo-semantic/local/cli-cancellation-observation-consumer/`；不提交 runner、snapshot、log、临时 lock view 或 probe。
+
+身份 bug 的有效 before 是真实 canonical boot 已 recovered/resumed 后，由 fixed Attended/agent_task_plan adapter 与合法 Unattended/autonomous run 的身份冲突拒绝；最小修后同合法 fixture 实际调用 provider 一次并真 join。随后只切原 late/early binding：late 真实报原 lifecycle owner 在 driver admission 前不可用，early 同 fixture 1pass（1.65s），无新增 hook/accessor、sleep 或放宽 5s。更早 masked deadline 不借为 root 时序红绿。
+
+混合恢复用例 1pass 覆盖 Running/Paused 两状态、普通两 run 恢复计数、protected journal/cell/guidance/interrupt 保持、错误 ack 拒绝和畸形 intent 报错；Paused/pending 扩展不追认为旧 before 已红。另 1pass 验证 canonical domain/route/attended/Goal 与原 trace、错误 active workspace/conversation/root 拒绝且 journal 不变；三类 negative 不是三个额外 tests。三个 focused top-level case 不叠加隔离子进程计数。
+
+当前真实 Cargo.lock 与同次干净 CF988 helper 新生成的 registry-origin view 均只有 3 个 denied upstream warnings；4 个 rustls 漏洞、yanked chacha20 及可正常升级的其它告警已从这个命名数据库切点消失。RustSec 缓存与官方 live Git HEAD/tree 已核同一身份；online fetch I/O 失败仍保留，不能称默认在线 gate 通过。未配置忽略，人的 A/B 尚未裁决。完整六项、GUI 两项、新 cron 与最终 main/CI 均待完成；三 broad behavior/scenario 的 needs_review 与三审查 lens 的 stale 保留，globalClosure 未检查。
