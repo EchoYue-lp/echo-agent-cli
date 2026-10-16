@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.cancellation-observation-consumer
 kind: evidence
-observed_at: source:7107b9ed37ee47c0c0826d30e8999a68942d6b06b4b0d5f7f4391a5575f43ed1
+observed_at: source:2aa310eee02a7d64298f7ecf1afb4993cfad297ebecec90b85d380c9c45e7548
 source_refs:
 - echo-agent-app-core/src/agent_pool/tests.rs
 - echo-agent-app-core/src/state/reliability_contracts.rs
@@ -203,3 +203,21 @@ closed-watch 竞争现在先尊重已经存在的真实 settlement/debt；mock �
 已按README记录的最小边界，仅发布两个annotated refs/tags/echo-semantic-source/<完整commit>，精确目标5cd9eff0b92d076699d04b07d4a8a1c19e3fcdd4及8bd2a6f08117cde61037b583000c71ab820e73ce；未发布其它本地tag或Release。两旧tree及相对main所需blob闭包经有界检查，未发现新增公开raw/真实凭据或构建产物；目标均已有公开branch/PR源，旧workflow不匹配tag push。7个二进制blob为应用图标，未把检查描述为任意外部自动化的穷尽证明。
 
 独立新建网络仓库只fetch远端main f57与这两个精确refs，无alternates、taskbranch、PR或本地object借用；tag object/peeled commit/tree/connectivity及九个正式对象32个唯一source身份（含bytes/mode/anchor）均一致。官方source_digest重读5cd为215699889c9c12b8702566e900205bc6e2f73d00e83993834c0688cafa6e7464，8bd为e310dee0cb79fe7ee6d4072248885201202320e426d217bcf97b3e5e600558a0。原件仅task-local cold-main-evidence-tags-proof。此项只证明历史source可取，三Audit仍stale/Behavior仍needs_review；安装版collector五错误仍归独立插件修复。最终真实main合入后须再仅用远端main+必要refs做冷验，并完成完整运行矩阵；当前未声称完成。
+
+
+## CF6563 surface fixture repair (focused checkpoint)
+
+在真实 CF6563 冻结切点执行原完整 `cargo test --workspace --all-features --locked`，实际101：core 顶层1647pass/0fail/9既有ignored，后续五个integration组通过，root CLI285pass/3fail/0ignore。child harness不重复计数，未到达的后继target/JSONL/doc不算通过。三个失败分别是Channel模型屏障超时、GUI原生命周期owner缺失、TUI源码字符串旧分隔符已删除。
+
+先保持Channel原夹具缺owner，仅增加既有JoinHandle早退诊断模式；同case实际101，真实driver在模型屏障前返回foreground_turn Failed，消息明确为original application lifecycle resource owner unavailable before driver admission。这使定因不依赖timeout推测。两个success fixture最终复用公开ApplicationLifecycleOwner，admission前bind原store并持活到原driver真实结算，再同owner Shutdown；原continuation/steer/rootcancel/terminal/foreground断言与负例均保留，生产guard未改。
+
+TUI改为调用真实send_to_agent的planned_resume分支，持有真实runtime/foreground/pool leases，原Goal/revision/hash/root和run IDs均不变；同conversation独立待处理input的完整frontier不变、仍Persisted、无ConversationInputReceipt，最终foreground释放。真实v2 run指出创建时必须配置continuation，故沿用既有核心allowDirect fixture的creation-time配置，不降低Completed断言。初版冻结同步错误产生两处未声明owner编译错误、零case；v2真实2pass/1fail；失败原件、各patch/manifest与独立inode binary均保留，未称为通过。
+
+最终三文件diff26e984ecfd1f2ccf362a0f3b11c7e93d57f8b2eb82de446cdb74043ed85c145f实际3pass/0fail/0ignore/285root filtered、2.25s行为/2m07编译/零warning；guard sourceDrift=[]、CF6563clean且不变，peak5630750720/free9400909824。独审source/必要性与原精确三依赖暴露均C0/I0/M0；每个生产prefix与9819字节相同。raw仅task-local cf6563-three-fixture-*，不入Git。三项风险按原人类授权及本次有限复评后才重绑，未升级依赖或扩大豁免；新在线扫描及完整门禁另记。
+
+本切片只改现有测试与记录，不新增产品架构、公共API、示例或官网行为，因此无需ADR/example/website源码变更；既有examples仍须进入最终all-target门禁。Plan继续ready，Map/Rule needs_review、三Audit stale、inventory/behavior closure open；不借focused3宣称完整workspace/GUI/nativeStop/main CI通过。
+
+
+本次重绑后六项risk adapter方法真实通过。actual在线HTTPS两次fetch失败且JSON为零、origin当时未启动，独立curl/nativeGit连接同样超时；失败全部保留。随后仅各scanner进程将完整官方RustSec HTTPS repo URL改为同仓SSH传输，新actual与新生成CF6563 canonical origin两次官方在线扫描均wrapper0/scanner1、精原三项warning/零漏洞、独立gate0、noFetch=false/ignore=[]，DB f28da8c5d386e507fac79153655184056a20c054。未借SDK旧报告，不改全局Git/registry/lock/filter，不称依赖已修。原件cf6563-fixture-checkpoint-actual/origin-online-ssh及前两失败只留task-local。
+
+完整cargo clippy --workspace --all-targets --all-features --locked -- -D warnings实际0，7m55s、零warning，guard sourceDrift=[]/CF6563clean不变、peak5742702592/free7926157312；含既有examples，未以新测试源为由跳过。此后仅新增文稿事实和允许的当前快照metadata，三个Rust源hash与实际focused3/all-targetClippy仍一致，不重跑相同三例。另一组panic Clippy、原完整workspace/core-no-default/GUI/nativeStop/精mainCI继续待完成。独审文稿Minor“遗漏两次新fetch失败”已用上段事实补齐，不改失败日志或宽闭合状态。

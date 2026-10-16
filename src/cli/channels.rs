@@ -6770,6 +6770,11 @@ mod tests {
         let store = std::sync::Arc::new(
             TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
         );
+        // Keep the original application owner alive through driver settlement.
+        let mut lifecycle = echo_agent_app_core::api::runtime::ApplicationLifecycleOwner::new(
+            echo_agent::agent::CancellationToken::new(),
+        );
+        lifecycle.bind_task_runtime(store.clone());
         let workspace_id = store.active_workspace_id();
         let foreground_turns = ForegroundTurnControl::default();
         let lease = foreground_turns
@@ -6835,9 +6840,18 @@ mod tests {
             )
             .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), llm.wait_started())
+        if tokio::time::timeout(std::time::Duration::from_secs(2), llm.wait_started())
             .await
-            .map_err(|_| "channel model request did not reach cancellation barrier".to_string())?;
+            .is_err()
+        {
+            if driver.is_finished() {
+                let outcome = driver.await.map_err(|error| error.to_string())?;
+                return Err(format!(
+                    "channel driver ended before reaching model cancellation barrier: {outcome:?}"
+                ));
+            }
+            return Err("channel model request did not reach cancellation barrier".to_string());
+        }
         let snapshot_wait = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if let Some(snapshot) = foreground_turns.snapshot_scoped(
@@ -6934,6 +6948,14 @@ mod tests {
                 )
                 .is_none()
         );
+        lifecycle
+            .settle(
+                echo_agent_app_core::api::runtime::ApplicationLifecycleReason::Shutdown,
+                None,
+            )
+            .await
+            .into_result()
+            .map_err(|error| error.to_string())?;
         let _cleanup = std::fs::remove_dir_all(&temporary);
         Ok(())
     }

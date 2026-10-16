@@ -1442,6 +1442,11 @@ mod tests {
                 echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                     .map_err(|error| error.to_string())?,
             );
+            // Keep the original application owner alive through driver settlement.
+            let mut lifecycle = echo_agent_app_core::api::runtime::ApplicationLifecycleOwner::new(
+                echo_agent::agent::CancellationToken::new(),
+            );
+            lifecycle.bind_task_runtime(store.clone());
             prepare_retry_run(store.clone(), run_id, "retry-task", recovery).await?;
             let preparation = spawn_tauri_task_retry(
                 store.clone(),
@@ -1460,6 +1465,14 @@ mod tests {
             store
                 .shutdown_run_drivers()
                 .await
+                .map_err(|error| error.to_string())?;
+            lifecycle
+                .settle(
+                    echo_agent_app_core::api::runtime::ApplicationLifecycleReason::Shutdown,
+                    None,
+                )
+                .await
+                .into_result()
                 .map_err(|error| error.to_string())?;
         }
         Ok(())

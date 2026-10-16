@@ -11,7 +11,7 @@ focus:
 - time_lifecycle
 - failure_concurrency
 - contract_evidence
-observed_at: source:7107b9ed37ee47c0c0826d30e8999a68942d6b06b4b0d5f7f4391a5575f43ed1
+observed_at: source:2aa310eee02a7d64298f7ecf1afb4993cfad297ebecec90b85d380c9c45e7548
 behavior_refs:
 - behavior.background-review-caller-owned-settlement
 - behavior.shared-turn-observation-retains-owner
