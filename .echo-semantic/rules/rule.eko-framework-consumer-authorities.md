@@ -11,7 +11,7 @@ focus:
 - time_lifecycle
 - failure_concurrency
 - contract_evidence
-observed_at: source:b23cdcfe33cd2e059c505230a29cdabfeb74fdf62a2b19832053ed65c64b948c
+observed_at: source:2d05eb516554057681106fcab2222c5f47c79ac6fda54ad6954c2ff130de6d13
 behavior_refs:
 - behavior.background-review-caller-owned-settlement
 - behavior.shared-turn-observation-retains-owner
@@ -97,6 +97,8 @@ Framework physical receipt/claim CAS唯一；观察不终态化。原Task/analys
 
 
 ## CF988 定向实施补充
+
+共享chat的准备与claim也保既有typed StoreError至ChatTurnError，RecoveryBlocked不能先String化再进入foreground普通Failed；仅普通错误加原context。真实journal重开→同共享入口的before业务fail/ordinary pass及same after两例通过和源码增量独审，只闭此遗漏，不替当前全门禁。三依赖Rust输入变动先拒绝，再经明确授权、独立无消费扩大重评及same AFTER后精确重绑，不能自动继承旧风险接受。
 
 CLI依赖政策只在应用层核对用户精确三项risk_accepted；原官方scanner、canonical framework origin helper仍唯一权威。policy绑定当前完整锁及消费者输入，任何新告警/漏洞/yanked/扫描错误或输入漂移均拒绝。原scanner失败和单独风险核对成功必须分别报告，不传播为framework/SDK豁免；全部Rust与GUI门禁保持。
 

@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.cancellation-observation-consumer
 kind: evidence
-observed_at: source:b23cdcfe33cd2e059c505230a29cdabfeb74fdf62a2b19832053ed65c64b948c
+observed_at: source:2d05eb516554057681106fcab2222c5f47c79ac6fda54ad6954c2ff130de6d13
 source_refs:
 - echo-agent-app-core/src/state/config.rs
 - echo-agent-app-core/src/state/tests.rs
@@ -51,8 +51,9 @@ supports:
 limitations:
 - Earlier public f0a/3ded focused and nine-case results remain historical; they are
   not final CF988/full acceptance.
-- Current CF988 qualified the named cron case, six surface/control cases and both required
-  Clippy commands; full workspace and GUI conditional matrix remain pending.
+- Prior CF988 cut qualified cron, six surface/control cases and both Clippy commands.
+  The later shared preparation repair has two same-entry AFTER passes; current full
+  workspace, Clippy and GUI qualification remain pending.
 - Exact three-dependency human acceptance has a reviewed gate; both online scans with
   per-process HTTP/1.1 report scanner1/gate0. Original default-transport fetch failure is retained.
 - No complete workspace/GUI/remote-main delivery or repository-wide closure is claimed.
@@ -155,5 +156,19 @@ P `.echo-semantic/local/cli-cancellation-observation-consumer/`保primary-channe
 actual-cached-v2与origin-cached-v3为缓存有限检查，各官方scanner1/三warnings/单独gate0。默认online-v1失败后系统git ls-remote能读官方最新HEAD479c888ce4401313bca61ba4aba2d0f6244c4a09；仅对两次后继扫描进程指定GIT_CONFIG_COUNT=1、GIT_CONFIG_KEY_0=http.version、GIT_CONFIG_VALUE_0=HTTP/1.1，actual-online-http1与origin-online-http1均实际wrapper0，noFetch=false，官方scanner1/三warnings/零漏洞/单独gate0，DB HEAD仍同官方remote。未关闭fetch、使用stale或改全局Git配置；该受控传输设置解决本次现场fetch失败，更底层传输协商原因未证明。保留原始失败，不宣默认传输已修或CI通过。
 
 原panic类别Clippy(--workspace --lib --bins --all-features --locked及四-D)真实exit0、2m36s、sourceDrift=[]/CF988clean不变，峰值8441212928B/最小free17226854400B。既有all-target Clippy也已0；两者不替完整workspace/GUI条件/JSONL/精main CI。剩余矩阵继续运行，宽状态不闭合。
+
+## Shared preparation exact-entry repair
+
+完整32c6719/tree8126025相对main f57的83路径独审发现此前15/17增量外的唯一Important：prepare_chat_execution把reserve准入的RecoveryBlocked转String，经共享foreground成为Ok(Failed)。原whole-candidate-review-32c6719.json保存block，不借旧surface6关闭这条入口。相邻previous-driver等待没有另一个错误转换，未证明的等待假设不扩成finding。
+
+真实BEFORE-v2：official FileEventJournal写原pending intent、drop/reopen Store、实际drive_foreground_chat_turn；原生产prefix与32c逐byte同。编译4m34、零warning，2case实际1普通stale-identity控制pass/1Gui pending-owner业务fail、0ignore/1650filtered，失败值正是Ok(Failed(...chat driver admission failed...physical settlement...))。首Gui失败后其它三surface不追认before已执行。原before首次编译因独审先发现ordinary缺原resource scope/真实reject ack等待而中断，0行为，不算red。原fullworkspace也在行为前为新Important中断(-2)，不算pass/red。两种中断、原件与输入/资源收据均保留。
+
+唯一生产源chat_driver.rs的原private prepare/claim改传既有ChatTurnError/From<StoreError>，ordinary context不变；普通scope/identity验证不变。原ordinary fixture复用既有test_resource_scope并等真实wait_for_run_driver_idle，不加API/sleep。same AFTER真实2pass/0fail/0ignore/1650filtered，1.09s行为、5m10编译、零warning、sourceDrift=[]/CF988clean；pending case实际走完Gui/Tui/Cli/Channel四参数，但只计一个顶层case。断原run/state/journal不变、0model/0event与foreground保留；普通error仍Failed/settled/清busy。不证明原OS执行或无source自动恢复。
+
+独审source增量C0/I0/M0、同Plan四章节绑定0，source c3fe62e6308fa0c2ac1130c978a1f4d532f246785b1f379889eead89fa755df3/diff81d159ea78c33619a0a47c2045bd506da5bb4b4e37eafcb0392e9f44d04a4c07；完整83路径review的唯一源码Important已闭，但完整矩阵/最终CI未冒通过。risk gate先真实因新Rust输入gate1/scanner未调用；独审确认三依赖无新生产消费，人的明确准入与Decision记录后才重绑77ae4b12...a201，lock/版本/来源/checksum不变，非自动refresh。后继扫描另记。
+
+本地原件：shared-preparation-before/v2、shared-preparation-after的log/run/receipt、before-v2.patch/source、before-freeze与独立inode原bin副本、shared-preparation-independent-source-review及risk-input-rejection。原件仅task-local，不入Git。双语ADR0004同步；无公共接口/示例/官网新增行为，无需改示例或官网；既有examples仍由最终all-target链验证。宽状态和原五历史引用收据缺口不借本切片关闭。
+
+重绑后的6个risk测试方法实际通过。shared-preparation-actual-online与shared-preparation-origin-online在相同单进程HTTP/1.1条件下分别真实wrapper0/scanner1/gate0、noFetch=false、精确三warnings/零漏洞；后者由同CF988 canonical helper新生成CLI真实锁的origin view。不是复用旧consumer扫描，不改写原default-transport失败或最终CI状态。
 
 宽B场景、三个stale lens、完整workspace/GUI、JSONL与精main CI不借此关闭，Plan保持ready，全局库存/行为闭合open。无前端实现变化，不额外本地frontend矩阵，CI原frontend保留；私有lint整理不改变examples/官网说明，既有examples由all-target编译链覆盖，后续完整门禁仍适用。

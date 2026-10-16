@@ -4,7 +4,7 @@ id: baseline.repository
 kind: baseline
 source_snapshot:
   base_revision: f57b90a2b0962fa5561f8839a3df70be1f261ffa
-  content_digest: b23cdcfe33cd2e059c505230a29cdabfeb74fdf62a2b19832053ed65c64b948c
+  content_digest: 2d05eb516554057681106fcab2222c5f47c79ac6fda54ad6954c2ff130de6d13
 inventory_closure: open
 behavior_model_closure: open
 map_refs: [map.eko-conversation-collaboration, map.eko-framework-consumer-settlement]
@@ -49,6 +49,8 @@ coverage: []
 2026-10-17 primary checkpoint仅刷新当前非语义源码摘要，base保已公开main祖先f57；原c874源码482a摘要已由官方source_digest_at_revision核同。GUI/channel两独立red→after/4控制共6pass、具名cron1pass与17file独审/Clippy零warning均属有限证据；完整workspace/GUI/精main CI未完，原needs_review/stale/库存与行为open不关闭。三依赖为人的精确risk_accepted，不冒修复或原audit0。
 
 ## 源码快照
+
+32c6719完整83路径审查新增的shared preparation Important经真实journal重开/shared入口反例与same AFTER2pass关闭源码遗漏。原普通control/四surface参数边界见共用Evidence；原Clippy仍属此前切点，当前完整矩阵继续待验。消费者输入先拒绝后经明确准入及独审无消费扩大重评精确重绑，未改锁或三项风险；本次仅刷新实际源码身份，不关闭宽状态或历史引用收据缺口。
 
 dfd5750之后的窄交付增量：精确三依赖risk gate经6测试方法及独审通过，真实锁/新origin在线扫描在单进程HTTP/1.1设置下各scanner1/gate0；原默认fetch失败保留。只刷新当前源码摘要及受影响Rule/Map/Evidence引用，宽B场景、stale audits、库存/行为open与完整workspace/GUI/main CI义务不变。
 

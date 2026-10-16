@@ -38,6 +38,11 @@ The same rule applies when launch preparation encounters an unresolved durable
 owner fence. Foreground settlement waiters preserve the typed run/execution
 identity through channel notification and skip the ordinary input-pump kick.
 
+Shared resume/recovery preparation and claims also preserve the existing typed
+Store error before any String presentation. A reopened unresolved owner fence
+must reach the same foreground observation branch; ordinary admission/identity
+errors retain their original context and Failed settlement.
+
 Before work, the existing Task journal or private analysis-directory intent
 records the original owner identity. Restart admission honors that fact. Only
 matching physical completion permits durable terminal recording and intent

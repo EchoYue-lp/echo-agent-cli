@@ -613,7 +613,7 @@ async fn prepare_chat_execution(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: Option<RunTurnBinding>,
-) -> Result<ChatExecutionPreparation, String> {
+) -> Result<ChatExecutionPreparation, ChatTurnError> {
     let foreground_progress = crate::foreground_turn::current_foreground_progress();
     if let Some(store) = res.store.as_ref() {
         let active_workspace_id = store.active_workspace_id();
@@ -622,7 +622,8 @@ async fn prepare_chat_execution(
                 "Chat execution scope {} does not match TaskRuntime workspace {}",
                 res.execution_scope.workspace_id(),
                 active_workspace_id
-            ));
+            )
+            .into());
         }
     }
     // Scope a per-turn run_id so task tools (task_create /
@@ -659,7 +660,7 @@ async fn prepare_chat_execution(
             Some(crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&binding.turn_id));
     }
     if binding.turn_id.trim().is_empty() || binding.root_message_id.trim().is_empty() {
-        return Err("RunTurn binding requires non-empty turn and root message ids".to_string());
+        return Err("RunTurn binding requires non-empty turn and root message ids".into());
     }
     if let Some(expected) = binding.expected_resume.as_ref() {
         let binding_matches = binding.origin == RunTurnOrigin::Resume
@@ -671,7 +672,8 @@ async fn prepare_chat_execution(
             return Err(format!(
                 "TaskRun '{}' expected resume binding does not match its execution scope",
                 expected.run_id
-            ));
+            )
+            .into());
         }
     }
     let turn_id = binding.turn_id.clone();
@@ -682,21 +684,28 @@ async fn prepare_chat_execution(
     // Every turn registers its run driver before memory admission; with the
     // eager default binding (ADR 0037) every ordinary turn owns a formal
     // TaskRun from the first model boundary.
+    // Store admission can observe an original unresolved physical owner.
+    // Preserve that existing typed cause; context belongs only to ordinary
+    // errors, which retain their original presentation and settlement.
+    let admission_error = |context: &str, error| match ChatTurnError::from(error) {
+        ChatTurnError::Error(message) => ChatTurnError::Error(format!("{context}: {message}")),
+        observation => observation,
+    };
     let mut task_driver_registration = match res.store.as_ref() {
         Some(store) => {
             let admission = store
                 .reserve_run_driver_admission(formal_run_id.clone(), res.cancel.clone())
-                .map_err(|error| format!("chat driver admission failed: {error}"))?;
-            let generation = store
-                .lease_active_workspace_generation()
-                .map_err(|error| format!("task runtime generation admission failed: {error}"))?;
+                .map_err(|error| admission_error("chat driver admission failed", error))?;
+            let generation = store.lease_active_workspace_generation().map_err(|error| {
+                admission_error("task runtime generation admission failed", error)
+            })?;
             let registration = store
                 .register_observed_run_driver::<TurnReceipt>(admission, generation)
-                .map_err(|error| format!("chat driver registration failed: {error}"))?;
+                .map_err(|error| admission_error("chat driver registration failed", error))?;
             Some(registration)
         }
         None if drives_task_run => {
-            return Err("TaskRun-bound turn requires TaskRuntimeStore".to_string());
+            return Err("TaskRun-bound turn requires TaskRuntimeStore".into());
         }
         None => None,
     };
@@ -826,7 +835,7 @@ async fn prepare_chat_execution(
                 } else {
                     owned_store.claim_run_turn(&owned_run_id, &owned_turn_id, origin, visibility)
                 };
-                Ok((registration, claim.map_err(|error| error.to_string())))
+                Ok((registration, claim))
             })
             .await;
         let claim = match claim {
@@ -834,12 +843,12 @@ async fn prepare_chat_execution(
                 task_driver_registration = Some(registration);
                 claim
             }
-            Ok((registration, Err(message))) => {
-                registration.reject(message.clone());
-                return Err(message);
+            Ok((registration, Err(error))) => {
+                registration.reject(error.to_string());
+                return Err(error.into());
             }
             Err(error) => {
-                return Err(error.to_string());
+                return Err(error.into());
             }
         };
         match claim {
@@ -857,7 +866,7 @@ async fn prepare_chat_execution(
                 if deferred {
                     return Ok(ChatExecutionPreparation::Deferred);
                 }
-                return Err(format!("RunTurn was not submitted: {reason:?}"));
+                return Err(format!("RunTurn was not submitted: {reason:?}").into());
             }
         }
     }
@@ -2013,6 +2022,226 @@ mod tests {
             resources: vec![],
             authorship: crate::prepared_turn::InstructionAuthorship::User,
         }
+    }
+
+    #[tokio::test]
+    async fn shared_foreground_reopened_owner_intent_stays_nonterminal() -> anyhow::Result<()> {
+        use crate::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, TaskRunResumeIdentity, TaskRunStatus, TaskRuntimeStore,
+        };
+        use echo_agent::state::journal::{EventJournal, FileEventJournal};
+        use echo_agent::utils::fs::FileDurability;
+        use std::sync::Arc;
+
+        for surface in [
+            ForegroundTurnSurface::Gui,
+            ForegroundTurnSurface::Tui,
+            ForegroundTurnSurface::Cli,
+            ForegroundTurnSurface::Channel,
+        ] {
+            let directory = tempfile::tempdir()?;
+            let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+            store.create_run(
+                "shared-owner",
+                "test",
+                "shared-conversation",
+                "original-root",
+                DomainProfile::General,
+                "preserve original owner",
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )?;
+            store.transition_run("shared-owner", TaskRunStatus::Running)?;
+            store.transition_run("shared-owner", TaskRunStatus::Paused)?;
+            drop(store);
+            let journal_path = directory.path().join("shared-owner/events.jsonl");
+            // Official durable original-owner intent followed by a fresh Store;
+            // no live driver or helper-injected observation masks admission.
+            let journal = FileEventJournal::<serde_json::Value>::open(
+                &journal_path,
+                FileDurability::SyncData,
+            )?;
+            journal
+                .append(serde_json::json!({
+                    "run_id":"shared-owner", "task_id":null, "step_id":"original-execution",
+                    "event_type":"recovery_blocked", "timestamp":chrono::Utc::now(),
+                    "payload":{"physical_owner_intent":{
+                        "run_id":"shared-owner", "owner_id":"original-owner",
+                        "execution_id":"original-execution", "workspace_id":"test",
+                        "physical_terminal_observed":false
+                    }}
+                }))
+                .map_err(|error| anyhow::anyhow!("persist original intent: {error:?}"))?;
+            drop(journal);
+            let store = Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+                directory.path(),
+            )?);
+            let original = store
+                .get_run_state("shared-owner")?
+                .ok_or_else(|| anyhow::anyhow!("original run absent"))?;
+            let before_journal = std::fs::read(&journal_path)?;
+            let before_state = serde_json::to_value(&original)?;
+            let llm = Arc::new(
+                echo_agent::testing::MockLlmClient::new()
+                    .with_model_name("shared-owner-test")
+                    .with_response("must not execute"),
+            );
+            let agent = AgentHandle::new(
+                echo_agent::agent::ReactAgentBuilder::new()
+                    .model("shared-owner-test")
+                    .llm_client(llm.clone())
+                    .build()?,
+            );
+            let sink = Arc::new(MockChatSink::default());
+            let control = ForegroundTurnControl::default();
+            let lease =
+                control.begin_scoped("test", surface, "shared-conversation", "resume-turn")?;
+            let resources = Arc::new(crate::chat_resources::ChatResources {
+                execution_scope: test_execution_scope(),
+                workspace_io_receipt: None,
+                pool: None,
+                store: Some(store.clone()),
+                sink: sink.clone(),
+                webhook_emitter: None,
+                conv_id: Some("shared-conversation".to_string()),
+                root_message_id: "resume-turn".to_string(),
+                attachments: Vec::new(),
+                cancel: lease.cancellation_token(),
+                review_integration: None,
+                memory_generation: None,
+                human_loop_provider: None,
+            });
+            let result = crate::foreground_turn::drive_foreground_chat_turn(
+                lease,
+                &agent,
+                &make_turn("resume original"),
+                resources,
+                RunTurnBinding::resume_expected(
+                    TaskRunResumeIdentity::capture(&original),
+                    "resume-turn",
+                ),
+            )
+            .await;
+            assert!(
+                matches!(&result, Err(ChatTurnError::Observation { run_id, execution_id: None })
+                            if run_id == "shared-owner"),
+                "shared {surface} preparation projected durable unknown ownership as terminal: {result:?}"
+            );
+            assert!(
+                control
+                    .snapshot_scoped("test", surface, "shared-conversation")
+                    .is_some()
+            );
+            assert_eq!(llm.call_count(), 0);
+            assert_eq!(sink.event_count(), 0);
+            assert_eq!(std::fs::read(&journal_path)?, before_journal);
+            assert_eq!(
+                serde_json::to_value(
+                    store
+                        .get_run_state("shared-owner")?
+                        .ok_or_else(|| anyhow::anyhow!("original run disappeared"))?
+                )?,
+                before_state
+            );
+            assert!(!store.is_run_active("shared-owner"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_foreground_ordinary_resume_claim_error_still_settles_failed()
+    -> anyhow::Result<()> {
+        use crate::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, TaskRunResumeIdentity, TaskRunStatus, TaskRuntimeStore,
+        };
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let _original_resource_scope = store.test_resource_scope();
+        store.create_run(
+            "ordinary-resume",
+            "test",
+            "ordinary-conversation",
+            "original-root",
+            DomainProfile::General,
+            "preserve ordinary identity",
+            "agent_task_plan",
+            AttendedMode::Attended,
+        )?;
+        store.transition_run("ordinary-resume", TaskRunStatus::Running)?;
+        store.configure_run_continuation("ordinary-resume", true, false, None, None)?;
+        store.transition_run("ordinary-resume", TaskRunStatus::Paused)?;
+        let original = store
+            .get_run_state("ordinary-resume")?
+            .ok_or_else(|| anyhow::anyhow!("ordinary run absent"))?;
+        let mut expected = TaskRunResumeIdentity::capture(&original);
+        expected.goal_revision = expected.goal_revision.saturating_add(1);
+        let llm =
+            Arc::new(echo_agent::testing::MockLlmClient::new().with_model_name("ordinary-test"));
+        let agent = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("ordinary-test")
+                .llm_client(llm.clone())
+                .build()?,
+        );
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin_scoped(
+            "test",
+            ForegroundTurnSurface::Tui,
+            "ordinary-conversation",
+            "resume-turn",
+        )?;
+        let waiter = control.settlement_waiter_scoped(
+            "test",
+            ForegroundTurnSurface::Tui,
+            "ordinary-conversation",
+            "resume-turn",
+        )?;
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink: Arc::new(MockChatSink::default()),
+            webhook_emitter: None,
+            conv_id: Some("ordinary-conversation".to_string()),
+            root_message_id: "resume-turn".to_string(),
+            attachments: Vec::new(),
+            cancel: lease.cancellation_token(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let result = crate::foreground_turn::drive_foreground_chat_turn(
+            lease,
+            &agent,
+            &make_turn("resume ordinary"),
+            resources,
+            RunTurnBinding::resume_expected(expected, "resume-turn"),
+        )
+        .await?;
+        assert!(
+            matches!(&result, TurnOutcome::Failed(error) if error.message.contains("identity changed"))
+        );
+        assert!(matches!(
+            waiter.wait().await?.outcome,
+            TurnOutcome::Failed(_)
+        ));
+        assert!(
+            control
+                .snapshot_scoped("test", ForegroundTurnSurface::Tui, "ordinary-conversation")
+                .is_none()
+        );
+        assert_eq!(llm.call_count(), 0);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.wait_for_run_driver_idle("ordinary-resume"),
+        )
+        .await?;
+        assert!(!store.is_run_active("ordinary-resume"));
+        Ok(())
     }
 
     fn test_turn_receipt(turn_id: &str, outcome: TurnOutcome) -> Result<TurnReceipt, String> {
@@ -3710,7 +3939,11 @@ mod tests {
             Ok(_) => return Err("conflicting expected resume unexpectedly prepared".to_string()),
             Err(error) => error,
         };
-        assert!(conflict_error.contains("does not match its execution scope"));
+        assert!(
+            conflict_error
+                .to_string()
+                .contains("does not match its execution scope")
+        );
         assert_eq!(store.active_run_driver_count()?, 0);
         assert_eq!(store.active_run_driver_receipt_count()?, 0);
         assert_eq!(
@@ -3736,7 +3969,7 @@ mod tests {
             Ok(_) => return Err("stale expected resume unexpectedly prepared".to_string()),
             Err(error) => error,
         };
-        assert!(error.contains("identity changed"));
+        assert!(error.to_string().contains("identity changed"));
         let after = store
             .get_run_state("stale-resume")
             .map_err(|error| error.to_string())?
@@ -3884,6 +4117,8 @@ mod tests {
         drive_scripted_task_graph("task-graph").await
     }
 
+    // Tokio's fixed macro option names test harness threads, outside the
+    // application's Subagent terminology.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawned_task_execute_retains_pool_receipt_until_outer_driver_settles()
     -> Result<(), String> {
