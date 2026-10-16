@@ -33,8 +33,8 @@ supports:
 - behavior.analysis-original-owner-settlement-retry
 - rule.eko-framework-consumer-authorities
 limitations:
-- Earlier public f0a focused results remain historical; this Scheduler increment separately passed two selected app-core cases on public development3ded, not final main.
-- Scheduler original-slot and Root continuation source plus two before/after receipts passed bounded independent review; this is not cron end-to-end or full B acceptance.
+- Earlier public f0a focused results remain historical; the Scheduler increment passed two cases and a later exact existing nine-case list passed on public development3ded; neither is final main acceptance.
+- Scheduler source/two before-after receipts and the later nine existing-case raw/guards passed bounded independent review; this is not cron end-to-end or full B acceptance.
 - Canonical relative paths currently resolve public framework3dedb9a; final framework-main consumer and applicable whole gates remain pending.
 - No full workspace/GUI/remote/main delivery claim.
 ---
@@ -80,3 +80,14 @@ cold增量d212/64及首编修正e2ea/64均由原独立reader源审C0/I0/M0。Roo
 两原module逻辑用例真实before各1fail（slot1421B45dfd8a7、aggregate1811B70fc8eac），不是首轮2fixture编译错误。after各1pass/0fail/0ignore/1646filtered、编译零warning，slot原raw608B9f57dfda/编译7m12s，aggregate425Bc235323e/暖编3.25s；各583F/303C/67前后零漂移、无signal/trunc、最终进程组空。原正常control新增的是等同一public run_once实际commit再断成功；Unknown/取消等待/原Root两个红oracle均保。源码和收据独立复核C0/I0/M0；执行只含真实framework callback/资源、原Root与独立normal异步flow，非OS进程或无source自动恢复证明。原before、首编错误和描述旁注只保tasklocal，不入Git。
 
 本增量不借旧f0a/v4或这两个case关闭其余9强例、TUI/GUI条件、完整workspace、cron E2E、最终framework-main消费者及远端交付。Plan仍ready、三个宽场景needs_review、三个原lens仍stale，库存和行为模型仍open。共享现有Rule/Map记录此窄原slot生命周期；其它历史观察用精确Git5cd9保留原215699摘要切点，未改其结论。
+
+
+## 原九强例的当前实际执行
+
+在CLI `2203e5edeaa9ed28445ab704535636aadfd48589` / 公开framework开发checkpoint `3dedb9a6834cd28a3718d9852023722a6d24f4dc`，此前prepared原九用例已实跑：七条Cargo命令，首组三个完整libtest名通过`-- --exact`并串行，后六组各exact一例；共9个不同逻辑case、9pass/0fail/0ignore，编译零warning。先用热binary确认实际选中数，listing没有当成执行；没有重跑已绿Scheduler两例，也不双算隔离子harness。原analysis组实际30.78s，30秒drain策略未改；每组实际CF1226/C434（Rust/Cargo与正式docs）及434冻结清单前后逐hash无漂移、noSignal/noTrunc/noMonitorError、进程组最终空。
+
+这九例分别覆盖原Root的no-runtime单飞发布、foreign join unwind显式资源保留、analysis最终发布唤醒、精确FG token与同key普通lease、typed error单独持根、cold delivery原cell绑定、ProductData嵌套普通操作、opaque guard的Host回边和原durable intent重启拒重放。结果及输入守卫由原独立reader有限复核C0/I0/M0；原raw/runner/manifest只在tasklocal，汇总`remaining9-current-receipt.json`摘要2092eb57b9d8c9a600909f85ca96708627037fb358be8a315d3d2e62d3176a0c。
+
+范围仍受fixture限制：typed-error持根用例在同backend先release/join后由测试写匹配physical completion/私有pending事实，不证明production无source能自动获取晚收据；normal异步flow不等于外部OS effect。foreign future的内部locals可能已自行析构，catch只证明框架没有额外丢弃显式外层Owner/bundle，也不建立任意opaque guard无环承诺。cold delivery用例验证原生产绑定helper/cell，不是整个GUI投递E2E。重启用例验证现有durable intent拒重放，不以应用重启推断进程已停。
+
+旧f0a与5cd9/2203提交材料中“九例待运行”属于当时事实；当前摘要不再列该名单为从未执行。源码/非语义摘要未改变，baseline不重复刷新，Plan仍ready、宽场景needs_review/原lens stale保持；最终framework main消费者、适用whole/TUI/GUI、CLI cron E2E和其它未覆盖B义务仍待，不以九例关闭整个Outcome。
