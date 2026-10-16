@@ -3140,6 +3140,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         store
             .create_run(
                 "pre-driver-cancel-run",
@@ -3258,6 +3259,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         store
             .create_run(
                 "pre-driver-shutdown-run",
@@ -3374,6 +3376,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         store
             .create_run_with_profile(
                 "claim-race-run",
@@ -3497,6 +3500,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         let run_id = "continuation-claim-activity";
         store
             .create_run(
@@ -3664,6 +3668,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         store
             .create_run(
                 "existing-goal",
@@ -3855,6 +3860,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         store
             .create_run(
                 "stale-resume",
@@ -4029,6 +4035,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         crate::tasks::task_runtime::register_task_tools_on_agent(
             &agent,
             store.clone(),
@@ -4160,6 +4167,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         crate::tasks::task_runtime::register_task_tools_on_agent(
             &primary_agent,
             store.clone(),
@@ -4296,6 +4304,7 @@ mod tests {
             crate::tasks::task_runtime::store::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         let turn_id = "stream-agent-events-contract-turn";
         let res = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
@@ -4514,6 +4523,7 @@ mod tests {
             crate::tasks::task_runtime::store::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         store
             .create_run_with_profile(
                 &run_id,
@@ -4647,6 +4657,7 @@ mod tests {
             crate::tasks::task_runtime::store::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         let turn_id = "raw-user-text-contract-turn";
         let res = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),

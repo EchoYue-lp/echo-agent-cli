@@ -11,13 +11,17 @@ focus:
 - time_lifecycle
 - failure_concurrency
 - contract_evidence
-observed_at: source:2d05eb516554057681106fcab2222c5f47c79ac6fda54ad6954c2ff130de6d13
+observed_at: source:7107b9ed37ee47c0c0826d30e8999a68942d6b06b4b0d5f7f4391a5575f43ed1
 behavior_refs:
 - behavior.background-review-caller-owned-settlement
 - behavior.shared-turn-observation-retains-owner
 - behavior.task-unknown-owner-admission-fence
 - behavior.analysis-original-owner-settlement-retry
 code_refs:
+- echo-agent-app-core/src/agent_pool/tests.rs
+- echo-agent-app-core/src/state/reliability_contracts.rs
+- echo-agent-app-core/src/tasks/task_runtime/store/journal.rs
+- echo-agent-app-core/src/tasks/service.rs
 - echo-agent-app-core/src/state/config.rs
 - echo-agent-app-core/src/state/tests.rs
 - echo-agent-app-core/src/tasks/task_runtime/executor/dispatch.rs

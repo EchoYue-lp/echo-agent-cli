@@ -1468,18 +1468,45 @@ mod tests {
         ),
         String,
     > {
+        let owner_cancel = CancellationToken::new();
         let admission = store
-            .reserve_run_driver_admission(run_id.to_string(), CancellationToken::new())
+            .reserve_run_driver_admission(run_id.to_string(), owner_cancel.clone())
             .map_err(|error| error.to_string())?;
         let generation = store
             .lease_active_workspace_generation()
             .map_err(|error| error.to_string())?;
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let owner_store = store.clone();
+        let owner_run_id = run_id.to_string();
         let waiter = store
-            .spawn_run_driver(admission, generation, move |_receipt_owner| async move {
+            .spawn_run_driver(admission, generation, move |receipt_owner| async move {
                 let _started = started_tx.send(());
                 release_rx.await.map_err(|error| error.to_string())?;
+                let source = owner_store
+                    .get_run_state(&owner_run_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "held original run source missing".to_string())?;
+                if !source
+                    .event_index
+                    .physical_owner_intents
+                    .iter()
+                    .any(|intent| {
+                        intent.owner_id == receipt_owner.execution_context_id()
+                            && intent.run_id == owner_run_id
+                            && !intent.physical_terminal_observed
+                    })
+                {
+                    return Err("release did not reach the same original held driver".to_string());
+                }
+                // The request itself is nonterminal. Only this original owner,
+                // after its actual release, acknowledges cancellation; pause
+                // uses the same signal and must retain its existing Paused state.
+                if owner_cancel.is_cancelled() && source.run.status == TaskRunStatus::Running {
+                    owner_store
+                        .finalize_run(&owner_run_id, TaskRunStatus::Cancelled, None)
+                        .map_err(|error| error.to_string())?;
+                }
                 Ok(())
             })
             .map_err(|error| error.to_string())?;
@@ -1494,6 +1521,7 @@ mod tests {
         cancel: bool,
     ) -> Result<(), String> {
         let (store, agent, resources) = retry_wait_fixture(run_id)?;
+        let _resource_scope = store.test_resource_scope();
         register_launcher(
             &store,
             run_id,

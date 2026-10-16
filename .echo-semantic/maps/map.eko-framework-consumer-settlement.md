@@ -4,7 +4,7 @@ id: map.eko-framework-consumer-settlement
 kind: capability_map
 title: EKO framework consumer settlement
 risk: high
-observed_at: source:2d05eb516554057681106fcab2222c5f47c79ac6fda54ad6954c2ff130de6d13
+observed_at: source:7107b9ed37ee47c0c0826d30e8999a68942d6b06b4b0d5f7f4391a5575f43ed1
 boundary_refs:
 - boundary.eko-framework-consumer-settlement
 behavior_refs:
@@ -229,3 +229,6 @@ Scheduler/Task claim原场景因B关闭语义受影响而转needs_review；旧ma
 ## CF988 当前任务 checkpoint
 
 CF988三原focused各1pass，后继具名cron1pass及primary冻结副本surface两个独立red→after/正常普通控制共6pass均见共用Evidence。17file独审和测试非语义增量C0/I0/M0，all-targetClippy零warning通过。九例保3ded历史身份，不扩为CF988重跑。完整workspace/GUI、JSONL/精main CI待完成；三B场景needs_review、三lens stale、仓库闭合open保留。三依赖由人接受当前精版本风险并延期升级，Finding为risk_accepted而非resolved；精确门禁仍待验证，不冒原audit0。
+
+
+本次 CF988 有限修复沿原 framework-consumer 边界：真实 completion 后的同 owner debt、读取错误取消目标、观察 watch、业务进展分类与真实进程退出夹具；证据见 evidence.cancellation-observation-consumer。宽行为仍待审，未扩展新产品能力。

@@ -470,6 +470,16 @@ fn stable_provider_retry_delay_millis(
 }
 
 fn is_run_progress_event(event: &RuntimeTaskEvent) -> bool {
+    // Original-owner admission/completion/ack facts are lifecycle bookkeeping,
+    // not task progress. Counting them resets every no-progress turn budget.
+    // Ordinary task recovery continues to advance the same business frontier.
+    if matches!(
+        event.event_type,
+        RuntimeEventKind::RecoveryBlocked | RuntimeEventKind::RecoveryResolved
+    ) && event.payload.get("physical_owner_intent").is_some()
+    {
+        return false;
+    }
     matches!(
         event.event_type,
         RuntimeEventKind::PlanRevisionCommitted

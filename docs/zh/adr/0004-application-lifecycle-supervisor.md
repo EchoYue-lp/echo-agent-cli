@@ -91,3 +91,8 @@ waiter 保留 typed run/execution 身份并传给 channel notifier；该观察�
 - `echo-website` 和 framework examples 不受影响；这是 EKO 应用内部生命周期，不改变公开框架 API。
 
 ApplicationServices 的标准组装在 TaskRun 启动恢复或应用 scheduler producer 接纳工作前，先为借用 AppState 的 workspace registry、foreground turns 和 analysis supervisor 接入同一生命周期 root；最终 AppState Arc 通过同一 helper 接管强引用。冷 workspace store 准入原 driver 不得依赖 compose 已返回。
+
+
+终态写入失败时，既有 settlement debt 保留原先准入并完成物理执行的 PhysicalOwnerIntent。投影缺失或读取失败均不能授权释放；重试在原 run 锁内验证同一 owner，再调用唯一 finalizer 和 acknowledgement，异步 receipt 释放放在锁外。执行前拒绝只能释放确证从未开始的资源。观察 watch 关闭不能覆盖已经发布的真实结算收据。原 driver 返回错误时，正常结算与读取错误兜底均从原取消 token 选择 Cancelled，否则 Failed；返回成功但未持久业务结算仍为 Failed。这是原应用 owner 的修复，没有增加生命周期状态或框架策略。
+
+故障回归只在 canonical 物理完成后注入真实 I/O 错误，保留并恢复原 journal，要求恰好一次 acknowledgement 后才释放 receipt。冷恢复夹具区分 caller abort（原 owner 继续保留）与实际子进程退出并被回收；只重开后者证明没有模型重放，不伪造 owner 收据。针对性检查不构成原生 GUI/OS owner 晚恢复或完整 workspace 交付证明。

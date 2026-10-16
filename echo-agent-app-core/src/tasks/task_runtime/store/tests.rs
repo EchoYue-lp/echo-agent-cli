@@ -173,7 +173,16 @@ mod tests {
             let directory = tempfile::tempdir()?;
             let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
             let create_ordinary = |run_id: &str| -> Result<(), StoreError> {
-                store.create_run(run_id, "global", "ordinary-conversation", "message", DomainProfile::General, "ordinary goal", "task", AttendedMode::Attended)?;
+                store.create_run(
+                    run_id,
+                    "global",
+                    "ordinary-conversation",
+                    "message",
+                    DomainProfile::General,
+                    "ordinary goal",
+                    "task",
+                    AttendedMode::Attended,
+                )?;
                 store.transition_run(run_id, TaskRunStatus::Running)?;
                 Ok(())
             };
@@ -201,13 +210,24 @@ mod tests {
             };
             store.begin_physical_owner_intent(&intent)?;
             store.record_background_cell_started(
-                "owner-run", "protected-cell", "original cell", "command-hash",
-                None, Some("original-execution"), Some("original-call"),
+                "owner-run",
+                "protected-cell",
+                "original cell",
+                "command-hash",
+                None,
+                Some("original-execution"),
+                Some("original-call"),
             )?;
             // Persist pending command facts only, not a fabricated terminal receipt.
             for (command_id, kind) in [
-                ("protected-guidance", RuntimeEventKind::SubagentGuidanceQueued),
-                ("protected-interrupt", RuntimeEventKind::SubagentInterruptRequested),
+                (
+                    "protected-guidance",
+                    RuntimeEventKind::SubagentGuidanceQueued,
+                ),
+                (
+                    "protected-interrupt",
+                    RuntimeEventKind::SubagentInterruptRequested,
+                ),
             ] {
                 store.commit_runtime_event(RuntimeJournalEvent::for_append(
                     "owner-run", Some("protected-task"), Some("original-execution"), kind,
@@ -227,16 +247,18 @@ mod tests {
             let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
                 directory.path(),
             )?);
-            let reconciler =
-                crate::tasks::task_runtime::TaskRunBootReconciler::for_store(&store);
+            let reconciler = crate::tasks::task_runtime::TaskRunBootReconciler::for_store(&store);
             assert_eq!(reconciler.recover_once().await?, 2);
             let candidates = reconciler.paused_candidates().await?;
             let candidate_ids = candidates
                 .iter()
                 .map(|run| run.run_id.as_str())
                 .collect::<std::collections::BTreeSet<_>>();
-            let mut expected = std::collections::BTreeSet::from(["ordinary-before", "ordinary-after"]);
-            if protected_status == TaskRunStatus::Paused { expected.insert("owner-run"); }
+            let mut expected =
+                std::collections::BTreeSet::from(["ordinary-before", "ordinary-after"]);
+            if protected_status == TaskRunStatus::Paused {
+                expected.insert("owner-run");
+            }
             assert_eq!(candidate_ids, expected);
             for run_id in ["ordinary-before", "ordinary-after"] {
                 assert_eq!(
@@ -265,7 +287,12 @@ mod tests {
                 serde_json::to_value(store.list_events("owner-run", 0)?)?,
                 serde_json::to_value(before)?
             );
-            assert!(store.list_background_cells("owner-run")?.iter().any(|cell| cell.cell_id == "protected-cell" && cell.is_active()));
+            assert!(
+                store
+                    .list_background_cells("owner-run")?
+                    .iter()
+                    .any(|cell| cell.cell_id == "protected-cell" && cell.is_active())
+            );
             let mut wrong = intent.clone();
             wrong.execution_id = Some("replacement".to_string());
             assert!(store.acknowledge_physical_owner_intent(&wrong).is_err());
@@ -289,13 +316,28 @@ mod tests {
                     )
                     .is_ok()
             );
-            store.create_run("corrupt-owner", "global", "conversation", "message", DomainProfile::General, "goal", "task", AttendedMode::Attended)?;
+            store.create_run(
+                "corrupt-owner",
+                "global",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "goal",
+                "task",
+                AttendedMode::Attended,
+            )?;
             store.transition_run("corrupt-owner", TaskRunStatus::Running)?;
             store.commit_runtime_event(RuntimeJournalEvent::for_append(
-                "corrupt-owner", None, None, RuntimeEventKind::RecoveryBlocked,
+                "corrupt-owner",
+                None,
+                None,
+                RuntimeEventKind::RecoveryBlocked,
                 serde_json::json!({ "physical_owner_intent": "malformed original fact" }),
             ))?;
-            assert!(store.recover_incomplete().is_err(), "malformed owner facts must not be silently skipped");
+            assert!(
+                store.recover_incomplete().is_err(),
+                "malformed owner facts must not be silently skipped"
+            );
         }
         Ok(())
     }
@@ -593,6 +635,7 @@ mod tests {
             physical_terminal_observed: false,
         };
         store.begin_physical_owner_intent(&first)?;
+        store.finalize_run("lock-order", TaskRunStatus::Completed, None)?;
         store.record_physical_owner_completion(&first)?;
         let next = PhysicalOwnerIntent {
             owner_id: "next".to_string(),
@@ -1875,7 +1918,305 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_write_debt_retains_execution_receipt_until_retry() -> Result<(), String> {
+    async fn rejected_pre_execution_debt_releases_only_its_unstarted_resources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let saved = temp.path().join("tasks-saved");
+        let store = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+                .map_err(|error| error.to_string())?,
+        );
+        let _resource_scope = store.test_resource_scope();
+        store.create_run(
+            "unstarted-debt",
+            "workspace-a",
+            "conversation",
+            "message",
+            DomainProfile::General,
+            "reject before physical start",
+            "",
+            AttendedMode::Unattended,
+        )?;
+        store.transition_run("unstarted-debt", TaskRunStatus::Running)?;
+        let admission = test_driver_admission(&store, "unstarted-debt")?;
+        let mut registration = store.register_observed_run_driver::<()>(
+            admission,
+            store.lease_active_workspace_generation()?,
+        )?;
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        registration
+            .receipt_owner
+            .as_mut()
+            .ok_or_else(|| "registered resource owner missing".to_string())?
+            .retain(DropFlag(dropped.clone()))
+            .map_err(|_| "receipt not retained".to_string())?;
+        registration.mark_preparation_started();
+        std::fs::rename(&root, &saved).map_err(|error| error.to_string())?;
+        std::fs::write(&root, b"block only the pre-execution terminal write")
+            .map_err(|error| error.to_string())?;
+        // No Execute future was supplied. Only the original preparation failure
+        // path can create this None-identity debt.
+        registration.fail_preparation("known preparation rejection before physical start");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.wait_for_run_driver_idle("unstarted-debt"),
+        )
+        .await
+        .map_err(|_| "unstarted owner failed to report preparation".to_string())?;
+        {
+            let supervisor = store
+                .run_driver_supervisor
+                .lock()
+                .map_err(|_| "supervisor lock poisoned".to_string())?;
+            assert_eq!(supervisor.settlement_debts.len(), 1);
+            assert!(
+                supervisor
+                    .settlement_debts
+                    .first()
+                    .ok_or_else(|| "unstarted debt missing".to_string())?
+                    .physical_owner_intent
+                    .is_none()
+            );
+            assert!(supervisor.uncertain_drivers.is_empty());
+        }
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        let events = std::fs::read_to_string(saved.join("unstarted-debt/events.jsonl"))
+            .map_err(|error| error.to_string())?;
+        let mut record_count = 0_usize;
+        // Reuse the original journal's public event DTO and projection. The
+        // on-disk lines are batch frames, not IPC RuntimeTaskEvent records;
+        // never open a second differently typed FileEventJournal owner.
+        for line in events.lines() {
+            let frame: serde_json::Value = serde_json::from_str(line)?;
+            let records = frame
+                .get("records")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "original journal frame records missing".to_string())?;
+            assert!(!records.is_empty());
+            for record in records {
+                let sequence = record
+                    .get("sequence")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| "original journal sequence missing".to_string())?;
+                let event: RuntimeJournalEvent = serde_json::from_value(
+                    record
+                        .get("event")
+                        .cloned()
+                        .ok_or_else(|| "original journal event missing".to_string())?,
+                )?;
+                let projected = event.project(sequence).map_err(|sequence| {
+                    format!("original journal sequence overflow: {sequence}")
+                })?;
+                assert_eq!(projected.run_id, "unstarted-debt");
+                assert!(projected.payload.get("physical_owner_intent").is_none());
+                record_count = record_count.saturating_add(1);
+            }
+        }
+        assert!(record_count > 0);
+        let diagnostic = store
+            .shutdown_run_drivers()
+            .await
+            .err()
+            .ok_or_else(|| "uncommitted pre-execution terminal write hidden".to_string())?;
+        assert_eq!(diagnostic.abandoned_settlements.len(), 1);
+        let debt = diagnostic
+            .abandoned_settlements
+            .first()
+            .ok_or_else(|| "unstarted diagnostic missing".to_string())?;
+        assert_eq!(debt.run_id, "unstarted-debt");
+        assert_eq!(debt.target, TaskRunStatus::Failed);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(store.active_run_driver_count()?, 0);
+        assert_eq!(store.active_run_driver_receipt_count()?, 0);
+        std::fs::remove_file(&root).map_err(|error| error.to_string())?;
+        std::fs::rename(&saved, &root).map_err(|error| error.to_string())?;
+        assert!(
+            store
+                .unresolved_physical_owner_intents("unstarted-debt")?
+                .is_empty()
+        );
+        drop(
+            store
+                .begin_workspace_transition()
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn physical_completion_read_error_preserves_original_driver_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // All three cases inject real I/O failure only after the original
+        // owner's physical completion was durably appended. Successful return
+        // without business settlement remains a protocol failure, even cancelled.
+        for (cancel_requested, driver_failed, expected) in [
+            (true, true, TaskRunStatus::Cancelled),
+            (false, true, TaskRunStatus::Failed),
+            (true, false, TaskRunStatus::Failed),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().join("tasks");
+            let saved = temp.path().join("original-tasks");
+            let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+                root.clone(),
+            )?);
+            let _resource_scope = store.test_resource_scope();
+            let expected_root = std::fs::canonicalize(temp.path())?.join("tasks");
+            let injected_root = root.clone();
+            let saved_root = saved.clone();
+            let physical_fault = store.inject_after_physical_completion_for_test(
+                "read-error-target",
+                move || {
+                    std::fs::rename(&injected_root, &saved_root)?;
+                    std::fs::create_dir_all(injected_root.join("read-error-target/run-state.json"))
+                },
+            )?;
+            store.create_run(
+                "read-error-target",
+                "workspace-a",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "retain the original cancellation target",
+                "",
+                AttendedMode::Unattended,
+            )?;
+            store.transition_run("read-error-target", TaskRunStatus::Running)?;
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let retained = dropped.clone();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let cancel = echo_agent::agent::CancellationToken::new();
+            let admission = store
+                .reserve_run_driver_admission("read-error-target".to_string(), cancel.clone())?;
+            let waiter = store.spawn_run_driver(
+                admission,
+                store.lease_active_workspace_generation()?,
+                move |mut receipt_owner| async move {
+                    receipt_owner
+                        .retain(DropFlag(retained))
+                        .map_err(|e| e.to_string())?;
+                    started_tx
+                        .send(receipt_owner.execution_context_id().to_owned())
+                        .map_err(|_| "start receiver closed".to_string())?;
+                    release_rx.await.map_err(|e| e.to_string())?;
+                    if driver_failed {
+                        Err::<(), String>("original driver error".to_string())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )?;
+            let owner_id = started_rx.await?;
+            if cancel_requested {
+                assert!(store.request_cancel("read-error-target")?);
+            }
+            assert_eq!(cancel.is_cancelled(), cancel_requested);
+            assert_eq!(
+                store
+                    .get_run("read-error-target")?
+                    .ok_or("run missing")?
+                    .status,
+                TaskRunStatus::Running
+            );
+            release_tx.send(()).map_err(|_| "release receiver closed")?;
+            let error = waiter.await?.err().ok_or("unsettled driver error hidden")?;
+            assert!(error.contains("terminal settlement failed"), "{error}");
+            store.wait_for_run_driver_idle("read-error-target").await;
+            let physical_event = physical_fault
+                .lock()
+                .map_err(|_| "fault lock poisoned")?
+                .clone()
+                .ok_or("physical completion fault not reached")??;
+            let original: PhysicalOwnerIntent = serde_json::from_value(
+                physical_event
+                    .payload
+                    .get("physical_owner_intent")
+                    .cloned()
+                    .ok_or("original intent missing")?,
+            )?;
+            assert_eq!(original.owner_id, owner_id);
+            assert_eq!(original.run_id, "read-error-target");
+            assert!(original.physical_terminal_observed);
+            assert!(store.get_run("read-error-target").is_err());
+            let journal_path = saved.join("read-error-target/events.jsonl");
+            let original_journal = std::fs::read(&journal_path)?;
+            {
+                let supervisor = store
+                    .run_driver_supervisor
+                    .lock()
+                    .map_err(|_| "supervisor lock poisoned")?;
+                assert!(supervisor.driver_cancels.is_empty());
+                assert_eq!(supervisor.pending_admissions, 0);
+                assert!(supervisor.uncertain_drivers.is_empty());
+                assert_eq!(supervisor.settlement_debts.len(), 1);
+                let debt = supervisor.settlement_debts.first().ok_or("debt missing")?;
+                assert_eq!(debt.run_id, original.run_id);
+                assert_eq!(debt.root, expected_root);
+                assert_eq!(debt.target, expected);
+                assert_eq!(debt.physical_owner_intent.as_ref(), Some(&original));
+                let context = supervisor
+                    .driver_contexts
+                    .get(&owner_id)
+                    .ok_or("original execution context missing")?;
+                assert_eq!(debt.driver_token, Some(context.driver_token));
+            }
+            assert_eq!(store.active_run_driver_receipt_count()?, 1);
+            assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(store.retry_run_settlement_debts().await.is_err());
+            assert_eq!(std::fs::read(&journal_path)?, original_journal);
+            assert_eq!(store.active_run_driver_receipt_count()?, 1);
+            assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+            // Preserve the injected projection directory; restore only the
+            // unchanged original canonical journal, never synthesize a receipt.
+            std::fs::rename(&root, temp.path().join("injected-projections"))?;
+            std::fs::rename(&saved, &root)?;
+            let restored_journal = root.join("read-error-target/events.jsonl");
+            assert_eq!(std::fs::read(&restored_journal)?, original_journal);
+            store.retry_run_settlement_debts().await?;
+            assert_eq!(
+                store
+                    .get_run("read-error-target")?
+                    .ok_or("run missing")?
+                    .status,
+                expected
+            );
+            assert!(
+                store
+                    .unresolved_physical_owner_intents("read-error-target")?
+                    .is_empty()
+            );
+            assert_eq!(store.active_run_driver_count()?, 0);
+            assert_eq!(store.active_run_driver_receipt_count()?, 0);
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            let settled = std::fs::read(&restored_journal)?;
+            let acknowledgements = store
+                .list_events("read-error-target", 0)?
+                .into_iter()
+                .filter(|event| {
+                    event.event_type == RuntimeEventKind::RecoveryResolved
+                        && event
+                            .payload
+                            .get("physical_owner_intent")
+                            .and_then(|value| value.get("owner_id"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(owner_id.as_str())
+                })
+                .count();
+            assert_eq!(acknowledgements, 1);
+            store.retry_run_settlement_debts().await?;
+            store.acknowledge_physical_owner_intent(&original)?;
+            assert_eq!(std::fs::read(&restored_journal)?, settled);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_write_debt_retains_execution_receipt_until_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root = temp.path().join("tasks");
         let blocked_root = temp.path().join("tasks-blocked");
@@ -1884,6 +2225,10 @@ mod tests {
                 .map_err(|error| error.to_string())?,
         );
         let _resource_scope = store.test_resource_scope();
+        let physical_fault = store.block_shadow_after_physical_completion_for_test(
+            "receipt-debt",
+            blocked_root.clone(),
+        )?;
         store
             .create_run(
                 "receipt-debt",
@@ -1913,10 +2258,7 @@ mod tests {
                     receipt_owner
                         .retain(DropFlag(dropped_for_driver))
                         .map_err(|error| error.to_string())?;
-                    std::fs::rename(&root, &blocked_root)
-                        .map_err(|error| format!("block task root: {error}"))?;
-                    std::fs::write(&root, b"block directory recreation")
-                        .map_err(|error| format!("replace task root: {error}"))?;
+
                     Err::<(), String>("injected driver failure".to_string())
                 },
             )
@@ -1926,18 +2268,135 @@ mod tests {
             .map_err(|error| error.to_string())?
             .err()
             .ok_or_else(|| "driver failure was not reported".to_string())?;
-        assert!(driver_error.contains("terminal settlement failed"));
+        let physical_event = physical_fault
+            .lock()
+            .map_err(|_| "physical completion fixture lock poisoned".to_string())?
+            .clone()
+            .ok_or_else(|| "physical completion did not reach fault boundary".to_string())??;
+        assert_eq!(physical_event.run_id, "receipt-debt");
+        assert_eq!(
+            physical_event
+                .payload
+                .get("physical_owner_intent")
+                .and_then(|intent| intent.get("physical_terminal_observed"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            driver_error.contains("terminal settlement failed"),
+            "actual: {driver_error}"
+        );
+        store.wait_for_run_driver_idle("receipt-debt").await;
+        assert_eq!(store.active_run_driver_count()?, 1);
+        assert_eq!(store.active_run_driver_receipt_count()?, 1);
+        {
+            let supervisor = store
+                .run_driver_supervisor
+                .lock()
+                .map_err(|_| "supervisor lock poisoned".to_string())?;
+            assert!(supervisor.driver_cancels.is_empty());
+            assert_eq!(supervisor.pending_admissions, 0);
+            assert!(supervisor.uncertain_drivers.is_empty());
+            let debt = supervisor
+                .settlement_debts
+                .first()
+                .ok_or_else(|| "terminal debt missing".to_string())?;
+            assert_eq!(supervisor.settlement_debts.len(), 1);
+            assert_eq!(debt.run_id, "receipt-debt");
+            assert!(debt.driver_token.is_some());
+            assert_eq!(debt.target, TaskRunStatus::Failed);
+            assert!(!debt.last_error.is_empty());
+        }
         assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
         assert!(store.begin_workspace_transition().await.is_err());
 
+        assert!(store.retry_run_settlement_debts().await.is_err());
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(store.active_run_driver_receipt_count()?, 1);
         std::fs::remove_file(temp.path().join("tasks")).map_err(|error| error.to_string())?;
         std::fs::rename(temp.path().join("tasks-blocked"), temp.path().join("tasks"))
             .map_err(|error| error.to_string())?;
+        let original: PhysicalOwnerIntent = serde_json::from_value(
+            physical_event
+                .payload
+                .get("physical_owner_intent")
+                .cloned()
+                .ok_or_else(|| "original physical receipt missing".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let event_path = temp.path().join("tasks/receipt-debt/events.jsonl");
+        let before_wrong_owner = std::fs::read(&event_path).map_err(|error| error.to_string())?;
+        {
+            let mut supervisor = store
+                .run_driver_supervisor
+                .lock()
+                .map_err(|_| "supervisor lock poisoned".to_string())?;
+            let debt = supervisor
+                .settlement_debts
+                .first_mut()
+                .ok_or_else(|| "original debt missing".to_string())?;
+            let identity = debt
+                .physical_owner_intent
+                .as_mut()
+                .ok_or_else(|| "admitted debt lost original identity".to_string())?;
+            assert_eq!(&*identity, &original);
+            identity.owner_id = "wrong-owner".to_string();
+        }
+        let wrong_owner = store
+            .retry_run_settlement_debts()
+            .await
+            .err()
+            .ok_or_else(|| "wrong owner cleared original terminal debt".to_string())?;
+        assert!(wrong_owner.to_string().contains("does not match"));
+        assert_eq!(
+            std::fs::read(&event_path).map_err(|error| error.to_string())?,
+            before_wrong_owner
+        );
+        assert_eq!(
+            store
+                .get_run("receipt-debt")?
+                .ok_or_else(|| "run missing".to_string())?
+                .status,
+            TaskRunStatus::Running
+        );
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(store.active_run_driver_receipt_count()?, 1);
+        {
+            let mut supervisor = store
+                .run_driver_supervisor
+                .lock()
+                .map_err(|_| "supervisor lock poisoned".to_string())?;
+            supervisor
+                .settlement_debts
+                .first_mut()
+                .ok_or_else(|| "wrong-owner retry lost original debt".to_string())?
+                .physical_owner_intent = Some(original.clone());
+        }
         store
             .retry_run_settlement_debts()
             .await
             .map_err(|error| error.to_string())?;
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            store
+                .get_run("receipt-debt")?
+                .ok_or_else(|| "run missing".to_string())?
+                .status,
+            TaskRunStatus::Failed
+        );
+        assert!(
+            store
+                .unresolved_physical_owner_intents("receipt-debt")?
+                .is_empty()
+        );
+        let before_duplicate_ack = std::fs::read(&event_path).map_err(|error| error.to_string())?;
+        store.acknowledge_physical_owner_intent(&original)?;
+        assert_eq!(
+            std::fs::read(&event_path).map_err(|error| error.to_string())?,
+            before_duplicate_ack
+        );
+        assert_eq!(store.active_run_driver_count()?, 0);
+        assert_eq!(store.active_run_driver_receipt_count()?, 0);
         let transition = store
             .begin_workspace_transition()
             .await
@@ -1946,7 +2405,8 @@ mod tests {
         store
             .shutdown_run_drivers()
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -2068,9 +2528,11 @@ mod tests {
                 .map_err(|error| error.to_string())?,
         );
         let _resource_scope = store.test_resource_scope();
-        let canonical_root = std::fs::canonicalize(temp.path())
-            .map_err(|error| error.to_string())?
-            .join("tasks");
+        let physical_fault = store.block_shadow_after_physical_completion_for_test(
+            "parked-prepare",
+            blocked_root.clone(),
+        )?;
+
         store
             .create_run(
                 "parked-prepare",
@@ -2108,12 +2570,12 @@ mod tests {
             .transition_run("parked-prepare", TaskRunStatus::Paused)
             .map_err(|error| error.to_string())?;
 
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retained = dropped.clone();
         let (prepare_started_tx, prepare_started_rx) = tokio::sync::oneshot::channel::<()>();
         let (continue_prepare_tx, continue_prepare_rx) = std::sync::mpsc::channel::<()>();
         let preparation_store = std::sync::Arc::clone(&store);
         let run_store = std::sync::Arc::clone(&store);
-        let root_for_driver = root.clone();
-        let blocked_root_for_driver = blocked_root.clone();
         let preparation = tokio::task::spawn_blocking(move || {
             preparation_store.spawn_supervised_run_driver(
                 "parked-prepare".to_string(),
@@ -2133,13 +2595,16 @@ mod tests {
                             ))
                         })?;
                     run_store.resume_task_run("parked-prepare")?;
-                    Ok(((), move |_receipt_owner| async move {
-                        std::fs::rename(&root_for_driver, &blocked_root_for_driver)
-                            .map_err(|error| format!("block task root: {error}"))?;
-                        std::fs::write(&root_for_driver, b"block directory recreation")
-                            .map_err(|error| format!("replace task root: {error}"))?;
-                        Err::<(), String>("injected prepared driver failure".to_string())
-                    }))
+                    Ok((
+                        (),
+                        move |mut receipt_owner: RunDriverReceiptOwner| async move {
+                            receipt_owner
+                                .retain(DropFlag(retained))
+                                .map_err(|error| error.to_string())?;
+
+                            Err::<(), String>("injected prepared driver failure".to_string())
+                        },
+                    ))
                 },
             )
         });
@@ -2186,18 +2651,53 @@ mod tests {
             .map_err(|error| error.to_string())?
             .err()
             .ok_or_else(|| "permanent prepared driver debt was not reported".to_string())?;
-        assert!(shutdown_error.abandoned_settlements.is_empty());
-        assert!(shutdown_error.driver_errors.iter().any(|error| error.contains("parked-prepare") && error.contains("owner")));
-        assert!(shutdown_error.to_string().contains(&canonical_root.display().to_string()));
-        assert_eq!(store.active_run_driver_count()?, 0);
-        assert_eq!(store.active_run_driver_receipt_count()?, 0);
+        let physical_event = physical_fault
+            .lock()
+            .map_err(|_| "physical completion fixture lock poisoned".to_string())?
+            .clone()
+            .ok_or_else(|| "physical completion did not reach fault boundary".to_string())??;
+        assert_eq!(physical_event.run_id, "parked-prepare");
+        assert_eq!(
+            physical_event
+                .payload
+                .get("physical_owner_intent")
+                .and_then(|intent| intent.get("physical_terminal_observed"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(shutdown_error.abandoned_settlements.len(), 1);
+        let debt = shutdown_error
+            .abandoned_settlements
+            .first()
+            .ok_or_else(|| "original terminal debt diagnostic missing".to_string())?;
+        assert_eq!(debt.run_id, "parked-prepare");
+        assert!(debt.driver_token.is_some());
+        assert_eq!(
+            debt.root,
+            std::fs::canonicalize(temp.path())
+                .map_err(|error| error.to_string())?
+                .join("tasks")
+        );
+        assert_eq!(debt.target, TaskRunStatus::Cancelled);
+        assert!(!debt.error.is_empty());
+        assert_eq!(store.active_run_driver_count()?, 1);
+        assert_eq!(store.active_run_driver_receipt_count()?, 1);
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
         assert!(store.begin_workspace_transition().await.is_err());
 
         std::fs::remove_file(temp.path().join("tasks")).map_err(|error| error.to_string())?;
         std::fs::rename(blocked_root, temp.path().join("tasks"))
             .map_err(|error| error.to_string())?;
-        store.retry_run_settlement_debts().await.map_err(|error| error.to_string())?;
-        let transition = store.begin_workspace_transition().await.map_err(|error| error.to_string())?;
+        store
+            .retry_run_settlement_debts()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(store.active_run_driver_receipt_count()?, 0);
+        let transition = store
+            .begin_workspace_transition()
+            .await
+            .map_err(|error| error.to_string())?;
         drop(transition);
         let run = store
             .get_run("parked-prepare")
@@ -2208,8 +2708,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overlapping_same_run_drivers_release_only_their_exact_receipts() -> Result<(), String>
-    {
+    async fn independent_run_drivers_release_only_their_exact_receipts() -> Result<(), String> {
         let store = std::sync::Arc::new(
             TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
         );
@@ -2233,6 +2732,25 @@ mod tests {
             .transition_run("overlap", TaskRunStatus::Paused)
             .map_err(|error| error.to_string())?;
 
+        store
+            .create_run(
+                "overlap-second",
+                "workspace-a",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "independent receipt",
+                "",
+                AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("overlap-second", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("overlap-second", TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
         let first_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let second_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (first_tx, first_rx) = tokio::sync::oneshot::channel::<()>();
@@ -2249,12 +2767,26 @@ mod tests {
                     receipt_owner
                         .retain(DropFlag(first_flag))
                         .map_err(|error| error.to_string())?;
+                    first_started_tx
+                        .send(())
+                        .map_err(|_| "first start observer closed".to_string())?;
                     first_rx.await.map_err(|error| error.to_string())
                 },
             )
             .map_err(|error| error.to_string())?;
+        first_started_rx.await.map_err(|error| error.to_string())?;
+        let rejection = store
+            .reserve_run_driver_admission(
+                "overlap".to_string(),
+                echo_agent::agent::CancellationToken::new(),
+            )
+            .err()
+            .ok_or_else(|| "same unsettled run accepted a second physical owner".to_string())?;
+        assert!(
+            matches!(rejection, StoreError::RecoveryBlocked { run_id, .. } if run_id == "overlap")
+        );
         let second_flag = std::sync::Arc::clone(&second_dropped);
-        let second_admission = test_driver_admission(&store, "overlap")?;
+        let second_admission = test_driver_admission(&store, "overlap-second")?;
         let second_waiter = store
             .spawn_run_driver(
                 second_admission,
@@ -2283,7 +2815,9 @@ mod tests {
         second_waiter.await.map_err(|error| error.to_string())??;
         assert!(second_dropped.load(std::sync::atomic::Ordering::SeqCst));
         store.wait_for_run_driver_idle("overlap").await;
+        store.wait_for_run_driver_idle("overlap-second").await;
         assert!(!store.is_run_active("overlap"));
+        assert!(!store.is_run_active("overlap-second"));
         store
             .shutdown_run_drivers()
             .await
@@ -2353,7 +2887,7 @@ mod tests {
             TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
         );
         let _resource_scope = store.test_resource_scope();
-        for run_id in ["context-overlap", "context-other"] {
+        for run_id in ["context-overlap", "context-second", "context-other"] {
             store
                 .create_run(
                     run_id,
@@ -2399,11 +2933,12 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .map_err(|error| format!("first driver context was not published: {error}"))?;
 
+        let second_store = store.clone();
         let (second_context_tx, second_context_rx) = std::sync::mpsc::sync_channel(1);
         let (finish_second_tx, finish_second_rx) = tokio::sync::oneshot::channel::<()>();
         let second_waiter = store
             .spawn_run_driver(
-                test_driver_admission(&store, "context-overlap")?,
+                test_driver_admission(&store, "context-second")?,
                 store
                     .lease_active_workspace_generation()
                     .map_err(|error| error.to_string())?,
@@ -2413,7 +2948,11 @@ mod tests {
                         .map_err(|_| "second context receiver closed".to_string());
                     async move {
                         context_sent?;
-                        finish_second_rx.await.map_err(|error| error.to_string())
+                        finish_second_rx.await.map_err(|error| error.to_string())?;
+                        second_store
+                            .finalize_run("context-second", TaskRunStatus::Completed, None)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
                     }
                 },
             )
@@ -2462,7 +3001,7 @@ mod tests {
         let second_released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         store
             .retain_run_driver_receipt_from_context(
-                "context-overlap",
+                "context-second",
                 &second_context,
                 DropFlag(std::sync::Arc::clone(&second_released)),
             )
@@ -2538,7 +3077,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abandoned_same_run_driver_releases_only_its_exact_receipt() -> Result<(), String> {
+    async fn independent_driver_cleanup_failure_retains_only_its_exact_receipt()
+    -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root = temp.path().join("tasks");
         let blocked_root = temp.path().join("tasks-blocked");
@@ -2563,6 +3103,22 @@ mod tests {
             .transition_run("overlap-abandon", TaskRunStatus::Running)
             .map_err(|error| error.to_string())?;
 
+        store
+            .create_run(
+                "independent-completed",
+                "workspace-a",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "independent completion",
+                "",
+                AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("independent-completed", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let first_store = store.clone();
         let first_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let second_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel::<()>();
@@ -2583,6 +3139,9 @@ mod tests {
                         .send(())
                         .map_err(|_| "first driver start receiver closed".to_string())?;
                     finish_first_rx.await.map_err(|error| error.to_string())?;
+                    first_store
+                        .finalize_run("overlap-abandon", TaskRunStatus::Completed, None)
+                        .map_err(|error| error.to_string())?;
                     std::fs::rename(&root, &blocked_root)
                         .map_err(|error| format!("block task root: {error}"))?;
                     std::fs::write(&root, b"block directory recreation")
@@ -2595,7 +3154,7 @@ mod tests {
 
         let second_flag = std::sync::Arc::clone(&second_dropped);
         let store_for_second = std::sync::Arc::clone(&store);
-        let second_admission = test_driver_admission(&store, "overlap-abandon")?;
+        let second_admission = test_driver_admission(&store, "independent-completed")?;
         let second_waiter = store
             .spawn_run_driver(
                 second_admission,
@@ -2607,7 +3166,7 @@ mod tests {
                         .retain(DropFlag(second_flag))
                         .map_err(|error| error.to_string())?;
                     store_for_second
-                        .finalize_run("overlap-abandon", TaskRunStatus::Completed, None)
+                        .finalize_run("independent-completed", TaskRunStatus::Completed, None)
                         .map(|_| ())
                         .map_err(|error| error.to_string())
                 },
@@ -2625,21 +3184,51 @@ mod tests {
             .map_err(|error| error.to_string())?
             .err()
             .ok_or_else(|| "first driver failure was not reported".to_string())?;
-        assert!(first_error.contains("tasks"), "actual first_error: {first_error}");
+        assert!(
+            first_error.contains("physical receipt identity"),
+            "actual first_error: {first_error}"
+        );
         assert_eq!(store.active_run_driver_receipt_count()?, 1);
-        let shutdown_error = store.shutdown_run_drivers().await.err()
+        let shutdown_error = store
+            .shutdown_run_drivers()
+            .await
+            .err()
             .ok_or_else(|| "original first driver cleanup failure was hidden".to_string())?;
         assert!(shutdown_error.abandoned_settlements.is_empty());
-        assert!(shutdown_error.driver_errors.iter().any(|error| error.contains("overlap-abandon") && error.contains("owner")));
+        assert!(
+            shutdown_error
+                .driver_errors
+                .iter()
+                .any(|error| error.contains("overlap-abandon") && error.contains("owner"))
+        );
         assert!(!first_dropped.load(std::sync::atomic::Ordering::SeqCst));
         assert!(second_dropped.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(store.active_run_driver_count()?, 0);
+        assert_eq!(store.active_run_driver_count()?, 1);
+        {
+            let supervisor = store
+                .run_driver_supervisor
+                .lock()
+                .map_err(|_| "supervisor lock poisoned".to_string())?;
+            assert_eq!(supervisor.uncertain_drivers.len(), 1);
+            assert!(supervisor.settlement_debts.is_empty());
+            let original = supervisor
+                .uncertain_drivers
+                .values()
+                .next()
+                .ok_or_else(|| "original completion-write owner missing".to_string())?;
+            assert_eq!(original.intent.run_id, "overlap-abandon");
+            assert!(original.physical_terminal_observed);
+            assert!(!original.intent.physical_terminal_observed);
+        }
         assert_eq!(store.active_run_driver_receipt_count()?, 1);
 
         std::fs::remove_file(temp.path().join("tasks")).map_err(|error| error.to_string())?;
         std::fs::rename(temp.path().join("tasks-blocked"), temp.path().join("tasks"))
             .map_err(|error| error.to_string())?;
-        store.retry_run_settlement_debts().await.map_err(|error| error.to_string())?;
+        store
+            .retry_run_settlement_debts()
+            .await
+            .map_err(|error| error.to_string())?;
         assert!(first_dropped.load(std::sync::atomic::Ordering::SeqCst));
         assert!(second_dropped.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(store.active_run_driver_receipt_count()?, 0);
@@ -5074,6 +5663,78 @@ mod tests {
     }
 
     #[test]
+    fn physical_owner_metadata_preserves_business_progress_fingerprint() -> Result<(), StoreError> {
+        // Classification-only event stream, not physical-execution proof. The
+        // real shared-driver three-turn regression exercises actual ownership.
+        let event = |sequence, kind, payload| {
+            RuntimeJournalEvent::for_append("progress-run", None, None, kind, payload)
+                .project(sequence)
+                .map_err(|sequence| {
+                    StoreError::InvalidPlan(format!("fixture sequence overflow: {sequence}"))
+                })
+        };
+        let mut events = vec![
+            event(
+                1,
+                RuntimeEventKind::TaskStarted,
+                serde_json::json!({"task_id":"task"}),
+            )?,
+            event(
+                2,
+                RuntimeEventKind::RunTurnStarted,
+                serde_json::json!({"turn_id":"turn"}),
+            )?,
+        ];
+        let original_progress = run_progress_fingerprint(&events);
+        let intent = PhysicalOwnerIntent {
+            run_id: "progress-run".to_string(),
+            owner_id: "original-owner".to_string(),
+            execution_id: None,
+            workspace_id: "workspace".to_string(),
+            physical_terminal_observed: false,
+        };
+        let completed = PhysicalOwnerIntent {
+            physical_terminal_observed: true,
+            ..intent.clone()
+        };
+        for (sequence, kind, owner) in [
+            (3, RuntimeEventKind::RecoveryBlocked, &intent),
+            (4, RuntimeEventKind::RecoveryBlocked, &completed),
+            (5, RuntimeEventKind::RecoveryResolved, &completed),
+        ] {
+            events.push(event(
+                sequence,
+                kind,
+                serde_json::json!({"physical_owner_intent":owner}),
+            )?);
+            assert_eq!(run_progress_fingerprint(&events), original_progress);
+            assert!(!run_turn_made_progress(&events, "turn"));
+        }
+        // Both real recovery event kinds still count; the marker exclusion is
+        // specific to those kinds, not every event with an owner field.
+        for (kind, payload) in [
+            (
+                RuntimeEventKind::RecoveryBlocked,
+                serde_json::json!({"task_id":"task","reason":"tool outcome requires recovery"}),
+            ),
+            (
+                RuntimeEventKind::RecoveryResolved,
+                serde_json::json!({"task_id":"task","decision":"retry"}),
+            ),
+            (
+                RuntimeEventKind::TaskCompleted,
+                serde_json::json!({"task_id":"task","physical_owner_intent":completed}),
+            ),
+        ] {
+            let mut progressed = events.clone();
+            progressed.push(event(6, kind, payload)?);
+            assert_ne!(run_progress_fingerprint(&progressed), original_progress);
+            assert!(run_turn_made_progress(&progressed, "turn"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn blocker_audit_resets_on_progress_and_distinguishes_error_fingerprints()
     -> Result<(), StoreError> {
         let store = fresh()?;
@@ -5805,7 +6466,7 @@ mod tests {
             .first()
             .cloned()
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
-        let _claim = match store.claim_runtime_task("r1", &task, snapshot.revision)? {
+        let claim = match store.claim_runtime_task("r1", &task, snapshot.revision)? {
             echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
             echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
                 return Err(StoreError::InvalidPlan(
@@ -5825,6 +6486,41 @@ mod tests {
             TaskRunStatus::Paused
         );
         assert!(store.request_cancel("r1")?);
+        assert_eq!(
+            store
+                .get_run("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?
+                .status,
+            TaskRunStatus::Paused
+        );
+        assert!(token.is_cancelled());
+        assert!(store.is_run_active("r1"));
+        let pending = store.load_runtime_plan_snapshot("r1")?;
+        let owned = pending
+            .tasks
+            .iter()
+            .find(|owned| owned.spec.id == task.spec.id)
+            .ok_or_else(|| StoreError::TaskNotFound(task.spec.id.clone()))?;
+        assert_eq!(owned.execution.claim.as_ref(), Some(&claim));
+        assert_eq!(
+            owned.execution.interruption_requested,
+            Some(echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled)
+        );
+        // Only the original claimed task acknowledges completion. The durable
+        // cancellation request wins over its nominal Completed result.
+        assert!(matches!(
+            store.settle_runtime_task_claim(
+                "r1",
+                &task.spec.id,
+                &claim,
+                echo_agent::tasks::TaskStatus::Completed,
+                None
+            )?,
+            echo_agent::tasks::RuntimeTaskSettlementOutcome::Settled {
+                status: echo_agent::tasks::TaskStatus::Cancelled
+            }
+        ));
+        store.finalize_run("r1", TaskRunStatus::Cancelled, None)?;
         assert_eq!(
             store
                 .get_run("r1")?
@@ -5897,9 +6593,12 @@ mod tests {
                 .get_run("cancel-request-driver")?
                 .ok_or_else(|| StoreError::RunNotFound("cancel-request-driver".to_string()))?
                 .status,
-            TaskRunStatus::Cancelled
+            TaskRunStatus::Running
         );
 
+        // This manual owner now acknowledges its own completion, before
+        // dropping the registry guard; the request alone was nonterminal.
+        store.finalize_run("cancel-request-driver", TaskRunStatus::Cancelled, None)?;
         drop(registration);
         assert!(!store.is_run_active("cancel-request-driver"));
         assert_eq!(
@@ -8217,7 +8916,7 @@ mod tests {
                 .get("state")
                 .and_then(|state| state.get("query_projection_schema"))
                 .and_then(serde_json::Value::as_u64),
-            Some(1)
+            Some(2)
         );
         drop(reopened);
         let restarted = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))

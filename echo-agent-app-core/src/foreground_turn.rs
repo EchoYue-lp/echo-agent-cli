@@ -1553,10 +1553,19 @@ impl ForegroundTurnSettlementWaiter {
             }
             tokio::select! {
                 changed = self.observation_rx.changed() => {
-                    if changed.is_err() { return Err(ForegroundTurnError::StateUnavailable); }
+                    // Removing the settled entry closes all senders. A closed
+                    // watch must not hide a fact published by the same owner.
+                    if changed.is_err()
+                        && self.observation_rx.borrow().is_none()
+                        && self.settlement_rx.borrow().is_none()
+                        && self.terminal_debt_rx.borrow().is_none()
+                    {
+                        return Err(ForegroundTurnError::StateUnavailable);
+                    }
                 }
                 changed = self.settlement_rx.changed() => {
                     if changed.is_err()
+                        && self.observation_rx.borrow().is_none()
                         && self.settlement_rx.borrow().is_none()
                         && self.terminal_debt_rx.borrow().is_none()
                     {
@@ -1565,6 +1574,7 @@ impl ForegroundTurnSettlementWaiter {
                 }
                 changed = self.terminal_debt_rx.changed() => {
                     if changed.is_err()
+                        && self.observation_rx.borrow().is_none()
                         && self.settlement_rx.borrow().is_none()
                         && self.terminal_debt_rx.borrow().is_none()
                     {
@@ -3148,6 +3158,27 @@ mod tests {
             Err(ForegroundTurnError::ShuttingDown)
         ));
         control.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn pending_waiter_reads_real_settlement_when_owner_closes_senders()
+    -> Result<(), ForegroundTurnError> {
+        // Poll the real waiter before settlement so its watch branches are
+        // armed. Repetition covers the select interleavings without synthetic
+        // receiver versions, sleeps, or a second settlement authority.
+        for _ in 0..64 {
+            let control = ForegroundTurnControl::default();
+            let lease = control.begin(ForegroundTurnSurface::Gui, "conversation", "turn")?;
+            let waiting = control
+                .request_cancel(ForegroundTurnSurface::Gui, "conversation", "turn")?
+                .wait();
+            tokio::pin!(waiting);
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            lease.settle(TurnOutcome::Cancelled);
+            assert_eq!(waiting.await?.outcome, TurnOutcome::Cancelled);
+            assert!(!control.has_active_turns());
+        }
+        Ok(())
     }
 
     #[tokio::test]

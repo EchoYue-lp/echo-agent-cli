@@ -2267,6 +2267,7 @@ Read the runtime path and found one missing branch.
     async fn planned_resume_launcher_rejects_stale_journal_epoch_before_driver_start()
     -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         let run_id = seed_run(&store, vec![solo_readonly_task("resume")])?;
         store
             .transition_run(&run_id, TaskRunStatus::Paused)
@@ -2366,6 +2367,7 @@ Read the runtime path and found one missing branch.
         use echo_agent::testing::MockLlmClient;
 
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         store
             .create_run_with_profile(
                 "direct-resume",

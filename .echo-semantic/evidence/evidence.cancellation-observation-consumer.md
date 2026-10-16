@@ -2,8 +2,12 @@
 schema_version: 1
 id: evidence.cancellation-observation-consumer
 kind: evidence
-observed_at: source:2d05eb516554057681106fcab2222c5f47c79ac6fda54ad6954c2ff130de6d13
+observed_at: source:7107b9ed37ee47c0c0826d30e8999a68942d6b06b4b0d5f7f4391a5575f43ed1
 source_refs:
+- echo-agent-app-core/src/agent_pool/tests.rs
+- echo-agent-app-core/src/state/reliability_contracts.rs
+- echo-agent-app-core/src/tasks/task_runtime/store/journal.rs
+- echo-agent-app-core/src/tasks/service.rs
 - echo-agent-app-core/src/state/config.rs
 - echo-agent-app-core/src/state/tests.rs
 - echo-agent-app-core/src/tasks/task_runtime/executor/dispatch.rs
@@ -165,10 +169,28 @@ actual-cached-v2与origin-cached-v3为缓存有限检查，各官方scanner1/三
 
 唯一生产源chat_driver.rs的原private prepare/claim改传既有ChatTurnError/From<StoreError>，ordinary context不变；普通scope/identity验证不变。原ordinary fixture复用既有test_resource_scope并等真实wait_for_run_driver_idle，不加API/sleep。same AFTER真实2pass/0fail/0ignore/1650filtered，1.09s行为、5m10编译、零warning、sourceDrift=[]/CF988clean；pending case实际走完Gui/Tui/Cli/Channel四参数，但只计一个顶层case。断原run/state/journal不变、0model/0event与foreground保留；普通error仍Failed/settled/清busy。不证明原OS执行或无source自动恢复。
 
-独审source增量C0/I0/M0、同Plan四章节绑定0，source c3fe62e6308fa0c2ac1130c978a1f4d532f246785b1f379889eead89fa755df3/diff81d159ea78c33619a0a47c2045bd506da5bb4b4e37eafcb0392e9f44d04a4c07；完整83路径review的唯一源码Important已闭，但完整矩阵/最终CI未冒通过。risk gate先真实因新Rust输入gate1/scanner未调用；独审确认三依赖无新生产消费，人的明确准入与Decision记录后才重绑77ae4b12...a201，lock/版本/来源/checksum不变，非自动refresh。后继扫描另记。
+独审source增量C0/I0/M0、同Plan四章节绑定0，source c3fe62e6308fa0c2ac1130c978a1f4d532f246785b1f379889eead89fa755df3/diff81d159ea78c33619a0a47c2045bd506da5bb4b4e37eafcb0392e9f44d04a4c07；完整83路径review的唯一源码Important已闭，但完整矩阵/最终CI未冒通过。risk gate先真实因新Rust输入gate1/scanner未调用；独审确认三依赖无新生产消费，依据原用户迁移并继续的指令、精确三依赖决定及本次有限复评记录后才重绑77ae4b12...a201，lock/版本/来源/checksum不变，非自动refresh。后继扫描另记。
 
 本地原件：shared-preparation-before/v2、shared-preparation-after的log/run/receipt、before-v2.patch/source、before-freeze与独立inode原bin副本、shared-preparation-independent-source-review及risk-input-rejection。原件仅task-local，不入Git。双语ADR0004同步；无公共接口/示例/官网新增行为，无需改示例或官网；既有examples仍由最终all-target链验证。宽状态和原五历史引用收据缺口不借本切片关闭。
 
 重绑后的6个risk测试方法实际通过。shared-preparation-actual-online与shared-preparation-origin-online在相同单进程HTTP/1.1条件下分别真实wrapper0/scanner1/gate0、noFetch=false、精确三warnings/零漏洞；后者由同CF988 canonical helper新生成CLI真实锁的origin view。不是复用旧consumer扫描，不改写原default-transport失败或最终CI状态。
 
 宽B场景、三个stale lens、完整workspace/GUI、JSONL与精main CI不借此关闭，Plan保持ready，全局库存/行为闭合open。无前端实现变化，不额外本地frontend矩阵，CI原frontend保留；私有lint整理不改变examples/官网说明，既有examples由all-target编译链覆盖，后续完整门禁仍适用。
+
+
+## Full-gate failure repair checkpoint (CF988, focused only)
+
+原完整 workspace 测试出现 43 条失败记录和两个不终结的 mock，未取得完整 summary；保留原冷运行原件，不把停止前日志当完整结果。保存的原始 binary 对 43 个 selector 实跑 3pass/40fail。后续夹具修复切点实跑 40pass/6fail；其中两个原收据释放反例确证生产 debt 丢失已准入 owner 来源，另有目录恢复、进展分类、held cancel 和伪进程死亡夹具问题，各按证据独立处理。真实完成后 I/O 故障的第一次 AFTER 为 4pass/1fail，不能抹去残余失败。修复后原 48 项组合取得 48pass/0fail，仍是此前源码切点；其日志实际含 fetch_update 一条弃用警告，先前零 warning 的表述已撤回，原日志不变。读取错误修复的首次 49 项也通过并含同一警告，最终仅用原有稳定 CAS API 等价修正饱和计数，不压制告警或提高 MSRV，再冻结同 49 项验证。
+
+既有 debt 现在持有原 PhysicalOwnerIntent；未知来源不得当作未开始。唯一重试路径在原 run 锁内验证同 owner、执行原 finalizer、确认后才在锁外释放资源。错误 owner、重复 ack、真实执行前拒绝各有控制。目录完全缺失时，缓存权威仅重建派生 state/checkpoint；夹具保留这些派生文件后恢复原 journal，并断言原 journal bytes/identity 不变，不删除或提升投影为权威。异步 pool-before-memory 释放和恰好一次计数保持。
+
+closed-watch 竞争现在先尊重已经存在的真实 settlement/debt；mock 在原取消 token 下发出真实 Cancelled 并结束原流。测试资源绑定原 test_resource_scope / ApplicationLifecycleOwner，不修改生产默认 root。held cancel 只由同一原 driver 在真实释放后结算。进展 predicate 仅排除私有 owner 元数据，保留业务恢复事件；原 BEFORE 52 帧/56 条 canonical 记录表明七个唯一 owner 均按 false→真实完成→true→同 owner ack 顺序推进，没有 TaskStarted、claim reset 或 plan revision，排除了未确认 fence 被清后重放的假设。真实子进程退出夹具另保 caller-abort 控制，两子场景只计一个顶层 case，重开原目录后模型调用为零。
+
+另一个独立拥有的 I/O 变体在保存的 36aa binary 实际报 Failed 对 Cancelled 的债务目标断言失败。该 probe 只替换自己精确匹配的故障占位文件，明确不是只读或原样夹具；canonical seq8→9 同 owner 物理完成、无 terminal/ack。窄 byte-equivalence 只证明五个生产文件与当前前一切点完全相同，不泛推整个 binary。最小修复复用原 cancellation target；原 Err 读取失败兜底保持 Cancelled/Failed，原 Ok 未业务结算仍 Failed。新 canonical-completion 后读取错误测试包含三个分支，只计一项；没有声称它自身跑过 BEFORE。
+
+最终本次冻结 diff f8368ac5ea29938f179c4133ea87eeea3b15b323766685934e2f7121866e9648 的原 48 + 新 1 项实际通过；完整日志、真实 counts、资源和输入 guard 以 task-local read-error-combined-49-after-v3 原件为准。两位 source/必要性 reviewer C0/I0/M0；源级结论不代替运行。14 个源文件只包含上述必要修复与原夹具，raw 日志不入 Git。三依赖改变输入先 gate1/scanner=null；独立闭包复评仍同三项原风险，绑定依据是原用户授权，不是协调 agent 的新 human approval。
+
+当前 CF 仍冻结 988；切换已接受的新 framework revision、当前全量 Clippy/workspace/core-no-default/GUI、安装后 repository/task semantic 收据及精确 main CI 都未借 focused49 关闭。Map/Rule 保持 needs_review，三审计 stale，inventory/behavior closure open；不证明原生 GUI/OS 或无 source 的自动晚恢复。仓库历史 Git 引用 collector 的五处缺口归独立 echo-semantic 修复任务，绝不改写本仓库历史引用以绕过。示例/官网不新增公共产品行为，无需新增代码；既有 examples 仍进入最终 all-target 门禁，双语 ADR 同步本修复。
+
+
+当前新 consumer274d3e12...fed14 的六项 adapter 方法真实通过；重绑前原 unit6 中1error为实际输入守卫拒绝，原件保留，重绑后同命令0。fresh actual/origin 两次在线官方完整扫描均 scanner1/精三项 warning/零 vulnerability，独立 gate0、noFetch=false，只给扫描进程 HTTP/1.1，不改变全局配置，也不宣称默认传输修复。原 raw 与扫描输出保留 task-local focused-checkpoint-actual/origin-online 原件，不入 Git。

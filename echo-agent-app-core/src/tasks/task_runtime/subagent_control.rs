@@ -2000,10 +2000,10 @@ mod tests {
             })
         }
 
-        fn execute_stream_message_with_cancel<'a>(
+        fn execute_stream_with_cancel<'a>(
             &'a self,
-            _message: echo_agent::prelude::Message,
-            _cancel: echo_agent::agent::CancellationToken,
+            _task: &'a str,
+            cancel: echo_agent::agent::CancellationToken,
         ) -> futures::future::BoxFuture<
             'a,
             echo_agent::error::Result<
@@ -2013,9 +2013,32 @@ mod tests {
                 >,
             >,
         > {
-            Box::pin(async {
-                Ok(Box::pin(futures::stream::pending()) as futures::stream::BoxStream<'a, _>)
+            Box::pin(async move {
+                // This test Agent has no external backend. Once its own cancel
+                // wait ends, report the required terminal and then real EOF;
+                // the executor still drains and joins the original stream.
+                let stream = futures::stream::once(async move {
+                    cancel.cancelled().await;
+                    Ok(echo_agent::agent::AgentEvent::Cancelled)
+                });
+                Ok(Box::pin(stream) as futures::stream::BoxStream<'a, _>)
             })
+        }
+
+        fn execute_stream_message_with_cancel<'a>(
+            &'a self,
+            _message: echo_agent::prelude::Message,
+            cancel: echo_agent::agent::CancellationToken,
+        ) -> futures::future::BoxFuture<
+            'a,
+            echo_agent::error::Result<
+                futures::stream::BoxStream<
+                    'a,
+                    echo_agent::error::Result<echo_agent::agent::AgentEvent>,
+                >,
+            >,
+        > {
+            self.execute_stream_with_cancel("", cancel)
         }
 
         fn steer_input(

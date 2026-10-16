@@ -1617,6 +1617,11 @@ mod tests {
         fs::write(directory.join("result.json"), "中文🙂 original")?;
         let intent =
             begin_analysis_owner_intent(root.path(), &id, "original-generation".to_string())?;
+        // A missing dataset is valid metadata; make the required script truly
+        // unavailable after admission and before any execution/output clear.
+        let script = directory.join(&manifest.script_path);
+        let saved_script = directory.join("saved-script.py");
+        fs::rename(&script, &saved_script)?;
         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let manager = ToolManager::new();
         manager.register(Box::new(ScriptTool));
@@ -1647,6 +1652,7 @@ mod tests {
         wrong.owner_id = "other-owner".to_string();
         assert!(reject_unstarted_analysis_owner(root.path(), &wrong).is_err());
         reject_unstarted_analysis_owner(root.path(), &intent)?;
+        fs::rename(&saved_script, &script)?;
         let retry = begin_analysis_owner_intent(root.path(), &id, "next-generation".to_string())?;
         assert_ne!(retry.run_id, intent.run_id);
         reject_unstarted_analysis_owner(root.path(), &retry)?;

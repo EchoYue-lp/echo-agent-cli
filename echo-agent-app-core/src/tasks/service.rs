@@ -1262,6 +1262,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_submission_creates_only_task_runtime_run() -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         let service = BackgroundTaskService::new(
             test_agent()?,
             CancellationToken::new(),
@@ -1302,10 +1303,12 @@ mod tests {
     -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root = temp.path().join("tasks");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
         let store = Arc::new(
             TaskRuntimeStore::new_in_memory_with_shadow_root(root.clone())
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         store.fail_next_initial_publish_before_rename();
         let service = BackgroundTaskService::new(
             test_agent()?,
@@ -1377,6 +1380,7 @@ mod tests {
     #[tokio::test]
     async fn same_run_dependency_graph_is_the_only_background_dag() -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         let service = BackgroundTaskService::new(
             test_agent()?,
             CancellationToken::new(),
@@ -1450,6 +1454,7 @@ mod tests {
     async fn retry_registers_driver_immediately_instead_of_leaving_fake_running()
     -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         store
             .create_run(
                 "retry-run",
@@ -1530,6 +1535,7 @@ mod tests {
     #[tokio::test]
     async fn cli_retry_selects_recovery_without_acceptance_mutation() -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         prepare_background_retry_run(&store, "recovery-run", "recovery-task", true)?;
         let service = BackgroundTaskService::new(
             test_agent()?,
@@ -1683,6 +1689,7 @@ mod tests {
             BootAutoResumeDecision::Ready { .. }
         ));
         let store = Arc::new(store);
+        let _resource_scope = store.test_resource_scope();
         let service = BackgroundTaskService::new(
             test_agent()?,
             CancellationToken::new(),

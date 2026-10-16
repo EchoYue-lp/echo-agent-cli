@@ -2,6 +2,10 @@
 /// journal; in-context projections stay bounded and point at the artifact.
 const OBJECTIVE_ARTIFACT_SPILL_CHARS: usize = 8_000;
 
+#[cfg(test)]
+pub(crate) type PhysicalCompletionFaultForTest =
+    std::sync::Arc<std::sync::Mutex<Option<Result<RuntimeTaskEvent, String>>>>;
+
 impl TaskRuntimeStore {
     /// Phase-one process shutdown: close driver admission and broadcast every
     /// accepted driver cancellation without awaiting settlement.
@@ -633,6 +637,57 @@ impl TaskRuntimeStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn block_shadow_after_physical_completion_for_test(
+        &self,
+        run_id: &str,
+        blocked_root: PathBuf,
+    ) -> Result<PhysicalCompletionFaultForTest, String> {
+        let root = self.shadow.root();
+        self.inject_after_physical_completion_for_test(run_id, move || {
+            std::fs::rename(&root, &blocked_root)
+                .and_then(|()| std::fs::write(&root, b"block directory recreation"))
+        })
+    }
+
+    #[cfg(test)]
+    fn inject_after_physical_completion_for_test(
+        &self,
+        run_id: &str,
+        inject: impl Fn() -> std::io::Result<()> + Send + Sync + 'static,
+    ) -> Result<PhysicalCompletionFaultForTest, String> {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed = captured.clone();
+        let run_id = run_id.to_string();
+        // Reuse the durable journal observer. Never query/capture the store
+        // here: the callback runs under its original authority/run locks.
+        let installed = self
+            .shadow
+            .try_attach_event_hook(std::sync::Arc::new(move |event| {
+                if event.run_id != run_id
+                    || event.event_type != RuntimeEventKind::RecoveryBlocked
+                    || event
+                        .payload
+                        .get("physical_owner_intent")
+                        .and_then(|intent| intent.get("physical_terminal_observed"))
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(true)
+                {
+                    return;
+                }
+                let mut result = observed.lock().unwrap_or_else(|error| error.into_inner());
+                if result.is_none() {
+                    *result = Some(inject().map(|()| event.clone()).map_err(|error| {
+                        format!("block root after durable physical completion: {error}")
+                    }));
+                }
+            }));
+        if !installed {
+            return Err("physical-completion fixture observer was already installed".to_string());
+        }
+        Ok(captured)
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_resource_scope(
         self: &std::sync::Arc<Self>,
     ) -> std::sync::Arc<crate::runtime::ApplicationLifecycleRetention> {
@@ -1007,26 +1062,35 @@ impl TaskRuntimeStore {
         };
         let mut remaining = Vec::new();
         for mut debt in debts {
-            let settlement = self.get_run(&debt.run_id).and_then(|run| {
-                match run {
-                    Some(run) if matches!(run.status, TaskRunStatus::Paused | TaskRunStatus::Cancelled | TaskRunStatus::Completed | TaskRunStatus::Failed) => Ok(run),
-                    _ => self.finalize_run(&debt.run_id, debt.target, debt.note.as_deref()),
+            let settlement = self.with_run_lock(&debt.run_id, || {
+                let run = self.get_run(&debt.run_id)?
+                    .ok_or_else(|| StoreError::RunNotFound(debt.run_id.clone()))?;
+                let already_settled = matches!(run.status, TaskRunStatus::Paused
+                    | TaskRunStatus::Cancelled | TaskRunStatus::Completed | TaskRunStatus::Failed);
+                if let Some(intent) = debt.physical_owner_intent.as_ref() {
+                    let acknowledged = self.validate_physical_owner_completion_locked(intent)?;
+                    if acknowledged && !already_settled {
+                        return Err(StoreError::RecoveryBlocked {
+                            run_id: debt.run_id.clone(),
+                            details: "terminal debt has no matching original completion on the current source".to_string(),
+                        });
+                    }
+                } else if !self.unresolved_physical_owner_intents(&debt.run_id)?.is_empty() {
+                    return Err(StoreError::RecoveryBlocked {
+                        run_id: debt.run_id.clone(),
+                        details: "pre-execution debt cannot settle another physical owner".to_string(),
+                    });
                 }
+                if !already_settled {
+                    self.finalize_run_with_note_task_locked(&debt.run_id, debt.target, None, debt.note.as_deref())?;
+                }
+                if let Some(intent) = debt.physical_owner_intent.as_ref() {
+                    self.acknowledge_physical_owner_intent_locked(intent)?;
+                }
+                Ok(())
             });
             match settlement {
-                Ok(_) => {
-                    let cleanup = self.unresolved_physical_owner_intents(&debt.run_id).and_then(|intents| {
-                        for intent in intents {
-                            if !intent.physical_terminal_observed { return Err(StoreError::RecoveryBlocked { run_id: debt.run_id.clone(), details: "terminal-write retry has no original physical completion evidence".to_string() }); }
-                            self.acknowledge_physical_owner_intent(&intent)?;
-                        }
-                        Ok(())
-                    });
-                    if let Err(error) = cleanup {
-                        debt.last_error = error.to_string();
-                        remaining.push(debt);
-                        continue;
-                    }
+                Ok(()) => {
                     if let Some(driver_token) = debt.driver_token {
                         self.release_run_driver_receipts(driver_token).await;
                     }
@@ -1076,10 +1140,13 @@ impl TaskRuntimeStore {
                 target: debt.target,
                 error: debt.last_error.clone(),
             });
-            let protected = self
-                .unresolved_physical_owner_intents(&debt.run_id)
-                .map(|intents| !intents.is_empty())
-                .unwrap_or(true);
+            // Missing/unreadable projection is not evidence that an admitted
+            // original owner disappeared. The existing debt retains its fact.
+            let protected = debt.physical_owner_intent.is_some()
+                || self
+                    .unresolved_physical_owner_intents(&debt.run_id)
+                    .map(|intents| !intents.is_empty())
+                    .unwrap_or(true);
             if protected {
                 if let Some(token) = debt.driver_token {
                     self.observe_run_driver_resources(token, &debt.run_id, None);
@@ -1108,6 +1175,7 @@ impl TaskRuntimeStore {
         &self,
         generation_lease: &mut Option<WorkspaceGenerationLease>,
         driver_token: Option<u64>,
+        physical_owner_intent: Option<&PhysicalOwnerIntent>,
         run_id: &str,
         target: TaskRunStatus,
         note: Option<&str>,
@@ -1121,6 +1189,7 @@ impl TaskRuntimeStore {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .settlement_debts
                         .push(RunSettlementDebt {
+                            physical_owner_intent: physical_owner_intent.cloned(),
                             generation_lease,
                             driver_token,
                             run_id: run_id.to_string(),
@@ -1384,11 +1453,21 @@ impl TaskRuntimeStore {
             }
             let operation_store = settlement_store.clone();
             let operation_run_id = run_id.clone();
+            let operation_intent = intent.clone();
             let (settled_result, release_receipts, mut generation_lease) =
                 super::executor::TaskRuntimeOperation::new(settlement_store.clone())
                     .run_owned("settle registered TaskRun", move || {
                 let mut release_receipts = !should_settle;
                 if should_settle {
+                    // Read failures cannot change the original driver's error
+                    // target. Re-evaluate cancellation at each settlement attempt.
+                    let original_error_target = || {
+                        if driver_cancel.is_cancelled() {
+                            TaskRunStatus::Cancelled
+                        } else {
+                            TaskRunStatus::Failed
+                        }
+                    };
                     let settlement = match &result {
                         Ok(_) => operation_store
                             .confirm_run_settled(&operation_run_id),
@@ -1400,15 +1479,12 @@ impl TaskRuntimeStore {
                             Ok(Some(run)) if run.status == TaskRunStatus::Paused => Ok(()),
                             Err(read_error) => Err(read_error),
                             _ => {
-                                let target = if driver_cancel.is_cancelled() {
-                                    TaskRunStatus::Cancelled
-                                } else {
-                                    TaskRunStatus::Failed
-                                };
+                                let target = original_error_target();
                                 operation_store
                                     .finalize_run_with_lease(
                                         &mut generation_lease,
                                         Some(driver_token),
+                                        operation_intent.as_ref(),
                                         &operation_run_id,
                                         target,
                                         Some(&error.to_string()),
@@ -1425,8 +1501,13 @@ impl TaskRuntimeStore {
                             match operation_store.finalize_run_with_lease(
                                 &mut generation_lease,
                                 Some(driver_token),
+                                operation_intent.as_ref(),
                                 &operation_run_id,
-                                TaskRunStatus::Failed,
+                                if result.is_err() {
+                                    original_error_target()
+                                } else {
+                                    TaskRunStatus::Failed
+                                },
                                 Some(&original),
                             ) {
                                 Ok(_) => {
@@ -2559,6 +2640,18 @@ impl TaskRuntimeStore {
         note_task_id: Option<&str>,
         note: Option<&str>,
     ) -> Result<TaskRun, StoreError> {
+        self.with_run_lock(run_id, || {
+            self.finalize_run_with_note_task_locked(run_id, target, note_task_id, note)
+        })
+    }
+
+    fn finalize_run_with_note_task_locked(
+        &self,
+        run_id: &str,
+        target: TaskRunStatus,
+        note_task_id: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<TaskRun, StoreError> {
         if !matches!(
             target,
             TaskRunStatus::Completed | TaskRunStatus::Failed | TaskRunStatus::Cancelled
@@ -2568,56 +2661,36 @@ impl TaskRuntimeStore {
                 target.as_str()
             )));
         }
-        self.with_run_lock(run_id, || {
-            let current = self
-                .get_run(run_id)?
-                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
-            let mut events = Vec::new();
-            if let Some(note) = note {
-                events.push(RuntimeJournalEvent::for_append(
-                    run_id,
-                    note_task_id,
-                    None,
-                    RuntimeEventKind::Note,
-                    serde_json::json!({ "message": note }),
-                ));
+        let current = self
+            .get_run(run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        let mut events = Vec::new();
+        if let Some(note) = note {
+            events.push(RuntimeJournalEvent::for_append(
+                run_id,
+                note_task_id,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({ "message": note }),
+            ));
+        }
+        if matches!(
+            current.status,
+            TaskRunStatus::Completed | TaskRunStatus::Cancelled
+        ) || current.status == target
+        {
+            if !events.is_empty() {
+                self.commit_runtime_events(run_id, events)?;
             }
-            if matches!(
-                current.status,
-                TaskRunStatus::Completed | TaskRunStatus::Cancelled
-            ) || current.status == target
-            {
-                if !events.is_empty() {
-                    self.commit_runtime_events(run_id, events)?;
-                }
-                return Ok(current);
-            }
-            let mut from = current.status;
-            if target != TaskRunStatus::Cancelled && from != TaskRunStatus::Running {
-                if !from.can_transition_to(TaskRunStatus::Running) {
-                    return Err(StoreError::IllegalTransition {
-                        run_id: run_id.to_string(),
-                        from: from.as_str().to_string(),
-                        to: TaskRunStatus::Running.as_str().to_string(),
-                    });
-                }
-                events.push(RuntimeJournalEvent::for_append(
-                    run_id,
-                    None,
-                    None,
-                    RuntimeEventKind::RunStatusChanged,
-                    serde_json::json!({
-                        "from": from.as_str(),
-                        "to": TaskRunStatus::Running.as_str(),
-                    }),
-                ));
-                from = TaskRunStatus::Running;
-            }
-            if !from.can_transition_to(target) {
+            return Ok(current);
+        }
+        let mut from = current.status;
+        if target != TaskRunStatus::Cancelled && from != TaskRunStatus::Running {
+            if !from.can_transition_to(TaskRunStatus::Running) {
                 return Err(StoreError::IllegalTransition {
                     run_id: run_id.to_string(),
                     from: from.as_str().to_string(),
-                    to: target.as_str().to_string(),
+                    to: TaskRunStatus::Running.as_str().to_string(),
                 });
             }
             events.push(RuntimeJournalEvent::for_append(
@@ -2625,31 +2698,49 @@ impl TaskRuntimeStore {
                 None,
                 None,
                 RuntimeEventKind::RunStatusChanged,
-                serde_json::json!({ "from": from.as_str(), "to": target.as_str() }),
+                serde_json::json!({
+                    "from": from.as_str(),
+                    "to": TaskRunStatus::Running.as_str(),
+                }),
             ));
-            if target == TaskRunStatus::Cancelled {
-                events.push(RuntimeJournalEvent::for_append(
-                    run_id,
-                    None,
-                    None,
-                    RuntimeEventKind::RunCancelled,
-                    serde_json::json!({}),
-                ));
-            }
-            self.commit_runtime_events(run_id, events)?;
+            from = TaskRunStatus::Running;
+        }
+        if !from.can_transition_to(target) {
+            return Err(StoreError::IllegalTransition {
+                run_id: run_id.to_string(),
+                from: from.as_str().to_string(),
+                to: target.as_str().to_string(),
+            });
+        }
+        events.push(RuntimeJournalEvent::for_append(
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::RunStatusChanged,
+            serde_json::json!({ "from": from.as_str(), "to": target.as_str() }),
+        ));
+        if target == TaskRunStatus::Cancelled {
+            events.push(RuntimeJournalEvent::for_append(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunCancelled,
+                serde_json::json!({}),
+            ));
+        }
+        self.commit_runtime_events(run_id, events)?;
 
-            let settled = self
-                .get_run(run_id)?
-                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
-            if settled.status != target {
-                return Err(StoreError::InvalidPlan(format!(
-                    "run {run_id} terminal write was not durable: expected {}, read back {}",
-                    target.as_str(),
-                    settled.status.as_str()
-                )));
-            }
-            Ok(settled)
-        })
+        let settled = self
+            .get_run(run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        if settled.status != target {
+            return Err(StoreError::InvalidPlan(format!(
+                "run {run_id} terminal write was not durable: expected {}, read back {}",
+                target.as_str(),
+                settled.status.as_str()
+            )));
+        }
+        Ok(settled)
     }
 
     pub(crate) fn finalize_cancelled_tasks_and_run(&self, run_id: &str) -> Result<(), StoreError> {
@@ -4847,21 +4938,8 @@ impl TaskRuntimeStore {
         &self,
         intent: &PhysicalOwnerIntent,
     ) -> Result<(), StoreError> {
-        if !intent.physical_terminal_observed {
-            return Err(StoreError::RecoveryBlocked {
-                run_id: intent.run_id.clone(),
-                details: "owner intent has no physical completion receipt".to_string(),
-            });
-        }
-        let pending = self.unresolved_physical_owner_intents(&intent.run_id)?;
-        if pending.is_empty() {
+        if self.validate_physical_owner_completion_locked(intent)? {
             return Ok(());
-        }
-        if !pending.iter().any(|current| current == intent) {
-            return Err(StoreError::RecoveryBlocked {
-                run_id: intent.run_id.clone(),
-                details: "physical completion does not match the original owner intent".to_string(),
-            });
         }
         self.commit_runtime_event(RuntimeJournalEvent::for_append(
             &intent.run_id,
@@ -4870,6 +4948,45 @@ impl TaskRuntimeStore {
             RuntimeEventKind::RecoveryResolved,
             serde_json::json!({ "physical_owner_intent": intent }),
         ))
+    }
+
+    // True means an already acknowledged identity on an available canonical
+    // source; missing state is never the empty/acknowledged case.
+    fn validate_physical_owner_completion_locked(
+        &self,
+        intent: &PhysicalOwnerIntent,
+    ) -> Result<bool, StoreError> {
+        if !intent.physical_terminal_observed {
+            return Err(StoreError::RecoveryBlocked {
+                run_id: intent.run_id.clone(),
+                details: "owner intent has no physical completion receipt".to_string(),
+            });
+        }
+        let state =
+            self.get_run_state(&intent.run_id)?
+                .ok_or_else(|| StoreError::RecoveryBlocked {
+                    run_id: intent.run_id.clone(),
+                    details:
+                        "original owner source is unavailable during physical receipt validation"
+                            .to_string(),
+                })?;
+        if let Some(error) = state.event_index.physical_owner_intent_error {
+            return Err(StoreError::RecoveryBlocked {
+                run_id: intent.run_id.clone(),
+                details: error,
+            });
+        }
+        let pending = state.event_index.physical_owner_intents;
+        if pending.is_empty() {
+            return Ok(true);
+        }
+        if !pending.iter().all(|current| current == intent) {
+            return Err(StoreError::RecoveryBlocked {
+                run_id: intent.run_id.clone(),
+                details: "physical completion does not match the original owner intent".to_string(),
+            });
+        }
+        Ok(false)
     }
 
     /// Recover every run whose process-scoped driver disappeared at restart.
@@ -4901,7 +5018,10 @@ impl TaskRuntimeStore {
         self.with_run_lock(&run.run_id, || {
             // A valid retained owner is a per-run boot disposition. It must
             // preserve cells, not abort independent recovery in this store.
-            if !self.unsettled_physical_owner_intents_locked(&run.run_id)?.is_empty() {
+            if !self
+                .unsettled_physical_owner_intents_locked(&run.run_id)?
+                .is_empty()
+            {
                 return Ok(false);
             }
             let active = self
@@ -6391,7 +6511,23 @@ impl TaskRuntimeStore {
         call_id: Option<&str>,
     ) -> Result<(), StoreError> {
         self.with_run_lock(run_id, || {
-            self.record_background_cell_finished_locked(run_id, cell_id, name, phase, terminal_cause, terminal_message, exit_code, artifact_status, artifact_message, total_output_bytes, output_truncated, output_excerpt, artifact_path, artifact_sha256, call_id)
+            self.record_background_cell_finished_locked(
+                run_id,
+                cell_id,
+                name,
+                phase,
+                terminal_cause,
+                terminal_message,
+                exit_code,
+                artifact_status,
+                artifact_message,
+                total_output_bytes,
+                output_truncated,
+                output_excerpt,
+                artifact_path,
+                artifact_sha256,
+                call_id,
+            )
         })
     }
 

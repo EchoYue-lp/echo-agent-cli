@@ -23,7 +23,11 @@ use super::WorkspaceRegistry;
 use crate::agent_handle::AgentHandle;
 use crate::workspace::WorkspaceKind;
 
-type Fixture = (tempfile::TempDir, Arc<AppState>);
+type Fixture = (
+    tempfile::TempDir,
+    Arc<AppState>,
+    crate::runtime::ApplicationLifecycleOwner,
+);
 
 // These tests assert lifecycle ordering, not a five-second latency SLA. Agent
 // and context initialization can contend with the full app-core suite on a
@@ -201,9 +205,14 @@ impl echo_agent::state::RuntimeStateStore for CheckpointReadBarrier {
 
 async fn isolated_app_state() -> anyhow::Result<Fixture> {
     let temp = tempfile::tempdir()?;
-    let registry = Arc::new(WorkspaceRegistry::with_base_dir(
-        temp.path().join("workspaces"),
-    )?);
+    let (state, lifecycle) = isolated_app_state_at(temp.path()).await?;
+    Ok((temp, state, lifecycle))
+}
+
+async fn isolated_app_state_at(
+    root: &std::path::Path,
+) -> anyhow::Result<(Arc<AppState>, crate::runtime::ApplicationLifecycleOwner)> {
+    let registry = Arc::new(WorkspaceRegistry::with_base_dir(root.join("workspaces"))?);
     let primary = ReactAgentBuilder::new()
         .llm_client(Arc::new(MockLlmClient::new()))
         .system_prompt("reliability contract fixture")
@@ -213,7 +222,7 @@ async fn isolated_app_state() -> anyhow::Result<Fixture> {
         crate::agent_pool::AgentPool::new_for_test(primary.clone(), None, None, 4, false).await,
     );
     let mcp = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
-        temp.path().join("mcp.json"),
+        root.join("mcp.json"),
         Default::default(),
     ));
     let mut state = AppState::from_shared(
@@ -227,19 +236,29 @@ async fn isolated_app_state() -> anyhow::Result<Fixture> {
         crate::product_data_io::ProductDataIoService::new(),
     )?;
     state.storage.chat_events = Arc::new(crate::chat_event_log::ChatEventLog::open(
-        temp.path().join("chat-events"),
+        root.join("chat-events"),
         crate::chat_event_log::ChatEventRetention::default(),
     )?);
     state.workspace.registry = registry;
     state.agent_router = Arc::new(crate::agent_router::AgentRouter::new(
-        temp.path().join("agent-router"),
+        root.join("agent-router"),
     ));
     state.agent_deliveries = Arc::new(crate::agent_router::AgentDeliverySupervisor::default());
-    state.set_pool(seed_pool);
+    state.set_pool(seed_pool.clone());
     state.tasks.runtime = Some(Arc::new(
-        crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()?,
+        crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory_with_shadow_root(
+            root.join("global-tasks"),
+        )?,
     ));
-    Ok((temp, Arc::new(state)))
+    let state = Arc::new(state);
+    let mut lifecycle =
+        crate::runtime::ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+    lifecycle.bind_app_state(state.clone());
+    lifecycle.bind_pool(seed_pool);
+    if let Some(store) = state.tasks.runtime.clone() {
+        lifecycle.bind_task_runtime(store);
+    }
+    Ok((state, lifecycle))
 }
 
 /// F03/M3: one `AgentAddress` admits at most one user foreground turn across
@@ -351,7 +370,7 @@ fn m6_conversation_suspension_is_workspace_qualified() -> Result<(), String> {
 async fn f09_workspace_conversation_delete_removes_workspace_task_runs() -> anyhow::Result<()> {
     use crate::tasks::task_runtime::{AttendedMode, DomainProfile, TaskRunStatus};
 
-    let (temp, state) = isolated_app_state().await?;
+    let (temp, state, _lifecycle) = isolated_app_state().await?;
     let workspace = state.workspace.registry.create_at(
         "alpha",
         WorkspaceKind::General,
@@ -435,7 +454,7 @@ fn f11_workspace_chat_events_carry_workspace_identity() -> anyhow::Result<()> {
 /// `Delivered`, so a later cancel or crash leaves a false success receipt.
 #[tokio::test]
 async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> anyhow::Result<()> {
-    let (temp, state) = isolated_app_state().await?;
+    let (temp, state, _lifecycle) = isolated_app_state().await?;
     let source_workspace = state.workspace.registry.create_at(
         "source",
         WorkspaceKind::General,
@@ -1259,7 +1278,7 @@ async fn f0_stale_router_attempt_cannot_cross_aba_generation() -> anyhow::Result
 
 #[tokio::test]
 async fn f0_idle_text_starts_a_cold_turn() -> anyhow::Result<()> {
-    let (temp, state) = isolated_app_state().await?;
+    let (temp, state, _lifecycle) = isolated_app_state().await?;
     let target_workspace = state.workspace.registry.create_at(
         "f0-cold-target",
         WorkspaceKind::General,
@@ -1321,7 +1340,7 @@ async fn f0_idle_text_starts_a_cold_turn() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn f1_cold_drain_is_durable_before_terminal_and_reopen_visible() -> anyhow::Result<()> {
-    let (temp, state) = isolated_app_state().await?;
+    let (temp, state, _lifecycle) = isolated_app_state().await?;
     let target_workspace = state.workspace.registry.create_at(
         "f1-cold-drain-target",
         WorkspaceKind::General,
@@ -1424,84 +1443,249 @@ async fn f1_cold_drain_is_durable_before_terminal_and_reopen_visible() -> anyhow
 
 #[tokio::test]
 async fn f1_cold_owner_exit_after_drain_recovers_without_model_replay() -> anyhow::Result<()> {
-    let (temp, state) = isolated_app_state().await?;
-    let target_workspace = state.workspace.registry.create_at(
-        "f1-cold-owner-exit-target",
-        WorkspaceKind::General,
-        temp.path().join("f1-cold-owner-exit-target"),
+    const CHILD_ROOT: &str = "EKO_RELIABILITY_COLD_EXIT_CHILD_ROOT";
+    const CHILD_MODE: &str = "EKO_RELIABILITY_COLD_EXIT_CHILD_MODE";
+    const CHILD_EXIT: i32 = 77;
+    const MARKER: &str = "cold-owner-exit-observation.json";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        // Parent owns this directory. This child must not own a TempDir whose
+        // Drop could erase the actual restart input.
+        let root = std::path::PathBuf::from(root);
+        let mode = std::env::var(CHILD_MODE)?;
+        let (state, _lifecycle) = isolated_app_state_at(&root).await?;
+        let target_workspace = state.workspace.registry.create_at(
+            "f1-cold-owner-exit-target",
+            WorkspaceKind::General,
+            root.join("f1-cold-owner-exit-target"),
+        )?;
+        let target = crate::agent_router::AgentAddress::new(
+            target_workspace.id,
+            "f1-cold-owner-exit-conversation",
+        );
+        let runtime = state.chat_runtime_for_agent(&target).await?;
+        runtime
+            .ensure_conversation(NewConversation {
+                conversation_id: target.conversation_id.clone(),
+                user_id: "default".to_string(),
+                agent_type: None,
+                title: Some("F1 cold owner exit".to_string()),
+            })
+            .await?;
+        let pool = runtime
+            .pool()
+            .ok_or_else(|| anyhow::anyhow!("fixture AgentPool is missing"))?;
+        let model = Arc::new(
+            MockLlmClient::new()
+                .with_responses(["owner exit preflight", "owner exit answer"])
+                .with_delay(std::time::Duration::from_secs(30)),
+        );
+        pool.set_llm_client_override_for_test(model.clone()).await;
+
+        let message = f0_router_message(&target, "f1-cold-owner-exit", "interrupt after drain");
+        let expected_turn_id = message.delivery_turn_id();
+        state.agent_router.enqueue(message.clone()).await?;
+        let delivery_state = Arc::clone(&state);
+        let delivery_target = target.clone();
+        let delivery = tokio::spawn(async move {
+            delivery_state
+                .deliver_agent_message_cold(
+                    &delivery_target,
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+        });
+
+        let deadline = tokio::time::Instant::now() + COLD_DELIVERY_TEST_TIMEOUT;
+        let injected = loop {
+            if let Some(in_flight) = state.agent_router.in_flight_claim(&target).await?
+                && in_flight.phase == crate::agent_router::AgentDeliveryPhase::Drained
+            {
+                break in_flight;
+            }
+            if delivery.is_finished() {
+                anyhow::bail!("cold owner settled before the durable drain boundary");
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("cold owner did not publish its drained attempt");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(injected.claim.payload.message_id, message.message_id);
+        assert_eq!(injected.claim.attempt, 1);
+        assert_eq!(injected.turn_id, expected_turn_id);
+
+        while model.call_count() == 0 {
+            if delivery.is_finished() {
+                anyhow::bail!("cold owner settled before entering the provider call");
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("cold owner did not enter the provider call after drain");
+            }
+            tokio::task::yield_now().await;
+        }
+        let calls_before_owner_exit = model.call_count();
+        assert_eq!(calls_before_owner_exit, 1);
+        if mode == "caller-abort-control" {
+            let original = state
+                .session
+                .foreground_turns
+                .snapshots_for_conversation_scoped(
+                    target.workspace_id.as_str(),
+                    &target.conversation_id,
+                )?;
+            let original = original
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("admitted original foreground missing"))?;
+            assert_eq!(original.root_turn_id, expected_turn_id);
+            assert!(original.run_id.is_some());
+            // Caller cancellation is a separate control: it cannot stand in for
+            // process death or acknowledge the original physical execution.
+            delivery.abort();
+            assert!(delivery.await.is_err_and(|error| error.is_cancelled()));
+            let retained = state
+                .session
+                .foreground_turns
+                .snapshots_for_conversation_scoped(
+                    target.workspace_id.as_str(),
+                    &target.conversation_id,
+                )?;
+            assert_eq!(retained.len(), 1);
+            let retained = retained
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("caller abort lost original foreground"))?;
+            assert_eq!(retained.root_turn_id, original.root_turn_id);
+            assert_eq!(retained.run_id, original.run_id);
+            assert!(retained.cancellation_requested);
+            assert_eq!(model.call_count(), calls_before_owner_exit);
+        } else {
+            assert_eq!(mode, "process-exit");
+            // This scenario exits with the original caller/execution pending,
+            // without signalling cancellation first. The abort control uses a
+            // different process and directory above.
+            assert!(!delivery.is_finished());
+        }
+        std::fs::write(
+            root.join(MARKER),
+            serde_json::to_vec(&serde_json::json!({
+                "scenario": mode,
+                "target": target,
+                "message": message,
+                "attempt_id": injected.claim.attempt_id,
+                "attempt": injected.claim.attempt,
+                "turn_id": injected.turn_id,
+                "model_calls": calls_before_owner_exit,
+            }))?,
+        )?;
+        // All of this fixture's execution is in this process (MockLlmClient has
+        // no external backend). Exit skips Rust Drop/normal shutdown. Only the
+        // parent's actual wait for this status proves that execution ended.
+        std::process::exit(CHILD_EXIT);
+    }
+
+    let temp = tempfile::tempdir()?;
+    for mode in ["caller-abort-control", "process-exit"] {
+        let child_root = temp.path().join(mode);
+        std::fs::create_dir_all(&child_root)?;
+        let child_log = child_root.join("cold-owner-child.log");
+        let output = std::fs::File::create(&child_log)?;
+        let mut child = tokio::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "state::reliability_contracts::f1_cold_owner_exit_after_drain_recovers_without_model_replay",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, &child_root)
+            .env(CHILD_MODE, mode)
+            // Isolate defaults opened transiently by from_shared; the actual
+            // registry/router/global/host sources below remain on the shared root.
+            .env("EKO_DATA_DIR", child_root.join("child-user-data"))
+            .stdout(output.try_clone()?)
+            .stderr(output)
+            .kill_on_drop(true)
+            .spawn()?;
+        let status = match tokio::time::timeout(COLD_DELIVERY_TEST_TIMEOUT, child.wait()).await {
+            Ok(status) => status?,
+            Err(error) => {
+                child.kill().await?;
+                let _reaped = child.wait().await?;
+                return Err(anyhow::anyhow!(
+                    "cold owner child did not reach real exit: {error}"
+                ));
+            }
+        };
+        assert_eq!(
+            status.code(),
+            Some(CHILD_EXIT),
+            "cold owner child failed: {}",
+            std::fs::read_to_string(&child_log)?
+        );
+        let observed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(child_root.join(MARKER))?)?;
+        assert_eq!(
+            observed.get("scenario").and_then(serde_json::Value::as_str),
+            Some(mode)
+        );
+        assert_eq!(
+            observed
+                .get("model_calls")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+    let root = temp.path().join("process-exit");
+    let marker: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join(MARKER))?)?;
+    let target: crate::agent_router::AgentAddress = serde_json::from_value(
+        marker
+            .get("target")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("child target observation missing"))?,
     )?;
-    let target = crate::agent_router::AgentAddress::new(
-        target_workspace.id,
-        "f1-cold-owner-exit-conversation",
+    let message: crate::agent_router::AgentMessage = serde_json::from_value(
+        marker
+            .get("message")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("child message observation missing"))?,
+    )?;
+    assert_eq!(
+        marker
+            .get("model_calls")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
     );
+    // Reopen the same persisted registry/router/host stores after actual child
+    // exit; create no replacement workspace, record, attempt or owner receipt.
+    let (state, _lifecycle) = isolated_app_state_at(&root).await?;
     let runtime = state.chat_runtime_for_agent(&target).await?;
-    runtime
-        .ensure_conversation(NewConversation {
-            conversation_id: target.conversation_id.clone(),
-            user_id: "default".to_string(),
-            agent_type: None,
-            title: Some("F1 cold owner exit".to_string()),
-        })
-        .await?;
     let pool = runtime
         .pool()
-        .ok_or_else(|| anyhow::anyhow!("fixture AgentPool is missing"))?;
-    let model = Arc::new(
-        MockLlmClient::new()
-            .with_responses(["owner exit preflight", "owner exit answer"])
-            .with_delay(std::time::Duration::from_secs(30)),
-    );
+        .ok_or_else(|| anyhow::anyhow!("reopened AgentPool missing"))?;
+    let model = Arc::new(MockLlmClient::new().with_response("recovery must not replay input"));
     pool.set_llm_client_override_for_test(model.clone()).await;
-
-    let message = f0_router_message(&target, "f1-cold-owner-exit", "interrupt after drain");
-    let expected_turn_id = message.delivery_turn_id();
-    state.agent_router.enqueue(message.clone()).await?;
-    let delivery_state = Arc::clone(&state);
-    let delivery_target = target.clone();
-    let delivery = tokio::spawn(async move {
-        delivery_state
-            .deliver_agent_message_cold(
-                &delivery_target,
-                &tokio_util::sync::CancellationToken::new(),
-            )
-            .await
-    });
-
-    let deadline = tokio::time::Instant::now() + COLD_DELIVERY_TEST_TIMEOUT;
-    let injected = loop {
-        if let Some(in_flight) = state.agent_router.in_flight_claim(&target).await?
-            && in_flight.phase == crate::agent_router::AgentDeliveryPhase::Drained
-        {
-            break in_flight;
-        }
-        if delivery.is_finished() {
-            anyhow::bail!("cold owner settled before the durable drain boundary");
-        }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("cold owner did not publish its drained attempt");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    };
-    assert_eq!(injected.claim.payload.message_id, message.message_id);
-    assert_eq!(injected.claim.attempt, 1);
-    assert_eq!(injected.turn_id, expected_turn_id);
-
-    while model.call_count() == 0 {
-        if delivery.is_finished() {
-            anyhow::bail!("cold owner settled before entering the provider call");
-        }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("cold owner did not enter the provider call after drain");
-        }
-        tokio::task::yield_now().await;
-    }
-    let calls_before_owner_exit = model.call_count();
-    assert_eq!(calls_before_owner_exit, 1);
-    delivery.abort();
-    let owner_exit = delivery.await;
-    assert!(
-        owner_exit.is_err_and(|error| error.is_cancelled()),
-        "the simulated cold owner exit must abort the real delivery future"
+    let recovery_calls_before = model.call_count();
+    assert_eq!(recovery_calls_before, 0);
+    let injected = state
+        .agent_router
+        .in_flight_claim(&target)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("real process exit lost the drained attempt"))?;
+    assert_eq!(
+        injected.phase,
+        crate::agent_router::AgentDeliveryPhase::Drained
+    );
+    assert_eq!(
+        Some(injected.claim.attempt_id.as_str()),
+        marker.get("attempt_id").and_then(serde_json::Value::as_str)
+    );
+    assert_eq!(
+        serde_json::to_value(injected.claim.attempt)?,
+        marker
+            .get("attempt")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("child attempt observation missing"))?
+    );
+    assert_eq!(
+        Some(injected.turn_id.as_str()),
+        marker.get("turn_id").and_then(serde_json::Value::as_str)
     );
     assert!(
         state
@@ -1509,12 +1693,10 @@ async fn f1_cold_owner_exit_after_drain_recovers_without_model_replay() -> anyho
             .foreground_turns
             .snapshots_for_conversation_scoped(
                 target.workspace_id.as_str(),
-                &target.conversation_id,
+                &target.conversation_id
             )?
-            .is_empty(),
-        "aborting the cold owner must retire its foreground turn before recovery"
+            .is_empty()
     );
-
     let abandoned = state
         .agent_router
         .in_flight_claim(&target)
@@ -1555,6 +1737,10 @@ async fn f1_cold_owner_exit_after_drain_recovers_without_model_replay() -> anyho
         recovered.turn_id.as_deref(),
         Some(injected.turn_id.as_str())
     );
+    assert_eq!(
+        recovered.outcome,
+        Some(crate::agent_router::AgentDeliveryOutcome::OutcomeUnknown)
+    );
     assert!(recovered.next_attempt_at.is_none());
     assert!(
         recovered
@@ -1579,7 +1765,7 @@ async fn f1_cold_owner_exit_after_drain_recovers_without_model_replay() -> anyho
     );
     assert_eq!(
         model.call_count(),
-        calls_before_owner_exit,
+        recovery_calls_before,
         "recovery must not replay the model input after durable drain"
     );
     assert!(state.agent_router.in_flight_claim(&target).await?.is_none());
@@ -1589,7 +1775,7 @@ async fn f1_cold_owner_exit_after_drain_recovers_without_model_replay() -> anyho
 
 #[tokio::test]
 async fn f1_cold_acceptance_waits_for_real_context_drain() -> anyhow::Result<()> {
-    let (temp, state) = isolated_app_state().await?;
+    let (temp, state, _lifecycle) = isolated_app_state().await?;
     let target_workspace = state.workspace.registry.create_at(
         "f1-cold-barrier-target",
         WorkspaceKind::General,
@@ -1670,7 +1856,7 @@ async fn f1_cold_acceptance_waits_for_real_context_drain() -> anyhow::Result<()>
 
 #[tokio::test]
 async fn f1_cold_terminal_before_drain_fails_without_drained_replay() -> anyhow::Result<()> {
-    let (temp, state) = isolated_app_state().await?;
+    let (temp, state, _lifecycle) = isolated_app_state().await?;
     let target_workspace = state.workspace.registry.create_at(
         "f1-cold-reject-target",
         WorkspaceKind::General,

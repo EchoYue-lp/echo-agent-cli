@@ -164,7 +164,9 @@ struct RunDriverRegistrationTestBarrier {
 
 /// Durable TaskRun terminal state that could not be written during the final
 /// shutdown retry. The on-disk run remains authoritative; this diagnostic
-/// records the uncommitted target and why execution resources were abandoned.
+/// records the uncommitted target and error. Despite its historical name,
+/// admitted execution resources remain retained until original-owner settlement;
+/// only resources proven never started may be released on shutdown failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbandonedRunSettlement {
     pub run_id: String,
@@ -589,6 +591,8 @@ struct RetainedUncertainDriver {
 }
 
 struct RunSettlementDebt {
+    // The original admitted driver identity, not a filesystem absence guess.
+    physical_owner_intent: Option<PhysicalOwnerIntent>,
     generation_lease: WorkspaceGenerationLease,
     driver_token: Option<u64>,
     run_id: String,

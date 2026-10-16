@@ -2528,8 +2528,13 @@ mod workspace_transition_tests {
             temp.path().join("router"),
         )));
         state.workspace.registry = Arc::clone(&registry);
-        state.set_pool(seed_pool);
+        state.set_pool(seed_pool.clone());
         let state = Arc::new(state);
+        let mut lifecycle = crate::runtime::ApplicationLifecycleOwner::new(
+            tokio_util::sync::CancellationToken::new(),
+        );
+        lifecycle.bind_app_state(state.clone());
+        lifecycle.bind_pool(seed_pool);
 
         for (workspace, conversation_id) in [
             (source_workspace.clone(), "source-conversation"),
