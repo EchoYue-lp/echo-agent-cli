@@ -194,3 +194,12 @@ closed-watch 竞争现在先尊重已经存在的真实 settlement/debt；mock �
 
 
 当前新 consumer274d3e12...fed14 的六项 adapter 方法真实通过；重绑前原 unit6 中1error为实际输入守卫拒绝，原件保留，重绑后同命令0。fresh actual/origin 两次在线官方完整扫描均 scanner1/精三项 warning/零 vulnerability，独立 gate0、noFetch=false，只给扫描进程 HTTP/1.1，不改变全局配置，也不宣称默认传输修复。原 raw 与扫描输出保留 task-local focused-checkpoint-actual/origin-online 原件，不入 Git。
+
+
+## Historical source continuity (source recovery only)
+
+正式源码读取引用中的5cd有6对象/17refs/13路径，8bd有3对象/28refs/19路径；前者仅任务分支可达，后者原本已进入main材料但其源码commit不在main谱系。5cd全部13blob均不在published main谱系596个commit的可达对象中；8bd仅manual asset四文件在6b局部同，Fork对象及完整source digest不同。因此不改历史observed_at/revision、不借局部相同声称重审或当前通过。c874/dfd/32c/629/e0正文短SHA不是本scope源码读取绑定，未为其新增保存引用。
+
+已按README记录的最小边界，仅发布两个annotated refs/tags/echo-semantic-source/<完整commit>，精确目标5cd9eff0b92d076699d04b07d4a8a1c19e3fcdd4及8bd2a6f08117cde61037b583000c71ab820e73ce；未发布其它本地tag或Release。两旧tree及相对main所需blob闭包经有界检查，未发现新增公开raw/真实凭据或构建产物；目标均已有公开branch/PR源，旧workflow不匹配tag push。7个二进制blob为应用图标，未把检查描述为任意外部自动化的穷尽证明。
+
+独立新建网络仓库只fetch远端main f57与这两个精确refs，无alternates、taskbranch、PR或本地object借用；tag object/peeled commit/tree/connectivity及九个正式对象32个唯一source身份（含bytes/mode/anchor）均一致。官方source_digest重读5cd为215699889c9c12b8702566e900205bc6e2f73d00e83993834c0688cafa6e7464，8bd为e310dee0cb79fe7ee6d4072248885201202320e426d217bcf97b3e5e600558a0。原件仅task-local cold-main-evidence-tags-proof。此项只证明历史source可取，三Audit仍stale/Behavior仍needs_review；安装版collector五错误仍归独立插件修复。最终真实main合入后须再仅用远端main+必要refs做冷验，并完成完整运行矩阵；当前未声称完成。
