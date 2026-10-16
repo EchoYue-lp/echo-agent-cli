@@ -8,6 +8,32 @@ async fn execute_runtime_plan<W: TaskDispatcher + 'static>(
     parent_cancel: CancellationToken,
     trace_sink: Option<ExecSink>,
 ) -> Result<RunOutcome, ExecError> {
+    execute_runtime_plan_with_admission(
+        store,
+        dispatcher,
+        reviewer_llm,
+        run_id,
+        limits,
+        parent_cancel,
+        trace_sink,
+        process_subagent_admission(),
+    )
+    .await
+}
+
+// The canonical entry binds process-wide product policy; tests can scope the
+// existing framework admission without duplicating execution or changing its quota.
+#[allow(clippy::too_many_arguments)]
+async fn execute_runtime_plan_with_admission<W: TaskDispatcher + 'static>(
+    store: Arc<TaskRuntimeStore>,
+    dispatcher: W,
+    reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
+    run_id: &str,
+    limits: EkoExecutionLimits,
+    parent_cancel: CancellationToken,
+    trace_sink: Option<ExecSink>,
+    shared_admission: Arc<ExecutionAdmission>,
+) -> Result<RunOutcome, ExecError> {
     let blocking = TaskRuntimeOperation::new(store.clone());
     let controller = Arc::new(EkoRuntimeDagController {
         store,
@@ -27,7 +53,7 @@ async fn execute_runtime_plan<W: TaskDispatcher + 'static>(
         controller,
         echo_agent::tasks::RuntimeTaskServiceConfig {
             max_concurrent_subagents: limits.max_concurrent_subagents,
-            shared_admission: Some(process_subagent_admission()),
+            shared_admission: Some(shared_admission),
             ..Default::default()
         },
     );

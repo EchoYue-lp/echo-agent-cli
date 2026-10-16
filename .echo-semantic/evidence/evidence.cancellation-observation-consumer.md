@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.cancellation-observation-consumer
 kind: evidence
-observed_at: source:2aa310eee02a7d64298f7ecf1afb4993cfad297ebecec90b85d380c9c45e7548
+observed_at: source:a7013e117da5c45675da2608ebf1b085872fc576f98bb01edfee7f42cedc0c8f
 source_refs:
 - echo-agent-app-core/src/agent_pool/tests.rs
 - echo-agent-app-core/src/state/reliability_contracts.rs
@@ -221,3 +221,19 @@ TUI改为调用真实send_to_agent的planned_resume分支，持有真实runtime/
 本次重绑后六项risk adapter方法真实通过。actual在线HTTPS两次fetch失败且JSON为零、origin当时未启动，独立curl/nativeGit连接同样超时；失败全部保留。随后仅各scanner进程将完整官方RustSec HTTPS repo URL改为同仓SSH传输，新actual与新生成CF6563 canonical origin两次官方在线扫描均wrapper0/scanner1、精原三项warning/零漏洞、独立gate0、noFetch=false/ignore=[]，DB f28da8c5d386e507fac79153655184056a20c054。未借SDK旧报告，不改全局Git/registry/lock/filter，不称依赖已修。原件cf6563-fixture-checkpoint-actual/origin-online-ssh及前两失败只留task-local。
 
 完整cargo clippy --workspace --all-targets --all-features --locked -- -D warnings实际0，7m55s、零warning，guard sourceDrift=[]/CF6563clean不变、peak5742702592/free7926157312；含既有examples，未以新测试源为由跳过。此后仅新增文稿事实和允许的当前快照metadata，三个Rust源hash与实际focused3/all-targetClippy仍一致，不重跑相同三例。另一组panic Clippy、原完整workspace/core-no-default/GUI/nativeStop/精mainCI继续待完成。独审文稿Minor“遗漏两次新fetch失败”已用上段事实补齐，不改失败日志或宽闭合状态。
+
+
+## Executor gate fixture admission and durable-interruption prerequisite
+
+c2d981后的原完整workspace命令实际101：core1645pass/2fail/9既有ignored，166.41s，后续targets未执行。该core binary与此前1647pass的保存bin逐字相同。原同bin cancel+revision两选择器2pass/1.66s不算稳定复现或修复；加入相邻pause后的自然三例组合实际1pass/2fail/5.52s。原三journal的8claims不冒充8个mock已开始：失败cancel仅2完成、pause仅3完成，均Running，尚无cancel/pause请求。
+
+只加三个原失败分支诊断，原1s/5s/gates/强断言不变；实际2pass/1fail/5.87s、零warning/drift、CF6563clean。pause原5s点order只有3个gated dispatch，returned4、共享admission active5、文件IO8全部可用、原driver finished=false/pending；未观察到提前错误，不推断全过程占用或永久泄露。Notify丢沿假设被实际Tokio1.53.1保证及单waiter/permit结构反证。两个4gate夹具在全进程5槽内存在等待环，此证据支持隔离fixture配额作用域，未调global容量或deadline。临时诊断源码已删除，源patch、真实bin、原journals/raw只保task-local。
+
+最终仅两源文件：canonical execute_runtime_plan仍绑定原process global5，同一执行体通过既有framework shared_admission Arc配置复用，四gate fixture各用同capacity5实例；IO8、原gates、时长与final断言均不变，无第二DAG/store/validator/public API。两个中断夹具原5s内保4gates和mock4返回，再从同Store确认原前4task IDs均Completed且claim=None后才发中断；TaskCompleted只通知，Store仍为权威。该前提修复不改原框架“中断先持久化可胜过未提交Completed”的CAS合同。
+
+冻结Gitdiff39ba794c4d371f10bf460eedb401ea16055aae6e645bbc91b15eabdce9734c98，两位源码/必要性及精三风险reader C0/I0/M0，四gate+三canonical wrapper普通/依赖/失败对照实际7pass/0fail/0ignore/1649core filtered，root0case/288filtered不计新增通过，3.18s行为/9m27编译/零warning、guard sourceDrift=[]/CF6563clean不变、peak6210084864/free6546939904。此为focused证据；原full红与前次Clippy只保原切点，不借本次关闭完整workspace/Clippy/noDefault/GUI/nativeStop/mainCI。新consumer28312e...ecb2仅在上述有限复评与实际通过后重绑，原精三项风险与lock不变，新扫描另记。
+
+设计仅更新Status/引言，四个Plan绑定章节与宽needs_review/stale/open状态不变；没有新产品架构或公共行为，不需新ADR/example/website源码，既有examples仍由最终all-target链覆盖。私有helper只转交原framework资源作用域，无迁移残留或并行执行权威。
+
+
+此28312e新consumer的六项adapter方法真实通过（cf6563-core-admission-risk-unit，6/0）；新actual和新生成CF6563 canonical origin在线扫描各wrapper0/scanner1、精原三项warning/零漏洞、独立gate0、noFetch=false/ignore=[]。仅扫描进程的完整官方RustSec HTTPS→同仓SSH传输，无全局配置、ignore或新风险身份，未借此前283以外consumer报告；DB版本及完整JSON以task-local cf6563-core-admission-actual/origin-online-ssh与fresh-online-results为准。原HTTPS失败、旧full红和窄after证据都保留分离。当前累计对main仍84路径，新增修复落在其中已有两路径，不新增公共接口、示例或官网行为；剩余完整门禁/原生Stop/精mainCI仍须完成。

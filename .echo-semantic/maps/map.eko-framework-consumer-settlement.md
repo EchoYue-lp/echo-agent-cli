@@ -4,7 +4,7 @@ id: map.eko-framework-consumer-settlement
 kind: capability_map
 title: EKO framework consumer settlement
 risk: high
-observed_at: source:2aa310eee02a7d64298f7ecf1afb4993cfad297ebecec90b85d380c9c45e7548
+observed_at: source:a7013e117da5c45675da2608ebf1b085872fc576f98bb01edfee7f42cedc0c8f
 boundary_refs:
 - boundary.eko-framework-consumer-settlement
 behavior_refs:

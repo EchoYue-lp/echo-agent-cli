@@ -1852,6 +1852,31 @@ Read the runtime path and found one missing branch.
         }
     }
 
+    async fn wait_for_fixture_task_commits(
+        store: &TaskRuntimeStore,
+        run_id: &str,
+        task_ids: &[String],
+        progress: &tokio::sync::Notify,
+    ) -> Result<(), String> {
+        loop {
+            let changed = progress.notified();
+            let plan = store
+                .get_plan(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "fixture plan missing before interruption".to_string())?;
+            if task_ids.iter().all(|id| {
+                plan.tasks.iter().any(|task| {
+                    task.id == *id
+                        && task.status == echo_agent::tasks::TaskStatus::Completed
+                        && task.claim.is_none()
+                })
+            }) {
+                return Ok(());
+            }
+            changed.await;
+        }
+    }
+
     impl TaskDispatcher for Arc<ScriptedDispatcher> {
         fn dispatch(
             &self,
@@ -2721,13 +2746,25 @@ Read the runtime path and found one missing branch.
             dispatcher.succeed(&task.id, "should be cancelled");
             cancelled_gates.push(dispatcher.gate(&task.id));
         }
+        let committed_progress = Arc::new(tokio::sync::Notify::new());
+        let progress_for_sink = committed_progress.clone();
+        let completion_sink: ExecSink = Arc::new(move |event| {
+            if event.event == RuntimeEventKind::TaskCompleted {
+                progress_for_sink.notify_one();
+            }
+        });
+        let completed_ids = tasks
+            .iter()
+            .take(4)
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
         let cancel = CancellationToken::new();
         let run_cancel = cancel.clone();
         let run_store = store.clone();
         let run_dispatcher = dispatcher.clone();
         let run_id_for_task = run_id.clone();
         let execution = tokio::spawn(async move {
-            execute_runtime_plan(
+            execute_runtime_plan_with_admission(
                 run_store,
                 run_dispatcher,
                 None,
@@ -2737,7 +2774,10 @@ Read the runtime path and found one missing branch.
                     ..EkoExecutionLimits::default()
                 },
                 run_cancel,
-                None,
+                Some(completion_sink),
+                Arc::new(ExecutionAdmission::with_capacity(
+                    EkoExecutionLimits::default().max_concurrent_subagents,
+                )),
             )
             .await
         });
@@ -2747,9 +2787,11 @@ Read the runtime path and found one missing branch.
                 gate.started.notified().await;
             }
             dispatcher.wait_for_returns(4).await;
+            wait_for_fixture_task_commits(&store, &run_id, &completed_ids, &committed_progress)
+                .await
         })
         .await
-        .map_err(|_| "dispatch/cancellation boundary was not reached".to_string())?;
+        .map_err(|_| "dispatch/cancellation boundary was not reached".to_string())??;
         cancel.cancel();
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
@@ -2801,6 +2843,18 @@ Read the runtime path and found one missing branch.
             dispatcher.succeed(&task.id, "pending after pause");
             paused_gates.push(dispatcher.gate(&task.id));
         }
+        let committed_progress = Arc::new(tokio::sync::Notify::new());
+        let progress_for_sink = committed_progress.clone();
+        let completion_sink: ExecSink = Arc::new(move |event| {
+            if event.event == RuntimeEventKind::TaskCompleted {
+                progress_for_sink.notify_one();
+            }
+        });
+        let completed_ids = tasks
+            .iter()
+            .take(4)
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
         let cancel = CancellationToken::new();
         let execution = {
             let run_store = store.clone();
@@ -2808,7 +2862,7 @@ Read the runtime path and found one missing branch.
             let run_id = run_id.clone();
             let run_cancel = cancel.clone();
             tokio::spawn(async move {
-                execute_runtime_plan(
+                execute_runtime_plan_with_admission(
                     run_store,
                     run_dispatcher,
                     None,
@@ -2818,7 +2872,10 @@ Read the runtime path and found one missing branch.
                         ..EkoExecutionLimits::default()
                     },
                     run_cancel,
-                    None,
+                    Some(completion_sink),
+                    Arc::new(ExecutionAdmission::with_capacity(
+                        EkoExecutionLimits::default().max_concurrent_subagents,
+                    )),
                 )
                 .await
             })
@@ -2828,9 +2885,11 @@ Read the runtime path and found one missing branch.
                 gate.started.notified().await;
             }
             dispatcher.wait_for_returns(4).await;
+            wait_for_fixture_task_commits(&store, &run_id, &completed_ids, &committed_progress)
+                .await
         })
         .await
-        .map_err(|_| "dispatch/pause boundary was not reached".to_string())?;
+        .map_err(|_| "dispatch/pause boundary was not reached".to_string())??;
         store
             .transition_run(&run_id, TaskRunStatus::Paused)
             .map_err(|error| error.to_string())?;
@@ -2987,7 +3046,7 @@ Read the runtime path and found one missing branch.
         let execution_dispatcher = dispatcher.clone();
         let execution_run_id = run_id.clone();
         let execution = tokio::spawn(async move {
-            execute_runtime_plan(
+            execute_runtime_plan_with_admission(
                 execution_store,
                 execution_dispatcher,
                 None,
@@ -2995,6 +3054,9 @@ Read the runtime path and found one missing branch.
                 EkoExecutionLimits::default(),
                 CancellationToken::new(),
                 None,
+                Arc::new(ExecutionAdmission::with_capacity(
+                    EkoExecutionLimits::default().max_concurrent_subagents,
+                )),
             )
             .await
         });
@@ -3260,7 +3322,7 @@ Read the runtime path and found one missing branch.
         let execution_dispatcher = dispatcher.clone();
         let execution_run_id = run_id.clone();
         let execution = tokio::spawn(async move {
-            execute_runtime_plan(
+            execute_runtime_plan_with_admission(
                 execution_store,
                 execution_dispatcher,
                 None,
@@ -3268,6 +3330,9 @@ Read the runtime path and found one missing branch.
                 EkoExecutionLimits::default(),
                 CancellationToken::new(),
                 None,
+                Arc::new(ExecutionAdmission::with_capacity(
+                    EkoExecutionLimits::default().max_concurrent_subagents,
+                )),
             )
             .await
         });
