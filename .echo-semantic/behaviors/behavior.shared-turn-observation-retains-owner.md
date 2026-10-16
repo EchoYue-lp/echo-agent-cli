@@ -13,7 +13,7 @@ focus:
 - failure_concurrency
 - contract_evidence
 boundary: boundary.eko-framework-consumer-settlement
-observed_at: source:215699889c9c12b8702566e900205bc6e2f73d00e83993834c0688cafa6e7464
+observed_at: 5cd9eff0b92d076699d04b07d4a8a1c19e3fcdd4
 code_refs:
 - echo-agent-app-core/src/chat_driver.rs
 - echo-agent-app-core/src/foreground_turn.rs

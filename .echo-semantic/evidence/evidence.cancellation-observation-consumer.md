@@ -2,8 +2,10 @@
 schema_version: 1
 id: evidence.cancellation-observation-consumer
 kind: evidence
-observed_at: source:215699889c9c12b8702566e900205bc6e2f73d00e83993834c0688cafa6e7464
+observed_at: source:b1f3c278483f857325923b3cd1a00b06fb514c40e2dedd6e7d39aa356a058b97
 source_refs:
+- echo-agent-app-core/src/state/config.rs
+- echo-agent-app-core/src/agent_router/tests.rs
 - echo-agent-app-core/src/agent_pool/admission.rs
 - echo-agent-app-core/src/agent_pool/pool.rs
 - echo-agent-app-core/src/analysis.rs
@@ -31,9 +33,9 @@ supports:
 - behavior.analysis-original-owner-settlement-retry
 - rule.eko-framework-consumer-authorities
 limitations:
-- Only two selected app-core cases passed with zero warnings on public intermediate f0a; remaining strong cases, surface conditions and final consumer gates remain pending.
-- Source passed independent review through the 65-file candidate; this checkpoint adds metadata only. Upstream scheduler occurrence settlement remains open.
-- Canonical relative paths are restored against public intermediate framework f0a6cd1; this is not final framework-main consumer acceptance.
+- Earlier public f0a focused results remain historical; this Scheduler increment separately passed two selected app-core cases on public development3ded, not final main.
+- Scheduler original-slot and Root continuation source plus two before/after receipts passed bounded independent review; this is not cron end-to-end or full B acceptance.
+- Canonical relative paths currently resolve public framework3dedb9a; final framework-main consumer and applicable whole gates remain pending.
 - No full workspace/GUI/remote/main delivery claim.
 ---
 
@@ -70,3 +72,11 @@ cold增量d212/64及首编修正e2ea/64均由原独立reader源审C0/I0/M0。Roo
 ## 零警告有限 focused checkpoint
 
 同65源freeze82f16及canonical相对path/lockc5a，借独立clean public F=f0a6cd1/tree9ee1e434：v4原aggregate强例和cron typed-roundtrip各实际1pass/0fail/0ignore/1644filtered，完整app-core libtest编译零warning；各583F/303C/65执行前后无漂移，原进程组最终为空。原v3因free5GiB硬线中断，仅0case/未完成编译，Node未终发官方run.json，外部monitor与158B原raw诚实保留，不冒行为red或通过。v4/cron原件只在task-local，摘要focused-checkpoint-receipt.json；这两case不证明OS/file effect或无source自动恢复，也不闭上游SchedulerRunner occurrence策略。剩余精确9强例/GUI与TUI条件/最终F main消费者/全门禁另待，Plan仍ready，三个场景/宽Finding保持未完成。
+
+## Scheduler 原 Handle / Root 有界增量
+
+当前公开开发依赖为 clean `3dedb9a6834cd28a3718d9852023722a6d24f4dc`（tree69240813），不是最终F main。原`SchedulerState`同Mutex slot跨await借原Handle，所有Err保留、仅真实Ok清；原Root每次poll均重观同slot并将Err计入uncertain，普通独立工作仍真实drain。没有新scheduler、状态/协议、effect重放或watcher；无late-source仍明确Unknown。
+
+两原module逻辑用例真实before各1fail（slot1421B45dfd8a7、aggregate1811B70fc8eac），不是首轮2fixture编译错误。after各1pass/0fail/0ignore/1646filtered、编译零warning，slot原raw608B9f57dfda/编译7m12s，aggregate425Bc235323e/暖编3.25s；各583F/303C/67前后零漂移、无signal/trunc、最终进程组空。原正常control新增的是等同一public run_once实际commit再断成功；Unknown/取消等待/原Root两个红oracle均保。源码和收据独立复核C0/I0/M0；执行只含真实framework callback/资源、原Root与独立normal异步flow，非OS进程或无source自动恢复证明。原before、首编错误和描述旁注只保tasklocal，不入Git。
+
+本增量不借旧f0a/v4或这两个case关闭其余9强例、TUI/GUI条件、完整workspace、cron E2E、最终framework-main消费者及远端交付。Plan仍ready、三个宽场景needs_review、三个原lens仍stale，库存和行为模型仍open。共享现有Rule/Map记录此窄原slot生命周期；其它历史观察用精确Git5cd9保留原215699摘要切点，未改其结论。

@@ -5,11 +5,11 @@ kind: audit
 boundary_ref: boundary.eko-framework-consumer-settlement
 lens: data_durability
 freshness: stale
-revision: source:215699889c9c12b8702566e900205bc6e2f73d00e83993834c0688cafa6e7464
+revision: 5cd9eff0b92d076699d04b07d4a8a1c19e3fcdd4
 finding_refs: []
 challenges:
   original-owner-observation-and-cleanup:
-    revision: source:215699889c9c12b8702566e900205bc6e2f73d00e83993834c0688cafa6e7464
+    revision: 5cd9eff0b92d076699d04b07d4a8a1c19e3fcdd4
     source_refs:
     - echo-agent-app-core/src/tasks/task_runtime/store/runtime.rs
     - echo-agent-app-core/src/analysis.rs

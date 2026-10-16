@@ -11,13 +11,15 @@ focus:
 - time_lifecycle
 - failure_concurrency
 - contract_evidence
-observed_at: source:215699889c9c12b8702566e900205bc6e2f73d00e83993834c0688cafa6e7464
+observed_at: source:b1f3c278483f857325923b3cd1a00b06fb514c40e2dedd6e7d39aa356a058b97
 behavior_refs:
 - behavior.background-review-caller-owned-settlement
 - behavior.shared-turn-observation-retains-owner
 - behavior.task-unknown-owner-admission-fence
 - behavior.analysis-original-owner-settlement-retry
 code_refs:
+- echo-agent-app-core/src/state/config.rs
+- echo-agent-app-core/src/agent_router/tests.rs
 - echo-agent-app-core/src/evolution/background_review_owner.rs
 - echo-agent-app-core/src/evolution/review_integration.rs
 - echo-agent-app-core/src/conversation_archive.rs
@@ -76,3 +78,8 @@ EKO ADR 0043-0046、框架 ADR 0058/0065/0069、定向故障注入、全 workspa
 ## B 消费新增不变量
 
 Framework physical receipt/claim CAS唯一；观察不终态化。原Task/analysis/foreground保owner与effect前durable intent；未知拒重复，真实terminal IO债务只同identity重写清理。aggregate普通工作必须真实drain、未知原owner可达、无Strong自环。新增范围尚需当前强tests/aggregate实现，Rule整体needs_review，不撤销旧历史验证也不将旧证据推广到B。
+
+
+## Scheduler 原 slot 观察
+
+同一应用代际的原SchedulerHandle只在同Mutex内借用shutdown；Err或借用等待取消保slot、onlyOk清。原Root每次poll复观并保unknown依赖，不以loop.is_finished/空slot/旧normal_drained推物理结算。此源与两具名case有界通过，不闭合Rule其余B义务及最终消费者门禁。

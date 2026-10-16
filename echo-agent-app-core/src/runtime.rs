@@ -781,11 +781,22 @@ impl ApplicationLifecycleOwner {
                 if let Err(error) = state.join_workspace_transition().await {
                     receipt.record("workspace transition", error);
                 }
-                if let Err(error) = state.shutdown_scheduler().await {
-                    receipt.record("scheduler", error);
+            }
+        }
+        // Re-observe the original slot on every real continuation poll. A
+        // previous observation does not settle this dependency of Agent close.
+        let scheduler_uncertain = if let Some(state) = self.app_state.as_ref() {
+            match state.shutdown_scheduler().await {
+                Ok(()) => false,
+                Err(error) => {
+                    receipt.record_retained("scheduler", error);
+                    true
                 }
             }
-
+        } else {
+            false
+        };
+        if !self.normal_drained {
             if let Some(store) = self.task_runtime_store.as_ref() {
                 if let Err(error) = store.shutdown_run_drivers().await {
                     receipt.record("TaskRun drivers", error);
@@ -838,7 +849,8 @@ impl ApplicationLifecycleOwner {
                 receipt.record_retained("config watcher", error);
             }
         }
-        let mut uncertain = self.external_owners.iter().any(|owner| owner.join_panicked);
+        let mut uncertain =
+            scheduler_uncertain || self.external_owners.iter().any(|owner| owner.join_panicked);
         if let Some(state) = self.app_state.as_ref() {
             if let Err(error) = state.workspace.runtimes.join_known_shutdown().await {
                 receipt.record_retained("workspace execution owners", error);
@@ -2835,6 +2847,173 @@ mod tests {
         )
         .await?;
         Ok((temp, runtime, services))
+    }
+
+    #[tokio::test]
+    async fn aggregate_scheduler_unknown_preserves_original_slot_on_reobservation()
+    -> anyhow::Result<()> {
+        const NAME: &str =
+            "runtime::tests::aggregate_scheduler_unknown_preserves_original_slot_on_reobservation";
+        if run_isolated_bootstrap_test(NAME)? {
+            return Ok(());
+        }
+        use crate::state::scheduler_shutdown_tests::SchedulerFixture;
+        use std::sync::atomic::Ordering;
+
+        let directory = tempfile::tempdir()?;
+        let mut scheduler = SchedulerFixture::new(true).await?;
+        let original = scheduler.original_result().await?;
+        let primary = AgentHandle::new(
+            echo_agent::prelude::ReactAgentBuilder::new()
+                .llm_client(Arc::new(echo_agent::testing::MockLlmClient::new()))
+                .build()?,
+        );
+        let weak_agent = Arc::downgrade(primary.inner());
+        let io = crate::product_data_io::ProductDataIoService::new();
+        let mut state = AppState::from_shared(
+            primary.clone(),
+            None,
+            Arc::new(HitlDispatcher::new()),
+            None,
+            None,
+            EkoConfig::default(),
+            Arc::new(crate::mcp_config_runtime::McpConfigRuntime::from_snapshot(
+                directory.path().join("mcp.json"),
+                Default::default(),
+            )),
+            io.clone(),
+        )?;
+        state.scheduler = scheduler.take_scheduler()?;
+        let state = Arc::new(state);
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.bind_app_state(state.clone());
+        owner.bind_primary_agent(primary);
+        owner.bind_product_data_io(io.clone());
+        let root = owner
+            .retention
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("original Root absent"))?;
+        let normal = io.begin_owned_flow("scheduler-independent normal future")?;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let normal_task = tokio::spawn(async move {
+            let result = normal
+                .run_async("held original normal operation", async move {
+                    let _ = entered_tx.send(());
+                    release_rx.await.map_err(|error| error.to_string())
+                })
+                .await;
+            normal.settle(result.as_ref().err().map(ToString::to_string));
+            result
+        });
+        entered_rx.await?;
+        let initial = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        let settlement = owner.start_join(initial);
+        let mut observer = Box::pin(settlement.clone().wait());
+        let normal_was_pending = futures::poll!(observer.as_mut()).is_pending();
+        // Always release and join the same ordinary source before reporting a
+        // regression, including on the original false-final implementation.
+        release_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("ordinary source vanished"))?;
+        let normal_result = normal_task.await??;
+        normal_result.map_err(anyhow::Error::msg)?;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(3), observer).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if !root
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .polling
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let first_retained = first.continuation.is_some();
+        let owner_normal_drained = root
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .owner
+            .as_ref()
+            .is_some_and(|(owner, _)| owner.normal_drained);
+        let first_final = root
+            .publications
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| p.final_receipt);
+        let has_scheduler_diagnostic = first
+            .failures
+            .iter()
+            .any(|failure| failure.owner == "scheduler");
+        let mut second_retained = false;
+        if first_retained {
+            let mut publication = root.publications.subscribe();
+            publication.borrow_and_update();
+            root.note_progress();
+            tokio::time::timeout(std::time::Duration::from_secs(3), publication.changed())
+                .await??;
+            second_retained = publication
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| !p.final_receipt);
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if !root
+                        .state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .polling
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+        }
+        let callback_held = scheduler.capacity.available_permits() == 0
+            && scheduler.drops.load(Ordering::SeqCst) == 0;
+        let agent_reachable = weak_agent.upgrade().is_some();
+        let calls = scheduler.calls.load(Ordering::SeqCst);
+        let identity = scheduler
+            .identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("original identity absent"))?;
+        // This joins the actual test-owned backend only. No canonical
+        // occurrence completion is injected and Unknown is never turned Ok.
+        scheduler.finish_backend().await?;
+        drop(first);
+        drop(settlement);
+        drop(root);
+        drop(state);
+        let final_drops = scheduler.drops.load(Ordering::SeqCst);
+        println!(
+            "scheduler aggregate: ordinary_pending={normal_was_pending} first_retained={first_retained} first_final={first_final} normal_drained={owner_normal_drained} second_retained={second_retained} callback_held={callback_held} agent_reachable={agent_reachable} calls={calls} final_drops={final_drops}"
+        );
+        assert!(
+            matches!(original, Err(echo_agent::error::ReactError::ExecutionNotSettled { run_id, execution_id: Some(execution_id) }) if run_id == identity.0 && execution_id == identity.1)
+        );
+        assert!(normal_was_pending);
+        assert!(has_scheduler_diagnostic);
+        assert!(
+            first_retained && !first_final && owner_normal_drained,
+            "scheduler Unknown escaped the original lifecycle retention decision"
+        );
+        assert!(
+            second_retained,
+            "normal_drained skipped the original scheduler on the next poll"
+        );
+        assert!(callback_held && agent_reachable);
+        assert_eq!(calls, 1);
+        assert_eq!(final_drops, 1);
+        Ok(())
     }
 
     #[tokio::test]

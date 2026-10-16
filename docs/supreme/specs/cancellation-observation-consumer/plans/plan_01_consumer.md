@@ -27,7 +27,7 @@ design_sections:
   - ref: design.md § 系统边界与权威
     digest: sha256:d904d8d126f7129d29eaacb83aa78901f5362f7adc566830f0c6776d40336b2d
   - ref: design.md § 设计
-    digest: sha256:2427b3dd757ba83392f3920d29fd9ce9cb987aeb1ca59e0cef9c3538fcb228d7
+    digest: sha256:67aa8175a25f2b26b2bfb327964e6de96581d896d7832f9252c62c2198484102
   - ref: design.md § 异常与边界
     digest: sha256:338dc201535e02f6d1cf8aca6fac9230cda7203de41645ec269edbbd3199169e
   - ref: design.md § 验收标准
@@ -130,6 +130,28 @@ todos:
         ApplicationLifecycleError receipt alone retains the root; subsystem
         links are Weak and genuine cleanup plus receipt drop releases the Weak
         graph.
+  - id: retain-original-scheduler-handle
+    summary: Borrow the original SchedulerHandle in its existing mutex slot and
+      include scheduler uncertainty in every same-owner lifecycle poll after the
+      reviewed public upstream API is available.
+    files:
+      - echo-agent-app-core/src/state/config.rs
+      - echo-agent-app-core/src/runtime.rs
+    acceptance:
+      - Repeated and concurrent shutdown, or cancellation of a borrowed wait,
+        cannot empty an unsettled handle slot or report false success; keep
+        exact parent/occurrence identity and callback count, and clear once only
+        after actual Ok.
+      - The original aggregate drains independent normal work, retains
+        scheduler-dependent resources on Err, and re-observes the same slot even
+        with normal_drained=true; existing Root/typed error remains the sole
+        continuation. No automatic late-proof or source-less recovery is
+        claimed.
+      - First bind the reviewed public framework checkpoint through canonical
+        relative paths. Record meaningful behavior-before with only necessary
+        receiver compile adaptation, then matching strong after cases in Root
+        resource lease. Current public f0a and the two prior focused cases are
+        not this evidence.
 artifact_id: plan:74c5690b-6f61-4d70-82f5-a769dfab055a
 lifecycle: ready
 ---

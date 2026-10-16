@@ -3,8 +3,8 @@ schema_version: 1
 id: baseline.repository
 kind: baseline
 source_snapshot:
-  base_revision: a88d247c0a87557093d723c24c2349c875b8e6b9
-  content_digest: 215699889c9c12b8702566e900205bc6e2f73d00e83993834c0688cafa6e7464
+  base_revision: 5cd9eff0b92d076699d04b07d4a8a1c19e3fcdd4
+  content_digest: b1f3c278483f857325923b3cd1a00b06fb514c40e2dedd6e7d39aa356a058b97
 inventory_closure: open
 behavior_model_closure: open
 map_refs: [map.eko-conversation-collaboration, map.eko-framework-consumer-settlement]
@@ -48,7 +48,7 @@ coverage: []
 
 ## 源码快照
 
-基线绑定 `echo-agent-cli` 最新 `main` 的可恢复 revision 与当前非语义源码摘要。设计和 Plan 已在当前工作树中，后续业务差异必须通过 semantic-diff 刷新摘要和受影响对象。
+基线绑定 `echo-agent-cli` 可恢复的开发提交 revision 与当前非语义源码摘要。设计和 Plan 已在当前工作树中，后续业务差异必须通过 semantic-diff 刷新摘要和受影响对象。
 
 ## 仓库区域
 
@@ -73,3 +73,8 @@ coverage: []
 ## Cancellation observation 开发 checkpoint
 
 当前任务以可恢复a88d247为前置，仅刷新实际非语义源码摘要。原owner typed observation、durable fence与聚合保留的三个场景仍为needs_review、三个lens仍stale；有限源码独审与两条focused测试不等于宽行为Finding/最终消费者闭合。当前构建借public f0a中间framework切点；TUI/GUI条件、其余强例、最终F main和全量门禁仍待。库存与行为模型仍open，不以本checkpoint收缩或删除既有义务。
+
+
+## Scheduler 增量开发 checkpoint
+
+前置提交为5cd9eff0，当前相对依赖是公开开发3ded，不冒最终F main。原Scheduler同slot/Root生命周期两逻辑case各真实before行为fail→after1pass/零warning；独审只该窄scope。原215699时代的三个Behavior/三个stale Audit仅恢复为等价Git5cd9历史锚，状态和结论不变。原scheduler场景新增B影响标needs_review；其它所有宽义务/剩余强例/GUI/全量门禁/最终消费者继续未闭。此处只刷新实际非语义源码摘要与真实前置，不宣全项目行为闭合。

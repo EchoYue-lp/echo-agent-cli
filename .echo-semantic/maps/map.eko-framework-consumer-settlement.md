@@ -4,7 +4,7 @@ id: map.eko-framework-consumer-settlement
 kind: capability_map
 title: EKO framework consumer settlement
 risk: high
-observed_at: source:215699889c9c12b8702566e900205bc6e2f73d00e83993834c0688cafa6e7464
+observed_at: source:b1f3c278483f857325923b3cd1a00b06fb514c40e2dedd6e7d39aa356a058b97
 boundary_refs:
 - boundary.eko-framework-consumer-settlement
 behavior_refs:
@@ -105,8 +105,10 @@ scenarios:
     evidence_refs:
     - evidence.latest-framework-consumer-integration
   scheduler-and-task-claim-adaptation:
-    status: mapped
+    status: needs_review
     source_refs:
+    - echo-agent-app-core/src/state/config.rs
+    - echo-agent-app-core/src/runtime.rs
     - echo-agent-app-core/src/state/app_state.rs
     - echo-agent-app-core/src/tasks/task_runtime/executor/dispatch.rs
     - echo-agent-app-core/src/tasks/task_runtime/run_authority.rs
@@ -114,6 +116,9 @@ scenarios:
     - rule.eko-framework-consumer-authorities
     evidence_refs:
     - evidence.latest-framework-consumer-integration
+    - evidence.cancellation-observation-consumer
+    unknown: 原Handle slot与Root重观两case在公开3ded各1pass、零warning；cron E2E、其余B强例和最终Fmain消费者仍待，不能将窄结果推广整个场景。
+    next_step: 保原sameowner；完成已列B强例、最终公开依赖及适用合前门禁。
   shared-turn-observation-retains-owner:
     status: needs_review
     source_refs:
@@ -127,8 +132,8 @@ scenarios:
     - rule.eko-framework-consumer-authorities
     evidence_refs:
     - evidence.cancellation-observation-consumer
-    unknown: 当前具名aggregate与cron typed-roundtrip各1pass、编译零warning；其余strong例、TUI/GUI条件与最终F消费者未验，上游scheduler occurrence观察结算未闭。
-    next_step: 先闭直接caller typed保留与上游scheduler观察结算缺口；Root租约重跑零警告focused及相关strong例，随后正式语义/消费者门禁。
+    unknown: 历史f0a具名aggregate/cron各1pass；新3ded仅原Handle/Root两case通过，零warning；其余strong、TUI/GUI条件、最终Fmain与CLI cron E2E未验。
+    next_step: 复用原typedowner完成其余strong例、CLI cron E2E和最终公开F消费者，再执行适用正式门禁。
   task-unknown-owner-admission-fence:
     status: needs_review
     source_refs:
@@ -143,8 +148,8 @@ scenarios:
     - rule.eko-framework-consumer-authorities
     evidence_refs:
     - evidence.cancellation-observation-consumer
-    unknown: 当前具名aggregate与cron typed-roundtrip各1pass、编译零warning；其余strong例、TUI/GUI条件与最终F消费者未验，上游scheduler occurrence观察结算未闭。
-    next_step: 先闭直接caller typed保留与上游scheduler观察结算缺口；Root租约重跑零警告focused及相关strong例，随后正式语义/消费者门禁。
+    unknown: 历史f0a具名aggregate/cron各1pass；新3ded仅原Handle/Root两case通过，零warning；其余strong、TUI/GUI条件、最终Fmain与CLI cron E2E未验。
+    next_step: 复用原typedowner完成其余strong例、CLI cron E2E和最终公开F消费者，再执行适用正式门禁。
   analysis-original-owner-settlement-retry:
     status: needs_review
     source_refs:
@@ -156,8 +161,8 @@ scenarios:
     - rule.eko-framework-consumer-authorities
     evidence_refs:
     - evidence.cancellation-observation-consumer
-    unknown: 当前具名aggregate与cron typed-roundtrip各1pass、编译零warning；其余strong例、TUI/GUI条件与最终F消费者未验，上游scheduler occurrence观察结算未闭。
-    next_step: 先闭直接caller typed保留与上游scheduler观察结算缺口；Root租约重跑零警告focused及相关strong例，随后正式语义/消费者门禁。
+    unknown: 历史f0a具名aggregate/cron各1pass；新3ded仅原Handle/Root两case通过，零warning；其余strong、TUI/GUI条件、最终Fmain与CLI cron E2E未验。
+    next_step: 复用原typedowner完成其余strong例、CLI cron E2E和最终公开F消费者，再执行适用正式门禁。
 ---
 
 # EKO framework consumer settlement
@@ -205,3 +210,6 @@ GUI Review 显示 `persisted` 的 true/false/unknown 状态并返回 operation I
 ## B 消费增量当前性
 
 仅新增三个needs_review场景；旧独立处置不改。当前dirty源身份不证明行为验收，既有Background Review证据不自动关闭新B义务。
+
+
+Scheduler/Task claim原场景因B关闭语义受影响而转needs_review；旧mapped工程来源保留，新增引用仅原config/runtime同owner及共用Evidence，不新建平行能力或删旧义务。其它三个B场景继续needs_review，历史观察仍绑定5cd9。

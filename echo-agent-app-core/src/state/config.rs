@@ -354,9 +354,12 @@ pub struct SchedulerState {
 
 impl SchedulerState {
     async fn shutdown(&self) -> echo_agent::error::Result<()> {
-        let handle = self.handle.lock().await.take();
-        if let Some(handle) = handle {
+        // Borrow the original handle under the same slot lock. Unknown or a
+        // cancelled observer cannot discard its Runner/JoinHandle parent.
+        let mut slot = self.handle.lock().await;
+        if let Some(handle) = slot.as_mut() {
             handle.shutdown().await?;
+            slot.take();
         }
         Ok(())
     }
@@ -390,4 +393,258 @@ pub struct WebhookState {
 pub struct ObservabilityState {
     /// Static prompt-module report for the primary EKO agent.
     pub prompt_assembly: RwLock<Option<crate::project::prompt::PromptAssembly>>,
+}
+
+#[cfg(test)]
+pub(crate) mod scheduler_shutdown_tests {
+    use super::SchedulerState;
+    use echo_agent::agent::CancellationToken;
+    use echo_agent::error::ReactError;
+    use echo_agent::scheduler::{CronTask, CronTaskStore, OccurrenceFireFn, SchedulerRunner};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::{Mutex, Notify};
+
+    struct CallbackResource {
+        drops: Arc<AtomicUsize>,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    }
+
+    impl Drop for CallbackResource {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // A real public framework occurrence/Handle, shared by the slot and Root
+    // regressions. The backend is test-owned async work, not an OS process.
+    pub(crate) struct SchedulerFixture {
+        _directory: tempfile::TempDir,
+        scheduler: Option<SchedulerState>,
+        release: Arc<Notify>,
+        backend: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+        manual: Option<tokio::task::JoinHandle<echo_agent::error::Result<String>>>,
+        pub(crate) calls: Arc<AtomicUsize>,
+        pub(crate) drops: Arc<AtomicUsize>,
+        pub(crate) capacity: Arc<tokio::sync::Semaphore>,
+        pub(crate) identity: Arc<std::sync::Mutex<Option<(String, String)>>>,
+    }
+
+    impl Drop for SchedulerFixture {
+        fn drop(&mut self) {
+            self.release.notify_one();
+        }
+    }
+
+    impl SchedulerFixture {
+        pub(crate) async fn new(unknown: bool) -> anyhow::Result<Self> {
+            let directory = tempfile::tempdir()?;
+            let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let resource = Arc::new(CallbackResource {
+                drops: drops.clone(),
+                _permit: capacity.clone().acquire_owned().await?,
+            });
+            let release = Arc::new(Notify::new());
+            let entered = Arc::new(Notify::new());
+            let backend = Arc::new(std::sync::Mutex::new(None));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let identity = Arc::new(std::sync::Mutex::new(None));
+            let fire_fn: OccurrenceFireFn = {
+                let release = release.clone();
+                let entered = entered.clone();
+                let backend = backend.clone();
+                let calls = calls.clone();
+                let identity = identity.clone();
+                Arc::new(move |invocation| {
+                    let resource = resource.clone();
+                    let release = release.clone();
+                    let entered = entered.clone();
+                    let backend = backend.clone();
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    *identity.lock().unwrap_or_else(|error| error.into_inner()) = Some((
+                        invocation.occurrence_id.clone(),
+                        invocation.attempt_id.clone(),
+                    ));
+                    Box::pin(async move {
+                        let (started, ready) = tokio::sync::oneshot::channel();
+                        let physical = tokio::spawn(async move {
+                            let _original_resource = resource;
+                            let _ = started.send(());
+                            release.notified().await;
+                        });
+                        ready
+                            .await
+                            .map_err(|error| ReactError::Other(error.to_string()))?;
+                        entered.notify_one();
+                        if unknown {
+                            *backend.lock().unwrap_or_else(|error| error.into_inner()) =
+                                Some(physical);
+                            Err(ReactError::ExecutionNotSettled {
+                                run_id: invocation.occurrence_id,
+                                execution_id: Some(invocation.attempt_id),
+                            })
+                        } else {
+                            physical
+                                .await
+                                .map_err(|error| ReactError::Other(error.to_string()))?;
+                            Ok("same original callback physically completed".to_string())
+                        }
+                    })
+                })
+            };
+            let cancel = CancellationToken::new();
+            let runner = Arc::new(
+                SchedulerRunner::new_with_occurrence_context(
+                    CronTaskStore::new().with_path(directory.path().join("tasks.json")),
+                    cancel.clone(),
+                    fire_fn,
+                )
+                .await?,
+            );
+            let task = CronTask::new("shutdown owner", "* * * * *", "original callback");
+            let task_id = task.id.clone();
+            runner.add_task(task).await?;
+            let handle = runner.clone().spawn();
+            let manual_runner = runner.clone();
+            let manual = tokio::spawn(async move { manual_runner.run_once(&task_id).await });
+            let fixture = Self {
+                _directory: directory,
+                scheduler: Some(SchedulerState {
+                    runner: Some(runner),
+                    cancel_token: cancel,
+                    handle: Mutex::new(Some(handle)),
+                }),
+                release,
+                backend,
+                manual: Some(manual),
+                calls,
+                drops,
+                capacity,
+                identity,
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified()).await?;
+            Ok(fixture)
+        }
+
+        pub(crate) fn take_scheduler(&mut self) -> anyhow::Result<SchedulerState> {
+            self.scheduler
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("same scheduler already transferred"))
+        }
+
+        pub(crate) async fn original_result(
+            &mut self,
+        ) -> anyhow::Result<echo_agent::error::Result<String>> {
+            let result = {
+                let manual = self
+                    .manual
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("original observer absent"))?;
+                tokio::time::timeout(std::time::Duration::from_secs(3), manual).await??
+            };
+            self.manual.take();
+            Ok(result)
+        }
+
+        pub(crate) fn release_backend(&self) {
+            self.release.notify_one();
+        }
+
+        pub(crate) async fn finish_backend(&mut self) -> anyhow::Result<()> {
+            self.release_backend();
+            if self.manual.is_some() {
+                let _original_result = self.original_result().await?;
+            }
+            let backend = self
+                .backend
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some(backend) = backend {
+                tokio::time::timeout(std::time::Duration::from_secs(3), backend).await??;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_slot_preserves_original_handle_across_unknown_and_cancelled_waits()
+    -> anyhow::Result<()> {
+        // Ordinary held work supplies the cancellation-safe-wait and true final
+        // completion control. No later physical receipt is synthesized.
+        let mut normal = SchedulerFixture::new(false).await?;
+        let normal_state = normal.take_scheduler()?;
+        let mut borrowed = Box::pin(normal_state.shutdown());
+        let was_pending = futures::poll!(borrowed.as_mut()).is_pending();
+        drop(borrowed);
+        let slot_after_cancelled_wait = normal_state.handle.lock().await.is_some();
+        // The loop ending is not proof that an independently admitted callback
+        // committed. Await that same callback's real public result first.
+        normal.release_backend();
+        let normal_completed = normal.original_result().await?;
+        let (normal_first, normal_second) = {
+            let first = normal_state.shutdown();
+            let second = normal_state.shutdown();
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::join!(first, second)
+            })
+            .await?
+        };
+        normal.finish_backend().await?;
+        let normal_slot_cleared = normal_state.handle.lock().await.is_none();
+        drop(normal_state);
+        let normal_drops = normal.drops.load(Ordering::SeqCst);
+
+        let mut unknown = SchedulerFixture::new(true).await?;
+        let state = unknown.take_scheduler()?;
+        let original = unknown.original_result().await?;
+        let first = state.shutdown().await;
+        let (second, third) = tokio::join!(state.shutdown(), state.shutdown());
+        let identity = unknown
+            .identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("original occurrence identity absent"))?;
+        let exact = |result: &echo_agent::error::Result<()>| {
+            matches!(result,
+            Err(ReactError::ExecutionNotSettled { run_id, execution_id: Some(execution_id) })
+                if run_id == &identity.0 && execution_id == &identity.1)
+        };
+        let exact_observations = exact(&first) && exact(&second) && exact(&third);
+        let unknown_slot_retained = state.handle.lock().await.is_some();
+        let resource_held =
+            unknown.capacity.available_permits() == 0 && unknown.drops.load(Ordering::SeqCst) == 0;
+        let calls = unknown.calls.load(Ordering::SeqCst);
+        // Test-owned backend is genuinely joined before the assertions report
+        // old behavior; this is not a fabricated framework journal completion.
+        unknown.finish_backend().await?;
+        drop(state);
+        let final_drops = unknown.drops.load(Ordering::SeqCst);
+        println!(
+            "scheduler slot: pending={was_pending} kept_after_wait_drop={slot_after_cancelled_wait} normal_cleared={normal_slot_cleared} unknown_slot={unknown_slot_retained} exact_observations={exact_observations} calls={calls} resources_held={resource_held} final_drops={final_drops}"
+        );
+        assert!(
+            matches!(original, Err(ReactError::ExecutionNotSettled { run_id, execution_id: Some(execution_id) }) if run_id == identity.0 && execution_id == identity.1)
+        );
+        assert!(
+            was_pending && slot_after_cancelled_wait,
+            "borrowed wait lost the original scheduler slot"
+        );
+        assert_eq!(
+            normal_completed?,
+            "same original callback physically completed"
+        );
+        assert!(normal_first.is_ok() && normal_second.is_ok() && normal_slot_cleared);
+        assert_eq!(normal_drops, 1);
+        assert!(
+            unknown_slot_retained && exact_observations,
+            "Unknown was mistaken for empty-slot success"
+        );
+        assert!(resource_held);
+        assert_eq!(calls, 1);
+        assert_eq!(final_drops, 1);
+        Ok(())
+    }
 }
