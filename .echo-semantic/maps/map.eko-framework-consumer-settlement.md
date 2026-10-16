@@ -4,7 +4,7 @@ id: map.eko-framework-consumer-settlement
 kind: capability_map
 title: EKO framework consumer settlement
 risk: high
-observed_at: source:bd75b49f18a60ada507be1bb1609d9a9e4e52b6f4def9101a859d6f66cc231aa
+observed_at: source:b23cdcfe33cd2e059c505230a29cdabfeb74fdf62a2b19832053ed65c64b948c
 boundary_refs:
 - boundary.eko-framework-consumer-settlement
 behavior_refs:
@@ -34,8 +34,12 @@ scenarios:
     status: mapped
     source_refs:
     - .github/workflows/rust-ci.yml
+    - .cargo/accepted-dependency-risks.json
+    - scripts/check_cli_dependency_risks.py
+    - scripts/test_cli_dependency_risks.py
     evidence_refs:
     - evidence.linux-validation-budgets
+    - evidence.cancellation-observation-consumer
   compression-product-policy:
     status: mapped
     source_refs:

@@ -58,11 +58,10 @@ jobs:
           python-version: "3.11"
       - name: Audit CLI lock and framework registry origins
         run: |
-          cargo audit --deny warnings --file "$GITHUB_WORKSPACE/Cargo.lock"
-          python -B "$GITHUB_WORKSPACE/echo-agent/scripts/generate-vendored-media-audit-lock.py" \
-            --lockfile "$GITHUB_WORKSPACE/Cargo.lock" \
-            --output "$RUNNER_TEMP/cli-media-registry-origin.lock"
-          cargo audit --deny warnings --file "$RUNNER_TEMP/cli-media-registry-origin.lock"
+          python -B scripts/test_cli_dependency_risks.py
+          python -B scripts/check_cli_dependency_risks.py --report-prefix "$RUNNER_TEMP/cli-audit"
+          python -B scripts/check_cli_dependency_risks.py --registry-origins \
+            --report-prefix "$RUNNER_TEMP/cli-media-audit"
       - name: Check Linux workspace
         run: |
           cargo fmt --all -- --check

@@ -481,6 +481,27 @@ framework `scripts/generate-vendored-media-audit-lock.py` 与其 `vendor/registr
 临时视图只恢复三个 bundled parent 的原 registry source/checksum 归属，保留真实锁的其它节点和依赖边，
 实际构建锁保持原样。Python 3.11+ 仅用于这项开发审计工具，不是 EKO 运行依赖。
 
+当前交付按[人的精确风险决定](docs/supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md)
+暂时保留 glib 0.18.5、proc-macro-error 1.0.4、bincode 1.3.3。
+`scripts/check_cli_dependency_risks.py` 保留完整官方扫描 JSON、stderr 和真实退出码，另行报告风险决定核对结果；
+扫描 exit 1 不会被改称审计通过。仅允许清单中的 advisory、类别、版本、registry source/checksum；
+新增告警、漏洞、yanked、扫描失败或输入漂移仍阻断。glib 的 soundness 风险尚未修复。
+为防扫描配置静默关闭检查，gate 拒绝项目及 Cargo home 下的 `audit.toml` 覆盖。
+`.cargo/accepted-dependency-risks.json` 同时绑定完整实际锁和应用 Rust 源码、manifest、Cargo 配置的输入指纹；
+这些输入有任何变动都须重新评估消费者范围，不能自动刷新指纹延续接受。
+
+```bash
+# 使用 Python 3.11+；产物写入已忽略的任务目录，前缀每次取新名称
+python3 -B scripts/test_cli_dependency_risks.py
+python3 -B scripts/check_cli_dependency_risks.py \
+  --report-prefix .echo-semantic/local/<task-id>/actual-audit
+python3 -B scripts/check_cli_dependency_risks.py --registry-origins \
+  --report-prefix .echo-semantic/local/<task-id>/origin-audit
+```
+
+默认更新官方 advisory 数据库；`--no-fetch` 只用于本地缓存诊断，不替代 CI 的在线扫描。
+这项应用策略不改变框架/SDK政策，也不放宽 formatter、Clippy、测试或条件矩阵。
+
 ### GUI 前端开发
 
 `web-frontend/` 目录包含 GUI 的前端代码（React + Tailwind CSS），由 Tauri 桌面应用嵌入：

@@ -11,7 +11,7 @@ focus:
 - time_lifecycle
 - failure_concurrency
 - contract_evidence
-observed_at: source:bd75b49f18a60ada507be1bb1609d9a9e4e52b6f4def9101a859d6f66cc231aa
+observed_at: source:b23cdcfe33cd2e059c505230a29cdabfeb74fdf62a2b19832053ed65c64b948c
 behavior_refs:
 - behavior.background-review-caller-owned-settlement
 - behavior.shared-turn-observation-retains-owner
@@ -97,6 +97,8 @@ Framework physical receipt/claim CAS唯一；观察不终态化。原Task/analys
 
 
 ## CF988 定向实施补充
+
+CLI依赖政策只在应用层核对用户精确三项risk_accepted；原官方scanner、canonical framework origin helper仍唯一权威。policy绑定当前完整锁及消费者输入，任何新告警/漏洞/yanked/扫描错误或输入漂移均拒绝。原scanner失败和单独风险核对成功必须分别报告，不传播为framework/SDK豁免；全部Rust与GUI门禁保持。
 
 后继primary切片：同一ForegroundTurnSettlementWaiter只对真实Observation保留run/execution，channel notifier传typed错误后不kick；GUI launch准备和执行等待共享原foreground错误结算，观察仅retain，普通错误保持Failed。两个独立行为red→samecase after及4普通/正常控制共6pass，17file独审/非语义增量确认和Clippy零warning通过；完整门禁/宽Rule仍未闭。三依赖精确风险接受由具名Finding/人的Decision引用拥有，不推广为SDK/framework例外或放宽工程门禁。
 

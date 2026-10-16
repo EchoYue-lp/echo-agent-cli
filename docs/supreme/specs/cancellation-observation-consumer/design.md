@@ -12,6 +12,8 @@ Approved for the same bounded implementation. Public framework main 9886502c83d6
 
 ## 问题与目标
 
+Delivery-policy continuation after the accepted dfd5750 checkpoint: the existing official audit step is adapted to the exact human three-dependency decision, with raw scanner failure retained and a separate acceptance check. The wrapper rejects unreviewed project/Cargo-home audit configuration, new warnings/vulnerabilities/yanked, scanner failures and lock/consumer-input drift. It reuses the canonical framework origin helper and changes no dependency or original Rust/GUI gate. This is application delivery policy, not another scanner or lifecycle authority; the four Plan-bound chapters remain unchanged. Online qualification and independent policy review remain explicit separate evidence.
+
 Framework B distinguishes `ReactError::ExecutionNotSettled { run_id, execution_id }` from physical terminal evidence. Its fallible `AgentFailure::try_from`, `AgentEvent::from_error`, `AgentTurnDriver::drive`, and `subagent_status_from_error` refuse to manufacture a terminal from that observation. Current EKO adapters convert every error into Failed/Cancelled or a String, then settle the TaskRun and release workspace, memory and pool receipts. The goal is to consume B without changing normal receipts or projecting observer knowledge into a terminal.
 
 ## 范围与非目标

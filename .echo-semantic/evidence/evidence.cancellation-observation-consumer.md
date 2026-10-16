@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.cancellation-observation-consumer
 kind: evidence
-observed_at: source:bd75b49f18a60ada507be1bb1609d9a9e4e52b6f4def9101a859d6f66cc231aa
+observed_at: source:b23cdcfe33cd2e059c505230a29cdabfeb74fdf62a2b19832053ed65c64b948c
 source_refs:
 - echo-agent-app-core/src/state/config.rs
 - echo-agent-app-core/src/state/tests.rs
@@ -16,6 +16,9 @@ source_refs:
 - Cargo.toml
 - Cargo.lock
 - .github/workflows/rust-ci.yml
+- .cargo/accepted-dependency-risks.json
+- scripts/check_cli_dependency_risks.py
+- scripts/test_cli_dependency_risks.py
 - echo-agent-app-core/src/agent_router/tests.rs
 - echo-agent-app-core/src/agent_pool/admission.rs
 - echo-agent-app-core/src/agent_pool/pool.rs
@@ -48,11 +51,10 @@ supports:
 limitations:
 - Earlier public f0a/3ded focused and nine-case results remain historical; they are
   not final CF988/full acceptance.
-- Current CF988 with unchanged Git status qualified only three distinct focused cases and independent
-  source/receipt review; new cron case and full six plus GUI two remain unexecuted.
-- CLI real-lock and same-CF canonical registry-origin cached scans each report zero
-  vulnerabilities and exactly three denied upstream warnings on the named live-matched
-  database epoch; policy A/B is undecided and default online audit has not passed.
+- Current CF988 qualified the named cron case, six surface/control cases and both required
+  Clippy commands; full workspace and GUI conditional matrix remain pending.
+- Exact three-dependency human acceptance has a reviewed gate; both online scans with
+  per-process HTTP/1.1 report scanner1/gate0. Original default-transport fetch failure is retained.
 - No complete workspace/GUI/remote-main delivery or repository-wide closure is claimed.
 ---
 
@@ -139,5 +141,19 @@ P `.echo-semantic/local/cli-cancellation-observation-consumer/`保primary-channe
 ## Three dependency risks accepted by the user
 
 人已明确保持glib0.18.5、proc-macro-error1.0.4、bincode1.3.3并延期升级。dependency-risk-decision.md和finding.cli-upstream-dependency-risks绑定精版本/registry checksum/消费者。风险未修复，unfiltered真实锁/registry-origin扫描仍1/3warnings，online fetch失败另存。没有宽泛ignore或SDK/framework特例移植；精确接受门禁仍待验证，不冒audit0或CI通过。
+
+## Exact risk gate impact and qualification
+
+从已审dfd5750 checkpoint续接：scanner和canonical framework registry-origin helper仍是原权威；新增内容只把EKO人的精确接受决定接到现有linux-quality步骤。直接影响policy配置、薄Python调用/结果核对、反例测试、原CI审计步骤及开发说明；不改变Cargo依赖/feature、Rust运行时、公共合同、UI、存储、原编译/测试门禁或其它仓库。共享Finding/Rule记录策略，原三个stale审查与宽B场景状态保持。
+
+新gate将advisory/kind/version/registry source/checksum与完整CLI锁字节、全部应用Rust消费源码/manifest/build/Cargo配置指纹共同核对；变动须重新评估，不自动更新接受清单。不复制advisory扫描器或media-origin解析器；没有网络错误回退绿灯。官方原始JSON、stderr、scannerExit与单独gate结果保存在task-local/CI临时目录，完整扫描输出同时进入CI日志。
+
+首轮5个unittest方法真实pass（含多个反例子场景，不重复计数）。真实默认在线扫描v1 exit1因RustSec fetch I/O失败且未产生JSON；adapter同样gate failed，失败原件risk-gate-actual-online-v1.*保留，不能借为3warning扫描或在线通过。首轮误用task-scope与既有repository预检不符的验证exit1保留；后续须以既定scope核对，历史Git引用收据专项仍未闭。独立review、缓存/新origin实跑和最终CI结果另记，不由测试存在推断通过。
+
+配置覆盖Important已修复并独立精增量复审C0/I0/M0；新版6个unittest方法实际通过，reader另查空HOME/CARGO_HOME合同及Plan schema4/四章节绑定通过。最终gate四核心文件hash和六文稿的审查身份保risk-gate-independent-review-v3.json。反例含真实adapter对project/home/相对home/坏symlink配置在scanner调用前拒绝；不以fake scanner测试冒RustSec执行。
+
+actual-cached-v2与origin-cached-v3为缓存有限检查，各官方scanner1/三warnings/单独gate0。默认online-v1失败后系统git ls-remote能读官方最新HEAD479c888ce4401313bca61ba4aba2d0f6244c4a09；仅对两次后继扫描进程指定GIT_CONFIG_COUNT=1、GIT_CONFIG_KEY_0=http.version、GIT_CONFIG_VALUE_0=HTTP/1.1，actual-online-http1与origin-online-http1均实际wrapper0，noFetch=false，官方scanner1/三warnings/零漏洞/单独gate0，DB HEAD仍同官方remote。未关闭fetch、使用stale或改全局Git配置；该受控传输设置解决本次现场fetch失败，更底层传输协商原因未证明。保留原始失败，不宣默认传输已修或CI通过。
+
+原panic类别Clippy(--workspace --lib --bins --all-features --locked及四-D)真实exit0、2m36s、sourceDrift=[]/CF988clean不变，峰值8441212928B/最小free17226854400B。既有all-target Clippy也已0；两者不替完整workspace/GUI条件/JSONL/精main CI。剩余矩阵继续运行，宽状态不闭合。
 
 宽B场景、三个stale lens、完整workspace/GUI、JSONL与精main CI不借此关闭，Plan保持ready，全局库存/行为闭合open。无前端实现变化，不额外本地frontend矩阵，CI原frontend保留；私有lint整理不改变examples/官网说明，既有examples由all-target编译链覆盖，后续完整门禁仍适用。
