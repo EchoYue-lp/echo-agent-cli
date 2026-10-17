@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.cancellation-observation-consumer
 kind: evidence
-observed_at: source:a7013e117da5c45675da2608ebf1b085872fc576f98bb01edfee7f42cedc0c8f
+observed_at: source:42165674392f8798397a1d6ca6db25de31d2c5aba30563e645d524bddd86a446
 source_refs:
 - echo-agent-app-core/src/agent_pool/tests.rs
 - echo-agent-app-core/src/state/reliability_contracts.rs
@@ -237,3 +237,16 @@ c2d981后的原完整workspace命令实际101：core1645pass/2fail/9既有ignore
 
 
 此28312e新consumer的六项adapter方法真实通过（cf6563-core-admission-risk-unit，6/0）；新actual和新生成CF6563 canonical origin在线扫描各wrapper0/scanner1、精原三项warning/零漏洞、独立gate0、noFetch=false/ignore=[]。仅扫描进程的完整官方RustSec HTTPS→同仓SSH传输，无全局配置、ignore或新风险身份，未借此前283以外consumer报告；DB版本及完整JSON以task-local cf6563-core-admission-actual/origin-online-ssh与fresh-online-results为准。原HTTPS失败、旧full红和窄after证据都保留分离。当前累计对main仍84路径，新增修复落在其中已有两路径，不新增公共接口、示例或官网行为；剩余完整门禁/原生Stop/精mainCI仍须完成。
+
+
+## Complete local matrix and final validation identities (runtime CLI7a33)
+
+当前CLI7a33/tree6fd的六条适用本地命令全部真实0、零warning、sourceDrift=[]/CF6563clean不变：workspace all-target Clippy、panic类Clippy、原完整workspace all-features测试、core-no-default、GUI binary check，以及原GUI命令的受守卫重跑。完整测试core1647pass/0fail/9既有ignore，core五integration组6/5/2/3/5通过，CLI lib288、binary11、JSONL6均通过；core doc1与compile-fail doc4通过，core/CLI docs另各3既有ignore。嵌套child1不重复计数。GUI-only lib219/binary1/JSONL6通过、docs3既有ignore。原首次GUI因globalfree5027909632低于5GiB被guard中止exit-2，原raw3139B/进度/guard及缺失的.run状态未伪造或覆盖；SDK正规自有cache清理后，同原命令/原9/5预算重跑0，peak8679952384/free11153244160。它不证明真实GUI窗口或OS场景。
+
+P保持真实HEAD7a33与official PFbase7a33，current-checkpoint strict0。原P累计strict请求basef57因PF基准不一致真实1，未手改PF或回填历史。原自有runtime frozen view在六门禁结束后，记录真实旧HEAD629与全945输入，再仅切换自身Git HEAD/index到mainf57，源码bytes不动，stage candidate tree6fd及84全累计diff与P精等；official record当下V/f57真实合同后，installed0.5普通与strict basef57/require-change-evidence均0。此为独立累计候选验收，不是P pre-edit/nativeStop。P安装版repository/task完成仍实际1、原五Errno2（agent_router两处与退役GUI三文件）完整保留，受保护插件两路径仍待原人裁决，未安装/绕过。
+
+新独立网络仓仅fetch远端mainf57与原两个精source tags，无alternates、非shallow、7a33对象不可读；official source读取复验9个历史对象/32唯一身份，tag object/peeled commit/tree、bytes/mode/blob/anchor及两个历史完整source digests全等。准备阶段曾用任意metadata出现旧SHA筛到11，断言在source验证前拒绝，非产品测试红；额外两个是automatic-agent-collaboration-ui-retirement Evidence（实际绑定40fd）与manual-agent-collaboration-ui-retirement Finding（不提供源码读取绑定）。改按official reader输出的实际bound revision选择9对象，未删历史或改观测。该冷验只证明历史可取；实际main合入后仍须仅main+精refs新冷验。
+
+最终累计84路径逐项理由与root独审C0/I0/M0在task-local记录，未纳raw/PF/log/temp/二进制或新增发布。所有27实际exe/67支持lib在cache外独立94inode保SHA；835 raw、旧569与关键beforebin全0mismatch后，official cargo clean明确own target/profiledev dryrun全部在本任务debug，actual0，8643604480→8192，free15644971008；不碰迁移备份/C源/CF/其它cache，不以资源中止作产品红绿。后继正规源码/文稿收束仅改非运行输入，须用Git/945等价证明carry六门禁，不重跑已通过heavy。
+
+正式双语ADR仍只涉及0004/0015，四Plan绑定章节、Rule/Behavior needs_review、三Audit stale、inventory/behavior closure open均不借本地全绿关闭。官网overview/capabilities/storage的有限事实同步由独立官网交付在CLI精确mainCI后处理，不自动复制全部CLI阶段文档；本次私有夹具修复无新公共示例行为，既有examples已由all-target链编译。当前Plan仍ready，main/nativeStop/最终冷验未写完成。
