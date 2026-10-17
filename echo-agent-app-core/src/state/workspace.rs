@@ -149,7 +149,7 @@ pub struct ScopedChatRuntime {
 /// guard; product policy and mutable workspace focus never cross that boundary.
 #[derive(Clone)]
 pub struct ScopedWorkspaceIoReceipt {
-    _lifetime: ScopedRuntimeLifetime,
+    _lifetime: Option<crate::workspace::runtime::WorkspaceIoLease>,
     identity: crate::workspace::WorkspaceIoIdentity,
 }
 
@@ -179,7 +179,7 @@ impl ScopedWorkspaceIoReceipt {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn global_for_test(data_root: impl Into<std::path::PathBuf>) -> Self {
         Self {
-            _lifetime: ScopedRuntimeLifetime::Global,
+            _lifetime: None,
             identity: crate::workspace::WorkspaceIoIdentity::global(data_root),
         }
     }
@@ -467,9 +467,11 @@ impl ScopedChatRuntime {
             .has_pending_handoff_for(self.execution_scope.workspace_id(), conversation_id)
             .map_err(crate::conversation_deletion::ConversationDeletionError::ConversationStore)?
         {
-            return Err(crate::conversation_deletion::ConversationDeletionError::HandoffPending(
-                conversation_id.to_string(),
-            ));
+            return Err(
+                crate::conversation_deletion::ConversationDeletionError::HandoffPending(
+                    conversation_id.to_string(),
+                ),
+            );
         }
         Ok(())
     }
@@ -477,7 +479,10 @@ impl ScopedChatRuntime {
     /// Pin the exact runtime generation for Agent-owned product-data work.
     pub fn workspace_io_receipt(&self) -> ScopedWorkspaceIoReceipt {
         ScopedWorkspaceIoReceipt {
-            _lifetime: self._lifetime.clone(),
+            _lifetime: match &self._lifetime {
+                ScopedRuntimeLifetime::Global => None,
+                ScopedRuntimeLifetime::Workspace { _lease } => Some(_lease.io_lifetime()),
+            },
             identity: self.workspace_io_identity.clone(),
         }
     }
@@ -510,13 +515,18 @@ impl ScopedChatRuntime {
         conversation: NewConversation,
     ) -> std::result::Result<Conversation, crate::conversation_deletion::ConversationDeletionError>
     {
-        let store = self.conversation_store.as_ref().ok_or(
-            crate::conversation_deletion::ConversationDeletionError::StoreUnavailable,
-        )?;
-        self.deletions.create_conversation_guarded(
-            store.as_ref(), conversation, Some(self.workspace_io_receipt()),
-            |id| self.ensure_handoff_admission_allowed(id),
-        ).await
+        let store = self
+            .conversation_store
+            .as_ref()
+            .ok_or(crate::conversation_deletion::ConversationDeletionError::StoreUnavailable)?;
+        self.deletions
+            .create_conversation_guarded(
+                store.as_ref(),
+                conversation,
+                Some(self.workspace_io_receipt()),
+                |id| self.ensure_handoff_admission_allowed(id),
+            )
+            .await
     }
 
     /// Suspend all turn surfaces while one direct user command replaces a transcript.
@@ -537,12 +547,14 @@ impl ScopedChatRuntime {
             self.execution_scope.workspace_id(),
             conversation_id,
         )?;
-        Ok(crate::managed_conversation::ManagedConversationAdmission::new(
-            self.execution_scope.workspace_id(),
-            conversation_id,
-            identity,
-            suspension,
-        ))
+        Ok(
+            crate::managed_conversation::ManagedConversationAdmission::new(
+                self.execution_scope.workspace_id(),
+                conversation_id,
+                identity,
+                suspension,
+            ),
+        )
     }
 
     pub(crate) async fn begin_handoff_recovery(
@@ -558,12 +570,14 @@ impl ScopedChatRuntime {
             self.execution_scope.workspace_id(),
             conversation_id,
         )?;
-        Ok(crate::managed_conversation::ManagedConversationAdmission::new(
-            self.execution_scope.workspace_id(),
-            conversation_id,
-            identity,
-            suspension,
-        ))
+        Ok(
+            crate::managed_conversation::ManagedConversationAdmission::new(
+                self.execution_scope.workspace_id(),
+                conversation_id,
+                identity,
+                suspension,
+            ),
+        )
     }
 
     /// Strict creation for a cross-workspace transfer; the returned guard owns rollback scope.
@@ -571,15 +585,19 @@ impl ScopedChatRuntime {
         &self,
         admission: &crate::managed_conversation::ManagedConversationAdmission,
         conversation: NewConversation,
-    ) -> std::result::Result<Conversation, crate::conversation_deletion::ConversationDeletionError> {
-        let store = self.conversation_store.as_ref().ok_or(
-            crate::conversation_deletion::ConversationDeletionError::StoreUnavailable,
-        )?;
+    ) -> std::result::Result<Conversation, crate::conversation_deletion::ConversationDeletionError>
+    {
+        let store = self
+            .conversation_store
+            .as_ref()
+            .ok_or(crate::conversation_deletion::ConversationDeletionError::StoreUnavailable)?;
         let id = conversation.conversation_id.clone();
         if !admission.matches(self.execution_scope.workspace_id(), &id) {
-            return Err(crate::conversation_deletion::ConversationDeletionError::ConversationStore(
-                "managed creation admission does not match destination identity".to_string(),
-            ));
+            return Err(
+                crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                    "managed creation admission does not match destination identity".to_string(),
+                ),
+            );
         }
         if store
             .get_conversation(&id)
@@ -590,9 +608,15 @@ impl ScopedChatRuntime {
                 )
             })?
             .is_some()
-            || store.get_projection_authority(&id).await.map_err(|error| {
-                crate::conversation_deletion::ConversationDeletionError::ConversationStore(error.to_string())
-            })?.is_some()
+            || store
+                .get_projection_authority(&id)
+                .await
+                .map_err(|error| {
+                    crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                        error.to_string(),
+                    )
+                })?
+                .is_some()
         {
             return Err(crate::conversation_deletion::ConversationDeletionError::AlreadyExists(id));
         }
@@ -753,7 +777,10 @@ pub enum AgentMessageSendError {
 #[derive(Clone)]
 struct WorkspaceTaskExecutionTargetResolver {
     workspace_registry: Arc<WorkspaceRegistry>,
-    runtimes: Arc<crate::workspace::runtime::WorkspaceRuntimeRegistry>,
+    // AppState/root and full accepted scopes own the registry. The resolver
+    // is also installed on a hosted Store, so this edge must not point strongly
+    // back through Registry -> Host -> the same Store.
+    runtimes: std::sync::Weak<crate::workspace::runtime::WorkspaceRuntimeRegistry>,
     seed_pool: std::sync::Weak<crate::agent_pool::AgentPool>,
     agent_router: Arc<crate::agent_router::AgentRouter>,
 }
@@ -812,8 +839,11 @@ impl crate::tasks::task_runtime::TaskExecutionTargetResolver
                     target.address.workspace_id
                 )
             })?;
-        let host = self
+        let runtimes = self
             .runtimes
+            .upgrade()
+            .ok_or_else(|| "original workspace runtime registry is unavailable".to_string())?;
+        let host = runtimes
             .get_or_open(workspace)
             .await
             .map_err(|error| error.to_string())?;
@@ -917,7 +947,7 @@ fn render_agent_delivery_instruction(message: &crate::agent_router::AgentMessage
 }
 
 fn cold_delivery_outcome_detail(
-    outcome: &Result<crate::chat_driver::TurnOutcome, String>,
+    outcome: &Result<crate::chat_driver::TurnOutcome, crate::chat_driver::ChatTurnError>,
 ) -> String {
     match outcome {
         Ok(crate::chat_driver::TurnOutcome::Completed) => "turn completed".to_string(),

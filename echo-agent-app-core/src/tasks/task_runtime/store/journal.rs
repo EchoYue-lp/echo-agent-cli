@@ -364,14 +364,16 @@ fn prepare_revisioned_graph_commit(
     }
     if effects.reordered {
         for (position, task) in next.snapshot.tasks.iter_mut().enumerate() {
-            let mut extension: EkoTaskExtension = task
-                .spec
-                .extension_as()
-                .map_err(StoreError::InvalidPlan)?;
+            let mut extension: EkoTaskExtension =
+                task.spec.extension_as().map_err(StoreError::InvalidPlan)?;
             extension.sort_order = i64::try_from(position).unwrap_or(i64::MAX);
-            task.spec = task.spec.clone().with_extension(extension).map_err(|error| {
-                StoreError::InvalidPlan(format!("task extension update failed: {error}"))
-            })?;
+            task.spec = task
+                .spec
+                .clone()
+                .with_extension(extension)
+                .map_err(|error| {
+                    StoreError::InvalidPlan(format!("task extension update failed: {error}"))
+                })?;
         }
     }
     let mut specifications = Vec::with_capacity(next.snapshot.tasks.len());
@@ -383,9 +385,7 @@ fn prepare_revisioned_graph_commit(
             )));
         }
         specifications
-            .push(
-                EkoTaskSpec::try_from(task.spec.clone()).map_err(StoreError::InvalidPlan)?,
-            );
+            .push(EkoTaskSpec::try_from(task.spec.clone()).map_err(StoreError::InvalidPlan)?);
     }
     if expected_revision.is_none()
         && next.snapshot.tasks.iter().any(|task| {
@@ -427,6 +427,7 @@ fn prepare_revisioned_graph_commit(
         "reset_task_ids": effects.reset_task_ids,
         "created_task_ids": created_task_ids,
         "plan": &plan,
+        "executions": next.snapshot.tasks.iter().map(|task| &task.execution).collect::<Vec<_>>(),
     });
     Ok(PreparedRevisionCommit {
         next,
@@ -469,6 +470,16 @@ fn stable_provider_retry_delay_millis(
 }
 
 fn is_run_progress_event(event: &RuntimeTaskEvent) -> bool {
+    // Original-owner admission/completion/ack facts are lifecycle bookkeeping,
+    // not task progress. Counting them resets every no-progress turn budget.
+    // Ordinary task recovery continues to advance the same business frontier.
+    if matches!(
+        event.event_type,
+        RuntimeEventKind::RecoveryBlocked | RuntimeEventKind::RecoveryResolved
+    ) && event.payload.get("physical_owner_intent").is_some()
+    {
+        return false;
+    }
     matches!(
         event.event_type,
         RuntimeEventKind::PlanRevisionCommitted

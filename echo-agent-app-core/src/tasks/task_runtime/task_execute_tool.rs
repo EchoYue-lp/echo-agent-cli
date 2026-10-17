@@ -484,6 +484,15 @@ impl Tool for ExecuteTaskTool {
                 .agent
                 .read(|agent| agent.llm_client().cloned())
                 .await;
+            let retained_tool = match execution_agent.pool_receipt.take() {
+                Some(receipt) => self
+                    .store
+                    .begin_run_tool_receipt(&run_id, receipt)
+                    .map_err(|error| {
+                        super::store::RunDriverFailure::from(error).into_react_error()
+                    })?,
+                None => None,
+            };
             let outcome = super::task_tools::CURRENT_UNATTENDED_WRITE_MODE
                 .scope(write_mode, async {
                     execute_run(
@@ -504,8 +513,22 @@ impl Tool for ExecuteTaskTool {
                     .await
                 })
                 .await;
-            if let Some(pool_receipt) = execution_agent.pool_receipt.take() {
-                super::store::RunDriverExecutionReceipt::release(Box::new(pool_receipt)).await;
+            let outcome = match outcome {
+                Err(super::executor::ExecError::Framework(
+                    source @ echo_agent::error::ReactError::ExecutionNotSettled { .. },
+                )) => {
+                    if let Some(intent) = retained_tool.as_ref() {
+                        self.store.observe_run_tool_receipt(intent);
+                    }
+                    return Err(source);
+                }
+                other => other,
+            };
+            if let Some(intent) = retained_tool.as_ref() {
+                self.store
+                    .finish_run_tool_receipt(intent)
+                    .await
+                    .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
             }
 
             match outcome {

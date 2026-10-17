@@ -3,8 +3,8 @@ schema_version: 1
 id: baseline.repository
 kind: baseline
 source_snapshot:
-  base_revision: ff27188e828c1685337dfd6fcc80b207a6456d6a
-  content_digest: 2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3
+  base_revision: f57b90a2b0962fa5561f8839a3df70be1f261ffa
+  content_digest: 42165674392f8798397a1d6ca6db25de31d2c5aba30563e645d524bddd86a446
 inventory_closure: open
 behavior_model_closure: open
 map_refs: [map.eko-conversation-collaboration, map.eko-framework-consumer-settlement]
@@ -46,9 +46,15 @@ coverage: []
 
 # EKO application semantic baseline
 
+2026-10-17 primary checkpoint仅刷新当前非语义源码摘要，base保已公开main祖先f57；原c874源码482a摘要已由官方source_digest_at_revision核同。GUI/channel两独立red→after/4控制共6pass、具名cron1pass与17file独审/Clippy零warning均属有限证据；完整workspace/GUI/精main CI未完，原needs_review/stale/库存与行为open不关闭。三依赖为人的精确risk_accepted，不冒修复或原audit0。
+
 ## 源码快照
 
-基线绑定 `echo-agent-cli` 最新 `main` 的可恢复 revision 与当前非语义源码摘要。设计和 Plan 已在当前工作树中，后续业务差异必须通过 semantic-diff 刷新摘要和受影响对象。
+32c6719完整83路径审查新增的shared preparation Important经真实journal重开/shared入口反例与same AFTER2pass关闭源码遗漏。原普通control/四surface参数边界见共用Evidence；原Clippy仍属此前切点，当前完整矩阵继续待验。消费者输入先拒绝后经明确准入及独审无消费扩大重评精确重绑，未改锁或三项风险；本次仅刷新实际源码身份，不关闭宽状态或历史引用收据缺口。
+
+dfd5750之后的窄交付增量：精确三依赖risk gate经6测试方法及独审通过，真实锁/新origin在线扫描在单进程HTTP/1.1设置下各scanner1/gate0；原默认fetch失败保留。只刷新当前源码摘要及受影响Rule/Map/Evidence引用，宽B场景、stale audits、库存/行为open与完整workspace/GUI/main CI义务不变。
+
+基线绑定 `echo-agent-cli` 可恢复的开发提交 revision 与当前非语义源码摘要。设计和 Plan 已在当前工作树中，后续业务差异必须通过 semantic-diff 刷新摘要和受影响对象。
 
 ## 仓库区域
 
@@ -69,3 +75,12 @@ coverage: []
 ## 闭合结论
 
 当前基线结构与路径分类可作为后续增量依据；GUI Fork 的当前候选单独绑定测试证据，全仓其它能力的库存闭合与行为模型闭合仍为 open。
+
+## Cancellation observation 开发 checkpoint
+
+当前任务以可恢复a88d247为前置，仅刷新实际非语义源码摘要。原owner typed observation、durable fence与聚合保留的三个场景仍为needs_review、三个lens仍stale；有限源码独审与两条focused测试不等于宽行为Finding/最终消费者闭合。当前构建借public f0a中间framework切点；TUI/GUI条件、其余强例、最终F main和全量门禁仍待。库存与行为模型仍open，不以本checkpoint收缩或删除既有义务。
+
+
+## Scheduler 增量开发 checkpoint
+
+前置提交为5cd9eff0，当前相对依赖是公开开发3ded，不冒最终F main。原Scheduler同slot/Root生命周期两逻辑case各真实before行为fail→after1pass/零warning；独审只该窄scope。原215699时代的三个Behavior/三个stale Audit仅恢复为等价Git5cd9历史锚，状态和结论不变。原scheduler场景新增B影响标needs_review；其它所有宽义务/剩余强例/GUI/全量门禁/最终消费者继续未闭。此处只刷新实际非语义源码摘要与真实前置，不宣全项目行为闭合。

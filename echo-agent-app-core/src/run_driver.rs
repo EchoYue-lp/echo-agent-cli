@@ -28,7 +28,7 @@ use crate::tasks::task_runtime::executor::{
     ExecSink, RunOutcome, TaskRuntimeOperation, drive_agent_run,
 };
 use crate::tasks::task_runtime::memory_bridge::{MemoryEvent, MemoryPolicy};
-use crate::tasks::task_runtime::store::TaskRuntimeStore;
+use crate::tasks::task_runtime::store::{RunDriverFailure, TaskRuntimeStore};
 use crate::tasks::task_runtime::types::{
     RunPlanPolicy, TaskRunExecutionProfile, TaskRunStatus, UnattendedWriteMode,
 };
@@ -91,7 +91,7 @@ fn admitted_human_loop_provider(
 /// agent. The isolated Agent first runs ReAct so it can materialize a formal
 /// plan through `task_create` + `task_execute`, or complete directly when the
 /// Run policy allows it.
-pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> {
+pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, RunDriverFailure> {
     let RunPayload {
         run_id,
         pool,
@@ -106,7 +106,7 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
         mut receipt_owner,
     } = payload;
     if let Some(generation) = memory_generation.as_ref() {
-        receipt_owner.retain(generation.clone());
+        receipt_owner.retain(generation.clone())?;
     }
     let settlement_store = store.clone();
     let settlement_run_id = run_id.clone();
@@ -116,11 +116,11 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
         Err(error) => {
             let message = format!("pool acquire failed for run {run_id}: {error}");
             settle_driver_error(store.clone(), &run_id, &message, cancel.is_cancelled()).await?;
-            return Err(message);
+            return Err(message.into());
         }
     };
     let pool_agent = pool_lease.agent();
-    receipt_owner.retain(pool.retain_for_supervised_run(run_id.clone(), pool_lease));
+    receipt_owner.retain(pool.retain_for_supervised_run(run_id.clone(), pool_lease))?;
     let hitl_run_id = run_id.clone();
     let attended_mode = TaskRuntimeOperation::new(store.clone())
         .run("load independent run HITL policy", move |store| {
@@ -165,10 +165,13 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
     )
     .await;
     if let Err(error) = &result {
+        if error.is_observation() {
+            return result;
+        }
         settle_driver_error(
             settlement_store,
             &settlement_run_id,
-            error,
+            &error.to_string(),
             settlement_cancel.is_cancelled(),
         )
         .await?;
@@ -181,7 +184,7 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
 async fn drive_run_async_inner(
     payload: RunExecutionPayload,
     pool_agent: crate::agent_handle::AgentHandle,
-) -> Result<RunOutcome, String> {
+) -> Result<RunOutcome, RunDriverFailure> {
     let drive_result = drive_agent_run(
         payload.store.clone(),
         pool_agent,
@@ -196,12 +199,7 @@ async fn drive_run_async_inner(
         payload.workspace_io,
     )
     .await;
-    drive_result.map_err(|error| {
-        format!(
-            "agent-driven run failed for run {}: {error}",
-            payload.run_id
-        )
-    })?;
+    drive_result.map_err(RunDriverFailure::from)?;
 
     let load_run_id = payload.run_id.clone();
     let (run, has_plan, execution_profile) = TaskRuntimeOperation::new(payload.store.clone())
@@ -236,7 +234,8 @@ async fn drive_run_async_inner(
                 "run {} ended in non-terminal status {}",
                 payload.run_id,
                 status.as_str()
-            ));
+            )
+            .into());
         }
     };
 

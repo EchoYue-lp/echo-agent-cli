@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use echo_agent::agent::Agent;
 use echo_agent::memory::{ConversationStore, FileConversationStore, FileStore, Store};
 use echo_agent::state::{FileRuntimeStateStore, RuntimeStateStore};
 use futures::FutureExt;
@@ -21,6 +22,8 @@ use crate::evolution::ReviewIntegration;
 use crate::tasks::task_runtime::TaskRuntimeStore;
 
 type WorkspaceShutdownSettlement = Shared<BoxFuture<'static, Result<(), String>>>;
+type WorkspaceLifecycleBinding =
+    Arc<std::sync::RwLock<std::sync::Weak<crate::runtime::ApplicationLifecycleRetention>>>;
 
 /// One coherently prepared set of workspace-scoped runtime resources.
 ///
@@ -46,7 +49,8 @@ pub(crate) struct WorkspaceRuntimeHost {
     resources: WorkspaceRuntimeResources,
     task_runtime: OnceCell<Arc<TaskRuntimeStore>>,
     execution: OnceCell<Arc<WorkspaceExecutionRuntime>>,
-    control_lifecycle: std::sync::Mutex<WorkspaceControlLifecycle>,
+    control_lifecycle: Arc<std::sync::Mutex<WorkspaceControlLifecycle>>,
+    lifecycle_retention: WorkspaceLifecycleBinding,
     operation_stores: Arc<std::sync::Mutex<Vec<std::sync::Weak<TaskRuntimeStore>>>>,
     operation_admission_open: Arc<std::sync::atomic::AtomicBool>,
     shutdown_settlement: std::sync::Mutex<Option<WorkspaceShutdownSettlement>>,
@@ -58,15 +62,33 @@ pub(crate) struct WorkspaceRuntimeHost {
 struct WorkspaceControlLifecycle {
     active: usize,
     closing: bool,
+    lifecycle_binding: Option<WorkspaceLifecycleBinding>,
 }
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceControlLease {
     _receipt: Arc<WorkspaceControlReceipt>,
+    _host: Arc<WorkspaceRuntimeHost>,
+}
+
+/// Only the original retirement counter crosses the opaque framework boundary.
+#[derive(Clone)]
+pub(crate) struct WorkspaceIoLease {
+    _receipt: Arc<WorkspaceControlReceipt>,
+}
+
+impl WorkspaceControlLease {
+    pub(crate) fn io_lifetime(&self) -> WorkspaceIoLease {
+        WorkspaceIoLease {
+            _receipt: self._receipt.clone(),
+        }
+    }
 }
 
 struct WorkspaceControlReceipt {
-    host: Arc<WorkspaceRuntimeHost>,
+    // Invocation guards retain the exact retirement counter, not the Host:
+    // Host -> Agent -> ToolManager -> guard must not return strongly to Host.
+    lifecycle: Arc<std::sync::Mutex<WorkspaceControlLifecycle>>,
 }
 
 struct WorkspaceClosingGuard {
@@ -92,17 +114,30 @@ impl Drop for WorkspaceClosingGuard {
 impl Drop for WorkspaceControlReceipt {
     fn drop(&mut self) {
         let mut lifecycle = self
-            .host
-            .control_lifecycle
+            .lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         lifecycle.active = lifecycle.active.saturating_sub(1);
+        let root = lifecycle.lifecycle_binding.as_ref().and_then(|binding| {
+            binding
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .upgrade()
+        });
+        drop(lifecycle);
+        // This is only progress: the original close authority must still
+        // produce its own real receipt before any dependent teardown.
+        if let Some(root) = root {
+            root.note_progress();
+        }
     }
 }
 
 /// Workspace-owned execution authorities used by foreground and background
 /// turns after focus has moved elsewhere.
 pub(crate) struct WorkspaceExecutionRuntime {
+    primary_closed: std::sync::atomic::AtomicBool,
+    primary_unsettled: std::sync::atomic::AtomicBool,
     primary_agent: crate::agent_handle::AgentHandle,
     pool: Arc<AgentPool>,
     task_runtime: Arc<TaskRuntimeStore>,
@@ -138,6 +173,7 @@ impl WorkspaceRuntimeActivity {
 /// resident until application shutdown; eviction requires an explicit idle
 /// proof and is intentionally deferred.
 pub(crate) struct WorkspaceRuntimeRegistry {
+    lifecycle_retention: WorkspaceLifecycleBinding,
     hosts: Mutex<HashMap<WorkspaceId, Arc<WorkspaceRuntimeHost>>>,
     product_data_io: crate::product_data_io::ProductDataIoService,
     operation_stores: Arc<std::sync::Mutex<Vec<std::sync::Weak<TaskRuntimeStore>>>>,
@@ -266,6 +302,7 @@ impl WorkspaceRuntimeHost {
         operation_stores: Arc<std::sync::Mutex<Vec<std::sync::Weak<TaskRuntimeStore>>>>,
         operation_admission_open: Arc<std::sync::atomic::AtomicBool>,
         product_data_io: crate::product_data_io::ProductDataIoService,
+        lifecycle_retention: WorkspaceLifecycleBinding,
     ) -> anyhow::Result<Arc<Self>> {
         let resources = WorkspaceRuntimeResources::prepare(workspace, product_data_io).await?;
         let workspace = resources.workspace().clone();
@@ -274,7 +311,11 @@ impl WorkspaceRuntimeHost {
             resources,
             task_runtime: OnceCell::new(),
             execution: OnceCell::new(),
-            control_lifecycle: std::sync::Mutex::new(WorkspaceControlLifecycle::default()),
+            lifecycle_retention: lifecycle_retention.clone(),
+            control_lifecycle: Arc::new(std::sync::Mutex::new(WorkspaceControlLifecycle {
+                lifecycle_binding: Some(lifecycle_retention.clone()),
+                ..WorkspaceControlLifecycle::default()
+            })),
             operation_stores,
             operation_admission_open,
             shutdown_settlement: std::sync::Mutex::new(None),
@@ -321,8 +362,9 @@ impl WorkspaceRuntimeHost {
             .ok_or_else(|| anyhow::anyhow!("workspace control lease counter exhausted"))?;
         drop(lifecycle);
         Ok(WorkspaceControlLease {
+            _host: self.clone(),
             _receipt: Arc::new(WorkspaceControlReceipt {
-                host: Arc::clone(self),
+                lifecycle: Arc::clone(&self.control_lifecycle),
             }),
         })
     }
@@ -413,6 +455,14 @@ impl WorkspaceRuntimeHost {
                     self.resources.tasks_dir(),
                     self.id().to_string(),
                 )?);
+                if let Some(root) = self
+                    .lifecycle_retention
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .upgrade()
+                {
+                    store.bind_lifecycle_retention(&root);
+                }
                 self.operation_stores
                     .lock()
                     .map_err(|_| {
@@ -432,6 +482,14 @@ impl WorkspaceRuntimeHost {
                 Ok::<Arc<TaskRuntimeStore>, anyhow::Error>(store)
             })
             .await?;
+        if let Some(root) = self
+            .lifecycle_retention
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade()
+        {
+            store.bind_lifecycle_retention(&root);
+        }
         Ok(Arc::clone(store))
     }
 
@@ -514,6 +572,9 @@ impl WorkspaceRuntimeHost {
                         workspace_io_identity,
                     })
                     .await?;
+                if let Some(root) = self.lifecycle_retention.read().unwrap_or_else(|error| error.into_inner()).upgrade() {
+                    pool.bind_lifecycle_retention(&root);
+                }
                 let primary_agent = pool.primary_agent().await?;
                 review_integration.bind_rule_projection_primary(primary_agent.clone());
                 review_integration.initialize_rule_promotions().await?;
@@ -545,6 +606,8 @@ impl WorkspaceRuntimeHost {
                 drop(review_generation);
                 let execution = Arc::new(
                     WorkspaceExecutionRuntime {
+                    primary_closed: std::sync::atomic::AtomicBool::new(false),
+                    primary_unsettled: std::sync::atomic::AtomicBool::new(false),
                         primary_agent,
                         pool,
                         task_runtime,
@@ -761,6 +824,115 @@ impl WorkspaceExecutionRuntime {
 }
 
 impl WorkspaceRuntimeRegistry {
+    pub(crate) fn bind_lifecycle_retention(
+        &self,
+        root: &Arc<crate::runtime::ApplicationLifecycleRetention>,
+    ) {
+        *self
+            .lifecycle_retention
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(root);
+        self.product_data_io.bind_lifecycle_retention(root);
+        for store in self
+            .operation_stores
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+        {
+            store.bind_lifecycle_retention(root);
+        }
+    }
+
+    pub(crate) async fn has_unsettled_owners(&self) -> bool {
+        let hosts = self
+            .hosts
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        hosts.iter().any(|host| {
+            host.task_runtime
+                .get()
+                .is_some_and(|store| store.has_unsettled_driver_resources())
+                || host.execution.get().is_some_and(|runtime| {
+                    runtime.pool.has_unsettled_executions()
+                        || runtime
+                            .primary_unsettled
+                            .load(std::sync::atomic::Ordering::Acquire)
+                })
+        })
+    }
+
+    /// Do not enter Host's cached final teardown while an exact original
+    /// owner is retained. Visit every host so one uncertainty cannot suppress
+    /// another host's real Task/file/pool drain.
+    pub(crate) async fn join_known_shutdown(&self) -> Result<(), String> {
+        let hosts = self
+            .hosts
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut errors = Vec::new();
+        for host in hosts {
+            if let Some(store) = host.task_runtime.get() {
+                if let Err(error) = store.retry_run_settlement_debts().await {
+                    errors.push(format!("workspace {} original cleanup: {error}", host.id()));
+                }
+                if let Err(error) = store.shutdown_run_drivers().await {
+                    errors.push(format!("workspace {} TaskRun: {error}", host.id()));
+                }
+                if let Err(error) = store.shutdown_operations().await {
+                    errors.push(format!("workspace {} operations: {error}", host.id()));
+                }
+            }
+            if let Some(runtime) = host.execution.get() {
+                if let Err(error) = runtime.pool.join_known_executions().await {
+                    errors.push(format!("workspace {} pool: {error}", host.id()));
+                }
+                let dependent_uncertainty = runtime.task_runtime.has_unsettled_driver_resources()
+                    || runtime.pool.has_unsettled_executions();
+                if !dependent_uncertainty
+                    && !runtime
+                        .primary_closed
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    match runtime
+                        .primary_agent
+                        .read_async(|agent| Box::pin(async move { agent.close().await }))
+                        .await
+                    {
+                        Ok(()) => {
+                            runtime
+                                .primary_closed
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            runtime
+                                .primary_unsettled
+                                .store(false, std::sync::atomic::Ordering::Release);
+                        }
+                        Err(error) => {
+                            runtime
+                                .primary_unsettled
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            errors.push(format!(
+                                "workspace {} original Agent close: {error}",
+                                host.id()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::new_with_product_data_io(crate::product_data_io::ProductDataIoService::new())
@@ -770,6 +942,7 @@ impl WorkspaceRuntimeRegistry {
         product_data_io: crate::product_data_io::ProductDataIoService,
     ) -> Self {
         Self {
+            lifecycle_retention: Arc::new(std::sync::RwLock::new(std::sync::Weak::new())),
             hosts: Mutex::new(HashMap::new()),
             product_data_io,
             operation_stores: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -803,6 +976,7 @@ impl WorkspaceRuntimeRegistry {
             Arc::clone(&self.operation_stores),
             Arc::clone(&self.operation_admission_open),
             self.product_data_io(),
+            self.lifecycle_retention.clone(),
         )
         .await?;
         hosts.insert(workspace_id, Arc::clone(&host));
@@ -837,6 +1011,7 @@ impl WorkspaceRuntimeRegistry {
                     Arc::clone(&self.operation_stores),
                     Arc::clone(&self.operation_admission_open),
                     self.product_data_io(),
+                    self.lifecycle_retention.clone(),
                 )
                 .await?;
                 hosts.insert(workspace_id, Arc::clone(&host));
@@ -1888,6 +2063,44 @@ mod tests {
             process_cwd
         );
         mcp.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_receipt_retains_retirement_counter_without_host_backedge() -> Result<(), String>
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("control-no-host-backedge");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let registry = WorkspaceRuntimeRegistry::new();
+        let host = registry
+            .get_or_open(workspace("control-no-host-backedge", root))
+            .await
+            .map_err(|error| error.to_string())?;
+        let original_host = Arc::downgrade(&host);
+        let counter = Arc::clone(&host.control_lifecycle);
+        let lease = host
+            .acquire_control_lease()
+            .map_err(|error| error.to_string())?;
+        let opaque = lease.io_lifetime();
+        let second_observer = opaque.clone();
+        assert_eq!(counter.lock().map_err(|error| error.to_string())?.active, 1);
+
+        // The application root owns the Host; an opaque invocation lifetime
+        // must not keep the Host/Agent/ToolManager graph alive in return.
+        drop(registry);
+        drop(host);
+        assert!(
+            original_host.upgrade().is_some(),
+            "the full caller still owns Host capability"
+        );
+        drop(lease);
+        assert!(original_host.upgrade().is_none());
+        assert_eq!(counter.lock().map_err(|error| error.to_string())?.active, 1);
+        drop(opaque);
+        assert_eq!(counter.lock().map_err(|error| error.to_string())?.active, 1);
+        drop(second_observer);
+        assert_eq!(counter.lock().map_err(|error| error.to_string())?.active, 0);
         Ok(())
     }
 

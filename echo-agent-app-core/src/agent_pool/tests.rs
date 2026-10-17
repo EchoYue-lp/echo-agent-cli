@@ -828,8 +828,7 @@ mod tests {
         let old_skill_dir = old_project_root.join(".eko/skills/project-review");
         std::fs::create_dir_all(&workspace_root).map_err(|error| error.to_string())?;
         std::fs::create_dir_all(&old_skill_dir).map_err(|error| error.to_string())?;
-        std::fs::create_dir_all(project_root.join(".git"))
-            .map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(project_root.join(".git")).map_err(|error| error.to_string())?;
         std::fs::create_dir_all(&skill_dir).map_err(|error| error.to_string())?;
         std::fs::write(project_root.join("AGENTS.md"), "LINKED_PROJECT_AGENT_RULE")
             .map_err(|error| error.to_string())?;
@@ -857,17 +856,12 @@ mod tests {
             .write_async(|agent| {
                 Box::pin(async move {
                     agent
-                        .tag_skills_source(
-                            &["project-review".to_string()],
-                            "plugin:old-project",
-                        )
+                        .tag_skills_source(&["project-review".to_string()], "plugin:old-project")
                         .await;
                 })
             })
             .await;
-        let seed_generation = seed_primary
-            .read(|agent| agent.skill_descriptors())
-            .await;
+        let seed_generation = seed_primary.read(|agent| agent.skill_descriptors()).await;
         let mut publication = seed
             .begin_plugin_publication()
             .await
@@ -881,7 +875,10 @@ mod tests {
             ))
             .await
             .map_err(|error| error.to_string())?;
-        publication.commit().await.map_err(|error| error.to_string())?;
+        publication
+            .commit()
+            .await
+            .map_err(|error| error.to_string())?;
 
         let now = chrono::Utc::now();
         let workspace = crate::workspace::Workspace {
@@ -1140,7 +1137,13 @@ mod tests {
             .acquire("side-1")
             .await
             .map_err(|error| error.to_string())?;
-        assert_eq!(first.agent().read(|child| child.model_name().to_string()).await, "a");
+        assert_eq!(
+            first
+                .agent()
+                .read(|child| child.model_name().to_string())
+                .await,
+            "a"
+        );
         drop(first);
 
         pool.configure_side_conversation("side-1", Some("local:b"))
@@ -1150,7 +1153,13 @@ mod tests {
             .acquire("side-1")
             .await
             .map_err(|error| error.to_string())?;
-        assert_eq!(second.agent().read(|child| child.model_name().to_string()).await, "b");
+        assert_eq!(
+            second
+                .agent()
+                .read(|child| child.model_name().to_string())
+                .await,
+            "b"
+        );
         drop(second);
         assert!(
             pool.configure_side_conversation("side-1", Some("missing:model"))
@@ -1542,7 +1551,10 @@ mod tests {
                 .map_err(|error| error.to_string())?,
             existing.agent(),
         ] {
-            assert_eq!(handle.read(|agent| agent.thinking().cloned()).await, thinking);
+            assert_eq!(
+                handle.read(|agent| agent.thinking().cloned()).await,
+                thinking
+            );
         }
         let future = pool
             .acquire("thinking-future")
@@ -1556,13 +1568,12 @@ mod tests {
         for key in ["thinking-existing", "thinking-future"] {
             let inherited = agents
                 .get(key)
-                .and_then(|pooled| {
-                    pooled
-                        .model_consumers
-                        .inherited_handle_for_test("reviewer")
-                })
+                .and_then(|pooled| pooled.model_consumers.inherited_handle_for_test("reviewer"))
                 .ok_or_else(|| format!("{key} has no inherited Subagent"))?;
-            assert_eq!(inherited.read(|agent| agent.thinking().cloned()).await, thinking);
+            assert_eq!(
+                inherited.read(|agent| agent.thinking().cloned()).await,
+                thinking
+            );
         }
         Ok(())
     }
@@ -1909,8 +1920,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permanent_terminal_debt_reports_abandonment_and_unblocks_pool_shutdown() -> TestResult
-    {
+    async fn permanent_terminal_debt_retains_original_receipts_until_durable_retry() -> TestResult {
+        use crate::tasks::task_runtime::store::RunDriverExecutionReceipt;
+        struct CountedMemoryRelease {
+            probe: MemoryReleaseProbe,
+            releases: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl RunDriverExecutionReceipt for CountedMemoryRelease {
+            fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
+                let Self { probe, releases } = *self;
+                Box::pin(async move {
+                    Box::new(probe).release().await;
+                    let mut count = releases.load(Ordering::SeqCst);
+                    loop {
+                        match releases.compare_exchange_weak(
+                            count,
+                            count.saturating_add(1),
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        ) {
+                            Ok(_) => break,
+                            Err(current) => count = current,
+                        }
+                    }
+                })
+            }
+        }
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root = temp.path().join("tasks");
         let blocked_root = temp.path().join("tasks-blocked");
@@ -1920,9 +1955,12 @@ mod tests {
             )
             .map_err(|error| error.to_string())?,
         );
-        let canonical_root = std::fs::canonicalize(temp.path())
-            .map_err(|error| error.to_string())?
-            .join("tasks");
+        let _resource_scope = store.test_resource_scope();
+        let physical_fault = store.block_shadow_after_physical_completion_for_test(
+            "permanent-terminal-debt",
+            blocked_root.clone(),
+        )?;
+
         store
             .create_run(
                 "permanent-terminal-debt",
@@ -1950,6 +1988,8 @@ mod tests {
         let pool_for_driver = Arc::clone(&pool);
         let released_after_pool = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release_probe = Arc::clone(&released_after_pool);
+        let memory_releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted_releases = memory_releases.clone();
         let admission = store
             .reserve_run_driver_admission(
                 "permanent-terminal-debt".to_string(),
@@ -1964,18 +2004,22 @@ mod tests {
                 admission,
                 generation_lease,
                 move |mut receipt_owner| async move {
-                    receipt_owner.retain(MemoryReleaseProbe {
-                        pool: Arc::clone(&pool_for_driver),
-                        released_after_pool: release_probe,
-                    });
-                    receipt_owner.retain(pool_for_driver.retain_for_supervised_run(
-                        "permanent-terminal-debt".to_string(),
-                        pool_execution,
-                    ));
-                    std::fs::rename(&root, &blocked_root)
-                        .map_err(|error| format!("block task root: {error}"))?;
-                    std::fs::write(&root, b"block directory recreation")
-                        .map_err(|error| format!("replace task root: {error}"))?;
+                    receipt_owner
+                        .retain(CountedMemoryRelease {
+                            probe: MemoryReleaseProbe {
+                                pool: Arc::clone(&pool_for_driver),
+                                released_after_pool: release_probe,
+                            },
+                            releases: counted_releases,
+                        })
+                        .map_err(|error| error.to_string())?;
+                    receipt_owner
+                        .retain(pool_for_driver.retain_for_supervised_run(
+                            "permanent-terminal-debt".to_string(),
+                            pool_execution,
+                        ))
+                        .map_err(|error| error.to_string())?;
+
                     Err::<(), String>("injected permanent driver failure".to_string())
                 },
             )
@@ -1985,8 +2029,47 @@ mod tests {
             .map_err(|error| error.to_string())?
             .err()
             .ok_or_else(|| "permanent driver failure was not reported".to_string())?;
-        assert!(driver_error.contains("terminal settlement failed"));
+        let physical_event = physical_fault
+            .lock()
+            .map_err(|_| "physical completion fixture lock poisoned".to_string())?
+            .clone()
+            .ok_or_else(|| "physical completion did not reach fault boundary".to_string())??;
+        assert_eq!(physical_event.run_id, "permanent-terminal-debt");
+        assert_eq!(
+            physical_event
+                .payload
+                .get("physical_owner_intent")
+                .and_then(|intent| intent.get("physical_terminal_observed"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(!driver_error.is_empty());
+        assert!(
+            driver_error.contains("injected permanent driver failure")
+                && driver_error.contains("terminal settlement failed")
+                && driver_error.contains("run not found: permanent-terminal-debt"),
+            "actual error: {driver_error}"
+        );
 
+        let canonical_journal = blocked_root.join("permanent-terminal-debt/events.jsonl");
+        let journal_before_missing =
+            std::fs::read(&canonical_journal).map_err(|error| error.to_string())?;
+        let original_frame: serde_json::Value = serde_json::from_str(
+            std::str::from_utf8(&journal_before_missing)
+                .map_err(|error| error.to_string())?
+                .lines()
+                .next()
+                .ok_or_else(|| "original journal frame missing".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let journal_identity = original_frame
+            .get("journal_identity")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "original journal identity missing".to_string())?;
+        // The debt already exists. Losing the root entirely must not be
+        // interpreted as evidence that the original owner never started.
+        std::fs::remove_file(&root).map_err(|error| error.to_string())?;
+        assert!(!root.exists());
         let shutdown_error =
             tokio::time::timeout(Duration::from_secs(2), store.shutdown_run_drivers())
                 .await
@@ -1994,42 +2077,200 @@ mod tests {
                 .err()
                 .ok_or_else(|| "permanent settlement debt was not reported".to_string())?;
         assert_eq!(shutdown_error.abandoned_settlements.len(), 1);
-        let diagnostic = shutdown_error
+        let debt = shutdown_error
             .abandoned_settlements
             .first()
-            .ok_or_else(|| "abandoned settlement diagnostic is missing".to_string())?;
-        let driver_token = diagnostic
-            .driver_token
-            .ok_or_else(|| "abandoned settlement driver token is missing".to_string())?;
-        assert_eq!(diagnostic.run_id, "permanent-terminal-debt");
-        assert_eq!(diagnostic.root, canonical_root);
-        assert!(!diagnostic.error.is_empty());
-        let shutdown_text = shutdown_error.to_string();
-        assert!(shutdown_text.contains("run=permanent-terminal-debt"));
-        assert!(shutdown_text.contains(&format!("driver_token={driver_token}")));
-        assert!(shutdown_text.contains(&diagnostic.root.display().to_string()));
-        assert_eq!(store.active_run_driver_count()?, 0);
+            .ok_or_else(|| "original terminal debt diagnostic missing".to_string())?;
+        assert_eq!(debt.run_id, "permanent-terminal-debt");
+        assert!(debt.driver_token.is_some());
+        assert_eq!(
+            debt.root,
+            std::fs::canonicalize(temp.path())
+                .map_err(|error| error.to_string())?
+                .join("tasks")
+        );
+        assert_eq!(
+            debt.target,
+            crate::tasks::task_runtime::TaskRunStatus::Failed
+        );
+        assert!(!debt.error.is_empty());
+        assert_eq!(store.active_run_driver_count()?, 1);
+        assert_eq!(store.active_run_driver_receipt_count()?, 2);
+        assert!(!released_after_pool.load(Ordering::SeqCst));
+        assert_eq!(memory_releases.load(Ordering::SeqCst), 0);
+        assert!(store.begin_workspace_transition().await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), pool.shutdown())
+                .await
+                .map_err(|_| "unknown pool ownership was not observable".to_string())?
+                .is_err()
+        );
+        assert_eq!(store.active_run_driver_count()?, 1);
+        assert_eq!(store.active_run_driver_receipt_count()?, 2);
+        assert!(!released_after_pool.load(Ordering::SeqCst));
+        assert_eq!(memory_releases.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read(&canonical_journal).map_err(|error| error.to_string())?,
+            journal_before_missing
+        );
+        let owner_id = physical_event
+            .payload
+            .get("physical_owner_intent")
+            .and_then(|intent| intent.get("owner_id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "original physical owner id missing".to_string())?;
+        if root.exists() {
+            // Cached authority may rematerialize derived projections while the
+            // original journal is unavailable. Preserve those files separately
+            // before restoring the same original directory; never discard or
+            // substitute a canonical journal to make retry succeed.
+            assert!(root.is_dir() && !root.is_symlink());
+            let projected_run = root.join("permanent-terminal-debt");
+            for entry in std::fs::read_dir(&root).map_err(|error| error.to_string())? {
+                let entry = entry.map_err(|error| error.to_string())?;
+                assert_eq!(entry.path(), projected_run);
+                assert!(
+                    entry
+                        .file_type()
+                        .map_err(|error| error.to_string())?
+                        .is_dir()
+                );
+            }
+            for entry in std::fs::read_dir(&projected_run).map_err(|error| error.to_string())? {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let name = entry.file_name();
+                assert!(name == "run-state.json" || name == "checkpoint.json");
+                assert!(
+                    entry
+                        .file_type()
+                        .map_err(|error| error.to_string())?
+                        .is_file()
+                );
+            }
+            assert!(!projected_run.join("events.jsonl").exists());
+            let projection: crate::tasks::task_runtime::RunStateSnapshot = serde_json::from_slice(
+                &std::fs::read(projected_run.join("run-state.json"))
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            let completed_sequence =
+                u64::try_from(physical_event.seq).map_err(|error| error.to_string())?;
+            assert_eq!(projection.journal_sequence, completed_sequence);
+            assert_eq!(
+                projection.run.status,
+                crate::tasks::task_runtime::TaskRunStatus::Running
+            );
+            assert_eq!(projection.event_index.physical_owner_intents.len(), 1);
+            let projected_owner = projection
+                .event_index
+                .physical_owner_intents
+                .first()
+                .ok_or_else(|| "rebuilt original owner projection missing".to_string())?;
+            assert_eq!(projected_owner.owner_id, owner_id);
+            assert!(projected_owner.physical_terminal_observed);
+            let checkpoint: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(projected_run.join("checkpoint.json"))
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            assert_eq!(
+                checkpoint
+                    .get("journal_identity")
+                    .and_then(serde_json::Value::as_str),
+                Some(journal_identity)
+            );
+            assert_eq!(
+                checkpoint
+                    .get("sequence")
+                    .and_then(serde_json::Value::as_u64),
+                Some(completed_sequence)
+            );
+
+            std::fs::rename(&root, temp.path().join("tasks-derived-projections"))
+                .map_err(|error| error.to_string())?;
+        }
+        std::fs::rename(temp.path().join("tasks-blocked"), temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        let restored_journal = temp
+            .path()
+            .join("tasks/permanent-terminal-debt/events.jsonl");
+        assert_eq!(
+            std::fs::read(&restored_journal).map_err(|error| error.to_string())?,
+            journal_before_missing
+        );
+        let restored = store
+            .get_run_state("permanent-terminal-debt")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "restored original source missing".to_string())?;
+        assert_eq!(restored.event_index.physical_owner_intents.len(), 1);
+        let original = restored
+            .event_index
+            .physical_owner_intents
+            .first()
+            .ok_or_else(|| "restored original intent missing".to_string())?;
+        assert_eq!(original.owner_id, owner_id);
+        assert!(original.physical_terminal_observed);
+        store
+            .retry_run_settlement_debts()
+            .await
+            .map_err(|error| error.to_string())?;
         assert_eq!(store.active_run_driver_receipt_count()?, 0);
         assert!(released_after_pool.load(Ordering::SeqCst));
+        assert_eq!(memory_releases.load(Ordering::SeqCst), 1);
+        let after_retry = std::fs::read(&restored_journal).map_err(|error| error.to_string())?;
+        assert!(after_retry.starts_with(&journal_before_missing));
+        let events = store
+            .list_events("permanent-terminal-debt", 0)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event_type
+                        == crate::tasks::task_runtime::RuntimeEventKind::RecoveryResolved
+                        && event
+                            .payload
+                            .get("physical_owner_intent")
+                            .and_then(|intent| intent.get("owner_id"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(owner_id)
+                })
+                .count(),
+            1
+        );
+        assert!(
+            store
+                .get_run_state("permanent-terminal-debt")
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "settled source missing".to_string())?
+                .event_index
+                .physical_owner_intents
+                .is_empty()
+        );
+        store
+            .retry_run_settlement_debts()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            std::fs::read(&restored_journal).map_err(|error| error.to_string())?,
+            after_retry
+        );
+        assert_eq!(memory_releases.load(Ordering::SeqCst), 1);
         let transition = store
             .begin_workspace_transition()
             .await
             .map_err(|error| error.to_string())?;
         drop(transition);
-
         tokio::time::timeout(Duration::from_secs(2), pool.shutdown())
             .await
-            .map_err(|_| "AgentPool shutdown remained blocked by abandoned debt".to_string())??;
-        std::fs::remove_file(temp.path().join("tasks")).map_err(|error| error.to_string())?;
-        std::fs::rename(temp.path().join("tasks-blocked"), temp.path().join("tasks"))
-            .map_err(|error| error.to_string())?;
+            .map_err(|_| "known original receipt did not release the pool".to_string())??;
         let run = store
             .get_run("permanent-terminal-debt")
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "non-terminal run disappeared from disk".to_string())?;
         assert_eq!(
             run.status,
-            crate::tasks::task_runtime::TaskRunStatus::Running
+            crate::tasks::task_runtime::TaskRunStatus::Failed
         );
         Ok(())
     }
@@ -2045,6 +2286,11 @@ mod tests {
             )
             .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
+        let physical_fault = store.block_shadow_after_physical_completion_for_test(
+            "aborted-shutdown-waiter",
+            blocked_root.clone(),
+        )?;
         store
             .create_run(
                 "aborted-shutdown-waiter",
@@ -2085,10 +2331,12 @@ mod tests {
                 admission,
                 generation_lease,
                 move |mut receipt_owner| async move {
-                    receipt_owner.retain(pool_for_driver.retain_for_supervised_run(
-                        "aborted-shutdown-waiter".to_string(),
-                        execution,
-                    ));
+                    receipt_owner
+                        .retain(pool_for_driver.retain_for_supervised_run(
+                            "aborted-shutdown-waiter".to_string(),
+                            execution,
+                        ))
+                        .map_err(|error| error.to_string())?;
                     driver_cancel.cancelled().await;
                     cancel_observed_tx
                         .send(())
@@ -2096,10 +2344,7 @@ mod tests {
                     continue_driver_rx
                         .await
                         .map_err(|error| error.to_string())?;
-                    std::fs::rename(&root, &blocked_root)
-                        .map_err(|error| format!("block task root: {error}"))?;
-                    std::fs::write(&root, b"block directory recreation")
-                        .map_err(|error| format!("replace task root: {error}"))?;
+
                     Err::<(), String>("injected failure after shutdown waiter abort".to_string())
                 },
             )
@@ -2128,41 +2373,77 @@ mod tests {
                 .map_err(|_| "second shutdown waiter did not observe owned settlement".to_string())?
                 .err()
                 .ok_or_else(|| "permanent debt was hidden after waiter abort".to_string())?;
+        let physical_event = physical_fault
+            .lock()
+            .map_err(|_| "physical completion fixture lock poisoned".to_string())?
+            .clone()
+            .ok_or_else(|| "physical completion did not reach fault boundary".to_string())??;
+        assert_eq!(physical_event.run_id, "aborted-shutdown-waiter");
+        assert_eq!(
+            physical_event
+                .payload
+                .get("physical_owner_intent")
+                .and_then(|intent| intent.get("physical_terminal_observed"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
         assert_eq!(shutdown_error.abandoned_settlements.len(), 1);
+        let debt = shutdown_error
+            .abandoned_settlements
+            .first()
+            .ok_or_else(|| "original terminal debt diagnostic missing".to_string())?;
+        assert_eq!(debt.run_id, "aborted-shutdown-waiter");
+        assert!(debt.driver_token.is_some());
+        assert_eq!(
+            debt.root,
+            std::fs::canonicalize(temp.path())
+                .map_err(|error| error.to_string())?
+                .join("tasks")
+        );
+        assert_eq!(
+            debt.target,
+            crate::tasks::task_runtime::TaskRunStatus::Cancelled
+        );
+        assert!(!debt.error.is_empty());
         assert!(
             shutdown_error
                 .driver_errors
                 .iter()
                 .any(|error| error.contains("shutdown reporter failed"))
         );
-        let diagnostic = shutdown_error
-            .abandoned_settlements
-            .first()
-            .ok_or_else(|| "abandoned settlement diagnostic is missing".to_string())?;
-        assert_eq!(diagnostic.run_id, "aborted-shutdown-waiter");
-        assert!(diagnostic.driver_token.is_some());
-        assert_eq!(store.active_run_driver_count()?, 0);
-        assert_eq!(store.active_run_driver_receipt_count()?, 0);
+        assert_eq!(store.active_run_driver_count()?, 1);
+        assert_eq!(store.active_run_driver_receipt_count()?, 1);
         let repeated_error = store
             .shutdown_run_drivers()
             .await
             .err()
             .ok_or_else(|| "repeated shutdown lost its typed degradation".to_string())?;
         assert_eq!(repeated_error, shutdown_error);
-        tokio::time::timeout(Duration::from_secs(2), pool.shutdown())
-            .await
-            .map_err(|_| "pool shutdown remained blocked after waiter abort".to_string())??;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), pool.shutdown())
+                .await
+                .map_err(|_| "unknown original lease did not report its owner".to_string())?
+                .is_err()
+        );
 
         std::fs::remove_file(temp.path().join("tasks")).map_err(|error| error.to_string())?;
         std::fs::rename(temp.path().join("tasks-blocked"), temp.path().join("tasks"))
             .map_err(|error| error.to_string())?;
+        store
+            .retry_run_settlement_debts()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(store.active_run_driver_receipt_count()?, 0);
+        tokio::time::timeout(Duration::from_secs(2), pool.shutdown())
+            .await
+            .map_err(|_| "settled original receipt remained active".to_string())??;
         let run = store
             .get_run("aborted-shutdown-waiter")
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "abandoned run disappeared".to_string())?;
         assert_eq!(
             run.status,
-            crate::tasks::task_runtime::TaskRunStatus::Running
+            crate::tasks::task_runtime::TaskRunStatus::Cancelled
         );
         Ok(())
     }

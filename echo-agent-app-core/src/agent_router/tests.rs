@@ -720,6 +720,7 @@ mod tests {
             attempt_id: "typed-attempt".to_string(),
             started_at: timestamp,
             turn_id: "typed-turn".to_string(),
+            replacement_payload: None,
         })?;
         append(DeliveryEvent::MailboxAccepted {
             message_id: "typed-lifecycle".to_string(),

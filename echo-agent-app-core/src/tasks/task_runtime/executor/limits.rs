@@ -36,12 +36,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use echo_agent::subagent::{ContextTransferPolicy, SubagentInvocation};
-use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
 use echo_agent::agent::ExecutionAdmission;
+use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
 use echo_agent::runtime::{
     AgentTurnDriver, EventSink, SinkControl, TurnMode, TurnOutcome, TurnReceipt, TurnRequest,
 };
+use echo_agent::subagent::{ContextTransferPolicy, SubagentInvocation};
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
 
 /// Process-wide EKO resource ceiling shared by every workspace and TaskRun.
@@ -158,16 +158,7 @@ pub fn process_execution_resource_snapshot() -> ProcessExecutionResourceSnapshot
 }
 
 /// Scope of an execution-flow event on the unified frontend channel.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    ts_rs::TS,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "ExecEventScope")]
 pub enum ExecEventScope {
@@ -180,9 +171,7 @@ pub enum ExecEventScope {
 ///
 /// The application keeps this metadata separate from its workspace address so
 /// replay can validate both authorities without parsing execution-id formats.
-#[derive(
-    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 #[ts(export, rename = "SubagentEventMetadata")]
 pub struct SubagentEventMetadata {
@@ -360,8 +349,7 @@ mod exec_event_typescript_contract_tests {
     }
 
     #[test]
-    fn app_owned_exec_event_serializes_absent_framework_metadata_as_null()
-    -> Result<(), String> {
+    fn app_owned_exec_event_serializes_absent_framework_metadata_as_null() -> Result<(), String> {
         let value = serde_json::to_value(ExecEvent::run(
             "workspace-1",
             "conversation-1",
@@ -370,7 +358,11 @@ mod exec_event_typescript_contract_tests {
             serde_json::json!({}),
         ))
         .map_err(|error| error.to_string())?;
-        assert!(value.get("framework_event").is_some_and(serde_json::Value::is_null));
+        assert!(
+            value
+                .get("framework_event")
+                .is_some_and(serde_json::Value::is_null)
+        );
         Ok(())
     }
 }
@@ -434,11 +426,11 @@ pub enum RunOutcome {
 
 pub struct TaskRunResumeLaunch {
     pub run_id: String,
-    completion: tokio::sync::oneshot::Receiver<Result<RunOutcome, String>>,
+    completion: tokio::sync::oneshot::Receiver<Result<RunOutcome, super::store::RunDriverFailure>>,
 }
 
 impl TaskRunResumeLaunch {
-    pub async fn wait(self) -> Result<RunOutcome, String> {
+    pub async fn wait(self) -> Result<RunOutcome, super::store::RunDriverFailure> {
         self.completion
             .await
             .map_err(|error| format!("TaskRun resume completion channel closed: {error}"))?
@@ -459,7 +451,8 @@ pub async fn launch_task_run_resume(
     let run_id = expected.run_id.clone();
     let admission = store.reserve_run_driver_admission(run_id.clone(), cancel.clone())?;
     let generation_lease = store.lease_active_workspace_generation()?;
-    let registration = store.register_run_driver::<RunOutcome>(admission, generation_lease)?;
+    let registration =
+        store.register_observed_run_driver::<RunOutcome>(admission, generation_lease)?;
     TaskRuntimeOperation::new(store.clone())
         .run_owned("prepare exact TaskRun resume", move || {
             let mut registration = registration;
@@ -504,13 +497,14 @@ pub async fn launch_task_run_resume(
             let completion = registration.start(
                 move |mut receipt_owner: super::store::RunDriverReceiptOwner| async move {
                     if let Some(generation) = memory_generation.as_ref() {
-                        receipt_owner.retain(generation.clone());
+                        receipt_owner.retain(generation.clone())?;
                     }
                     if let Some(execution) = pool_execution {
-                        receipt_owner.retain(execution);
+                        receipt_owner.retain(execution)?;
                     }
                     if has_plan {
-                        let run_store = primary_agent.read(|agent| agent.run_store().cloned()).await;
+                        let run_store =
+                            primary_agent.read(|agent| agent.run_store().cloned()).await;
                         let reviewer_llm = primary_agent
                             .read(|agent| agent.llm_client().cloned())
                             .await;
@@ -527,7 +521,7 @@ pub async fn launch_task_run_resume(
                             workspace_io,
                         )
                         .await
-                        .map_err(|error| error.to_string());
+                        .map_err(super::store::RunDriverFailure::from);
                     }
 
                     drive_agent_run(
@@ -544,7 +538,7 @@ pub async fn launch_task_run_resume(
                         workspace_io,
                     )
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(super::store::RunDriverFailure::from)?;
                     let outcome_run_id = preparation_run_id.clone();
                     let run = TaskRuntimeOperation::new(preparation_store.clone())
                         .run("load resumed direct run outcome", move |store| {
@@ -553,7 +547,7 @@ pub async fn launch_task_run_resume(
                                 .ok_or(StoreError::RunNotFound(outcome_run_id))
                         })
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(super::store::RunDriverFailure::from)?;
                     let outcome = match run.status {
                         TaskRunStatus::Completed => RunOutcome::Completed,
                         TaskRunStatus::Cancelled => RunOutcome::Cancelled,
@@ -570,7 +564,8 @@ pub async fn launch_task_run_resume(
                                 "resumed direct run {} ended in non-terminal status {}",
                                 preparation_run_id,
                                 status.as_str()
-                            ));
+                            )
+                            .into());
                         }
                     };
                     if matches!(outcome, RunOutcome::Completed | RunOutcome::Cancelled) {
@@ -666,6 +661,8 @@ fn unattended_run_prompt(
 /// Error returned by the executor.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
+    #[error(transparent)]
+    Framework(#[from] echo_agent::error::ReactError),
     #[error("run {0} not found")]
     RunNotFound(String),
     #[error("run {0} has no plan")]
@@ -680,4 +677,13 @@ pub enum ExecError {
     Delegate(String),
     #[error("{0}")]
     Other(String),
+}
+
+impl From<ExecError> for super::store::RunDriverFailure {
+    fn from(error: ExecError) -> Self {
+        match error {
+            ExecError::Framework(source) => Self::from(source),
+            other => Self::Error(other.to_string()),
+        }
+    }
 }

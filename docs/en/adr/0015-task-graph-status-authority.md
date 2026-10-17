@@ -78,6 +78,22 @@ The task tools remain `task_create`, `task_update`, `task_list`, and
 surface-local state mutation is introduced. The former interaction-mode surface
 was removed by F4; task graph execution remains explicit through `task_execute`.
 
+### Physical settlement and lossless execution facts
+
+The framework's exact-claim interruption request is persisted before signalling
+the original cancellation token. Submission does not settle the claim or emit a
+TaskRun terminal. The eventual framework CAS receipt determines the committed
+status, including a stronger interruption that wins over a late dispatch result.
+
+The internal spec/execution join and discardable checkpoint retain the complete
+canonical `TaskExecution`, including an absent versus explicit-null result and
+`interruption_requested`. Graph commits and execution events preserve those
+facts in the same journal. Older query checkpoints are replayed from that
+journal; `TaskSpec` and `TodoItem` IPC remain unchanged. An unresolved original
+physical-owner intent blocks boot recovery and duplicate execution rather than
+being converted into another Task status.
+
+
 ## Consequences
 
 - Retrying and paused execution survive restart without being flattened to
@@ -91,3 +107,8 @@ was removed by F4; task graph execution remains explicit through `task_execute`.
   `run-state.json` execution projections, both rebuildable from one journal.
 - Future task lifecycle states must be added to framework `TaskStatus` first;
   Todo may deliberately collapse them for display but can never write back.
+
+Boot recovery treats a valid unresolved physical-owner intent as a disposition of that exact run: under its original run lock, leave the run, command cells and pending Subagent control facts unchanged and continue recovering unrelated historical runs. Malformed intent facts and storage failures still fail recovery. The same original evidence reader and exact physical acknowledgement path serve recovery and per-run admission; this does not authorize replay or synthesize a terminal receipt. A continuation consumes the canonical existing run domain, route, attended mode, Goal and execution profile; its internal instruction is not a new user goal. The actual active workspace and caller conversation/root still pass through the original immutable-identity validator, including negative mismatch checks; RunStarted projection uses the returned original goal/route.
+
+
+Continuation progress excludes only private physical_owner_intent metadata on RecoveryBlocked/RecoveryResolved from both the existing progress predicate and fingerprint. Real business recovery and task events still count. The original explicit-resume Goal/revision and no-progress limits remain unchanged. Canonical before evidence excluded an unconfirmed-owner fence replay: each original owner completed and was acknowledged before the next turn; the defect was metadata resetting the business-progress budget. The same canonical journal remains the only authority.

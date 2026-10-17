@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-      - master
-  pull_request:
 
 permissions:
   contents: read
@@ -54,6 +52,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "false"
+      - uses: taiki-e/install-action@cargo-audit
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Audit CLI lock and framework registry origins
+        run: |
+          python -B scripts/test_cli_dependency_risks.py
+          python -B scripts/check_cli_dependency_risks.py --report-prefix "$RUNNER_TEMP/cli-audit"
+          python -B scripts/check_cli_dependency_risks.py --registry-origins \
+            --report-prefix "$RUNNER_TEMP/cli-media-audit"
       - name: Check Linux workspace
         run: |
           cargo fmt --all -- --check

@@ -70,7 +70,7 @@ CI 对 lib/bins 强制 `-D clippy::unwrap_used -D clippy::expect_used -D clippy:
 
 - **新任务必须在非 main 分支开发**,分支命名 `<type>/<user>/<任务名>`。`<type>` 是任务事件类型,与 conventional commits 前缀对齐:`feature`(新功能)、`fix`(bug 修复)、`doc`(文档)、`debug`(排查/诊断类调查)、`refactor`(重构)、`test`(补测试)、`chore`(构建/工具/依赖)。如 `feature/Echoyue/unified-turn`。worktree 场景见后文。main 保持随时可发布。
 - 开发阶段可以细粒度拆分提交,每个 commit 只需通过 focused 快检(见"验证节奏"),**不要求每个 commit 跑全量门禁**。
-- **合并粒度 = 任务**:任务完成后,先 `git merge main` 进任务分支(注意先确认依赖的框架改动已合入 echo-agent main),在任务分支上跑下节全量门禁,开 PR 等远端 CI 全绿(或确认本地门禁已全绿),然后 **squash merge 成一个 commit 进 main**,commit message 用与分支一致的类型前缀(如 `fix: ...` / `feat: ...` / `docs: ...`)。门禁或 CI 不绿不得合并;合并后 `git branch -D` 删除任务分支。
+- **合并粒度 = 任务**:任务完成后,先 `git merge main` 进任务分支(注意先确认依赖的框架改动已合入 echo-agent main),在任务分支上跑下节适用的全量本地门禁;本地门禁全部通过后,开 PR 审查并 **squash merge 成一个 commit 进 main**,commit message 用与分支一致的类型前缀(如 `fix: ...` / `feat: ...` / `docs: ...`)。CI 仅由推送 `main` 触发,任务分支和 PR 不触发 CI。合并后必须核对精确 main 提交的远端 CI 全绿才能完成交付;任何失败仍须修复,不得以已合并为由跳过或绕过。交付完成后 `git branch -D` 删除任务分支。
 
 ## 全量提交门禁(合并到 main 前强制)
 
@@ -135,7 +135,8 @@ npm run build
 
 ## CI 形态与环境差异
 
-完整 Rust、GUI 与前端门禁由任务分支在合并前执行一次。CI 只补本地 macOS 无法等价
+完整 Rust、GUI 与前端适用门禁由任务分支在合并前执行一次。CI 仅在推送 `main` 后运行,
+不响应其它分支推送或 PR;必须验证精确合并提交,不能借用相邻提交的结果。CI 只补本地 macOS 无法等价
 覆盖的信号:Linux all-target/all-feature lint、app-core 默认 feature 测试和 Node LTS 前端
 门禁(包含已提交 TypeScript 契约的编译);不重复完整 workspace、GUI test 或 JSONL 产品验收。
 app-core 测试必须把 `ts-rs` 导出隔离到 runner 临时目录,避免覆盖需要人工补齐跨 crate

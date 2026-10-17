@@ -13,6 +13,8 @@
 //! old `(&str, Option<&Message>)` pair has been replaced by the single
 //! `PreparedUserTurn`.
 
+pub use crate::tasks::task_runtime::store::RunDriverFailure as ChatTurnError;
+
 use echo_agent::agent::{Agent, AgentEvent, AgentHandle, EventEnvelope, EventIdentity};
 use echo_agent::prelude::Message;
 use echo_agent::runtime::{
@@ -333,7 +335,7 @@ pub async fn drive_chat(
     agent: &AgentHandle,
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
-) -> Result<TurnOutcome, String> {
+) -> Result<TurnOutcome, ChatTurnError> {
     drive_chat_turn(agent, turn, res, None)
         .await
         .map(|receipt| receipt.outcome)
@@ -349,7 +351,7 @@ pub async fn drive_chat_turn(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: Option<RunTurnBinding>,
-) -> Result<TurnReceipt, String> {
+) -> Result<TurnReceipt, ChatTurnError> {
     drive_chat_turn_with_input_observer(agent, turn, res, binding, None).await
 }
 
@@ -359,11 +361,11 @@ pub async fn drive_chat_turn_with_input_observer(
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: Option<RunTurnBinding>,
     input_observer: Option<InputReceiptObserver>,
-) -> Result<TurnReceipt, String> {
+) -> Result<TurnReceipt, ChatTurnError> {
     match drive_chat_turn_dispatch(agent, turn, res, binding, input_observer).await? {
         RunTurnDriveOutcome::Driven(receipt) => Ok(*receipt),
         RunTurnDriveOutcome::Deferred => {
-            Err("RunTurn continuation deferred before model execution".to_string())
+            Err("RunTurn continuation deferred before model execution".into())
         }
     }
 }
@@ -373,7 +375,7 @@ pub(crate) async fn drive_chat_continuation_turn(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: RunTurnBinding,
-) -> Result<RunTurnDriveOutcome, String> {
+) -> Result<RunTurnDriveOutcome, ChatTurnError> {
     drive_chat_turn_dispatch(agent, turn, res, Some(binding), None).await
 }
 
@@ -383,7 +385,7 @@ async fn drive_chat_turn_dispatch(
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: Option<RunTurnBinding>,
     input_observer: Option<InputReceiptObserver>,
-) -> Result<RunTurnDriveOutcome, String> {
+) -> Result<RunTurnDriveOutcome, ChatTurnError> {
     wait_for_previous_continuation_driver(&res, binding.as_ref()).await?;
     match prepare_chat_execution(turn, res, binding).await? {
         ChatExecutionPreparation::Ready(prepared) => {
@@ -407,7 +409,7 @@ pub async fn drive_pooled_chat<Configure, ConfigureFuture>(
     configure: Configure,
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
-) -> Result<TurnOutcome, String>
+) -> Result<TurnOutcome, ChatTurnError>
 where
     Configure: FnOnce(AgentHandle) -> ConfigureFuture,
     ConfigureFuture: std::future::Future<Output = Result<(), String>>,
@@ -427,7 +429,7 @@ pub(crate) async fn drive_pooled_chat_turn<Configure, ConfigureFuture>(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: impl Into<Option<RunTurnBinding>>,
-) -> Result<TurnReceipt, String>
+) -> Result<TurnReceipt, ChatTurnError>
 where
     Configure: FnOnce(AgentHandle) -> ConfigureFuture,
     ConfigureFuture: std::future::Future<Output = Result<(), String>>,
@@ -437,7 +439,7 @@ where
     {
         RunTurnDriveOutcome::Driven(receipt) => Ok(*receipt),
         RunTurnDriveOutcome::Deferred => {
-            Err("RunTurn continuation deferred before model execution".to_string())
+            Err("RunTurn continuation deferred before model execution".into())
         }
     }
 }
@@ -449,7 +451,7 @@ pub(crate) async fn drive_pooled_chat_continuation_turn<Configure, ConfigureFutu
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: RunTurnBinding,
-) -> Result<RunTurnDriveOutcome, String>
+) -> Result<RunTurnDriveOutcome, ChatTurnError>
 where
     Configure: FnOnce(AgentHandle) -> ConfigureFuture,
     ConfigureFuture: std::future::Future<Output = Result<(), String>>,
@@ -464,7 +466,7 @@ async fn drive_pooled_chat_turn_dispatch<Configure, ConfigureFuture>(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: Option<RunTurnBinding>,
-) -> Result<RunTurnDriveOutcome, String>
+) -> Result<RunTurnDriveOutcome, ChatTurnError>
 where
     Configure: FnOnce(AgentHandle) -> ConfigureFuture,
     ConfigureFuture: std::future::Future<Output = Result<(), String>>,
@@ -484,7 +486,7 @@ where
             prepared
                 .reject_before_driver_start("continuation cancelled during pool admission")
                 .await?;
-            return Err("continuation cancelled during pool admission".to_string());
+            return Err("continuation cancelled during pool admission".into());
         }
         result = pool.acquire(pool_key) => result,
     } {
@@ -492,7 +494,7 @@ where
         Err(error) => {
             let message = format!("AgentPool admission failed: {error}");
             prepared.reject_before_driver_start(&message).await?;
-            return Err(message);
+            return Err(message.into());
         }
     };
     let agent = execution.agent();
@@ -503,13 +505,13 @@ where
             prepared
                 .reject_before_driver_start("continuation cancelled during agent configuration")
                 .await?;
-            return Err("continuation cancelled during agent configuration".to_string());
+            return Err("continuation cancelled during agent configuration".into());
         }
         result = configure(agent.clone()) => result,
     };
     if let Err(error) = configuration {
         prepared.reject_before_driver_start(&error).await?;
-        return Err(error);
+        return Err(error.into());
     }
     drive_prepared_chat(agent, turn, *prepared, Some(execution), None)
         .await
@@ -554,7 +556,7 @@ struct PreparedChatExecution {
     formal_run_id: String,
     binding: RunTurnBinding,
     task_driver_registration:
-        Option<crate::tasks::task_runtime::store::RegisteredRunDriver<TurnReceipt>>,
+        Option<crate::tasks::task_runtime::store::RegisteredRunDriver<TurnReceipt, ChatTurnError>>,
     resources: std::sync::Arc<crate::chat_resources::ChatResources>,
     cancel: echo_agent::agent::CancellationToken,
     sink: std::sync::Arc<dyn ChatSink>,
@@ -611,7 +613,7 @@ async fn prepare_chat_execution(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: Option<RunTurnBinding>,
-) -> Result<ChatExecutionPreparation, String> {
+) -> Result<ChatExecutionPreparation, ChatTurnError> {
     let foreground_progress = crate::foreground_turn::current_foreground_progress();
     if let Some(store) = res.store.as_ref() {
         let active_workspace_id = store.active_workspace_id();
@@ -620,7 +622,8 @@ async fn prepare_chat_execution(
                 "Chat execution scope {} does not match TaskRuntime workspace {}",
                 res.execution_scope.workspace_id(),
                 active_workspace_id
-            ));
+            )
+            .into());
         }
     }
     // Scope a per-turn run_id so task tools (task_create /
@@ -657,7 +660,7 @@ async fn prepare_chat_execution(
             Some(crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&binding.turn_id));
     }
     if binding.turn_id.trim().is_empty() || binding.root_message_id.trim().is_empty() {
-        return Err("RunTurn binding requires non-empty turn and root message ids".to_string());
+        return Err("RunTurn binding requires non-empty turn and root message ids".into());
     }
     if let Some(expected) = binding.expected_resume.as_ref() {
         let binding_matches = binding.origin == RunTurnOrigin::Resume
@@ -669,7 +672,8 @@ async fn prepare_chat_execution(
             return Err(format!(
                 "TaskRun '{}' expected resume binding does not match its execution scope",
                 expected.run_id
-            ));
+            )
+            .into());
         }
     }
     let turn_id = binding.turn_id.clone();
@@ -680,21 +684,28 @@ async fn prepare_chat_execution(
     // Every turn registers its run driver before memory admission; with the
     // eager default binding (ADR 0037) every ordinary turn owns a formal
     // TaskRun from the first model boundary.
+    // Store admission can observe an original unresolved physical owner.
+    // Preserve that existing typed cause; context belongs only to ordinary
+    // errors, which retain their original presentation and settlement.
+    let admission_error = |context: &str, error| match ChatTurnError::from(error) {
+        ChatTurnError::Error(message) => ChatTurnError::Error(format!("{context}: {message}")),
+        observation => observation,
+    };
     let mut task_driver_registration = match res.store.as_ref() {
         Some(store) => {
             let admission = store
                 .reserve_run_driver_admission(formal_run_id.clone(), res.cancel.clone())
-                .map_err(|error| format!("chat driver admission failed: {error}"))?;
-            let generation = store
-                .lease_active_workspace_generation()
-                .map_err(|error| format!("task runtime generation admission failed: {error}"))?;
+                .map_err(|error| admission_error("chat driver admission failed", error))?;
+            let generation = store.lease_active_workspace_generation().map_err(|error| {
+                admission_error("task runtime generation admission failed", error)
+            })?;
             let registration = store
-                .register_run_driver::<TurnReceipt>(admission, generation)
-                .map_err(|error| format!("chat driver registration failed: {error}"))?;
+                .register_observed_run_driver::<TurnReceipt>(admission, generation)
+                .map_err(|error| admission_error("chat driver registration failed", error))?;
             Some(registration)
         }
         None if drives_task_run => {
-            return Err("TaskRun-bound turn requires TaskRuntimeStore".to_string());
+            return Err("TaskRun-bound turn requires TaskRuntimeStore".into());
         }
         None => None,
     };
@@ -824,7 +835,7 @@ async fn prepare_chat_execution(
                 } else {
                     owned_store.claim_run_turn(&owned_run_id, &owned_turn_id, origin, visibility)
                 };
-                Ok((registration, claim.map_err(|error| error.to_string())))
+                Ok((registration, claim))
             })
             .await;
         let claim = match claim {
@@ -832,12 +843,12 @@ async fn prepare_chat_execution(
                 task_driver_registration = Some(registration);
                 claim
             }
-            Ok((registration, Err(message))) => {
-                registration.reject(message.clone());
-                return Err(message);
+            Ok((registration, Err(error))) => {
+                registration.reject(error.to_string());
+                return Err(error.into());
             }
             Err(error) => {
-                return Err(error.to_string());
+                return Err(error.into());
             }
         };
         match claim {
@@ -855,7 +866,7 @@ async fn prepare_chat_execution(
                 if deferred {
                     return Ok(ChatExecutionPreparation::Deferred);
                 }
-                return Err(format!("RunTurn was not submitted: {reason:?}"));
+                return Err(format!("RunTurn was not submitted: {reason:?}").into());
             }
         }
     }
@@ -882,7 +893,7 @@ async fn drive_prepared_chat(
     mut prepared: PreparedChatExecution,
     pool_execution: Option<crate::agent_pool::AgentPoolExecutionLease>,
     input_observer: Option<InputReceiptObserver>,
-) -> Result<TurnReceipt, String> {
+) -> Result<TurnReceipt, ChatTurnError> {
     let continuation_dispatch_owned = prepared.binding.transcript_visibility
         == TurnVisibility::Internal
         && matches!(
@@ -930,10 +941,10 @@ async fn drive_prepared_chat(
         let waiter = registration.start(move |mut receipt_owner| async move {
             let driver_execution_context = receipt_owner.execution_context_id();
             if let Some(generation) = owned_resources.memory_generation.as_ref() {
-                receipt_owner.retain(generation.clone());
+                receipt_owner.retain(generation.clone())?;
             }
             if let Some(execution) = pool_execution {
-                receipt_owner.retain(execution);
+                receipt_owner.retain(execution)?;
             }
             let _projection_registration =
                 crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
@@ -983,6 +994,13 @@ async fn drive_prepared_chat(
         )
         .await
     };
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(ChatTurnError::is_observation)
+    {
+        return result;
+    }
     if prepared.drives_task_run
         && !continuation_dispatch_owned
         && let Some(store) = prepared.store.as_ref()
@@ -1035,7 +1053,8 @@ async fn drive_prepared_chat(
                     return Err(format!(
                         "foreground TaskRun {} lost its continuation launcher",
                         prepared.formal_run_id
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -1072,7 +1091,7 @@ struct RegisteredTurnDriver {
     input_observer: Option<InputReceiptObserver>,
 }
 
-async fn drive_registered_turn(driver: RegisteredTurnDriver) -> Result<TurnReceipt, String> {
+async fn drive_registered_turn(driver: RegisteredTurnDriver) -> Result<TurnReceipt, ChatTurnError> {
     if let Some(progress) = driver.foreground_progress.as_ref() {
         progress.bind_run_turn(&driver.run_id, &driver.binding.turn_id);
     }
@@ -1102,9 +1121,12 @@ async fn drive_registered_turn(driver: RegisteredTurnDriver) -> Result<TurnRecei
     let outcome = match result.as_ref() {
         Ok(outcome) => outcome,
         Err(error) => {
+            if error.is_observation() {
+                return result;
+            }
             fallback = TurnReceipt::failed(
                 driver.binding.turn_id,
-                echo_agent::error::AgentFailure::message("chat_driver", error.clone()),
+                echo_agent::error::AgentFailure::message("chat_driver", error.to_string()),
             )
             .map_err(|failure| failure.to_string())?;
             &fallback
@@ -1145,18 +1167,35 @@ fn ensure_bound_task_run(
 ) -> Result<(), crate::tasks::task_runtime::StoreError> {
     use crate::tasks::task_runtime::{AttendedMode, DomainProfile, TaskRunStatus};
 
-    let execution_profile = store
-        .get_run_state(run_id)?
-        .map(|snapshot| snapshot.execution_profile)
-        .unwrap_or_else(crate::tasks::task_runtime::TaskRunExecutionProfile::conversation_turn);
+    let existing = store.get_run_state(run_id)?;
+    // A continuation consumes the original run identity. Its internal prompt
+    // is not a new attended request and must not rewrite route or domain.
+    // The existing store validator still checks workspace/conversation/root.
+    let (domain_profile, route, attended_mode, run_goal, execution_profile) =
+        match existing.as_ref() {
+            Some(snapshot) => (
+                snapshot.run.domain_profile,
+                snapshot.run.route.as_str(),
+                snapshot.run.attended_mode,
+                snapshot.run.goal.as_str(),
+                snapshot.execution_profile,
+            ),
+            None => (
+                DomainProfile::General,
+                "agent_task_plan",
+                AttendedMode::Attended,
+                goal,
+                crate::tasks::task_runtime::TaskRunExecutionProfile::conversation_turn(),
+            ),
+        };
     let run = store.create_run_for_active_workspace_with_profile(
         run_id,
         conversation_id.unwrap_or("message:task"),
         turn_id,
-        DomainProfile::General,
-        goal,
-        "agent_task_plan",
-        AttendedMode::Attended,
+        domain_profile,
+        run_goal,
+        route,
+        attended_mode,
         execution_profile,
     )?;
     if !attachments.is_empty() {
@@ -1172,8 +1211,8 @@ fn ensure_bound_task_run(
                 RuntimeEventKind::RunStarted,
                 serde_json::json!({
                     "conversation_id": conversation_id,
-                    "goal": goal,
-                    "route": "agent_task_plan",
+                    "goal": &run.goal,
+                    "route": &run.route,
                 }),
             ));
         }
@@ -1378,7 +1417,7 @@ impl EkoTurnEventSink {
         &self,
         receipt: TurnReceipt,
         framework_terminal: TurnOutcome,
-    ) -> Result<TurnReceipt, String> {
+    ) -> Result<TurnReceipt, ChatTurnError> {
         let mut state = self
             .state
             .lock()
@@ -1575,7 +1614,7 @@ async fn drive_chat_inner(
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     scope: ChatTurnModelScope,
     input_observer: Option<InputReceiptObserver>,
-) -> Result<TurnReceipt, String> {
+) -> Result<TurnReceipt, ChatTurnError> {
     let ChatTurnModelScope {
         turn_id,
         bound_run_id,
@@ -1698,6 +1737,7 @@ async fn drive_chat_inner(
                 Ok(()),
             )
         };
+        let receipt = receipt.map_err(ChatTurnError::from)?;
         let effective_terminal =
             effective_terminal_after_input_observer(receipt.outcome.clone(), observer_result);
         eko_sink.finish(receipt, effective_terminal)
@@ -1731,6 +1771,121 @@ impl ChatSink for ChannelChatSink {
 mod tests {
     use super::*;
     use crate::tasks::task_runtime::TaskRunStatus;
+
+    #[test]
+    fn existing_run_continuation_preserves_identity_and_rejects_foreign_bindings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, RunPlanPolicy, TaskRunExecutionProfile, TaskRuntimeStore,
+        };
+        let directory = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        let workspace = store.active_workspace_id();
+        let original = store.create_run_with_profile(
+            "original-unattended",
+            &workspace,
+            "original-conversation",
+            "original-root",
+            DomainProfile::DataAnalysis,
+            "original user Goal",
+            "agent_autonomous",
+            AttendedMode::Unattended,
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+        )?;
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<ExecEvent>::new()));
+        let sink_events = events.clone();
+        let trace_sink: crate::tasks::task_runtime::task_tools::TraceSink =
+            std::sync::Arc::new(move |event| {
+                if let Ok(mut events) = sink_events.lock() {
+                    events.push(event);
+                }
+            });
+        ensure_bound_task_run(
+            &store,
+            &original.run_id,
+            Some("original-conversation"),
+            "original-root",
+            "internal continuation instruction",
+            &[],
+            Some(&trace_sink),
+        )?;
+        let actual = store
+            .get_run(&original.run_id)?
+            .ok_or("original run disappeared")?;
+        assert_eq!(actual.domain_profile, original.domain_profile);
+        assert_eq!(actual.route, original.route);
+        assert_eq!(actual.attended_mode, original.attended_mode);
+        assert_eq!(actual.goal, original.goal);
+        let traces = events.lock().map_err(|_| "trace lock poisoned")?.clone();
+        assert_eq!(traces.len(), 1);
+        let started = traces.first().ok_or("original run-start event missing")?;
+        assert_eq!(started.event, RuntimeEventKind::RunStarted);
+        assert_eq!(
+            started
+                .payload
+                .get("goal")
+                .and_then(serde_json::Value::as_str),
+            Some("original user Goal")
+        );
+        assert_eq!(
+            started
+                .payload
+                .get("route")
+                .and_then(serde_json::Value::as_str),
+            Some("agent_autonomous")
+        );
+        let before = serde_json::to_value(store.list_events(&original.run_id, 0)?)?;
+        for (conversation, root) in [
+            ("wrong-conversation", "original-root"),
+            ("original-conversation", "wrong-root"),
+        ] {
+            assert!(
+                ensure_bound_task_run(
+                    &store,
+                    &original.run_id,
+                    Some(conversation),
+                    root,
+                    "internal continuation instruction",
+                    &[],
+                    None
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(store.list_events(&original.run_id, 0)?)?,
+            before
+        );
+        store.create_run_with_profile(
+            "foreign-workspace",
+            "another-workspace",
+            "original-conversation",
+            "original-root",
+            DomainProfile::DataAnalysis,
+            "foreign Goal",
+            "agent_autonomous",
+            AttendedMode::Unattended,
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+        )?;
+        let foreign_before = serde_json::to_value(store.list_events("foreign-workspace", 0)?)?;
+        assert!(
+            ensure_bound_task_run(
+                &store,
+                "foreign-workspace",
+                Some("original-conversation"),
+                "original-root",
+                "internal continuation instruction",
+                &[],
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(store.list_events("foreign-workspace", 0)?)?,
+            foreign_before
+        );
+        Ok(())
+    }
 
     #[test]
     fn product_event_wire_contract_preserves_canonical_identity_and_payloads() -> Result<(), String>
@@ -1869,6 +2024,226 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn shared_foreground_reopened_owner_intent_stays_nonterminal() -> anyhow::Result<()> {
+        use crate::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, TaskRunResumeIdentity, TaskRunStatus, TaskRuntimeStore,
+        };
+        use echo_agent::state::journal::{EventJournal, FileEventJournal};
+        use echo_agent::utils::fs::FileDurability;
+        use std::sync::Arc;
+
+        for surface in [
+            ForegroundTurnSurface::Gui,
+            ForegroundTurnSurface::Tui,
+            ForegroundTurnSurface::Cli,
+            ForegroundTurnSurface::Channel,
+        ] {
+            let directory = tempfile::tempdir()?;
+            let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+            store.create_run(
+                "shared-owner",
+                "test",
+                "shared-conversation",
+                "original-root",
+                DomainProfile::General,
+                "preserve original owner",
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )?;
+            store.transition_run("shared-owner", TaskRunStatus::Running)?;
+            store.transition_run("shared-owner", TaskRunStatus::Paused)?;
+            drop(store);
+            let journal_path = directory.path().join("shared-owner/events.jsonl");
+            // Official durable original-owner intent followed by a fresh Store;
+            // no live driver or helper-injected observation masks admission.
+            let journal = FileEventJournal::<serde_json::Value>::open(
+                &journal_path,
+                FileDurability::SyncData,
+            )?;
+            journal
+                .append(serde_json::json!({
+                    "run_id":"shared-owner", "task_id":null, "step_id":"original-execution",
+                    "event_type":"recovery_blocked", "timestamp":chrono::Utc::now(),
+                    "payload":{"physical_owner_intent":{
+                        "run_id":"shared-owner", "owner_id":"original-owner",
+                        "execution_id":"original-execution", "workspace_id":"test",
+                        "physical_terminal_observed":false
+                    }}
+                }))
+                .map_err(|error| anyhow::anyhow!("persist original intent: {error:?}"))?;
+            drop(journal);
+            let store = Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+                directory.path(),
+            )?);
+            let original = store
+                .get_run_state("shared-owner")?
+                .ok_or_else(|| anyhow::anyhow!("original run absent"))?;
+            let before_journal = std::fs::read(&journal_path)?;
+            let before_state = serde_json::to_value(&original)?;
+            let llm = Arc::new(
+                echo_agent::testing::MockLlmClient::new()
+                    .with_model_name("shared-owner-test")
+                    .with_response("must not execute"),
+            );
+            let agent = AgentHandle::new(
+                echo_agent::agent::ReactAgentBuilder::new()
+                    .model("shared-owner-test")
+                    .llm_client(llm.clone())
+                    .build()?,
+            );
+            let sink = Arc::new(MockChatSink::default());
+            let control = ForegroundTurnControl::default();
+            let lease =
+                control.begin_scoped("test", surface, "shared-conversation", "resume-turn")?;
+            let resources = Arc::new(crate::chat_resources::ChatResources {
+                execution_scope: test_execution_scope(),
+                workspace_io_receipt: None,
+                pool: None,
+                store: Some(store.clone()),
+                sink: sink.clone(),
+                webhook_emitter: None,
+                conv_id: Some("shared-conversation".to_string()),
+                root_message_id: "resume-turn".to_string(),
+                attachments: Vec::new(),
+                cancel: lease.cancellation_token(),
+                review_integration: None,
+                memory_generation: None,
+                human_loop_provider: None,
+            });
+            let result = crate::foreground_turn::drive_foreground_chat_turn(
+                lease,
+                &agent,
+                &make_turn("resume original"),
+                resources,
+                RunTurnBinding::resume_expected(
+                    TaskRunResumeIdentity::capture(&original),
+                    "resume-turn",
+                ),
+            )
+            .await;
+            assert!(
+                matches!(&result, Err(ChatTurnError::Observation { run_id, execution_id: None })
+                            if run_id == "shared-owner"),
+                "shared {surface} preparation projected durable unknown ownership as terminal: {result:?}"
+            );
+            assert!(
+                control
+                    .snapshot_scoped("test", surface, "shared-conversation")
+                    .is_some()
+            );
+            assert_eq!(llm.call_count(), 0);
+            assert_eq!(sink.event_count(), 0);
+            assert_eq!(std::fs::read(&journal_path)?, before_journal);
+            assert_eq!(
+                serde_json::to_value(
+                    store
+                        .get_run_state("shared-owner")?
+                        .ok_or_else(|| anyhow::anyhow!("original run disappeared"))?
+                )?,
+                before_state
+            );
+            assert!(!store.is_run_active("shared-owner"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_foreground_ordinary_resume_claim_error_still_settles_failed()
+    -> anyhow::Result<()> {
+        use crate::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, TaskRunResumeIdentity, TaskRunStatus, TaskRuntimeStore,
+        };
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let _original_resource_scope = store.test_resource_scope();
+        store.create_run(
+            "ordinary-resume",
+            "test",
+            "ordinary-conversation",
+            "original-root",
+            DomainProfile::General,
+            "preserve ordinary identity",
+            "agent_task_plan",
+            AttendedMode::Attended,
+        )?;
+        store.transition_run("ordinary-resume", TaskRunStatus::Running)?;
+        store.configure_run_continuation("ordinary-resume", true, false, None, None)?;
+        store.transition_run("ordinary-resume", TaskRunStatus::Paused)?;
+        let original = store
+            .get_run_state("ordinary-resume")?
+            .ok_or_else(|| anyhow::anyhow!("ordinary run absent"))?;
+        let mut expected = TaskRunResumeIdentity::capture(&original);
+        expected.goal_revision = expected.goal_revision.saturating_add(1);
+        let llm =
+            Arc::new(echo_agent::testing::MockLlmClient::new().with_model_name("ordinary-test"));
+        let agent = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("ordinary-test")
+                .llm_client(llm.clone())
+                .build()?,
+        );
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin_scoped(
+            "test",
+            ForegroundTurnSurface::Tui,
+            "ordinary-conversation",
+            "resume-turn",
+        )?;
+        let waiter = control.settlement_waiter_scoped(
+            "test",
+            ForegroundTurnSurface::Tui,
+            "ordinary-conversation",
+            "resume-turn",
+        )?;
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink: Arc::new(MockChatSink::default()),
+            webhook_emitter: None,
+            conv_id: Some("ordinary-conversation".to_string()),
+            root_message_id: "resume-turn".to_string(),
+            attachments: Vec::new(),
+            cancel: lease.cancellation_token(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let result = crate::foreground_turn::drive_foreground_chat_turn(
+            lease,
+            &agent,
+            &make_turn("resume ordinary"),
+            resources,
+            RunTurnBinding::resume_expected(expected, "resume-turn"),
+        )
+        .await?;
+        assert!(
+            matches!(&result, TurnOutcome::Failed(error) if error.message.contains("identity changed"))
+        );
+        assert!(matches!(
+            waiter.wait().await?.outcome,
+            TurnOutcome::Failed(_)
+        ));
+        assert!(
+            control
+                .snapshot_scoped("test", ForegroundTurnSurface::Tui, "ordinary-conversation")
+                .is_none()
+        );
+        assert_eq!(llm.call_count(), 0);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.wait_for_run_driver_idle("ordinary-resume"),
+        )
+        .await?;
+        assert!(!store.is_run_active("ordinary-resume"));
+        Ok(())
+    }
+
     fn test_turn_receipt(turn_id: &str, outcome: TurnOutcome) -> Result<TurnReceipt, String> {
         let identity = EventIdentity::new(format!("test-stream-{turn_id}"), turn_id)
             .map_err(|error| error.to_string())?;
@@ -1931,7 +2306,8 @@ mod tests {
             None,
             Some(input_observer),
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         Ok((outcome, chat_sink))
     }
 
@@ -2090,7 +2466,8 @@ mod tests {
             },
             None,
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         let TurnOutcome::Failed(failure) = &outcome.outcome else {
             return Err(format!("expected typed setup failure, got {outcome:?}"));
         };
@@ -2400,7 +2777,9 @@ mod tests {
         receipt.completion_tokens = 7;
         receipt.llm_calls = 1;
         receipt.compaction_count = 1;
-        let outcome = adapter.finish(receipt, TurnOutcome::Completed)?;
+        let outcome = adapter
+            .finish(receipt, TurnOutcome::Completed)
+            .map_err(|error| error.to_string())?;
         assert_eq!(outcome.outcome, TurnOutcome::Completed);
         assert_eq!(outcome.prompt_tokens, 11);
         assert_eq!(outcome.completion_tokens, 7);
@@ -2456,7 +2835,9 @@ mod tests {
         assert!(error.to_string().contains("downstream_disconnect"));
 
         let receipt = test_turn_receipt("rejected-turn", TurnOutcome::Cancelled)?;
-        let outcome = adapter.finish(receipt, TurnOutcome::Cancelled)?;
+        let outcome = adapter
+            .finish(receipt, TurnOutcome::Cancelled)
+            .map_err(|error| error.to_string())?;
         assert!(matches!(
             outcome.outcome,
             TurnOutcome::Failed(ref failure) if failure.code == "downstream_disconnect"
@@ -2554,7 +2935,9 @@ mod tests {
         };
         assert!(error.to_string().contains("sink_projector_closed"));
         let receipt = test_turn_receipt("closed-projector-turn", TurnOutcome::Cancelled)?;
-        let outcome = adapter.finish(receipt, TurnOutcome::Cancelled)?;
+        let outcome = adapter
+            .finish(receipt, TurnOutcome::Cancelled)
+            .map_err(|error| error.to_string())?;
         assert!(matches!(
             outcome.outcome,
             TurnOutcome::Failed(ref failure) if failure.code == "sink_projector_closed"
@@ -2729,7 +3112,7 @@ mod tests {
             Ok(outcome) => return Err(format!("closed TaskRuntime admitted {outcome:?}")),
             Err(error) => error,
         };
-        assert!(error.contains("admission"));
+        assert!(error.to_string().contains("admission"));
         assert!(!configured.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(pool.pool_size().await, 0);
         Ok(())
@@ -2757,6 +3140,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         store
             .create_run(
                 "pre-driver-cancel-run",
@@ -2875,6 +3259,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         store
             .create_run(
                 "pre-driver-shutdown-run",
@@ -2991,6 +3376,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         store
             .create_run_with_profile(
                 "claim-race-run",
@@ -3090,7 +3476,8 @@ mod tests {
         );
         winner
             .await
-            .map_err(|error| format!("winner task failed: {error}"))??;
+            .map_err(|error| format!("winner task failed: {error}"))?
+            .map_err(|error| error.to_string())?;
         // ADR 0037: a completed turn on a run that never committed a plan
         // settles as Completed at turn end (previously it spun continuation
         // turns until RepeatedBlocker paused the run).
@@ -3113,6 +3500,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         let run_id = "continuation-claim-activity";
         store
             .create_run(
@@ -3195,7 +3583,8 @@ mod tests {
                 expected_resume: None,
             },
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         assert!(matches!(outcome, RunTurnDriveOutcome::Deferred));
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -3279,6 +3668,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         store
             .create_run(
                 "existing-goal",
@@ -3360,7 +3750,8 @@ mod tests {
                 "resume-turn",
             )),
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
 
         let run = wait_for_run_status(
             &store,
@@ -3435,7 +3826,8 @@ mod tests {
                 human_loop_provider: None,
             }),
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         let unchanged_starts = store
             .list_events("existing-goal", 0)
             .map_err(|error| error.to_string())?
@@ -3468,6 +3860,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         store
             .create_run(
                 "stale-resume",
@@ -3552,7 +3945,11 @@ mod tests {
             Ok(_) => return Err("conflicting expected resume unexpectedly prepared".to_string()),
             Err(error) => error,
         };
-        assert!(conflict_error.contains("does not match its execution scope"));
+        assert!(
+            conflict_error
+                .to_string()
+                .contains("does not match its execution scope")
+        );
         assert_eq!(store.active_run_driver_count()?, 0);
         assert_eq!(store.active_run_driver_receipt_count()?, 0);
         assert_eq!(
@@ -3578,7 +3975,7 @@ mod tests {
             Ok(_) => return Err("stale expected resume unexpectedly prepared".to_string()),
             Err(error) => error,
         };
-        assert!(error.contains("identity changed"));
+        assert!(error.to_string().contains("identity changed"));
         let after = store
             .get_run_state("stale-resume")
             .map_err(|error| error.to_string())?
@@ -3638,6 +4035,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         crate::tasks::task_runtime::register_task_tools_on_agent(
             &agent,
             store.clone(),
@@ -3660,7 +4058,9 @@ mod tests {
             memory_generation: None,
             human_loop_provider: None,
         });
-        let outcome = drive_chat(&agent, &make_turn("run the task graph"), resources).await?;
+        let outcome = drive_chat(&agent, &make_turn("run the task graph"), resources)
+            .await
+            .map_err(|error| error.to_string())?;
         if outcome != TurnOutcome::Completed {
             return Err(format!("task graph turn ended {outcome:?}"));
         }
@@ -3724,6 +4124,8 @@ mod tests {
         drive_scripted_task_graph("task-graph").await
     }
 
+    // Tokio's fixed macro option names test harness threads, outside the
+    // application's Subagent terminology.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawned_task_execute_retains_pool_receipt_until_outer_driver_settles()
     -> Result<(), String> {
@@ -3765,6 +4167,7 @@ mod tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         crate::tasks::task_runtime::register_task_tools_on_agent(
             &primary_agent,
             store.clone(),
@@ -3863,7 +4266,8 @@ mod tests {
         let outcome = tokio::time::timeout(TASK_EXECUTE_RECEIPT_TEST_TIMEOUT, drive)
             .await
             .map_err(|_| "pooled chat driver did not settle".to_string())?
-            .map_err(|error| error.to_string())??;
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
         assert_eq!(outcome, TurnOutcome::Completed);
         assert_eq!(store.active_run_driver_receipt_count()?, 0);
         store
@@ -3900,6 +4304,7 @@ mod tests {
             crate::tasks::task_runtime::store::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         let turn_id = "stream-agent-events-contract-turn";
         let res = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
@@ -3916,7 +4321,9 @@ mod tests {
             memory_generation: None,
             human_loop_provider: None,
         });
-        let outcome = drive_chat(&agent, &make_turn("hi"), res).await?;
+        let outcome = drive_chat(&agent, &make_turn("hi"), res)
+            .await
+            .map_err(|error| error.to_string())?;
         assert_eq!(outcome, TurnOutcome::Completed);
         // The agent's FinalAnswer is streamed through the sink.
         assert!(
@@ -4054,7 +4461,9 @@ mod tests {
             human_loop_provider: None,
         });
 
-        let outcome = drive_chat(&agent, &make_turn("start"), resources).await?;
+        let outcome = drive_chat(&agent, &make_turn("start"), resources)
+            .await
+            .map_err(|error| error.to_string())?;
         let TurnOutcome::Failed(failure) = outcome else {
             return Err(format!("expected failed turn, got {outcome:?}"));
         };
@@ -4114,6 +4523,7 @@ mod tests {
             crate::tasks::task_runtime::store::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         store
             .create_run_with_profile(
                 &run_id,
@@ -4169,7 +4579,9 @@ mod tests {
         // identity matches the turn-derived formal run) and drives it to a
         // successful completion; the old "abandoned Pending run fails" path no
         // longer exists because no turn executes outside the runtime.
-        let outcome = drive_chat(&agent, &make_turn("continue"), res).await?;
+        let outcome = drive_chat(&agent, &make_turn("continue"), res)
+            .await
+            .map_err(|error| error.to_string())?;
         assert_eq!(outcome, echo_agent::runtime::TurnOutcome::Completed);
         let settled_run = store
             .get_run(&run_id)
@@ -4245,6 +4657,7 @@ mod tests {
             crate::tasks::task_runtime::store::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
+        let _resource_scope = store.test_resource_scope();
         let turn_id = "raw-user-text-contract-turn";
         let res = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
@@ -4262,7 +4675,9 @@ mod tests {
             human_loop_provider: None,
         });
         let turn = make_turn("hi there");
-        drive_chat(&agent, &turn, res).await?;
+        drive_chat(&agent, &turn, res)
+            .await
+            .map_err(|error| error.to_string())?;
         let messages = mock
             .last_messages()
             .ok_or_else(|| "LLM was not called".to_string())?;
@@ -4334,7 +4749,9 @@ mod tests {
             human_loop_provider: None,
         });
 
-        drive_chat(&agent, &make_turn("probe"), resources).await?;
+        drive_chat(&agent, &make_turn("probe"), resources)
+            .await
+            .map_err(|error| error.to_string())?;
         let actual = observed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4402,7 +4819,10 @@ mod tests {
         .await
         .err()
         .ok_or_else(|| "mismatched workspace scope was accepted".to_string())?;
-        if !error.contains("does not match TaskRuntime workspace") {
+        if !error
+            .to_string()
+            .contains("does not match TaskRuntime workspace")
+        {
             return Err(format!("unexpected scope mismatch error: {error}"));
         }
         let observer = tokio::time::timeout(std::time::Duration::from_secs(1), observer_rx)

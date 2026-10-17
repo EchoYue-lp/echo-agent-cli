@@ -560,6 +560,7 @@ async fn finalize_subagent_execution(
             message,
             usage: Some(usage),
             agent_failure: None,
+            observation: None,
         });
     }
     Ok((execution.outcome, execution.output, usage))
@@ -571,6 +572,7 @@ struct ExecutionFailure {
     message: String,
     usage: Option<ExecutionUsage>,
     agent_failure: Option<echo_agent::error::AgentFailure>,
+    observation: Option<super::store::RunDriverFailure>,
 }
 
 impl ExecutionFailure {
@@ -580,6 +582,7 @@ impl ExecutionFailure {
             message: message.into(),
             usage: None,
             agent_failure: None,
+            observation: None,
         }
     }
 
@@ -589,6 +592,7 @@ impl ExecutionFailure {
             message: message.into(),
             usage: None,
             agent_failure: None,
+            observation: None,
         }
     }
 
@@ -607,16 +611,21 @@ impl ExecutionFailure {
             message: message.into(),
             usage: None,
             agent_failure: Some(failure.clone()),
+            observation: None,
         }
     }
 
     fn with_react_error(error: echo_agent::error::ReactError, context: &str) -> Self {
-        let status = echo_agent::subagent::subagent_status_from_error(&error);
-        Self {
-            status,
-            message: format!("{context}: {error}"),
-            usage: None,
-            agent_failure: Some(echo_agent::error::AgentFailure::from(&error)),
+        let message = format!("{context}: {error}");
+        match echo_agent::error::AgentFailure::try_from(&error) {
+            Ok(failure) => Self::with_agent_failure(&failure, message),
+            Err(observation) => Self {
+                status: SubagentStatus::Running,
+                message,
+                usage: None,
+                agent_failure: None,
+                observation: Some(observation.into()),
+            },
         }
     }
 
@@ -1039,8 +1048,9 @@ impl EventSink for EkoAgentTurnSink {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if let Some(check) = state.pending_verification.remove(&call_id) {
-                        state.observed_evidence.push(
-                            echo_agent::subagent::SubagentEvidence {
+                        state
+                            .observed_evidence
+                            .push(echo_agent::subagent::SubagentEvidence {
                                 kind: "verification".to_string(),
                                 subject: check,
                                 outcome: Some(if result.success {
@@ -1049,41 +1059,37 @@ impl EventSink for EkoAgentTurnSink {
                                     "failed".to_string()
                                 }),
                                 details: result_text.chars().take(500).collect(),
-                                source:
-                                    echo_agent::subagent::SubagentEvidenceSource::Observed,
+                                source: echo_agent::subagent::SubagentEvidenceSource::Observed,
                                 attributes: serde_json::Value::Null,
-                            },
-                        );
+                            });
                     }
                     if result.success
-                        && let Some((tool_name, args)) =
-                            state.pending_file_access.remove(&call_id)
+                        && let Some((tool_name, args)) = state.pending_file_access.remove(&call_id)
                     {
-                        state.observed_evidence.push(
-                            echo_agent::subagent::SubagentEvidence {
+                        state
+                            .observed_evidence
+                            .push(echo_agent::subagent::SubagentEvidence {
                                 kind: "tool_result".to_string(),
                                 subject: tool_name,
                                 outcome: Some("succeeded".to_string()),
                                 details: String::new(),
-                                source:
-                                    echo_agent::subagent::SubagentEvidenceSource::Observed,
+                                source: echo_agent::subagent::SubagentEvidenceSource::Observed,
                                 attributes: serde_json::json!({ "args": args }),
-                            },
-                        );
+                            });
                     } else {
                         state.pending_file_access.remove(&call_id);
                     }
                     if let Some(artifact) = result.artifact.as_ref() {
-                        state.observed_artifacts.push(
-                            echo_agent::subagent::SubagentArtifact {
+                        state
+                            .observed_artifacts
+                            .push(echo_agent::subagent::SubagentArtifact {
                                 path: artifact.path.to_string_lossy().to_string(),
                                 kind: "tool_log".to_string(),
                                 bytes: Some(artifact.artifact_bytes),
                                 sha256: Some(artifact.sha256.clone()),
                                 producer_execution_id: self.context.execution_id.clone(),
                                 available: true,
-                            },
-                        );
+                            });
                     }
                 }
                 if let Some(primary_task) = self.primary_task.as_ref() {
@@ -1187,6 +1193,7 @@ struct TaskDispatchFailure {
     status: SubagentStatus,
     message: String,
     agent_failure: Option<echo_agent::error::AgentFailure>,
+    observation: Option<Box<super::store::RunDriverFailure>>,
 }
 
 impl TaskDispatchFailure {
@@ -1196,6 +1203,7 @@ impl TaskDispatchFailure {
             status: SubagentStatus::Failed,
             message: message.into(),
             agent_failure: None,
+            observation: None,
         }
     }
 
@@ -1205,6 +1213,7 @@ impl TaskDispatchFailure {
             status: SubagentStatus::Cancelled,
             message: message.into(),
             agent_failure: None,
+            observation: None,
         }
     }
 
@@ -1214,11 +1223,15 @@ impl TaskDispatchFailure {
             status: failure.status,
             message: failure.message,
             agent_failure: failure.agent_failure,
+            observation: failure.observation.map(Box::new),
         }
     }
 
     fn into_react(self) -> echo_agent::error::ReactError {
         use echo_agent::error::AgentError;
+        if let Some(observation) = self.observation {
+            return (*observation).into_react_error();
+        }
         match self.status {
             SubagentStatus::Cancelled => {
                 echo_agent::error::ReactError::Agent(Box::new(AgentError::Cancelled(self.message)))
@@ -1226,9 +1239,9 @@ impl TaskDispatchFailure {
             SubagentStatus::TimedOut => {
                 echo_agent::error::ReactError::Agent(Box::new(AgentError::Timeout(self.message)))
             }
-            SubagentStatus::Running
-            | SubagentStatus::Completed
-            | SubagentStatus::Failed => echo_agent::error::ReactError::Other(self.message),
+            SubagentStatus::Running | SubagentStatus::Completed | SubagentStatus::Failed => {
+                echo_agent::error::ReactError::Other(self.message)
+            }
         }
     }
 }
@@ -1681,6 +1694,20 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             .await
     }
 
+    async fn request_task_interruption(
+        &self,
+        run_id: &str,
+        task: &echo_agent::tasks::Task,
+        claim: &echo_agent::tasks::TaskClaim,
+        disposition: echo_agent::tasks::RuntimeInterruptionDisposition,
+    ) -> echo_agent::error::Result<bool> {
+        let capabilities = Arc::new(super::task_tools::TaskCapabilityCatalog::default());
+        super::revisioned_runtime::build_task_revision_service(self.store.clone(), capabilities)
+            .request_runtime_task_interruption(run_id, &task.spec.id, claim, disposition)
+            .await
+            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
+    }
+
     fn select_ready_wave(
         &self,
         tasks: &[echo_agent::tasks::Task],
@@ -1826,6 +1853,12 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         let dispatched = match dispatch {
             Ok(dispatched) => dispatched,
             Err(error) => {
+                if matches!(
+                    &error,
+                    echo_agent::error::ReactError::ExecutionNotSettled { .. }
+                ) {
+                    return Err(error);
+                }
                 let typed_failure = self
                     .dispatch_failures
                     .lock()
@@ -1838,21 +1871,21 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     .unwrap_or_else(|| error.to_string());
                 let status = typed_failure
                     .as_ref()
-                    .map(|failure| match failure.terminal_kind {
-                        echo_agent::error::AgentTerminalKind::Cancelled => {
-                            echo_agent::subagent::SubagentStatus::Cancelled
-                        }
-                        echo_agent::error::AgentTerminalKind::TimedOut => {
-                            echo_agent::subagent::SubagentStatus::TimedOut
-                        }
-                        echo_agent::error::AgentTerminalKind::Failed
-                        | echo_agent::error::AgentTerminalKind::PermissionDenied => {
-                            echo_agent::subagent::SubagentStatus::Failed
-                        }
+                    .map(|failure| {
+                        Ok(match failure.terminal_kind {
+                            echo_agent::error::AgentTerminalKind::Cancelled => {
+                                echo_agent::subagent::SubagentStatus::Cancelled
+                            }
+                            echo_agent::error::AgentTerminalKind::TimedOut => {
+                                echo_agent::subagent::SubagentStatus::TimedOut
+                            }
+                            echo_agent::error::AgentTerminalKind::Failed
+                            | echo_agent::error::AgentTerminalKind::PermissionDenied => {
+                                echo_agent::subagent::SubagentStatus::Failed
+                            }
+                        })
                     })
-                    .unwrap_or_else(|| {
-                        echo_agent::subagent::subagent_status_from_error(&error)
-                    });
+                    .unwrap_or_else(|| echo_agent::subagent::subagent_status_from_error(&error))?;
                 let request = if let Some(failure) = typed_failure.as_ref().filter(|failure| {
                     failure.retryable
                         && failure.category == echo_agent::error::AgentFailureCategory::Llm
@@ -1893,11 +1926,8 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                         }
                     }
                 };
-                let mut result = SubagentOutcome::terminal(
-                    status,
-                    message.clone(),
-                    vec![message.clone()],
-                );
+                let mut result =
+                    SubagentOutcome::terminal(status, message.clone(), vec![message.clone()]);
                 if let Some(failure) = typed_failure.as_ref() {
                     attach_agent_failure_evidence(&mut result, failure);
                 }
@@ -2187,6 +2217,16 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             echo_agent::tasks::RuntimeTaskResolution::Cancelled => {
                 Some(RuntimeEventKind::TaskCancelled)
             }
+            echo_agent::tasks::RuntimeTaskResolution::Interrupted { disposition } => {
+                Some(match disposition {
+                    echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled => {
+                        RuntimeEventKind::TaskCancelled
+                    }
+                    echo_agent::tasks::RuntimeInterruptionDisposition::Paused { .. } => {
+                        RuntimeEventKind::TaskBlocked
+                    }
+                })
+            }
             echo_agent::tasks::RuntimeTaskResolution::Pending
             | echo_agent::tasks::RuntimeTaskResolution::Superseded => None,
         };
@@ -2241,12 +2281,6 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                 (echo_agent::tasks::TaskStatus::Failed(error.clone()), error)
             }
         };
-        let terminal_event = match &status {
-            echo_agent::tasks::TaskStatus::Cancelled => RuntimeEventKind::TaskCancelled,
-            echo_agent::tasks::TaskStatus::Paused(_) => RuntimeEventKind::TaskBlocked,
-            echo_agent::tasks::TaskStatus::Failed(_) => RuntimeEventKind::TaskFailed,
-            _ => RuntimeEventKind::TaskFailed,
-        };
         let payload = serde_json::json!({ "summary": &summary });
         let agent_role = Self::plan_task(runtime_task)?.agent_role;
         let run_id = run_id.to_string();
@@ -2267,9 +2301,21 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                 Ok((outcome, run))
             })
             .await?;
-        if outcome == echo_agent::tasks::RuntimeTaskSettlementOutcome::Settled
+        if let echo_agent::tasks::RuntimeTaskSettlementOutcome::Settled { status } = &outcome
             && let Some(run) = run
         {
+            // The exact-claim CAS may commit a stronger durable interruption.
+            // Emit only the committed status, never the requested fallback.
+            let terminal_event = match status {
+                echo_agent::tasks::TaskStatus::Cancelled => RuntimeEventKind::TaskCancelled,
+                echo_agent::tasks::TaskStatus::Paused(_) => RuntimeEventKind::TaskBlocked,
+                echo_agent::tasks::TaskStatus::Failed(_) => RuntimeEventKind::TaskFailed,
+                _ => {
+                    return Err(echo_agent::error::ReactError::Other(
+                        "abandoned claim returned a non-terminal settlement".to_string(),
+                    ));
+                }
+            };
             emit_exec(
                 self.trace_sink.as_ref(),
                 ExecEvent::task(
@@ -2333,7 +2379,8 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
     ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeInterruptionSettlementOutcome> {
         let run_id = run_id.to_string();
         let wake_run_id = run_id.clone();
-        let outcome = self.blocking
+        let outcome = self
+            .blocking
             .run("settle runtime task interruption", move |store| {
                 store.settle_runtime_task_interruption(&run_id, expected_revision, disposition)
             })

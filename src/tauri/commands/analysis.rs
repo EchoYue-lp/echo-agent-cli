@@ -38,7 +38,8 @@ fn ipc_error(error: AnalysisError) -> IpcError {
         AnalysisError::Io(_)
         | AnalysisError::Json(_)
         | AnalysisError::Execution(_)
-        | AnalysisError::RuntimeUnavailable(_) => IpcError::Internal(error.to_string()),
+        | AnalysisError::RuntimeUnavailable(_)
+        | AnalysisError::Observation { .. } => IpcError::Internal(error.to_string()),
     }
 }
 
@@ -52,9 +53,9 @@ fn control_error(
         | AnalysisRunControlError::NotFound { .. }
         | AnalysisRunControlError::ReceiptMismatch { .. }
         | AnalysisRunControlError::Busy { .. } => IpcError::Validation(error.to_string()),
-        AnalysisRunControlError::CleanupFailed { .. } | AnalysisRunControlError::Execution(_) => {
-            IpcError::Internal(error.to_string())
-        }
+        AnalysisRunControlError::CleanupFailed { .. }
+        | AnalysisRunControlError::Execution(_)
+        | AnalysisRunControlError::Observation { .. } => IpcError::Internal(error.to_string()),
     }
 }
 

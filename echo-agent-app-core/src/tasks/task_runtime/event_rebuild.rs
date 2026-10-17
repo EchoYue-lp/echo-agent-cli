@@ -20,12 +20,12 @@ use super::run_authority::RuntimeJournalEvent;
 use super::types::{
     ActiveSubagentBoundary, ActiveToolBoundary, Artifact, ArtifactKind, AttendedMode,
     BackgroundCellArtifactStatus, BackgroundCellPhase, BackgroundCellState,
-    BackgroundCellTerminalCause, BlockerAudit, DomainProfile, ExecutionMode, PlanRevision,
-    PlanTask, ProviderRetryState, RecordedUserSteer, RecoveryBlocker, ReviewOutcome, ReviewResult,
-    RunContinuationState, RunPause, RunPauseReason, RunStateEventIndex, RunStateSnapshot,
-    RunTurnOrigin, RunTurnStatus, RunTurnSummary, RuntimeEventKind, RuntimeTaskEvent,
-    TaskExecutionSummary, TaskPlan, TaskRun, TaskRunExecutionProfile, TaskRunStatus,
-    TurnVisibility,
+    BackgroundCellTerminalCause, BlockerAudit, DomainProfile, ExecutionMode, PhysicalOwnerIntent,
+    PlanRevision, PlanTask, ProviderRetryState, RecordedUserSteer, RecoveryBlocker, ReviewOutcome,
+    ReviewResult, RunContinuationState, RunPause, RunPauseReason, RunStateEventIndex,
+    RunStateSnapshot, RunTurnOrigin, RunTurnStatus, RunTurnSummary, RuntimeEventKind,
+    RuntimeTaskEvent, TaskExecutionSummary, TaskPlan, TaskRun, TaskRunExecutionProfile,
+    TaskRunStatus, TurnVisibility,
 };
 
 /// How many recent user steers the fold keeps for the recovery capsule.
@@ -241,6 +241,8 @@ pub(crate) struct EventFoldState {
     #[serde(default)]
     tasks: Vec<PlanTask>,
     #[serde(default)]
+    invalid_execution: Option<String>,
+    #[serde(default)]
     background_cells: std::collections::BTreeMap<String, BackgroundCellState>,
     #[serde(default)]
     continuation: Option<RunContinuationState>,
@@ -264,6 +266,10 @@ pub(crate) struct EventFoldState {
     active_tools: std::collections::BTreeMap<String, ActiveToolBoundary>,
     #[serde(default)]
     recovery_blockers: std::collections::BTreeMap<String, RecoveryBlocker>,
+    #[serde(default)]
+    physical_owner_intents: std::collections::BTreeMap<String, PhysicalOwnerIntent>,
+    #[serde(default)]
+    physical_owner_intent_error: Option<String>,
     #[serde(default)]
     todo_runtime: std::collections::BTreeMap<String, TodoRuntimeProjection>,
     #[serde(default)]
@@ -296,7 +302,7 @@ impl EventFoldState {
     }
 
     pub(crate) fn has_current_query_projection_schema(&self) -> bool {
-        self.query_projection_schema == Some(1)
+        self.query_projection_schema == Some(2)
     }
 
     #[cfg(test)]
@@ -316,6 +322,7 @@ impl EventFoldState {
             run,
             plan,
             tasks,
+            invalid_execution,
             background_cells,
             continuation,
             recent_constraints,
@@ -328,6 +335,8 @@ impl EventFoldState {
             active_subagents,
             active_tools,
             recovery_blockers,
+            physical_owner_intents,
+            physical_owner_intent_error,
             todo_runtime,
             summaries,
             completion,
@@ -335,7 +344,7 @@ impl EventFoldState {
             sequence_overflow: _,
             missing_record_sequence: _,
         } = self;
-        *query_projection_schema = Some(1);
+        *query_projection_schema = Some(2);
         use RuntimeEventKind as K;
         for ev in std::slice::from_ref(event) {
             seen_run_ids.insert(ev.run_id.clone());
@@ -590,6 +599,30 @@ impl EventFoldState {
                                 todo_runtime.remove(&task.id);
                             }
                         }
+                        // New commits persist the framework's exact execution
+                        // result; reset/interruption decisions remain canonical.
+                        if let Some(executions) = p.get("executions") {
+                            match serde_json::from_value::<Vec<echo_agent::tasks::TaskExecution>>(
+                                executions.clone(),
+                            ) {
+                                Ok(executions) => {
+                                    for execution in executions {
+                                        if let Some(task) = tasks
+                                            .iter_mut()
+                                            .find(|task| task.id == execution.task_id)
+                                        {
+                                            *task = PlanTask::from_parts(task.spec(), execution);
+                                        } else {
+                                            *invalid_execution = Some(
+                                                "canonical execution is outside committed plan"
+                                                    .to_string(),
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(error) => *invalid_execution = Some(error.to_string()),
+                            }
+                        }
                         *plan = Some(TaskPlan {
                             plan_id: committed.plan_id,
                             run_id: committed.run_id,
@@ -629,6 +662,22 @@ impl EventFoldState {
                             #[allow(clippy::collapsible_if)]
                             // nested let-Option guard reads clearer than a let-chain
                             if let Some(t) = tasks.iter_mut().find(|t| &t.id == task_id) {
+                                if let Some(execution) = ev.payload.get("execution") {
+                                    match serde_json::from_value::<echo_agent::tasks::TaskExecution>(
+                                        execution.clone(),
+                                    ) {
+                                        Ok(execution) if execution.task_id == *task_id => {
+                                            *t = PlanTask::from_parts(t.spec(), execution);
+                                        }
+                                        Ok(_) => {
+                                            *invalid_execution = Some(
+                                                "canonical task execution identity mismatch"
+                                                    .to_string(),
+                                            )
+                                        }
+                                        Err(error) => *invalid_execution = Some(error.to_string()),
+                                    }
+                                }
                                 t.status = status;
                                 if let Some(value) = ev.payload.get("claim") {
                                     t.claim = serde_json::from_value(value.clone()).ok();
@@ -867,6 +916,24 @@ impl EventFoldState {
                     active_tools.remove(&tool_boundary_key(task_id, &call_id));
                 }
                 K::RecoveryBlocked => {
+                    if let Some(value) = ev.payload.get("physical_owner_intent") {
+                        match serde_json::from_value::<PhysicalOwnerIntent>(value.clone()) {
+                            Ok(intent)
+                                if intent.run_id == ev.run_id
+                                    && !intent.owner_id.trim().is_empty()
+                                    && !intent.workspace_id.trim().is_empty() =>
+                            {
+                                physical_owner_intents.insert(intent.owner_id.clone(), intent);
+                            }
+                            _ => {
+                                *physical_owner_intent_error = Some(
+                                    "invalid physical owner intent in canonical journal"
+                                        .to_string(),
+                                )
+                            }
+                        }
+                        continue;
+                    }
                     let Some(task_id) = ev.task_id.clone() else {
                         continue;
                     };
@@ -885,6 +952,22 @@ impl EventFoldState {
                     );
                 }
                 K::RecoveryResolved => {
+                    if let Some(value) = ev.payload.get("physical_owner_intent") {
+                        match serde_json::from_value::<PhysicalOwnerIntent>(value.clone()) {
+                            Ok(intent) => {
+                                if physical_owner_intents.get(&intent.owner_id) == Some(&intent) {
+                                    physical_owner_intents.remove(&intent.owner_id);
+                                }
+                            }
+                            Err(_) => {
+                                *physical_owner_intent_error = Some(
+                                    "invalid physical owner acknowledgment in canonical journal"
+                                        .to_string(),
+                                )
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(task_id) = ev.task_id.as_ref() {
                         recovery_blockers.remove(task_id);
                     }
@@ -1192,6 +1275,9 @@ impl EventFoldState {
     }
 
     pub(crate) fn rebuilt_plan(&self) -> Result<RebuiltPlan, RebuildError> {
+        if let Some(error) = self.invalid_execution.as_ref() {
+            return Err(RebuildError::InvalidExecution(error.clone()));
+        }
         let run = self.run.clone().ok_or(RebuildError::NoRunCreated)?;
         let plan = self.plan.clone().unwrap_or_else(|| empty_plan_for(&run));
         Ok(RebuiltPlan {
@@ -1211,6 +1297,8 @@ impl EventFoldState {
                 active_subagents: self.active_subagents.values().cloned().collect(),
                 active_tools: self.active_tools.values().cloned().collect(),
                 recovery_blockers: self.recovery_blockers.values().cloned().collect(),
+                physical_owner_intents: self.physical_owner_intents.values().cloned().collect(),
+                physical_owner_intent_error: self.physical_owner_intent_error.clone(),
             },
         })
     }
@@ -1600,6 +1688,8 @@ fn task_status_from_event(
 
 #[derive(Debug, thiserror::Error)]
 pub enum RebuildError {
+    #[error("invalid canonical task execution: {0}")]
+    InvalidExecution(String),
     #[error("event stream has no RunCreated event")]
     NoRunCreated,
 }
@@ -1685,6 +1775,8 @@ mod tests {
             failure_fingerprint: None,
             status: echo_agent::tasks::TaskStatus::Pending,
             claim: None,
+            result: None,
+            interruption_requested: None,
             sort_order: 0,
         }
     }

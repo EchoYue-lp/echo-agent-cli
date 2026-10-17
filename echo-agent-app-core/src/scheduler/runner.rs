@@ -13,7 +13,10 @@
 use crate::agent_handle::AgentHandle;
 use crate::agent_pool::AgentPool;
 use crate::tasks::task_runtime::TaskRuntimeStore;
-use crate::tasks::task_runtime::executor::{create_unattended_run, drive_existing_cron_run};
+use crate::tasks::task_runtime::executor::{
+    ExecError, create_unattended_run, drive_existing_cron_run,
+};
+use crate::tasks::task_runtime::store::RunDriverFailure;
 use echo_agent::agent::CancellationToken;
 use echo_agent::scheduler::{
     CronTask, CronTaskStore, FireFn, SchedulerRunner as FrameworkSchedulerRunner,
@@ -98,7 +101,7 @@ fn build_fire_fn_with_cancel(
                 ))
             })?;
             let mut registration = store
-                .register_run_driver::<String>(admission, generation_lease)
+                .register_observed_run_driver::<String>(admission, generation_lease)
                 .map_err(|error| {
                     echo_agent::error::ReactError::Other(format!(
                         "cron TaskRun driver registration failed: {error}"
@@ -129,7 +132,7 @@ fn build_fire_fn_with_cancel(
                     .transpose()
                     .map_err(|error| format!("cron memory generation unavailable: {error}"))?;
                 if let Some(generation) = memory_generation.as_ref() {
-                    receipt_owner.retain(generation.clone());
+                    receipt_owner.retain(generation.clone())?;
                 }
                 let layer_manager = memory_generation
                     .as_ref()
@@ -146,7 +149,7 @@ fn build_fire_fn_with_cancel(
                             .await
                             .map_err(|error| format!("cron pool acquire failed: {error}"))?;
                         let agent = acquired.agent();
-                        receipt_owner.retain(pool.retain_for_supervised_run(run_key, acquired));
+                        receipt_owner.retain(pool.retain_for_supervised_run(run_key, acquired))?;
                         register_task_execute_on_agent(&agent, owned_store.clone()).await;
                         agent
                     }
@@ -170,7 +173,7 @@ fn build_fire_fn_with_cancel(
                     owned_cancel,
                 )
                 .await
-                .map_err(|error| format!("cron run failed: {error}"));
+                .map_err(cron_execution_error);
                 let settled_run_id = result?;
                 if let Some(emitter) = webhook_emitter.as_ref() {
                     emitter.emit(crate::webhook::WebhookEvent::CronTaskCompleted {
@@ -186,13 +189,23 @@ fn build_fire_fn_with_cancel(
             });
             match waiter.await {
                 Ok(Ok(result)) => Ok(result),
-                Ok(Err(error)) => Err(echo_agent::error::ReactError::Other(error)),
+                Ok(Err(error)) => Err(error.into_react_error()),
                 Err(error) => Err(echo_agent::error::ReactError::Other(format!(
                     "cron TaskRun result waiter failed: {error}"
                 ))),
             }
         }) as futures::future::BoxFuture<'static, echo_agent::error::Result<String>>
     })
+}
+
+// Add ordinary cron context only after preserving the typed observation.
+// The existing supervisor must see unknown ownership before any failure policy.
+fn cron_execution_error(error: ExecError) -> RunDriverFailure {
+    let ordinary = format!("cron run failed: {error}");
+    match RunDriverFailure::from(error) {
+        observation @ RunDriverFailure::Observation { .. } => observation,
+        RunDriverFailure::Error(_) => RunDriverFailure::Error(ordinary),
+    }
 }
 
 /// Register `task_execute` on a cron run's pool-acquired Agent. The normal
@@ -253,6 +266,25 @@ mod tests {
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::testing::MockLlmClient;
 
+    #[test]
+    fn cron_observation_round_trip_keeps_exact_identity_and_ordinary_error_context() {
+        let original = echo_agent::error::ReactError::ExecutionNotSettled {
+            run_id: "cron-original-run".into(),
+            execution_id: Some("cron-original-execution".into()),
+        };
+        let typed = cron_execution_error(ExecError::Framework(original));
+        assert!(
+            matches!(&typed, RunDriverFailure::Observation { run_id, execution_id } if run_id == "cron-original-run" && execution_id.as_deref() == Some("cron-original-execution"))
+        );
+        assert!(
+            matches!(typed.into_react_error(), echo_agent::error::ReactError::ExecutionNotSettled { run_id, execution_id } if run_id == "cron-original-run" && execution_id.as_deref() == Some("cron-original-execution"))
+        );
+        let ordinary = cron_execution_error(ExecError::Other("provider unavailable".into()));
+        assert!(
+            matches!(ordinary.into_react_error(), echo_agent::error::ReactError::Other(message) if message == "cron run failed: provider unavailable")
+        );
+    }
+
     /// Cron 必须经 supervised TaskRuntime driver（在 store 建 run）。mock LLM
     /// 返回纯文本时，driver 的 direct 分支自动转 Completed。
     #[tokio::test]
@@ -265,6 +297,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let handle = AgentHandle::new(agent);
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         let workspace = tempfile::tempdir().map_err(|error| error.to_string())?;
         store
             .rebind_shadow_root(workspace.path().join("tasks"), "cron-workspace")
@@ -303,6 +336,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let handle = AgentHandle::new(agent);
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None, None);
 
         let task = CronTask::new("plan", "*/5 * * * *", "[plan] do the thing");
@@ -332,6 +366,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let handle = AgentHandle::new(agent);
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None, None);
 
         let task = CronTask::new("failing", "*/5 * * * *", "run this");
@@ -353,6 +388,7 @@ mod tests {
             .build()
             .map_err(|error| error.to_string())?;
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         let scheduler_cancel = CancellationToken::new();
         scheduler_cancel.cancel();
         let fire_fn = build_fire_fn_with_cancel(
@@ -384,6 +420,7 @@ mod tests {
             .build()
             .map_err(|error| error.to_string())?;
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
         let (reservation_started, release_reservation) =
             store.park_next_run_driver_admission_for_test()?;
         let fire_fn = build_fire_fn(
@@ -455,6 +492,399 @@ mod tests {
             pause_reason,
             Some(crate::tasks::task_runtime::RunPauseReason::BootRecovery)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_scheduler_fire_fn_keeps_task_unknown_and_original_occurrence_nonterminal()
+    -> anyhow::Result<()> {
+        use echo_agent::delivery::{DeliveryEvent, DeliveryOutcome};
+        use echo_agent::error::ReactError;
+        use echo_agent::llm::{ChatChunk, ChatRequest, ChatResponse, LlmClient};
+        use futures::future::BoxFuture;
+        use futures::stream::BoxStream;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        // The gate is in the real Agent's provider call, not around FireFn.
+        // The backend is test-owned async work; it is not an OS-process proof.
+        struct ProviderGate {
+            store: std::sync::Weak<TaskRuntimeStore>,
+            unknown: bool,
+            entered: Notify,
+            output: Notify,
+            physical_release: Arc<Notify>,
+            backend: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+            capacity: Arc<tokio::sync::Semaphore>,
+            physical_closed: Arc<AtomicBool>,
+            calls: AtomicUsize,
+            identity: std::sync::Mutex<Option<(String, Option<String>)>>,
+        }
+
+        impl ProviderGate {
+            async fn admitted_identity(
+                &self,
+            ) -> echo_agent::error::Result<(String, Option<String>)> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) != 0 {
+                    return Err(ReactError::Other("unexpected second provider call".into()));
+                }
+                let store = self
+                    .store
+                    .upgrade()
+                    .ok_or_else(|| ReactError::Other("original store lost".into()))?;
+                let runs = store
+                    .list_runs_in(&[
+                        TaskRunStatus::Pending,
+                        TaskRunStatus::Running,
+                        TaskRunStatus::Paused,
+                        TaskRunStatus::Completed,
+                        TaskRunStatus::Failed,
+                        TaskRunStatus::Cancelled,
+                    ])
+                    .map_err(|error| ReactError::Other(error.to_string()))?;
+                if runs.len() != 1 {
+                    return Err(ReactError::Other(
+                        "provider did not receive exactly one original TaskRun".into(),
+                    ));
+                }
+                let run = runs
+                    .first()
+                    .ok_or_else(|| ReactError::Other("original TaskRun absent".into()))?;
+                let snapshot = store
+                    .get_run_state(&run.run_id)
+                    .map_err(|error| ReactError::Other(error.to_string()))?
+                    .ok_or_else(|| ReactError::Other("original Run state absent".into()))?;
+                if snapshot.event_index.physical_owner_intents.len() != 1 {
+                    return Err(ReactError::Other(
+                        "provider started without its original durable intent".into(),
+                    ));
+                }
+                let intent = snapshot
+                    .event_index
+                    .physical_owner_intents
+                    .first()
+                    .ok_or_else(|| ReactError::Other("original intent absent".into()))?;
+                if intent.run_id != run.run_id || intent.physical_terminal_observed {
+                    return Err(ReactError::Other(
+                        "provider intent identity/finality mismatch".into(),
+                    ));
+                }
+                let identity = (intent.run_id.clone(), intent.execution_id.clone());
+                *self
+                    .identity
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(identity.clone());
+                let permit = self
+                    .capacity
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|error| ReactError::Other(error.to_string()))?;
+                let release = self.physical_release.clone();
+                let closed = self.physical_closed.clone();
+                let (started, ready) = tokio::sync::oneshot::channel();
+                let backend = tokio::spawn(async move {
+                    let _original_permit = permit;
+                    let _ = started.send(());
+                    release.notified().await;
+                    closed.store(true, Ordering::SeqCst);
+                });
+                *self
+                    .backend
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(backend);
+                ready
+                    .await
+                    .map_err(|error| ReactError::Other(error.to_string()))?;
+                self.entered.notify_one();
+                self.output.notified().await;
+                Ok(identity)
+            }
+
+            fn response(&self, identity: (String, Option<String>)) -> MockLlmClient {
+                if self.unknown {
+                    MockLlmClient::new().with_error(ReactError::ExecutionNotSettled {
+                        run_id: identity.0,
+                        execution_id: identity.1,
+                    })
+                } else {
+                    MockLlmClient::new().with_response("normal cron physical result")
+                }
+            }
+
+            async fn finish_backend(&self) -> anyhow::Result<()> {
+                self.physical_release.notify_one();
+                let backend = self
+                    .backend
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("original provider backend absent"))?;
+                tokio::time::timeout(std::time::Duration::from_secs(10), backend).await??;
+                Ok(())
+            }
+        }
+
+        impl LlmClient for ProviderGate {
+            fn chat(
+                &self,
+                request: ChatRequest,
+            ) -> BoxFuture<'_, echo_agent::error::Result<ChatResponse>> {
+                Box::pin(async move {
+                    let identity = self.admitted_identity().await?;
+                    self.response(identity).chat(request).await
+                })
+            }
+            fn chat_stream(
+                &self,
+                request: ChatRequest,
+            ) -> BoxFuture<
+                '_,
+                echo_agent::error::Result<BoxStream<'static, echo_agent::error::Result<ChatChunk>>>,
+            > {
+                Box::pin(async move {
+                    let identity = self.admitted_identity().await?;
+                    self.response(identity).chat_stream(request).await
+                })
+            }
+            fn model_name(&self) -> &str {
+                "mock-model"
+            }
+        }
+
+        struct ReleaseOnError(Arc<ProviderGate>);
+        impl Drop for ReleaseOnError {
+            fn drop(&mut self) {
+                self.0.output.notify_one();
+                self.0.physical_release.notify_one();
+            }
+        }
+
+        type Event = DeliveryEvent<String, serde_json::Value>;
+        fn original_events(path: &std::path::Path) -> anyhow::Result<Vec<Event>> {
+            // Read only the real writer's batch records using its public Event
+            // DTO. Opening a second FileEventJournal with a different payload
+            // TypeId would replace the original authority and is not allowed.
+            let mut events = Vec::new();
+            for line in std::fs::read_to_string(path)?.lines() {
+                let frame: serde_json::Value = serde_json::from_str(line)?;
+                let records = frame
+                    .get("records")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("original journal batch records absent"))?;
+                for record in records {
+                    let event = record
+                        .get("event")
+                        .ok_or_else(|| anyhow::anyhow!("original record event absent"))?;
+                    events.push(serde_json::from_value(event.clone())?);
+                }
+            }
+            Ok(events)
+        }
+
+        for unknown in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+            let _original_resource_root = store.test_resource_scope();
+            store
+                .rebind_shadow_root(directory.path().join("TaskRun"), "cron-real-chain")
+                .await?;
+            let gate = Arc::new(ProviderGate {
+                store: Arc::downgrade(&store),
+                unknown,
+                entered: Notify::new(),
+                output: Notify::new(),
+                physical_release: Arc::new(Notify::new()),
+                backend: std::sync::Mutex::new(None),
+                capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+                physical_closed: Arc::new(AtomicBool::new(false)),
+                calls: AtomicUsize::new(0),
+                identity: std::sync::Mutex::new(None),
+            });
+            let _release_on_error = ReleaseOnError(gate.clone());
+            let agent = AgentHandle::new(
+                ReactAgentBuilder::new()
+                    .llm_client(gate.clone())
+                    .system_prompt("test")
+                    .build()?,
+            );
+            let cancel = CancellationToken::new();
+            let definition = directory.path().join("tasks.json");
+            // CronTaskStore::occurrence_paths appends this suffix to the full
+            // selected definition filename; the test does not invent a store.
+            let journal = directory.path().join("tasks.json.occurrences.jsonl");
+            let runner = Arc::new(
+                new_scheduler_runner(
+                    CronTaskStore::new().with_path(definition),
+                    cancel,
+                    agent,
+                    Some(store.clone()),
+                    None,
+                    None,
+                    None,
+                )
+                .await?,
+            );
+            let task = CronTask::new("real consumer chain", "* * * * *", "read-only answer");
+            let task_id = task.id.clone();
+            runner.add_task(task).await?;
+            let original_runner = runner.clone();
+            let original_task_id = task_id.clone();
+            let manual =
+                tokio::spawn(async move { original_runner.run_once(&original_task_id).await });
+            tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
+                .await?;
+            let provider_identity = gate
+                .identity
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("actual provider identity absent"))?;
+            let before = store
+                .get_run_state(&provider_identity.0)?
+                .ok_or_else(|| anyhow::anyhow!("original run snapshot absent"))?;
+            let before_run = store
+                .get_run(&provider_identity.0)?
+                .ok_or_else(|| anyhow::anyhow!("original run absent"))?;
+            let entered_events = original_events(&journal)?;
+            let claims: Vec<_> = entered_events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Claimed {
+                        message_id,
+                        attempt_id,
+                        ..
+                    } => Some((message_id.clone(), attempt_id.clone())),
+                    _ => None,
+                })
+                .collect();
+            let original_claim = claims
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("actual scheduler claim absent"))?;
+            let held = !manual.is_finished()
+                && gate.capacity.available_permits() == 0
+                && !gate.physical_closed.load(Ordering::SeqCst);
+            if !unknown {
+                gate.finish_backend().await?;
+            }
+            gate.output.notify_one();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), manual).await??;
+            let after_run = store
+                .get_run(&provider_identity.0)?
+                .ok_or_else(|| anyhow::anyhow!("original run disappeared"))?;
+            let after = store
+                .get_run_state(&provider_identity.0)?
+                .ok_or_else(|| anyhow::anyhow!("original state disappeared"))?;
+            let task_events = store.list_events(&provider_identity.0, 0)?;
+            let same_run_rejected = unknown
+                && store
+                    .reserve_run_driver_admission(
+                        provider_identity.0.clone(),
+                        CancellationToken::new(),
+                    )
+                    .is_err();
+            let mut handle = runner.clone().spawn();
+            let shutdown =
+                tokio::time::timeout(std::time::Duration::from_secs(10), handle.shutdown()).await?;
+            let repeated =
+                tokio::time::timeout(std::time::Duration::from_secs(10), handle.join()).await?;
+            let final_events = original_events(&journal)?;
+            let final_tasks = runner.list_tasks().await;
+            let final_task = final_tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .ok_or_else(|| anyhow::anyhow!("original cron definition disappeared"))?;
+            let callback_held_after_observation = gate.capacity.available_permits() == 0
+                && !gate.physical_closed.load(Ordering::SeqCst);
+            if unknown {
+                gate.finish_backend().await?;
+            }
+            let original_backend_joined = gate.capacity.available_permits() == 1
+                && gate.physical_closed.load(Ordering::SeqCst);
+            // No store/occurrence terminal acknowledgement is fabricated from
+            // the test's physical join. Unknown with no late source stays so.
+            assert!(held && original_backend_joined);
+            assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(claims.len(), 1);
+            let final_claims: Vec<_> = final_events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Claimed {
+                        message_id,
+                        attempt_id,
+                        ..
+                    } => Some((message_id.clone(), attempt_id.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(final_claims, claims);
+            assert_eq!(final_events.iter().filter(|event| matches!(event, Event::EffectStarted { message_id, attempt_id, .. } if message_id == &original_claim.0 && attempt_id == &original_claim.1)).count(), 1);
+            let all_runs = store.list_runs_in(&[
+                TaskRunStatus::Pending,
+                TaskRunStatus::Running,
+                TaskRunStatus::Paused,
+                TaskRunStatus::Completed,
+                TaskRunStatus::Failed,
+                TaskRunStatus::Cancelled,
+            ])?;
+            assert_eq!(all_runs.len(), 1);
+            if unknown {
+                assert!(
+                    matches!(result, Err(ReactError::ExecutionNotSettled { run_id, execution_id }) if run_id == provider_identity.0 && execution_id == provider_identity.1)
+                );
+                assert_eq!(after_run.status, before_run.status);
+                assert!(!matches!(
+                    after_run.status,
+                    TaskRunStatus::Completed | TaskRunStatus::Failed | TaskRunStatus::Cancelled
+                ));
+                assert_eq!(
+                    after.event_index.physical_owner_intents,
+                    before.event_index.physical_owner_intents
+                );
+                assert!(store.has_unsettled_driver_resources() && same_run_rejected);
+                assert!(callback_held_after_observation);
+                assert!(!task_events.iter().any(|event| matches!(
+                    event.event_type,
+                    crate::tasks::task_runtime::RuntimeEventKind::RunCompleted
+                        | crate::tasks::task_runtime::RuntimeEventKind::RunFailed
+                        | crate::tasks::task_runtime::RuntimeEventKind::RunCancelled
+                )));
+                let exact_occurrence = |error: &echo_agent::error::Result<()>| {
+                    matches!(error,
+                    Err(ReactError::ExecutionNotSettled { run_id, execution_id: Some(attempt) })
+                    if run_id == &original_claim.0 && attempt == &original_claim.1)
+                };
+                assert!(exact_occurrence(&shutdown) && exact_occurrence(&repeated));
+                assert!(final_task.last_result.is_none() && final_task.last_run_at.is_none());
+                assert!(
+                    !final_events
+                        .iter()
+                        .any(|event| matches!(event, Event::TurnSettled { .. }))
+                );
+            } else {
+                let answer = result?;
+                assert_eq!(after_run.status, TaskRunStatus::Completed);
+                assert!(after.event_index.physical_owner_intents.is_empty());
+                assert!(!store.has_unsettled_driver_resources());
+                assert_eq!(final_task.last_result.as_deref(), Some(answer.as_str()));
+                assert!(final_task.last_run_at.is_some());
+                assert!(shutdown.is_ok() && repeated.is_ok());
+                assert_eq!(
+                    final_events
+                        .iter()
+                        .filter(|event| matches!(event, Event::TurnSettled {
+                    message_id, attempt_id, outcome: DeliveryOutcome::Completed, ..
+                } if message_id == &original_claim.0 && attempt_id == &original_claim.1))
+                        .count(),
+                    1
+                );
+            }
+            // Spawning and immediately cancelling the loop is not claimed to
+            // exercise recovery/replay; that remains the framework's own proof.
+            // This composition proves the existing claim and callback count
+            // survive real shutdown/re-observation without false settlement.
+        }
         Ok(())
     }
 }

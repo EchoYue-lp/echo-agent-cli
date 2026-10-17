@@ -164,9 +164,10 @@ impl PreparedAgentPoolPluginPublication<'_> {
         &mut self,
         retired: AgentPluginGeneration,
     ) -> Result<(), String> {
-        let candidate = self.candidate.take().ok_or_else(|| {
-            "AgentPool has no prepared Plugin candidate to retire".to_string()
-        })?;
+        let candidate = self
+            .candidate
+            .take()
+            .ok_or_else(|| "AgentPool has no prepared Plugin candidate to retire".to_string())?;
         let mut errors = Vec::new();
         let mut pooled_agents = self.agents.iter().collect::<Vec<_>>();
         pooled_agents.sort_by(|left, right| left.0.cmp(right.0));
@@ -665,22 +666,21 @@ impl AgentPool {
                 let ownership = crate::mcp_config_runtime::McpNameOwnershipRegistry::new(
                     mcp_config.mcp_servers.keys().cloned(),
                 );
-                let runtime = crate::plugin_runtime::PluginRuntimeService::new_for_scope_after_agent_reset(
-                    primary.handle.clone(),
-                    lsp_runtime,
-                    Arc::clone(&ownership),
-                    plugin_target_scope,
-                    Some(authority_plugin_generation.clone()),
-                )
-                .await?;
+                let runtime =
+                    crate::plugin_runtime::PluginRuntimeService::new_for_scope_after_agent_reset(
+                        primary.handle.clone(),
+                        lsp_runtime,
+                        Arc::clone(&ownership),
+                        plugin_target_scope,
+                        Some(authority_plugin_generation.clone()),
+                    )
+                    .await?;
                 runtime.bind_agent_pool(Arc::downgrade(&pool)).await?;
                 (Some(runtime), ownership)
             }
             _ => {
-                pool.agent_generation.write().await.skill_descriptors = primary
-                    .handle
-                    .read(|agent| agent.skill_descriptors())
-                    .await;
+                pool.agent_generation.write().await.skill_descriptors =
+                    primary.handle.read(|agent| agent.skill_descriptors()).await;
                 (
                     None,
                     crate::mcp_config_runtime::McpNameOwnershipRegistry::new(Vec::<String>::new()),
@@ -731,12 +731,14 @@ impl AgentPool {
                 ..Default::default()
             },
         );
-        app_config.configured_models.push(crate::config::ConfiguredModel {
-            id: "test:test-model".to_string(),
-            provider: "test".to_string(),
-            model: "test-model".to_string(),
-            ..Default::default()
-        });
+        app_config
+            .configured_models
+            .push(crate::config::ConfiguredModel {
+                id: "test:test-model".to_string(),
+                provider: "test".to_string(),
+                model: "test-model".to_string(),
+                ..Default::default()
+            });
         Self::new_for_test_with_config(
             &agent,
             review_integration,
@@ -1163,10 +1165,7 @@ impl AgentPool {
         Ok(())
     }
 
-    pub async fn conversation_model_override(
-        &self,
-        conversation_id: &str,
-    ) -> Option<String> {
+    pub async fn conversation_model_override(&self, conversation_id: &str) -> Option<String> {
         self.conversation_model_overrides
             .read()
             .await
@@ -1420,10 +1419,10 @@ impl AgentPool {
         for handle in handles {
             let thinking = thinking.clone();
             let _updated = handle.try_write(|agent| {
-                    if agent.thinking() != thinking.as_ref() {
-                        agent.set_thinking(thinking);
-                    }
-                });
+                if agent.thinking() != thinking.as_ref() {
+                    agent.set_thinking(thinking);
+                }
+            });
         }
         for consumers in model_consumers {
             consumers.apply_thinking(thinking.clone()).await;
@@ -1452,12 +1451,12 @@ impl AgentPool {
         }
         for handle in handles {
             let _updated = handle.try_write(|agent| {
-                    if agent.config().get_max_iterations() != resolved
-                        && let Err(error) = agent.set_max_iterations(resolved)
-                    {
-                        tracing::warn!(%error, "AgentPool: rejected max_iterations publication");
-                    }
-                });
+                if agent.config().get_max_iterations() != resolved
+                    && let Err(error) = agent.set_max_iterations(resolved)
+                {
+                    tracing::warn!(%error, "AgentPool: rejected max_iterations publication");
+                }
+            });
         }
     }
 
@@ -1731,6 +1730,26 @@ impl AgentPool {
         }));
     }
 
+    pub(crate) fn bind_lifecycle_retention(
+        &self,
+        root: &Arc<crate::runtime::ApplicationLifecycleRetention>,
+    ) {
+        *self
+            .admission
+            .lifecycle_retention
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(root);
+    }
+
+    pub(crate) fn has_unsettled_executions(&self) -> bool {
+        self.admission.has_unsettled()
+    }
+
+    pub(crate) async fn join_known_executions(&self) -> Result<(), String> {
+        self.begin_shutdown();
+        self.admission.join_known().await
+    }
+
     /// Stop the cleanup monitor and release all pool agents.
     pub fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
@@ -1755,7 +1774,7 @@ impl AgentPool {
         } else {
             None
         };
-        self.admission.wait_until_idle().await;
+        self.admission.join_known().await?;
         let mut agents = self.agents.write().await;
         let count = agents.len();
         agents.clear();
@@ -2025,10 +2044,8 @@ impl AgentPool {
         let agent_generation = self.agent_generation.read().await.clone();
         for desc in &agent_generation.skill_descriptors {
             if let Some(policy) = self.shared.review_integration.as_ref()
-                && !echo_agent::skills::external::SkillLoadPolicy::allows(
-                    policy.as_ref(), desc,
-                )
-                .await
+                && !echo_agent::skills::external::SkillLoadPolicy::allows(policy.as_ref(), desc)
+                    .await
             {
                 continue;
             }

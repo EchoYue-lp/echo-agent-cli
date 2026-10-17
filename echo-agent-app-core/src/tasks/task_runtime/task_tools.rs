@@ -1061,7 +1061,7 @@ impl CreateComplexTaskTool {
             }
         };
         let mut registration =
-            match store.register_run_driver::<RunOutcome>(admission, generation_lease) {
+            match store.register_observed_run_driver::<RunOutcome>(admission, generation_lease) {
                 Ok(registration) => registration,
                 Err(error) => {
                     return Ok(ToolResult::error(format!(
@@ -1160,6 +1160,7 @@ impl CreateComplexTaskTool {
                             .to_string(),
                     ))
                 }
+                Ok(Err(error)) if error.is_observation() => Err(error.into_react_error()),
                 Ok(Err(error)) => Ok(ToolResult::error(format!("Run failed: {error}"))),
                 Err(error) => Ok(ToolResult::error(format!(
                     "Run driver settlement was lost: {error}"

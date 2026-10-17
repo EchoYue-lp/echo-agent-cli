@@ -326,6 +326,24 @@ pub enum ConversationInputError {
     NotDispatchable { input_id: String },
     #[error(transparent)]
     Journal(#[from] ChatEventLogError),
+    #[error("input execution for run {run_id} is not physically settled")]
+    Observation {
+        run_id: String,
+        execution_id: Option<String>,
+    },
+}
+
+fn input_observation_error(error: echo_agent::error::ReactError) -> ConversationInputError {
+    match error {
+        echo_agent::error::ReactError::ExecutionNotSettled {
+            run_id,
+            execution_id,
+        } => ConversationInputError::Observation {
+            run_id,
+            execution_id,
+        },
+        other => ConversationInputError::Validation(other.to_string()),
+    }
 }
 
 /// Stateless adapter over the existing `ChatEventLog` input reducer.
@@ -633,7 +651,10 @@ impl ConversationInputService {
                 )
                 .await);
         }
-        let accepted = receipt.wait_for_accepted().await;
+        let accepted = receipt
+            .wait_for_accepted()
+            .await
+            .map_err(input_observation_error)?;
         match accepted {
             echo_agent::runtime::TurnInputState::Pending => Err(self
                 .observer_failure(
@@ -648,7 +669,11 @@ impl ConversationInputService {
                 if let Err(error) = self.mailbox_accepted(attempt.clone()).await {
                     return Err(self.observer_failure(attempt, false, error).await);
                 }
-                match receipt.wait_for_drained().await {
+                match receipt
+                    .wait_for_drained()
+                    .await
+                    .map_err(input_observation_error)?
+                {
                     echo_agent::runtime::TurnInputState::Drained => {
                         attempt.observation.mark_drained();
                         match self.drained(attempt.clone()).await {
