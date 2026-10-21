@@ -2,8 +2,9 @@
 schema_version: 1
 id: evidence.cancellation-observation-consumer
 kind: evidence
-observed_at: source:42165674392f8798397a1d6ca6db25de31d2c5aba30563e645d524bddd86a446
+observed_at: source:fa8844cd92e0841468a1ba360fe64f390b7a0c49927935ac89731cf51e642989
 source_refs:
+- echo-agent-app-core/src/infra/factory.rs
 - echo-agent-app-core/src/agent_pool/tests.rs
 - echo-agent-app-core/src/state/reliability_contracts.rs
 - echo-agent-app-core/src/tasks/task_runtime/store/journal.rs
@@ -47,6 +48,10 @@ source_refs:
 - docs/supreme/specs/cancellation-observation-consumer/plans/plan_01_consumer.md
 - echo-agent-app-core/src/plugin_runtime/tests.rs
 - echo-agent-app-core/src/tasks/task_runtime/subagent_control.rs
+- echo-agent-app-core/src/managed_conversation.rs
+- docs/en/adr/0045-managed-conversation-lifecycle.md
+- docs/zh/adr/0045-managed-conversation-lifecycle.md
+- docs/supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md
 supports:
 - behavior.shared-turn-observation-retains-owner
 - behavior.task-unknown-owner-admission-fence
@@ -67,7 +72,11 @@ limitations:
 
 ## 支持的结论
 
-当前 checkpoint（CF988）：三个不同 focused case 各真实 1pass/0fail、零编译 warning、运行前后无源码漂移；独立实现与原件复审 C0/I0/M0。合法 unknown 逐 run 保留而不阻断普通恢复，原 existing-run identity/Goal 与入口错配校验保持，canonical compose 在真实 driver 准入前接同一 root。它不代表新 cron、全量矩阵或主分支交付通过。下文旧 cut 是按 epoch 保存的历史记录，当前完成边界以本段和最后 checkpoint 为准。
+当前结论以文末 `Approved six-risk / WebPKI focused checkpoint, 2026-10-21` 为准：用户已明确接受新增精三项及六项校验合同，两份实际审计均为原 scanner1、独立 riskgate0/caller0，0vuln/6精告警。新锁 Rust 三组 focused 已实际通过，共31个不同名称、0fail/0ignore/零warning，详见文末；patched-lock 完整八项、最终 framework/CLI main、native Hook/Stop 仍未完成，F 自身的测试不作为 CLI 成绩。
+
+历史批准前切点（截至 2026-10-20）：framework356 候选仅闭合下文具名的 managed import 根 prompt/计数适配及原六用例：same AFTER6pass/0fail/0ignore/1650filtered、零 warning、原 framework clean 与源码无漂移。原六项依赖工具测试与 formatter 也通过，但两份新在线扫描均 scanner1/gate1：在原三个冻结接受风险之外新增三个未接受的 zbus 系列停止维护告警。因此完整 Rust/GUI、精确 main CI、native Stop 与宽行为仍未完成；下文其它切点均为保留的历史证据。
+
+历史 CF988 checkpoint：三个不同 focused case 各真实 1pass/0fail、零编译 warning、运行前后无源码漂移；独立实现与原件复审 C0/I0/M0。合法 unknown 逐 run 保留而不阻断普通恢复，原 existing-run identity/Goal 与入口错配校验保持，canonical compose 在真实 driver 准入前接同一 root。它不代表新 cron、全量矩阵或主分支交付通过。下文旧 cut 是按 epoch 保存的历史记录，当前完成边界以本段和最后 checkpoint 为准。
 
 历史切点记录：
 
@@ -250,3 +259,43 @@ P保持真实HEAD7a33与official PFbase7a33，current-checkpoint strict0。原P�
 最终累计84路径逐项理由与root独审C0/I0/M0在task-local记录，未纳raw/PF/log/temp/二进制或新增发布。所有27实际exe/67支持lib在cache外独立94inode保SHA；835 raw、旧569与关键beforebin全0mismatch后，official cargo clean明确own target/profiledev dryrun全部在本任务debug，actual0，8643604480→8192，free15644971008；不碰迁移备份/C源/CF/其它cache，不以资源中止作产品红绿。后继正规源码/文稿收束仅改非运行输入，须用Git/945等价证明carry六门禁，不重跑已通过heavy。
 
 正式双语ADR仍只涉及0004/0015，四Plan绑定章节、Rule/Behavior needs_review、三Audit stale、inventory/behavior closure open均不借本地全绿关闭。官网overview/capabilities/storage的有限事实同步由独立官网交付在CLI精确mainCI后处理，不自动复制全部CLI阶段文档；本次私有夹具修复无新公共示例行为，既有examples已由all-target链编译。当前Plan仍ready，main/nativeStop/最终冷验未写完成。
+
+
+## Historical pre-approval Framework 3560812 ordinary managed import candidate (as of 2026-10-20)
+
+本节逐字事实和 scanner1/riskgate1 记录属于新增三项尚未获批的历史切点；不作为当前接受状态。当前已批准精六项及两审计 gate0 的有限资格见文末 2026-10-21 checkpoint，旧原件不改写。
+
+CLI 从公开0d1bbd39接续；canonical相对Cargo路径指向独立clean framework main `3560812caede84998a1f6f26d7bf3fa81ea0486c` / tree `bbacaad650b935c516194a9373580fe7747c8256`，不改用户primary、不把应用CI改成hash pin。普通导入的两个 `TranscriptProjectionCheckpoint` literal明确 `context_only: None`，仍用原canonical rows、digest/ordinal、receipt、epoch和Runtime CAS。
+
+原6case第一次实际运行已成功编译但3pass/3fail/0ignore/1650filtered；三处恢复断言得到3条而非2条。根因为应用先把 `Agent::system_prompt` 的基础值合成为System行，框架恢复后又加入自己的完整canonical rendered root。raw18622B/SHA `c4333bd3bb5fd85f334c7b0569aa51baa8cde83b273702a13b01b15eaf7ce1c2`、原437987536B executable/SHA `5cfe253fa7244f0c2872093377d83712879f8b88122b37452a2c44e3ab0f64d4`和全部原guard保在本任务ignored目录。这是业务失败，不是资源中断；编译零warning。
+
+最小生产修复只删除应用合成基础System，根渲染/补入继续由框架resume负责。matching checkpoint返回值按checkpoint真实非System消息计数，替代固定减一；只计数，不删除payload或读取live Context另造权威。调用方System行仍由既有visible-transcript validator拒绝，不新增System导入合同，框架对独立System上下文的保护也不修改。原6case全部断言与test body逐字保留，仅把原Message import移至test scope。独立框架根权威reader和必要性/三项风险暴露reader对精source `012909c965c0dffe03e621d880b1a2f48160c4d0c1fc1e02af6d024dd1a96c2d`及双语ADR0045均C0/I0/M0；原固定减一遗漏是源码复审发现的I1，不冒第二次native red。
+
+同原 `cargo test -p echo-agent-app-core --lib --no-default-features --locked managed_conversation::tests`、同原profile实际AFTER0：6pass/0fail/0ignore/1650filtered，编译4m16s、行为1.02s、零warning。raw2798B/SHA `2f91d3e905b1f7227b990e5e68eb49367ba1be9da6d1fbb3e54f6cf23d6a30f6`；945份CLI与2329份framework tracked文件SHA guard无漂移，F前后clean。唯一自有target硬线4GiB/free floor5GiB不变，peak2669748224B/free min6269149184B，未触发。jobs1、incremental0、debug0/strip debuginfo；无新增RUSTFLAGS/opt/assertions/overflow/unwind改动。`cargo fmt --all`与其自然终态后的串行 `cargo fmt --all -- --check`实际0，Rust源和消费者fingerprint无变化；较早重叠的check原记录另保，不以其代替最终串行check。
+
+合法有限复评后，原接受政策只把consumer fingerprint从28312efa...ecb2重绑为 `e2d5f0effc12b6df6952efb40eb56119cdf83edacabf170ba83c290658536043`。未加GTK/glib/macro/syntect-bincode production caller、serialization、feature、manifest或依赖边，锁仍 `8e9512837eab1cab81bd9097d0636fbb7fc9afd00b809bd69eedde8c5345aa4c`；这是原人类三项冻结决策下的实现复评，不是agent新的人类批准。原gate对最初两None及最终source均先返回consumer drift/scannerExit null，旧风险接受未自动续期。重绑后的原全部6risk工具test methods真实0；其mock-scanner控制不是官方在线扫描证据。
+
+新actual-lock与framework原canonical registry-origin helper两份官方online扫描都自然完成，`noFetch=false`、ignore=[]、0vuln、6warnings；每份original scanner1、separate riskgate1，DB `999ec89d5d3f10f20be14750ec8c2d8b44e0ac9b`/1338。两原始JSON均12049B、SHA `a5cd6d2845470cdb3f6e5f94ddc21980e80317a8505fcf68ae6aa588063034f6`，stderr为空；sourceDrift=[]/Fclean。每个scanner进程仅把完整官方RustSec HTTPS仓库URL改走同repo SSH，无全局配置、no-fetch或过滤变化。原三个冻结风险仍在；新增未接受的是zbus_names4.3.4/RUSTSEC-2026-0371、zvariant5.13.1/RUSTSEC-2026-0370、zvariant_derive5.14.0/RUSTSEC-2026-0372。原gate正确阻断而非误报成功，Finding仍只承载原三项risk_accepted。
+
+源码可达的GUI通知链是gui→tauri-plugin-notification2.3.3→notify-rust4.17.0→zbus5.18.0→三新告警包，plugin已注册且 `native_notify`包含真实NotificationExt调用；本次未运行GUI窗口或D-Bus通知效果测试。原Decision列出官方advisory和2026-10-20官网API核读：notify-rust4.18.2仍zbus^5，plugin2.7.0仍notify-rust^4.18且Linux/BSD直依zbus^5；仅升官方latest不能清除新3。此处只记录实际blocked事实，不选择迁移/接受路线，不升级依赖或新增ignore。Cargo/扫描进程已清空，SDK接管运行窗口；当前未stage/commit/push、未跑framework356完整workspace/GUI或CLI精main CI，native Stop受保护插件边界另待，不闭宽状态。
+
+文档同步复用了双语ADR0045各一条根权威约束；examples没有手工构造此应用私有导入游标或基础root，未改变示例公共API，无需改例。官网相关ADR由最终官方同步消费accepted CLI main，当前不提前部署或运行Node构建。所有raw、binary、runner、输入清单和上游抓取原件只在 `.echo-semantic/local/cli-framework356-consumer/`，不作为Git交付文件。
+
+
+## Approved six-risk / WebPKI focused checkpoint, 2026-10-21
+
+用户明确接受当前精确新增三项及固定六项校验合同；原glib0.18.5、proc-macro-error1.0.4、bincode1.3.3全部接受字段、版本与事件期限保持。当前policy绑定lockd2e7b7ebc035d35940f20fd9a95628a37ddf13bba2c1d5c828cdac142ae41680 / consumer e46c7fcc7d928aa5442ae0fafcd3155363153c63fd18a4f52592b4549c16109b，新增zbus_names4.3.4/2026-0371、zvariant5.13.1/2026-0370、zvariant_derive5.14.0/2026-0372的registry checksum/source/kind详见现有Decision与政策。三者仍是维护风险risk_accepted，不是resolved。
+
+新RUSTSEC-2026-0382仅通过rustls-webpki0.103.14→0.103.16及官方checksum两值补丁修复，其余838package blocks字节不变。人的原三项冻结不是忽略其它漏洞的授权；consumer_digest不含锁，仍e46，独立lock_sha256绑定实际新锁。
+
+批准后的actual-lock和framework现有canonical helper registry-origin两官方扫描均真实0vuln/6精告警/839deps/DB1348；原scanner1、separate exact-six riskgate0/caller0。两JSON均11988B/SHA948691d46513016fbea8c8005088582ff9429aee137a1dabf16fccf19737fc8c。显式ownDB/no-fetch固定刚独立核验officiale6f94/tree36f251，1367完整数据文件集合/字节/mode及CLI945/F2329mode前后精同；不称onlinefetch或跨scope叠加。6原离线unit方法真实0，old/new警告身份、withdrawn null和未知/漏洞/输入/配置拒绝保留。旧scanner1/riskgate1、前置prefix碰撞两runner1与后继最小ignored修复证据均原样保存，不倒写历史成功。
+
+原managed import普通历史由framework resume唯一补rendered root；应用只传原历史，matching checkpoint按nonSystem实际计数。原6恢复case先真实3fail再同命令6pass。当前knownpair factory把原prepare_runtime_llm的同一Arc/config送入framework完整Builder，opaque-only原后置注入、critic/settings/registry/runtime publication均保；原full05的17missing-config失败在F1d25selected实际全绿，fixture断言体不变。两Rust路径是e46摘要相对parent0d1的必要完整闭包，不能只提交policy四件后留下其未提交来源。
+
+F7ded/source6eb的旧锁8e951原完整八命令：前7自然0，末项GUI在原9GiB资源中断后经独审的新12GiB/7GiB预算同argv自然0；workspace1978pass/15原ignore，GUI-only226pass/3原ignore，配置不相加成distinct总数。原nested selfprobe不重复计数，两独立rustdoc分片都保；nativeTauri0harness不冒OS GUI运行。旧锁完整八项仍仅对应8e951历史切点，不借其绿色或两审计关闭新锁完整门禁；新锁本次仅下述31项focused通过。
+
+新锁 d2e7 / policy6cd / consumer e46、clean F7ded/source6eb 的三条原Rust命令已真实自然0并经Java有限独审C0/I0/M0：managed no-default6pass/1650filtered/0.75s，model-mutation all-features24pass/1632filtered/2.36s，exact pool all-features1pass/1655filtered/0.37s。三组31个不重复具名case均0fail/0ignore/零warning，原17missing-config失败属于后两组25的子集不另加；未匹配/filtered用例不算执行覆盖。三raw分别15577B/SHA6494482d27b6d9f888e801914ac744c04775211cc908705a044c8a2c053ebd0e、4831B/SHAef079ece6cf2b44c70f64642964800bfcbf725967cde8524cb5ec0756a61924e、410B/SHAe75a61478f7a6a690e0d08f6ea634c81edd5f0e68214daf55ac75fda67199dd6。实际no-default测试bin199584528B/SHAcf8f459864de69b9ced411e991f0ba9d5d9323c4a39a9dcfb31e78d46c15a874；all-feature bin200199424B/SHAb324279890ad5066338a237a0fa470a74599db2ea95efa411f8a87c5fc37d54c由model/pool共享，同名旧bin的旧锁SHA不混用。31运行全程CLI945/F2329模式字节、外cfg、DB1367和2505旧custody精同，peak target2824437760B/minfree16712630272B，原opt0/jobs1/inc0/debug0/strip/9cap5floor/5s守卫不变；这仅是patched-lock focused消费者资格，不是新锁full8/最终main/nativeHook通过。
+
+本阶段原件都在ignored任务local：approved-six-freshdb-audit（实际两审计和各自然出口）、new3-risk-approved-adoption（真实6unit）、webpki-0382-lockpatch（精两值锁和lockSHA政策）、patchedlock31-preparation（真实6/24/1、两actualbin、source fence与资源收据）、qualified7ded-full8-complete-budget-epochs-proof（旧锁full8）、main1d-focused25-original17-after-proof（原17前后）、oldlock-full8-cache-clean-proposal（7producer custody及唯一官方devclean0/after0）。日志/DB/源码副本/索引/二进制不入Git。独立审查有限C0不代替未完成的patched-lock full8、final framework/CLI mainCI/cold/nativeHook；宽Rule needs_review/Audit stale/inventory与behavior open不关闭。
+
+本提交切片没有新公共API、CLI wire、前端或产品能力；已有ADR0029/0045双语同步唯一权威，CI只追加被include!隐藏的factory单文件格式检查；示例仍进入all-target编译链，官网无新增产品事实须写。当前无部署/发布/npm/PyPI/Maven授权。

@@ -35,8 +35,8 @@ def report_for(risks: list[dict]) -> dict:
 
 
 class AcceptedRiskTests(unittest.TestCase):
-    def test_exact_three_and_clean_official_results(self):
-        self.assertEqual(len(gate.verify_report(report_for(POLICY["accepted"]), 1, POLICY, 839)), 3)
+    def test_exact_six_and_clean_official_results(self):
+        self.assertEqual(len(gate.verify_report(report_for(POLICY["accepted"]), 1, POLICY, 839)), 6)
         self.assertEqual(gate.verify_report(report_for([]), 0, POLICY, 839), [])
         self.assertEqual(len(gate.verify_inputs(gate.ROOT, POLICY)), 839)
 

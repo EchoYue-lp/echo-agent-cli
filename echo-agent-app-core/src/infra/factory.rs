@@ -4,15 +4,14 @@
 
 use std::sync::Arc;
 
-use echo_agent::subagent::{
-    AgentFactory, FnAgentFactory, SubagentAccessMode, SubagentBuilder,
-    SubagentExecutionBoundary, SubagentPromptCompiler, SubagentSystemPromptInput,
-    ToolCapabilitySnapshot,
-};
 use echo_agent::llm::{LlmApiProtocol, LlmClient, LlmConfig};
 use echo_agent::memory::ConversationStore;
 use echo_agent::prelude::*;
 use echo_agent::state::RuntimeStateStore;
+use echo_agent::subagent::{
+    AgentFactory, FnAgentFactory, SubagentAccessMode, SubagentBuilder, SubagentExecutionBoundary,
+    SubagentPromptCompiler, SubagentSystemPromptInput, ToolCapabilitySnapshot,
+};
 use futures::future::BoxFuture;
 
 use crate::agent_handle::AgentHandle;
@@ -263,9 +262,7 @@ impl AgentModelConsumers {
         self.registry.event_bus().clone()
     }
 
-    pub(crate) fn subagent_catalog(
-        &self,
-    ) -> Arc<crate::subagent_loader::SubagentCatalogSnapshot> {
+    pub(crate) fn subagent_catalog(&self) -> Arc<crate::subagent_loader::SubagentCatalogSnapshot> {
         self.subagent_catalog.clone()
     }
 
@@ -404,10 +401,10 @@ impl AgentModelConsumers {
         for inherited in self.inherited_factories.iter() {
             let thinking = thinking.clone();
             let _updated = inherited.handle.try_write(|agent| {
-                    if agent.thinking() != thinking.as_ref() {
-                        agent.set_thinking(thinking);
-                    }
-                });
+                if agent.thinking() != thinking.as_ref() {
+                    agent.set_thinking(thinking);
+                }
+            });
         }
     }
 
@@ -751,8 +748,7 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
     let injected_llm_config = prepared_llm
         .as_ref()
         .map(|prepared| prepared.config.clone());
-    if let (Some(runtime), Some(llm_config)) = (runtime_model.as_ref(), injected_llm_config.clone())
-    {
+    if let (Some(runtime), Some(prepared)) = (runtime_model.as_ref(), prepared_llm.as_ref()) {
         tracing::info!(
             provider = %runtime.provider,
             model = %runtime.model,
@@ -760,7 +756,7 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
             has_base_url = runtime.base_url.is_some(),
             "Injecting LlmConfig from configured model"
         );
-        builder = builder.llm_config(llm_config);
+        builder = builder.configured_llm_client(prepared.client.clone(), prepared.config.clone());
     } else {
         tracing::info!("Starting without an LLM; waiting for the first configured model");
     }
@@ -893,12 +889,6 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
     agent
         .tool_manager()
         .apply_script_execution_profile_resolver(script_execution_profile_resolver.clone());
-    // `prepare_runtime_llm` already constructed this exact client before any
-    // runtime state was accepted. Install it explicitly so agent bootstrap can
-    // never fall back to an environment/YAML client after a swallowed rebuild.
-    if let Some(prepared) = prepared_llm.as_ref() {
-        agent.set_llm_client(prepared.client.clone());
-    }
     refresh_dynamic_context(&mut agent, subagent_project_root.as_deref()).await;
     configure_run_code_capability(&mut agent, run_code_available);
     agent.set_pre_model_context_projector(Some(std::sync::Arc::new(
@@ -989,9 +979,7 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
     // exclusively owned. Mutating it from inside task_execute would re-enter
     // the outer ReAct turn's AgentHandle write lock.
     agent
-        .set_subagent_admission(
-            crate::tasks::task_runtime::executor::process_subagent_admission(),
-        )
+        .set_subagent_admission(crate::tasks::task_runtime::executor::process_subagent_admission())
         .await;
 
     // Register default hooks
@@ -1182,7 +1170,9 @@ async fn register_default_subagents(
                     .await
                     .clone()
                     .unwrap_or_default();
-                subagent.set_disabled_tools((!disabled_tools.is_empty()).then_some(disabled_tools.clone()));
+                subagent.set_disabled_tools(
+                    (!disabled_tools.is_empty()).then_some(disabled_tools.clone()),
+                );
                 let capabilities = ToolCapabilitySnapshot::from_definitions(
                     &subagent.tool_definitions(),
                     &disabled_tools,
@@ -1366,11 +1356,8 @@ async fn register_default_subagents(
                                     memory_store,
                                 )?
                             };
-                            let disabled_tools: std::collections::HashSet<String> = disabled_tools
-                                .read()
-                                .await
-                                .clone()
-                                .unwrap_or_default();
+                            let disabled_tools: std::collections::HashSet<String> =
+                                disabled_tools.read().await.clone().unwrap_or_default();
                             subagent.set_disabled_tools(
                                 (!disabled_tools.is_empty()).then_some(disabled_tools.clone()),
                             );
@@ -1378,8 +1365,8 @@ async fn register_default_subagents(
                                 &subagent.tool_definitions(),
                                 &disabled_tools,
                             );
-                            let compiled_system = prompt_compiler.compile_system(
-                                &SubagentSystemPromptInput {
+                            let compiled_system =
+                                prompt_compiler.compile_system(&SubagentSystemPromptInput {
                                     actor: echo_agent::subagent::PromptActor::Subagent,
                                     name: &subagent_def.name,
                                     description: &subagent_def.description,
@@ -1396,8 +1383,7 @@ async fn register_default_subagents(
                                         ),
                                         can_delegate: subagent_def.can_delegate,
                                     },
-                                },
-                            );
+                                });
                             subagent.replace_system_prompt(compiled_system.system_prompt);
                             subagent.set_tool_output_artifacts(tool_output_artifacts);
                             if subagent_def.can_delegate {
@@ -1504,7 +1490,7 @@ fn build_writer_subagent_agent(
     prompt: &str,
     model: &str,
     llm_config: Option<LlmConfig>,
-    llm_client: Option<Arc<dyn LlmClient>>,
+    mut llm_client: Option<Arc<dyn LlmClient>>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     token_limit: usize,
@@ -1578,7 +1564,10 @@ fn build_writer_subagent_agent(
             has_auth = !config.api_key.is_empty(),
             "writer subagent: injecting LlmConfig"
         );
-        builder = builder.llm_config(config);
+        builder = match llm_client.take() {
+            Some(client) => builder.configured_llm_client(client, config),
+            None => builder.llm_config(config),
+        };
     } else {
         // No model configured is a supported first-run state; the parent
         // already emits the single "Starting without an LLM" INFO. Keep this
@@ -1641,7 +1630,7 @@ fn build_readonly_subagent_agent(
     prompt: &str,
     model: &str,
     llm_config: Option<LlmConfig>,
-    llm_client: Option<Arc<dyn LlmClient>>,
+    mut llm_client: Option<Arc<dyn LlmClient>>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     token_limit: usize,
@@ -1707,7 +1696,10 @@ fn build_readonly_subagent_agent(
             has_auth = !config.api_key.is_empty(),
             "subagent: injecting LlmConfig"
         );
-        builder = builder.llm_config(config);
+        builder = match llm_client.take() {
+            Some(client) => builder.configured_llm_client(client, config),
+            None => builder.llm_config(config),
+        };
     } else {
         // No model configured is a supported first-run state; see the writer
         // builder note — keep the per-subagent line at debug.

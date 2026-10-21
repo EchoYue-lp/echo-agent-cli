@@ -66,8 +66,8 @@ def verify_inputs(root: Path, policy: dict) -> list[dict]:
         raise ValueError("consumer inputs changed; human risk reassessment required")
     packages = tomllib.loads(lock.decode())["package"]
     risks = policy["accepted"]
-    if len(risks) != 3 or len({r["advisory"] for r in risks}) != 3:
-        raise ValueError("expected three distinct human-accepted risks")
+    if len(risks) != 6 or len({r["advisory"] for r in risks}) != 6:
+        raise ValueError("expected six distinct human-accepted risks")
     for risk in risks:
         matches = [p for p in packages if all(p.get(k) == risk[k] for k in IDENTITY_FIELDS)]
         if len(matches) != 1:

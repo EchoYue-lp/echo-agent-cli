@@ -11,13 +11,14 @@ focus:
 - time_lifecycle
 - failure_concurrency
 - contract_evidence
-observed_at: source:42165674392f8798397a1d6ca6db25de31d2c5aba30563e645d524bddd86a446
+observed_at: source:fa8844cd92e0841468a1ba360fe64f390b7a0c49927935ac89731cf51e642989
 behavior_refs:
 - behavior.background-review-caller-owned-settlement
 - behavior.shared-turn-observation-retains-owner
 - behavior.task-unknown-owner-admission-fence
 - behavior.analysis-original-owner-settlement-retry
 code_refs:
+- echo-agent-app-core/src/infra/factory.rs
 - echo-agent-app-core/src/agent_pool/tests.rs
 - echo-agent-app-core/src/state/reliability_contracts.rs
 - echo-agent-app-core/src/tasks/task_runtime/store/journal.rs
@@ -104,8 +105,16 @@ Framework physical receipt/claim CAS唯一；观察不终态化。原Task/analys
 
 共享chat的准备与claim也保既有typed StoreError至ChatTurnError，RecoveryBlocked不能先String化再进入foreground普通Failed；仅普通错误加原context。真实journal重开→同共享入口的before业务fail/ordinary pass及same after两例通过和源码增量独审，只闭此遗漏，不替当前全门禁。三依赖Rust输入变动先拒绝，再经明确授权、独立无消费扩大重评及same AFTER后精确重绑，不能自动继承旧风险接受。
 
-CLI依赖政策只在应用层核对用户精确三项risk_accepted；原官方scanner、canonical framework origin helper仍唯一权威。policy绑定当前完整锁及消费者输入，任何新告警/漏洞/yanked/扫描错误或输入漂移均拒绝。原scanner失败和单独风险核对成功必须分别报告，不传播为framework/SDK豁免；全部Rust与GUI门禁保持。
+CLI依赖政策只在应用层核对用户当前精确risk_accepted集合；原官方scanner、canonical framework origin helper仍唯一权威。policy绑定当前完整锁及消费者输入，任何新告警/漏洞/yanked/扫描错误或输入漂移均拒绝。原scanner失败和单独风险核对成功必须分别报告，不传播为framework/SDK豁免；全部Rust与GUI门禁保持。
 
 后继primary切片：同一ForegroundTurnSettlementWaiter只对真实Observation保留run/execution，channel notifier传typed错误后不kick；GUI launch准备和执行等待共享原foreground错误结算，观察仅retain，普通错误保持Failed。两个独立行为red→samecase after及4普通/正常控制共6pass，17file独审/非语义增量确认和Clippy零warning通过；完整门禁/宽Rule仍未闭。三依赖精确风险接受由具名Finding/人的Decision引用拥有，不推广为SDK/framework例外或放宽工程门禁。
 
 合法 unresolved physical-owner intent 是精确 run 的待观察事实，批次恢复在原 run 锁内跳过其状态/cell/control 写入并继续无关 run；真实存储/畸形证据错误仍报错。Running/Paused/guidance 共享原证据与精确 ack，不新增恢复器或权威。canonical compose 先绑定原三个 Weak 子组件，最终强 Arc 接管复用同一 helper。existing-run continuation 保留 canonical domain/route/attended/Goal/profile，仍用入口实际 active workspace/conversation/root 经原 immutable validator；trace 用返回原值。三 focused 实际通过及独立复审只支持此有限 checkpoint，不能替完整矩阵、新 cron、依赖政策或 main CI。
+
+
+## Configured LLM construction adapter
+
+EKO 的 ConfiguredModel/ModelProviderConfig 与既有 resolver 仍拥有产品选择、endpoint 和 credentials。主 Agent 与两类 Subagent 的已知 config/client 配对通过框架完整 builder 原样传入；框架唯一拥有 profile 准备与 client/config 同步安装，不添加应用 cfg cache、第二个 resolver 或构造时 async generation。无 config 的 opaque client 仍保留旧语义，运行时 model generation/critic/继承发布权威不改。此处仅记录既有模型构造合同的薄适配；原17反例和最终门禁尚需新 framework main 上的实际 AFTER，宽 needs_review/stale 状态不关闭。
+
+
+2026-10-21 的显式新三项决定使当前应用policy只接受绑定d2e7/e46的精六项；原三项保持版本/字段/事件期限。原officialscanner1与独立精风险gate0必须分列，不可传播为framework/SDK例外，未知类别、身份/输入漂移和任意漏洞/yanked仍拒。现有Decision/Finding/Evidence各自保存人的范围、risk_accepted状态和真实扫描/工程限制；Rule仍needs_review，宽义务不因窄checkpoint关闭。

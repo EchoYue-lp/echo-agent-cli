@@ -27,6 +27,7 @@
 
 ## 影响
 
+- Managed 历史导入只序列化调用方的 canonical rows 与 transcript cursor，不合成基础 System 消息。当前 canonical 根 prompt 的渲染和恢复由框架 `ReactAgent` resume 唯一负责，避免应用基础 prompt 与框架完整根 prompt 并存。原有可见 transcript 输入校验及框架对独立 System 上下文的保留规则均不变。
 - 聚合删除仍是唯一 EKO 协调权威；框架 Managed transcript 与 runtime-state journal 保留自己的 CAS 语义。目标回滚已提交而 handoff 意图清理失败时，启动恢复识别目标 tombstone 并结算废弃意图，不再导入新 epoch。
 - 缺少 managed 请求的旧未完成 tombstone 明确保留恢复债务，不绑定到新建的同名 conversation。
 - 框架 examples 与 `echo-website` 不消费 EKO 删除 tombstone，无需同步修改。

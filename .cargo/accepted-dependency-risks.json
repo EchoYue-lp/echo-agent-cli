@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "decision": "docs/supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md",
-  "lock_sha256": "8e9512837eab1cab81bd9097d0636fbb7fc9afd00b809bd69eedde8c5345aa4c",
-  "consumer_inputs_sha256": "28312efa214ac20f55c387ae665949511f3e27980740793eb821f30cc37eecb2",
+  "lock_sha256": "d2e7b7ebc035d35940f20fd9a95628a37ddf13bba2c1d5c828cdac142ae41680",
+  "consumer_inputs_sha256": "e46c7fcc7d928aa5442ae0fafcd3155363153c63fd18a4f52592b4549c16109b",
   "accepted": [
     {
       "name": "glib",
@@ -26,6 +26,30 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "checksum": "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad",
       "advisory": "RUSTSEC-2025-0141",
+      "kind": "unmaintained"
+    },
+    {
+      "name": "zvariant",
+      "version": "5.13.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "bee2a0bcd2a907786a456fff45aaaaf54c9ba5f50b71ae9ec1a4edd200c94911",
+      "advisory": "RUSTSEC-2026-0370",
+      "kind": "unmaintained"
+    },
+    {
+      "name": "zbus_names",
+      "version": "4.3.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "d8bf88b4a3ff53e883001e0e0115b297a9d53c31b9c1edd2bfdd853e3428624e",
+      "advisory": "RUSTSEC-2026-0371",
+      "kind": "unmaintained"
+    },
+    {
+      "name": "zvariant_derive",
+      "version": "5.14.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "d496a145685283b67e232bd9e47377f6b60ad9d51e3601b23867f77c42477f96",
+      "advisory": "RUSTSEC-2026-0372",
       "kind": "unmaintained"
     }
   ]

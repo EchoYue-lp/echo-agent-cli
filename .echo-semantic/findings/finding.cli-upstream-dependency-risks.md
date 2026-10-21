@@ -36,3 +36,10 @@ Official unfiltered scans actually returned exit1 with three denied warnings. Th
 ## 处理记录
 
 Only the named current versions, registry sources/checksums and consumer graph are accepted. Changed inputs require reassessment; extra warnings, vulnerabilities or yanked results are outside this decision. Exact CI gate wiring remains pending verification, and all source/test/lint failures remain blockers.
+
+
+## 2026-10-21 additional exact human acceptance
+
+用户另行明确接受当前锁d2e7 / consumer e46的zbus_names4.3.4/RUSTSEC-2026-0371、zvariant5.13.1/2026-0370、zvariant_derive5.14.0/2026-0372精确维护风险及固定六项合同。source/checksum/kind与scope以原Decision和policy为准；原三项版本、全部接受字段和事件期限不变。此后此Finding当前risk_accepted集合为精六项，不把新维护风险写resolved，也不把旧preapprovalgate1改为成功。
+
+批准后actual/canonical-origin两扫描分别0vuln/6精warnings，原scanner1与独立riskgate0/caller0均真实保留；刚独立核验的officialDB e6f94/tree36f251通过ownDB/no-fetch固定，不冒onlinefetch。新的0382漏洞已通过WebPKI0.103.16精两值lockpatch消除于该DB扫描，不能据审计冒patched-lock工程/最终main通过。额外或变化的告警、漏洞、yanked与输入/来源/类别漂移仍阻断；未满足的源码/完整门禁/nativeHook/最终CI均不豁免。

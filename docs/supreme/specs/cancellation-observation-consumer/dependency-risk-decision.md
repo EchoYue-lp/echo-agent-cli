@@ -8,7 +8,7 @@ accepted
 
 On 2026-10-16 the user instructed: “glib、proc-macro-error、bincode 先记录，暂不升级。既然稳定的依赖依然采纳，就不要动。你继续处理其他的问题”. This accepts only the current EKO CLI delivery's three residual risks. Earlier unselected upgrade/backport proposals remain ignored history.
 
-## Exact scope
+## Original three-risk scope (historical lock cut)
 
 Registry source for all entries: `registry+https://github.com/rust-lang/crates.io-index`. Actual CLI Cargo.lock SHA256: `8e9512837eab1cab81bd9097d0636fbb7fc9afd00b809bd69eedde8c5345aa4c`.
 
@@ -85,3 +85,58 @@ Current rebound qualification now includes six adapter test methods and two newl
 All six applicable local Rust/GUI commands now pass on unchanged CLI7a33 runtime inputs and clean CF6563, with zero compiler warnings and no source/framework drift. The first GUI attempt was interrupted by the unchanged global free-space guard; its original exit-2/failed progress and raw outputs remain preserved. After the SDK's authorized cache cleanup, the identical GUI command passed under the original9GiB target/5GiB free-space limits. The six risk adapter methods and newly fetched actual/origin exact-three reports remain applicable to unchanged consumer28312efa214ac20f55c387ae665949511f3e27980740793eb821f30cc37eecb2. This documentation does not change the lock, code, features, scanners, accepted identities or residual risks and does not renew acceptance for future consumer changes.
 
 The primary current-checkpoint preflight and the cumulative PR comparison use different real bases. The original primary cumulative request failed because its preflight base7a33 differed from requested mainf57; that error is retained. The already owned frozen candidate view has actual HEADf57, a staged complete tree exactly equal to primary7a33 (945 files,84 changed paths), and a freshly recorded official view/f57 contract; its ordinary and cumulative strict checks pass. This is a candidate validation contract, not retroactive primary pre-edit evidence or native Stop. Primary installed task/repository validation still has the known five historical-file collector errors pending protected plugin repair. Exact main CI and fresh actual merged-main source recovery remain outstanding; earlier scanner/compile/semantic success cannot close them.
+
+
+## Bounded consumer reassessment for framework main 3560812
+
+The original human instruction to retain the three stable dependencies and continue remains the authority. The coordinating task and independent reviewers supplied implementation and consumer-exposure evidence, not a new human risk approval. The original gate first rejected both the two-field candidate and the final changed consumer before invoking any scanner (`scannerExit: null`).
+
+The only changed application Rust input is `echo-agent-app-core/src/managed_conversation.rs` (SHA256 `012909c965c0dffe03e621d880b1a2f48160c4d0c1fc1e02af6d024dd1a96c2d`). Its two ordinary-import cursor literals explicitly have no compression-derived bindings. Import now delegates current rendered-root creation to the existing framework resume path, and matching-checkpoint counts use actual non-System messages rather than assuming one synthesized root. It retains canonical rows, validation, receipts, epoch, CAS and all six original test bodies. Framework main `3560812caede84998a1f6f26d7bf3fa81ea0486c` is the clean sibling consumer input; the canonical relative manifest paths remain unchanged.
+
+Independent implementation, necessity and exact exposure review report C0/I0/M0: no GTK/glib, related macro, syntect/bincode production caller, serialization path, feature, manifest, build entry or dependency edge is added. Framework manifests and lock bytes also remain unchanged from the earlier accepted consumer framework. The first actual original six-case run compiled without warnings but failed three restoration assertions (3 pass/3 fail, 0 ignored, 1650 filtered, message length 3 rather than 2). Its raw output and original executable remain preserved. After the bounded root/count repair, the same original command passes 6/0/0 with 1650 filtered, zero warnings, no source drift and clean exact framework356. The original 4 GiB target / 5 GiB free-space limits were not raised or triggered.
+
+Only on that finite review and actual pass, the consumer fingerprint is rebound from `28312efa214ac20f55c387ae665949511f3e27980740793eb821f30cc37eecb2` to `e2d5f0effc12b6df6952efb40eb56119cdf83edacabf170ba83c290658536043`. Cargo.lock SHA256 `8e9512837eab1cab81bd9097d0636fbb7fc9afd00b809bd69eedde8c5345aa4c`, all three exact versions, registry sources/checksums, advisories, kinds and residual risks are unchanged. No upgrade, backport, replacement, scanner ignore or SDK-specific exception is introduced. Fresh adapter tests and actual-lock/canonical-origin online scans remain separate qualification; the prior results cannot validate this new consumer. Full Rust/GUI/main CI and installed native Stop remain separate outstanding delivery gates.
+
+
+### Historical pre-approval online qualification was blocked
+
+The six original adapter test methods pass after the bounded fingerprint update. Both freshly fetched official online scans completed: the actual CLI lock and the registry-origin view generated by the clean framework's canonical helper. Each has `noFetch=false`, empty scanner ignores, zero vulnerabilities and six warnings, with official scanner exit1 **and** the separate exact-risk gate exit1. The gate correctly rejects the additional unaccepted advisories; this is not scanner1/gate0 or a clean audit. Both reports use RustSec database `999ec89d5d3f10f20be14750ec8c2d8b44e0ac9b` (1338 advisories). Their actual report bytes are identical, SHA256 `a5cd6d2845470cdb3f6e5f94ddc21980e80317a8505fcf68ae6aa588063034f6`; raw reports, stderr, exits and unchanged-source guards remain task-local.
+
+The original exact glib0.18.5, proc-macro-error1.0.4 and bincode1.3.3 risks remain frozen and accepted only within the existing decision. The following newly reported standalone-crate maintenance risks are **not accepted** by that decision or its Finding:
+
+| Package/version | Official advisory | Current real consumer |
+| --- | --- | --- |
+| zbus_names 4.3.4 | [RUSTSEC-2026-0371](https://rustsec.org/advisories/RUSTSEC-2026-0371.html) | Linux/BSD GUI notifications through zbus 5.18.0 and its macros |
+| zvariant 5.13.1 | [RUSTSEC-2026-0370](https://rustsec.org/advisories/RUSTSEC-2026-0370.html) | The same zbus 5.18.0 D-Bus wire implementation |
+| zvariant_derive 5.14.0 | [RUSTSEC-2026-0372](https://rustsec.org/advisories/RUSTSEC-2026-0372.html) | zvariant 5.13.1 derive macros on that same path |
+
+The existing active path is `gui` → tauri-plugin-notification2.3.3 → notify-rust4.17.0 → zbus5.18.0 → the three packages. `src/tauri/mod.rs` registers the notification plugin and `src/tauri/ipc.rs::native_notify` actually uses its `NotificationExt`; this is not an unused lock entry. This is production source reachability, not a new native GUI or D-Bus execution test. The advisories describe standalone crates merged into zbus6, not a newly demonstrated memory-safety vulnerability. Zero reported vulnerabilities does not settle their maintenance risks.
+
+The 2026-10-20 read-only official upstream check found [notify-rust4.18.2](https://crates.io/crates/notify-rust/4.18.2) still requires zbus^5. The latest stable [tauri-plugin-notification2.7.0](https://crates.io/crates/tauri-plugin-notification/2.7.0) requires notify-rust^4.18 and directly requires zbus^5 on Linux/BSD. Therefore merely updating to those official latest releases would retain the new warnings. The [upstream merge issue](https://github.com/z-galaxy/zbus/issues/2043) records that the standalone packages receive no further maintained releases after the zbus6 merge. This finite source check does not select or approve a migration, fork or new risk acceptance.
+
+The original accepted-risk policy/scanner and its three identities remain unchanged; only the reviewed application-consumer fingerprint changed. No dependency, feature, manifest, build entry, scanner ignore or acceptance expansion is introduced. The new three-advisory blocker, full framework356 Rust/GUI gates, exact CLI main CI and installed native Stop remain unresolved. No commit or main delivery is claimed while these scans fail.
+
+
+## 2026-10-21 exact six-risk decision and WebPKI lock patch
+
+The user explicitly accepted the additional current `zbus_names4.3.4`, `zvariant5.13.1` and `zvariant_derive5.14.0` maintenance risks together with the reviewed fixed-six input contract. The original 2026-10-16 glib0.18.5, proc-macro-error1.0.4 and bincode1.3.3 versions, identities, residual-risk definitions and event-bounded lifetime remain unchanged. The earlier three-risk rejection above is historical evidence before this additional decision, not a fabricated successful scan.
+
+The current exact CLI lock SHA256 is `d2e7b7ebc035d35940f20fd9a95628a37ddf13bba2c1d5c828cdac142ae41680`; consumer digest is `e46c7fcc7d928aa5442ae0fafcd3155363153c63fd18a4f52592b4549c16109b`. All six entries use `registry+https://github.com/rust-lang/crates.io-index`. The additional accepted identities are:
+
+| Advisory | Package/version | Registry checksum | Kind |
+| --- | --- | --- | --- |
+| RUSTSEC-2026-0370 | zvariant 5.13.1 | bee2a0bcd2a907786a456fff45aaaaf54c9ba5f50b71ae9ec1a4edd200c94911 | unmaintained |
+| RUSTSEC-2026-0371 | zbus_names 4.3.4 | d8bf88b4a3ff53e883001e0e0115b297a9d53c31b9c1edd2bfdd853e3428624e | unmaintained |
+| RUSTSEC-2026-0372 | zvariant_derive 5.14.0 | d496a145685283b67e232bd9e47377f6b60ad9d51e3601b23867f77c42477f96 | unmaintained |
+
+Their official `withdrawn` values are null, as required by the unchanged report verifier. GUI plugin registration and `native_notify` reach notify-rust4.17.0 / zbus5.18.0 on Linux/BSD; these maintenance warnings remain real. No native notification/D-Bus execution or repaired maintenance status is claimed. Only these exact added identities are accepted, not arbitrary zbus versions, sources, warnings, vulnerabilities or yanked packages.
+
+The same existing event-bounded decision applies only to this delivery and the exact lock/consumer graph. Changes to lock bytes, dependency identities, consumer inputs, warning kinds or withdrawn state require reassessment. There is no new calendar expiry field, automatic renewal, scanner ignore or framework/SDK exception. Original three-risk acceptance is not extended to another delivery by this record.
+
+The separate new vulnerability RUSTSEC-2026-0382 is fixed by changing only rustls-webpki0.103.14 to0.103.16 and its official checksum `4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281`. The other838 package blocks are byte-identical; the policy's lock digest is rebound to the actual patched lock. This does not upgrade the original frozen three packages or the notification chain.
+
+After human approval, both actual-lock and canonical registry-origin official scans report zero vulnerabilities and exactly the six accepted warnings (839 dependencies / 1348 advisories). Each original `cargo audit --json --deny warnings` exits1; the independent fixed-six risk gate and caller exit0. Both reports are11988B / SHA256 `948691d46513016fbea8c8005088582ff9429aee137a1dabf16fccf19737fc8c`. Explicit `--db` plus `--no-fetch` binds an independently fresh official RustSec cut `e6f94f3760d5e6c54c1b05f204002263bc025524` / tree `36f251a0f912c8275985e0306e9fe7715c19a4ad`; this is not described as online fetching or a stale-database exemption. Complete raw JSON/stderr/natural exits and source/DB guards remain task-local.
+
+The original six offline unit methods pass on the approved policy; only the existing input-count guard changes from3 to6 and its original test name/expected count are synchronized. Exact version/source/checksum/kind, unknown-warning, vulnerability, scan-error and configuration-override checks remain unchanged. The report verifier is byte/AST-equivalent.
+
+This is a focused source/risk checkpoint. F1d's original17 failures pass in25 selected cases, and the old-lock F7ded full Rust/GUI sequence passed with its two explicitly recorded resource budgets; neither is patched-lock engineering qualification. On the exact patched lock, the original managed6 / model-module24 / exact-pool1 commands now pass31 distinct named cases (zero failures/ignores/warnings), with the original17 failures only a subset of25. Raw/source/binary identities and finite independent review are recorded in the existing Evidence. Patched-lock full Rust/GUI gates, final framework main/CI/cold, CLI full main acceptance and native semantic Hook/Stop remain pending. No warning-free audit, complete delivery, publish or release is claimed.

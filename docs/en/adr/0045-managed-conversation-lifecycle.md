@@ -36,6 +36,7 @@ The latest framework refuses legacy transcript writes and aggregate deletion whe
 
 ## Consequences
 
+- Managed history import serializes the caller-owned canonical rows and transcript cursor without synthesizing a base System message. Framework `ReactAgent` resume alone renders and restores the current canonical root prompt, avoiding an application-inserted base prompt beside that root. Existing visible-transcript validation and framework preservation of independently owned System context remain unchanged.
 - Aggregate deletion remains the single EKO coordination authority; framework managed transcript and runtime-state journals retain their own CAS semantics. If target rollback commits but clearing the handoff intent fails, boot recovery recognizes the target tombstone and retires that abandoned intent rather than re-importing a new epoch.
 - Old incomplete tombstones without a managed request remain explicit recovery debt rather than being rebound to a newly recreated conversation.
 - Framework examples and `echo-website` do not consume EKO's deletion tombstone and need no update.

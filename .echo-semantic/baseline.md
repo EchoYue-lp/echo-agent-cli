@@ -4,7 +4,7 @@ id: baseline.repository
 kind: baseline
 source_snapshot:
   base_revision: f57b90a2b0962fa5561f8839a3df70be1f261ffa
-  content_digest: 42165674392f8798397a1d6ca6db25de31d2c5aba30563e645d524bddd86a446
+  content_digest: fa8844cd92e0841468a1ba360fe64f390b7a0c49927935ac89731cf51e642989
 inventory_closure: open
 behavior_model_closure: open
 map_refs: [map.eko-conversation-collaboration, map.eko-framework-consumer-settlement]
@@ -84,3 +84,13 @@ dfd5750之后的窄交付增量：精确三依赖risk gate经6测试方法及独
 ## Scheduler 增量开发 checkpoint
 
 前置提交为5cd9eff0，当前相对依赖是公开开发3ded，不冒最终F main。原Scheduler同slot/Root生命周期两逻辑case各真实before行为fail→after1pass/零warning；独审只该窄scope。原215699时代的三个Behavior/三个stale Audit仅恢复为等价Git5cd9历史锚，状态和结论不变。原scheduler场景新增B影响标needs_review；其它所有宽义务/剩余强例/GUI/全量门禁/最终消费者继续未闭。此处只刷新实际非语义源码摘要与真实前置，不宣全项目行为闭合。
+
+
+## Historical pre-approval Framework356 managed import candidate (2026-10-20)
+
+历史批准前记录（截至 2026-10-20，新增三项当时尚未获批；当前接受状态见后节 2026-10-21 exact-six checkpoint）：当时的候选仍以公开main祖先f57为base，刷新实际非语义源码摘要。CLI现有ordinary import补足两个无derived绑定游标，删除应用合成base System，改按checkpoint非System消息计数；框架resume仍唯一拥有canonical rendered root。双语ADR0045、独立窄审C0与原6case真实3fail→same AFTER6pass/零warning/无漂移只支持此局部修复。原3稳定依赖继续精确risk_accepted，有限消费复评重绑e2d5；新actual/origin online扫描都scanner1/riskgate1，新增zbus_names4.3.4、zvariant5.13.1、zvariant_derive5.14.0三个未接受停止维护告警。不能以旧scanner1/gate0、0vuln或本次6pass冒完整交付。宽needs_review/stale/库存与行为open、framework356完整Rust/GUI、CLI精mainCI及受保护插件/nativeStop均不关闭；当前未stage/commit/push。
+
+
+## Focused exact-six dependency and consumer milestone
+
+2026-10-21 仅刷新本候选实际非语义源码摘要，base仍公开main祖先f57。新增人的精三项使当前policy精六项，old3冻结及事件期限保持；WebPKI0382精两值lockpatch、现有fixed-six gate与6unit、两officialscanner1/separate riskgate0均在原Evidence/Decision/Finding有界记录。e46要求managed import与factory两Rust既有修复同提交，否则parent0d1四政策路径投影精consumer不匹配。原旧锁full8/25selected仅属历史；新锁d2e7/F7ded原managed6、modelmodule24、exactpool1三组实际31具名0fail/0ignore/零warning并有限独审C0，原17是25子集不另加。该focused资格不冒patched-lock full8与最终main/nativeHook，现有needs_review/stale/库存与行为open不变。

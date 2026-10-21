@@ -65,6 +65,7 @@ jobs:
       - name: Check Linux workspace
         run: |
           cargo fmt --all -- --check
+          rustfmt --edition 2024 --check echo-agent-app-core/src/infra/factory.rs
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
           cargo check -p echo-agent-app-core --no-default-features --locked
 
