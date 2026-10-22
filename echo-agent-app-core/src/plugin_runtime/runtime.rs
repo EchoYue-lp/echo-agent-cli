@@ -1,19 +1,4 @@
 impl PluginRuntimeService {
-    /// Transitional constructor retained while the application bootstrap still
-    /// consumes `anyhow::Result`.
-    ///
-    /// This wrapper maps a bootstrap failure into `anyhow::Error` **and drops its
-    /// cleanup receipts**; new call sites must use [`Self::new_owned`] instead.
-    pub(crate) async fn new(
-        agent_handle: AgentHandle,
-        lsp: PluginLspRuntime,
-        mcp_ownership: Arc<McpNameOwnershipRegistry>,
-    ) -> anyhow::Result<Arc<Self>> {
-        Self::new_owned(agent_handle, lsp, mcp_ownership)
-            .await
-            .map_err(PluginBootstrapFailure::into_error)
-    }
-
     /// Construct a plugin runtime that hands every unsettled cleanup receipt
     /// (including exact MCP ownership tokens) back to the caller when the initial
     /// generation cannot be committed.
@@ -37,24 +22,6 @@ impl PluginRuntimeService {
     /// Construct a scoped plugin runtime after the caller has already
     /// retired the seed Agent generation. This avoids a second name-based
     /// descriptor cleanup after project-local Skills have been loaded.
-    pub(crate) async fn new_for_scope_after_agent_reset(
-        agent_handle: AgentHandle,
-        lsp: PluginLspRuntime,
-        mcp_ownership: Arc<McpNameOwnershipRegistry>,
-        target_scope: String,
-        authority_generation: Option<AgentPluginGeneration>,
-    ) -> anyhow::Result<Arc<Self>> {
-        Self::new_owned_for_scope_after_agent_reset(
-            agent_handle,
-            lsp,
-            mcp_ownership,
-            target_scope,
-            authority_generation,
-        )
-        .await
-        .map_err(PluginBootstrapFailure::into_error)
-    }
-
     pub(crate) async fn new_owned_for_scope_after_agent_reset(
         agent_handle: AgentHandle,
         lsp: PluginLspRuntime,

@@ -292,13 +292,13 @@ done
             PluginLspRuntime::config_for_workspace(root),
             root.to_path_buf(),
         );
-        PluginRuntimeService::new(
+        PluginRuntimeService::new_owned(
             AgentHandle::new(agent),
             lsp,
             McpNameOwnershipRegistry::new(Vec::<String>::new()),
         )
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|failure| failure.into_error().to_string())
     }
 
     async fn wait_until_mutation_holds_state(runtime: &PluginRuntimeService) -> Result<(), String> {

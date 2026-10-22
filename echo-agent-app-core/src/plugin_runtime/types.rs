@@ -525,19 +525,21 @@ pub(crate) struct PluginBootstrapFailure {
 }
 
 impl PluginBootstrapFailure {
-    /// Split the failure into its error and retained receipts. The owned
-    /// bootstrap switch (T3) adopts the receipts; tests assert they survive.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Split the failure into its error and retained receipts. Callers must log
+    /// or adopt the receipts; tests assert they survive.
     pub(crate) fn into_parts(self) -> (anyhow::Error, Vec<CleanupReceipt>) {
         (self.error, self.receipts)
     }
 
-    /// Transitional helper for the `anyhow::Result` constructors.
+    /// Convenience mapping for the `cfg(test)` constructors, which still return
+    /// `anyhow::Result`. Production callers use [`Self::into_parts`] so receipts
+    /// are never dropped silently.
+    #[cfg(test)]
     pub(crate) fn into_error(self) -> anyhow::Error {
         if !self.receipts.is_empty() {
             tracing::error!(
                 receipts = self.receipts.len(),
-                "Plugin runtime bootstrap failed with unsettled cleanup receipts that the legacy anyhow constructor cannot carry"
+                "Plugin runtime bootstrap failed with unsettled cleanup receipts in a test constructor"
             );
         }
         self.error

@@ -1803,7 +1803,10 @@ impl AgentRuntime {
         // ── 10. Plugins ──
         // Discovery, initial wiring, and later live mutations all go through
         // one runtime owner. This avoids bootstrap/reload double registration.
-        let plugin_runtime = match crate::plugin_runtime::PluginRuntimeService::new(
+        // The owned constructor returns the cleanup obligations it could not
+        // settle; the success path has none to adopt (the initial generation is
+        // committed before it returns), so only the failure path carries them.
+        let plugin_runtime = match crate::plugin_runtime::PluginRuntimeService::new_owned(
             agent_handle.clone(),
             lsp_runtime,
             mcp_config_runtime.ownership(),
@@ -1811,10 +1814,40 @@ impl AgentRuntime {
         .await
         {
             Ok(runtime) => runtime,
-            Err(error) => {
-                let receipt = bootstrap_lifecycle
+            Err(failure) => {
+                let (error, cleanup_receipts) = failure.into_parts();
+                // A failed initial plugin generation can leave cleanup
+                // obligations behind — most importantly exact MCP name
+                // ownership tokens. Dropping them would silently strand names
+                // that every later plugin boot must be able to claim, so each
+                // receipt is logged here and recorded in the rollback receipt,
+                // whose Display is the returned error's message. There is no
+                // plugin runtime owner left to adopt them into.
+                let descriptions = cleanup_receipts
+                    .iter()
+                    .map(|cleanup| cleanup.describe())
+                    .collect::<Vec<_>>();
+                for (index, description) in descriptions.iter().enumerate() {
+                    tracing::error!(
+                        receipt = index.saturating_add(1),
+                        total = descriptions.len(),
+                        cleanup = %description,
+                        "plugin runtime bootstrap left an unsettled cleanup receipt"
+                    );
+                }
+                let mut receipt = bootstrap_lifecycle
                     .settle(ApplicationLifecycleReason::BootstrapRollback, Some(error))
                     .await;
+                for (index, description) in descriptions.iter().enumerate() {
+                    receipt.record(
+                        format!(
+                            "plugin cleanup receipt {}/{}",
+                            index.saturating_add(1),
+                            descriptions.len()
+                        ),
+                        description,
+                    );
+                }
                 return Err(anyhow::Error::new(receipt.into_error()));
             }
         };

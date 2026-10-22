@@ -667,14 +667,58 @@ impl AgentPool {
                     mcp_config.mcp_servers.keys().cloned(),
                 );
                 let runtime =
-                    crate::plugin_runtime::PluginRuntimeService::new_for_scope_after_agent_reset(
+                    match crate::plugin_runtime::PluginRuntimeService::new_owned_for_scope_after_agent_reset(
                         primary.handle.clone(),
                         lsp_runtime,
                         Arc::clone(&ownership),
                         plugin_target_scope,
                         Some(authority_plugin_generation.clone()),
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(runtime) => runtime,
+                        Err(failure) => {
+                            // A failed bootstrap leaves cleanup obligations that no
+                            // runtime owner exists to adopt. Log every receipt with
+                            // its exact MCP ownership tokens, then carry every one of
+                            // them in the returned error instead of dropping them.
+                            let (error, receipts) = failure.into_parts();
+                            let mut descriptions = Vec::with_capacity(receipts.len());
+                            for receipt in &receipts {
+                                let tokens = receipt
+                                    .mcp_claims()
+                                    .iter()
+                                    .map(|claim| {
+                                        format!(
+                                            "{}:{}={:?}",
+                                            claim.plugin_id(),
+                                            claim.name(),
+                                            claim.token()
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                tracing::error!(
+                                    cleanup = %receipt.describe(),
+                                    mcp_tokens = %tokens,
+                                    "plugin runtime bootstrap retained an unsettled cleanup receipt"
+                                );
+                                descriptions.push(if tokens.is_empty() {
+                                    receipt.describe()
+                                } else {
+                                    format!("{} [mcp_tokens: {tokens}]", receipt.describe())
+                                });
+                            }
+                            if descriptions.is_empty() {
+                                return Err(error);
+                            }
+                            return Err(error.context(format!(
+                                "plugin runtime bootstrap retained {} cleanup receipt(s): {}",
+                                descriptions.len(),
+                                descriptions.join("; ")
+                            )));
+                        }
+                    };
                 runtime.bind_agent_pool(Arc::downgrade(&pool)).await?;
                 (Some(runtime), ownership)
             }
