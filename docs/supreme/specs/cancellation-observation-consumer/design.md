@@ -8,6 +8,10 @@ carrier: markdown
 
 ## 状态
 
+实现与本地消费者资格已完成：原执行owner/typed observation/durable intent、同一Scheduler slot与framework physical receipt/CAS权威保持；不存在第二执行/恢复状态机。接受的framework main f7bac、patched lock d2e7与相同编译/测试输入上，完整workspace/GUI/Clippy/格式和原六风险矩阵已实际通过，永久限制与准确计数见既有Evidence的2026-10-22结算。文稿收束不伪造重跑；精确合并mainCI/cold单列为交付条件，不需预设第二次doc-only确认PR。全EKO治理闭合不在此局部结论中，已撤回的plugin消费者原生专项不恢复。四个Plan-bound权威/数据流/边界/验收章节不变。
+
+### 历史状态：CLI7a33 / CF6563
+
 Approved for the same bounded implementation. The current runtime source at CLI7a33 is qualified by all six applicable local Rust/GUI commands on the accepted clean framework6563, with zero warnings and no input drift. Full workspace results include core1647pass/0fail/9existing ignored, CLI library288pass, CLI binary11pass, JSONL6pass and all integration/doc groups; GUI-only qualification includes219 library,1 binary and6 JSONL passes with3existing doc ignores. The original GUI resource-budget stop and earlier product/fixture failures remain preserved as separate attempts. Production still uses process-wide capacity5 and the sole framework DAG/CAS; the original seven-case repair controls and exact-three dependency qualification remain bounded evidence. Current-checkpoint primary strict and same-tree cumulative candidate strict are separately recorded; primary installed repository/task completion still reports five historical-file collector errors pending the independent protected plugin repair. Native Stop, exact merged-main CI and a fresh actual merged-main cold proof remain required. No local execution of newer framework main is claimed. The four Plan-bound ownership/data-flow/boundary/acceptance chapters remain unchanged; this adapter design does not replace framework ADR0088 or physical-settlement authority.
 
 ## 问题与目标

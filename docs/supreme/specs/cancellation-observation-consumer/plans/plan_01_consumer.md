@@ -153,5 +153,10 @@ todos:
         resource lease. Current public f0a and the two prior focused cases are
         not this evidence.
 artifact_id: plan:74c5690b-6f61-4d70-82f5-a769dfab055a
-lifecycle: ready
+lifecycle: completed
 ---
+
+
+## Notes
+
+2026-10-22实施与本地消费者资格已完成，准确输入、完整矩阵、原17具名回归、六风险限定和历史反例由既有 `evidence.cancellation-observation-consumer` 最终结算节承载，不在Plan重复验收条款或计数。Plan生命周期只描述本消费者实现与scoped验证独审的Outcome，独立于精确合并mainCI/cold交付条件；不以本地Outcome完成冒main已发布，也不预设第二次doc-only ack PR。已取消的plugin专项不恢复，全EKO库存/行为模型与宽Rule/Audit状态不由此Plan升级。

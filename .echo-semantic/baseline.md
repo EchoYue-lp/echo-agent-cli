@@ -4,7 +4,7 @@ id: baseline.repository
 kind: baseline
 source_snapshot:
   base_revision: f57b90a2b0962fa5561f8839a3df70be1f261ffa
-  content_digest: 68ce1c8d787a55c5934df86869dd2fd3ca51fdb5569a4c59f32227f6fb040195
+  content_digest: a316119d3d822166fd260b6806ad05b2bf2762f349d47185e64a2bea4f964241
 inventory_closure: open
 behavior_model_closure: open
 map_refs: [map.eko-conversation-collaboration, map.eko-framework-consumer-settlement]
@@ -94,3 +94,8 @@ dfd5750之后的窄交付增量：精确三依赖risk gate经6测试方法及独
 ## Focused exact-six dependency and consumer milestone
 
 2026-10-21 仅刷新本候选实际非语义源码摘要，base仍公开main祖先f57。新增人的精三项使当前policy精六项，old3冻结及事件期限保持；WebPKI0382精两值lockpatch、现有fixed-six gate与6unit、两officialscanner1/separate riskgate0均在原Evidence/Decision/Finding有界记录。e46要求managed import与factory两Rust既有修复同提交，否则parent0d1四政策路径投影精consumer不匹配。原旧锁full8/25selected仅属历史；新锁d2e7/F7ded原managed6、modelmodule24、exactpool1三组实际31具名0fail/0ignore/零warning并有限独审C0，原17是25子集不另加。该focused资格不冒patched-lock full8与最终main/nativeHook，现有needs_review/stale/库存与行为open不变。
+
+
+## Final accepted-framework consumer qualification
+
+2026-10-22，本消费者在接受的framework main f7bac与patched CLI lock d2e7上完成原八项工程命令、included factory格式及原风险三项矩阵：workspace1978pass/15既有ignore、GUI226pass/3既有ignore，分配置不相加；零编译warning/源码漂移，原17失败具名PASS。fresh官方DB4b587两scanner自然1、零漏洞/精六告警、独立riskgate0，原三版本继续冻结；详见共用Evidence末节。此前开发/focused段为历史切点，当前摘要只绑定实际文稿收束后的源；相同编译/测试/工具输入经投影承接本次成绩，不宣称再次执行。精确合并mainCI/cold属于交付条件；inventory与behavior_model仍open，Rule/Audit原状态不扩大，取消的plugin消费者专项不再列前置。

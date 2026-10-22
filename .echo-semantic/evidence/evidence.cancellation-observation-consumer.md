@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.cancellation-observation-consumer
 kind: evidence
-observed_at: source:68ce1c8d787a55c5934df86869dd2fd3ca51fdb5569a4c59f32227f6fb040195
+observed_at: source:a316119d3d822166fd260b6806ad05b2bf2762f349d47185e64a2bea4f964241
 source_refs:
 - echo-agent-app-core/src/infra/factory.rs
 - echo-agent-app-core/src/agent_pool/tests.rs
@@ -58,21 +58,21 @@ supports:
 - behavior.analysis-original-owner-settlement-retry
 - rule.eko-framework-consumer-authorities
 limitations:
-- Earlier public f0a/3ded focused and nine-case results remain historical; they are
-  not final CF988/full acceptance.
-- Prior CF988 cut qualified cron, six surface/control cases and both Clippy commands.
-  The later shared preparation repair has two same-entry AFTER passes; current full
-  workspace, Clippy and GUI qualification remain pending.
-- Exact three-dependency human acceptance has a reviewed gate; both online scans with
-  per-process HTTP/1.1 report scanner1/gate0. Original default-transport fetch failure is retained.
-- No complete workspace/GUI/remote-main delivery or repository-wide closure is claimed.
+- Final local qualification binds the actual C8d compiled/test/tool inputs,
+  framework f7bac and patched CLI lock d2e7; historical cuts retain their own results.
+- Workspace and GUI are separate feature configurations; ignored and zero-case
+  harnesses are not executed coverage, and no native Tauri OS/window test is claimed.
+- Exact six human-accepted dependency warnings remain real. Official fresh scanners
+  exit1 while the independent identity-bound risk gates exit0; no warning-free audit.
+- Exact merged-main CI/cold is a separate delivery condition. Repository-wide EKO
+  inventory/behavior closure stays open; the canceled plugin campaign is not revived.
 ---
 
 # Cancellation observation consumer
 
 ## 支持的结论
 
-当前结论以文末 `Approved six-risk / WebPKI focused checkpoint, 2026-10-21` 为准：用户已明确接受新增精三项及六项校验合同，两份实际审计均为原 scanner1、独立 riskgate0/caller0，0vuln/6精告警。新锁 Rust 三组 focused 已实际通过，共31个不同名称、0fail/0ignore/零warning，详见文末；patched-lock 完整八项、最终 framework/CLI main、native Hook/Stop 仍未完成，F 自身的测试不作为 CLI 成绩。
+当前工程与消费资格以文末 `Final framework main consumer qualification, 2026-10-22` 为准：EKO 在已接受 framework main f7bac、patched lock d2e7 上实际完成原八项门禁及独立 factory include 格式检查；workspace 1978pass/15既有ignore，GUI配置226pass/3既有ignore，零编译warning及源码漂移。原六风险工具测试与两份 fresh 官方审计也完成：零漏洞、精六项已接受告警，scanner1与riskgate0/caller0分列。它不证明原生窗口/OS GUI、不合并跨feature数量，也不关闭全EKO库存/行为模型；精确合并main的CI/cold属于单列交付条件。已撤回的插件消费者Hook/Stop专项不再作为前置。
 
 历史批准前切点（截至 2026-10-20）：framework356 候选仅闭合下文具名的 managed import 根 prompt/计数适配及原六用例：same AFTER6pass/0fail/0ignore/1650filtered、零 warning、原 framework clean 与源码无漂移。原六项依赖工具测试与 formatter 也通过，但两份新在线扫描均 scanner1/gate1：在原三个冻结接受风险之外新增三个未接受的 zbus 系列停止维护告警。因此完整 Rust/GUI、精确 main CI、native Stop 与宽行为仍未完成；下文其它切点均为保留的历史证据。
 
@@ -299,3 +299,20 @@ F7ded/source6eb的旧锁8e951原完整八命令：前7自然0，末项GUI在原9
 本阶段原件都在ignored任务local：approved-six-freshdb-audit（实际两审计和各自然出口）、new3-risk-approved-adoption（真实6unit）、webpki-0382-lockpatch（精两值锁和lockSHA政策）、patchedlock31-preparation（真实6/24/1、两actualbin、source fence与资源收据）、qualified7ded-full8-complete-budget-epochs-proof（旧锁full8）、main1d-focused25-original17-after-proof（原17前后）、oldlock-full8-cache-clean-proposal（7producer custody及唯一官方devclean0/after0）。日志/DB/源码副本/索引/二进制不入Git。独立审查有限C0不代替未完成的patched-lock full8、final framework/CLI mainCI/cold/nativeHook；宽Rule needs_review/Audit stale/inventory与behavior open不关闭。
 
 本提交切片没有新公共API、CLI wire、前端或产品能力；已有ADR0029/0045双语同步唯一权威，CI只追加被include!隐藏的factory单文件格式检查；示例仍进入all-target编译链，官网无新增产品事实须写。当前无部署/发布/npm/PyPI/Maven授权。
+
+
+## Final framework main consumer qualification, 2026-10-22
+
+EKO 的执行、取消和恢复适配保留 framework physical receipt/claim CAS、原 Scheduler slot 与 managed transcript 权威；观察者结束不能伪造 terminal、释放未结算 owner 或重放工作。应用保留原 durable intent、产品资源与收据，主 Agent/写入/只读 Subagent 的已知 client/config 原样经过完整 Builder；真正 opaque override 仍清除配置。历史导入只传既有 transcript，framework resume 唯一构造 rendered root，按非 System 历史计数，ordinal/import receipt/CAS不变。上述是永久行为约束，后续不以本地运行完成替代真实物理证据。
+
+本次真实运行切点为 CLI `8d9632ccb5791144f34f5f8992f7441916647b0a`、tree `84655ad7ffe8a632a470b811a6fead64aace7022`，framework 已接受 main `f7bac62eee04a963f92a3e4308b6ea2336e91cc0`（2332文件/source8506），CLI lock `d2e7b7ebc035d35940f20fd9a95628a37ddf13bba2c1d5c828cdac142ae41680`、policy6cd与consumer e46。相对后续仅文稿收束，资格只按相同编译、测试、工具输入的精确投影承接，不伪造文稿后又跑了一次。
+
+原 fmt、fmtcheck、独立 `rustfmt --edition 2024 --check` included factory、all-target/all-feature Clippy、四panic lint、完整workspace测试、core no-default check、GUI binary check、GUI test，共九命令全部自然0/OBSERVED/monitorError=null/sourceDrift=[]，零编译warning。默认opt0/unoptimized、assertions/overflow/unwind、jobs1/inc0/debug0/strip/TSRS隔离不变。workspace按target为core1647pass/9ignore，五integration分别6/5/2/3/5，CLI lib288/main11/JSONL6；两独立core rustdoc分片为1pass/3ignore及4compile-fail pass，CLI docs另3ignore，合1978pass/15ignore；嵌套selfprobe1不重复计入。GUI另配置lib219/main1/JSONL6，共226pass，docs3ignore，Tauri0harness不冒原生OS执行。原17个missing-config失败此次在workspace全部具名PASS，属于core1647子集，不另加31或17。
+
+本次原9GiB/5GiB工程预算与末GUI10GiB/7GiB预算从首次执行前已明确，5s/du3与原stop/reap保持；workspace采样peak6181445632B/minfree13022863360B，GUIpeak8754610176B/minfree12849651712B，没有资源中断或重试。前一lease准入min18008256512B不足782225408B的失败永久保留且0命令启动。另有05结束后的metadata reader `next(tuple.groups())` TypeError1原件保留；修正为group(1)后只取身份，不重跑05。core实际bin200243072B/SHA17a8639030d713e0519ff401a3e3c6e104352c629bc244cd5ad10e420c999e7d在05后、06check已开始时读取并如实标时；全部workspace10个运行文件在GUI后仍同SHA。
+
+原6个风险测试方法实际通过。actual CLI lock与framework canonical registry-origin helper两份官方扫描默认fresh HTTPS fetch，`noFetch=false`/ignore=[]，DB `4b587f00996ebe5c05a73eaef105ef241e876414`、tree `523058420679c8a4901e43e8e5fcb1e1406e7436`，1348 advisories/839 dependencies。两份均零漏洞、精六项已接受warnings；original scanner自然1，独立精风险gate及caller0。旧e6固定DB资格不冒本次fresh结果；没有SDK/F例外、依赖升级、新ignore或风险自动续期。
+
+原件位于 ignored `local/cli-framework356-consumer/final-f7bac-clean8d-full8-runtime-20261022-02/`，汇总proof49106B/SHA bff031aefe5f421804c2f664a32352595df4866c94b6c5ee33c4578c45e22a9b；05 raw199415B/SHA b2c6438ab737825ad161844a0f18ed2dd5875fd44cd9a3db3b0321fb1f1fd8a2，08 raw25875B/SHA b08090e86173e49124498f2b112c00edcb30a82718c990d6bd78c31fa3110b45。末核C945/CF2332全SET/SHA/mode、PF、配置及政策锁一致；原4755保护清单不改，4745普通文件与2份new31实核，退休10通过已审lossless archive/member/index与actual journal承接，SDK/F49及Host2c/collector外置保护由已接受external successor继承。旧反例、custody、source refs及scanner失败不改，不以恢复表示冒原普通路径仍存在。末核无Cargo/Host/扫描进程。
+
+最终交付以精确合并main的CI/cold及累计文件必要性结果单列收据判定，不把源码冷可取当重新运行，不预设另一次doc-only ack PR。Rule needs_review、Audit stale、全仓inventory/behavior open保留各自原义；本任务局部工程与消费资格不扩为全EKO闭合。纯内部适配与风险规则不增加公共调用或产品入口，现有examples已由all-target链覆盖，官网只同步已有产品事实。

@@ -11,7 +11,7 @@ focus:
 - time_lifecycle
 - failure_concurrency
 - contract_evidence
-observed_at: source:68ce1c8d787a55c5934df86869dd2fd3ca51fdb5569a4c59f32227f6fb040195
+observed_at: source:a316119d3d822166fd260b6806ad05b2bf2762f349d47185e64a2bea4f964241
 behavior_refs:
 - behavior.background-review-caller-owned-settlement
 - behavior.shared-turn-observation-retains-owner
@@ -85,7 +85,7 @@ EKO 使用同一 generation-bound Review owner；Skill 使用框架 preview/appr
 
 ## 证据
 
-EKO ADR 0043-0046 与框架 ADR 0058/0065/0069 是既有机制的设计依据；本次 CF988 的当前执行证据限于共用 Evidence 明确记录的三个 focused case 及独立复审。历史门禁不替代当前完整 workspace、Clippy/GUI/前端适用门禁，最终远端 CI 与主分支交付仍待完成。
+EKO 与framework既有ADR继续约束唯一状态权威。当前消费者的完整本地资格见共用Evidence的2026-10-22最终framework main切点：原八项门禁、included factory格式与既有三项风险矩阵全部实际通过。历史CF988及其它focused切点只保原范围；精确合并main的CI/cold单列交付，GUIfeature测试不等于原生窗口/OS验收，Rule整体needs_review不因本次消费者资格升级。
 
 ## 裁决记录
 
@@ -114,7 +114,7 @@ CLI依赖政策只在应用层核对用户当前精确risk_accepted集合；原�
 
 ## Configured LLM construction adapter
 
-EKO 的 ConfiguredModel/ModelProviderConfig 与既有 resolver 仍拥有产品选择、endpoint 和 credentials。主 Agent 与两类 Subagent 的已知 config/client 配对通过框架完整 builder 原样传入；框架唯一拥有 profile 准备与 client/config 同步安装，不添加应用 cfg cache、第二个 resolver 或构造时 async generation。无 config 的 opaque client 仍保留旧语义，运行时 model generation/critic/继承发布权威不改。此处仅记录既有模型构造合同的薄适配；原17反例和最终门禁尚需新 framework main 上的实际 AFTER，宽 needs_review/stale 状态不关闭。
+EKO 的 ConfiguredModel/ModelProviderConfig 与既有 resolver 仍拥有产品选择、endpoint 和 credentials。主 Agent 与两类 Subagent 的已知 config/client 配对通过框架完整 builder 原样传入；框架唯一拥有 profile 准备与 client/config 同步安装，不添加应用 cfg cache、第二个 resolver 或构造时 async generation。无 config 的 opaque client 仍保留旧语义，运行时 model generation/critic/继承发布权威不改。此处仅记录既有模型构造合同的薄适配；原17反例已在接受的framework f7bac/newlock完整workspace中具名通过；永久保留known-pair/opaque分界，宽needs_review/stale状态不关闭。
 
 
 2026-10-21 的显式新三项决定使当前应用policy只接受绑定d2e7/e46的精六项；原三项保持版本/字段/事件期限。原officialscanner1与独立精风险gate0必须分列，不可传播为framework/SDK例外，未知类别、身份/输入漂移和任意漏洞/yanked仍拒。现有Decision/Finding/Evidence各自保存人的范围、risk_accepted状态和真实扫描/工程限制；Rule仍needs_review，宽义务不因窄checkpoint关闭。
