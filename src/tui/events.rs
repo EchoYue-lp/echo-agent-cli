@@ -2231,7 +2231,7 @@ async fn dispatch_turn(
         .clone()
         .map(|attempt| (app_state.conversation_inputs(), attempt));
     if let Err(error) = foreground_turns.supervise(lease, move |lease| async move {
-        let _scoped_runtime_guard = scoped_runtime_guard;
+        lease.retain(scoped_runtime_guard);
         let outcome = match std::panic::AssertUnwindSafe(send_to_agent(
             &agent_owned,
             prepared,
@@ -2248,10 +2248,16 @@ async fn dispatch_turn(
         .catch_unwind()
         .await
         {
-            Ok(outcome) => outcome,
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) if error.is_observation() => {
+                let _ = agent_tx.send(AgentEvent::Notice(error.to_string()));
+                return;
+            }
+            Ok(Err(error)) => TurnOutcome::Failed(echo_agent::error::AgentFailure::message("foreground_turn", error.to_string())),
             Err(_) => {
-                tracing::error!(turn_id = %settled_turn_id, "TUI foreground driver panicked");
-                TurnOutcome::Cancelled
+                tracing::error!(turn_id = %settled_turn_id, "TUI foreground driver panicked without a physical receipt");
+                let _ = agent_tx.send(AgentEvent::Notice("Foreground settlement is unknown; the original turn remains owned.".to_string()));
+                return;
             }
         };
         let _ = agent_tx.send(AgentEvent::TurnSettled {
@@ -3305,7 +3311,7 @@ async fn send_to_agent(
     turn: echo_agent_app_core::api::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<echo_agent_app_core::api::chat_resources::ChatResources>,
     context: TuiAgentTurnContext,
-) -> TurnOutcome {
+) -> Result<TurnOutcome, echo_agent_app_core::api::chat_driver::ChatTurnError> {
     use echo_agent_app_core::api::foreground_turn::{
         drive_foreground_chat, drive_foreground_chat_turn, drive_foreground_chat_with_ingress,
     };
@@ -3337,8 +3343,8 @@ async fn send_to_agent(
                     .map(|receipt| receipt.invocation()),
             )
             .await
-            .map_err(|error| error.to_string()),
-            None => Err("TaskRuntime store is unavailable".to_string()),
+            .map_err(echo_agent_app_core::api::chat_driver::ChatTurnError::from),
+            None => Err("TaskRuntime store is unavailable".into()),
         };
         let outcome = match result {
             Ok(launch) => match launch.wait().await {
@@ -3352,20 +3358,28 @@ async fn send_to_agent(
                     "planned_resume",
                     format!("planned resume ended with {other:?}"),
                 )),
+                Err(error) if error.is_observation() => {
+                    lease.retain_observation(error.clone());
+                    return Err(error);
+                }
                 Err(error) => TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
                     "planned_resume",
-                    error,
+                    error.to_string(),
                 )),
             },
+            Err(error) if error.is_observation() => {
+                lease.retain_observation(error.clone());
+                return Err(error);
+            }
             Err(error) => TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
                 "planned_resume",
-                error,
+                error.to_string(),
             )),
         };
-        return settle_planned_resume_foreground(lease, outcome).await;
+        return Ok(settle_planned_resume_foreground(lease, outcome).await);
     }
-    let _pool_execution = pool_execution;
-    let result = if let Some(binding) = run_turn_binding {
+    lease.retain_execution(pool_execution);
+    if let Some(binding) = run_turn_binding {
         drive_foreground_chat_turn(lease, agent, &turn, res, binding).await
     } else if let Some((service, attempt)) = input_observation {
         let observer_service = service.clone();
@@ -3401,14 +3415,7 @@ async fn send_to_agent(
         .await
     } else {
         drive_foreground_chat(lease, agent, &turn, res).await
-    };
-    result.unwrap_or_else(|error| {
-        tracing::warn!(%error, "TUI foreground chat failed");
-        TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
-            "foreground_turn",
-            error,
-        ))
-    })
+    }
 }
 
 fn run_turn_binding_for_request(
@@ -6798,9 +6805,11 @@ async fn start_tui_task_retry_driver(
                     })
             },
             move |memory_generation, mut receipt_owner| async move {
-                let _pool_execution = pool_execution;
                 if let Some(generation) = memory_generation.as_ref() {
-                    receipt_owner.retain(generation.clone());
+                    receipt_owner.retain(generation.clone())?;
+                }
+                if let Some(execution) = pool_execution {
+                    receipt_owner.retain(execution)?;
                 }
                 let reviewer_llm = agent.read(|value| value.llm_client().cloned()).await;
                 let run_store = agent.read(|value| value.run_store().cloned()).await;
@@ -6819,7 +6828,7 @@ async fn start_tui_task_retry_driver(
                 .await;
                 if let Err(error) = result {
                     tracing::error!(run_id = %preparation_run_id, %error, "TUI task retry driver failed");
-                    return Err(error.to_string());
+                    return Err(echo_agent_app_core::api::chat_driver::ChatTurnError::from(error));
                 }
                 Ok(())
             },
@@ -8373,22 +8382,220 @@ mod tests {
         assert!(!event_projection.contains(".settle_attempt("));
     }
 
-    #[test]
-    fn task_run_resume_stays_outside_conversation_input_ingress() {
-        const SOURCE: &str = include_str!("events.rs");
-        let driver = SOURCE
-            .split("async fn send_to_agent")
-            .nth(1)
-            .and_then(|tail| tail.split("fn run_turn_binding_for_request").next())
-            .unwrap_or_default();
-        let resume = driver
-            .split("if let Some(expected) = planned_resume")
-            .nth(1)
-            .and_then(|tail| tail.split("let _pool_execution").next())
-            .unwrap_or_default();
-        assert!(resume.contains("launch_task_run_resume"));
-        assert!(!resume.contains("drive_foreground_chat_with_ingress"));
-        assert!(!resume.contains("ConversationInput"));
+    #[tokio::test]
+    async fn task_run_resume_stays_outside_conversation_input_ingress() -> Result<(), String> {
+        use echo_agent_app_core::api::chat_event_log::{ChatEventLog, ChatEventRetention};
+        use echo_agent_app_core::api::runtime::{
+            ApplicationLifecycleOwner, ApplicationLifecycleReason,
+        };
+        use echo_agent_app_core::api::tasks::task_runtime::{
+            RunPlanPolicy, TaskRunExecutionProfile, TaskRunResumeIdentity,
+        };
+
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let agent = task_test_agent()?;
+        let product_io = echo_agent_app_core::api::product_data_io::ProductDataIoService::new();
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temporary.path().join("tasks"), "global")
+                .map_err(|error| error.to_string())?,
+        );
+        let mut state = echo_agent_app_core::api::state::AppState::from_shared(
+            agent.clone(),
+            None,
+            Arc::new(echo_agent_app_core::api::hitl::HitlDispatcher::new()),
+            None,
+            None,
+            Default::default(),
+            Arc::new(
+                echo_agent_app_core::api::mcp_config_runtime::McpConfigRuntime::from_snapshot(
+                    temporary.path().join("mcp.json"),
+                    Default::default(),
+                ),
+            ),
+            product_io.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        state.workspace.global_execution_root = temporary.path().to_path_buf();
+        state.tasks.runtime = Some(store.clone());
+        state.storage.chat_events = Arc::new(
+            ChatEventLog::open(
+                temporary.path().join("chat-events"),
+                ChatEventRetention::default(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        let state = Arc::new(state);
+        let mut lifecycle =
+            ApplicationLifecycleOwner::new(echo_agent::agent::CancellationToken::new());
+        lifecycle.bind_app_state(state.clone());
+        lifecycle.bind_task_runtime(store.clone());
+        lifecycle.bind_primary_agent(agent);
+        lifecycle.bind_product_data_io(product_io);
+        let runtime = state
+            .current_control_runtime()
+            .await
+            .map_err(|error| error.to_string())?;
+        let conversation = format!("tui-resume-{}", uuid::Uuid::new_v4());
+        let original = store
+            .create_run_for_active_workspace_with_profile(
+                "tui-resume-run",
+                &conversation,
+                "original-root",
+                DomainProfile::General,
+                "inspect and report the original goal",
+                "agent_autonomous",
+                AttendedMode::Attended,
+                TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            )
+            .map_err(|error| error.to_string())?;
+        // Resume admission requires this creation-time policy, as in the core fixture.
+        store
+            .configure_run_continuation(&original.run_id, true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(&original.run_id, TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(&original.run_id, TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
+        let expected = TaskRunResumeIdentity::capture(
+            &store
+                .get_run_state(&original.run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "original resume snapshot missing".to_string())?,
+        );
+        let run_ids = || {
+            store
+                .list_runs_for_conversation(&conversation)
+                .map(|runs| runs.into_iter().map(|run| run.run_id).collect::<Vec<_>>())
+                .map_err(|error| error.to_string())
+        };
+        let original_run_ids = run_ids()?;
+
+        // A resume wake must neither become a new Goal nor consume an unrelated queued input.
+        let service = state.conversation_inputs();
+        let address = ConversationInputAddress {
+            workspace_id: runtime.execution_scope().workspace_id().to_string(),
+            conversation_id: conversation.clone(),
+        };
+        service
+            .submit(
+                address.clone(),
+                "independent-input".to_string(),
+                "independent queued user goal".to_string(),
+                Vec::new(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let frontier_before = serde_json::to_value(
+            service
+                .list(&address)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let lease = runtime
+            .begin_turn(
+                &state.session.foreground_turns,
+                ForegroundTurnSurface::Tui,
+                &conversation,
+                "resume-wake",
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let pool_execution = runtime
+            .agent_for(&conversation)
+            .await
+            .map_err(|error| error.to_string())?;
+        let agent = pool_execution.agent();
+        let resources = Arc::new(echo_agent_app_core::api::chat_resources::ChatResources {
+            execution_scope: runtime.execution_scope().clone(),
+            workspace_io_receipt: Some(runtime.workspace_io_receipt()),
+            pool: runtime.pool(),
+            store: runtime.task_runtime(),
+            sink: Arc::new(super::TuiChatSink::new(tx.clone())),
+            webhook_emitter: None,
+            conv_id: Some(conversation.clone()),
+            root_message_id: "resume-wake".to_string(),
+            attachments: Vec::new(),
+            cancel: lease.cancellation_token(),
+            review_integration: runtime.review_integration(),
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let turn = echo_agent_app_core::api::prepared_turn::PreparedUserTurn::build(
+            echo_agent_app_core::api::prepared_turn::UserTurnInput {
+                text: "THIS IS A RESUME WAKE, NOT A USER GOAL",
+                attachments: &[],
+                spill_dir: temporary.path(),
+                conversation_id: Some(&conversation),
+                turn_id: Some("resume-wake"),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let outcome = super::send_to_agent(
+            &agent,
+            turn,
+            resources,
+            super::TuiAgentTurnContext {
+                lease,
+                run_turn_binding: None,
+                planned_resume: Some(expected),
+                pool_execution,
+                input_observation: None,
+                receipt_tx: tx,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        assert_eq!(outcome, TurnOutcome::Completed);
+        let resumed = store
+            .get_run(&original.run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "resumed run missing".to_string())?;
+        assert_eq!(resumed.status, TaskRunStatus::Completed);
+        assert_eq!(resumed.goal, original.goal);
+        assert_eq!(resumed.goal_revision, original.goal_revision);
+        assert_eq!(resumed.goal_sha256, original.goal_sha256);
+        assert_eq!(resumed.root_message_id, original.root_message_id);
+        assert_eq!(run_ids()?, original_run_ids);
+        let frontier_after = service
+            .list(&address)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            serde_json::to_value(&frontier_after).map_err(|error| error.to_string())?,
+            frontier_before
+        );
+        assert!(
+            frontier_after
+                .items
+                .iter()
+                .any(|item| item.receipt.identity.input_id == "independent-input"
+                    && item.receipt.phase == ConversationInputPhase::Persisted)
+        );
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event, AgentEvent::ConversationInputReceipt(_)));
+        }
+        assert!(
+            state
+                .session
+                .foreground_turns
+                .snapshot_scoped(
+                    runtime.execution_scope().workspace_id(),
+                    ForegroundTurnSurface::Tui,
+                    &conversation,
+                )
+                .is_none()
+        );
+        drop(runtime);
+        lifecycle
+            .settle(ApplicationLifecycleReason::Shutdown, None)
+            .await
+            .into_result()
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     #[test]

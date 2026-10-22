@@ -1419,6 +1419,22 @@ pub(crate) struct RunStateEventIndex {
     pub(crate) active_tools: Vec<ActiveToolBoundary>,
     #[serde(default)]
     pub(crate) recovery_blockers: Vec<RecoveryBlocker>,
+    /// Private admission facts folded from the same FileTaskShadow journal.
+    /// A caller's observation cannot clear an original physical owner's intent.
+    #[serde(default)]
+    pub(crate) physical_owner_intents: Vec<PhysicalOwnerIntent>,
+    #[serde(default)]
+    pub(crate) physical_owner_intent_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PhysicalOwnerIntent {
+    pub(crate) run_id: String,
+    pub(crate) owner_id: String,
+    pub(crate) execution_id: Option<String>,
+    pub(crate) workspace_id: String,
+    #[serde(default)]
+    pub(crate) physical_terminal_observed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1863,11 +1879,27 @@ pub struct PlanTask {
     /// Subagent execution ids instead.
     #[serde(default)]
     pub claim: Option<echo_agent::tasks::TaskClaim>,
+    /// Lossless internal execution projection; never part of TaskSpec/Todo IPC.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_task_result"
+    )]
+    pub result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption_requested: Option<echo_agent::tasks::RuntimeInterruptionDisposition>,
     /// Stable sort key for display ordering. Set by plan generation (sequential
     /// index) and updated by `reorder_tasks`. Separated from `parallel_group`
     /// (which encodes parallel-fanout grouping, not display order) to avoid
     /// semantic pollution.
     pub sort_order: i64,
+}
+
+// A present JSON null is an explicit task result, not a missing result.
+fn deserialize_present_task_result<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 impl Default for PlanTask {
@@ -1892,6 +1924,8 @@ impl Default for PlanTask {
             failure_fingerprint: None,
             status: echo_agent::tasks::TaskStatus::Pending,
             claim: None,
+            result: None,
+            interruption_requested: None,
             sort_order: 0,
         }
     }
@@ -1926,6 +1960,8 @@ impl PlanTask {
             retry_count: self.retry_count,
             failure_fingerprint: self.failure_fingerprint.clone(),
             claim: self.claim.clone(),
+            result: self.result.clone(),
+            interruption_requested: self.interruption_requested.clone(),
         }
     }
 
@@ -1950,6 +1986,8 @@ impl PlanTask {
             failure_fingerprint: execution.failure_fingerprint,
             status: execution.status,
             claim: execution.claim,
+            result: execution.result,
+            interruption_requested: execution.interruption_requested,
             sort_order: spec.sort_order,
         }
     }
@@ -1967,6 +2005,8 @@ impl TryFrom<&PlanTask> for echo_agent::tasks::Task {
                 retry_count: value.retry_count,
                 failure_fingerprint: value.failure_fingerprint.clone(),
                 claim: value.claim.clone(),
+                result: value.result.clone(),
+                interruption_requested: value.interruption_requested.clone(),
             },
         })
     }
@@ -2004,6 +2044,8 @@ impl TryFrom<echo_agent::tasks::Task> for PlanTask {
             failure_fingerprint: execution.failure_fingerprint,
             status: execution.status,
             claim: execution.claim,
+            result: execution.result,
+            interruption_requested: execution.interruption_requested,
             sort_order: spec.sort_order,
         })
     }
@@ -2723,6 +2765,30 @@ mod tests {
     }
 
     #[test]
+    fn internal_task_execution_round_trip_preserves_null_result_and_interruption()
+    -> Result<(), String> {
+        let task = PlanTask {
+            id: "original-task".to_string(),
+            title: "internal execution".to_string(),
+            result: Some(serde_json::Value::Null),
+            interruption_requested: Some(
+                echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled,
+            ),
+            ..PlanTask::default()
+        };
+        let canonical = echo_agent::tasks::Task::try_from(&task)?;
+        let materialized = PlanTask::try_from(canonical.clone())?;
+        let bytes = serde_json::to_vec(&materialized).map_err(|e| e.to_string())?;
+        let restored: PlanTask = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        assert_eq!(restored.result, Some(serde_json::Value::Null));
+        assert_eq!(echo_agent::tasks::Task::try_from(&restored)?, canonical);
+        let public_spec = serde_json::to_value(restored.spec()).map_err(|e| e.to_string())?;
+        assert!(public_spec.get("result").is_none());
+        assert!(public_spec.get("interruption_requested").is_none());
+        Ok(())
+    }
+
+    #[test]
     fn plan_task_round_trips_through_framework_task() -> Result<(), String> {
         let task = PlanTask {
             id: "t1".to_string(),
@@ -2755,6 +2821,8 @@ mod tests {
                 2,
                 "spec-hash".to_string(),
             )),
+            result: None,
+            interruption_requested: None,
             sort_order: 10,
         };
 
@@ -2943,6 +3011,8 @@ mod tests {
             failure_fingerprint: Some("compile-error".to_string()),
             status: echo_agent::tasks::TaskStatus::Failed("cargo check failed".to_string()),
             claim: None,
+            result: None,
+            interruption_requested: None,
             sort_order: 0,
         };
 

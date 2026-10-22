@@ -46,6 +46,7 @@ model 时，runtime resolver 还能从 mirror 合成一个模型。
 
 ## 影响
 
+- 已配置的主 Agent、writer 与只读 Subagent 构造通过框架完整 builder 的 `configured_llm_client(client, original_config)` 传递同一个已准备 client 和它的原始 `LlmConfig`，不重建 transport，也不在 build 后再用 opaque client setter 覆盖已知配对。只有 config 或无 config 的 opaque client 保持原行为。EKO 继续复用原 resolver、critic 共享、继承代际发布、settings 与 registry 路径；profile/install 仍只有框架一个权威。
 - Agent 配置跨 application/framework 边界时不再需要 conversion adapter。
 - 模型选择、provider credential 与 runtime validation 各自只有一个明确来源。
 - GUI、TUI、CLI/JSONL、channel、Cron 与未来 pooled Agent 共用同一个 typed resolver/error。

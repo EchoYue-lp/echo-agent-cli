@@ -675,7 +675,7 @@ pub async fn run_jsonl_mode(
         )),
     });
     let turn_cancel = lease.cancellation_token();
-    let _pool_execution = pool_execution;
+    lease.retain_execution(pool_execution);
     let result = await_jsonl_driver_or_cancel(
         echo_agent_app_core::api::foreground_turn::drive_foreground_chat(
             lease, &agent, &turn, resources,
@@ -689,6 +689,9 @@ pub async fn run_jsonl_mode(
         },
     )
     .await;
+    if let Some(error) = result.as_ref().err().filter(|error| error.is_observation()) {
+        return Err(anyhow::Error::msg(error.to_string()));
+    }
     let status = result.as_ref().map_or(
         "failed",
         echo_agent_app_core::api::chat_driver::TurnOutcome::status,

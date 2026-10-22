@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 const ANALYSIS_ROOT: &str = "analysis";
 const MANIFEST_FILE: &str = "manifest.json";
 const LATEST_RUN_FILE: &str = "latest-run.json";
+const OWNER_INTENT_FILE: &str = ".physical-owner-intent.json";
 const RUNS_DIR: &str = "runs";
 const CONTRACT_VERSION: u32 = 1;
 const MAX_SCRIPT_BYTES: u64 = 2 * 1024 * 1024;
@@ -45,11 +46,141 @@ pub enum AnalysisError {
     Json(#[from] serde_json::Error),
     #[error("analysis execution failed: {0}")]
     Execution(String),
+    #[error("analysis execution for run {run_id} is not physically settled")]
+    Observation {
+        run_id: String,
+        execution_id: Option<String>,
+    },
     #[error("analysis runtime is unavailable: {0}")]
     RuntimeUnavailable(String),
 }
 
 pub type AnalysisResult<T> = Result<T, AnalysisError>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AnalysisOwnerIntent {
+    run_id: String,
+    analysis_id: String,
+    workspace_generation: String,
+    owner_id: String,
+    execution_id: Option<String>,
+}
+
+// Named projections of the same admitted owner; neither creates a supervisor
+// nor changes the durable intent or original cleanup slot.
+#[derive(Clone)]
+struct AnalysisOwnerObservation {
+    intent: AnalysisOwnerIntent,
+    execution_started: Arc<std::sync::atomic::AtomicBool>,
+    pending_settlement: Arc<std::sync::Mutex<Option<PendingAnalysisSettlement>>>,
+}
+
+#[derive(Default)]
+struct AnalysisExecutionContext<'a> {
+    runtime: Option<&'a crate::analysis_runtime::PreparedAnalyticsRuntime>,
+    prepare_managed_runtime: bool,
+    product_data: Option<&'a crate::product_data_io::ProductDataIoFlow>,
+    owner: Option<AnalysisOwnerObservation>,
+}
+
+pub(crate) fn require_analysis_owner_settled(root: &Path, id: &str) -> AnalysisResult<()> {
+    let directory = analysis_dir(root, id)?;
+    let path = directory.join(OWNER_INTENT_FILE);
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let intent: AnalysisOwnerIntent = serde_json::from_slice(&bytes)?;
+            if intent.analysis_id != id
+                || intent.owner_id.trim().is_empty()
+                || intent.run_id.trim().is_empty()
+            {
+                return Err(AnalysisError::Invalid(
+                    "analysis owner intent is corrupt".to_string(),
+                ));
+            }
+            let terminal_path = directory
+                .join(RUNS_DIR)
+                .join(format!("{}.json", intent.run_id));
+            match fs::read(&terminal_path) {
+                Ok(bytes) => {
+                    let terminal: AnalysisRunRecord = serde_json::from_slice(&bytes)?;
+                    if terminal.run_id == intent.run_id
+                        && terminal.analysis_id == intent.analysis_id
+                    {
+                        acknowledge_analysis_owner_intent(root, &intent)?;
+                        return Ok(());
+                    }
+                    return Err(AnalysisError::Conflict);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            Err(AnalysisError::Observation {
+                run_id: intent.run_id,
+                execution_id: intent.execution_id,
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn begin_analysis_owner_intent(
+    root: &Path,
+    id: &str,
+    generation: String,
+) -> AnalysisResult<AnalysisOwnerIntent> {
+    require_analysis_owner_settled(root, id)?;
+    let intent = AnalysisOwnerIntent {
+        run_id: uuid::Uuid::new_v4().to_string(),
+        analysis_id: id.to_string(),
+        workspace_generation: generation,
+        owner_id: uuid::Uuid::new_v4().to_string(),
+        execution_id: None,
+    };
+    write_json(&analysis_dir(root, id)?.join(OWNER_INTENT_FILE), &intent)?;
+    Ok(intent)
+}
+
+pub(crate) fn acknowledge_analysis_owner_intent(
+    root: &Path,
+    intent: &AnalysisOwnerIntent,
+) -> AnalysisResult<()> {
+    let directory = analysis_dir(root, &intent.analysis_id)?;
+    let path = directory.join(OWNER_INTENT_FILE);
+    let current: AnalysisOwnerIntent = serde_json::from_slice(&fs::read(&path)?)?;
+    if current != *intent {
+        return Err(AnalysisError::Conflict);
+    }
+    let record: AnalysisRunRecord = serde_json::from_slice(&fs::read(
+        directory
+            .join(RUNS_DIR)
+            .join(format!("{}.json", intent.run_id)),
+    )?)?;
+    if record.run_id != intent.run_id {
+        return Err(AnalysisError::Conflict);
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+pub(crate) fn reject_unstarted_analysis_owner(
+    root: &Path,
+    intent: &AnalysisOwnerIntent,
+) -> AnalysisResult<()> {
+    let path = analysis_dir(root, &intent.analysis_id)?.join(OWNER_INTENT_FILE);
+    let current: AnalysisOwnerIntent = read_json(&path)?;
+    if current != *intent {
+        return Err(AnalysisError::Conflict);
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+impl From<String> for AnalysisError {
+    fn from(message: String) -> Self {
+        Self::Execution(message)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -340,6 +471,7 @@ pub fn save_analysis(
     analysis_id: &str,
     request: SaveAnalysisRequest,
 ) -> AnalysisResult<AnalysisDocument> {
+    require_analysis_owner_settled(workspace_root, analysis_id)?;
     if request.script.len() as u64 > MAX_SCRIPT_BYTES {
         return Err(AnalysisError::Invalid(
             "analysis script exceeds 2 MiB".to_string(),
@@ -370,6 +502,7 @@ pub fn save_analysis(
 }
 
 pub fn delete_analysis(workspace_root: &Path, analysis_id: &str) -> AnalysisResult<()> {
+    require_analysis_owner_settled(workspace_root, analysis_id)?;
     let directory = analysis_dir(workspace_root, analysis_id)?;
     fs::remove_dir_all(directory)?;
     Ok(())
@@ -381,25 +514,126 @@ pub async fn run_analysis_with_product_data(
     analysis_id: &str,
     cancel: Option<Arc<CancellationToken>>,
 ) -> AnalysisResult<AnalysisDocument> {
+    let root = product_data.data_root().to_path_buf();
+    let id = analysis_id.to_string();
+    let generation = product_data.generation();
+    let intent = run_analysis_io(Some(flow), "persist analysis owner intent", move || {
+        begin_analysis_owner_intent(&root, &id, generation)
+    })
+    .await?;
     let conversation_id = format!("analysis:{analysis_id}");
-    let execution = product_data
-        .runtime()
-        .agent_for(&conversation_id)
-        .await
-        .map_err(|error| AnalysisError::Execution(error.to_string()))?;
+    let execution = match product_data.runtime().agent_for(&conversation_id).await {
+        Ok(execution) => execution,
+        Err(error) => {
+            let original = error.to_string();
+            let root = product_data.data_root().to_path_buf();
+            let cleanup_intent = intent.clone();
+            if let Err(cleanup) =
+                run_analysis_io(Some(flow), "reject unstarted analysis owner", move || {
+                    reject_unstarted_analysis_owner(&root, &cleanup_intent)
+                })
+                .await
+            {
+                product_data.retain_analysis_cleanup(
+                    analysis_id,
+                    intent.clone(),
+                    true,
+                    Err(original.clone()),
+                );
+                return Err(AnalysisError::Execution(format!(
+                    "{original}; original owner rollback failed: {cleanup}"
+                )));
+            }
+            return Err(AnalysisError::Execution(original));
+        }
+    };
     let agent = execution.agent();
     let tool_manager = agent.read(|agent| agent.tool_manager().clone()).await;
+    product_data
+        .retain_analysis_resource(analysis_id, execution)
+        .map_err(|_| {
+            AnalysisError::Execution("original analysis owner is not admitted".to_string())
+        })?;
+    let execution_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pending_settlement = Arc::new(std::sync::Mutex::new(None));
     let result = run_analysis_with_runtime(
         tool_manager.as_ref(),
         product_data.data_root(),
         analysis_id,
         cancel,
-        None,
-        true,
-        Some(flow),
+        AnalysisExecutionContext {
+            runtime: None,
+            prepare_managed_runtime: true,
+            product_data: Some(flow),
+            owner: Some(AnalysisOwnerObservation {
+                intent: intent.clone(),
+                execution_started: execution_started.clone(),
+                pending_settlement: pending_settlement.clone(),
+            }),
+        },
     )
     .await;
-    drop(execution);
+    if result.is_ok() {
+        let root = product_data.data_root().to_path_buf();
+        let cleanup_intent = intent.clone();
+        if let Err(error) =
+            run_analysis_io(Some(flow), "acknowledge analysis owner intent", move || {
+                acknowledge_analysis_owner_intent(&root, &cleanup_intent)
+            })
+            .await
+        {
+            product_data.retain_analysis_cleanup(
+                analysis_id,
+                intent,
+                false,
+                result
+                    .as_ref()
+                    .map(Clone::clone)
+                    .map_err(ToString::to_string),
+            );
+            return Err(error);
+        }
+    } else if !execution_started.load(std::sync::atomic::Ordering::Acquire)
+        && !matches!(&result, Err(AnalysisError::Observation { .. }))
+    {
+        let root = product_data.data_root().to_path_buf();
+        let cleanup_intent = intent.clone();
+        if let Err(error) =
+            run_analysis_io(Some(flow), "reject unstarted analysis owner", move || {
+                reject_unstarted_analysis_owner(&root, &cleanup_intent)
+            })
+            .await
+        {
+            product_data.retain_analysis_cleanup(
+                analysis_id,
+                intent,
+                true,
+                result
+                    .as_ref()
+                    .map(Clone::clone)
+                    .map_err(ToString::to_string),
+            );
+            return Err(error);
+        }
+    } else if !matches!(&result, Err(AnalysisError::Observation { .. }))
+        && let Some(pending) = pending_settlement
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    {
+        // The original tool has returned a real result. Retain its exact
+        // pending durable writes; a later poll only retries these writes.
+        product_data.retain_analysis_pending_settlement(
+            analysis_id,
+            intent,
+            pending,
+            result
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        );
+    }
     result
 }
 
@@ -415,9 +649,12 @@ async fn run_analysis(
         workspace_root,
         analysis_id,
         cancel,
-        None,
-        false,
-        None,
+        AnalysisExecutionContext {
+            runtime: None,
+            prepare_managed_runtime: false,
+            product_data: None,
+            owner: None,
+        },
     )
     .await
 }
@@ -427,10 +664,16 @@ async fn run_analysis_with_runtime(
     workspace_root: &Path,
     analysis_id: &str,
     cancel: Option<Arc<CancellationToken>>,
-    runtime: Option<&crate::analysis_runtime::PreparedAnalyticsRuntime>,
-    prepare_managed_runtime: bool,
-    product_data: Option<&crate::product_data_io::ProductDataIoFlow>,
+    context: AnalysisExecutionContext<'_>,
 ) -> AnalysisResult<AnalysisDocument> {
+    let AnalysisExecutionContext {
+        runtime,
+        prepare_managed_runtime,
+        product_data,
+        owner: intent,
+    } = context;
+    let pending_settlement = intent.clone();
+    let execution_started = intent.as_ref().map(|owner| owner.execution_started.clone());
     let timer = Instant::now();
     let root = workspace_root.to_path_buf();
     let id = analysis_id.to_string();
@@ -443,9 +686,11 @@ async fn run_analysis_with_runtime(
         )?;
         let inputs = fingerprint_inputs(&root, &document.manifest.input_paths)?;
         let parameters_sha256 = hash_json(&document.manifest.parameters)?;
-        let run_id = uuid::Uuid::new_v4().to_string();
+        let run_id = intent
+            .as_ref()
+            .map(|owner| owner.intent.run_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let started_at = Utc::now();
-        clear_generated_outputs(&analysis_dir)?;
         Ok(PreparedAnalysisRun {
             document,
             analysis_dir,
@@ -457,6 +702,44 @@ async fn run_analysis_with_runtime(
         })
     })
     .await?;
+
+    if let Some(started) = execution_started {
+        started.store(true, std::sync::atomic::Ordering::Release);
+    }
+    let clear_directory = prepared.analysis_dir.clone();
+    if let Err(error) =
+        run_analysis_io(product_data, "clear original analysis outputs", move || {
+            clear_generated_outputs(&clear_directory)
+        })
+        .await
+    {
+        // No tool was started, so this is a known physical preparation
+        // failure; retain a failed record for ordinary durable-write retry.
+        let detail = error.to_string();
+        let terminal = AnalysisTerminal {
+            status: AnalysisRunStatus::Failed,
+            exit_code: None,
+            sandbox_type: None,
+            output: String::new(),
+            error: Some(detail.clone()),
+            output_truncated: false,
+        };
+        settle_analysis_run(
+            workspace_root,
+            analysis_id,
+            prepared,
+            terminal,
+            timer,
+            AnalysisExecutionContext {
+                runtime: None,
+                product_data,
+                owner: pending_settlement,
+                ..Default::default()
+            },
+        )
+        .await?;
+        return Err(AnalysisError::Execution(detail));
+    }
 
     let managed_runtime = if runtime.is_none()
         && prepare_managed_runtime
@@ -494,8 +777,12 @@ async fn run_analysis_with_runtime(
                     prepared,
                     terminal,
                     timer,
-                    None,
-                    product_data,
+                    AnalysisExecutionContext {
+                        runtime: None,
+                        product_data,
+                        owner: pending_settlement,
+                        ..Default::default()
+                    },
                 )
                 .await;
             }
@@ -543,7 +830,7 @@ async fn run_analysis_with_runtime(
                 output_truncated: result.truncated,
             }
         }
-        Err(error) => terminal_from_react_error(&error),
+        Err(error) => terminal_from_react_error(&error)?,
     };
     settle_analysis_run(
         workspace_root,
@@ -551,12 +838,17 @@ async fn run_analysis_with_runtime(
         prepared,
         terminal,
         timer,
-        runtime,
-        product_data,
+        AnalysisExecutionContext {
+            runtime,
+            product_data,
+            owner: pending_settlement,
+            ..Default::default()
+        },
     )
     .await
 }
 
+#[derive(Clone)]
 struct PreparedAnalysisRun {
     document: AnalysisDocument,
     analysis_dir: PathBuf,
@@ -567,6 +859,7 @@ struct PreparedAnalysisRun {
     started_at: DateTime<Utc>,
 }
 
+#[derive(Clone)]
 struct AnalysisTerminal {
     status: AnalysisRunStatus,
     exit_code: Option<i32>,
@@ -576,56 +869,106 @@ struct AnalysisTerminal {
     output_truncated: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct PendingAnalysisSettlement {
+    root: PathBuf,
+    analysis_id: String,
+    prepared: PreparedAnalysisRun,
+    terminal: AnalysisTerminal,
+    finished_at: DateTime<Utc>,
+    duration_ms: u64,
+    runtime_environment: BTreeMap<String, String>,
+    runtime_profile: Option<String>,
+    owner_intent: Option<AnalysisOwnerIntent>,
+}
+
+pub(crate) fn retry_analysis_settlement(
+    pending: &PendingAnalysisSettlement,
+) -> AnalysisResult<AnalysisDocument> {
+    let prepared = &pending.prepared;
+    if let Some(expected) = pending.owner_intent.as_ref() {
+        let current: AnalysisOwnerIntent =
+            read_json(&prepared.analysis_dir.join(OWNER_INTENT_FILE))?;
+        if current != *expected
+            || pending.analysis_id != expected.analysis_id
+            || prepared.run_id != expected.run_id
+        {
+            return Err(AnalysisError::Conflict);
+        }
+    }
+    let terminal = &pending.terminal;
+    let outputs = archive_outputs(&pending.root, &prepared.analysis_dir, &prepared.run_id)?;
+    let mut environment = read_environment(&prepared.analysis_dir.join("environment.json"))?;
+    environment.extend(pending.runtime_environment.clone());
+    let record = AnalysisRunRecord {
+        contract_version: CONTRACT_VERSION,
+        run_id: prepared.run_id.clone(),
+        analysis_id: pending.analysis_id.clone(),
+        status: terminal.status,
+        started_at: prepared.started_at,
+        finished_at: pending.finished_at,
+        duration_ms: pending.duration_ms,
+        script: prepared.script.clone(),
+        inputs: prepared.inputs.clone(),
+        parameters: prepared.document.manifest.parameters.clone(),
+        parameters_sha256: prepared.parameters_sha256.clone(),
+        random_seed: prepared.document.manifest.random_seed,
+        outputs,
+        environment,
+        exit_code: terminal.exit_code,
+        sandbox_type: terminal.sandbox_type.clone(),
+        runtime_profile: pending.runtime_profile.clone(),
+        output: terminal.output.clone(),
+        error: terminal.error.clone(),
+        output_truncated: terminal.output_truncated,
+    };
+    let runs_dir = prepared.analysis_dir.join(RUNS_DIR);
+    fs::create_dir_all(&runs_dir)?;
+    write_json(&runs_dir.join(format!("{}.json", prepared.run_id)), &record)?;
+    write_json(&prepared.analysis_dir.join(LATEST_RUN_FILE), &record)?;
+    load_analysis(&pending.root, &pending.analysis_id)
+}
+
 async fn settle_analysis_run(
     workspace_root: &Path,
     analysis_id: &str,
     prepared: PreparedAnalysisRun,
     terminal: AnalysisTerminal,
     timer: Instant,
-    runtime: Option<&crate::analysis_runtime::PreparedAnalyticsRuntime>,
-    product_data: Option<&crate::product_data_io::ProductDataIoFlow>,
+    context: AnalysisExecutionContext<'_>,
 ) -> AnalysisResult<AnalysisDocument> {
-    let runtime_environment = runtime
-        .map(|runtime| runtime.environment.clone())
-        .unwrap_or_default();
-    let runtime_profile = runtime.map(|runtime| runtime.profile.id.clone());
-    let finished_at = Utc::now();
-    let duration_ms = u64::try_from(timer.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let root = workspace_root.to_path_buf();
-    let id = analysis_id.to_string();
-    run_analysis_io(product_data, "settle analysis execution", move || {
-        let outputs = archive_outputs(&root, &prepared.analysis_dir, &prepared.run_id)?;
-        let mut environment = read_environment(&prepared.analysis_dir.join("environment.json"))?;
-        environment.extend(runtime_environment);
-        let record = AnalysisRunRecord {
-            contract_version: CONTRACT_VERSION,
-            run_id: prepared.run_id.clone(),
-            analysis_id: id.clone(),
-            status: terminal.status,
-            started_at: prepared.started_at,
-            finished_at,
-            duration_ms,
-            script: prepared.script,
-            inputs: prepared.inputs,
-            parameters: prepared.document.manifest.parameters,
-            parameters_sha256: prepared.parameters_sha256,
-            random_seed: prepared.document.manifest.random_seed,
-            outputs,
-            environment,
-            exit_code: terminal.exit_code,
-            sandbox_type: terminal.sandbox_type,
-            runtime_profile,
-            output: terminal.output,
-            error: terminal.error,
-            output_truncated: terminal.output_truncated,
-        };
-        let runs_dir = prepared.analysis_dir.join(RUNS_DIR);
-        fs::create_dir_all(&runs_dir)?;
-        write_json(&runs_dir.join(format!("{}.json", prepared.run_id)), &record)?;
-        write_json(&prepared.analysis_dir.join(LATEST_RUN_FILE), &record)?;
-        load_analysis(&root, &id)
+    let AnalysisExecutionContext {
+        runtime,
+        product_data,
+        owner: owner_pending,
+        ..
+    } = context;
+    let pending = PendingAnalysisSettlement {
+        root: workspace_root.to_path_buf(),
+        analysis_id: analysis_id.to_string(),
+        prepared,
+        terminal,
+        finished_at: Utc::now(),
+        duration_ms: u64::try_from(timer.elapsed().as_millis()).unwrap_or(u64::MAX),
+        runtime_environment: runtime
+            .map(|runtime| runtime.environment.clone())
+            .unwrap_or_default(),
+        runtime_profile: runtime.map(|runtime| runtime.profile.id.clone()),
+        owner_intent: owner_pending.as_ref().map(|owner| owner.intent.clone()),
+    };
+    if let Some(owner) = owner_pending.as_ref() {
+        *owner
+            .pending_settlement
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(pending.clone());
+    }
+    let result = run_analysis_io(product_data, "settle analysis execution", move || {
+        retry_analysis_settlement(&pending)
     })
-    .await
+    .await;
+    // The original caller may still need to acknowledge the durable intent.
+    // The private slot dies normally on success and is retained only on error.
+    result
 }
 
 async fn run_analysis_io<T, F>(
@@ -1110,22 +1453,36 @@ fn run_status(result: &echo_agent::tools::ToolResult) -> AnalysisRunStatus {
     }
 }
 
-fn terminal_from_react_error(error: &echo_agent::error::ReactError) -> AnalysisTerminal {
-    let failure = echo_agent::error::AgentFailure::from(error);
+fn terminal_from_react_error(
+    error: &echo_agent::error::ReactError,
+) -> AnalysisResult<AnalysisTerminal> {
+    let failure =
+        echo_agent::error::AgentFailure::try_from(error).map_err(
+            |observation| match observation {
+                echo_agent::error::ReactError::ExecutionNotSettled {
+                    run_id,
+                    execution_id,
+                } => AnalysisError::Observation {
+                    run_id,
+                    execution_id,
+                },
+                other => AnalysisError::Execution(other.to_string()),
+            },
+        )?;
     let status = match failure.terminal_kind {
         echo_agent::error::AgentTerminalKind::Cancelled => AnalysisRunStatus::Cancelled,
         echo_agent::error::AgentTerminalKind::TimedOut => AnalysisRunStatus::TimedOut,
         echo_agent::error::AgentTerminalKind::Failed
         | echo_agent::error::AgentTerminalKind::PermissionDenied => AnalysisRunStatus::Failed,
     };
-    AnalysisTerminal {
+    Ok(AnalysisTerminal {
         status,
         exit_code: None,
         sandbox_type: None,
         output: String::new(),
         error: Some(bounded_text(&failure.message, 8_000)),
         output_truncated: false,
-    }
+    })
 }
 
 fn classify_runtime_error(
@@ -1209,6 +1566,286 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> AnalysisResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unknown_analysis_owner_survives_restart_without_clearing_outputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let created =
+            super::create_analysis(root.path(), "owner proof", super::AnalysisLanguage::Python)?;
+        let id = created.manifest.analysis_id;
+        let output = root
+            .path()
+            .join(super::ANALYSIS_ROOT)
+            .join(&id)
+            .join("outputs")
+            .join("sentinel.txt");
+        std::fs::create_dir_all(output.parent().ok_or("output parent missing")?)?;
+        std::fs::write(&output, "中文🙂 unchanged")?;
+        let intent = super::begin_analysis_owner_intent(
+            root.path(),
+            &id,
+            "original-generation".to_string(),
+        )?;
+        // A fresh owner must consult the same file authority before any clear
+        // or new work; no in-memory supervisor record is available here.
+        assert!(
+            matches!(super::begin_analysis_owner_intent(root.path(), &id, "new-generation".to_string()), Err(super::AnalysisError::Observation { run_id, .. }) if run_id == intent.run_id)
+        );
+        assert!(matches!(
+            super::delete_analysis(root.path(), &id),
+            Err(super::AnalysisError::Observation { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(output)?, "中文🙂 unchanged");
+        assert!(
+            super::acknowledge_analysis_owner_intent(root.path(), &intent).is_err(),
+            "no durable terminal receipt may be synthesized for cleanup"
+        );
+        assert!(super::require_analysis_owner_settled(root.path(), &id).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analysis_prepare_rejection_preserves_outputs_and_releases_only_same_unstarted_intent()
+    -> AnalysisResult<()> {
+        let root = tempfile::tempdir()?;
+        let created = create_analysis(root.path(), "prepare rejection", AnalysisLanguage::Python)?;
+        let id = created.manifest.analysis_id;
+        let directory = analysis_dir(root.path(), &id)?;
+        let mut manifest: AnalysisManifest = read_json(&directory.join(MANIFEST_FILE))?;
+        manifest.input_paths = vec!["missing-input.csv".to_string()];
+        write_json(&directory.join(MANIFEST_FILE), &manifest)?;
+        fs::write(directory.join("result.json"), "中文🙂 original")?;
+        let intent =
+            begin_analysis_owner_intent(root.path(), &id, "original-generation".to_string())?;
+        // A missing dataset is valid metadata; make the required script truly
+        // unavailable after admission and before any execution/output clear.
+        let script = directory.join(&manifest.script_path);
+        let saved_script = directory.join("saved-script.py");
+        fs::rename(&script, &saved_script)?;
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let manager = ToolManager::new();
+        manager.register(Box::new(ScriptTool));
+        let result = run_analysis_with_runtime(
+            &manager,
+            root.path(),
+            &id,
+            None,
+            AnalysisExecutionContext {
+                runtime: None,
+                prepare_managed_runtime: false,
+                product_data: None,
+                owner: Some(AnalysisOwnerObservation {
+                    intent: intent.clone(),
+                    execution_started: started.clone(),
+                    pending_settlement: Arc::new(std::sync::Mutex::new(None)),
+                }),
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!started.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            fs::read_to_string(directory.join("result.json"))?,
+            "中文🙂 original"
+        );
+        let mut wrong = intent.clone();
+        wrong.owner_id = "other-owner".to_string();
+        assert!(reject_unstarted_analysis_owner(root.path(), &wrong).is_err());
+        reject_unstarted_analysis_owner(root.path(), &intent)?;
+        fs::rename(&saved_script, &script)?;
+        let retry = begin_analysis_owner_intent(root.path(), &id, "next-generation".to_string())?;
+        assert_ne!(retry.run_id, intent.run_id);
+        reject_unstarted_analysis_owner(root.path(), &retry)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analysis_known_completion_retries_original_intent_cleanup_without_running_tool_again()
+    -> AnalysisResult<()> {
+        let root = tempfile::tempdir()?;
+        let created = create_analysis(root.path(), "known completion", AnalysisLanguage::Python)?;
+        let id = created.manifest.analysis_id;
+        let intent =
+            begin_analysis_owner_intent(root.path(), &id, "original-generation".to_string())?;
+        let manager = ToolManager::new();
+        manager.register(Box::new(ScriptTool));
+        let completed = run_analysis_with_runtime(
+            &manager,
+            root.path(),
+            &id,
+            None,
+            AnalysisExecutionContext {
+                runtime: None,
+                prepare_managed_runtime: false,
+                product_data: None,
+                owner: Some(AnalysisOwnerObservation {
+                    intent: intent.clone(),
+                    execution_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    pending_settlement: Arc::new(std::sync::Mutex::new(None)),
+                }),
+            },
+        )
+        .await?;
+        assert_eq!(
+            completed
+                .last_run
+                .as_ref()
+                .map(|record| record.run_id.as_str()),
+            Some(intent.run_id.as_str())
+        );
+        let directory = analysis_dir(root.path(), &id)?;
+        let path = directory.join(OWNER_INTENT_FILE);
+        let saved = directory.join("owner-intent-saved.json");
+        fs::rename(&path, &saved)?;
+        fs::create_dir(&path)?;
+        assert!(acknowledge_analysis_owner_intent(root.path(), &intent).is_err());
+        let record_before = fs::read(
+            directory
+                .join(RUNS_DIR)
+                .join(format!("{}.json", intent.run_id)),
+        )?;
+        fs::remove_dir(&path)?;
+        fs::rename(&saved, &path)?;
+        require_analysis_owner_settled(root.path(), &id)?;
+        require_analysis_owner_settled(root.path(), &id)?;
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read(
+                directory
+                    .join(RUNS_DIR)
+                    .join(format!("{}.json", intent.run_id))
+            )?,
+            record_before
+        );
+        assert_eq!(
+            load_analysis(root.path(), &id)?
+                .last_run
+                .as_ref()
+                .map(|record| record.run_id.as_str()),
+            Some(intent.run_id.as_str())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_analysis_retries_archive_runs_and_latest_writes_without_reexecuting()
+    -> AnalysisResult<()> {
+        for phase in ["archive", "run-record", "latest-record"] {
+            let root = tempfile::tempdir()?;
+            let created = create_analysis(root.path(), phase, AnalysisLanguage::Python)?;
+            let id = created.manifest.analysis_id;
+            let directory = analysis_dir(root.path(), &id)?;
+            let intent =
+                begin_analysis_owner_intent(root.path(), &id, "original-generation".to_string())?;
+            fs::create_dir_all(directory.join(RUNS_DIR))?;
+            let blocked = match phase {
+                "archive" => directory.join(RUNS_DIR).join(&intent.run_id),
+                "run-record" => directory
+                    .join(RUNS_DIR)
+                    .join(format!("{}.json", intent.run_id)),
+                _ => directory.join(LATEST_RUN_FILE),
+            };
+            if phase == "archive" {
+                fs::write(&blocked, "block archive directory")?;
+            } else {
+                fs::create_dir(&blocked)?;
+            }
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let manager = ToolManager::new();
+            manager.register(Box::new(CountedScriptTool(calls.clone())));
+            let pending = Arc::new(std::sync::Mutex::new(None));
+            let result = run_analysis_with_runtime(
+                &manager,
+                root.path(),
+                &id,
+                None,
+                AnalysisExecutionContext {
+                    runtime: None,
+                    prepare_managed_runtime: false,
+                    product_data: None,
+                    owner: Some(AnalysisOwnerObservation {
+                        intent: intent.clone(),
+                        execution_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        pending_settlement: pending.clone(),
+                    }),
+                },
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "{phase} fault did not reject its durable write"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(directory.join(OWNER_INTENT_FILE).is_file());
+            let retained = pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .ok_or_else(|| {
+                    AnalysisError::Execution("original terminal write evidence missing".to_string())
+                })?;
+            if phase == "archive" {
+                fs::remove_file(&blocked)?;
+            } else {
+                fs::remove_dir(&blocked)?;
+            }
+            if phase == "latest-record" {
+                let original_output = fs::read(directory.join("result.json"))?;
+                let mut replacement = intent.clone();
+                replacement.owner_id = "replacement-owner".to_string();
+                write_json(&directory.join(OWNER_INTENT_FILE), &replacement)?;
+                fs::write(
+                    directory.join(LATEST_RUN_FILE),
+                    "replacement latest sentinel",
+                )?;
+                fs::write(directory.join("result.json"), "replacement output sentinel")?;
+                assert!(matches!(
+                    retry_analysis_settlement(&retained),
+                    Err(AnalysisError::Conflict)
+                ));
+                assert_eq!(
+                    fs::read_to_string(directory.join(LATEST_RUN_FILE))?,
+                    "replacement latest sentinel"
+                );
+                assert_eq!(
+                    fs::read_to_string(directory.join("result.json"))?,
+                    "replacement output sentinel"
+                );
+                write_json(&directory.join(OWNER_INTENT_FILE), &intent)?;
+                fs::remove_file(directory.join(LATEST_RUN_FILE))?;
+                fs::write(directory.join("result.json"), original_output)?;
+            }
+            let completed = retry_analysis_settlement(&retained)?;
+            acknowledge_analysis_owner_intent(root.path(), &intent)?;
+            assert_eq!(
+                completed.last_run.as_ref().map(|run| run.run_id.as_str()),
+                Some(intent.run_id.as_str())
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(!directory.join(OWNER_INTENT_FILE).exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn analysis_terminal_classification_refuses_nonterminal_observation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let error = echo_agent::error::ReactError::ExecutionNotSettled {
+            run_id: "original-run".to_string(),
+            execution_id: Some("original-execution".to_string()),
+        };
+        assert!(
+            matches!(super::terminal_from_react_error(&error), Err(super::AnalysisError::Observation { run_id, execution_id }) if run_id == "original-run" && execution_id.as_deref() == Some("original-execution"))
+        );
+        assert!(
+            super::terminal_from_react_error(&echo_agent::error::ReactError::Other(
+                "ordinary failure".to_string()
+            ))
+            .is_ok()
+        );
+        Ok(())
+    }
+
     use super::*;
     use echo_agent::error::Result as AgentResult;
     use echo_agent::tools::{Tool, ToolResult};
@@ -1222,6 +1859,27 @@ mod tests {
 
     struct ProfileScriptTool {
         seen_profile: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    struct CountedScriptTool(Arc<std::sync::atomic::AtomicUsize>);
+    impl Tool for CountedScriptTool {
+        fn name(&self) -> &str {
+            "run_code"
+        }
+        fn description(&self) -> &str {
+            "count original analysis execution"
+        }
+        fn parameters(&self) -> Value {
+            ScriptTool.parameters()
+        }
+        fn execute_with_context<'a>(
+            &'a self,
+            parameters: ToolParameters,
+            context: &'a ToolContext,
+        ) -> BoxFuture<'a, AgentResult<ToolResult>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ScriptTool.execute_with_context(parameters, context)
+        }
     }
 
     impl Tool for ScriptTool {
@@ -1594,9 +2252,12 @@ mod tests {
             workspace.path(),
             &created.manifest.analysis_id,
             Some(cancel),
-            None,
-            true,
-            None,
+            AnalysisExecutionContext {
+                runtime: None,
+                prepare_managed_runtime: true,
+                product_data: None,
+                owner: None,
+            },
         )
         .await?;
         let run = completed
@@ -1642,9 +2303,12 @@ mod tests {
             workspace.path(),
             &created.manifest.analysis_id,
             None,
-            Some(&prepared),
-            false,
-            None,
+            AnalysisExecutionContext {
+                runtime: Some(&prepared),
+                prepare_managed_runtime: false,
+                product_data: None,
+                owner: None,
+            },
         )
         .await?;
         let run = completed

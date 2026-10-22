@@ -22,6 +22,8 @@ pub struct TaskRuntimeStore {
     /// Accepted TaskRun driver tasks. The store is the existing runtime owner,
     /// so dropping an individual surface waiter never drops the actual driver.
     run_driver_supervisor: std::sync::Mutex<RunDriverSupervisor>,
+    lifecycle_retention:
+        std::sync::RwLock<std::sync::Weak<crate::runtime::ApplicationLifecycleRetention>>,
     /// Wakes the store-owned shutdown settlement after the last pre-shutdown
     /// driver admission reservation either registers a driver or is released.
     run_driver_admission_idle: tokio::sync::Notify,
@@ -94,7 +96,9 @@ struct ShadowOperation<'a> {
 /// Rebinding returns Busy until every lease from the previous generation drops.
 #[must_use]
 pub(crate) struct WorkspaceGenerationLease {
-    store: std::sync::Arc<TaskRuntimeStore>,
+    // The application/real producer owns Store; its own registry must not
+    // retain Store again through a generation counter's backedge.
+    store: std::sync::Weak<TaskRuntimeStore>,
 }
 
 /// Opaque application receipt used by foreground surfaces to establish the
@@ -116,8 +120,10 @@ struct RunDriverSupervisor {
     driver_contexts: std::collections::HashMap<String, RunDriverExecutionContext>,
     driver_settlements: tokio::task::JoinSet<(u64, Result<(), String>)>,
     settlement_debts: Vec<RunSettlementDebt>,
+    uncertain_drivers: std::collections::BTreeMap<u64, RetainedUncertainDriver>,
+    tool_receipts: std::collections::BTreeMap<String, RetainedToolReceipt>,
     next_driver_token: u64,
-    execution_receipts: std::collections::HashMap<u64, Vec<Box<dyn RunDriverExecutionReceipt>>>,
+    execution_receipts: std::collections::HashMap<u64, std::sync::Weak<RunDriverResources>>,
     shutdown_result_sender:
         Option<tokio::sync::watch::Sender<Option<Result<(), TaskRunDriverShutdownError>>>>,
     shutdown_result:
@@ -158,7 +164,9 @@ struct RunDriverRegistrationTestBarrier {
 
 /// Durable TaskRun terminal state that could not be written during the final
 /// shutdown retry. The on-disk run remains authoritative; this diagnostic
-/// records the uncommitted target and why execution resources were abandoned.
+/// records the uncommitted target and error. Despite its historical name,
+/// admitted execution resources remain retained until original-owner settlement;
+/// only resources proven never started may be released on shutdown failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbandonedRunSettlement {
     pub run_id: String,
@@ -226,24 +234,211 @@ fn add_shutdown_driver_error(
 /// One execution resource retained by the canonical TaskRun driver until its
 /// durable terminal state (or settlement debt) has completed.
 pub trait RunDriverExecutionReceipt: Send {
+    /// Project uncertainty into the same receipt's existing admission. This
+    /// does not settle, drop or transfer its underlying physical ownership.
+    fn observe_unsettled(&self, _run_id: &str, _execution_id: Option<&str>) {}
     /// Release the resource after later-acquired receipts have settled.
     fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()>;
+}
+
+type RunDriverResource =
+    std::sync::Arc<std::sync::Mutex<Option<Box<dyn RunDriverExecutionReceipt>>>>;
+
+#[derive(Default)]
+struct RunDriverResourceState {
+    receipts: Vec<RunDriverResource>,
+    observation: Option<(String, Option<String>)>,
+    released: bool,
+}
+
+/// Resource projection of the original supervisor. The application root and
+/// real producer own this Arc; Store keeps only a Weak index into the same
+/// bundle, breaking receipt -> Pool/Agent/Tool -> Store -> receipt cycles.
+#[derive(Default)]
+pub(crate) struct RunDriverResources {
+    state: std::sync::Mutex<RunDriverResourceState>,
+}
+
+impl RunDriverResources {
+    fn retain<Receipt: RunDriverExecutionReceipt + 'static>(
+        &self,
+        receipt: Receipt,
+    ) -> Result<(), Receipt> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.released {
+            return Err(receipt);
+        }
+        let receipt: RunDriverResource =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(receipt))));
+        state.receipts.push(receipt.clone());
+        let observation = state.observation.clone();
+        drop(state);
+        if let Some((run, execution)) = observation {
+            Self::observe_receipt(&receipt, &run, execution.as_deref());
+        }
+        Ok(())
+    }
+
+    fn observe_receipt(receipt: &RunDriverResource, run: &str, execution: Option<&str>) {
+        let receipt = receipt.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(receipt) = receipt.as_ref() {
+            receipt.observe_unsettled(run, execution);
+        }
+    }
+
+    pub(crate) fn observe_unsettled(&self, run: &str, execution: Option<&str>) {
+        let receipts = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.observation = Some((run.to_string(), execution.map(str::to_string)));
+            state.receipts.clone()
+        };
+        // No supervisor or bundle-state monitor is held during receipt code.
+        for receipt in receipts {
+            Self::observe_receipt(&receipt, run, execution);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .receipts
+            .len()
+    }
+
+    pub(crate) fn is_released(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .released
+    }
+
+    async fn release(&self) {
+        let receipts = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.released = true;
+            std::mem::take(&mut state.receipts)
+        };
+        for receipt in receipts.into_iter().rev() {
+            let receipt = receipt
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some(receipt) = receipt {
+                receipt.release().await;
+            }
+        }
+    }
 }
 
 /// Capability handed only to an accepted TaskRun driver. Pool-backed adapters
 /// transfer their execution receipt here immediately after acquisition so it
 /// survives inner future errors and panics until durable run settlement.
 pub struct RunDriverReceiptOwner {
-    store: std::sync::Arc<TaskRuntimeStore>,
-    driver_token: u64,
+    resources: std::sync::Arc<RunDriverResources>,
     execution_context_id: String,
+    run_id: String,
 }
 
-type BoxRunDriverFuture<T> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send + 'static>>;
+/// Internal observer error; normal callers still use their original String
+/// result. The typed branch must reach the sole supervisor before projection.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum RunDriverFailure {
+    #[error("{0}")]
+    Error(String),
+    #[error("execution for run {run_id} is not physically settled")]
+    Observation {
+        run_id: String,
+        execution_id: Option<String>,
+    },
+}
 
-enum RunDriverStart<T> {
-    Execute(BoxRunDriverFuture<T>),
+impl From<&str> for RunDriverFailure {
+    fn from(value: &str) -> Self {
+        Self::Error(value.to_string())
+    }
+}
+impl From<String> for RunDriverFailure {
+    fn from(value: String) -> Self {
+        Self::Error(value)
+    }
+}
+impl From<StoreError> for RunDriverFailure {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::RecoveryBlocked { run_id, .. } => Self::Observation {
+                run_id,
+                execution_id: None,
+            },
+            other => Self::Error(other.to_string()),
+        }
+    }
+}
+impl From<echo_agent::error::ReactError> for RunDriverFailure {
+    fn from(error: echo_agent::error::ReactError) -> Self {
+        match error {
+            echo_agent::error::ReactError::ExecutionNotSettled {
+                run_id,
+                execution_id,
+            } => Self::Observation {
+                run_id,
+                execution_id,
+            },
+            other => Self::Error(other.to_string()),
+        }
+    }
+}
+impl RunDriverFailure {
+    pub fn is_observation(&self) -> bool {
+        matches!(self, Self::Observation { .. })
+    }
+    /// Preserve the nonterminal identity when a surface returns to framework
+    /// streaming APIs; string conversion is only for final presentation.
+    pub fn into_react_error(self) -> echo_agent::error::ReactError {
+        match self {
+            Self::Observation {
+                run_id,
+                execution_id,
+            } => echo_agent::error::ReactError::ExecutionNotSettled {
+                run_id,
+                execution_id,
+            },
+            Self::Error(message) => echo_agent::error::ReactError::Other(message),
+        }
+    }
+}
+
+pub(crate) trait RunDriverFailureKind:
+    Clone + From<String> + std::fmt::Display + Send + 'static
+{
+    fn is_observation(&self) -> bool;
+    fn owner_unsettled(run_id: String, execution_id: Option<String>, detail: String) -> Self;
+}
+impl RunDriverFailureKind for String {
+    fn owner_unsettled(run_id: String, execution_id: Option<String>, detail: String) -> Self {
+        format!("execution for run {run_id} ({execution_id:?}) is not physically settled: {detail}")
+    }
+    fn is_observation(&self) -> bool {
+        false
+    }
+}
+impl RunDriverFailureKind for RunDriverFailure {
+    fn owner_unsettled(run_id: String, execution_id: Option<String>, _detail: String) -> Self {
+        Self::Observation {
+            run_id,
+            execution_id,
+        }
+    }
+    fn is_observation(&self) -> bool {
+        matches!(self, Self::Observation { .. })
+    }
+}
+
+type BoxRunDriverFuture<T, E> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, E>> + Send + 'static>>;
+
+enum RunDriverStart<T, E> {
+    Execute(BoxRunDriverFuture<T, E>),
     PreparationFailed(String),
     Reject(String),
 }
@@ -252,9 +447,9 @@ enum RunDriverStart<T> {
 /// Dropping an unstarted registration wakes the canonical owner as a rejected
 /// preparation, so shutdown never waits forever for an accepted slot.
 #[must_use]
-pub(crate) struct RegisteredRunDriver<T: Send + 'static> {
-    start_sender: Option<tokio::sync::oneshot::Sender<RunDriverStart<T>>>,
-    result_receiver: Option<tokio::sync::oneshot::Receiver<Result<T, String>>>,
+pub(crate) struct RegisteredRunDriver<T: Send + 'static, E: RunDriverFailureKind = String> {
+    start_sender: Option<tokio::sync::oneshot::Sender<RunDriverStart<T, E>>>,
+    result_receiver: Option<tokio::sync::oneshot::Receiver<Result<T, E>>>,
     receipt_owner: Option<RunDriverReceiptOwner>,
     preparation_started: bool,
     active: bool,
@@ -277,18 +472,18 @@ impl RunDriverReceiptOwner {
     /// Retain one driver resource. Factories passed to `spawn_run_driver` must
     /// call this from the returned future, not while constructing that future,
     /// because driver admission is serialized by the supervisor lock.
-    pub fn retain<Receipt>(&mut self, receipt: Receipt)
+    pub fn retain<Receipt>(&mut self, receipt: Receipt) -> Result<(), RunDriverFailure>
     where
         Receipt: RunDriverExecutionReceipt + 'static,
     {
-        self.store
-            .run_driver_supervisor
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .execution_receipts
-            .entry(self.driver_token)
-            .or_default()
-            .push(Box::new(receipt));
+        // This unique capability lives only inside the original producer;
+        // physical release cannot precede that producer's returned result.
+        self.resources
+            .retain(receipt)
+            .map_err(|_| RunDriverFailure::Observation {
+                run_id: self.run_id.clone(),
+                execution_id: None,
+            })
     }
 
     /// Opaque value-carried identity for framework-spawned tool execution.
@@ -298,7 +493,7 @@ impl RunDriverReceiptOwner {
     }
 }
 
-impl<T: Send + 'static> RegisteredRunDriver<T> {
+impl<T: Send + 'static, E: RunDriverFailureKind> RegisteredRunDriver<T, E> {
     pub(crate) fn mark_preparation_started(&mut self) {
         self.preparation_started = true;
     }
@@ -306,9 +501,9 @@ impl<T: Send + 'static> RegisteredRunDriver<T> {
     pub(crate) fn start<F, Factory>(
         mut self,
         factory: Factory,
-    ) -> tokio::sync::oneshot::Receiver<Result<T, String>>
+    ) -> tokio::sync::oneshot::Receiver<Result<T, E>>
     where
-        F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+        F: std::future::Future<Output = Result<T, E>> + Send + 'static,
         Factory: FnOnce(RunDriverReceiptOwner) -> F,
     {
         let receiver = self.result_receiver.take().unwrap_or_else(|| {
@@ -341,7 +536,7 @@ impl<T: Send + 'static> RegisteredRunDriver<T> {
     }
 }
 
-impl<T: Send + 'static> Drop for RegisteredRunDriver<T> {
+impl<T: Send + 'static, E: RunDriverFailureKind> Drop for RegisteredRunDriver<T, E> {
     fn drop(&mut self) {
         if !self.active {
             return;
@@ -379,7 +574,25 @@ impl Drop for RunDriverAdmissionReservation {
     }
 }
 
+struct RetainedToolReceipt {
+    intent: PhysicalOwnerIntent,
+    _generation_lease: WorkspaceGenerationLease,
+    resources: std::sync::Weak<RunDriverResources>,
+    physical_terminal_observed: bool,
+}
+
+struct RetainedUncertainDriver {
+    _generation_lease: WorkspaceGenerationLease,
+    _cancellation_registration: RunCancellationRegistration,
+    intent: PhysicalOwnerIntent,
+    observation: String,
+    physical_terminal_observed: bool,
+    pending_terminal: Option<TaskRunStatus>,
+}
+
 struct RunSettlementDebt {
+    // The original admitted driver identity, not a filesystem absence guess.
+    physical_owner_intent: Option<PhysicalOwnerIntent>,
     generation_lease: WorkspaceGenerationLease,
     driver_token: Option<u64>,
     run_id: String,
@@ -398,6 +611,8 @@ impl Default for RunDriverSupervisor {
             driver_contexts: std::collections::HashMap::new(),
             driver_settlements: tokio::task::JoinSet::new(),
             settlement_debts: Vec::new(),
+            uncertain_drivers: std::collections::BTreeMap::new(),
+            tool_receipts: std::collections::BTreeMap::new(),
             next_driver_token: 0,
             execution_receipts: std::collections::HashMap::new(),
             shutdown_result_sender: None,
@@ -507,8 +722,10 @@ impl Drop for ShadowOperation<'_> {
 
 impl Drop for WorkspaceGenerationLease {
     fn drop(&mut self) {
-        let mut generation = self
-            .store
+        let Some(store) = self.store.upgrade() else {
+            return;
+        };
+        let mut generation = store
             .shadow_generation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -519,7 +736,7 @@ impl Drop for WorkspaceGenerationLease {
 /// RAII registration for one active TaskRun driver. Each guard removes only
 /// its own token, so overlapping drivers can finish in either order.
 pub struct RunCancellationRegistration {
-    store: std::sync::Arc<TaskRuntimeStore>,
+    store: std::sync::Weak<TaskRuntimeStore>,
     run_id: String,
     registration_id: u64,
 }
@@ -650,6 +867,8 @@ fn runtime_execution_change_event(
             "status": status,
             "status_detail": status_detail,
             "claim": after.execution.claim,
+            // Store the canonical execution as one lossless internal fact.
+            "execution": &after.execution,
             "execution_id": after
                 .execution
                 .claim
@@ -729,7 +948,10 @@ enum RunTurnClaimPreparation {
 
 impl Drop for RunCancellationRegistration {
     fn drop(&mut self) {
-        if let Ok(mut map) = self.store.run_cancel_tokens.lock() {
+        let Some(store) = self.store.upgrade() else {
+            return;
+        };
+        if let Ok(mut map) = store.run_cancel_tokens.lock() {
             let remove_run = if let Some(tokens) = map.get_mut(&self.run_id) {
                 tokens.retain(|(registration_id, _)| registration_id != &self.registration_id);
                 tokens.is_empty()
@@ -740,6 +962,6 @@ impl Drop for RunCancellationRegistration {
                 map.remove(&self.run_id);
             }
         }
-        self.store.run_driver_idle.notify_waiters();
+        store.run_driver_idle.notify_waiters();
     }
 }

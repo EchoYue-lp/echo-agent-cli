@@ -252,7 +252,11 @@ pub fn build_fix_task(original: &PlanTask, review: &ReviewResult) -> PlanTask {
         // Keep the SAME id so downstream depends_on keeps pointing at it; the
         // retry_count bump tracks how many times this node has been retried.
         id: original.id.clone(),
-        title: format!("{} (fix #{})", original.title, original.retry_count + 1),
+        title: format!(
+            "{} (fix #{})",
+            original.title,
+            original.retry_count.saturating_add(1)
+        ),
         description: format!(
             "Previous attempt failed review. Address each issue:\n{issue_brief}\n\n\
              Original task: {}",
@@ -269,11 +273,13 @@ pub fn build_fix_task(original: &PlanTask, review: &ReviewResult) -> PlanTask {
         required_artifacts: original.required_artifacts.clone(),
         execution_checks: original.execution_checks.clone(),
         acceptance_criteria: original.acceptance_criteria.clone(),
-        retry_count: original.retry_count + 1,
+        retry_count: original.retry_count.saturating_add(1),
         max_retries: original.max_retries,
         failure_fingerprint: review.failure_fingerprint.clone(),
         status: echo_agent::tasks::TaskStatus::Pending,
         claim: None,
+        result: None,
+        interruption_requested: None,
         sort_order: original.sort_order,
     }
 }

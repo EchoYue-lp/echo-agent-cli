@@ -61,6 +61,7 @@ by framework ADR 0021 and EKO ADR 0027.
 
 ## Consequences
 
+- Configured primary, writer and read-only Subagent construction passes the exact already prepared client and its original `LlmConfig` through the framework full builder `configured_llm_client(client, original_config)`. It does not rebuild the transport or reinstall a known pair through the opaque custom-client setter after build. Config-only and config-less opaque-client paths keep their existing behavior. EKO keeps the original resolver, critic sharing, inherited-generation publication, settings and registry paths; the framework remains the only profile/install authority.
 - Agent configuration crosses the application/framework boundary without a
   conversion adapter.
 - Model selection, provider credentials, and runtime validation have one

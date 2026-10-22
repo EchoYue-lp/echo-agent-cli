@@ -15,6 +15,19 @@ Task、Plan 和 Todo 曾有相互重叠的状态写入路径，导致 UI 投影�
 由 framework/runtime authority 驱动，`PlanRevision` 是可编辑 artifact，`TodoItem` 只是只读
 查询投影。EKO 只提供 `task_execute`、文件事实、review/worktree 和 surface policy。
 
+### 物理结算与无损执行事实
+
+framework 的 exact-claim interruption request 先持久化，再信号通知原 cancellation token。
+请求已提交不等于 claim 已结算，也不能发布 TaskRun 终态；最终使用 framework CAS 回执中的
+实际状态，包括胜过迟到 dispatch 结果的更强 interruption。
+
+内部 spec/execution join 与可丢弃 checkpoint 保留完整 canonical `TaskExecution`，包括缺失
+结果与显式 JSON null 的差异以及 `interruption_requested`。graph commit 和 execution event
+通过同一 journal 无损保留这些事实；旧 query checkpoint 必须从 journal 重放。`TaskSpec`、
+`TodoItem` IPC 不变。原 physical owner intent 尚未结算时，boot recovery 与重复执行均被拒绝，
+不把未知观察转换成新的 Task 状态。
+
+
 ## 影响
 
 没有独立 Todo store、plan executor 或 parallel CRUD。计划批准由 artifact、prompt 和 policy
@@ -22,3 +35,8 @@ Task、Plan 和 Todo 曾有相互重叠的状态写入路径，导致 UI 投影�
 
 `RunStateSnapshot.tasks` 直接保存 framework `TaskExecution`，不再定义 EKO 镜像类型；`PlanTask`
 只在读取 plan specification 和 execution projection 时临时组合，`TodoItem` 仍是单向 UI 投影。
+
+启动恢复将合法未结算 physical-owner intent 视为该精确 run 的待观察事实：在原 run 锁内保留 run、command cell 及待处理 Subagent 控制事实，继续恢复其它无关历史 run；畸形 intent 和真实存储错误仍报错。批次恢复和单 run 准入共用原证据读取与精确物理确认路径，不允许重放或合成终态收据。 continuation 消费既有 run 的 domain、route、attended mode、Goal 与 execution profile，内部续接指令不是新用户目标；实际 active workspace 与调用方 conversation/root 仍经原不可变身份校验，错配继续拒绝，RunStarted 投影使用返回的原 goal/route。
+
+
+Continuation 的既有进展判定及 fingerprint 仅排除 RecoveryBlocked/RecoveryResolved 中的私有 physical_owner_intent 元数据，真实业务恢复及任务事件仍算进展。原 explicit-resume 的 Goal/revision 和无进展上限保持。canonical BEFORE 证据排除了“未确认 owner fence 被清后重放”的假设：每个原 owner 都在下一轮前完成并获确认；实际缺陷是元数据重置了业务进展预算。原 canonical journal 仍是唯一权威。

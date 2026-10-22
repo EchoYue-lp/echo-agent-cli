@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.background-review-entry-repair
 kind: evidence
-observed_at: source:2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3
+observed_at: f57b90a2b0962fa5561f8839a3df70be1f261ffa
 source_refs: [src/tauri/desktop.rs, echo-agent-app-core/src/runtime.rs, echo-agent-app-core/src/workspace/runtime.rs, echo-agent-app-core/src/agent_pool/pool.rs, echo-agent-app-core/src/evolution/review_integration.rs, echo-agent-app-core/src/evolution/background_review_owner.rs, echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/state/tests.rs, docs/en/adr/0043-background-review-owner.md, docs/zh/adr/0043-background-review-owner.md]
 supports: [finding.background-review-entry-settlement, behavior.background-review-caller-owned-settlement, rule.eko-framework-consumer-authorities]
 limitations:
@@ -54,3 +54,5 @@ record until remote CI and delivery finish.
 Earlier post-fork primary/rule initialization errors still return directly; their
 complete cleanup is an existing, unproven coverage limit, not a verified property
 of this repair.
+
+历史观察归属：原 `source:2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3` 经官方源码摘要函数与 Git `f57b90a2b0962fa5561f8839a3df70be1f261ffa` 精确对应；本次只恢复同一历史切点的可恢复版本锚，不代表当前源码重验。原 source_refs、锚点、roles 与状态保持。

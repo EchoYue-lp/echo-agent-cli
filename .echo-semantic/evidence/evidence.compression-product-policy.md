@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.compression-product-policy
 kind: evidence
-observed_at: source:2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3
+observed_at: f57b90a2b0962fa5561f8839a3df70be1f261ffa
 source_refs: [echo-agent-app-core/src/config.rs, echo-agent-app-core/src/manual_compression.rs, echo-agent-app-core/src/tasks/task_runtime/compact_context.rs, src/cli/cmd_impls/context.rs, src/cli/channels.rs, src/tui/commands.rs, src/tui/events.rs, src/tauri/commands/panels.rs, web-frontend/src/api/endpoints.ts, web-frontend/src/types/api.ts, web-frontend/src/components/compress/CompressPanel.tsx, config/eko.example.yaml, docs/zh/configuration.md, docs/en/configuration.md, docs/zh/features.md, docs/en/features.md, docs/zh/architecture/persistence.md, docs/en/architecture/persistence.md, docs/zh/adr/0048-context-compression-product-policy.md, docs/en/adr/0048-context-compression-product-policy.md]
 supports: [asset.eko-conversation-authorities, rule.eko-framework-consumer-authorities]
 limitations: [Local candidate is not merged; depends on framework compression branch; native UI and external provider acceptance are not established]
@@ -47,3 +47,5 @@ The failed environmental attempt is retained, not treated as a passing GUI gate.
 ## 已知缺口
 
 Framework and application branches are local candidates; native UI and real provider acceptance are not established.
+
+历史观察归属：原 `source:2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3` 经官方源码摘要函数与 Git `f57b90a2b0962fa5561f8839a3df70be1f261ffa` 精确对应；本次只恢复同一历史切点的可恢复版本锚，不代表当前源码重验。原 source_refs、锚点、roles 与状态保持。

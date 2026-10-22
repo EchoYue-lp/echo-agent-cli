@@ -5,15 +5,15 @@ kind: audit
 boundary_ref: boundary.eko-framework-consumer-settlement
 lens: time_lifecycle
 freshness: examined
-revision: source:2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3
+revision: f57b90a2b0962fa5561f8839a3df70be1f261ffa
 finding_refs: [finding.background-review-entry-settlement]
 challenges:
   entry-shutdown-and-recovery:
-    revision: source:2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3
+    revision: f57b90a2b0962fa5561f8839a3df70be1f261ffa
     source_refs: [src/tauri/desktop.rs, echo-agent-app-core/src/runtime.rs, echo-agent-app-core/src/workspace/runtime.rs, echo-agent-app-core/src/state/app_state.rs, echo-agent-app-core/src/state/tests.rs]
     evidence_refs: [evidence.background-review-entry-repair, evidence.background-review-entry-verification]
   persistence-attribution-and-projection:
-    revision: source:2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3
+    revision: f57b90a2b0962fa5561f8839a3df70be1f261ffa
     source_refs: [echo-agent-app-core/src/evolution/background_review_owner.rs, echo-agent-app-core/src/evolution/review_integration.rs, echo-agent-app-core/src/agent_pool/pool.rs, echo-agent-app-core/src/unified_memory.rs]
     evidence_refs: [evidence.background-review-entry-repair, evidence.background-review-entry-verification]
 ---
@@ -72,3 +72,5 @@ All applicable local gates passed after the frozen-source review; remote CI and
 mainline delivery remain pending. Native OS window
 interaction, forced process death, Tauri restart/setup panic and real-provider
 execution were not exercised.
+
+历史观察归属：原 `source:2b2aadbb89e3fb339505cc4e42f53c0466f982f1310e5fc1c30720acaefa33c3` 经官方源码摘要函数与 Git `f57b90a2b0962fa5561f8839a3df70be1f261ffa` 精确对应；本次只恢复同一历史切点的可恢复版本锚，不代表当前源码重验。原 source_refs、锚点、roles 与状态保持。

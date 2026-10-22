@@ -4,8 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use echo_agent::agent::Agent;
-use echo_agent::llm::types::Message;
+use echo_agent::llm::types::Role;
 use echo_agent::memory::{
     ConversationProjectionAuthority, ConversationProjectionLifecycle, ConversationStore,
     EnsureConversationProjectionRequest, ManagedConversationImport,
@@ -108,6 +107,7 @@ fn validate_import_history(conversation_id: &str, messages: &[StoredMessage]) ->
                 next_ordinal: u64::try_from(projected.len())
                     .context("import cursor capacity exhausted")?,
                 projected,
+                context_only: None,
             }),
         )?,
         current_plan: None,
@@ -231,12 +231,8 @@ async fn checkpoint_import(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut messages = restore_messages(&import.messages)?;
+    let messages = restore_messages(&import.messages)?;
     let message_count = messages.len();
-    let system_prompt = agent.read(|agent| agent.system_prompt().to_string()).await;
-    if !system_prompt.is_empty() {
-        messages.insert(0, Message::system(system_prompt));
-    }
     let previous = state_before.and_then(|state| state.checkpoint);
     let checkpoint = AgentCheckpoint {
         conversation_id: conversation_id.clone(),
@@ -246,6 +242,7 @@ async fn checkpoint_import(
                 generation_id: conversation_id.clone(),
                 next_ordinal,
                 projected,
+                context_only: None,
             }),
         )?,
         current_plan: None,
@@ -373,7 +370,11 @@ pub async fn resume_or_import(
             .read_async(|agent| Box::pin(async move { agent.resume_from_state_store().await }))
             .await?;
         let checkpoint = restored.context("managed runtime checkpoint disappeared")?;
-        return Ok(checkpoint.restore_messages()?.len().saturating_sub(1));
+        return Ok(checkpoint
+            .restore_messages()?
+            .into_iter()
+            .filter(|message| message.role != Role::System)
+            .count());
     }
     let rows = canonical_rows(conversation_id, &stored);
     let scope_epoch = state_before
@@ -453,6 +454,7 @@ mod tests {
     use std::sync::Arc;
 
     use echo_agent::agent::ReactAgentBuilder;
+    use echo_agent::llm::types::Message;
     use echo_agent::memory::{ConversationStore, FileConversationStore};
     use echo_agent::state::{FileRuntimeStateStore, RuntimeStateStore};
 

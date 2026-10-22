@@ -404,6 +404,8 @@ mod tests {
             failure_fingerprint: None,
             status: echo_agent::tasks::TaskStatus::Pending,
             claim: None,
+            result: None,
+            interruption_requested: None,
             sort_order: 0,
         }
     }

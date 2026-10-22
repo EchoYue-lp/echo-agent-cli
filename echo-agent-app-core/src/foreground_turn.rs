@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex};
 use echo_agent::agent::{AgentEvent, AgentHandle, CancellationToken};
 use tokio::sync::watch;
 
-use crate::chat_driver::{ChatDriverEvent, ChatSink, TurnOutcome, drive_chat, drive_chat_turn};
+use crate::chat_driver::{
+    ChatDriverEvent, ChatSink, ChatTurnError, TurnOutcome, drive_chat, drive_chat_turn,
+};
 use crate::chat_resources::ChatResources;
 use crate::prepared_turn::PreparedUserTurn;
 
@@ -134,6 +136,25 @@ pub enum ForegroundTurnError {
     LeaseOwnerMismatch,
     #[error("foreground driver settlement failed: {0}")]
     DriverSettlement(String),
+    #[error("execution for run {run_id} is not physically settled")]
+    Observation {
+        run_id: String,
+        execution_id: Option<String>,
+    },
+}
+
+enum ForegroundRetainedResource {
+    Ordinary(Box<dyn Send>),
+    Execution(Arc<Mutex<Box<dyn crate::tasks::task_runtime::store::RunDriverExecutionReceipt>>>),
+}
+
+impl ForegroundRetainedResource {
+    fn release(self) {
+        match self {
+            Self::Ordinary(receipt) => drop(receipt),
+            Self::Execution(receipt) => drop(receipt),
+        }
+    }
 }
 
 struct ActiveForegroundTurn {
@@ -144,6 +165,10 @@ struct ActiveForegroundTurn {
     cancel: CancellationToken,
     settlement_tx: watch::Sender<Option<ForegroundTurnSettlement>>,
     terminal_debt_tx: watch::Sender<Option<ForegroundTerminalDebt>>,
+    observation_tx: watch::Sender<Option<ChatTurnError>>,
+    retained_resources: Mutex<Vec<ForegroundRetainedResource>>,
+    driver_started: AtomicBool,
+    physical_result_observed: AtomicBool,
     settlement_owner_started: AtomicBool,
     input_observers: Mutex<ForegroundInputObservers>,
 }
@@ -181,6 +206,43 @@ impl Default for ForegroundInputObservers {
 }
 
 impl ActiveForegroundTurn {
+    fn retain_observation(&self, error: ChatTurnError) {
+        let hooks = {
+            let resources = self
+                .retained_resources
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.observation_tx.send_replace(Some(error.clone()));
+            resources
+                .iter()
+                .filter_map(|receipt| match receipt {
+                    ForegroundRetainedResource::Execution(receipt) => Some(receipt.clone()),
+                    ForegroundRetainedResource::Ordinary(_) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (run, execution) = match &error {
+            ChatTurnError::Observation {
+                run_id,
+                execution_id,
+            } => (run_id.clone(), execution_id.clone()),
+            _ => (
+                self.active_run_id
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone()
+                    .unwrap_or_else(|| self.root_turn_id.clone()),
+                None,
+            ),
+        };
+        // Exact original lease hooks, outside the foreground resource monitor.
+        for hook in hooks {
+            hook.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .observe_unsettled(&run, execution.as_deref());
+        }
+    }
+
     fn active_agent_turn_id(&self) -> String {
         self.active_agent_turn_id
             .lock()
@@ -277,11 +339,12 @@ impl ForegroundTurnProgress {
         &self,
         resources: Arc<ChatResources>,
         execute: Execute,
-    ) -> Result<crate::chat_driver::RunTurnDriveOutcome, String>
+    ) -> Result<crate::chat_driver::RunTurnDriveOutcome, ChatTurnError>
     where
         Execute: FnOnce(Arc<ChatResources>) -> ExecuteFuture,
-        ExecuteFuture:
-            std::future::Future<Output = Result<crate::chat_driver::RunTurnDriveOutcome, String>>,
+        ExecuteFuture: std::future::Future<
+                Output = Result<crate::chat_driver::RunTurnDriveOutcome, ChatTurnError>,
+            >,
     {
         let cancel = self.cancellation_token();
         let delivery = Arc::new(DownstreamDeliveryState::default());
@@ -309,6 +372,10 @@ impl ForegroundTurnProgress {
         let result = CURRENT_FOREGROUND_TURN
             .scope(Arc::clone(&self.0), execute(controlled_resources))
             .await;
+        if let Some(error) = result.as_ref().err().filter(|error| error.is_observation()) {
+            self.0.retain_observation(error.clone());
+            return result;
+        }
         if let Some(generation) = memory_generation {
             let receipt = generation.settle_hot_memory_projection().await;
             if receipt.status
@@ -372,6 +439,7 @@ struct ForegroundTurnState {
 #[derive(Default)]
 struct ForegroundTurnControlInner {
     state: Mutex<ForegroundTurnState>,
+    lifecycle_retention: Mutex<std::sync::Weak<crate::runtime::ApplicationLifecycleRetention>>,
 }
 
 /// Single application authority for foreground turn identity and cancellation.
@@ -479,6 +547,30 @@ impl Drop for ForegroundConversationSuspension {
 }
 
 impl ForegroundTurnControl {
+    pub(crate) fn bind_lifecycle_retention(
+        &self,
+        root: &Arc<crate::runtime::ApplicationLifecycleRetention>,
+    ) {
+        *self
+            .inner
+            .lifecycle_retention
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(root);
+    }
+
+    pub(crate) fn has_retained_observation(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .map(|state| {
+                state
+                    .active
+                    .values()
+                    .any(|entry| entry.observation_tx.borrow().is_some())
+            })
+            .unwrap_or(true)
+    }
+
     pub fn supervise_input_lifecycle_scoped<Fut>(
         &self,
         workspace_id: &str,
@@ -641,6 +733,7 @@ impl ForegroundTurnControl {
         let cancel = CancellationToken::new();
         let (settlement_tx, _) = watch::channel(None);
         let (terminal_debt_tx, _) = watch::channel(None);
+        let (observation_tx, _) = watch::channel(None);
         let entry = Arc::new(ActiveForegroundTurn {
             key: key.clone(),
             root_turn_id: turn_id.clone(),
@@ -649,6 +742,10 @@ impl ForegroundTurnControl {
             cancel,
             settlement_tx,
             terminal_debt_tx,
+            observation_tx,
+            retained_resources: Mutex::new(Vec::new()),
+            driver_started: AtomicBool::new(false),
+            physical_result_observed: AtomicBool::new(false),
             settlement_owner_started: AtomicBool::new(false),
             input_observers: Mutex::new(ForegroundInputObservers::default()),
         });
@@ -799,6 +896,7 @@ impl ForegroundTurnControl {
         Ok(ForegroundTurnSettlementWaiter {
             settlement_rx: entry.settlement_tx.subscribe(),
             terminal_debt_rx: entry.terminal_debt_tx.subscribe(),
+            observation_rx: entry.observation_tx.subscribe(),
         })
     }
 
@@ -908,9 +1006,13 @@ impl ForegroundTurnControl {
         entry: Arc<ActiveForegroundTurn>,
         outcome: TurnOutcome,
     ) -> Result<ForegroundTurnSettlementWaiter, ForegroundTurnError> {
+        if let Some(error) = entry.observation_tx.borrow().as_ref() {
+            return Err(ForegroundTurnError::DriverSettlement(error.to_string()));
+        }
         let waiter = ForegroundTurnSettlementWaiter {
             settlement_rx: entry.settlement_tx.subscribe(),
             terminal_debt_rx: entry.terminal_debt_tx.subscribe(),
+            observation_rx: entry.observation_tx.subscribe(),
         };
         let runtime = match tokio::runtime::Handle::try_current() {
             Ok(runtime) => runtime,
@@ -1163,6 +1265,7 @@ impl ForegroundTurnControl {
         Ok(ForegroundTurnSettlementWaiter {
             settlement_rx,
             terminal_debt_rx: entry.terminal_debt_tx.subscribe(),
+            observation_rx: entry.observation_tx.subscribe(),
         })
     }
 
@@ -1219,6 +1322,7 @@ impl ForegroundTurnControl {
         Ok(ForegroundTurnSettlementWaiter {
             settlement_rx,
             terminal_debt_rx: entry.terminal_debt_tx.subscribe(),
+            observation_rx: entry.observation_tx.subscribe(),
         })
     }
 
@@ -1323,6 +1427,7 @@ impl ForegroundTurnControl {
                         ForegroundTurnSettlementWaiter {
                             settlement_rx,
                             terminal_debt_rx: entry.terminal_debt_tx.subscribe(),
+                            observation_rx: entry.observation_tx.subscribe(),
                         }
                     })
                     .collect::<Vec<_>>();
@@ -1379,6 +1484,17 @@ impl ForegroundTurnControl {
     }
 
     fn settle(&self, entry: &Arc<ActiveForegroundTurn>, outcome: TurnOutcome) {
+        if entry.observation_tx.borrow().is_some() {
+            return;
+        }
+        let mut receipts = entry
+            .retained_resources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while let Some(receipt) = receipts.pop() {
+            receipt.release();
+        }
+        drop(receipts);
         let settlement = ForegroundTurnSettlement {
             workspace_id: entry.key.workspace_id.clone(),
             surface: entry.key.surface,
@@ -1395,6 +1511,15 @@ impl ForegroundTurnControl {
             state.active.remove(&entry.key);
         }
         entry.settlement_tx.send_replace(Some(settlement));
+        let root = self
+            .inner
+            .lifecycle_retention
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade();
+        if let Some(root) = root {
+            root.note_progress();
+        }
     }
 }
 
@@ -1402,11 +1527,24 @@ impl ForegroundTurnControl {
 pub struct ForegroundTurnSettlementWaiter {
     settlement_rx: watch::Receiver<Option<ForegroundTurnSettlement>>,
     terminal_debt_rx: watch::Receiver<Option<ForegroundTerminalDebt>>,
+    observation_rx: watch::Receiver<Option<ChatTurnError>>,
 }
 
 impl ForegroundTurnSettlementWaiter {
     pub async fn wait(mut self) -> Result<ForegroundTurnSettlement, ForegroundTurnError> {
         loop {
+            if let Some(error) = self.observation_rx.borrow().as_ref() {
+                return Err(match error {
+                    ChatTurnError::Observation {
+                        run_id,
+                        execution_id,
+                    } => ForegroundTurnError::Observation {
+                        run_id: run_id.clone(),
+                        execution_id: execution_id.clone(),
+                    },
+                    other => ForegroundTurnError::DriverSettlement(other.to_string()),
+                });
+            }
             if let Some(settlement) = self.settlement_rx.borrow().clone() {
                 return Ok(settlement);
             }
@@ -1414,8 +1552,20 @@ impl ForegroundTurnSettlementWaiter {
                 return Err(debt.error());
             }
             tokio::select! {
+                changed = self.observation_rx.changed() => {
+                    // Removing the settled entry closes all senders. A closed
+                    // watch must not hide a fact published by the same owner.
+                    if changed.is_err()
+                        && self.observation_rx.borrow().is_none()
+                        && self.settlement_rx.borrow().is_none()
+                        && self.terminal_debt_rx.borrow().is_none()
+                    {
+                        return Err(ForegroundTurnError::StateUnavailable);
+                    }
+                }
                 changed = self.settlement_rx.changed() => {
                     if changed.is_err()
+                        && self.observation_rx.borrow().is_none()
                         && self.settlement_rx.borrow().is_none()
                         && self.terminal_debt_rx.borrow().is_none()
                     {
@@ -1424,6 +1574,7 @@ impl ForegroundTurnSettlementWaiter {
                 }
                 changed = self.terminal_debt_rx.changed() => {
                     if changed.is_err()
+                        && self.observation_rx.borrow().is_none()
                         && self.settlement_rx.borrow().is_none()
                         && self.terminal_debt_rx.borrow().is_none()
                     {
@@ -1451,6 +1602,44 @@ pub struct ForegroundTurnLease {
 }
 
 impl ForegroundTurnLease {
+    /// Transfer a pre-existing product receipt to this exact entry. An
+    /// observation cannot release it by dropping a surface's wait future.
+    pub fn retain<Receipt: Send + 'static>(&self, receipt: Receipt) {
+        self.entry
+            .retained_resources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(ForegroundRetainedResource::Ordinary(Box::new(receipt)));
+    }
+
+    pub fn retain_execution<
+        Receipt: crate::tasks::task_runtime::store::RunDriverExecutionReceipt + 'static,
+    >(
+        &self,
+        receipt: Receipt,
+    ) {
+        let observed = {
+            let mut resources = self
+                .entry
+                .retained_resources
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            resources.push(ForegroundRetainedResource::Execution(Arc::new(Mutex::new(
+                Box::new(receipt),
+            ))));
+            self.entry.observation_tx.borrow().clone()
+        };
+        if let Some(error) = observed {
+            self.entry.retain_observation(error);
+        }
+    }
+
+    pub fn retain_observation(&self, error: ChatTurnError) {
+        if error.is_observation() {
+            self.entry.retain_observation(error);
+        }
+    }
+
     pub fn workspace_id(&self) -> &str {
         &self.entry.key.workspace_id
     }
@@ -1518,10 +1707,21 @@ impl ForegroundTurnLease {
 
 impl Drop for ForegroundTurnLease {
     fn drop(&mut self) {
-        if self.settled {
+        if self.settled || self.entry.observation_tx.borrow().is_some() {
+            // The original entry and resource receipts remain in the control.
+            // Dropping the observer is not a Cancelled physical receipt.
             return;
         }
         self.entry.cancel.cancel();
+        if self.entry.driver_started.load(Ordering::Acquire)
+            && !self.entry.physical_result_observed.load(Ordering::Acquire)
+        {
+            self.entry.retain_observation(ChatTurnError::Error(format!(
+                "foreground turn {} lost its wait without a physical settlement receipt",
+                self.entry.root_turn_id
+            )));
+            return;
+        }
         if let Err(error) = self
             .control
             .start_settlement_owner(Arc::clone(&self.entry), TurnOutcome::Cancelled)
@@ -1595,9 +1795,16 @@ impl ChatSink for CancellationAwareChatSink {
 }
 
 fn normalize_downstream_outcome(
-    result: Result<TurnOutcome, String>,
+    result: Result<TurnOutcome, ChatTurnError>,
     delivery: &DownstreamDeliveryState,
-) -> Result<TurnOutcome, String> {
+) -> Result<TurnOutcome, ChatTurnError> {
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(ChatTurnError::is_observation)
+    {
+        return result;
+    }
     if delivery.terminal_delivery_failed() {
         // Events already accepted by the consumer remain delivered; only the
         // authoritative terminal result is replaced when that consumer closed
@@ -1622,8 +1829,11 @@ pub async fn drive_foreground_chat(
     agent: &AgentHandle,
     turn: &PreparedUserTurn,
     resources: Arc<ChatResources>,
-) -> Result<TurnOutcome, String> {
+) -> Result<TurnOutcome, ChatTurnError> {
     let (result, settlement_outcome) = run_foreground_chat(&lease, agent, turn, resources).await;
+    let Some(settlement_outcome) = settlement_outcome else {
+        return result;
+    };
     let settlement = lease
         .settle_after_observers(settlement_outcome)
         .await
@@ -1641,7 +1851,7 @@ pub async fn drive_foreground_chat_with_input_observer(
     turn: &PreparedUserTurn,
     resources: Arc<ChatResources>,
     input_observer: crate::chat_driver::InputReceiptObserver,
-) -> Result<TurnOutcome, String> {
+) -> Result<TurnOutcome, ChatTurnError> {
     let (result, settlement_outcome) =
         run_foreground_chat_with(&lease, resources, |controlled_resources| async move {
             crate::chat_driver::drive_chat_turn_with_input_observer(
@@ -1655,6 +1865,9 @@ pub async fn drive_foreground_chat_with_input_observer(
             .map(|receipt| receipt.outcome)
         })
         .await;
+    let Some(settlement_outcome) = settlement_outcome else {
+        return result;
+    };
     let settlement = lease
         .settle_after_observers(settlement_outcome)
         .await
@@ -1670,7 +1883,7 @@ pub async fn drive_foreground_chat_with_ingress<Settle, SettleFuture>(
     resources: Arc<ChatResources>,
     input_observer: crate::chat_driver::InputReceiptObserver,
     durable_terminal: Settle,
-) -> Result<TurnOutcome, String>
+) -> Result<TurnOutcome, ChatTurnError>
 where
     Settle: Fn(TurnOutcome) -> SettleFuture + Send + Sync + 'static,
     SettleFuture: std::future::Future<Output = Result<(), String>> + Send + 'static,
@@ -1688,6 +1901,9 @@ where
             .map(|receipt| receipt.outcome)
         })
         .await;
+    let Some(settlement_outcome) = settlement_outcome else {
+        return result;
+    };
     let settlement = lease
         .settle_after(settlement_outcome, durable_terminal)
         .await
@@ -1703,7 +1919,7 @@ pub async fn drive_foreground_chat_turn(
     turn: &PreparedUserTurn,
     resources: Arc<ChatResources>,
     binding: crate::tasks::task_runtime::types::RunTurnBinding,
-) -> Result<TurnOutcome, String> {
+) -> Result<TurnOutcome, ChatTurnError> {
     let (result, settlement_outcome) =
         run_foreground_chat_with(&lease, resources, |controlled_resources| async move {
             drive_chat_turn(agent, turn, controlled_resources, Some(binding))
@@ -1711,6 +1927,9 @@ pub async fn drive_foreground_chat_turn(
                 .map(|receipt| receipt.outcome)
         })
         .await;
+    let Some(settlement_outcome) = settlement_outcome else {
+        return result;
+    };
     let settlement = lease
         .settle_after_observers(settlement_outcome)
         .await
@@ -1731,7 +1950,7 @@ pub async fn drive_foreground_pooled_chat<Configure, ConfigureFuture>(
     configure: Configure,
     turn: &PreparedUserTurn,
     resources: Arc<ChatResources>,
-) -> TurnOutcome
+) -> Result<TurnOutcome, ChatTurnError>
 where
     Configure: FnOnce(AgentHandle) -> ConfigureFuture,
     ConfigureFuture: std::future::Future<Output = Result<(), String>>,
@@ -1753,7 +1972,7 @@ pub async fn drive_foreground_pooled_chat_turn<Configure, ConfigureFuture>(
     turn: &PreparedUserTurn,
     resources: Arc<ChatResources>,
     binding: crate::tasks::task_runtime::types::RunTurnBinding,
-) -> TurnOutcome
+) -> Result<TurnOutcome, ChatTurnError>
 where
     Configure: FnOnce(AgentHandle) -> ConfigureFuture,
     ConfigureFuture: std::future::Future<Output = Result<(), String>>,
@@ -1778,12 +1997,12 @@ async fn drive_foreground_pooled_chat_with_binding<Configure, ConfigureFuture>(
     turn: &PreparedUserTurn,
     resources: Arc<ChatResources>,
     binding: Option<crate::tasks::task_runtime::types::RunTurnBinding>,
-) -> TurnOutcome
+) -> Result<TurnOutcome, ChatTurnError>
 where
     Configure: FnOnce(AgentHandle) -> ConfigureFuture,
     ConfigureFuture: std::future::Future<Output = Result<(), String>>,
 {
-    let (_result, settlement_outcome) =
+    let (result, settlement_outcome) =
         run_foreground_chat_with(&lease, resources, move |controlled_resources| async move {
             crate::chat_driver::drive_pooled_chat_turn(
                 pool,
@@ -1797,16 +2016,21 @@ where
             .map(|receipt| receipt.outcome)
         })
         .await;
-    match lease
-        .settle_after_observers(settlement_outcome.clone())
-        .await
-    {
-        Ok(_) => settlement_outcome,
-        Err(error) => TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
-            "input_observer",
-            error.to_string(),
-        )),
-    }
+    let Some(settlement_outcome) = settlement_outcome else {
+        return result;
+    };
+    Ok(
+        match lease
+            .settle_after_observers(settlement_outcome.clone())
+            .await
+        {
+            Ok(_) => settlement_outcome,
+            Err(error) => TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+                "input_observer",
+                error.to_string(),
+            )),
+        },
+    )
 }
 
 async fn run_foreground_chat(
@@ -1814,7 +2038,7 @@ async fn run_foreground_chat(
     agent: &AgentHandle,
     turn: &PreparedUserTurn,
     resources: Arc<ChatResources>,
-) -> (Result<TurnOutcome, String>, TurnOutcome) {
+) -> (Result<TurnOutcome, ChatTurnError>, Option<TurnOutcome>) {
     run_foreground_chat_with(lease, resources, |controlled_resources| {
         drive_chat(agent, turn, controlled_resources)
     })
@@ -1825,10 +2049,10 @@ async fn run_foreground_chat_with<Execute, ExecuteFuture>(
     lease: &ForegroundTurnLease,
     resources: Arc<ChatResources>,
     execute: Execute,
-) -> (Result<TurnOutcome, String>, TurnOutcome)
+) -> (Result<TurnOutcome, ChatTurnError>, Option<TurnOutcome>)
 where
     Execute: FnOnce(Arc<ChatResources>) -> ExecuteFuture,
-    ExecuteFuture: std::future::Future<Output = Result<TurnOutcome, String>>,
+    ExecuteFuture: std::future::Future<Output = Result<TurnOutcome, ChatTurnError>>,
 {
     let identity_error = if resources.conv_id.as_deref() != Some(lease.conversation_id()) {
         Some("foreground conversation id does not match chat resources".to_string())
@@ -1842,9 +2066,10 @@ where
             "foreground_turn",
             error.clone(),
         ));
-        return (Err(error), outcome);
+        return (Err(error.into()), Some(outcome));
     }
 
+    lease.retain(resources.clone());
     let cancel = lease.cancellation_token();
     let delivery = Arc::new(DownstreamDeliveryState::default());
     let sink: Arc<dyn ChatSink> = Arc::new(CancellationAwareChatSink {
@@ -1871,12 +2096,21 @@ where
         human_loop_provider: resources.human_loop_provider.clone(),
     });
     let memory_generation = resources.memory_generation.clone();
+    lease.entry.driver_started.store(true, Ordering::Release);
     let result = normalize_downstream_outcome(
         CURRENT_FOREGROUND_TURN
             .scope(Arc::clone(&lease.entry), execute(controlled_resources))
             .await,
         delivery.as_ref(),
     );
+    if let Some(error) = result.as_ref().err().filter(|error| error.is_observation()) {
+        lease.entry.retain_observation(error.clone());
+        return (result, None);
+    }
+    lease
+        .entry
+        .physical_result_observed
+        .store(true, Ordering::Release);
     if let Some(generation) = memory_generation {
         let receipt = generation.settle_hot_memory_projection().await;
         if receipt.status
@@ -1888,15 +2122,110 @@ where
     let settlement_outcome = result.clone().unwrap_or_else(|error| {
         TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
             "foreground_turn",
-            error,
+            error.to_string(),
         ))
     });
-    (result, settlement_outcome)
+    (result, Some(settlement_outcome))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn aggregate_foreground_exact_unknown_lease_does_not_hide_same_key_normal_work()
+    -> anyhow::Result<()> {
+        let client =
+            Arc::new(echo_agent::testing::MockLlmClient::new().with_model_name("test-model"));
+        let agent = crate::agent_handle::AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("test-model")
+                .llm_client(client.clone())
+                .build()?,
+        );
+        let pool =
+            Arc::new(crate::agent_pool::AgentPool::new_for_test(agent, None, None, 2, false).await);
+        pool.set_llm_client_override_for_test(client).await;
+        let unknown = pool.acquire("same-original-key").await?;
+        let ordinary = pool.acquire("same-original-key").await?;
+        assert_eq!(pool.active_execution_count(), 2);
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin(
+            ForegroundTurnSurface::Channel,
+            "same-original-key",
+            "foreground-original-turn",
+        )?;
+        let original_entry = lease.entry.clone();
+        // Same Arc cell as the GUI, plus direct surface ownership on the same
+        // original Entry; neither projection creates a new Agent or permit.
+        let cell = Arc::new(Mutex::new(Some(unknown)));
+        lease.retain_execution(cell.clone());
+        let (release, held) = tokio::sync::oneshot::channel();
+        let backend = tokio::spawn(held);
+        lease.retain_observation(ChatTurnError::Observation {
+            run_id: "original-run".into(),
+            execution_id: Some("original-backend".into()),
+        });
+        drop(lease);
+        let mut owner = crate::runtime::ApplicationLifecycleOwner::new(
+            tokio_util::sync::CancellationToken::new(),
+        );
+        owner.bind_pool(pool.clone());
+        let begin_control = control.clone();
+        let join_control = control.clone();
+        owner.track_external_owner(
+            "original foreground",
+            move || {
+                begin_control
+                    .begin_shutdown()
+                    .map_err(|error| error.to_string())
+            },
+            async move {
+                join_control
+                    .shutdown()
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+        );
+        let initial =
+            owner.begin_shutdown(crate::runtime::ApplicationLifecycleReason::Shutdown, None);
+        let settlement = owner.start_join(initial);
+        {
+            let waiting = settlement.clone().wait();
+            tokio::pin!(waiting);
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+        }
+        assert_eq!(pool.active_execution_count(), 2);
+        drop(ordinary);
+        let observation =
+            tokio::time::timeout(std::time::Duration::from_secs(2), settlement.clone().wait())
+                .await?;
+        assert!(!observation.is_clean());
+        assert_eq!(pool.active_execution_count(), 1);
+        assert!(control.has_retained_observation());
+        assert!(!backend.is_finished());
+        release
+            .send(())
+            .map_err(|_| anyhow::anyhow!("same original backend vanished"))?;
+        backend.await??;
+        // Only this test-owned exact backend proof permits the existing Entry's
+        // physical result and original resource cleanup, with no second drive.
+        original_entry
+            .physical_result_observed
+            .store(true, Ordering::Release);
+        original_entry.observation_tx.send_replace(None);
+        control.settle(&original_entry, TurnOutcome::Completed);
+        cell.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        assert_eq!(pool.active_execution_count(), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(2), pool.shutdown())
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        drop(observation);
+        drop(settlement);
+        Ok(())
+    }
 
     struct DropReceipt(Arc<AtomicBool>);
 
@@ -1918,6 +2247,53 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(self.name);
         }
+    }
+
+    #[tokio::test]
+    async fn observation_keeps_each_surface_owned_without_drop_terminal() -> Result<(), String> {
+        for surface in [
+            ForegroundTurnSurface::Gui,
+            ForegroundTurnSurface::Tui,
+            ForegroundTurnSurface::Cli,
+            ForegroundTurnSurface::Channel,
+        ] {
+            let control = ForegroundTurnControl::default();
+            let lease = control
+                .begin_scoped("workspace", surface, "conversation", "turn")
+                .map_err(|error| error.to_string())?;
+            let released = Arc::new(AtomicBool::new(false));
+            lease.retain(DropReceipt(released.clone()));
+            lease.retain_observation(ChatTurnError::Observation {
+                run_id: "original-run".to_string(),
+                execution_id: Some("original-execution".to_string()),
+            });
+            let waiter = control
+                .settlement_waiter_scoped("workspace", surface, "conversation", "turn")
+                .map_err(|error| error.to_string())?;
+            drop(lease);
+            assert!(!released.load(Ordering::SeqCst));
+            assert!(control.has_active_conversation("conversation"));
+            assert!(
+                control
+                    .begin_scoped("workspace", surface, "conversation", "replacement")
+                    .is_err()
+            );
+            assert!(waiter.wait().await.is_err());
+            assert!(control.shutdown().await.is_err());
+            assert!(!released.load(Ordering::SeqCst));
+            let state = control
+                .inner
+                .state
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let entry = state
+                .active
+                .values()
+                .next()
+                .ok_or("original owner disappeared")?;
+            assert!(entry.settlement_tx.borrow().is_none());
+        }
+        Ok(())
     }
 
     struct ClosedSink;
@@ -2782,6 +3158,27 @@ mod tests {
             Err(ForegroundTurnError::ShuttingDown)
         ));
         control.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn pending_waiter_reads_real_settlement_when_owner_closes_senders()
+    -> Result<(), ForegroundTurnError> {
+        // Poll the real waiter before settlement so its watch branches are
+        // armed. Repetition covers the select interleavings without synthetic
+        // receiver versions, sleeps, or a second settlement authority.
+        for _ in 0..64 {
+            let control = ForegroundTurnControl::default();
+            let lease = control.begin(ForegroundTurnSurface::Gui, "conversation", "turn")?;
+            let waiting = control
+                .request_cancel(ForegroundTurnSurface::Gui, "conversation", "turn")?
+                .wait();
+            tokio::pin!(waiting);
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            lease.settle(TurnOutcome::Cancelled);
+            assert_eq!(waiting.await?.outcome, TurnOutcome::Cancelled);
+            assert!(!control.has_active_turns());
+        }
+        Ok(())
     }
 
     #[tokio::test]
