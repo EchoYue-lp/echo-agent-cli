@@ -6,6 +6,7 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
+use echo_agent::sandbox::{IsolationLevel, SandboxCommand, SandboxExecutor};
 use echo_agent::tools::permission::{PermissionRule, RuleBehavior, RuleMatcher, RuleSource};
 use echo_agent_app_core::api::state::AuditDecision;
 use echo_agent_app_core::api::structured_extraction::{
@@ -545,19 +546,49 @@ pub async fn execute_workflow(
 // Sandbox
 // ════════════════════════════════════════════════════════════════════════════
 
-async fn eko_local_sandbox_available(manager: &dyn echo_agent::sandbox::SandboxExecutor) -> bool {
+/// Isolation floor every GUI sandbox entry point must clear.
+///
+/// EKO is a local personal assistant on the user's own machine, so this floor is
+/// **not** about separating tenants from each other. A process-only backend
+/// inherits the user's whole filesystem, network and credentials: if the framework
+/// mis-renders a command, mis-evaluates the policy, or a shell/code language is
+/// mapped to the wrong interpreter, a process-only run damages the host instead of
+/// failing inside `sandbox-exec` / `bwrap`. The floor therefore exists to contain
+/// framework bugs (AGENTS.md: 防框架自身 bug 造成破坏), not to gate the user.
+///
+/// It is derived from backend capability only, never from `permission_mode`:
+/// terminal/code execution is a user-initiated developer action, so an
+/// agent-automatic approval gate (`require_full_auto` & friends) would be the
+/// wrong control and must not be reintroduced here.
+const EKO_LOCAL_SANDBOX_ISOLATION_FLOOR: IsolationLevel = IsolationLevel::OsSandbox;
+
+/// Capability probe: can this executor actually provide OS-level isolation?
+///
+/// `is_available_at` is a probe rather than a configuration claim: for the local
+/// backend it requires both an OS-isolation backend *and* a successful start of
+/// `sandbox-exec` (macOS) / `bwrap` (Linux/WSL2). A backend that only spawns plain
+/// host processes reports [`IsolationLevel::Process`] and is rejected here even
+/// though [`SandboxExecutor::is_available`] alone would answer `true`.
+async fn eko_local_sandbox_available(manager: &dyn SandboxExecutor) -> bool {
     if cfg!(target_os = "windows") {
+        // Windows has no local OS sandbox backend yet; WSL2 supplies bwrap.
         false
     } else {
-        manager.is_available().await
+        manager
+            .is_available_at(EKO_LOCAL_SANDBOX_ISOLATION_FLOOR)
+            .await
     }
 }
 
-fn eko_local_sandbox_backend_label() -> &'static str {
+/// Backend label derived from the same probe as [`eko_local_sandbox_available`],
+/// so the reported backend cannot advertise OS isolation that was never probed.
+fn eko_local_sandbox_backend_label(local_available: bool) -> &'static str {
     if cfg!(target_os = "windows") {
         "wsl2-required"
-    } else {
+    } else if local_available {
         "local"
+    } else {
+        "process-only"
     }
 }
 
@@ -567,6 +598,38 @@ fn eko_local_sandbox_unavailable_message() -> &'static str {
     } else {
         "Local sandbox backend is unavailable. On macOS this requires sandbox-exec; on Linux/WSL2 this requires bubblewrap (bwrap)."
     }
+}
+
+/// Guard for the actual execution entry point.
+///
+/// There is deliberately **no** implicit fallback: when OS isolation is not
+/// available the GUI must return this error instead of quietly running the command
+/// as a plain host process. Note this is not a permission gate — it does not look
+/// at `permission_mode` and it does not ask for `full-auto`; it only refuses to
+/// execute without the OS-level containment the sandbox contract promises.
+async fn eko_require_os_sandbox(manager: &dyn SandboxExecutor) -> Result<(), IpcError> {
+    if eko_local_sandbox_available(manager).await {
+        Ok(())
+    } else {
+        Err(IpcError::Validation(
+            eko_local_sandbox_unavailable_message().to_string(),
+        ))
+    }
+}
+
+/// Build a sandbox command that carries the OS-isolation floor into the executor.
+///
+/// The probe above already rejects an unavailable backend, but the floor rides on
+/// the command as defence in depth: a `SandboxManager` configured with
+/// `allow_fallback` refuses to downgrade a command whose `minimum_isolation` is
+/// unmet, so no future routing change can silently turn this into a host process.
+fn eko_sandbox_command(is_shell: bool, language: &str, code: String) -> SandboxCommand {
+    let command = if is_shell {
+        SandboxCommand::shell(code)
+    } else {
+        SandboxCommand::code(language, code)
+    };
+    command.with_minimum_isolation(EKO_LOCAL_SANDBOX_ISOLATION_FLOOR)
 }
 
 #[tauri::command]
@@ -588,7 +651,7 @@ pub async fn get_sandbox_status(
         "local_available": local_available,
         "docker_available": false,
         "k8s_available": false,
-        "current_backend": eko_local_sandbox_backend_label(),
+        "current_backend": eko_local_sandbox_backend_label(local_available),
         "config": config,
     }))
 }
@@ -648,17 +711,13 @@ pub async fn execute_sandbox(
             ));
         }
     };
-    if !eko_local_sandbox_available(manager.as_ref()).await {
-        return Err(IpcError::Validation(
-            eko_local_sandbox_unavailable_message().to_string(),
-        ));
-    }
+    // Fail closed before touching the executor: a process-only backend would run
+    // this as a plain host process, which is exactly the silent downgrade the
+    // sandbox contract forbids. The GUI has no "run unsandboxed anyway" opt-in,
+    // so there is no explicit non-isolated path to preserve here.
+    eko_require_os_sandbox(manager.as_ref()).await?;
 
-    let command = if is_shell {
-        echo_agent::sandbox::SandboxCommand::shell(code)
-    } else {
-        echo_agent::sandbox::SandboxCommand::code(lang, code)
-    };
+    let command = eko_sandbox_command(is_shell, &lang, code);
     let config = state.app_state.config.sandbox_config.read().await.clone();
     let memory_bytes = u64::from(config.max_memory_mb)
         .checked_mul(1024)
@@ -2021,5 +2080,128 @@ mod scoped_control_tests {
         let unattended =
             echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo);
         assert!(Arc::ptr_eq(&primary, &unattended));
+    }
+}
+
+/// GUI sandbox isolation contract.
+///
+/// The Tauri commands themselves need a live `tauri::State`, so the isolation
+/// decision is factored into `eko_local_sandbox_available` / `eko_require_os_sandbox`
+/// / `eko_sandbox_command` and exercised directly against executor doubles.
+#[cfg(test)]
+mod sandbox_isolation_tests {
+    use super::*;
+    use echo_agent::error::{ReactError, SandboxError};
+    use echo_agent::sandbox::ExecutionResult;
+    use futures::future::BoxFuture;
+
+    /// Executor double that separates "claims an isolation level" from "the
+    /// backend actually starts", mirroring how the real local backend probes
+    /// `sandbox-exec` / `bwrap` instead of trusting configuration.
+    struct ProbeSandbox {
+        level: IsolationLevel,
+        backend_starts: bool,
+    }
+
+    impl ProbeSandbox {
+        fn new(level: IsolationLevel, backend_starts: bool) -> Self {
+            Self {
+                level,
+                backend_starts,
+            }
+        }
+    }
+
+    impl SandboxExecutor for ProbeSandbox {
+        fn name(&self) -> &str {
+            "probe"
+        }
+
+        fn isolation_level(&self) -> IsolationLevel {
+            self.level
+        }
+
+        fn is_available(&self) -> BoxFuture<'_, bool> {
+            Box::pin(async move { self.backend_starts })
+        }
+
+        fn execute(
+            &self,
+            _command: SandboxCommand,
+        ) -> BoxFuture<'_, echo_agent::error::Result<ExecutionResult>> {
+            Box::pin(async move {
+                Err(ReactError::Sandbox(Box::new(SandboxError::Unavailable(
+                    "probe executor must never execute".to_string(),
+                ))))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn process_only_backend_reports_unavailable() {
+        // `is_available()` is true: the process runner can spawn commands.
+        let manager = ProbeSandbox::new(IsolationLevel::Process, true);
+        assert!(
+            !eko_local_sandbox_available(&manager).await,
+            "a process-only backend must not be advertised as an available sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_only_backend_rejects_execution_with_the_canonical_message() {
+        let manager = ProbeSandbox::new(IsolationLevel::Process, true);
+        let message = eko_require_os_sandbox(&manager)
+            .await
+            .err()
+            .map(|error| error.to_string());
+        assert_eq!(
+            message.as_deref(),
+            Some(eko_local_sandbox_unavailable_message()),
+            "process-only execution must be rejected with the canonical message, not degraded"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn os_isolated_backend_is_not_misreported() {
+        let manager = ProbeSandbox::new(IsolationLevel::OsSandbox, true);
+        assert!(eko_local_sandbox_available(&manager).await);
+        assert!(eko_require_os_sandbox(&manager).await.is_ok());
+        assert_eq!(eko_local_sandbox_backend_label(true), "local");
+    }
+
+    #[tokio::test]
+    async fn os_isolation_label_without_a_starting_backend_is_unavailable() {
+        // Claims OS isolation, but the backend cannot start: capability probing,
+        // not the reported level, decides availability.
+        let manager = ProbeSandbox::new(IsolationLevel::OsSandbox, false);
+        assert!(!eko_local_sandbox_available(&manager).await);
+        assert!(eko_require_os_sandbox(&manager).await.is_err());
+    }
+
+    #[test]
+    fn backend_label_follows_probed_capability() {
+        if cfg!(target_os = "windows") {
+            assert_eq!(eko_local_sandbox_backend_label(true), "wsl2-required");
+            assert_eq!(eko_local_sandbox_backend_label(false), "wsl2-required");
+        } else {
+            assert_eq!(eko_local_sandbox_backend_label(false), "process-only");
+        }
+    }
+
+    #[test]
+    fn sandbox_commands_carry_the_os_isolation_floor() {
+        let shell = eko_sandbox_command(true, "bash", "echo ok".to_string());
+        assert_eq!(
+            shell.minimum_isolation,
+            Some(IsolationLevel::OsSandbox),
+            "shell execution must not be allowed to downgrade to process-only"
+        );
+        let code = eko_sandbox_command(false, "python", "print(1)".to_string());
+        assert_eq!(
+            code.minimum_isolation,
+            Some(IsolationLevel::OsSandbox),
+            "code execution must not be allowed to downgrade to process-only"
+        );
     }
 }
