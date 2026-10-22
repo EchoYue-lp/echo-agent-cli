@@ -161,8 +161,10 @@ pub async fn execute_run(
 
         break outcome;
     };
-    // Reflect the outcome on the run state. Each branch also writes a trace
-    // Run record when a RunStore is available.
+    // Reflect the outcome on the run state. The durable status is the single
+    // authority: each branch settles first, then emits exactly the status that
+    // landed. This is what keeps the live event stream and the on-disk
+    // summary/terminal in agreement when cancellation races the executor.
     match &outcome {
         Ok(RunOutcome::Completed) => {
             let status_run_id = run_id.to_string();
@@ -180,15 +182,12 @@ pub async fn execute_run(
                 // completion batch and publishes the terminal projection.
                 return outcome;
             }
-            emit_exec(
+            emit_committed_run_event(
                 trace_sink.as_ref(),
-                ExecEvent::run(
-                    run.workspace_id.clone(),
-                    run.conversation_id.clone(),
-                    run_id.to_string(),
-                    RuntimeEventKind::RunCompleted,
-                    serde_json::json!({ "status": "completed" }),
-                ),
+                &run,
+                TaskRunStatus::Completed,
+                None,
+                None,
             );
             // With an active primary RunTurn, Goal completion is committed by
             // turn_lifecycle in the same batch as RunTurnFinished. Without an
@@ -215,23 +214,10 @@ pub async fn execute_run(
             failed_task_id,
             error,
         }) => {
-            emit_exec(
-                trace_sink.as_ref(),
-                ExecEvent::run(
-                    run.workspace_id.clone(),
-                    run.conversation_id.clone(),
-                    run_id.to_string(),
-                    RuntimeEventKind::RunFailed,
-                    serde_json::json!({
-                        "failed_task_id": failed_task_id,
-                        "error": error,
-                    }),
-                ),
-            );
             let final_run_id = run_id.to_string();
             let final_task_id = failed_task_id.clone();
             let final_error = format!("run failed: {error}");
-            blocking
+            let settled = blocking
                 .run("finalize failed runtime run", move |store| {
                     store
                         .finalize_run_with_note_task(
@@ -240,117 +226,204 @@ pub async fn execute_run(
                             final_task_id.as_deref(),
                             Some(&final_error),
                         )
-                        .map(|_| ())
+                        .map(|run| run.status)
                 })
                 .await
                 .map_err(|error| ExecError::Other(error.to_string()))?;
+            emit_committed_run_event(
+                trace_sink.as_ref(),
+                &run,
+                settled,
+                failed_task_id.clone(),
+                Some(error.as_str()),
+            );
             save_trace(
                 run_store.as_ref(),
                 run_id,
                 &run.goal,
                 &run.conversation_id,
-                "failed",
+                trace_label(settled),
             );
+            // A late failure must not overwrite a terminal run that already
+            // won; the committed status decides the closure.
+            if settled != TaskRunStatus::Failed
+                && let Some(committed) =
+                    committed_outcome(settled, failed_task_id.clone(), error.clone())
+            {
+                return Ok(committed);
+            }
         }
         Ok(RunOutcome::Cancelled) => {
-            emit_exec(
-                trace_sink.as_ref(),
-                ExecEvent::run(
-                    run.workspace_id.clone(),
-                    run.conversation_id.clone(),
-                    run_id.to_string(),
-                    RuntimeEventKind::RunCancelled,
-                    serde_json::json!({ "status": "cancelled" }),
-                ),
-            );
             let final_run_id = run_id.to_string();
-            blocking
+            let settled = blocking
                 .run("finalize cancelled runtime run", move |store| {
                     store
                         .finalize_run(&final_run_id, TaskRunStatus::Cancelled, None)
-                        .map(|_| ())
+                        .map(|run| run.status)
                 })
                 .await
                 .map_err(|error| ExecError::Other(error.to_string()))?;
+            emit_committed_run_event(trace_sink.as_ref(), &run, settled, None, None);
             save_trace(
                 run_store.as_ref(),
                 run_id,
                 &run.goal,
                 &run.conversation_id,
-                "cancelled",
+                trace_label(settled),
             );
-            super::memory_bridge::write_memory_candidate_dispatch(
-                memory_policy,
-                memory_generation.as_ref(),
-                &store,
-                super::memory_bridge::MemoryEvent::RunCancelledByUser {
-                    run_id: run_id.to_string(),
-                    goal: run.goal.clone(),
-                },
-            )
-            .await;
+            if settled == TaskRunStatus::Cancelled {
+                super::memory_bridge::write_memory_candidate_dispatch(
+                    memory_policy,
+                    memory_generation.as_ref(),
+                    &store,
+                    super::memory_bridge::MemoryEvent::RunCancelledByUser {
+                        run_id: run_id.to_string(),
+                        goal: run.goal.clone(),
+                    },
+                )
+                .await;
+            } else {
+                if let Some(committed) = committed_outcome(settled, None, String::new()) {
+                    return Ok(committed);
+                }
+            }
         }
         Ok(RunOutcome::Paused {
             failed_task_id,
             error,
         }) => {
-            emit_exec(
-                trace_sink.as_ref(),
-                ExecEvent::run(
-                    run.workspace_id.clone(),
-                    run.conversation_id.clone(),
-                    run_id.to_string(),
-                    RuntimeEventKind::RunStatusChanged,
-                    serde_json::json!({
-                        "status": "paused",
-                        "failed_task_id": failed_task_id,
-                        "error": error,
-                    }),
-                ),
-            );
             let note_run_id = run_id.to_string();
             let note_task_id = failed_task_id.clone();
             let note = format!("run paused: {error}");
-            blocking
+            let settled = blocking
                 .run("note paused runtime run", move |store| {
-                    store.note(&note_run_id, note_task_id.as_deref(), &note)
+                    store.note(&note_run_id, note_task_id.as_deref(), &note)?;
+                    store
+                        .get_run(&note_run_id)?
+                        .map(|run| run.status)
+                        .ok_or(StoreError::RunNotFound(note_run_id))
                 })
                 .await
                 .map_err(|error| ExecError::Other(error.to_string()))?;
+            emit_committed_run_event(
+                trace_sink.as_ref(),
+                &run,
+                settled,
+                failed_task_id.clone(),
+                Some(error.as_str()),
+            );
             save_trace(
                 run_store.as_ref(),
                 run_id,
                 &run.goal,
                 &run.conversation_id,
-                "paused",
+                trace_label(settled),
             );
+            if settled != TaskRunStatus::Paused
+                && let Some(committed) =
+                    committed_outcome(settled, failed_task_id.clone(), error.clone())
+            {
+                return Ok(committed);
+            }
         }
         Err(ExecError::Framework(echo_agent::error::ReactError::ExecutionNotSettled { .. })) =>
         {
             // Observation is not a run resolution or a retry instruction.
         }
         Err(e) => {
-            emit_exec(
-                trace_sink.as_ref(),
-                ExecEvent::run(
-                    run.workspace_id.clone(),
-                    run.conversation_id.clone(),
-                    run_id.to_string(),
-                    RuntimeEventKind::RunFailed,
-                    serde_json::json!({ "error": e.to_string() }),
-                ),
-            );
             let final_run_id = run_id.to_string();
             let final_error = format!("executor error: {e}");
-            blocking
+            let settled = blocking
                 .run("finalize runtime executor error", move |store| {
                     store
                         .finalize_run(&final_run_id, TaskRunStatus::Failed, Some(&final_error))
-                        .map(|_| ())
+                        .map(|run| run.status)
                 })
                 .await
                 .map_err(|error| ExecError::Other(error.to_string()))?;
+            let error_text = e.to_string();
+            emit_committed_run_event(
+                trace_sink.as_ref(),
+                &run,
+                settled,
+                None,
+                Some(error_text.as_str()),
+            );
+            if let Some(committed) = committed_outcome(settled, None, String::new()) {
+                return Ok(committed);
+            }
         }
     }
     outcome
+}
+
+/// Outcome variant matching the durable terminal status. Non-terminal statuses
+/// keep the original executor outcome.
+fn committed_outcome(
+    status: TaskRunStatus,
+    failed_task_id: Option<String>,
+    error: String,
+) -> Option<RunOutcome> {
+    match status {
+        TaskRunStatus::Completed => Some(RunOutcome::Completed),
+        TaskRunStatus::Cancelled => Some(RunOutcome::Cancelled),
+        TaskRunStatus::Failed => Some(RunOutcome::Failed {
+            failed_task_id,
+            error,
+        }),
+        TaskRunStatus::Paused => Some(RunOutcome::Paused {
+            failed_task_id,
+            error,
+        }),
+        TaskRunStatus::Pending | TaskRunStatus::Running => None,
+    }
+}
+
+/// Stable trace label for one durable run status.
+fn trace_label(status: TaskRunStatus) -> &'static str {
+    match status {
+        TaskRunStatus::Completed => "completed",
+        TaskRunStatus::Cancelled => "cancelled",
+        TaskRunStatus::Failed => "failed",
+        TaskRunStatus::Paused => "paused",
+        TaskRunStatus::Pending => "pending",
+        TaskRunStatus::Running => "running",
+    }
+}
+
+/// Emit the live event that matches the committed run status.
+///
+/// The event kind and payload are derived from the durable status rather than
+/// from the executor's requested outcome, so a cancelled run never streams a
+/// completion payload (and vice versa).
+fn emit_committed_run_event(
+    sink: Option<&ExecSink>,
+    run: &TaskRun,
+    settled: TaskRunStatus,
+    failed_task_id: Option<String>,
+    error: Option<&str>,
+) {
+    let payload = serde_json::json!({
+        "status": settled.as_str(),
+        "failed_task_id": failed_task_id,
+        "error": error,
+    });
+    let kind = match settled {
+        TaskRunStatus::Completed => RuntimeEventKind::RunCompleted,
+        TaskRunStatus::Failed => RuntimeEventKind::RunFailed,
+        TaskRunStatus::Cancelled => RuntimeEventKind::RunCancelled,
+        TaskRunStatus::Paused | TaskRunStatus::Pending | TaskRunStatus::Running => {
+            RuntimeEventKind::RunStatusChanged
+        }
+    };
+    emit_exec(
+        sink,
+        ExecEvent::run(
+            run.workspace_id.clone(),
+            run.conversation_id.clone(),
+            run.run_id.clone(),
+            kind,
+            payload,
+        ),
+    );
 }

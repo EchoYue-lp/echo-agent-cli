@@ -2184,6 +2184,37 @@ impl TaskRuntimeStore {
         attended_mode: AttendedMode,
         execution_profile: TaskRunExecutionProfile,
     ) -> Result<TaskRun, StoreError> {
+        self.create_run_with_profile_result(
+            run_id,
+            workspace_id,
+            conversation_id,
+            root_message_id,
+            domain_profile,
+            goal,
+            route,
+            attended_mode,
+            execution_profile,
+        )
+        .map(|(run, _created)| run)
+    }
+
+    /// Create-or-read one run and report whether this call committed
+    /// `RunCreated`. Idempotent occurrence admission uses the flag to
+    /// distinguish a first delivery from a re-delivery of the same slot; the
+    /// read path itself is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_run_with_profile_result(
+        &self,
+        run_id: &str,
+        workspace_id: &str,
+        conversation_id: &str,
+        root_message_id: &str,
+        domain_profile: DomainProfile,
+        goal: &str,
+        route: &str,
+        attended_mode: AttendedMode,
+        execution_profile: TaskRunExecutionProfile,
+    ) -> Result<(TaskRun, bool), StoreError> {
         self.with_run_lock(run_id, || {
             if let Some(existing) = self.get_run(run_id)? {
                 let existing_profile = self
@@ -2202,7 +2233,7 @@ impl TaskRuntimeStore {
                         "TaskRun '{run_id}' already exists with a different immutable identity"
                     )));
                 }
-                return Ok(existing);
+                return Ok((existing, false));
             }
 
             let run = new_pending_run(
@@ -2244,7 +2275,7 @@ impl TaskRuntimeStore {
                 &run.goal_sha256,
                 goal,
             );
-            Ok(run)
+            Ok((run, true))
         })
     }
 
@@ -2630,7 +2661,26 @@ impl TaskRuntimeStore {
         target: TaskRunStatus,
         note: Option<&str>,
     ) -> Result<TaskRun, StoreError> {
-        self.finalize_run_with_note_task(run_id, target, None, note)
+        self.finalize_run_evidence(run_id, target, note)
+            .map(|(run, _settlement)| run)
+    }
+
+    /// Finalize a terminal run and classify the attempted transition.
+    ///
+    /// Success (`Completed`) evidence is only accepted from a running run.
+    /// Once cancellation or pause has settled, late success is rejected with
+    /// [`SuccessEvidenceSettlement::Late`] and the durable status is preserved;
+    /// re-delivering an already committed terminal status is a
+    /// [`SuccessEvidenceSettlement::Duplicate`] no-op.
+    pub(crate) fn finalize_run_evidence(
+        &self,
+        run_id: &str,
+        target: TaskRunStatus,
+        note: Option<&str>,
+    ) -> Result<(TaskRun, SuccessEvidenceSettlement), StoreError> {
+        self.with_run_lock(run_id, || {
+            self.finalize_run_with_note_task_locked(run_id, target, None, note)
+        })
     }
 
     pub(crate) fn finalize_run_with_note_task(
@@ -2640,6 +2690,17 @@ impl TaskRuntimeStore {
         note_task_id: Option<&str>,
         note: Option<&str>,
     ) -> Result<TaskRun, StoreError> {
+        self.finalize_run_with_note_task_evidence(run_id, target, note_task_id, note)
+            .map(|(run, _settlement)| run)
+    }
+
+    pub(crate) fn finalize_run_with_note_task_evidence(
+        &self,
+        run_id: &str,
+        target: TaskRunStatus,
+        note_task_id: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<(TaskRun, SuccessEvidenceSettlement), StoreError> {
         self.with_run_lock(run_id, || {
             self.finalize_run_with_note_task_locked(run_id, target, note_task_id, note)
         })
@@ -2651,7 +2712,7 @@ impl TaskRuntimeStore {
         target: TaskRunStatus,
         note_task_id: Option<&str>,
         note: Option<&str>,
-    ) -> Result<TaskRun, StoreError> {
+    ) -> Result<(TaskRun, SuccessEvidenceSettlement), StoreError> {
         if !matches!(
             target,
             TaskRunStatus::Completed | TaskRunStatus::Failed | TaskRunStatus::Cancelled
@@ -2674,15 +2735,39 @@ impl TaskRuntimeStore {
                 serde_json::json!({ "message": note }),
             ));
         }
-        if matches!(
-            current.status,
-            TaskRunStatus::Completed | TaskRunStatus::Cancelled
-        ) || current.status == target
-        {
+        if current.status == target {
             if !events.is_empty() {
                 self.commit_runtime_events(run_id, events)?;
             }
-            return Ok(current);
+            return Ok((current, SuccessEvidenceSettlement::Duplicate));
+        }
+        if matches!(
+            current.status,
+            TaskRunStatus::Completed | TaskRunStatus::Cancelled
+        ) {
+            if !events.is_empty() {
+                self.commit_runtime_events(run_id, events)?;
+            }
+            let winner = current.status;
+            return Ok((
+                current,
+                SuccessEvidenceSettlement::Late(LateSuccessEvidence::RunTerminal {
+                    run_status: winner,
+                }),
+            ));
+        }
+        // Cancellation and pause settle before late evidence. A `Completed`
+        // request must therefore start from `Running`; a paused run is only
+        // restartable through an explicit resume, never through executor
+        // success evidence that raced the interruption.
+        if target == TaskRunStatus::Completed {
+            let settlement = classify_run_completion(current.status);
+            if !settlement.is_committed() {
+                if !events.is_empty() {
+                    self.commit_runtime_events(run_id, events)?;
+                }
+                return Ok((current, settlement));
+            }
         }
         let mut from = current.status;
         if target != TaskRunStatus::Cancelled && from != TaskRunStatus::Running {
@@ -2740,7 +2825,7 @@ impl TaskRuntimeStore {
                 settled.status.as_str()
             )));
         }
-        Ok(settled)
+        Ok((settled, SuccessEvidenceSettlement::Committed))
     }
 
     pub(crate) fn finalize_cancelled_tasks_and_run(&self, run_id: &str) -> Result<(), StoreError> {
@@ -4233,6 +4318,12 @@ impl TaskRuntimeStore {
     }
 
     /// Atomically commit one framework-owned dispatch resolution.
+    ///
+    /// Interruption-first: when cancellation or pause already settled the run,
+    /// a late success resolution is re-targeted through the framework's exact
+    /// claim interruption authority instead of publishing the attempt's
+    /// success summary. The returned receipt reports the durable outcome so
+    /// the live event stream can project exactly what was committed.
     pub(crate) fn settle_runtime_task_resolution(
         &self,
         run_id: &str,
@@ -4240,12 +4331,62 @@ impl TaskRuntimeStore {
         claim: &echo_agent::tasks::TaskClaim,
         request: echo_agent::tasks::RuntimeTaskResolutionRequest,
         product: RuntimeTaskProductSettlement,
-    ) -> Result<echo_agent::tasks::RuntimeTaskResolution, StoreError> {
+    ) -> Result<RuntimeTaskResolutionReceipt, StoreError> {
         self.with_run_lock(run_id, || {
+            let run = self
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
             let mut graph = self
                 .load_revisioned_task_graph(run_id)?
                 .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
             let before = graph.snapshot.clone();
+            let execution_before = before
+                .tasks
+                .iter()
+                .find(|task| task.spec.id == task_id)
+                .map(|task| task.execution.clone());
+            let success_request = matches!(
+                request,
+                echo_agent::tasks::RuntimeTaskResolutionRequest::Completed
+                    | echo_agent::tasks::RuntimeTaskResolutionRequest::CompletedWithResult { .. }
+            );
+            let mut settlement = SuccessEvidenceSettlement::Committed;
+            if success_request {
+                if let Some(execution) = execution_before.as_ref() {
+                    settlement = classify_success_evidence(run.status, claim.attempt, execution);
+                } else {
+                    return Err(StoreError::TaskNotFound(task_id.to_string()));
+                }
+                if matches!(
+                    settlement,
+                    SuccessEvidenceSettlement::Late(LateSuccessEvidence::RunInterrupted { .. })
+                ) {
+                    // Record the exact-claim interruption through the framework
+                    // authority, then settle through the same path. This keeps
+                    // one settlement implementation while making the task
+                    // status agree with the interrupted run.
+                    let current = echo_agent::tasks::runtime_claim_is_current(
+                        &graph.snapshot,
+                        task_id,
+                        claim,
+                    )?;
+                    if current {
+                        let disposition = if run.status == TaskRunStatus::Paused {
+                            echo_agent::tasks::RuntimeInterruptionDisposition::Paused {
+                                reason: "run paused before late success evidence".to_string(),
+                            }
+                        } else {
+                            echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled
+                        };
+                        echo_agent::tasks::request_runtime_task_interruption(
+                            &mut graph.snapshot,
+                            task_id,
+                            claim,
+                            disposition,
+                        )?;
+                    }
+                }
+            }
             let outcome = echo_agent::tasks::settle_runtime_resolution(
                 &mut graph.snapshot,
                 task_id,
@@ -4259,22 +4400,61 @@ impl TaskRuntimeStore {
                 diagnostic_note,
                 typed_terminal: _,
             } = product;
+            // Success evidence may only be published when the framework
+            // committed a successful resolution for this exact attempt.
+            let committed_success =
+                outcome == echo_agent::tasks::RuntimeTaskResolution::Completed;
+            // Rejected success evidence never publishes the attempt's success
+            // text or review. Non-success resolutions (blocked/failed/
+            // cancelled) keep their product evidence so review history and
+            // diagnostics stay intact.
+            let rejected = settlement.is_late() || (success_request && !committed_success);
+            let committed_label = rejected.then_some("settlement superseded by interruption");
             let mut product_events = Vec::new();
             if outcome != echo_agent::tasks::RuntimeTaskResolution::Superseded {
-                if let Some(summary) = execution_summary {
+                if rejected {
+                    let (classification, late_reason) = match &settlement {
+                        SuccessEvidenceSettlement::Late(late) => (
+                            serde_json::to_value(late).unwrap_or(serde_json::Value::Null),
+                            Some(late.as_str()),
+                        ),
+                        _ => (serde_json::json!({ "run_status": run.status }), None),
+                    };
                     product_events.push(RuntimeJournalEvent::for_append(
                         run_id,
                         Some(task_id),
                         None,
                         RuntimeEventKind::Note,
                         serde_json::json!({
-                            "kind": "summary_persisted",
-                            "summary": summary,
+                            "kind": "settlement_evidence_rejected",
+                            "settlement": settlement.as_str(),
+                            "reason": late_reason,
+                            "classification": classification,
+                            "claim_id": claim.claim_id,
+                            "plan_revision": claim.revision,
+                            "attempt": claim.attempt,
                         }),
                     ));
-                }
-                if let Some(review) = review {
-                    product_events.push(review_runtime_event(&review, Some(claim)));
+                } else {
+                    if let Some(execution_summary) = execution_summary {
+                        product_events.push(RuntimeJournalEvent::for_append(
+                            run_id,
+                            Some(task_id),
+                            None,
+                            RuntimeEventKind::Note,
+                            serde_json::json!({
+                                "kind": "summary_persisted",
+                                "summary": execution_summary,
+                                // Attempt fence: replay must never apply this
+                                // fact to a later retry of the same task.
+                                "attempt": claim.attempt,
+                                "claim_id": claim.claim_id,
+                            }),
+                        ));
+                    }
+                    if let Some(review) = review {
+                        product_events.push(review_runtime_event(&review, Some(claim)));
+                    }
                 }
                 if let Some(message) = diagnostic_note {
                     product_events.push(RuntimeJournalEvent::for_append(
@@ -4292,14 +4472,35 @@ impl TaskRuntimeStore {
                     ));
                 }
             }
+            // The task event summary must agree with what committed: rejected
+            // attempts fall back to the interruption label instead of leaking
+            // their success text into the projection.
+            let event_summary = if rejected {
+                committed_label
+            } else {
+                summary.as_deref()
+            };
             self.persist_runtime_execution_changes(
                 run_id,
                 &before,
                 &graph.snapshot,
-                summary.as_deref(),
+                event_summary,
                 product_events,
             )?;
-            Ok(outcome)
+            let committed_status = self
+                .runtime_task_execution_locked(run_id, task_id)?
+                .map(|execution| execution.status);
+            let committed_summary = if rejected {
+                committed_label.map(str::to_string)
+            } else {
+                summary
+            };
+            Ok(RuntimeTaskResolutionReceipt {
+                resolution: outcome,
+                settlement,
+                committed_summary,
+                committed_status,
+            })
         })
     }
 
@@ -4533,8 +4734,48 @@ impl TaskRuntimeStore {
     /// write is transactional and appends a `Note` event so the GUI and the
     /// recovery path can tell when a summary was updated (consistent with the
     /// "every state-relevant change writes a TaskEvent" invariant).
-    pub fn put_summary(&self, s: &TaskExecutionSummary) -> Result<(), StoreError> {
+    ///
+    /// Interruption-first fence: a summary that arrives after the run was
+    /// cancelled/paused (for example a review that finished during the
+    /// interruption) is rejected as late and never overwrites interruption
+    /// truth. Re-delivering the identical summary for an already settled
+    /// attempt is a duplicate no-op. The summary is bound to the producing
+    /// attempt so replay cannot apply it to a newer retry.
+    pub fn put_summary(
+        &self,
+        s: &TaskExecutionSummary,
+    ) -> Result<SuccessEvidenceSettlement, StoreError> {
         self.with_run_lock(&s.run_id, || {
+            let run = self
+                .get_run(&s.run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(s.run_id.clone()))?;
+            let execution = self.runtime_task_execution_locked(&s.run_id, &s.task_id)?;
+            let attempt = execution
+                .as_ref()
+                .map(|execution| execution.retry_count.saturating_add(1))
+                .unwrap_or(1);
+            // Run-level interruption is the binding fence for summary
+            // evidence. Task/claim freshness is enforced on the executor path
+            // (`settle_runtime_task_resolution`), which carries the exact
+            // physical claim; this upsert path only refuses evidence that the
+            // run already settled as an interruption or failure.
+            let run_fence = classify_run_completion(run.status);
+            let settlement = if run_fence.is_late() {
+                run_fence
+            } else if self.existing_summary_matches(s)? {
+                SuccessEvidenceSettlement::Duplicate
+            } else {
+                SuccessEvidenceSettlement::Committed
+            };
+            if !settlement.is_committed() {
+                tracing::debug!(
+                    run_id = %s.run_id,
+                    task_id = %s.task_id,
+                    settlement = settlement.as_str(),
+                    "late execution summary rejected; durable terminal truth preserved"
+                );
+                return Ok(settlement);
+            }
             // U1c phase-0/0bc step-2: file authority. Note{summary_persisted}
             // carries the full summary so FileTaskStore.get_summary can derive it.
             self.commit_runtime_event(RuntimeJournalEvent::for_append(
@@ -4546,9 +4787,51 @@ impl TaskRuntimeStore {
                     "kind": "summary_persisted",
                     // Full summary so events.jsonl can rebuild plan.json task summaries.
                     "summary": s,
+                    // Attempt fence: replay must never apply this fact to a
+                    // later retry of the same task.
+                    "attempt": attempt,
+                    "claim_id": execution.as_ref().and_then(|execution| {
+                        execution.claim.as_ref().map(|claim| claim.claim_id.clone())
+                    }),
                 }),
-            ))
+            ))?;
+            Ok(SuccessEvidenceSettlement::Committed)
         })
+    }
+
+    /// Whether the durable summary for `s` is the same evidence.
+    fn existing_summary_matches(&self, s: &TaskExecutionSummary) -> Result<bool, StoreError> {
+        let Some(existing) = self.get_summary(&s.run_id, &s.task_id)? else {
+            return Ok(false);
+        };
+        Ok(existing.task_id == s.task_id
+            && existing.subagent_name == s.subagent_name
+            && existing.outcome.status == s.outcome.status
+            && existing.outcome.summary == s.outcome.summary)
+    }
+
+    /// Canonical framework execution for one plan task, read without mutation.
+    pub fn runtime_task_execution(
+        &self,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<Option<echo_agent::tasks::TaskExecution>, StoreError> {
+        self.runtime_task_execution_locked(run_id, task_id)
+    }
+
+    fn runtime_task_execution_locked(
+        &self,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<Option<echo_agent::tasks::TaskExecution>, StoreError> {
+        Ok(self.load_revisioned_task_graph(run_id)?.and_then(|graph| {
+            graph
+                .snapshot
+                .tasks
+                .iter()
+                .find(|task| task.spec.id == task_id)
+                .map(|task| task.execution.clone())
+        }))
     }
 
     // ── Read paths (used by Tauri query commands + recovery) ────────────

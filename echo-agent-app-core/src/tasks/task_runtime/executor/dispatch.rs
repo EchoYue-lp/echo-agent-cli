@@ -509,6 +509,82 @@ fn task_execution_summary_candidate(
     }
 }
 
+/// Stable label for one committed framework task status.
+fn committed_task_status_label(status: &echo_agent::tasks::TaskStatus) -> &'static str {
+    match status {
+        echo_agent::tasks::TaskStatus::Pending => "pending",
+        echo_agent::tasks::TaskStatus::Running => "running",
+        echo_agent::tasks::TaskStatus::Retrying { .. } => "retrying",
+        echo_agent::tasks::TaskStatus::Completed => "completed",
+        echo_agent::tasks::TaskStatus::Failed(_) => "failed",
+        echo_agent::tasks::TaskStatus::TimedOut { .. } => "timed_out",
+        echo_agent::tasks::TaskStatus::Blocked(_) => "blocked",
+        echo_agent::tasks::TaskStatus::Skipped => "skipped",
+        echo_agent::tasks::TaskStatus::Cancelled => "cancelled",
+        echo_agent::tasks::TaskStatus::Paused(_) => "paused",
+    }
+}
+
+/// Terminal live event for one committed framework task status.
+///
+/// The live stream must never project a status the journal did not commit, so
+/// this mapping is driven by the committed execution rather than by the
+/// attempt's requested resolution.
+fn runtime_event_for_committed_status(
+    status: &echo_agent::tasks::TaskStatus,
+) -> Option<RuntimeEventKind> {
+    match status {
+        echo_agent::tasks::TaskStatus::Completed => Some(RuntimeEventKind::TaskCompleted),
+        echo_agent::tasks::TaskStatus::Skipped => Some(RuntimeEventKind::TaskSkipped),
+        echo_agent::tasks::TaskStatus::TimedOut { .. } => Some(RuntimeEventKind::TaskTimedOut),
+        echo_agent::tasks::TaskStatus::Failed(_) => Some(RuntimeEventKind::TaskFailed),
+        echo_agent::tasks::TaskStatus::Blocked(_) => Some(RuntimeEventKind::TaskBlocked),
+        echo_agent::tasks::TaskStatus::Cancelled => Some(RuntimeEventKind::TaskCancelled),
+        echo_agent::tasks::TaskStatus::Paused(_) => Some(RuntimeEventKind::TaskBlocked),
+        echo_agent::tasks::TaskStatus::Pending
+        | echo_agent::tasks::TaskStatus::Running
+        | echo_agent::tasks::TaskStatus::Retrying { .. } => None,
+    }
+}
+
+/// Build the live task payload from the committed settlement receipt.
+///
+/// Accepted evidence keeps the attempt's rich fields (artifacts, verification,
+/// touched files) because the store committed them. Rejected (late) evidence
+/// is reduced to the interruption facts that actually settled, so the live
+/// stream cannot advertise a success the journal does not contain.
+fn committed_task_payload(
+    receipt: &RuntimeTaskResolutionReceipt,
+    staged: serde_json::Value,
+) -> serde_json::Value {
+    let status_label = receipt
+        .committed_status
+        .as_ref()
+        .map(committed_task_status_label);
+    if receipt.settlement.is_late() {
+        return serde_json::json!({
+            "terminal_status": status_label,
+            "summary": receipt.committed_summary,
+            "settlement": receipt.settlement.as_str(),
+        });
+    }
+    let mut payload = staged;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "terminal_status".to_string(),
+            serde_json::json!(status_label),
+        );
+        if let Some(summary) = receipt.committed_summary.as_ref() {
+            object.insert("summary".to_string(), serde_json::json!(summary));
+        }
+        object.insert(
+            "settlement".to_string(),
+            serde_json::json!(receipt.settlement.as_str()),
+        );
+    }
+    payload
+}
+
 #[allow(clippy::result_large_err)]
 async fn finalize_subagent_execution(
     blocking: TaskRuntimeOperation,
@@ -2169,7 +2245,10 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&claim.claim_id)
             .unwrap_or_default();
-        let committed_payload = product
+        // The attempt's rich payload is only eligible when the durable
+        // settlement accepts it; the committed receipt below decides what the
+        // live stream may claim.
+        let staged_payload = product
             .execution_summary
             .as_ref()
             .map(|summary| {
@@ -2189,46 +2268,27 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         let task_id = runtime_task.spec.id.clone();
         let agent_role = Self::plan_task(runtime_task)?.agent_role;
         let claim = claim.clone();
-        let (outcome, run) = self
+        let (receipt, run) = self
             .blocking
             .run("settle runtime task resolution", move |store| {
-                let outcome = store
+                let receipt = store
                     .settle_runtime_task_resolution(&run_id, &task_id, &claim, request, product)?;
                 let run = store.get_run(&run_id)?;
-                Ok((outcome, run))
+                Ok((receipt, run))
             })
             .await?;
-        let terminal_event = match &outcome {
-            echo_agent::tasks::RuntimeTaskResolution::Completed => {
-                Some(RuntimeEventKind::TaskCompleted)
-            }
-            echo_agent::tasks::RuntimeTaskResolution::Skipped => {
-                Some(RuntimeEventKind::TaskSkipped)
-            }
-            echo_agent::tasks::RuntimeTaskResolution::TimedOut { .. } => {
-                Some(RuntimeEventKind::TaskTimedOut)
-            }
-            echo_agent::tasks::RuntimeTaskResolution::Failed { .. } => {
-                Some(RuntimeEventKind::TaskFailed)
-            }
-            echo_agent::tasks::RuntimeTaskResolution::Blocked { .. } => {
-                Some(RuntimeEventKind::TaskBlocked)
-            }
-            echo_agent::tasks::RuntimeTaskResolution::Cancelled => {
-                Some(RuntimeEventKind::TaskCancelled)
-            }
-            echo_agent::tasks::RuntimeTaskResolution::Interrupted { disposition } => {
-                Some(match disposition {
-                    echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled => {
-                        RuntimeEventKind::TaskCancelled
-                    }
-                    echo_agent::tasks::RuntimeInterruptionDisposition::Paused { .. } => {
-                        RuntimeEventKind::TaskBlocked
-                    }
-                })
-            }
-            echo_agent::tasks::RuntimeTaskResolution::Pending
-            | echo_agent::tasks::RuntimeTaskResolution::Superseded => None,
+        let committed_payload = committed_task_payload(&receipt, staged_payload);
+        // The live event projects the committed task status. A duplicate
+        // re-delivery is a no-op, and a late attempt must surface the
+        // interruption that actually won.
+        let terminal_event = match receipt.committed_status.as_ref() {
+            Some(status) => runtime_event_for_committed_status(status),
+            None => None,
+        };
+        let terminal_event = if receipt.settlement.is_duplicate() {
+            None
+        } else {
+            terminal_event
         };
         if let Some(run) = run
             && let Some(terminal_event) = terminal_event
@@ -2254,7 +2314,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                 &wake_run_id,
             );
         }
-        Ok(outcome)
+        Ok(receipt.resolution)
     }
 
     async fn abandon_claim(

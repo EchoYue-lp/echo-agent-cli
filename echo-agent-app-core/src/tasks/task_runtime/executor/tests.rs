@@ -456,6 +456,7 @@ mod tests {
                         typed_terminal: Some(failure.clone()),
                     },
                 )
+                .map(|receipt| receipt.resolution)
                 .map_err(|error| error.to_string())?;
             match expected_outcome {
                 "pending" => assert_eq!(
@@ -3791,4 +3792,71 @@ Read the runtime path and found one missing branch.
         );
         Ok(())
     }
+    #[test]
+    fn live_task_payload_projects_only_committed_settlement() {
+        let paused = echo_agent::tasks::TaskStatus::Paused("paused by user".to_string());
+        let late = RuntimeTaskResolutionReceipt {
+            resolution: echo_agent::tasks::RuntimeTaskResolution::Interrupted {
+                disposition: echo_agent::tasks::RuntimeInterruptionDisposition::Paused {
+                    reason: "paused by user".to_string(),
+                },
+            },
+            settlement: crate::tasks::task_runtime::SuccessEvidenceSettlement::Late(
+                crate::tasks::task_runtime::LateSuccessEvidence::RunInterrupted {
+                    run_status: TaskRunStatus::Paused,
+                },
+            ),
+            committed_summary: Some("settlement superseded by interruption".to_string()),
+            committed_status: Some(paused.clone()),
+        };
+        let staged = serde_json::json!({
+            "terminal_status": "completed",
+            "summary": "late success",
+            "artifacts": [{"path": "late.txt"}],
+        });
+        let payload = committed_task_payload(&late, staged);
+        assert_eq!(payload["terminal_status"], "paused");
+        assert_eq!(payload["settlement"], "late");
+        assert_ne!(payload["summary"], "late success");
+        assert!(
+            payload.get("artifacts").is_none(),
+            "rejected evidence must not expose its artifacts"
+        );
+        assert_eq!(
+            runtime_event_for_committed_status(&paused),
+            Some(RuntimeEventKind::TaskBlocked)
+        );
+
+        let completed = echo_agent::tasks::TaskStatus::Completed;
+        let accepted = RuntimeTaskResolutionReceipt {
+            resolution: echo_agent::tasks::RuntimeTaskResolution::Completed,
+            settlement: crate::tasks::task_runtime::SuccessEvidenceSettlement::Committed,
+            committed_summary: Some("committed result".to_string()),
+            committed_status: Some(completed.clone()),
+        };
+        let accepted_payload = committed_task_payload(
+            &accepted,
+            serde_json::json!({
+                "terminal_status": "completed",
+                "summary": "staged result",
+                "artifacts": [{"path": "kept.txt"}],
+            }),
+        );
+        assert_eq!(accepted_payload["terminal_status"], "completed");
+        assert_eq!(accepted_payload["summary"], "committed result");
+        assert_eq!(accepted_payload["settlement"], "committed");
+        assert!(
+            accepted_payload.get("artifacts").is_some(),
+            "committed evidence keeps its rich payload"
+        );
+        assert_eq!(
+            runtime_event_for_committed_status(&completed),
+            Some(RuntimeEventKind::TaskCompleted)
+        );
+        assert_eq!(
+            runtime_event_for_committed_status(&echo_agent::tasks::TaskStatus::Pending),
+            None
+        );
+    }
+
 }

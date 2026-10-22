@@ -56,6 +56,7 @@ mod history_projection;
 pub mod hook_event_dispatcher;
 pub mod ledger;
 pub mod memory_bridge;
+pub mod occurrence;
 pub mod planner;
 pub mod profiles;
 pub mod register;
@@ -63,6 +64,7 @@ pub mod review;
 pub mod revisioned_runtime;
 mod root_authority;
 mod run_authority;
+pub mod settlement_evidence;
 pub mod store;
 pub mod subagent_control;
 pub mod task_execute_tool;
@@ -88,6 +90,7 @@ pub use ledger::{export_path, render_progress, write_progress};
 pub use memory_bridge::{
     MemoryEvent, MemoryPolicy, write_memory_candidate_dispatch, write_memory_candidate_settled,
 };
+pub use occurrence::{OccurrenceIdentity, OccurrenceRunRequest};
 pub use planner::{
     FileOverlapPair, OwnershipReport, analyze_file_ownership, has_writer_file_overlap,
 };
@@ -98,6 +101,10 @@ pub use register::{
 };
 pub use review::{BreakerAction, ReviewError, build_fix_task, requires_review, review_task};
 pub use revisioned_runtime::{apply_task_update, build_task_revision_service, commit_task_plan};
+pub use settlement_evidence::{
+    LateSuccessEvidence, SuccessEvidenceSettlement, classify_run_completion,
+    classify_success_evidence,
+};
 pub use store::{
     AbandonedRunSettlement, BootAutoResumeBlocker, BootAutoResumeDecision, BootAutoResumeOutcome,
     ProviderRetryDisposition, RunDriverReceiptOwner, RuntimeEventQuery, StoreError,

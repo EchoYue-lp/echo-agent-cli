@@ -106,7 +106,8 @@ impl ProcessExecutionGovernor {
 
 use super::completion_gate::{artifact_matches, verification_matches};
 use super::store::{
-    RuntimeTaskProductSettlement, StoreError, SubagentReleaseRecord, TaskRuntimeStore,
+    RuntimeTaskProductSettlement, RuntimeTaskResolutionReceipt, StoreError, SubagentReleaseRecord,
+    TaskRuntimeStore,
 };
 use super::types::*;
 

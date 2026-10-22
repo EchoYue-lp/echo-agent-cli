@@ -670,7 +670,10 @@ mod tests {
             },
             RuntimeTaskProductSettlement::default(),
         )?;
-        assert_eq!(outcome, echo_agent::tasks::RuntimeTaskResolution::Completed);
+        assert_eq!(
+            outcome.resolution,
+            echo_agent::tasks::RuntimeTaskResolution::Completed
+        );
         let original = store
             .load_revisioned_task_graph("r1")?
             .ok_or("graph missing")?;
@@ -7334,7 +7337,8 @@ mod tests {
                     summary: Some("retry after cargo check".to_string()),
                     ..RuntimeTaskProductSettlement::default()
                 },
-            )?,
+            )?
+            .resolution,
             framework_resolution
         );
         let stored_requeued = store.load_runtime_plan_snapshot("r1")?;
@@ -7403,7 +7407,8 @@ mod tests {
                     diagnostic_note: Some("accepted new claim review".to_string()),
                     typed_terminal: None,
                 },
-            )?,
+            )?
+            .resolution,
             echo_agent::tasks::RuntimeTaskResolution::Completed
         );
         let stale_summary = TaskExecutionSummary {
@@ -7438,7 +7443,8 @@ mod tests {
                     diagnostic_note: Some("stale claim review note".to_string()),
                     typed_terminal: None,
                 },
-            )?,
+            )?
+            .resolution,
             echo_agent::tasks::RuntimeTaskResolution::Superseded
         );
         assert_eq!(
@@ -8916,7 +8922,7 @@ mod tests {
                 .get("state")
                 .and_then(|state| state.get("query_projection_schema"))
                 .and_then(serde_json::Value::as_u64),
-            Some(2)
+            Some(3)
         );
         drop(reopened);
         let restarted = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
@@ -10101,4 +10107,369 @@ mod tests {
             sort_order: 0,
         }
     }
+    fn claimed_task_for(
+        store: &TaskRuntimeStore,
+        run_id: &str,
+    ) -> Result<(echo_agent::tasks::TaskClaim, echo_agent::tasks::Task), StoreError> {
+        let snapshot = store.load_runtime_plan_snapshot(run_id)?;
+        let task = snapshot
+            .tasks
+            .first()
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        let claim = match store.claim_runtime_task(run_id, &task, snapshot.revision)? {
+            echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                return Err(StoreError::InvalidPlan("claim not admitted".to_string()));
+            }
+        };
+        Ok((claim, task))
+    }
+
+    fn evidence_summary(text: &str) -> TaskExecutionSummary {
+        TaskExecutionSummary {
+            run_id: "r1".to_string(),
+            task_id: "t1".to_string(),
+            subagent_name: "subagent".to_string(),
+            outcome: SubagentOutcome::terminal(SubagentStatus::Completed, text, Vec::new()),
+            decisions: Vec::new(),
+            next_implications: Vec::new(),
+            suggested_tasks: Vec::new(),
+            created_at: Utc::now(),
+        }
+    }
+
+    fn evidence_product(text: &str) -> RuntimeTaskProductSettlement {
+        RuntimeTaskProductSettlement {
+            summary: Some(text.to_string()),
+            execution_summary: Some(evidence_summary(text)),
+            review: Some(ReviewResult {
+                id: format!("review-{text}"),
+                run_id: "r1".to_string(),
+                task_id: "t1".to_string(),
+                reviewer_agent: "reviewer".to_string(),
+                outcome: ReviewOutcome::Pass,
+                issues: Vec::new(),
+                failure_fingerprint: None,
+                created_fix_task_id: None,
+                created_at: Utc::now(),
+            }),
+            diagnostic_note: None,
+            typed_terminal: None,
+        }
+    }
+
+    #[test]
+    fn interruption_wins_over_late_completion_and_abandon_matrix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // cancel/pause x completion/abandon: interruption always owns the
+        // durable status and no success summary or review is published.
+        for interrupt in ["cancel", "pause"] {
+            for outcome in ["completion", "abandon"] {
+                let store = fresh()?;
+                seed_plan(&store)?;
+                let (claim, _task) = claimed_task_for(&store, "r1")?;
+                if interrupt == "cancel" {
+                    assert!(store.request_cancel("r1")?);
+                } else {
+                    assert!(store.request_pause("r1")?);
+                }
+                let expected_run = if interrupt == "cancel" {
+                    TaskRunStatus::Cancelled
+                } else {
+                    TaskRunStatus::Paused
+                };
+                assert_eq!(
+                    store.get_run("r1")?.map(|run| run.status),
+                    Some(expected_run),
+                    "{interrupt} must settle the run before evidence"
+                );
+
+                if outcome == "completion" {
+                    let receipt = store.settle_runtime_task_resolution(
+                        "r1",
+                        "t1",
+                        &claim,
+                        echo_agent::tasks::RuntimeTaskResolutionRequest::Completed,
+                        evidence_product("late success"),
+                    )?;
+                    assert!(
+                        receipt.settlement.is_late(),
+                        "{interrupt}/{outcome}: late evidence must be classified as late, got {:?}",
+                        receipt.settlement
+                    );
+                    assert_ne!(
+                        receipt.committed_summary.as_deref(),
+                        Some("late success"),
+                        "{interrupt}/{outcome}: committed summary must never be the rejected text"
+                    );
+                    let committed = receipt
+                        .committed_status
+                        .as_ref()
+                        .cloned()
+                        .ok_or("committed status missing")?;
+                    assert!(
+                        matches!(
+                            committed,
+                            echo_agent::tasks::TaskStatus::Cancelled
+                                | echo_agent::tasks::TaskStatus::Paused(_)
+                        ),
+                        "{interrupt}/{outcome}: committed task status was {committed:?}"
+                    );
+                } else {
+                    let fallback = if interrupt == "cancel" {
+                        echo_agent::tasks::TaskStatus::Cancelled
+                    } else {
+                        echo_agent::tasks::TaskStatus::Paused("paused by user".to_string())
+                    };
+                    store.settle_runtime_task_claim(
+                        "r1",
+                        "t1",
+                        &claim,
+                        fallback,
+                        Some("abandoned attempt".to_string()),
+                    )?;
+                    let committed = store
+                        .runtime_task_execution("r1", "t1")?
+                        .map(|execution| execution.status)
+                        .ok_or("task missing after abandon")?;
+                    assert!(
+                        matches!(
+                            committed,
+                            echo_agent::tasks::TaskStatus::Cancelled
+                                | echo_agent::tasks::TaskStatus::Paused(_)
+                        ),
+                        "{interrupt}/{outcome}: abandoned task status was {committed:?}"
+                    );
+                }
+
+                assert_eq!(
+                    store.get_run("r1")?.map(|run| run.status),
+                    Some(expected_run),
+                    "{interrupt}/{outcome}: late evidence must not change the run"
+                );
+                assert!(
+                    store.get_summary("r1", "t1")?.is_none(),
+                    "{interrupt}/{outcome}: no success summary may land"
+                );
+                assert!(
+                    store.list_reviews("r1", "t1")?.is_empty(),
+                    "{interrupt}/{outcome}: no success review may land"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn review_finishing_after_pause_never_persists_success_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = fresh()?;
+        seed_plan(&store)?;
+        let (claim, _task) = claimed_task_for(&store, "r1")?;
+        assert!(store.request_pause("r1")?);
+
+        let receipt = store.settle_runtime_task_resolution(
+            "r1",
+            "t1",
+            &claim,
+            echo_agent::tasks::RuntimeTaskResolutionRequest::Completed,
+            evidence_product("review completed after pause"),
+        )?;
+        assert!(receipt.settlement.is_late());
+        assert_eq!(
+            store.get_run("r1")?.map(|run| run.status),
+            Some(TaskRunStatus::Paused)
+        );
+        assert!(store.get_summary("r1", "t1")?.is_none());
+        assert!(store.list_reviews("r1", "t1")?.is_empty());
+        let events = store.list_events("r1", 0)?;
+        assert!(
+            events.iter().any(|event| {
+                event
+                    .payload
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("settlement_evidence_rejected")
+            }),
+            "late evidence must leave one durable rejection fact"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_success_redelivery_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+        let store = fresh()?;
+        seed_plan(&store)?;
+        let (claim, _task) = claimed_task_for(&store, "r1")?;
+        let first = store.settle_runtime_task_resolution(
+            "r1",
+            "t1",
+            &claim,
+            echo_agent::tasks::RuntimeTaskResolutionRequest::Completed,
+            evidence_product("committed result"),
+        )?;
+        assert!(first.settlement.is_committed());
+        let sequence = store
+            .get_run_state("r1")?
+            .map(|state| state.journal_sequence)
+            .ok_or("run state missing")?;
+
+        let repeat = store.settle_runtime_task_resolution(
+            "r1",
+            "t1",
+            &claim,
+            echo_agent::tasks::RuntimeTaskResolutionRequest::Completed,
+            evidence_product("committed result"),
+        )?;
+        assert!(
+            repeat.settlement.is_duplicate(),
+            "re-delivery of the same attempt's success must be a duplicate, got {:?}",
+            repeat.settlement
+        );
+        assert_eq!(
+            store
+                .get_run_state("r1")?
+                .map(|state| state.journal_sequence),
+            Some(sequence),
+            "duplicate evidence must not append journal facts"
+        );
+        assert_eq!(
+            store
+                .get_summary("r1", "t1")?
+                .map(|summary| summary.outcome.summary),
+            Some("committed result".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn late_success_after_cancel_does_not_rewrite_terminal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = fresh()?;
+        seed_plan(&store)?;
+        let (claim, _task) = claimed_task_for(&store, "r1")?;
+        assert!(store.request_cancel("r1")?);
+        let receipt = store.settle_runtime_task_resolution(
+            "r1",
+            "t1",
+            &claim,
+            echo_agent::tasks::RuntimeTaskResolutionRequest::Completed,
+            evidence_product("late success after cancel"),
+        )?;
+        assert!(receipt.settlement.is_late());
+        assert_eq!(
+            store.get_run("r1")?.map(|run| run.status),
+            Some(TaskRunStatus::Cancelled)
+        );
+        assert_eq!(
+            store
+                .runtime_task_execution("r1", "t1")?
+                .map(|execution| execution.status),
+            Some(echo_agent::tasks::TaskStatus::Cancelled)
+        );
+        assert!(store.get_summary("r1", "t1")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_retry_restores_execution_fields_without_stale_summary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store =
+            TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path()).map_err(|error| {
+                StoreError::InvalidPlan(error.to_string())
+            })?;
+        seed_plan(&store)?;
+        let (claim, _task) = claimed_task_for(&store, "r1")?;
+        // Attempt one publishes a summary, then fails and becomes retryable.
+        assert!(store.put_summary(&evidence_summary("attempt one summary"))?
+            .is_committed());
+        let failed = store.settle_runtime_task_resolution(
+            "r1",
+            "t1",
+            &claim,
+            echo_agent::tasks::RuntimeTaskResolutionRequest::Failed {
+                error: "attempt one failed".to_string(),
+            },
+            RuntimeTaskProductSettlement {
+                summary: Some("attempt one failed".to_string()),
+                ..RuntimeTaskProductSettlement::default()
+            },
+        )?;
+        assert_eq!(
+            failed.resolution,
+            echo_agent::tasks::RuntimeTaskResolution::Failed {
+                error: "attempt one failed".to_string()
+            }
+        );
+
+        // Field-level authority: the framework retry defines the exact
+        // canonical execution every projection must restore.
+        let before = store.load_runtime_plan_snapshot("r1")?;
+        let expected_task = before
+            .tasks
+            .first()
+            .cloned()
+            .ok_or("task missing before retry")?;
+        let mut expected_snapshot = store
+            .load_revisioned_task_graph("r1")?
+            .ok_or("revisioned graph missing before retry")?
+            .snapshot;
+        assert_eq!(
+            echo_agent::tasks::retry_runtime_task(
+                &mut expected_snapshot,
+                &expected_task,
+                before.revision
+            )?,
+            echo_agent::tasks::RuntimeTaskRetryOutcome::Retried { retry_count: 1 }
+        );
+        let expected_execution = expected_snapshot
+            .tasks
+            .first()
+            .map(|task| task.execution.clone())
+            .ok_or("retried task missing")?;
+
+        let retried = store.retry_runtime_task("r1", &expected_task, before.revision)?;
+        assert_eq!(
+            retried,
+            echo_agent::tasks::RuntimeTaskRetryOutcome::Retried { retry_count: 1 }
+        );
+        let committed = store
+            .runtime_task_execution("r1", "t1")?
+            .ok_or("canonical execution missing after retry")?;
+        assert_eq!(
+            committed, expected_execution,
+            "retried canonical execution must be restored field by field"
+        );
+        assert_eq!(committed.status, echo_agent::tasks::TaskStatus::Pending);
+        assert_eq!(committed.retry_count, 1);
+        assert!(committed.claim.is_none());
+        assert!(committed.result.is_none());
+        assert!(committed.interruption_requested.is_none());
+        assert!(
+            store.get_summary("r1", "t1")?.is_none(),
+            "attempt-one summary must not survive the retry"
+        );
+        // The plan projection and the canonical execution agree.
+        let plan = store.get_plan("r1")?.ok_or("plan missing")?;
+        let plan_task = plan
+            .tasks
+            .iter()
+            .find(|task| task.id == "t1")
+            .ok_or("plan task missing")?;
+        assert_eq!(plan_task.execution(), committed);
+
+        drop(store);
+        // Restart replay from the journal restores the same canonical fields.
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+        let replayed = reopened
+            .runtime_task_execution("r1", "t1")?
+            .ok_or("canonical execution missing after replay")?;
+        assert_eq!(replayed, expected_execution);
+        assert!(reopened.get_summary("r1", "t1")?.is_none());
+        Ok(())
+    }
+
 }

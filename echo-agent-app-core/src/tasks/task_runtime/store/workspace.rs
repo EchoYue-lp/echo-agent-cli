@@ -941,6 +941,24 @@ pub(crate) struct RuntimeTaskProductSettlement {
     pub typed_terminal: Option<echo_agent::error::AgentFailure>,
 }
 
+/// Durable result of one dispatch resolution.
+///
+/// The live event stream projects this receipt instead of the staged attempt
+/// payload, so rejected success evidence can never surface as a completed task
+/// while the journal records an interruption.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeTaskResolutionReceipt {
+    /// Framework resolution committed by the canonical graph.
+    pub resolution: echo_agent::tasks::RuntimeTaskResolution,
+    /// Interruption-first classification of the attempted evidence.
+    pub settlement: SuccessEvidenceSettlement,
+    /// Summary text actually committed to the task projection, if any.
+    pub committed_summary: Option<String>,
+    /// Task status read back from the committed graph.
+    pub committed_status: Option<echo_agent::tasks::TaskStatus>,
+}
+
+
 enum RunTurnClaimPreparation {
     Start(RuntimeJournalEvent),
     NotSubmitted(ContinuationNotSubmittedReason),

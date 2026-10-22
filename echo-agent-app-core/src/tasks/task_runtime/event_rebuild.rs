@@ -56,6 +56,49 @@ impl BoundCompletionEvent {
     }
 }
 
+/// Attempt fence for one durable summary fact.
+///
+/// Summaries are produced by one physical claim. Replay must never apply a
+/// summary to a later retry (or to a resumed attempt that produced a new
+/// claim), otherwise stale text from an old attempt overwrites the canonical
+/// execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SummaryEvidenceFence {
+    attempt: u32,
+    claim_id: Option<String>,
+}
+
+impl SummaryEvidenceFence {
+    fn from_payload(payload: &serde_json::Value) -> Option<Self> {
+        let attempt = payload
+            .get("attempt")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())?;
+        Some(Self {
+            attempt,
+            claim_id: payload
+                .get("claim_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        })
+    }
+
+    /// Whether this fence still describes the canonical execution.
+    fn matches_execution(&self, execution: &echo_agent::tasks::TaskExecution) -> bool {
+        let current_attempt = execution.retry_count.saturating_add(1);
+        if self.attempt != current_attempt {
+            return false;
+        }
+        // A live claim must be the exact producer. Once the attempt settled the
+        // claim is cleared and the attempt number is the authoritative fence.
+        match (self.claim_id.as_deref(), execution.claim.as_ref()) {
+            (Some(producer), Some(current)) => producer == current.claim_id.as_str(),
+            _ => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct CompletionQueryProjection {
     summaries: std::collections::BTreeMap<String, BoundCompletionEvent>,
@@ -274,6 +317,10 @@ pub(crate) struct EventFoldState {
     todo_runtime: std::collections::BTreeMap<String, TodoRuntimeProjection>,
     #[serde(default)]
     summaries: std::collections::BTreeMap<String, TaskExecutionSummary>,
+    /// Attempt fence of each folded summary. Absent fences (legacy journals)
+    /// keep the historical apply-without-fence behaviour.
+    #[serde(default)]
+    summary_fences: std::collections::BTreeMap<String, SummaryEvidenceFence>,
     #[serde(default)]
     completion: CompletionQueryProjection,
     #[serde(default)]
@@ -302,7 +349,7 @@ impl EventFoldState {
     }
 
     pub(crate) fn has_current_query_projection_schema(&self) -> bool {
-        self.query_projection_schema == Some(2)
+        self.query_projection_schema == Some(3)
     }
 
     #[cfg(test)]
@@ -339,12 +386,13 @@ impl EventFoldState {
             physical_owner_intent_error,
             todo_runtime,
             summaries,
+            summary_fences,
             completion,
             seen_run_ids,
             sequence_overflow: _,
             missing_record_sequence: _,
         } = self;
-        *query_projection_schema = Some(2);
+        *query_projection_schema = Some(3);
         use RuntimeEventKind as K;
         for ev in std::slice::from_ref(event) {
             seen_run_ids.insert(ev.run_id.clone());
@@ -702,6 +750,26 @@ impl EventFoldState {
                             todo_runtime.entry(task_id.clone()).or_default(),
                             ev,
                         );
+                        // A retry or resume re-opens the canonical execution:
+                        // evidence produced by the previous attempt must not
+                        // survive into the new one.
+                        let reopened =
+                            tasks
+                                .iter()
+                                .find(|task| &task.id == task_id)
+                                .is_some_and(|task| {
+                                    matches!(
+                                        task.status,
+                                        echo_agent::tasks::TaskStatus::Pending
+                                            | echo_agent::tasks::TaskStatus::Retrying { .. }
+                                    )
+                                });
+                        if reopened {
+                            summaries.remove(task_id);
+                            summary_fences.remove(task_id);
+                            completion.summaries.remove(task_id);
+                            completion.reviews.remove(task_id);
+                        }
                     }
                 }
                 K::ArtifactProduced => {}
@@ -751,19 +819,43 @@ impl EventFoldState {
                         == Some("summary_persisted") =>
                 {
                     if let Some(task_id) = ev.task_id.as_ref() {
-                        match ev.payload.get("summary").cloned().and_then(|value| {
-                            serde_json::from_value::<TaskExecutionSummary>(value).ok()
-                        }) {
-                            Some(summary) => {
-                                summaries.insert(task_id.clone(), summary);
+                        let fence = SummaryEvidenceFence::from_payload(&ev.payload);
+                        // Replay never applies a summary to a newer attempt or
+                        // to a claim that did not produce it.
+                        let stale = match (
+                            fence.as_ref(),
+                            tasks.iter().find(|task| &task.id == task_id),
+                        ) {
+                            (Some(fence), Some(task)) => {
+                                !fence.matches_execution(&task.execution())
                             }
-                            None => {
-                                summaries.remove(task_id);
+                            (Some(_), None) => true,
+                            (None, _) => false,
+                        };
+                        if !stale {
+                            match ev.payload.get("summary").cloned().and_then(|value| {
+                                serde_json::from_value::<TaskExecutionSummary>(value).ok()
+                            }) {
+                                Some(summary) => {
+                                    summaries.insert(task_id.clone(), summary);
+                                    match fence {
+                                        Some(fence) => {
+                                            summary_fences.insert(task_id.clone(), fence);
+                                        }
+                                        None => {
+                                            summary_fences.remove(task_id);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    summaries.remove(task_id);
+                                    summary_fences.remove(task_id);
+                                }
                             }
+                            completion
+                                .summaries
+                                .insert(task_id.clone(), bind_completion_event(ev, plan.as_ref()));
                         }
-                        completion
-                            .summaries
-                            .insert(task_id.clone(), bind_completion_event(ev, plan.as_ref()));
                     }
                 }
                 K::BackgroundCellStarted => {
