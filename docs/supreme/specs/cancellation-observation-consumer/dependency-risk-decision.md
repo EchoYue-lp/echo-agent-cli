@@ -121,7 +121,9 @@ The original accepted-risk policy/scanner and its three identities remain unchan
 
 The user explicitly accepted the additional current `zbus_names4.3.4`, `zvariant5.13.1` and `zvariant_derive5.14.0` maintenance risks together with the reviewed fixed-six input contract. The original 2026-10-16 glib0.18.5, proc-macro-error1.0.4 and bincode1.3.3 versions, identities, residual-risk definitions and event-bounded lifetime remain unchanged. The earlier three-risk rejection above is historical evidence before this additional decision, not a fabricated successful scan.
 
-The current exact CLI lock SHA256 is `d2e7b7ebc035d35940f20fd9a95628a37ddf13bba2c1d5c828cdac142ae41680`; consumer digest is `e46c7fcc7d928aa5442ae0fafcd3155363153c63fd18a4f52592b4549c16109b`. All six entries use `registry+https://github.com/rust-lang/crates.io-index`. The additional accepted identities are:
+The current exact CLI lock SHA256 is `d2e7b7ebc035d35940f20fd9a95628a37ddf13bba2c1d5c828cdac142ae41680`; consumer digest is `9c834f6cf60a328b93ef45888e3b88ebdd483c85244dea9b6bd6463a59d76c12`.
+
+On 2026-10-23 the application-consumer fingerprint was recomputed after the parallel remediation batch (MCP name ownership, plugin cleanup receipts, cron occurrence identity, task settlement evidence, GUI sandbox isolation floor). Only application Rust sources changed: `Cargo.lock` still hashes to the recorded value, the dependency graph is unchanged, and the six accepted advisory identities, versions, checksums and kinds are byte-identical to the decision above. No dependency, feature, build entry, scanner ignore or acceptance expansion is introduced, and no new advisory applies; only `consumer_inputs_sha256` moved with the reviewed source bytes. All six entries use `registry+https://github.com/rust-lang/crates.io-index`. The additional accepted identities are:
 
 | Advisory | Package/version | Registry checksum | Kind |
 | --- | --- | --- | --- |
