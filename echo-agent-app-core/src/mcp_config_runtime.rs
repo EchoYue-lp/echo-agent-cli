@@ -17,8 +17,97 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent_handle::AgentHandle;
 
+/// Upper bound for one MCP client connection during reconciliation.
+///
+/// The framework prepares a replacement client before swapping it in, so a
+/// bounded *wait* never sacrifices the last-known-good connection. The
+/// operation itself is never dropped on this deadline (see
+/// [`BackgroundConnect`]): the pass stops waiting, reports the target
+/// unconfirmed, and a background task keeps the framework preparation alive
+/// until it reaches a terminal state.
 const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Upper bound for one MCP client disconnection during reconciliation.
+///
+/// The framework retains an unsettled client as cleanup debt, so a timed out
+/// disconnect can be retried by a later generation. Until that retry is
+/// confirmed the name must stay claimed: releasing it while the old transport
+/// may still be half alive would let a plugin wire the same name underneath it.
+const MCP_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 const REDACTED_VALUE: &str = "<redacted>";
+
+/// Bounded deadlines for the two client operations a reconcile pass performs.
+///
+/// Production uses the module constants. Tests shrink them so deadline
+/// regressions run in milliseconds instead of seconds.
+#[derive(Clone, Copy, Debug)]
+struct ReconcileDeadlines {
+    connect: std::time::Duration,
+    disconnect: std::time::Duration,
+}
+
+impl Default for ReconcileDeadlines {
+    fn default() -> Self {
+        Self {
+            connect: MCP_CONNECT_TIMEOUT,
+            disconnect: MCP_DISCONNECT_TIMEOUT,
+        }
+    }
+}
+
+/// Result class of one bounded reconcile operation.
+///
+/// Only [`Self::Confirmed`] is a safe point for settling the user namespace:
+/// every other class means the previous connection may still be reachable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconcileOperation {
+    /// The framework reported the target reached the requested state.
+    Confirmed,
+    /// The operation failed; the previous state of the target may survive.
+    Failed,
+    /// The operation exceeded its deadline and may still be in flight.
+    TimedOut,
+    /// A newer generation superseded this pass before the operation finished.
+    Superseded,
+}
+
+/// Terminal result reported by a backgrounded connection operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConnectOperationOutcome {
+    Completed(echo_agent::mcp::McpTargetChange),
+    Failed(String),
+}
+
+/// What the pass that issued a connection operation wants done with a result
+/// that arrived after that pass stopped waiting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LateConnectDecision {
+    /// The pass consumed the receipt in time; leave the published client.
+    Keep,
+    /// The pass timed out or was superseded; withdraw a client that this
+    /// operation published after the pass reported the target unconfirmed.
+    Withdraw,
+}
+
+/// Pass-side handle of one connection operation owned by a background task.
+struct ConnectOperation {
+    result: tokio::sync::oneshot::Receiver<ConnectOperationOutcome>,
+    decision: tokio::sync::watch::Sender<Option<LateConnectDecision>>,
+}
+
+/// Settlement receipt for one connection operation owned by a background task.
+///
+/// A reconcile pass must never drop an in-flight framework preparation. The
+/// manager only clears its `preparing` ticket when the operation itself
+/// reaches a terminal state (`McpPreparationScope` has no `Drop`), so a dropped
+/// preparation keeps `building` set forever and every later connection for that
+/// name is rejected with "another preparation is still active". Keeping the
+/// operation in a task therefore trades a bounded lock wait for a permanently
+/// unusable server name.
+struct BackgroundConnect {
+    settled: tokio::sync::watch::Sender<bool>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpConfigRuntimeError {
@@ -173,6 +262,72 @@ impl Default for McpRuntimeSupervisor {
 struct WriterTestGate {
     started: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconcileFault {
+    /// Report an error without touching the framework manager.
+    Fail,
+    /// Keep the operation pending so the production deadline must fire.
+    Hang,
+}
+
+#[cfg(test)]
+impl ReconcileFault {
+    /// Substitute the operation future so faults pass through the exact same
+    /// bounded/deadline code path as a real framework operation.
+    fn operation(
+        self,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<echo_agent::mcp::McpTargetChange, echo_agent::error::ReactError>,
+    > {
+        match self {
+            Self::Fail => Box::pin(async {
+                Err(echo_agent::error::ReactError::Other(
+                    "fixture MCP operation failure".to_string(),
+                ))
+            }),
+            Self::Hang => Box::pin(std::future::pending()),
+        }
+    }
+}
+
+/// One queued fault, consumed by the next matching reconcile operation.
+#[cfg(test)]
+struct QueuedReconcileFault {
+    name: String,
+    fault: ReconcileFault,
+}
+
+/// Deterministic operation faults for reconcile tests.
+///
+/// The app layer can only observe what the framework manager reports, and the
+/// manager has no public way to construct a client whose close fails. Injecting
+/// the *operation outcome* here keeps the production convergence and settle
+/// gates under test without weakening them. Only disconnects need this seam:
+/// connection timeouts are covered with a real slow MCP server, which is what
+/// proves the framework preparation is not stranded.
+#[cfg(test)]
+#[derive(Default)]
+struct ReconcileFaultQueue {
+    queued: Vec<QueuedReconcileFault>,
+}
+
+#[cfg(test)]
+impl ReconcileFaultQueue {
+    fn push(&mut self, name: &str, fault: ReconcileFault) {
+        self.queued.push(QueuedReconcileFault {
+            name: name.to_string(),
+            fault,
+        });
+    }
+
+    fn take(&mut self, name: &str) -> Option<ReconcileFault> {
+        let index = self.queued.iter().position(|queued| queued.name == name)?;
+        Some(self.queued.remove(index).fault)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -340,37 +495,48 @@ impl McpNameOwnershipGuard {
 
 #[derive(Clone, Debug)]
 struct ReconcilePlan {
+    /// Tracked user names whose desired state is "not connected". Includes
+    /// servers that were just disabled or removed, plus any disconnect a
+    /// previous generation could not confirm.
     disconnect: Vec<String>,
+    /// Enabled desired entries that must be connected or replaced.
     connect: Vec<(String, McpServerEntry)>,
+    /// Enabled names in the desired snapshot. This becomes the retry frontier
+    /// only after a pass confirmed every operation.
+    active_names: BTreeSet<String>,
 }
 
 impl ReconcilePlan {
     #[cfg(test)]
     fn between(previous: &McpConfigFile, current: &McpConfigFile) -> Self {
-        Self::with_disconnect_names(previous.mcp_servers.keys().cloned(), current)
+        Self::with_tracked_names(previous.mcp_servers.keys().cloned(), current)
     }
 
-    fn with_disconnect_names(
-        disconnect_names: impl IntoIterator<Item = String>,
+    fn with_tracked_names(
+        tracked_names: impl IntoIterator<Item = String>,
         current: &McpConfigFile,
     ) -> Self {
         // A canceled older generation may not have applied every disconnection
-        // or connection. Rebuild the tracked user set so the newest
-        // generation converges from any partial predecessor state. Names that
+        // or connection, so the caller passes every name that could still own a
+        // live connection (leftovers plus the previous snapshot). Names that
         // exist only in the plugin registry are outside this set.
-        let mut disconnect = disconnect_names.into_iter().collect::<Vec<_>>();
+        let mut disconnect = tracked_names.into_iter().collect::<Vec<_>>();
         disconnect.sort();
         disconnect.dedup();
-        let current_names = current.mcp_servers.keys().collect::<BTreeSet<_>>();
-        // Names still present in the desired snapshot are reconciled through
-        // the framework manager's replacement/unchanged contract. Only stale
-        // names need an explicit disconnect pass.
-        disconnect.retain(|name| !current_names.contains(name));
+        let active_names = enabled_server_names(current)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        // Disabling an entry is a connection change, not a no-op: only names
+        // that stay enabled are reconciled through the framework manager's
+        // replacement/unchanged contract. Everything else gets an explicit
+        // disconnect pass so an enabled -> disabled flip withdraws the live
+        // client instead of merely persisting `disabled: true`.
+        disconnect.retain(|name| !active_names.contains(name));
 
         let mut connect = current
             .mcp_servers
             .iter()
-            .filter(|(_, current_entry)| !current_entry.disabled)
+            .filter(|(_, entry)| !entry.disabled)
             .map(|(name, entry)| (name.clone(), entry.clone()))
             .collect::<Vec<_>>();
         connect.sort_by(|left, right| left.0.cmp(&right.0));
@@ -378,7 +544,22 @@ impl ReconcilePlan {
         Self {
             disconnect,
             connect,
+            active_names,
         }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.disconnect.is_empty() && self.connect.is_empty()
+    }
+
+    /// Every name this pass touches, used to serialize against connection
+    /// operations still owned by a previous background task.
+    fn touched_names(&self) -> BTreeSet<String> {
+        self.disconnect
+            .iter()
+            .chain(self.connect.iter().map(|(name, _)| name))
+            .cloned()
+            .collect()
     }
 }
 
@@ -391,9 +572,16 @@ pub struct McpConfigRuntime {
     supervisor: Mutex<McpRuntimeSupervisor>,
     unreconciled_user_names: Mutex<BTreeSet<String>>,
     ownership: Arc<McpNameOwnershipRegistry>,
+    deadlines: ReconcileDeadlines,
+    /// Connection operations that outlived their reconcile pass and keep
+    /// running in a background task. Later passes serialize against these
+    /// before touching the same name.
+    background_connects: Mutex<BTreeMap<String, Arc<BackgroundConnect>>>,
     shutdown: CancellationToken,
     #[cfg(test)]
     writer_gate: Mutex<Option<WriterTestGate>>,
+    #[cfg(test)]
+    reconcile_faults: Mutex<ReconcileFaultQueue>,
 }
 
 impl McpConfigRuntime {
@@ -404,7 +592,10 @@ impl McpConfigRuntime {
     }
 
     pub(crate) fn new(path: PathBuf, snapshot: McpConfigFile) -> Self {
-        let unreconciled_user_names = snapshot.mcp_servers.keys().cloned().collect();
+        // Only enabled entries can own a live client when this runtime starts:
+        // connections are process-local, and bootstrap connects enabled
+        // entries only. Disabled entries therefore need no disconnect debt.
+        let unreconciled_user_names = enabled_server_names(&snapshot).into_iter().collect();
         let ownership = McpNameOwnershipRegistry::new(snapshot.mcp_servers.keys().cloned());
         Self {
             path,
@@ -414,15 +605,40 @@ impl McpConfigRuntime {
             supervisor: Mutex::new(McpRuntimeSupervisor::default()),
             unreconciled_user_names: Mutex::new(unreconciled_user_names),
             ownership,
+            deadlines: ReconcileDeadlines::default(),
+            background_connects: Mutex::new(BTreeMap::new()),
             shutdown: CancellationToken::new(),
             #[cfg(test)]
             writer_gate: Mutex::new(None),
+            #[cfg(test)]
+            reconcile_faults: Mutex::new(ReconcileFaultQueue::default()),
         }
     }
 
     #[cfg(test)]
     fn empty(path: PathBuf) -> Self {
         Self::new(path, McpConfigFile::default())
+    }
+
+    #[cfg(test)]
+    fn with_deadlines(mut self, deadlines: ReconcileDeadlines) -> Self {
+        self.deadlines = deadlines;
+        self
+    }
+
+    #[cfg(test)]
+    async fn queue_disconnect_fault(&self, name: &str, fault: ReconcileFault) {
+        self.reconcile_faults.lock().await.push(name, fault);
+    }
+
+    #[cfg(test)]
+    async fn take_reconcile_fault(&self, name: &str) -> Option<ReconcileFault> {
+        self.reconcile_faults.lock().await.take(name)
+    }
+
+    #[cfg(test)]
+    async fn background_connect_count(&self) -> usize {
+        self.background_connects.lock().await.len()
     }
 
     #[cfg(test)]
@@ -690,9 +906,13 @@ impl McpConfigRuntime {
     ) {
         let plan = {
             let mut names = self.unreconciled_user_names.lock().await;
-            names.extend(commit.previous.mcp_servers.keys().cloned());
-            names.extend(commit.current.mcp_servers.keys().cloned());
-            ReconcilePlan::with_disconnect_names(names.iter().cloned(), &commit.current)
+            // Only entries that are enabled on either side can own (or be about
+            // to own) a live client. Keeping the desired enabled names in the
+            // frontier before the pass means a failed connection stays queued
+            // for the next generation instead of silently disappearing.
+            names.extend(enabled_server_names(&commit.previous));
+            names.extend(enabled_server_names(&commit.current));
+            ReconcilePlan::with_tracked_names(names.iter().cloned(), &commit.current)
         };
         let current_names = commit
             .current
@@ -769,6 +989,18 @@ impl McpConfigRuntime {
             std::mem::take(&mut supervisor.reconcile_tasks)
         };
         Self::await_reconcile_tasks(tasks, "shutdown").await;
+
+        // Backgrounded connection operations are deliberately not dropped (a
+        // dropped framework preparation would keep its manager ticket forever).
+        // Their transports bound their own settlement, so shutdown observes them
+        // instead of waiting unboundedly.
+        let outstanding = self.background_connects.lock().await.len();
+        if outstanding > 0 {
+            tracing::warn!(
+                outstanding,
+                "MCP connection operations still settling in background tasks at shutdown; the framework retains their tickets and each transport bounds its own close"
+            );
+        }
     }
 
     async fn await_mutation_tasks(
@@ -820,29 +1052,63 @@ impl McpConfigRuntime {
             .cloned()
             .collect::<BTreeSet<_>>();
         let generation = commit.generation;
-        let reconciliations = targets.iter().map(|target| {
-            Self::reconcile_target(
-                target.agent.clone(),
-                Arc::clone(&self),
+        let reconciliations = targets
+            .iter()
+            .map(|target| {
+                Self::reconcile_target(
+                    target.agent.clone(),
+                    Arc::clone(&self),
+                    generation,
+                    commit.cancel.clone(),
+                    plan.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        // A pass without any target cannot confirm a connection change. Only a
+        // pass with nothing to do at all is a safe settle point in that case.
+        let converged = if reconciliations.is_empty() {
+            plan.is_empty()
+        } else {
+            futures::future::join_all(reconciliations)
+                .await
+                .into_iter()
+                .all(|converged| converged)
+        };
+        if !converged {
+            // At least one disconnect or connection was never confirmed. Keep
+            // both the user namespace claims and the retry frontier exactly as
+            // they were: settling here would release a name whose old client
+            // may still be half alive, letting a plugin or a newer user
+            // generation take over underneath it.
+            tracing::warn!(
                 generation,
-                commit.cancel.clone(),
-                plan.clone(),
-            )
-        });
-        let converged = futures::future::join_all(reconciliations)
-            .await
-            .into_iter()
-            .all(|converged| converged);
-        if converged && self.generation() == generation {
-            let mut names = self.unreconciled_user_names.lock().await;
-            if self.generation() == generation {
-                *names = current_names.clone();
-                self.ownership.settle_user_names(&current_names).await;
-                for target in targets {
-                    target.ownership.settle_user_names(&current_names).await;
-                }
-            }
+                pending = plan.disconnect.len(),
+                connect = plan.connect.len(),
+                "MCP user config reconcile did not converge; name ownership and retry state retained"
+            );
+            return;
         }
+        if self.generation() != generation {
+            return;
+        }
+        let mut names = self.unreconciled_user_names.lock().await;
+        if self.generation() != generation {
+            return;
+        }
+        *names = plan.active_names.clone();
+        // Disabled entries stay user-owned: the durable config still declares
+        // that name, so a plugin must not take it over while the user has it
+        // switched off. Only names absent from the desired config are dropped.
+        self.ownership.settle_user_names(&current_names).await;
+        for target in targets {
+            target.ownership.settle_user_names(&current_names).await;
+        }
+        tracing::info!(
+            generation,
+            active = plan.active_names.len(),
+            configured = current_names.len(),
+            "MCP user config reconcile settled"
+        );
     }
 
     async fn reconcile_target(
@@ -852,54 +1118,387 @@ impl McpConfigRuntime {
         reconcile_cancel: CancellationToken,
         plan: ReconcilePlan,
     ) -> bool {
-        agent.write_async(|agent| {
-                Box::pin(async move {
-                    let mut converged = true;
-                    'reconcile: {
-                    for name in plan.disconnect {
-                        if reconcile_cancel.is_cancelled()
-                            || runtime.generation() != generation
-                        {
-                            converged = false;
-                            break 'reconcile;
-                        }
-                        if let Err(error) = agent.reconcile_mcp_entry(&name, None).await {
-                            tracing::warn!(server = %name, %error, "MCP user server disconnect failed");
-                        }
-                    }
+        // Phase 1 (no agent lock): observe connection operations that outlived
+        // an earlier pass. Their background tasks hold the agent write lock
+        // while the framework future runs, so waiting for them here - where
+        // this pass holds no lock - is the only deadlock-free point.
+        let mut outstanding = BTreeSet::new();
+        for name in plan.touched_names() {
+            if reconcile_cancel.is_cancelled() || runtime.generation() != generation {
+                return false;
+            }
+            if !runtime
+                .observe_background_connect(&name, runtime.deadlines.connect)
+                .await
+            {
+                outstanding.insert(name);
+            }
+        }
 
-                    for (name, entry) in plan.connect {
-                        if reconcile_cancel.is_cancelled()
-                            || runtime.generation() != generation
-                        {
-                            converged = false;
-                            break 'reconcile;
-                        }
-                        let connect = agent.reconcile_mcp_entry(&name, Some(entry));
-                        tokio::select! {
-                            _ = reconcile_cancel.cancelled() => {
-                                converged = false;
-                                break 'reconcile;
-                            },
-                            result = tokio::time::timeout(MCP_CONNECT_TIMEOUT, connect) => {
-                                match result {
-                                    Ok(Ok(change)) => tracing::info!(server = %name, generation, ?change, "MCP user server reconciled"),
-                                    Ok(Err(error)) => tracing::warn!(server = %name, %error, "MCP user server connection failed"),
-                                    Err(_) => tracing::warn!(server = %name, timeout_secs = MCP_CONNECT_TIMEOUT.as_secs(), "MCP user server connection timed out"),
+        // Phase 2: withdraw every server that must not stay connected, under
+        // one write lock. A dropped disconnect future is safe: transports keep
+        // cancellation-safe close receipts and the manager retains unsettled
+        // clients as retryable cleanup debt, so a later pass can retry.
+        // `write_async` requires a future valid for every agent borrow, so the
+        // pass hands owned values to the closure instead of borrowing its own
+        // locals (the plan's connect list is still needed for phase 3).
+        let disconnect_names = plan.disconnect.clone();
+        let outstanding_for_pass = outstanding.clone();
+        let runtime_for_pass = Arc::clone(&runtime);
+        let cancel_for_pass = reconcile_cancel.clone();
+        let mut settled = agent
+            .write_async(move |agent| {
+                Box::pin(async move {
+                    let mut settled = true;
+                    'disconnect: {
+                        for name in &disconnect_names {
+                            if cancel_for_pass.is_cancelled()
+                                || runtime_for_pass.generation() != generation
+                            {
+                                settled = false;
+                                break 'disconnect;
+                            }
+                            if outstanding_for_pass.contains(name) {
+                                settled = false;
+                                continue;
+                            }
+                            match runtime_for_pass
+                                .disconnect_entry(agent, name, generation, &cancel_for_pass)
+                                .await
+                            {
+                                ReconcileOperation::Confirmed => {}
+                                ReconcileOperation::Superseded => {
+                                    settled = false;
+                                    break 'disconnect;
+                                }
+                                ReconcileOperation::Failed | ReconcileOperation::TimedOut => {
+                                    settled = false;
                                 }
                             }
                         }
                     }
-                    }
+                    // Tool projections may have been revoked by a partial pass,
+                    // so the prompt is refreshed on failures as well.
                     let disabled_tools = agent.disabled_tool_names();
-                    crate::subagent_prompt::refresh_primary_system_prompt(
-                        agent,
-                        &disabled_tools,
-                    );
-                    converged
+                    crate::subagent_prompt::refresh_primary_system_prompt(agent, &disabled_tools);
+                    settled
                 })
             })
+            .await;
+
+        // Phase 3 (no lock): reconcile desired connections. Every operation is
+        // owned by a background task that keeps the framework preparation alive
+        // after this pass stops waiting, so a deadline or a newer generation can
+        // never strand the manager's `preparing` ticket.
+        for (name, entry) in plan.connect {
+            if reconcile_cancel.is_cancelled() || runtime.generation() != generation {
+                return false;
+            }
+            if outstanding.contains(&name) {
+                settled = false;
+                continue;
+            }
+            match runtime
+                .connect_entry(&agent, &name, entry, generation, &reconcile_cancel)
+                .await
+            {
+                ReconcileOperation::Confirmed => {}
+                ReconcileOperation::Superseded => return false,
+                ReconcileOperation::Failed | ReconcileOperation::TimedOut => settled = false,
+            }
+        }
+        settled
+    }
+
+    /// Withdraw one tracked user server connection.
+    ///
+    /// Only a framework receipt is `Confirmed`. A failure or deadline keeps the
+    /// name claimed and lets a later generation retry the close; the framework
+    /// either keeps the last-known-good client or retains it as cleanup debt,
+    /// so this call never has to guess.
+    async fn disconnect_entry(
+        self: &Arc<Self>,
+        agent: &mut echo_agent::agent::ReactAgent,
+        name: &str,
+        generation: u64,
+        cancel: &CancellationToken,
+    ) -> ReconcileOperation {
+        if cancel.is_cancelled() || self.generation() != generation {
+            return ReconcileOperation::Superseded;
+        }
+        let deadline = self.deadlines.disconnect;
+        #[cfg(test)]
+        if let Some(fault) = self.take_reconcile_fault(name).await {
+            return self
+                .run_bounded_disconnect(name, generation, deadline, cancel, fault.operation())
+                .await;
+        }
+        let operation = agent.reconcile_mcp_entry(name, None);
+        self.run_bounded_disconnect(name, generation, deadline, cancel, Box::pin(operation))
             .await
+    }
+
+    /// Drive one disconnect to a bounded, observable outcome.
+    ///
+    /// Supersession wins over the deadline so a newer generation never waits on
+    /// a stale one. Dropping the disconnect future cannot strand a framework
+    /// preparation (there is none), and the manager keeps failed or abandoned
+    /// closes as retryable cleanup debt.
+    async fn run_bounded_disconnect(
+        &self,
+        name: &str,
+        generation: u64,
+        deadline: std::time::Duration,
+        cancel: &CancellationToken,
+        operation: futures::future::BoxFuture<
+            '_,
+            Result<echo_agent::mcp::McpTargetChange, echo_agent::error::ReactError>,
+        >,
+    ) -> ReconcileOperation {
+        tokio::select! {
+            _ = cancel.cancelled() => ReconcileOperation::Superseded,
+            result = tokio::time::timeout(deadline, operation) => {
+                match result {
+                    Ok(Ok(change)) => {
+                        tracing::info!(
+                            server = %name,
+                            generation,
+                            ?change,
+                            "MCP user server disconnection confirmed"
+                        );
+                        ReconcileOperation::Confirmed
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            server = %name,
+                            generation,
+                            %error,
+                            "MCP user server disconnect failed; name ownership and retry state retained"
+                        );
+                        ReconcileOperation::Failed
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            server = %name,
+                            generation,
+                            timeout_secs = deadline.as_secs_f64(),
+                            "MCP user server disconnect timed out; name ownership and retry state retained"
+                        );
+                        ReconcileOperation::TimedOut
+                    }
+                }
+            }
+        }
+    }
+
+    /// Connect or replace one desired user server.
+    ///
+    /// The framework operation runs in a background task and this pass only
+    /// waits for its receipt. If the deadline expires or a newer generation
+    /// supersedes the pass, the task is told to withdraw any client it
+    /// publishes late instead of being dropped. Failures and deadlines leave the
+    /// target unconfirmed, which forbids settling the namespace this generation.
+    async fn connect_entry(
+        self: &Arc<Self>,
+        agent: &AgentHandle,
+        name: &str,
+        entry: McpServerEntry,
+        generation: u64,
+        cancel: &CancellationToken,
+    ) -> ReconcileOperation {
+        if cancel.is_cancelled() || self.generation() != generation {
+            return ReconcileOperation::Superseded;
+        }
+        let deadline = self.deadlines.connect;
+        let ConnectOperation {
+            mut result,
+            decision,
+        } = self.spawn_connect_operation(agent, name, entry).await;
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                let _ = decision.send_replace(Some(LateConnectDecision::Withdraw));
+                tracing::info!(
+                    server = %name,
+                    "MCP user server connection was superseded; the background operation keeps settling"
+                );
+                ReconcileOperation::Superseded
+            }
+            outcome = &mut result => {
+                // The pass consumed the receipt, so a client this operation
+                // published belongs to this generation.
+                let _ = decision.send_replace(Some(LateConnectDecision::Keep));
+                match outcome {
+                    Ok(ConnectOperationOutcome::Completed(change)) => {
+                        tracing::info!(
+                            server = %name,
+                            ?change,
+                            "MCP user server connection confirmed"
+                        );
+                        ReconcileOperation::Confirmed
+                    }
+                    Ok(ConnectOperationOutcome::Failed(error)) => {
+                        tracing::warn!(
+                            server = %name,
+                            %error,
+                            "MCP user server connection failed; name ownership and retry state retained"
+                        );
+                        ReconcileOperation::Failed
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            server = %name,
+                            "MCP user server connection task ended without reporting a receipt; name ownership and retry state retained"
+                        );
+                        ReconcileOperation::Failed
+                    }
+                }
+            }
+            _ = tokio::time::sleep(deadline) => {
+                // The operation keeps running: dropping it here would leave the
+                // framework preparation ticket allocated for the rest of the
+                // agent's life.
+                let _ = decision.send_replace(Some(LateConnectDecision::Withdraw));
+                tracing::warn!(
+                    server = %name,
+                    timeout_secs = deadline.as_secs_f64(),
+                    "MCP user server connection timed out; the background operation keeps settling and the name stays claimed"
+                );
+                ReconcileOperation::TimedOut
+            }
+        }
+    }
+
+    /// Register and spawn one framework connection operation.
+    ///
+    /// The settlement receipt is published before the task starts, so a pass
+    /// that arrives later serializes against this operation instead of starting
+    /// a second preparation for the same name.
+    async fn spawn_connect_operation(
+        self: &Arc<Self>,
+        agent: &AgentHandle,
+        name: &str,
+        entry: McpServerEntry,
+    ) -> ConnectOperation {
+        let (result_sender, result) = tokio::sync::oneshot::channel();
+        let (decision, decision_receiver) = tokio::sync::watch::channel(None);
+        let (settled, _) = tokio::sync::watch::channel(false);
+        let receipt = Arc::new(BackgroundConnect { settled });
+        let _ = self
+            .background_connects
+            .lock()
+            .await
+            .insert(name.to_string(), Arc::clone(&receipt));
+        let runtime = Arc::clone(self);
+        let agent = agent.clone();
+        let operation_name = name.to_string();
+        tokio::spawn(async move {
+            let connect_name = operation_name.clone();
+            let outcome = agent
+                .write_async(move |agent| {
+                    Box::pin(async move {
+                        match agent.reconcile_mcp_entry(&connect_name, Some(entry)).await {
+                            Ok(change) => {
+                                // Capability projections reach the model only
+                                // through this refresh, so a confirmed
+                                // connection updates the prompt under the same
+                                // lock the framework operation used.
+                                let disabled_tools = agent.disabled_tool_names();
+                                crate::subagent_prompt::refresh_primary_system_prompt(
+                                    agent,
+                                    &disabled_tools,
+                                );
+                                ConnectOperationOutcome::Completed(change)
+                            }
+                            Err(error) => ConnectOperationOutcome::Failed(error.to_string()),
+                        }
+                    })
+                })
+                .await;
+            let published = matches!(
+                outcome,
+                ConnectOperationOutcome::Completed(
+                    echo_agent::mcp::McpTargetChange::Connected
+                        | echo_agent::mcp::McpTargetChange::Replaced
+                )
+            );
+            let _ = result_sender.send(outcome);
+            let decision =
+                wait_for_late_connect_decision(decision_receiver, runtime.deadlines.connect).await;
+            if decision == LateConnectDecision::Withdraw && published {
+                let withdraw_name = operation_name.clone();
+                match agent
+                    .write_async(move |agent| {
+                        Box::pin(async move {
+                            let withdrawn = agent.reconcile_mcp_entry(&withdraw_name, None).await;
+                            if withdrawn.is_ok() {
+                                let disabled_tools = agent.disabled_tool_names();
+                                crate::subagent_prompt::refresh_primary_system_prompt(
+                                    agent,
+                                    &disabled_tools,
+                                );
+                            }
+                            withdrawn
+                        })
+                    })
+                    .await
+                {
+                    Ok(change) => tracing::info!(
+                        server = %operation_name,
+                        ?change,
+                        "MCP connection completed after its pass stopped waiting; late client withdrawn"
+                    ),
+                    Err(error) => tracing::warn!(
+                        server = %operation_name,
+                        %error,
+                        "MCP late client withdrawal failed; the framework retains it as retryable cleanup debt"
+                    ),
+                }
+            }
+            receipt.settled.send_replace(true);
+            let mut background = runtime.background_connects.lock().await;
+            if background
+                .get(&operation_name)
+                .is_some_and(|current| Arc::ptr_eq(current, &receipt))
+            {
+                background.remove(&operation_name);
+            }
+        });
+        ConnectOperation { result, decision }
+    }
+
+    /// Observe one backgrounded connection without holding the agent lock.
+    ///
+    /// Returns true when no operation remains outstanding for `name`.
+    async fn observe_background_connect(
+        self: &Arc<Self>,
+        name: &str,
+        deadline: std::time::Duration,
+    ) -> bool {
+        let Some(receipt) = self.background_connects.lock().await.get(name).cloned() else {
+            return true;
+        };
+        let mut settled = receipt.settled.subscribe();
+        let wait = async {
+            loop {
+                if *settled.borrow() {
+                    return;
+                }
+                if settled.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        match tokio::time::timeout(deadline, wait).await {
+            Ok(()) => true,
+            Err(_) => {
+                tracing::warn!(
+                    server = %name,
+                    timeout_secs = deadline.as_secs_f64(),
+                    "MCP backgrounded connection is still running; this pass stays unconfirmed"
+                );
+                false
+            }
+        }
     }
 
     #[cfg(test)]
@@ -988,6 +1587,49 @@ fn restore_redacted_values(candidate: &mut McpConfigFile, previous: &McpConfigFi
     }
 }
 
+/// Wait for the issuing pass to decide what to do with a late result.
+///
+/// The pass decides immediately after it stops waiting, so this bound only
+/// exists to keep a lost pass (dropped or panicked reconcile task) from parking
+/// the operation forever. Withdrawal is the conservative default: a client this
+/// generation never confirmed must not stay wired.
+async fn wait_for_late_connect_decision(
+    mut receiver: tokio::sync::watch::Receiver<Option<LateConnectDecision>>,
+    deadline: std::time::Duration,
+) -> LateConnectDecision {
+    let wait = async {
+        loop {
+            if let Some(decision) = *receiver.borrow() {
+                return decision;
+            }
+            if receiver.changed().await.is_err() {
+                return LateConnectDecision::Withdraw;
+            }
+        }
+    };
+    match tokio::time::timeout(deadline, wait).await {
+        Ok(decision) => decision,
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = deadline.as_secs_f64(),
+                "MCP connection receipt was never claimed by its pass; withdrawing late publications"
+            );
+            LateConnectDecision::Withdraw
+        }
+    }
+}
+
+/// Names the desired snapshot expects to be connected. Disabled entries are
+/// intentionally excluded: they own no client and need no disconnect retry.
+fn enabled_server_names(config: &McpConfigFile) -> Vec<String> {
+    config
+        .mcp_servers
+        .iter()
+        .filter(|(_, entry)| !entry.disabled)
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 fn validate_mcp_config(config: &McpConfigFile) -> Result<(), McpConfigRuntimeError> {
     for (name, entry) in &config.mcp_servers {
         if name.trim().is_empty() {
@@ -1024,6 +1666,228 @@ mod tests {
 
     fn configs_equal(left: &McpConfigFile, right: &McpConfigFile) -> anyhow::Result<bool> {
         Ok(serde_json::to_value(left)? == serde_json::to_value(right)?)
+    }
+
+    /// One tool exposed by the fixture MCP server.
+    struct FixtureTool {
+        name: String,
+    }
+
+    impl echo_agent::tools::Tool for FixtureTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "fixture MCP tool"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _parameters: echo_agent::tools::ToolParameters,
+        ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<echo_agent::tools::ToolResult>>
+        {
+            Box::pin(async { Ok(echo_agent::tools::ToolResult::success("fixture-ok")) })
+        }
+    }
+
+    /// In-process MCP server exposed over Streamable HTTP.
+    ///
+    /// Reconcile regressions are about what the framework manager actually
+    /// confirms (a live client, a revoked tool projection), so the tests drive
+    /// a real transport instead of mocking the seam under test.
+    struct HttpMcpFixture {
+        endpoint: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl HttpMcpFixture {
+        async fn start(tool_name: &str) -> anyhow::Result<Self> {
+            Self::start_delayed(tool_name, std::time::Duration::ZERO).await
+        }
+
+        /// Start a fixture that answers JSON-RPC only after `delay`, which makes
+        /// a real framework client preparation outlive a short reconcile
+        /// deadline. That is what a stranded preparation ticket would poison.
+        async fn start_delayed(
+            tool_name: &str,
+            delay: std::time::Duration,
+        ) -> anyhow::Result<Self> {
+            let server = Arc::new(
+                echo_agent::mcp::McpServer::builder()
+                    .name("fixture")
+                    .version("1.0.0")
+                    .tool(Arc::new(FixtureTool {
+                        name: tool_name.to_string(),
+                    }))
+                    .build(),
+            );
+            let router = axum::Router::new().route(
+                "/mcp",
+                axum::routing::post(move |body: String| {
+                    let server = Arc::clone(&server);
+                    async move {
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        let response = server.handle_json_rpc(&body).await;
+                        if response.is_empty() {
+                            (axum::http::StatusCode::ACCEPTED, String::new())
+                        } else {
+                            (axum::http::StatusCode::OK, response)
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+            let task = tokio::spawn(async move {
+                if let Err(error) = axum::serve(listener, router).await {
+                    tracing::warn!(%error, "fixture MCP HTTP server stopped");
+                }
+            });
+            Ok(Self { endpoint, task })
+        }
+
+        fn entry(&self) -> McpServerEntry {
+            McpServerEntry {
+                url: Some(self.endpoint.clone()),
+                ..Default::default()
+            }
+        }
+    }
+
+    impl Drop for HttpMcpFixture {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// One runtime plus a real agent namespace, mirroring how production wires
+    /// a reconcile target.
+    struct ReconcileHarness {
+        runtime: Arc<McpConfigRuntime>,
+        agent: AgentHandle,
+        ownership: Arc<McpNameOwnershipRegistry>,
+        targets: Vec<McpReconcileTarget>,
+        _temp: tempfile::TempDir,
+    }
+
+    impl ReconcileHarness {
+        fn new(deadlines: ReconcileDeadlines) -> anyhow::Result<Self> {
+            let temp = tempfile::tempdir()?;
+            let runtime = Arc::new(
+                McpConfigRuntime::empty(temp.path().join("mcp.json")).with_deadlines(deadlines),
+            );
+            let agent = AgentHandle::new(echo_agent::agent::ReactAgent::new(
+                echo_agent::agent::AgentConfig::minimal("fixture-model", "fixture-agent"),
+            ));
+            let ownership = runtime.ownership();
+            let targets = vec![McpReconcileTarget::new(
+                agent.clone(),
+                Arc::clone(&ownership),
+                None,
+            )];
+            Ok(Self {
+                runtime,
+                agent,
+                ownership,
+                targets,
+                _temp: temp,
+            })
+        }
+
+        async fn upsert(&self, name: &str, entry: McpServerEntry) -> anyhow::Result<()> {
+            self.runtime
+                .upsert_and_reconcile(self.targets.clone(), name.to_string(), entry)
+                .await?;
+            self.await_reconcile().await
+        }
+
+        async fn set_enabled(&self, name: &str, enabled: bool) -> anyhow::Result<()> {
+            self.runtime
+                .set_enabled_and_reconcile(self.targets.clone(), name, enabled)
+                .await?;
+            self.await_reconcile().await
+        }
+
+        async fn remove(&self, name: &str) -> anyhow::Result<()> {
+            self.runtime
+                .remove_and_reconcile(self.targets.clone(), name)
+                .await?;
+            self.await_reconcile().await
+        }
+
+        async fn replace_all(&self, candidate: McpConfigFile) -> anyhow::Result<()> {
+            self.runtime
+                .replace_and_reconcile(self.targets.clone(), candidate)
+                .await?;
+            self.await_reconcile().await
+        }
+
+        /// Await the exact reconcile generation this mutation handed off, so a
+        /// later assertion observes settled state rather than a live pass.
+        async fn await_reconcile(&self) -> anyhow::Result<()> {
+            let tasks = {
+                let mut supervisor = self.runtime.supervisor.lock().await;
+                std::mem::take(&mut supervisor.reconcile_tasks)
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                for task in tasks {
+                    task.handle
+                        .await
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("MCP reconcile did not finish within the test window")
+            })??;
+            Ok(())
+        }
+
+        async fn connected_servers(&self) -> Vec<String> {
+            self.agent.read(|agent| agent.list_mcp_servers()).await
+        }
+
+        async fn tool_names(&self) -> Vec<String> {
+            self.agent.read(|agent| agent.list_tools()).await
+        }
+
+        /// Names whose desired state is not confirmed yet. After a converged
+        /// pass this is exactly the enabled set; after a failure it also keeps
+        /// names that still need a disconnect or a connection retry.
+        async fn retry_frontier(&self) -> BTreeSet<String> {
+            self.runtime.unreconciled_user_names.lock().await.clone()
+        }
+
+        /// Wait until every backgrounded connection operation settled. The
+        /// runtime removes its receipt exactly when the framework preparation
+        /// reached a terminal state and any late client was withdrawn.
+        async fn await_background_connections(&self) -> anyhow::Result<()> {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    if self.runtime.background_connect_count().await == 0 {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("backgrounded MCP connection did not settle within the test window")
+            })?;
+            Ok(())
+        }
+
+        async fn queue_disconnect_fault(&self, name: &str, fault: ReconcileFault) {
+            self.runtime.queue_disconnect_fault(name, fault).await;
+        }
     }
 
     #[tokio::test]
@@ -1209,16 +2073,31 @@ mod tests {
     #[test]
     fn reconcile_plan_disconnects_names_carried_from_a_canceled_generation() {
         let current = McpConfigFile::default();
-        let plan = ReconcilePlan::with_disconnect_names(
-            ["removed-before-reconcile".to_string()],
-            &current,
-        );
+        let plan =
+            ReconcilePlan::with_tracked_names(["removed-before-reconcile".to_string()], &current);
 
         assert_eq!(
             plan.disconnect,
             vec!["removed-before-reconcile".to_string()]
         );
         assert!(plan.connect.is_empty());
+        assert!(plan.active_names.is_empty());
+    }
+
+    #[test]
+    fn reconcile_plan_withdraws_a_disabled_server() {
+        let previous = config_with("local", stdio_entry("node", false));
+        let mut current = config_with("local", stdio_entry("node", false));
+        if let Some(entry) = current.mcp_servers.get_mut("local") {
+            entry.disabled = true;
+        }
+        let plan = ReconcilePlan::between(&previous, &current);
+
+        // Disabling is a connection change: the old client must be withdrawn,
+        // not merely left connected while `disabled` is persisted.
+        assert_eq!(plan.disconnect, vec!["local".to_string()]);
+        assert!(plan.connect.is_empty());
+        assert!(plan.active_names.is_empty());
     }
 
     #[tokio::test]
@@ -1529,5 +2408,204 @@ mod tests {
             resolve_mcp_config_path_sources(None, None, Some("from-env.json")),
             PathBuf::from("from-env.json")
         );
+    }
+
+    #[tokio::test]
+    async fn disabling_a_server_disconnects_it_and_revokes_its_tools() -> anyhow::Result<()> {
+        let fixture = HttpMcpFixture::start("fixture_tool").await?;
+        let harness = ReconcileHarness::new(ReconcileDeadlines::default())?;
+
+        harness.upsert("local", fixture.entry()).await?;
+        assert!(
+            harness
+                .connected_servers()
+                .await
+                .contains(&"local".to_string())
+        );
+        let exposed = echo_agent::mcp::McpToolAdapter::exposed_name_for("local", "fixture_tool");
+        assert!(harness.tool_names().await.contains(&exposed));
+
+        harness.set_enabled("local", false).await?;
+
+        assert!(
+            !harness
+                .connected_servers()
+                .await
+                .contains(&"local".to_string()),
+            "an enabled -> disabled flip must withdraw the live client"
+        );
+        assert!(
+            !harness.tool_names().await.contains(&exposed),
+            "a disabled MCP server must no longer expose callable tools"
+        );
+        // The disabled entry still owns its name: the durable user config
+        // declares it, so a plugin must not take the name over.
+        assert!(harness.ownership.is_user_owned("local").await);
+        // The disconnect was confirmed, so no retry is left pending.
+        assert!(!harness.retry_frontier().await.contains("local"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_connection_retains_the_name_until_a_retry_settles() -> anyhow::Result<()> {
+        let fixture = HttpMcpFixture::start("fixture_tool").await?;
+        let harness = ReconcileHarness::new(ReconcileDeadlines::default())?;
+
+        harness
+            .upsert("shared", stdio_entry("/nonexistent/eko-mcp-fixture", false))
+            .await?;
+
+        assert!(harness.connected_servers().await.is_empty());
+        assert!(
+            harness.ownership.is_user_owned("shared").await,
+            "a failed connection must not release the user namespace claim"
+        );
+        assert!(
+            harness.retry_frontier().await.contains("shared"),
+            "an unconfirmed connection must stay in the retry frontier"
+        );
+
+        harness.upsert("shared", fixture.entry()).await?;
+
+        assert!(
+            harness
+                .connected_servers()
+                .await
+                .contains(&"shared".to_string())
+        );
+        assert_eq!(
+            harness.retry_frontier().await,
+            BTreeSet::from(["shared".to_string()]),
+            "a confirmed retry settles the frontier to the enabled set"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_disconnect_keeps_the_name_claimed_until_a_retry_releases_it()
+    -> anyhow::Result<()> {
+        let fixture = HttpMcpFixture::start("fixture_tool").await?;
+        let harness = ReconcileHarness::new(ReconcileDeadlines::default())?;
+        harness.upsert("shared", fixture.entry()).await?;
+
+        harness
+            .queue_disconnect_fault("shared", ReconcileFault::Fail)
+            .await;
+        harness.remove("shared").await?;
+
+        assert!(
+            harness.ownership.is_user_owned("shared").await,
+            "an unconfirmed disconnect must keep the name out of plugin reach"
+        );
+        assert!(harness.retry_frontier().await.contains("shared"));
+        {
+            let mut guard = harness.ownership.lock().await;
+            assert!(guard.claim_plugin("fixture-plugin", "shared").is_err());
+        }
+        // The disconnect never reached the framework, so the client is live.
+        assert!(
+            harness
+                .connected_servers()
+                .await
+                .contains(&"shared".to_string())
+        );
+
+        // The next generation retries the pending disconnect and settles.
+        harness.replace_all(McpConfigFile::default()).await?;
+
+        assert!(
+            !harness
+                .connected_servers()
+                .await
+                .contains(&"shared".to_string())
+        );
+        assert!(!harness.ownership.is_user_owned("shared").await);
+        let mut guard = harness.ownership.lock().await;
+        assert!(guard.claim_plugin("fixture-plugin", "shared").is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timed_out_disconnect_keeps_the_name_claimed_until_a_retry_releases_it()
+    -> anyhow::Result<()> {
+        let fixture = HttpMcpFixture::start("fixture_tool").await?;
+        let harness = ReconcileHarness::new(ReconcileDeadlines {
+            connect: std::time::Duration::from_secs(10),
+            disconnect: std::time::Duration::from_millis(50),
+        })?;
+        harness.upsert("shared", fixture.entry()).await?;
+
+        harness
+            .queue_disconnect_fault("shared", ReconcileFault::Hang)
+            .await;
+        harness.remove("shared").await?;
+
+        assert!(harness.ownership.is_user_owned("shared").await);
+        assert!(harness.retry_frontier().await.contains("shared"));
+        assert!(
+            harness
+                .connected_servers()
+                .await
+                .contains(&"shared".to_string())
+        );
+
+        harness.replace_all(McpConfigFile::default()).await?;
+
+        assert!(!harness.ownership.is_user_owned("shared").await);
+        assert!(!harness.retry_frontier().await.contains("shared"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timed_out_connection_settles_its_preparation_and_reconnects() -> anyhow::Result<()> {
+        // The first server answers initialize only after the reconcile
+        // deadline, so a real framework client preparation is still in flight
+        // when the pass stops waiting. Dropping it there would strand the
+        // manager's `preparing` ticket for this name.
+        let slow =
+            HttpMcpFixture::start_delayed("fixture_tool", std::time::Duration::from_millis(600))
+                .await?;
+        let fast = HttpMcpFixture::start("fixture_tool").await?;
+        let harness = ReconcileHarness::new(ReconcileDeadlines {
+            connect: std::time::Duration::from_millis(150),
+            disconnect: std::time::Duration::from_secs(10),
+        })?;
+
+        harness.upsert("slow", slow.entry()).await?;
+
+        // The pass reported the deadline, so nothing is confirmed yet.
+        assert!(harness.ownership.is_user_owned("slow").await);
+        assert!(harness.retry_frontier().await.contains("slow"));
+
+        // The background task keeps the preparation alive until the slow
+        // server answers, then withdraws the late client instead of letting it
+        // join the generation that never confirmed it.
+        harness.await_background_connections().await?;
+        assert!(
+            !harness
+                .connected_servers()
+                .await
+                .contains(&"slow".to_string()),
+            "a connection that completed after its pass timed out must be withdrawn"
+        );
+
+        // The retry must reach the framework. A stranded preparation would make
+        // it fail with "another preparation is still active", which would leave
+        // the name permanently unusable.
+        harness.upsert("slow", fast.entry()).await?;
+        assert!(
+            harness
+                .connected_servers()
+                .await
+                .contains(&"slow".to_string()),
+            "the generation after a timed out connection must be able to connect the same name"
+        );
+        let exposed = echo_agent::mcp::McpToolAdapter::exposed_name_for("slow", "fixture_tool");
+        assert!(harness.tool_names().await.contains(&exposed));
+        assert_eq!(
+            harness.retry_frontier().await,
+            BTreeSet::from(["slow".to_string()])
+        );
+        Ok(())
     }
 }
