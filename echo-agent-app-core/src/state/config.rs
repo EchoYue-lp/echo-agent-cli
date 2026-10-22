@@ -384,6 +384,27 @@ struct TaskRunBootReport {
     failed_scopes: Vec<String>,
 }
 
+impl TaskRunBootReport {
+    /// Whether the boot scan settled every TaskRun it observed.
+    ///
+    /// A fence-rejected run is counted as `blocked`, so a zero `recovered`
+    /// count can never make an unsettled boot look settled (R1).
+    fn is_settled(&self) -> bool {
+        self.blocked == 0 && self.failed_scopes.is_empty()
+    }
+}
+
+/// Whether a TaskRun belongs to a cron occurrence slot.
+///
+/// Cron runs carry the scheduler's conversation prefix, derived from the
+/// durable occurrence id. Ordinary recovery must not resume them: the slot is
+/// owned by the cron delivery that admitted it, not by the ordinary
+/// continuation launcher.
+fn is_cron_owned_task_run(run: &crate::tasks::task_runtime::TaskRun) -> bool {
+    run.conversation_id
+        .starts_with(crate::scheduler::CRON_CONVERSATION_PREFIX)
+}
+
 /// Webhook 状态
 pub struct WebhookState {
     pub emitter: Arc<crate::webhook::WebhookEmitter>,

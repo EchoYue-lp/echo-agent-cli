@@ -6182,6 +6182,231 @@ mod service_bootstrap_tests {
         );
         Ok(())
     }
+
+    /// Boot-recovery AppState with an isolated workspace registry so the scan
+    /// never touches the developer's real workspaces.
+    fn boot_recovery_state(registry_root: &std::path::Path) -> Result<AppState, String> {
+        let agent = ReactAgentBuilder::new()
+            .llm_client(Arc::new(MockLlmClient::new()))
+            .system_prompt("task run boot recovery test")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let mcp_runtime = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
+            std::env::temp_dir().join(format!("eko-mcp-boot-{}.json", uuid::Uuid::new_v4())),
+            Default::default(),
+        ));
+        let mut state = AppState::from_shared(
+            AgentHandle::new(agent),
+            None,
+            Arc::new(crate::hitl::HitlDispatcher::new()),
+            None,
+            None,
+            Default::default(),
+            mcp_runtime,
+            crate::product_data_io::ProductDataIoService::new(),
+        )
+        .map_err(|error| error.to_string())?;
+        state.workspace.registry = Arc::new(
+            crate::workspace::registry::WorkspaceRegistry::with_base_dir(
+                registry_root.to_path_buf(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        Ok(state)
+    }
+
+    /// Seed one `Running` run with a resumable continuation.
+    fn seed_running_run(
+        store: &crate::tasks::task_runtime::TaskRuntimeStore,
+        run_id: &str,
+        conversation_id: &str,
+        attended_mode: crate::tasks::task_runtime::AttendedMode,
+    ) -> Result<(), String> {
+        use crate::tasks::task_runtime::{
+            DomainProfile, ExecutionMode, PlanTask, TaskPlan, TaskRunStatus,
+        };
+        let workspace_id = store.active_workspace_id();
+        let goal = "seeded boot recovery goal";
+        store
+            .create_run(
+                run_id,
+                &workspace_id,
+                conversation_id,
+                "",
+                DomainProfile::General,
+                goal,
+                "task",
+                attended_mode,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .attach_plan_for_test(&TaskPlan {
+                plan_id: format!("{run_id}-plan"),
+                run_id: run_id.to_string(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal_revision: 1,
+                goal_sha256: crate::tasks::task_runtime::task_goal_sha256(goal),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![PlanTask {
+                    id: format!("{run_id}-task"),
+                    title: "Seeded work".to_string(),
+                    ..Default::default()
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(run_id, TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation(run_id, true, true, None, None)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// 普通启动恢复不得接管 cron 拥有的 run：scheduler 先于恢复启动，cron
+    /// slot 的归属权在 occurrence 投递侧；普通恢复只能把它计入 blocked。
+    #[tokio::test]
+    async fn ordinary_boot_recovery_does_not_take_over_cron_owned_run() -> Result<(), String> {
+        use crate::tasks::task_runtime::{AttendedMode, TaskRunStatus};
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let mut state = boot_recovery_state(&temp.path().join("registry"))?;
+        let store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        seed_running_run(
+            &store,
+            "cron-owned-run",
+            "cron:daily-summary:cron-scheduled:seed",
+            AttendedMode::Unattended,
+        )?;
+        state.tasks.runtime = Some(store.clone());
+
+        let report = state.reconcile_task_runs_at_boot().await;
+
+        assert_eq!(
+            report.recovered, 1,
+            "the recovery scan still settles the run into its boot disposition"
+        );
+        assert_eq!(
+            report.resumed, 0,
+            "ordinary recovery must never resume a cron-owned run"
+        );
+        assert!(
+            report.blocked >= 1,
+            "the skipped cron run must be observable as blocked"
+        );
+        assert!(
+            !report.is_settled(),
+            "a boot that left a cron run for its owner is not settled"
+        );
+        assert_eq!(
+            store
+                .get_run("cron-owned-run")
+                .map_err(|error| error.to_string())?
+                .map(|run| run.status),
+            Some(TaskRunStatus::Paused),
+            "the cron-owned run must stay Paused until its cron delivery owns it"
+        );
+        Ok(())
+    }
+
+    /// 物理 owner fence 拒绝恢复的 run 必须计入 blocked / failed_scopes，
+    /// 不能因为 `recover_incomplete() == Ok(0)` 就谎报启动已结算。
+    #[tokio::test]
+    async fn owner_fence_rejection_is_reported_as_blocked_not_settled() -> Result<(), String> {
+        use crate::tasks::task_runtime::TaskRunStatus;
+        use crate::tasks::task_runtime::store::RunDriverFailure;
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let mut state = boot_recovery_state(&temp.path().join("registry"))?;
+        let store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        // The driver admission below requires the store's lifecycle owner.
+        let _resource_scope = store.test_resource_scope();
+        seed_running_run(
+            &store,
+            "fenced-run",
+            "ordinary-conversation",
+            crate::tasks::task_runtime::AttendedMode::Unattended,
+        )?;
+        // Leave the exact R1 state through the canonical driver path: the
+        // driver reports an unknown physical settlement, so the supervisor
+        // retains the owner intent with observed=false.
+        let cancel = CancellationToken::new();
+        let admission = store
+            .reserve_run_driver_admission("fenced-run".to_string(), cancel)
+            .map_err(|error| error.to_string())?;
+        let registration = store
+            .register_observed_run_driver::<()>(
+                admission,
+                store
+                    .lease_active_workspace_generation()
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        let waiter = registration.start(|_resources| async move {
+            Err::<(), RunDriverFailure>(RunDriverFailure::Observation {
+                run_id: "fenced-run".to_string(),
+                execution_id: None,
+            })
+        });
+        let observed = waiter
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string());
+        assert!(observed.is_err(), "the driver must report the unsettled owner");
+        assert!(store.has_unsettled_driver_resources());
+        // R1: the fence leaves the run Running and recovery settles nothing.
+        assert_eq!(
+            store.recover_incomplete().map_err(|error| error.to_string())?,
+            0
+        );
+        assert_eq!(
+            store
+                .get_run("fenced-run")
+                .map_err(|error| error.to_string())?
+                .map(|run| run.status),
+            Some(TaskRunStatus::Running)
+        );
+        state.tasks.runtime = Some(store.clone());
+
+        let report = state.reconcile_task_runs_at_boot().await;
+
+        assert_eq!(report.recovered, 0, "the fence settles nothing");
+        assert_eq!(report.resumed, 0);
+        assert!(
+            report.blocked >= 1,
+            "the fenced run must be counted as blocked, not silently settled"
+        );
+        assert!(
+            !report.is_settled(),
+            "Ok(0) from recover_incomplete must not be treated as a settled boot"
+        );
+        assert!(
+            report
+                .failed_scopes
+                .iter()
+                .any(|scope| scope.contains("remain unsettled")),
+            "the unsettled scope must be observable in the boot report: {:?}",
+            report.failed_scopes
+        );
+        // Fence semantics are preserved: T3 never rewrites the run.
+        assert_eq!(
+            store
+                .get_run("fenced-run")
+                .map_err(|error| error.to_string())?
+                .map(|run| run.status),
+            Some(TaskRunStatus::Running)
+        );
+        Ok(())
+    }
 }
 
 async fn await_workspace_settlement(

@@ -1054,6 +1054,33 @@ impl Drop for ApplicationServices {
     }
 }
 
+/// Open the scheduler's durable memory store.
+///
+/// A corrupt or unreadable `FileStore` fails application startup instead of
+/// degrading to an in-memory store: a silent fallback would discard every
+/// persisted cron definition and the scheduler's delivery journal while the app
+/// still looked healthy, so the user's schedule would quietly stop firing. The
+/// path and the underlying parse/IO error are logged once here and propagated to
+/// the caller's rollback.
+fn open_scheduler_store(
+    file_path: &std::path::Path,
+) -> anyhow::Result<Arc<dyn echo_agent::memory::Store>> {
+    match echo_agent::memory::FileStore::new(file_path) {
+        Ok(store) => Ok(Arc::new(store)),
+        Err(error) => {
+            tracing::error!(
+                path = %file_path.display(),
+                %error,
+                "scheduler FileStore is unavailable; refusing to fall back to an in-memory scheduler store"
+            );
+            Err(anyhow::anyhow!(
+                "scheduler FileStore at {} cannot be opened: {error}",
+                file_path.display()
+            ))
+        }
+    }
+}
+
 impl ApplicationServices {
     /// Compose one complete EKO application generation around an Agent runtime.
     ///
@@ -1200,11 +1227,11 @@ impl ApplicationServices {
 
         let scheduler_store: Arc<dyn echo_agent::memory::Store> = {
             let file_path = crate::data_root::user_data_path("scheduler_store");
-            match echo_agent::memory::FileStore::new(&file_path) {
-                Ok(store) => Arc::new(store),
+            match open_scheduler_store(&file_path) {
+                Ok(store) => store,
                 Err(error) => {
-                    tracing::warn!(%error, "failed to create scheduler store; using in-memory");
-                    Arc::new(echo_agent::memory::InMemoryStore::new())
+                    lifecycle.bind_app_state(Arc::new(state));
+                    return Err(rollback_composition(lifecycle, error).await);
                 }
             }
         };
@@ -2039,6 +2066,37 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
         Ok(true)
+    }
+
+    /// 损坏的 scheduler FileStore 必须让启动返回明确错误，而不是静默降级到
+    /// 内存 store：降级会丢掉全部持久化 cron 定义和 scheduler 投递账本，
+    /// 而应用看起来仍然正常运行。
+    #[test]
+    fn corrupt_scheduler_file_store_fails_startup_without_memory_fallback() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("scheduler_store");
+        let corrupt = b"{ this is not a JSON store";
+        std::fs::write(&path, corrupt)?;
+
+        let error = match open_scheduler_store(&path) {
+            Ok(_) => {
+                return Err(anyhow::anyhow!(
+                    "corrupt scheduler FileStore was accepted; startup would lose persisted cron state"
+                ));
+            }
+            Err(error) => error,
+        };
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("scheduler FileStore") && rendered.contains("cannot be opened"),
+            "error must be explicit about the scheduler FileStore: {rendered}"
+        );
+        assert_eq!(
+            std::fs::read(&path)?,
+            corrupt,
+            "startup must not overwrite the corrupt store"
+        );
+        Ok(())
     }
 
     async fn bootstrap_review_fixture(

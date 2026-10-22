@@ -1742,15 +1742,12 @@ impl AppState {
         store.attach_execution_target_resolver(resolver);
     }
 
-    /// 启动定时任务调度器（仅在 Web 或双模式下调用）
+    /// 启动定时任务调度器，可选 Store 后端。
     ///
-    /// Call this **before** wrapping in `Arc`.
-    pub async fn start_scheduler(&mut self) -> echo_agent::error::Result<()> {
-        self.start_scheduler_with_store(None).await
-    }
-
-    /// 启动定时任务调度器，可选 Store 后端
-    pub async fn start_scheduler_with_store(
+    /// Deliberately private: the only startup entry is
+    /// [`Self::start_scheduler_and_task_service`], so no surface can start the
+    /// scheduler while skipping TaskRun boot recovery.
+    async fn start_scheduler_with_store(
         &mut self,
         backend: Option<Arc<dyn echo_agent::memory::Store>>,
     ) -> echo_agent::error::Result<()> {
@@ -1797,22 +1794,44 @@ impl AppState {
         self.scheduler.shutdown().await
     }
 
-    /// Start the fallible scheduler before admitting background TaskRun
-    /// recovery, then start the pool monitor only after both owners exist.
+    /// Sole startup entry for the scheduler and TaskRun recovery.
+    ///
+    /// The fallible scheduler starts before TaskRun recovery is admitted, then
+    /// the background task service and pool monitor start only after both
+    /// owners exist. This order is load-bearing: cron delivery keeps its owning
+    /// occurrence, and ordinary recovery must never resume a cron-owned run
+    /// (see [`is_cron_owned_task_run`]). Swapping the two steps needs
+    /// deterministic evidence and is not a cleanup.
+    ///
+    /// TaskRun recovery converges on [`Self::reconcile_task_runs_at_boot`],
+    /// which delegates to the per-store [`TaskRunBootReconciler`] singleflight —
+    /// the same implementation used by lazy workspace open and by
+    /// `BackgroundTaskService`. No second recovery path may be added here.
     pub async fn start_scheduler_and_task_service(
         &mut self,
         backend: Option<Arc<dyn echo_agent::memory::Store>>,
     ) -> echo_agent::error::Result<()> {
         self.start_scheduler_with_store(backend).await?;
         let report = self.reconcile_task_runs_at_boot().await;
-        tracing::info!(
-            recovered = report.recovered,
-            resumed = report.resumed,
-            blocked = report.blocked,
-            failed_scopes = report.failed_scopes.len(),
-            "TaskRun boot reconciliation settled"
-        );
-        for failure in report.failed_scopes {
+        // `recovered` counts runs the recovery scan settled; it is never a
+        // success gauge on its own (a fence-rejected run is not counted — R1).
+        // Only a report with no blocked runs and no failed scopes is settled.
+        if report.is_settled() {
+            tracing::info!(
+                recovered = report.recovered,
+                resumed = report.resumed,
+                "TaskRun boot reconciliation settled"
+            );
+        } else {
+            tracing::warn!(
+                recovered = report.recovered,
+                resumed = report.resumed,
+                blocked = report.blocked,
+                failed_scopes = report.failed_scopes.len(),
+                "TaskRun boot reconciliation incomplete — unsettled TaskRuns remain"
+            );
+        }
+        for failure in &report.failed_scopes {
             tracing::warn!(%failure, "TaskRun boot scope remains unreconciled");
         }
         self.start_task_service().await;
@@ -1986,6 +2005,10 @@ impl AppState {
         report: &mut TaskRunBootReport,
     ) {
         let reconciler = crate::tasks::task_runtime::TaskRunBootReconciler::for_store(&store);
+        // `recover_incomplete()` counts the runs it settled. It is NOT a
+        // settlement proof: a run refused by the physical-owner fence stays
+        // `Running` and is not counted (R1). The recovery entry therefore
+        // inspects the surviving state below instead of trusting this count.
         match reconciler.recover_once().await {
             Ok(recovered) => report.recovered = report.recovered.saturating_add(recovered),
             Err(error) => {
@@ -1995,6 +2018,8 @@ impl AppState {
                 return;
             }
         }
+        self.record_unsettled_task_runs(workspace_id, &store, report)
+            .await;
         let candidates = match reconciler.paused_candidates().await {
             Ok(candidates) => candidates,
             Err(error) => {
@@ -2005,6 +2030,20 @@ impl AppState {
             }
         };
         for run in candidates {
+            // Cron slots are owned by their durable occurrence admission. The
+            // scheduler starts before this recovery, so resuming a cron run
+            // here would take it away from the delivery that owns it (and could
+            // execute the prompt twice). Leave the run untouched and count it as
+            // blocked instead of silently dropping it.
+            if is_cron_owned_task_run(&run) {
+                tracing::warn!(
+                    workspace_id = %workspace_id,
+                    run_id = %run.run_id,
+                    "cron-owned TaskRun is not resumed by ordinary boot recovery"
+                );
+                report.blocked = report.blocked.saturating_add(1);
+                continue;
+            }
             // BackgroundTaskService is the sole launcher owner for global
             // background runs. AppState owns ordinary continuation recovery.
             if workspace_id == "global" && run.conversation_id.starts_with("background:") {
@@ -2116,6 +2155,52 @@ impl AppState {
                     ));
                 }
             }
+        }
+    }
+
+    /// Count TaskRuns that are still `Running` after the recovery scan.
+    ///
+    /// `recover_incomplete() == Ok(0)` does not prove settlement: the
+    /// physical-owner fence can leave a `Running` run untouched (R1). Those
+    /// runs are deliberately left exactly as they are — this lane does not
+    /// change fence semantics — but they must be observable as `blocked` so a
+    /// boot never reports a settled recovery for unsettled work.
+    async fn record_unsettled_task_runs(
+        &self,
+        workspace_id: &str,
+        store: &Arc<crate::tasks::task_runtime::TaskRuntimeStore>,
+        report: &mut TaskRunBootReport,
+    ) {
+        let store = store.clone();
+        let running = match crate::tasks::task_runtime::TaskRuntimeOperation::new(store)
+            .run_store("list unsettled TaskRuns after boot recovery", |store| {
+                store.list_runs_in(&[crate::tasks::task_runtime::TaskRunStatus::Running])
+            })
+            .await
+        {
+            Ok(runs) => runs,
+            Err(error) => {
+                report.failed_scopes.push(format!(
+                    "{workspace_id}: unsettled TaskRun scan failed: {error}"
+                ));
+                return;
+            }
+        };
+        if running.is_empty() {
+            return;
+        }
+        report.blocked = report.blocked.saturating_add(running.len());
+        report.failed_scopes.push(format!(
+            "{workspace_id}: {} TaskRun(s) remain unsettled after boot recovery (physical owner fence)",
+            running.len()
+        ));
+        for run in running.iter().take(5) {
+            tracing::warn!(
+                workspace_id = %workspace_id,
+                run_id = %run.run_id,
+                conversation_id = %run.conversation_id,
+                "TaskRun remains unsettled after boot recovery; the physical owner fence still owns it"
+            );
         }
     }
 

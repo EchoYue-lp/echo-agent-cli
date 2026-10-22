@@ -1,32 +1,52 @@
 //! Cron scheduler adapter — wires the framework's `SchedulerRunner` to the
 //! CLI's `AgentHandle` and TaskRuntime.
 //!
-//! The framework's runner is generic over a `FireFn` callback; this module
-//! provides [`build_fire_fn`] which constructs one that launches TaskRuntime runs.
+//! The framework's runner is generic over an `OccurrenceFireFn` callback; this
+//! module provides [`build_occurrence_fire_fn`], which constructs one that
+//! launches TaskRuntime runs.
 //!
 //! All cron tasks route through the unified TaskRuntime executor
 //! (`drive_existing_cron_run`). Prompts are passed through unchanged; simple
 //! prompts are answered directly by the agent and materialized as a one-task
 //! Plan with completion evidence, while complex prompts drive task creation and
 //! execution.
+//!
+//! # Idempotent occurrences
+//!
+//! The framework may deliver one durable occurrence more than once (owner loss,
+//! duplicate tick) and gives every physical attempt a fresh `attempt_id`. Cron
+//! delivery therefore never derives the run from the delivery moment:
+//! [`OccurrenceIdentity`] hashes only the scheduling slot (workspace,
+//! occurrence id, scheduler task, scheduled time — attempt and trigger fields
+//! are excluded by construction), and
+//! [`TaskRuntimeStore::get_or_create_occurrence_run`] admits exactly one run per
+//! slot. A re-delivery reports `created == false` and must not execute the
+//! prompt, change status, or append journal facts. The run id is the
+//! idempotency key, so a duplicate cannot execute even when the two deliveries
+//! race: the second one either reads the committed run or is refused by the
+//! run-level admission fence — never by timing.
 
 use crate::agent_handle::AgentHandle;
 use crate::agent_pool::AgentPool;
-use crate::tasks::task_runtime::TaskRuntimeStore;
 use crate::tasks::task_runtime::executor::{
     ExecError, create_unattended_run, drive_existing_cron_run,
 };
 use crate::tasks::task_runtime::store::RunDriverFailure;
+use crate::tasks::task_runtime::{
+    AttendedMode, DomainProfile, OccurrenceIdentity, OccurrenceRunRequest, RunPlanPolicy, TaskRun,
+    TaskRunExecutionProfile, TaskRunStatus, TaskRuntimeStore,
+};
 use echo_agent::agent::CancellationToken;
 use echo_agent::scheduler::{
-    CronTask, CronTaskStore, FireFn, SchedulerRunner as FrameworkSchedulerRunner,
+    CronTask, CronTaskStore, OccurrenceFireFn, SchedulerInvocation,
+    SchedulerRunner as FrameworkSchedulerRunner,
 };
 use std::sync::Arc;
 
 /// The CLI's scheduler runner is the framework's `SchedulerRunner`.
 pub type SchedulerRunner = FrameworkSchedulerRunner;
 
-/// Build a `FireFn` that dispatches cron task execution.
+/// Build the occurrence-aware callback that dispatches cron task execution.
 ///
 /// All cron prompts route through the unified supervised TaskRuntime executor
 /// in unattended mode. Simple prompts are answered directly by the agent
@@ -37,14 +57,14 @@ pub type SchedulerRunner = FrameworkSchedulerRunner;
 /// available, each cron run acquires its own Agent so worktree state cannot be
 /// shared across overlapping runs; single-Agent embeddings use the supplied
 /// fallback Agent.
-pub fn build_fire_fn(
+pub fn build_occurrence_fire_fn(
     agent: AgentHandle,
     task_runtime_store: Option<Arc<TaskRuntimeStore>>,
     pool: Option<Arc<AgentPool>>,
     webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
     review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
-) -> FireFn {
-    build_fire_fn_with_cancel(
+) -> OccurrenceFireFn {
+    build_occurrence_fire_fn_with_cancel(
         agent,
         task_runtime_store,
         pool,
@@ -54,15 +74,15 @@ pub fn build_fire_fn(
     )
 }
 
-fn build_fire_fn_with_cancel(
+fn build_occurrence_fire_fn_with_cancel(
     agent: AgentHandle,
     task_runtime_store: Option<Arc<TaskRuntimeStore>>,
     pool: Option<Arc<AgentPool>>,
     webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
     review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
     scheduler_cancel: CancellationToken,
-) -> FireFn {
-    Arc::new(move |task: CronTask| {
+) -> OccurrenceFireFn {
+    Arc::new(move |invocation: SchedulerInvocation| {
         let fallback_agent = agent.clone();
         let runtime_store = task_runtime_store.clone();
         let pool = pool.clone();
@@ -75,15 +95,33 @@ fn build_fire_fn_with_cancel(
                     "TaskRuntimeStore not configured — cron cannot run".into(),
                 )
             })?;
-            let prompt = task.prompt.as_str();
+            // Capture the task definition carried by the occurrence. It is the
+            // definition that was durable when the slot was persisted, not the
+            // mutable current definition.
+            let task = invocation.task.clone();
+            let prompt = task.prompt.clone();
             if prompt.trim().is_empty() {
                 return Err(echo_agent::error::ReactError::Other(
                     "cron prompt is empty".into(),
                 ));
             }
-            let fire_id = uuid::Uuid::new_v4().to_string();
-            let run_id = uuid::Uuid::new_v4().to_string();
+            // The slot identity is derived from the durable occurrence only;
+            // `attempt_id`, `attempt`, and `trigger` are deliberately ignored so
+            // every retry of this slot lands on the same run.
+            let identity = OccurrenceIdentity::from_scheduler_invocation(
+                store.active_workspace_id(),
+                &invocation,
+            );
+            let run_id = identity.run_id();
+            // `attempt_id` remains the physical attempt identity for pool keys
+            // and logs; it must never influence the run.
+            let fire_id = invocation.attempt_id.clone();
+            let request = cron_occurrence_request(&identity, &task, &prompt);
             let cancel = scheduler_cancel.child_token();
+            // Keep the canonical driver reservation first so shutdown cannot
+            // overtake this accepted fire before it is registered with the
+            // supervisor. The reservation also refuses a second driver for the
+            // same run while the first one is still unsettled.
             let admission = store
                 .reserve_run_driver_admission(run_id.clone(), cancel.clone())
                 .map_err(|error| {
@@ -92,9 +130,7 @@ fn build_fire_fn_with_cancel(
                     ))
                 })?;
             // Keep TaskRun creation/execution, memory and pool acquisition, and
-            // final projection on one workspace generation. The canonical
-            // driver reservation is acquired first so shutdown cannot overtake
-            // this accepted fire before it is registered with the supervisor.
+            // final projection on one workspace generation.
             let generation_lease = store.lease_active_workspace_generation().map_err(|error| {
                 echo_agent::error::ReactError::Other(format!(
                     "task runtime generation admission failed: {error}"
@@ -107,20 +143,62 @@ fn build_fire_fn_with_cancel(
                         "cron TaskRun driver registration failed: {error}"
                     ))
                 })?;
-            registration.mark_preparation_started();
-            if let Err(error) =
-                create_unattended_run(&store, &run_id, "cron", &task.id, &fire_id, prompt)
-            {
-                registration.fail_preparation(error.to_string());
-                return Err(echo_agent::error::ReactError::Other(format!(
-                    "cron TaskRun creation failed: {error}"
-                )));
+            // Authoritative admission: one run per occurrence slot. This is the
+            // only place a cron run comes into existence. A re-delivery reads the
+            // existing run and must not touch it, so it rejects the driver slot
+            // instead of starting a driver; `Reject` performs no settlement.
+            match store.get_or_create_occurrence_run(&request) {
+                Ok((_run, true)) => {
+                    // This delivery owns the new run: bind continuation and
+                    // Pending → Running through the shared unattended launcher
+                    // contract before driving it. The occurrence admission above
+                    // already created this exact run, so the helper's create
+                    // step only re-validates the immutable run identity; it
+                    // cannot create a second run for the slot.
+                    registration.mark_preparation_started();
+                    if let Err(error) = create_unattended_run(
+                        &store,
+                        &run_id,
+                        "cron",
+                        &task.id,
+                        identity.occurrence_id.as_str(),
+                        &prompt,
+                    ) {
+                        registration.fail_preparation(error.to_string());
+                        return Err(echo_agent::error::ReactError::Other(format!(
+                            "cron TaskRun admission failed: {error}"
+                        )));
+                    }
+                }
+                Ok((run, false)) => {
+                    // Duplicate delivery of the same slot. Rejecting the
+                    // reservation releases it without settlement, so the run's
+                    // status, journal, and events stay exactly as the first
+                    // delivery left them.
+                    registration.reject(format!(
+                        "cron occurrence {} is already admitted as run {}",
+                        identity.occurrence_id, run.run_id
+                    ));
+                    return duplicate_occurrence_outcome(&run, &identity.occurrence_id, &task.id);
+                }
+                Err(error) => {
+                    // No run was created by this delivery; reject instead of
+                    // failing preparation so no settlement debt is fabricated
+                    // for a run that does not exist.
+                    registration.reject(format!(
+                        "cron occurrence {} admission failed: {error}",
+                        identity.occurrence_id
+                    ));
+                    return Err(echo_agent::error::ReactError::Other(format!(
+                        "cron TaskRun creation failed: {error}"
+                    )));
+                }
             }
             let owned_store = store.clone();
             let owned_run_id = run_id.clone();
             let owned_task = task.clone();
             let owned_fire_id = fire_id.clone();
-            let owned_prompt = prompt.to_string();
+            let owned_prompt = prompt.clone();
             let owned_cancel = cancel.clone();
             let waiter = registration.start(move |mut receipt_owner| async move {
                 // The exact driver owns memory settlement before pool
@@ -198,6 +276,95 @@ fn build_fire_fn_with_cancel(
     })
 }
 
+/// Immutable run request for one cron scheduling slot.
+///
+/// `conversation_id` is derived from the durable occurrence id, never from the
+/// attempt id, so a retry reconstructs the same immutable run identity. The
+/// remaining fields mirror the ordinary unattended launcher so both paths share
+/// one executor and one completion gate.
+fn cron_occurrence_request(
+    identity: &OccurrenceIdentity,
+    task: &CronTask,
+    prompt: &str,
+) -> OccurrenceRunRequest {
+    OccurrenceRunRequest {
+        identity: identity.clone(),
+        conversation_id: crate::scheduler::cron_conversation_id(
+            task.id.as_str(),
+            identity.occurrence_id.as_str(),
+        ),
+        root_message_id: String::new(),
+        domain_profile: DomainProfile::General,
+        goal: prompt.to_string(),
+        route: "parallel_readonly_delegation".to_string(),
+        attended_mode: AttendedMode::Unattended,
+        execution_profile: TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+    }
+}
+
+/// Result of a re-delivered occurrence whose run already exists.
+///
+/// A completed slot settles the callback with the same summary shape the first
+/// delivery returned, so the cron task projection is not rewritten with a
+/// synthetic message. Every other status stays an error: the framework must keep
+/// the occurrence unsettled rather than record success for work its owner has
+/// not finished (a fence-rejected, paused, or still-running run must never look
+/// settled — R1).
+fn duplicate_occurrence_outcome(
+    run: &TaskRun,
+    occurrence_id: &str,
+    scheduler_task_id: &str,
+) -> echo_agent::error::Result<String> {
+    match run.status {
+        TaskRunStatus::Completed => {
+            tracing::info!(
+                occurrence_id = %occurrence_id,
+                run_id = %run.run_id,
+                "cron occurrence re-delivered; reusing the completed run without re-executing"
+            );
+            Ok(format!(
+                "cron run {} finished for task {scheduler_task_id}",
+                run.run_id
+            ))
+        }
+        TaskRunStatus::Failed => {
+            tracing::warn!(
+                occurrence_id = %occurrence_id,
+                run_id = %run.run_id,
+                "cron occurrence re-delivered after failure; refusing to re-execute"
+            );
+            Err(echo_agent::error::ReactError::Other(format!(
+                "cron occurrence {occurrence_id} already failed as run {}; duplicate delivery never re-executes",
+                run.run_id
+            )))
+        }
+        TaskRunStatus::Cancelled => {
+            tracing::warn!(
+                occurrence_id = %occurrence_id,
+                run_id = %run.run_id,
+                "cron occurrence re-delivered after cancellation; refusing to re-execute"
+            );
+            Err(echo_agent::error::ReactError::Other(format!(
+                "cron occurrence {occurrence_id} was cancelled as run {}; duplicate delivery never re-executes",
+                run.run_id
+            )))
+        }
+        TaskRunStatus::Pending | TaskRunStatus::Running | TaskRunStatus::Paused => {
+            tracing::warn!(
+                occurrence_id = %occurrence_id,
+                run_id = %run.run_id,
+                status = %run.status.as_str(),
+                "cron occurrence re-delivered while its run is non-terminal; leaving the run to its owning driver"
+            );
+            Err(echo_agent::error::ReactError::Other(format!(
+                "cron occurrence {occurrence_id} is already owned by non-terminal run {} ({}); duplicate delivery refused without touching it",
+                run.run_id,
+                run.status.as_str()
+            )))
+        }
+    }
+}
+
 // Add ordinary cron context only after preserving the typed observation.
 // The existing supervisor must see unknown ownership before any failure policy.
 fn cron_execution_error(error: ExecError) -> RunDriverFailure {
@@ -248,7 +415,7 @@ pub async fn new_scheduler_runner(
     webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
     review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
 ) -> echo_agent::error::Result<SchedulerRunner> {
-    let fire_fn = build_fire_fn_with_cancel(
+    let fire_fn = build_occurrence_fire_fn_with_cancel(
         agent,
         task_runtime_store,
         pool,
@@ -256,7 +423,10 @@ pub async fn new_scheduler_runner(
         review_integration,
         cancel.clone(),
     );
-    SchedulerRunner::new(store, cancel, fire_fn).await
+    // Occurrence-aware constructor: the callback receives the durable
+    // occurrence identity (not just the mutable task), which is what makes the
+    // TaskRun admission idempotent across retries.
+    SchedulerRunner::new_with_occurrence_context(store, cancel, fire_fn).await
 }
 
 #[cfg(test)]
@@ -265,6 +435,16 @@ mod tests {
     use crate::tasks::task_runtime::TaskRunStatus;
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::testing::MockLlmClient;
+
+    /// First physical delivery of one durable occurrence.
+    fn invocation(occurrence_id: &str, task: CronTask) -> SchedulerInvocation {
+        SchedulerInvocation::new(
+            occurrence_id,
+            task,
+            chrono::Utc::now(),
+            echo_agent::scheduler::SchedulerTrigger::Scheduled,
+        )
+    }
 
     #[test]
     fn cron_observation_round_trip_keeps_exact_identity_and_ordinary_error_context() {
@@ -288,7 +468,7 @@ mod tests {
     /// Cron 必须经 supervised TaskRuntime driver（在 store 建 run）。mock LLM
     /// 返回纯文本时，driver 的 direct 分支自动转 Completed。
     #[tokio::test]
-    async fn build_fire_fn_routes_non_plan_cron_to_supervised_run() -> Result<(), String> {
+    async fn occurrence_fire_fn_routes_non_plan_cron_to_supervised_run() -> Result<(), String> {
         let llm = MockLlmClient::new().with_response("ok");
         let agent = ReactAgentBuilder::new()
             .llm_client(Arc::new(llm))
@@ -305,10 +485,10 @@ mod tests {
             .map_err(|error| error.to_string())?;
 
         // runtime_store 接管所有 prompt，并统一进入 supervised driver。
-        let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None, None);
+        let fire_fn = build_occurrence_fire_fn(handle, Some(store.clone()), None, None, None);
 
         let task = CronTask::new("plain", "*/5 * * * *", "hello world");
-        let result = fire_fn(task).await;
+        let result = fire_fn(invocation("cron-scheduled:plain", task)).await;
         assert!(result.is_ok(), "fire_fn should succeed: {:?}", result.err());
 
         let completed = store
@@ -327,7 +507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_fire_fn_preserves_plan_marker_as_prompt_text() -> Result<(), String> {
+    async fn occurrence_fire_fn_preserves_plan_marker_as_prompt_text() -> Result<(), String> {
         let llm = MockLlmClient::new().with_response("ok");
         let agent = ReactAgentBuilder::new()
             .llm_client(Arc::new(llm))
@@ -337,10 +517,10 @@ mod tests {
         let handle = AgentHandle::new(agent);
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let _resource_scope = store.test_resource_scope();
-        let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None, None);
+        let fire_fn = build_occurrence_fire_fn(handle, Some(store.clone()), None, None, None);
 
         let task = CronTask::new("plan", "*/5 * * * *", "[plan] do the thing");
-        let result = fire_fn(task).await;
+        let result = fire_fn(invocation("cron-scheduled:plan", task)).await;
         assert!(result.is_ok(), "fire_fn should succeed: {:?}", result.err());
 
         let completed = store
@@ -367,10 +547,10 @@ mod tests {
         let handle = AgentHandle::new(agent);
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let _resource_scope = store.test_resource_scope();
-        let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None, None);
+        let fire_fn = build_occurrence_fire_fn(handle, Some(store.clone()), None, None, None);
 
         let task = CronTask::new("failing", "*/5 * * * *", "run this");
-        let result = fire_fn(task).await;
+        let result = fire_fn(invocation("cron-scheduled:failing", task)).await;
         assert!(result.is_err(), "failed cron run must not report success");
         let failed = store
             .list_runs_in(&[TaskRunStatus::Failed])
@@ -391,7 +571,7 @@ mod tests {
         let _resource_scope = store.test_resource_scope();
         let scheduler_cancel = CancellationToken::new();
         scheduler_cancel.cancel();
-        let fire_fn = build_fire_fn_with_cancel(
+        let fire_fn = build_occurrence_fire_fn_with_cancel(
             AgentHandle::new(agent),
             Some(store.clone()),
             None,
@@ -400,7 +580,11 @@ mod tests {
             scheduler_cancel,
         );
 
-        let result = fire_fn(CronTask::new("cancelled", "*/5 * * * *", "do work")).await;
+        let result = fire_fn(invocation(
+            "cron-scheduled:cancelled",
+            CronTask::new("cancelled", "*/5 * * * *", "do work"),
+        ))
+        .await;
 
         assert!(result.is_err());
         let cancelled = store
@@ -423,7 +607,7 @@ mod tests {
         let _resource_scope = store.test_resource_scope();
         let (reservation_started, release_reservation) =
             store.park_next_run_driver_admission_for_test()?;
-        let fire_fn = build_fire_fn(
+        let fire_fn = build_occurrence_fire_fn(
             AgentHandle::new(agent),
             Some(store.clone()),
             None,
@@ -431,7 +615,11 @@ mod tests {
             None,
         );
         let fire = tokio::spawn(async move {
-            fire_fn(CronTask::new("shutdown-race", "*/5 * * * *", "do work")).await
+            fire_fn(invocation(
+                "cron-scheduled:shutdown-race",
+                CronTask::new("shutdown-race", "*/5 * * * *", "do work"),
+            ))
+            .await
         });
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -491,6 +679,247 @@ mod tests {
         assert_eq!(
             pause_reason,
             Some(crate::tasks::task_runtime::RunPauseReason::BootRecovery)
+        );
+        Ok(())
+    }
+
+    /// 同一 occurrence 重投只执行一次：第二次投递（新的 attempt_id、不同
+    /// trigger）必须复用已提交的 run，不得再次调用模型、不得追加 journal
+    /// 事实、不得写事件。幂等性来自 run_id 的构造（slot 身份哈希），不是
+    /// 投递时序上的锁。
+    #[tokio::test]
+    async fn duplicate_occurrence_delivery_executes_exactly_once() -> Result<(), String> {
+        let llm = Arc::new(MockLlmClient::new().with_response("ok"));
+        let agent = ReactAgentBuilder::new()
+            .llm_client(llm.clone())
+            .system_prompt("test")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
+        let workspace = tempfile::tempdir().map_err(|error| error.to_string())?;
+        store
+            .rebind_shadow_root(workspace.path().join("tasks"), "cron-workspace")
+            .await
+            .map_err(|error| error.to_string())?;
+        let fire_fn = build_occurrence_fire_fn(
+            AgentHandle::new(agent),
+            Some(store.clone()),
+            None,
+            None,
+            None,
+        );
+
+        let task = CronTask::new("duplicate", "*/5 * * * *", "hello duplicate");
+        let scheduled_at = chrono::Utc::now();
+        let first = SchedulerInvocation::new(
+            "cron-scheduled:duplicate",
+            task.clone(),
+            scheduled_at,
+            echo_agent::scheduler::SchedulerTrigger::Scheduled,
+        );
+        fire_fn(first.clone())
+            .await
+            .map_err(|error| format!("first delivery failed: {error}"))?;
+
+        let completed = store
+            .list_runs_in(&[TaskRunStatus::Completed])
+            .map_err(|error| error.to_string())?;
+        assert_eq!(completed.len(), 1, "first delivery must create one run");
+        let run_id = completed
+            .first()
+            .map(|run| run.run_id.clone())
+            .ok_or_else(|| "completed run missing".to_string())?;
+        assert!(
+            run_id.starts_with("occ-"),
+            "cron run id must be the occurrence digest, not a delivery uuid: {run_id}"
+        );
+        let before = store
+            .get_run_state(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "run state missing".to_string())?;
+        let events_before = store
+            .list_events(&run_id, 0)
+            .map_err(|error| error.to_string())?
+            .len();
+        let calls_before = llm.call_count();
+        assert!(calls_before > 0, "the first delivery must reach the model");
+
+        // Retry the same slot with a fresh attempt identity and a manual trigger;
+        // neither may influence the run.
+        let retry = SchedulerInvocation::new(
+            "cron-scheduled:duplicate",
+            task,
+            scheduled_at,
+            echo_agent::scheduler::SchedulerTrigger::Manual,
+        );
+        assert_ne!(retry.attempt_id, first.attempt_id);
+        let delivered = fire_fn(retry)
+            .await
+            .map_err(|error| format!("completed slot must settle without re-executing: {error}"))?;
+        assert!(delivered.contains(&run_id));
+
+        assert_eq!(
+            llm.call_count(),
+            calls_before,
+            "duplicate delivery must not execute the prompt again"
+        );
+        let after = store
+            .get_run_state(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "run state missing after re-delivery".to_string())?;
+        assert_eq!(after.run.status, TaskRunStatus::Completed);
+        assert_eq!(
+            after.journal_sequence, before.journal_sequence,
+            "duplicate delivery must not append journal facts"
+        );
+        assert_eq!(
+            store
+                .list_events(&run_id, 0)
+                .map_err(|error| error.to_string())?
+                .len(),
+            events_before,
+            "duplicate delivery must not write runtime events"
+        );
+        let all = store
+            .list_runs_in(&[
+                TaskRunStatus::Pending,
+                TaskRunStatus::Running,
+                TaskRunStatus::Paused,
+                TaskRunStatus::Completed,
+                TaskRunStatus::Failed,
+                TaskRunStatus::Cancelled,
+            ])
+            .map_err(|error| error.to_string())?;
+        assert_eq!(all.len(), 1, "one occurrence slot owns exactly one run");
+        // The canonical supervisor releases a rejected admission on its own
+        // settlement task, after the callback returned. Wait for that
+        // bookkeeping only — the execution/non-mutation assertions above are
+        // already deterministic.
+        let mut leaked = (usize::MAX, usize::MAX);
+        for _ in 0..200 {
+            leaked = (
+                store
+                    .active_run_driver_count()
+                    .map_err(|error| error.to_string())?,
+                store
+                    .active_run_driver_receipt_count()
+                    .map_err(|error| error.to_string())?,
+            );
+            if leaked == (0, 0) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            leaked,
+            (0, 0),
+            "the rejected duplicate admission must not leak a driver reservation"
+        );
+        Ok(())
+    }
+
+    /// 非终态 run（Paused）被 fence 保护：重投不得把它重新拉起、不得改状态、
+    /// 不得写事件，并且必须返回错误，让 framework 不把该 occurrence 记为
+    /// 已结算。
+    #[tokio::test]
+    async fn duplicate_occurrence_delivery_never_restarts_a_nonterminal_run() -> Result<(), String>
+    {
+        let llm = Arc::new(MockLlmClient::new().with_response("must not run"));
+        let agent = ReactAgentBuilder::new()
+            .llm_client(llm.clone())
+            .system_prompt("test")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
+        let workspace = tempfile::tempdir().map_err(|error| error.to_string())?;
+        store
+            .rebind_shadow_root(workspace.path().join("tasks"), "cron-workspace")
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let task = CronTask::new("paused", "*/5 * * * *", "paused slot");
+        let scheduled_at = chrono::Utc::now();
+        let invocation = SchedulerInvocation::new(
+            "cron-scheduled:paused",
+            task.clone(),
+            scheduled_at,
+            echo_agent::scheduler::SchedulerTrigger::Scheduled,
+        );
+        // Seed the slot through the same admission the callback uses.
+        let identity =
+            OccurrenceIdentity::from_scheduler_invocation(store.active_workspace_id(), &invocation);
+        let request = cron_occurrence_request(&identity, &task, task.prompt.as_str());
+        let (run, created) = store
+            .get_or_create_occurrence_run(&request)
+            .map_err(|error| error.to_string())?;
+        assert!(created);
+        store
+            .transition_run(&run.run_id, TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            store
+                .request_pause(&run.run_id)
+                .map_err(|error| error.to_string())?
+        );
+        let before = store
+            .get_run_state(&run.run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "run state missing".to_string())?;
+        assert_eq!(before.run.status, TaskRunStatus::Paused);
+        let events_before = store
+            .list_events(&run.run_id, 0)
+            .map_err(|error| error.to_string())?
+            .len();
+
+        let fire_fn = build_occurrence_fire_fn(
+            AgentHandle::new(agent),
+            Some(store.clone()),
+            None,
+            None,
+            None,
+        );
+        let retry = SchedulerInvocation::new(
+            "cron-scheduled:paused",
+            task,
+            scheduled_at,
+            echo_agent::scheduler::SchedulerTrigger::Scheduled,
+        );
+        let result = fire_fn(retry).await;
+        assert!(
+            result.is_err(),
+            "a non-terminal occurrence must stay unsettled, not report success"
+        );
+        let error = match result {
+            Ok(_) => return Err("non-terminal occurrence reported success".to_string()),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("non-terminal"),
+            "error must identify the non-terminal owner: {error}"
+        );
+
+        assert_eq!(
+            llm.call_count(),
+            0,
+            "no model call for a duplicate delivery"
+        );
+        let after = store
+            .get_run_state(&run.run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "run state missing after re-delivery".to_string())?;
+        assert_eq!(after.run.status, TaskRunStatus::Paused);
+        assert_eq!(
+            after.journal_sequence, before.journal_sequence,
+            "duplicate delivery must not append journal facts"
+        );
+        assert_eq!(
+            store
+                .list_events(&run.run_id, 0)
+                .map_err(|error| error.to_string())?
+                .len(),
+            events_before
         );
         Ok(())
     }
