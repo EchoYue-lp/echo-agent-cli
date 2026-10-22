@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.cancellation-observation-consumer
 kind: evidence
-observed_at: source:fa8844cd92e0841468a1ba360fe64f390b7a0c49927935ac89731cf51e642989
+observed_at: source:68ce1c8d787a55c5934df86869dd2fd3ca51fdb5569a4c59f32227f6fb040195
 source_refs:
 - echo-agent-app-core/src/infra/factory.rs
 - echo-agent-app-core/src/agent_pool/tests.rs
