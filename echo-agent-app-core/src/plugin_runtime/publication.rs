@@ -57,6 +57,9 @@ struct FailedAgentComponents {
     mcp_ownership: PluginMcpOwnership,
     prepared: PreparedApplicationComponents,
     candidate_monitors: Vec<CronTask>,
+    /// Candidate claims that were taken and are no longer backed by wired
+    /// components. They must travel as cleanup receipts, never be dropped.
+    orphaned_claims: Vec<PluginMcpNameClaim>,
 }
 
 fn active_output_style_instructions(state: &PluginRuntimeState) -> Option<String> {
@@ -196,6 +199,35 @@ fn release_plugin_mcp_claims(guard: &mut McpNameOwnershipGuard, ownership: &Plug
     }
 }
 
+/// Flatten an ownership map into exact retryable claims. The map is an internal
+/// generation detail; receipts are the durable form that survives errors.
+fn claims_from_ownership(ownership: &PluginMcpOwnership) -> Vec<PluginMcpNameClaim> {
+    let mut claims = ownership
+        .iter()
+        .flat_map(|(plugin_id, tokens)| {
+            tokens.iter().map(|(name, token)| {
+                PluginMcpNameClaim::new(plugin_id.clone(), name.clone(), *token)
+            })
+        })
+        .collect::<Vec<_>>();
+    claims.sort_by(|left, right| {
+        (left.plugin_id(), left.name()).cmp(&(right.plugin_id(), right.name()))
+    });
+    claims
+}
+
+/// Release only the names this receipt still owns. A taken-over name is an
+/// explicit hand-over: the ownership guard rejects the stale token and nothing
+/// else is disconnected.
+fn release_plugin_mcp_name_claims(
+    guard: &mut McpNameOwnershipGuard,
+    claims: &[PluginMcpNameClaim],
+) {
+    for claim in claims {
+        guard.release_plugin(claim.plugin_id(), claim.name(), claim.token());
+    }
+}
+
 fn claim_plugin_mcp_names(
     guard: &mut McpNameOwnershipGuard,
     declarations: &PluginMcpDeclarations,
@@ -276,6 +308,17 @@ async fn unload_application_components(
     for plugin_agent in &application.agents {
         let _ = agent.unregister_subagent(plugin_agent.name()).await;
     }
+}
+
+/// Shut down and drop the plugin LSP generation currently published on this
+/// runtime. Used when a generation was already swapped in but its publication
+/// could not be committed.
+async fn shutdown_published_plugin_lsp(lsp: &PluginLspRuntime) {
+    let mut published = {
+        let mut current = lsp.manager.write().await;
+        std::mem::replace(&mut *current, LspManager::new())
+    };
+    published.shutdown_all().await;
 }
 
 async fn replace_plugin_monitors(

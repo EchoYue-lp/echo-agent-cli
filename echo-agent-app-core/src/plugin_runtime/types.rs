@@ -244,6 +244,319 @@ enum RegistrySource {
 type PluginMcpOwnership = HashMap<String, HashMap<String, PluginMcpOwnershipToken>>;
 type PluginMcpDeclarations = HashMap<String, Vec<String>>;
 
+/// One exact plugin MCP name claim.
+///
+/// The token is the only authority that may release the name. A retried cleanup
+/// receipt therefore settles as a hand-over (a no-op) when user configuration or
+/// another plugin token has taken the name over, and can never disconnect a name
+/// this receipt never owned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PluginMcpNameClaim {
+    plugin_id: String,
+    name: String,
+    token: PluginMcpOwnershipToken,
+}
+
+impl PluginMcpNameClaim {
+    fn new(plugin_id: String, name: String, token: PluginMcpOwnershipToken) -> Self {
+        Self {
+            plugin_id,
+            name,
+            token,
+        }
+    }
+
+    pub(crate) fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn token(&self) -> PluginMcpOwnershipToken {
+        self.token
+    }
+}
+
+/// What a cleanup receipt still owes. Receipts are values, not log lines: every
+/// variant carries enough authority to retry the exact withdrawal, and settling
+/// one twice is harmless.
+enum CleanupSettlement {
+    /// Exact MCP names whose owning components were already withdrawn from the
+    /// Agent. Only these tokens may be released; no other owner is touched.
+    McpNames { claims: Vec<PluginMcpNameClaim> },
+    /// Framework components that may still be wired. The exact wiring receipt
+    /// must settle before the listed ownership tokens may be released, so a name
+    /// is never handed to a new owner while its old client is still connected.
+    Framework {
+        // Boxed so the rarely-owned wiring receipt does not inflate every
+        // settlement variant to its size.
+        wiring: Box<PluginWiringResult>,
+        claims: Vec<PluginMcpNameClaim>,
+    },
+    /// Lifecycle registrations still held by the live lifecycle manager.
+    LiveLifecycle { plugin_ids: Vec<String> },
+    /// A lifecycle manager detached from the runtime by fail-closed retirement.
+    OwnedLifecycle {
+        manager: Arc<Mutex<PluginLifecycleManager>>,
+    },
+    /// The runtime-wide lifecycle shutdown still owes a retry.
+    LifecycleShutdown,
+    /// Plugin monitors that could not be removed from the scheduler.
+    Monitors { tasks: Vec<CronTask> },
+    /// A plugin entry whose uninstall did not complete.
+    PluginUninstall { plugin_id: String, keep_data: bool },
+}
+
+/// A retryable, first-class plugin cleanup obligation.
+///
+/// Receipts survive failed installs/uninstalls, rejected generations, caller
+/// cancellation and bootstrap failure. They are retried by every owned mutation
+/// and only disappear once their exact resource withdrawal has settled; success
+/// is never reported while one is still outstanding.
+pub(crate) struct CleanupReceipt {
+    root: PathBuf,
+    cause: String,
+    attempts: u32,
+    last_errors: Vec<String>,
+    settlement: CleanupSettlement,
+}
+
+impl CleanupReceipt {
+    fn mcp_names(root: PathBuf, cause: String, claims: Vec<PluginMcpNameClaim>) -> Self {
+        Self::new(root, cause, CleanupSettlement::McpNames { claims })
+    }
+
+    fn framework(
+        root: PathBuf,
+        cause: String,
+        wiring: PluginWiringResult,
+        claims: Vec<PluginMcpNameClaim>,
+    ) -> Self {
+        Self::new(
+            root,
+            cause,
+            CleanupSettlement::Framework {
+                wiring: Box::new(wiring),
+                claims,
+            },
+        )
+    }
+
+    fn live_lifecycle(root: PathBuf, cause: String, plugin_ids: Vec<String>) -> Self {
+        Self::new(
+            root,
+            cause,
+            CleanupSettlement::LiveLifecycle { plugin_ids },
+        )
+    }
+
+    fn owned_lifecycle(root: PathBuf, cause: String, manager: PluginLifecycleManager) -> Self {
+        Self::new(
+            root,
+            cause,
+            CleanupSettlement::OwnedLifecycle {
+                manager: Arc::new(Mutex::new(manager)),
+            },
+        )
+    }
+
+    fn lifecycle_shutdown(root: PathBuf, cause: String) -> Self {
+        Self::new(root, cause, CleanupSettlement::LifecycleShutdown)
+    }
+
+    fn monitors(root: PathBuf, cause: String, tasks: Vec<CronTask>) -> Self {
+        Self::new(root, cause, CleanupSettlement::Monitors { tasks })
+    }
+
+    fn plugin_uninstall(
+        root: PathBuf,
+        cause: String,
+        plugin_id: String,
+        keep_data: bool,
+    ) -> Self {
+        Self::new(
+            root,
+            cause,
+            CleanupSettlement::PluginUninstall {
+                plugin_id,
+                keep_data,
+            },
+        )
+    }
+
+    fn new(root: PathBuf, cause: String, settlement: CleanupSettlement) -> Self {
+        Self {
+            root,
+            cause,
+            attempts: 0,
+            last_errors: Vec::new(),
+            settlement,
+        }
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn mcp_claims(&self) -> &[PluginMcpNameClaim] {
+        match &self.settlement {
+            CleanupSettlement::McpNames { claims }
+            | CleanupSettlement::Framework { claims, .. } => claims,
+            CleanupSettlement::LiveLifecycle { .. }
+            | CleanupSettlement::OwnedLifecycle { .. }
+            | CleanupSettlement::LifecycleShutdown
+            | CleanupSettlement::Monitors { .. }
+            | CleanupSettlement::PluginUninstall { .. } => &[],
+        }
+    }
+
+    pub(crate) fn plugin_id(&self) -> Option<&str> {
+        match &self.settlement {
+            CleanupSettlement::LiveLifecycle { plugin_ids } => plugin_ids.first().map(String::as_str),
+            CleanupSettlement::PluginUninstall { plugin_id, .. } => Some(plugin_id.as_str()),
+            CleanupSettlement::McpNames { claims }
+            | CleanupSettlement::Framework { claims, .. } => {
+                claims.first().map(PluginMcpNameClaim::plugin_id)
+            }
+            CleanupSettlement::OwnedLifecycle { .. }
+            | CleanupSettlement::LifecycleShutdown
+            | CleanupSettlement::Monitors { .. } => None,
+        }
+    }
+
+    /// Human-readable identity used in errors and debt reports.
+    pub(crate) fn describe(&self) -> String {
+        let claims = self
+            .mcp_claims()
+            .iter()
+            .map(|claim| format!("{}:{}", claim.plugin_id(), claim.name()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let kind = match &self.settlement {
+            CleanupSettlement::McpNames { .. } => format!("mcp-ownership({claims})"),
+            CleanupSettlement::Framework { .. } => {
+                format!("framework-wiring+ownership({claims})")
+            }
+            CleanupSettlement::LiveLifecycle { plugin_ids } => {
+                format!("lifecycle({})", plugin_ids.join(","))
+            }
+            CleanupSettlement::OwnedLifecycle { .. } => "lifecycle-manager".to_string(),
+            CleanupSettlement::LifecycleShutdown => "lifecycle-shutdown".to_string(),
+            CleanupSettlement::Monitors { tasks } => format!("monitors({})", tasks.len()),
+            CleanupSettlement::PluginUninstall { plugin_id, .. } => {
+                format!("uninstall({plugin_id})")
+            }
+        };
+        let plugin = self
+            .plugin_id()
+            .map(|plugin_id| format!("plugin={plugin_id} "))
+            .unwrap_or_default();
+        format!(
+            "cleanup receipt {kind} for {plugin}{} from '{}' (attempts={})",
+            self.root.display(),
+            self.cause,
+            self.attempts
+        )
+    }
+}
+
+impl Clone for CleanupReceipt {
+    fn clone(&self) -> Self {
+        let settlement = match &self.settlement {
+            CleanupSettlement::McpNames { claims } => CleanupSettlement::McpNames {
+                claims: claims.clone(),
+            },
+            CleanupSettlement::Framework { wiring, claims } => CleanupSettlement::Framework {
+                wiring: wiring.clone(),
+                claims: claims.clone(),
+            },
+            CleanupSettlement::LiveLifecycle { plugin_ids } => CleanupSettlement::LiveLifecycle {
+                plugin_ids: plugin_ids.clone(),
+            },
+            CleanupSettlement::OwnedLifecycle { manager } => CleanupSettlement::OwnedLifecycle {
+                manager: Arc::clone(manager),
+            },
+            CleanupSettlement::LifecycleShutdown => CleanupSettlement::LifecycleShutdown,
+            CleanupSettlement::Monitors { tasks } => CleanupSettlement::Monitors {
+                tasks: tasks.clone(),
+            },
+            CleanupSettlement::PluginUninstall {
+                plugin_id,
+                keep_data,
+            } => CleanupSettlement::PluginUninstall {
+                plugin_id: plugin_id.clone(),
+                keep_data: *keep_data,
+            },
+        };
+        Self {
+            root: self.root.clone(),
+            cause: self.cause.clone(),
+            attempts: self.attempts,
+            last_errors: self.last_errors.clone(),
+            settlement,
+        }
+    }
+}
+
+impl std::fmt::Debug for CleanupReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CleanupReceipt")
+            .field("root", &self.root)
+            .field("cause", &self.cause)
+            .field("attempts", &self.attempts)
+            .field("last_errors", &self.last_errors)
+            .field("describe", &self.describe())
+            .finish()
+    }
+}
+
+/// Failure of a plugin runtime bootstrap that still owns cleanup receipts.
+///
+/// `PluginRuntimeService::new` remains as a transition shim that maps this into
+/// `anyhow::Error` and drops the receipts; `new_owned` callers must hand them to
+/// `PluginRuntimeService::adopt_cleanup_receipts` (or report them) instead.
+#[derive(Debug)]
+pub(crate) struct PluginBootstrapFailure {
+    pub(crate) error: anyhow::Error,
+    pub(crate) receipts: Vec<CleanupReceipt>,
+}
+
+impl PluginBootstrapFailure {
+    /// Split the failure into its error and retained receipts. The owned
+    /// bootstrap switch (T3) adopts the receipts; tests assert they survive.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn into_parts(self) -> (anyhow::Error, Vec<CleanupReceipt>) {
+        (self.error, self.receipts)
+    }
+
+    /// Transitional helper for the `anyhow::Result` constructors.
+    pub(crate) fn into_error(self) -> anyhow::Error {
+        if !self.receipts.is_empty() {
+            tracing::error!(
+                receipts = self.receipts.len(),
+                "Plugin runtime bootstrap failed with unsettled cleanup receipts that the legacy anyhow constructor cannot carry"
+            );
+        }
+        self.error
+    }
+}
+
+impl std::fmt::Display for PluginBootstrapFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "plugin runtime bootstrap failed: {} ({} cleanup receipt(s) retained)",
+            self.error,
+            self.receipts.len()
+        )
+    }
+}
+
+impl std::error::Error for PluginBootstrapFailure {}
+
 struct PluginRuntimeState {
     registry: PluginRegistry,
     framework_components: HashMap<String, WiredPluginComponents>,
@@ -252,19 +565,11 @@ struct PluginRuntimeState {
     mcp_ownership: PluginMcpOwnership,
     prepared: PreparedApplicationComponents,
     lifecycle: PluginLifecycleManager,
-    cleanup_quarantine: Vec<PluginCleanupQuarantine>,
+    cleanup_receipts: Vec<CleanupReceipt>,
     active_theme: Option<String>,
     active_output_style: Option<String>,
     generation: u64,
     shut_down: bool,
-}
-
-struct PluginCleanupQuarantine {
-    root: PathBuf,
-    lifecycle: Option<PluginLifecycleManager>,
-    lifecycle_plugin_ids: Vec<String>,
-    monitors: Vec<CronTask>,
-    last_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

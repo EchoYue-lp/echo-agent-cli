@@ -1520,7 +1520,7 @@ done
         let compose = tokio::spawn(async move { ApplicationServices::compose(&runtime_for_compose, None, None, echo_agent::tools::permission::PermissionMode::Default).await });
         let reached_boot_resume = AtomicBool::new(false);
         let reached_late_bind = AtomicBool::new(false);
-        let observation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let observation = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let cold = TaskRuntimeStore::open_for_workspace(&task_root, workspace.id.to_string())?;
                 let resumed = cold.list_events("cold-original", 0)?.iter().any(|event| event.event_type == crate::tasks::task_runtime::RuntimeEventKind::RunContinuationResumed);
@@ -1636,6 +1636,565 @@ done
                 .as_text_ref()
                 .is_some_and(|content| content.contains("Answer directly"))
         }));
+        Ok(())
+    }
+
+    async fn service_with_ownership(
+        root: &Path,
+        ownership: Arc<McpNameOwnershipRegistry>,
+    ) -> Result<Arc<PluginRuntimeService>, String> {
+        let agent = ReactAgentBuilder::new()
+            .llm_client(Arc::new(MockLlmClient::new()))
+            .system_prompt("plugin runtime ownership integration test")
+            .enable_tools()
+            .enable_subagent()
+            .register_agent_dispatch_tool()
+            .working_dir(root)
+            .build()
+            .map_err(|error| error.to_string())?;
+        PluginRuntimeService::new_for_test_with_ownership(
+            AgentHandle::new(agent),
+            root.to_path_buf(),
+            root.join("registry.json"),
+            root.join("plugin-data"),
+            ownership,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    /// Declare one MCP server whose transport is unreachable. Connection failure
+    /// is a warning in the framework, so the plugin still claims its name.
+    fn write_mcp_fixture(plugin: &Path, server_name: &str) -> Result<(), String> {
+        let config = serde_json::json!({
+            "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+            "mcpServers": {
+                server_name: {"type": "streamable-http", "url": "http://127.0.0.1:9/mcp"}
+            }
+        });
+        std::fs::write(
+            plugin.join("mcp.json"),
+            serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    async fn claim_token(
+        runtime: &PluginRuntimeService,
+        plugin_id: &str,
+        name: &str,
+    ) -> Result<PluginMcpOwnershipToken, String> {
+        runtime
+            .state
+            .lock()
+            .await
+            .mcp_ownership
+            .get(plugin_id)
+            .and_then(|tokens| tokens.get(name))
+            .copied()
+            .ok_or_else(|| format!("missing MCP ownership token for '{plugin_id}:{name}'"))
+    }
+
+    async fn test_scheduler(root: &Path) -> Result<Arc<SchedulerRunner>, String> {
+        let cron_store = crate::scheduler::CronTaskStore::new()
+            .with_path(root.join("cron-tasks.json"));
+        let fire_fn: echo_agent::scheduler::FireFn =
+            Arc::new(|_| Box::pin(async { Ok("fixture monitor fired".to_string()) }));
+        SchedulerRunner::new(
+            cron_store,
+            echo_agent::agent::CancellationToken::new(),
+            fire_fn,
+        )
+        .await
+        .map(Arc::new)
+        .map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn failed_install_retains_cleanup_receipt_with_exact_mcp_token_and_retries()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let ownership = McpNameOwnershipRegistry::new(Vec::<String>::new());
+        let alpha = write_fixture_at(
+            temp.path().join(".echo-agent/plugins/alpha-fixture"),
+            "alpha-fixture",
+        )?;
+        write_mcp_fixture(&alpha, "alpha")?;
+        let runtime = service_with_ownership(temp.path(), Arc::clone(&ownership)).await?;
+        let alpha_token = claim_token(&runtime, "alpha-fixture", "alpha").await?;
+
+        // The install itself succeeds up to activation; the failure happens after
+        // the candidate generation already claimed its MCP names.
+        let lifecycle = Arc::new(LifecycleCounts::default());
+        runtime
+            .register_lifecycle(
+                "alpha-fixture",
+                Arc::new(TestLifecycle(Arc::clone(&lifecycle))),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        lifecycle
+            .fail_next_activation
+            .store(true, Ordering::SeqCst);
+
+        let beta_source = write_fixture_at(temp.path().join("beta-source"), "beta-fixture")?;
+        write_mcp_fixture(&beta_source, "beta")?;
+        let error = runtime
+            .install(&InstallSource::Local(beta_source), PluginScope::Project)
+            .await
+            .err()
+            .ok_or_else(|| "failing install unexpectedly succeeded".to_string())?;
+        assert!(error.to_string().contains("injected activation failure"));
+        assert!(runtime.get("beta-fixture").await.is_none());
+        assert!(!temp.path().join(".echo-agent/plugins/beta-fixture").exists());
+
+        let receipts = runtime.cleanup_receipts().await;
+        assert_eq!(receipts.len(), 1, "retained receipts: {receipts:?}");
+        let retained = receipts
+            .first()
+            .ok_or_else(|| "failed install retained no cleanup receipt".to_string())?;
+        let claims = retained.mcp_claims();
+        let alpha_claim = claims
+            .iter()
+            .find(|claim| claim.plugin_id() == "alpha-fixture" && claim.name() == "alpha")
+            .ok_or_else(|| "receipt lost the exact alpha ownership token".to_string())?;
+        let retained_alpha_token = alpha_claim.token();
+        assert!(
+            claims
+                .iter()
+                .any(|claim| claim.plugin_id() == "beta-fixture" && claim.name() == "beta"),
+            "receipt lost the partially installed beta token: {claims:?}"
+        );
+        assert_eq!(
+            runtime.cleanup_debt_roots().await,
+            vec![temp.path().to_path_buf()]
+        );
+        {
+            let guard = ownership.lock().await;
+            // The candidate rewire reclaimed the name before the failure, so the
+            // receipt must carry that exact live token, not the older one.
+            assert!(guard.owns_plugin("alpha-fixture", "alpha", retained_alpha_token));
+            assert!(!guard.owns_plugin("alpha-fixture", "alpha", alpha_token));
+        }
+
+        // Every owned mutation retries receipts before it may report success.
+        runtime.reload().await.map_err(|error| error.to_string())?;
+        assert!(runtime.cleanup_receipts().await.is_empty());
+        assert!(runtime.cleanup_debt_roots().await.is_empty());
+        let refreshed = claim_token(&runtime, "alpha-fixture", "alpha").await?;
+        assert_ne!(refreshed, retained_alpha_token);
+        {
+            let guard = ownership.lock().await;
+            assert!(!guard.owns_plugin("alpha-fixture", "alpha", retained_alpha_token));
+            assert!(guard.owns_plugin("alpha-fixture", "alpha", refreshed));
+        }
+        runtime.shutdown().await.map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn failed_uninstall_retains_lifecycle_cleanup_receipt_and_retries() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
+        let runtime = service(temp.path()).await?;
+        let lifecycle = Arc::new(LifecycleCounts::default());
+        runtime
+            .register_lifecycle(
+                "runtime-fixture",
+                Arc::new(TestLifecycle(Arc::clone(&lifecycle))),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        lifecycle
+            .shutdown_failures_remaining
+            .store(1, Ordering::SeqCst);
+
+        let error = runtime
+            .uninstall("runtime-fixture", false)
+            .await
+            .err()
+            .ok_or_else(|| "failing uninstall unexpectedly succeeded".to_string())?;
+        assert!(error.to_string().contains("injected shutdown failure"));
+        assert!(!plugin.exists());
+        assert!(runtime.get("runtime-fixture").await.is_none());
+        let receipts = runtime.cleanup_receipts().await;
+        assert_eq!(receipts.len(), 1, "retained receipts: {receipts:?}");
+        assert!(
+            receipts
+                .iter()
+                .any(|receipt| receipt.plugin_id() == Some("runtime-fixture")
+                    && receipt.describe().contains("lifecycle")),
+            "uninstall did not retain its lifecycle cleanup receipt: {receipts:?}"
+        );
+        assert_eq!(
+            runtime.cleanup_debt_roots().await,
+            vec![temp.path().to_path_buf()]
+        );
+
+        runtime.reload().await.map_err(|error| error.to_string())?;
+        assert!(runtime.cleanup_receipts().await.is_empty());
+        assert!(runtime.cleanup_debt_roots().await.is_empty());
+        assert_eq!(lifecycle.shutdown.load(Ordering::SeqCst), 2);
+        runtime.shutdown().await.map_err(|error| error.to_string())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_uninstall_waiter_still_retains_cleanup_receipt() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        write_fixture(temp.path())?;
+        let runtime = service(temp.path()).await?;
+        let lifecycle = Arc::new(LifecycleCounts::default());
+        runtime
+            .register_lifecycle(
+                "runtime-fixture",
+                Arc::new(TestLifecycle(Arc::clone(&lifecycle))),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        lifecycle
+            .shutdown_failures_remaining
+            .store(1, Ordering::SeqCst);
+
+        // Hold the state lock so the admitted settlement parks in the real
+        // uninstall path; aborting the caller must not cancel or drop the receipt.
+        let state_guard = runtime.state.lock().await;
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let waiter_runtime = Arc::clone(&runtime);
+        let waiter = tokio::spawn(async move {
+            waiter_runtime
+                .run_owned_mutation(move |service| async move {
+                    let _ = started.send(());
+                    service.uninstall_inner("runtime-fixture", false).await
+                })
+                .await
+        });
+        started_rx
+            .await
+            .map_err(|_| "owned plugin uninstall never started".to_string())?;
+        waiter.abort();
+        let _ = waiter.await;
+        drop(state_guard);
+
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if runtime.get("runtime-fixture").await.is_none()
+                    && !runtime.cleanup_receipts().await.is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if settled.is_err() {
+            let receipts = runtime.cleanup_receipts().await;
+            let present = runtime.get("runtime-fixture").await.is_some();
+            let settlements = runtime
+                .mutation_supervisor
+                .lock()
+                .await
+                .settlements
+                .len();
+            return Err(format!(
+                "cancelled plugin uninstall lost its cleanup receipt: plugin_present={present}, receipts={}, shutdowns={}, settlements={settlements}",
+                receipts.len(),
+                lifecycle.shutdown.load(Ordering::SeqCst),
+            ));
+        }
+
+        let receipts = runtime.cleanup_receipts().await;
+        assert!(
+            receipts
+                .iter()
+                .any(|receipt| receipt.plugin_id() == Some("runtime-fixture")),
+            "cancelled uninstall did not retain its receipt: {receipts:?}"
+        );
+        runtime.reload().await.map_err(|error| error.to_string())?;
+        assert!(runtime.cleanup_receipts().await.is_empty());
+        runtime.shutdown().await.map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn same_name_takeover_is_rejected_without_releasing_the_owner_token()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let ownership = McpNameOwnershipRegistry::new(Vec::<String>::new());
+        let alpha = write_fixture_at(
+            temp.path().join(".echo-agent/plugins/alpha-fixture"),
+            "alpha-fixture",
+        )?;
+        write_mcp_fixture(&alpha, "shared")?;
+        ownership.claim_user_names(["user-shared".to_string()]).await;
+        let runtime = service_with_ownership(temp.path(), Arc::clone(&ownership)).await?;
+        let alpha_token = claim_token(&runtime, "alpha-fixture", "shared").await?;
+
+        // A second enabled plugin declaring the incumbent name is rejected before
+        // any ownership token is taken.
+        let beta_source = write_fixture_at(temp.path().join("beta-source"), "beta-fixture")?;
+        write_mcp_fixture(&beta_source, "shared")?;
+        let error = runtime
+            .install(&InstallSource::Local(beta_source), PluginScope::Project)
+            .await
+            .err()
+            .ok_or_else(|| "same-name plugin takeover unexpectedly succeeded".to_string())?;
+        assert!(
+            error
+                .to_string()
+                .contains("is declared by both 'alpha-fixture' and 'beta-fixture'"),
+            "install error: {error}"
+        );
+        assert!(!temp.path().join(".echo-agent/plugins/beta-fixture").exists());
+        assert!(
+            runtime.cleanup_receipts().await.is_empty(),
+            "a rejected takeover must not fabricate a cleanup receipt"
+        );
+
+        // A user-configured name is also rejected by the ownership authority.
+        let gamma_source = write_fixture_at(temp.path().join("gamma-source"), "gamma-fixture")?;
+        write_mcp_fixture(&gamma_source, "user-shared")?;
+        let error = runtime
+            .install(&InstallSource::Local(gamma_source), PluginScope::Project)
+            .await
+            .err()
+            .ok_or_else(|| "user-owned MCP name takeover unexpectedly succeeded".to_string())?;
+        assert!(
+            error.to_string().contains("owned by user configuration"),
+            "install error: {error}"
+        );
+        assert!(runtime.cleanup_receipts().await.is_empty());
+        {
+            let guard = ownership.lock().await;
+            assert!(
+                guard.owns_plugin("alpha-fixture", "shared", alpha_token),
+                "rejected takeover released the incumbent plugin token"
+            );
+            assert!(
+                guard
+                    .validate_plugin_claim("gamma-fixture", "user-shared", None)
+                    .err()
+                    .is_some_and(|error| error.contains("user configuration"))
+            );
+        }
+
+        // A stale receipt carrying another plugin's token settles as a no-op and
+        // can never release a name it does not own.
+        let stale = CleanupReceipt::mcp_names(
+            temp.path().to_path_buf(),
+            "stale receipt from a partial install".to_string(),
+            vec![PluginMcpNameClaim::new(
+                "beta-fixture".to_string(),
+                "shared".to_string(),
+                alpha_token,
+            )],
+        );
+        runtime
+            .adopt_cleanup_receipts(vec![stale.clone()])
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(runtime.cleanup_receipts().await.is_empty());
+        {
+            let guard = ownership.lock().await;
+            assert!(
+                guard.owns_plugin("alpha-fixture", "shared", alpha_token),
+                "a receipt carrying a foreign plugin id released the owner token"
+            );
+        }
+
+        // Retrying the same receipt is an idempotent no-op, never a double release.
+        runtime
+            .adopt_cleanup_receipts(vec![stale])
+            .await
+            .map_err(|error| error.to_string())?;
+        {
+            let guard = ownership.lock().await;
+            assert!(guard.owns_plugin("alpha-fixture", "shared", alpha_token));
+        }
+
+        // An explicit user takeover is a hand-over, not a plugin release.
+        ownership.claim_user_names(["shared".to_string()]).await;
+        let handed_over = CleanupReceipt::mcp_names(
+            temp.path().to_path_buf(),
+            "hand-over receipt".to_string(),
+            vec![PluginMcpNameClaim::new(
+                "alpha-fixture".to_string(),
+                "shared".to_string(),
+                alpha_token,
+            )],
+        );
+        runtime
+            .adopt_cleanup_receipts(vec![handed_over])
+            .await
+            .map_err(|error| error.to_string())?;
+        {
+            let guard = ownership.lock().await;
+            assert!(!guard.owns_plugin("alpha-fixture", "shared", alpha_token));
+            assert!(
+                guard
+                    .validate_plugin_claim("alpha-fixture", "shared", Some(alpha_token))
+                    .err()
+                    .is_some_and(|error| error.contains("user configuration")),
+                "user takeover was not preserved"
+            );
+        }
+        runtime.shutdown().await.map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn partial_receipt_settlement_is_not_success_until_every_obligation_settles()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let ownership = McpNameOwnershipRegistry::new(Vec::<String>::new());
+        let orphan_token = {
+            let mut guard = ownership.lock().await;
+            guard
+                .claim_plugin("stale-plugin", "stale-name")
+                .map_err(|error| error.to_string())?
+        };
+        let alpha = write_fixture_at(
+            temp.path().join(".echo-agent/plugins/alpha-fixture"),
+            "alpha-fixture",
+        )?;
+        write_mcp_fixture(&alpha, "alpha")?;
+        let runtime = service_with_ownership(temp.path(), Arc::clone(&ownership)).await?;
+        let alpha_token = claim_token(&runtime, "alpha-fixture", "alpha").await?;
+
+        let claim_receipt = CleanupReceipt::mcp_names(
+            temp.path().to_path_buf(),
+            "partial install".to_string(),
+            vec![PluginMcpNameClaim::new(
+                "stale-plugin".to_string(),
+                "stale-name".to_string(),
+                orphan_token,
+            )],
+        );
+        let monitor_receipt = CleanupReceipt::monitors(
+            temp.path().to_path_buf(),
+            "stale plugin monitor".to_string(),
+            vec![CronTask::new(
+                "stale-plugin-monitor",
+                "0 0 * * * *",
+                "stale plugin monitor",
+            )],
+        );
+        let error = runtime
+            .adopt_cleanup_receipts(vec![claim_receipt, monitor_receipt])
+            .await
+            .err()
+            .ok_or_else(|| "unsettleable monitor receipt was reported as settled".to_string())?;
+        assert!(error.to_string().contains("cleanup receipts remain unsettled"));
+        {
+            let guard = ownership.lock().await;
+            assert!(
+                !guard.owns_plugin("stale-plugin", "stale-name", orphan_token),
+                "the settleable half of the partial recovery was not settled"
+            );
+            assert!(
+                guard.owns_plugin("alpha-fixture", "alpha", alpha_token),
+                "partial recovery released a live plugin token"
+            );
+        }
+        assert_eq!(runtime.cleanup_receipts().await.len(), 1);
+
+        let reload_error = runtime
+            .reload()
+            .await
+            .err()
+            .ok_or_else(|| "reload reported success with an unsettled receipt".to_string())?;
+        assert!(reload_error.to_string().contains("cleanup receipts remain unsettled"));
+        assert_eq!(runtime.cleanup_receipts().await.len(), 1);
+
+        let scheduler = test_scheduler(temp.path()).await?;
+        runtime
+            .bind_scheduler(Arc::clone(&scheduler))
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(runtime.cleanup_receipts().await.is_empty());
+        assert!(runtime.cleanup_debt_roots().await.is_empty());
+        assert_eq!(scheduler.list_tasks().await.len(), 1);
+        runtime.shutdown().await.map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_failure_exports_retained_cleanup_receipts_with_exact_tokens()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture_at(
+            temp.path().join(".echo-agent/plugins/alpha-fixture"),
+            "alpha-fixture",
+        )?;
+        write_mcp_fixture(&plugin, "alpha")?;
+        let runtime = service(temp.path()).await?;
+        let lifecycle = Arc::new(LifecycleCounts::default());
+        runtime
+            .register_lifecycle(
+                "alpha-fixture",
+                Arc::new(TestLifecycle(Arc::clone(&lifecycle))),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        lifecycle
+            .fail_next_activation
+            .store(true, Ordering::SeqCst);
+        let reload_error = runtime
+            .reload()
+            .await
+            .err()
+            .ok_or_else(|| "failing reload unexpectedly succeeded".to_string())?;
+
+        // This is exactly the conversion `new_owned` uses when the initial
+        // generation fails: the failed service hands its receipts to the caller.
+        let failure = runtime.into_bootstrap_failure(reload_error).await;
+        assert!(failure.error.to_string().contains("injected activation failure"));
+        let receipts = &failure.receipts;
+        assert_eq!(receipts.len(), 1, "retained receipts: {receipts:?}");
+        let claims = receipts
+            .first()
+            .ok_or_else(|| "bootstrap failure retained no receipt".to_string())?
+            .mcp_claims();
+        assert!(
+            claims
+                .iter()
+                .any(|claim| claim.plugin_id() == "alpha-fixture" && claim.name() == "alpha"),
+            "bootstrap failure lost its exact ownership tokens: {claims:?}"
+        );
+        let (error, receipts) = failure.into_parts();
+        assert!(error.to_string().contains("injected activation failure"));
+        assert_eq!(receipts.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owned_constructor_maps_rejected_generation_into_bootstrap_failure()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
+        std::fs::write(plugin.join("agents/example.md"), "not valid frontmatter")
+            .map_err(|error| error.to_string())?;
+        let agent = ReactAgentBuilder::new()
+            .llm_client(Arc::new(MockLlmClient::new()))
+            .system_prompt("owned constructor rejection test")
+            .working_dir(temp.path())
+            .build()
+            .map(AgentHandle::new)
+            .map_err(|error| error.to_string())?;
+
+        let failure = PluginRuntimeService::new_for_test_owned(
+            agent,
+            temp.path().to_path_buf(),
+            temp.path().join("registry.json"),
+            temp.path().join("plugin-data"),
+            McpNameOwnershipRegistry::new(Vec::<String>::new()),
+        )
+        .await
+        .err()
+        .ok_or_else(|| "invalid initial generation unexpectedly bootstrapped".to_string())?;
+
+        assert!(
+            failure.error.to_string().contains("frontmatter"),
+            "bootstrap error: {}",
+            failure.error
+        );
+        assert!(failure.receipts.is_empty());
+        assert!(failure.to_string().contains("cleanup receipt(s) retained"));
         Ok(())
     }
 
