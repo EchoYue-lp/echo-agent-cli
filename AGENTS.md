@@ -89,7 +89,7 @@ cargo test --workspace --all-features --locked
 cargo check -p echo-agent-app-core --no-default-features --locked
 ```
 
-本 CLI 的依赖审计另按用户明确接受的当前交付精确合同执行：Cargo.lock SHA256 `d804d2907ad283e6f6831cb37551bc0b09e6a169c24a50abe320a9ea0fddae84` 与既有 consumer 指纹绑定的 glib 0.18.5、proc-macro-error 1.0.4、bincode 1.3.3、zbus_names 4.3.4、zvariant 5.13.1、zvariant_derive 5.14.0 六项风险，以 `.cargo/accepted-dependency-risks.json` 和 `docs/supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md` 为唯一机器身份与人类裁决依据；执行既有六项工具测试及 actual-lock/canonical-origin 两次 `scripts/check_cli_dependency_risks.py` 检查，保留完整官方输出与 scanner 自然出口 1，由独立精确风险 gate 0 表示已接受，不能称零 warning 审计。原三稳定版本继续冻结，不升级、不增 ignore、不将风险改称 resolved；仅本次精确 lock/consumer/source/version/checksum/advisory/kind 合同适用，变化须复评，不自动续期，不接受其它 warning、漏洞、yanked 或扫描错误。SDK/framework 的独立例外不继承到 CLI，编译、Clippy、fmt、测试与精确 main 门禁仍须全部通过。
+本 CLI 的依赖审计另按用户明确接受的当前交付精确合同执行：Cargo.lock SHA256 `cca90ea328dbdbb5ebf819b5afb8845714c202e5f5fd1b9c032811c35f0e1307` 与既有 consumer 指纹绑定的 glib 0.18.5、proc-macro-error 1.0.4、bincode 1.3.3、zbus_names 4.3.4、zvariant 5.13.1、zvariant_derive 5.14.0 六项风险，以 `.cargo/accepted-dependency-risks.json` 和 `docs/supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md` 为唯一机器身份与人类裁决依据；执行既有六项工具测试及 actual-lock/canonical-origin 两次 `scripts/check_cli_dependency_risks.py` 检查，保留完整官方输出与 scanner 自然出口 1，由独立精确风险 gate 0 表示已接受，不能称零 warning 审计。原三稳定版本继续冻结，不升级、不增 ignore、不将风险改称 resolved；仅本次精确 lock/consumer/source/version/checksum/advisory/kind 合同适用，变化须复评，不自动续期，不接受其它 warning、漏洞、yanked 或扫描错误。SDK/framework 的独立例外不继承到 CLI，编译、Clippy、fmt、测试与精确 main 门禁仍须全部通过。
 
 ### 条件矩阵(仅触及对应风险面时)
 
