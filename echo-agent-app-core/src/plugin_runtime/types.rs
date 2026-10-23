@@ -515,34 +515,49 @@ impl std::fmt::Debug for CleanupReceipt {
 
 /// Failure of a plugin runtime bootstrap that still owns cleanup receipts.
 ///
-/// `PluginRuntimeService::new` remains as a transition shim that maps this into
-/// `anyhow::Error` and drops the receipts; `new_owned` callers must hand them to
-/// `PluginRuntimeService::adopt_cleanup_receipts` (or report them) instead.
+/// The failed service is gone, so these receipts cannot be settled by it any
+/// more. They therefore travel as [`RetainedCleanupReceipts`], a collection that
+/// cannot leave scope silently: production callers hand it to the process-level
+/// retry owner with [`RetainedCleanupReceipts::park`], and dropping it parks the
+/// receipts anyway.
 #[derive(Debug)]
 pub(crate) struct PluginBootstrapFailure {
-    pub(crate) error: anyhow::Error,
-    pub(crate) receipts: Vec<CleanupReceipt>,
+    error: anyhow::Error,
+    receipts: RetainedCleanupReceipts,
 }
 
 impl PluginBootstrapFailure {
-    /// Split the failure into its error and retained receipts. Callers must log
-    /// or adopt the receipts; tests assert they survive.
-    pub(crate) fn into_parts(self) -> (anyhow::Error, Vec<CleanupReceipt>) {
+    pub(crate) fn new(error: anyhow::Error, receipts: Vec<CleanupReceipt>) -> Self {
+        Self {
+            error,
+            receipts: RetainedCleanupReceipts::new(receipts),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn error(&self) -> &anyhow::Error {
+        &self.error
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn receipts(&self) -> &RetainedCleanupReceipts {
+        &self.receipts
+    }
+
+    /// Split the failure into its error and the retained receipts. Callers must
+    /// hand the receipts to a live retry owner; dropping them parks them in the
+    /// process-level ledger instead of forgetting them.
+    pub(crate) fn into_parts(self) -> (anyhow::Error, RetainedCleanupReceipts) {
         (self.error, self.receipts)
     }
 
     /// Convenience mapping for the `cfg(test)` constructors, which still return
-    /// `anyhow::Result`. Production callers use [`Self::into_parts`] so receipts
-    /// are never dropped silently.
+    /// `anyhow::Result`. Receipts are parked, never dropped.
     #[cfg(test)]
     pub(crate) fn into_error(self) -> anyhow::Error {
-        if !self.receipts.is_empty() {
-            tracing::error!(
-                receipts = self.receipts.len(),
-                "Plugin runtime bootstrap failed with unsettled cleanup receipts in a test constructor"
-            );
-        }
-        self.error
+        let (error, receipts) = self.into_parts();
+        receipts.park();
+        error
     }
 }
 

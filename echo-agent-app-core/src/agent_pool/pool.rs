@@ -679,43 +679,28 @@ impl AgentPool {
                         Ok(runtime) => runtime,
                         Err(failure) => {
                             // A failed bootstrap leaves cleanup obligations that no
-                            // runtime owner exists to adopt. Log every receipt with
-                            // its exact MCP ownership tokens, then carry every one of
-                            // them in the returned error instead of dropping them.
+                            // runtime owner exists to adopt. Report every receipt
+                            // with its exact MCP ownership tokens, then park them
+                            // with the process-level retry owner: the next
+                            // bootstrap of this project adopts and retries them, so
+                            // the obligations never shrink to log text.
                             let (error, receipts) = failure.into_parts();
-                            let mut descriptions = Vec::with_capacity(receipts.len());
-                            for receipt in &receipts {
-                                let tokens = receipt
-                                    .mcp_claims()
-                                    .iter()
-                                    .map(|claim| {
-                                        format!(
-                                            "{}:{}={:?}",
-                                            claim.plugin_id(),
-                                            claim.name(),
-                                            claim.token()
-                                        )
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(",");
+                            let tokens = receipts.mcp_tokens();
+                            for description in receipts.describe() {
                                 tracing::error!(
-                                    cleanup = %receipt.describe(),
-                                    mcp_tokens = %tokens,
-                                    "plugin runtime bootstrap retained an unsettled cleanup receipt"
+                                    cleanup = %description,
+                                    mcp_tokens = %tokens.join(","),
+                                    "plugin runtime bootstrap parked an unsettled cleanup receipt"
                                 );
-                                descriptions.push(if tokens.is_empty() {
-                                    receipt.describe()
-                                } else {
-                                    format!("{} [mcp_tokens: {tokens}]", receipt.describe())
-                                });
                             }
-                            if descriptions.is_empty() {
+                            let parked = receipts.park();
+                            if parked.is_empty() {
                                 return Err(error);
                             }
                             return Err(error.context(format!(
-                                "plugin runtime bootstrap retained {} cleanup receipt(s): {}",
-                                descriptions.len(),
-                                descriptions.join("; ")
+                                "plugin runtime bootstrap retained {} cleanup receipt(s) in the process retry ledger: {}",
+                                parked.len(),
+                                parked.join("; ")
                             )));
                         }
                     };

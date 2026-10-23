@@ -124,7 +124,44 @@ impl PluginRuntimeService {
         if let Err(error) = service.reload().await {
             return Err(service.into_bootstrap_failure(error).await);
         }
+        // A previous bootstrap for this project root may have parked cleanup
+        // debt in the process-level ledger. Take it over now that this runtime
+        // is the live owner and retry it: whatever still cannot settle stays in
+        // the ledger and blocks the next success report.
+        service.adopt_parked_cleanup_receipts().await;
         Ok(service)
+    }
+
+    /// Take over cleanup debt parked by an earlier failed bootstrap and retry it.
+    ///
+    /// The receipts belong to project roots, so only this root's debt is adopted:
+    /// a runtime can only know which scheduler, registry and name authority a
+    /// receipt needs. Residual debt stays in the runtime ledger and is retried by
+    /// every later mutation, which keeps the "no success while unsettled" rule.
+    async fn adopt_parked_cleanup_receipts(&self) {
+        let root = self.lsp.binding().await.project_root;
+        let parked = take_parked_cleanup_receipts(&root);
+        if parked.is_empty() {
+            return;
+        }
+        let adopted = parked.len();
+        let mut state = self.state.lock().await;
+        state.cleanup_receipts.extend(parked);
+        let errors = self.retry_cleanup_receipts(&mut state).await;
+        let outstanding = state.cleanup_receipts.len();
+        if errors.is_empty() {
+            tracing::warn!(
+                adopted,
+                "adopted and settled cleanup receipts parked by an earlier failed bootstrap"
+            );
+        } else {
+            tracing::error!(
+                adopted,
+                outstanding,
+                errors = %errors.join("; "),
+                "adopted parked plugin cleanup receipts that still cannot settle; the next plugin mutation will retry them before reporting success"
+            );
+        }
     }
 
     /// Convert a failed initial generation into a value that keeps every
@@ -182,7 +219,9 @@ impl PluginRuntimeService {
             );
         }
         drop(state);
-        PluginBootstrapFailure { error, receipts }
+        // `PluginBootstrapFailure` hands these to the caller as a collection that
+        // can only leave scope parked in the process-level retry ledger.
+        PluginBootstrapFailure::new(error, receipts)
     }
 
     #[cfg(test)]
@@ -824,12 +863,17 @@ impl PluginRuntimeService {
                     errors.push(format!("framework plugin rollback failed: {error}"));
                     // The failed withdrawal still owns its MCP clients: keep the
                     // exact tokens in one receipt and only release them after a
-                    // successful retry of this wiring receipt.
+                    // successful retry of this wiring receipt. Prefer the receipt
+                    // the framework reported as canonical for this failed attempt.
+                    let retained_withdrawal = error
+                        .cleanup_receipt()
+                        .cloned()
+                        .unwrap_or_else(|| receipt.clone());
                     state.cleanup_receipts.push(CleanupReceipt::framework(
                         previous_root.clone(),
                         "fail-closed plugin retirement could not withdraw plugin components"
                             .to_string(),
-                        receipt.clone(),
+                        retained_withdrawal,
                         std::mem::take(&mut owned_claims),
                     ));
                 }
@@ -897,16 +941,31 @@ impl PluginRuntimeService {
 
     /// Retry every outstanding cleanup receipt exactly once.
     ///
-    /// Settled receipts disappear; partially settled receipts keep only the
-    /// obligations that are still outstanding, so a retry can never release a
-    /// token twice or take over a name this runtime no longer owns.
+    /// Settlement runs against the ledger in place and a receipt is removed only
+    /// after its exact obligation settled. Nothing is moved out of the ledger
+    /// before an await, so cancelling the caller mid-retry (a dropped mutation
+    /// future, an aborted waiter) cannot drop debt on the stack: the ledger still
+    /// holds the receipt and the next retry finds it.
     async fn retry_cleanup_receipts(&self, state: &mut PluginRuntimeState) -> Vec<String> {
-        let pending = std::mem::take(&mut state.cleanup_receipts);
         let mut retry_errors = Vec::new();
-        for mut receipt in pending {
-            let errors = self.settle_cleanup_receipt(state, &mut receipt).await;
+        // Split the state borrow so settlement can use the lifecycle authority
+        // while the receipt stays in the ledger.
+        let PluginRuntimeState {
+            lifecycle,
+            cleanup_receipts,
+            ..
+        } = state;
+        let mut index = 0;
+        while index < cleanup_receipts.len() {
+            let errors = {
+                let receipt = &mut cleanup_receipts[index];
+                self.settle_cleanup_receipt(lifecycle, receipt).await
+            };
+            let receipt = &mut cleanup_receipts[index];
             receipt.attempts = receipt.attempts.saturating_add(1);
             if errors.is_empty() {
+                // Confirmed settlement: only now does the receipt leave the ledger.
+                cleanup_receipts.remove(index);
                 continue;
             }
             receipt.last_errors = errors
@@ -914,14 +973,14 @@ impl PluginRuntimeService {
                 .map(|error| format!("{}: {error}", receipt.root.display()))
                 .collect();
             retry_errors.extend(receipt.last_errors.clone());
-            state.cleanup_receipts.push(receipt);
+            index = index.saturating_add(1);
         }
         retry_errors
     }
 
     async fn settle_cleanup_receipt(
         &self,
-        state: &mut PluginRuntimeState,
+        lifecycle: &mut PluginLifecycleManager,
         receipt: &mut CleanupReceipt,
     ) -> Vec<String> {
         match &mut receipt.settlement {
@@ -947,7 +1006,7 @@ impl PluginRuntimeService {
                 let mut errors = Vec::new();
                 let mut remaining = Vec::new();
                 for plugin_id in plugin_ids.drain(..) {
-                    if let Err(error) = state.lifecycle.unregister(&plugin_id) {
+                    if let Err(error) = lifecycle.unregister(&plugin_id) {
                         errors.push(error);
                         remaining.push(plugin_id);
                     }
@@ -959,7 +1018,7 @@ impl PluginRuntimeService {
                 let mut manager = Arc::clone(manager).lock_owned().await;
                 manager.shutdown()
             }
-            CleanupSettlement::LifecycleShutdown => state.lifecycle.shutdown(),
+            CleanupSettlement::LifecycleShutdown => lifecycle.shutdown(),
             CleanupSettlement::Monitors { tasks } => {
                 let scheduler = self.scheduler.read().await.clone();
                 let Some(scheduler) = scheduler else {
@@ -968,9 +1027,14 @@ impl PluginRuntimeService {
                         tasks.len()
                     )];
                 };
+                // Withdraw against a snapshot and narrow the receipt only after the
+                // whole loop finished. Cancelling mid-loop therefore leaves the
+                // receipt listing every monitor, and a retry re-attempts them (the
+                // removal is exact and idempotent).
+                let snapshot = tasks.clone();
                 let mut errors = Vec::new();
                 let mut remaining = Vec::new();
-                for task in tasks.drain(..) {
+                for task in snapshot {
                     if let Err(error) = scheduler.remove_task_exact(&task.id).await {
                         errors.push(format!(
                             "Failed to remove plugin monitor '{}': {error}",
@@ -2096,12 +2160,46 @@ impl PluginRuntimeService {
                         format!("{}; rollback plugin monitors failed: {error}", failed.error);
                 }
                 replacement_lsp.shutdown_all().await;
-                failed.error = append_errors(
-                    failed.error,
-                    state
-                        .lifecycle
-                        .activate_enabled(previous_plugins.iter().map(String::as_str)),
-                );
+                if let Some((wiring, claims)) = failed.retained_withdrawal.take() {
+                    // A withdrawal did not settle, so no generation can be
+                    // described as live any more. The exact wiring receipt and its
+                    // tokens move to the ledger, which retries the withdrawal
+                    // before it may release a single name, and the rest of the
+                    // retired generation is withdrawn fail-closed.
+                    state.cleanup_receipts.push(CleanupReceipt::framework(
+                        binding.project_root.clone(),
+                        format!("plugin generation replacement aborted: {}", failed.error),
+                        wiring,
+                        claims,
+                    ));
+                    let mut previous_lifecycle =
+                        std::mem::replace(&mut state.lifecycle, PluginLifecycleManager::new());
+                    let lifecycle_errors = previous_lifecycle.shutdown();
+                    if lifecycle_errors.is_empty() {
+                        drop(previous_lifecycle);
+                    } else {
+                        state.cleanup_receipts.push(CleanupReceipt::owned_lifecycle(
+                            binding.project_root.clone(),
+                            "aborted plugin generation could not shut down plugin lifecycles"
+                                .to_string(),
+                            previous_lifecycle,
+                        ));
+                        failed.error = append_errors(failed.error, lifecycle_errors);
+                    }
+                    primary
+                        .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, None)
+                        .await;
+                    crate::runtime::configure_intent_router(&mut primary);
+                    state.active_theme = None;
+                    state.active_output_style = None;
+                } else {
+                    failed.error = append_errors(
+                        failed.error,
+                        state
+                            .lifecycle
+                            .activate_enabled(previous_plugins.iter().map(String::as_str)),
+                    );
+                }
                 if !failed.orphaned_claims.is_empty() {
                     // Candidate names that were claimed and then unwound travel as
                     // a receipt; dropping them here would leak the exact tokens.
@@ -2469,6 +2567,7 @@ impl PluginRuntimeService {
                     prepared: previous_prepared,
                     candidate_monitors,
                     orphaned_claims: Vec::new(),
+                    retained_withdrawal: None,
                 });
             }
         };
@@ -2488,13 +2587,42 @@ impl PluginRuntimeService {
                 prepared: previous_prepared,
                 candidate_monitors,
                 orphaned_claims: Vec::new(),
+                retained_withdrawal: None,
             });
         }
 
+        // Withdraw the previous framework generation before releasing anything of
+        // it. A failed withdrawal leaves its Skills/Hooks/MCP clients attached to
+        // the Agent, so releasing the exact name tokens now would let a new owner
+        // take a name whose old client is still connected. The replacement stops,
+        // and the exact wiring receipt plus tokens become retryable debt.
         if let Some(receipt) = previous_framework_receipt.as_ref()
             && let Err(error) = self.integrator.rollback(agent, receipt).await
         {
-            tracing::error!(%error, "framework plugin rollback failed before replacement");
+            let retained_withdrawal = error
+                .cleanup_receipt()
+                .cloned()
+                .unwrap_or_else(|| receipt.clone());
+            let retained_claims = claims_from_ownership(&previous_mcp_ownership);
+            unload_application_components(agent, &previous_prepared).await;
+            agent
+                .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, None)
+                .await;
+            crate::runtime::configure_intent_router(agent);
+            return Err(FailedAgentComponents {
+                error: format!(
+                    "framework plugin rollback failed before replacement: {error}; the previous plugin generation could not be withdrawn, so its exact wiring receipt stays retryable and no MCP name was released"
+                ),
+                registry: previous_registry,
+                framework_components: HashMap::new(),
+                framework_generation: None,
+                framework_receipt: None,
+                mcp_ownership: HashMap::new(),
+                prepared: PreparedApplicationComponents::default(),
+                candidate_monitors,
+                orphaned_claims: Vec::new(),
+                retained_withdrawal: Some((retained_withdrawal, retained_claims)),
+            });
         }
         unload_application_components(agent, &previous_prepared).await;
         release_plugin_mcp_claims(&mut ownership_guard, &previous_mcp_ownership);
@@ -2522,6 +2650,7 @@ impl PluginRuntimeService {
                             prepared: PreparedApplicationComponents::default(),
                             candidate_monitors,
                             orphaned_claims: Vec::new(),
+                            retained_withdrawal: None,
                         });
                     }
                 };
@@ -2542,6 +2671,7 @@ impl PluginRuntimeService {
                                     prepared: PreparedApplicationComponents::default(),
                                     candidate_monitors,
                                     orphaned_claims: Vec::new(),
+                                    retained_withdrawal: None,
                                 });
                             }
                         }
@@ -2569,39 +2699,52 @@ impl PluginRuntimeService {
                     prepared: previous_prepared,
                     candidate_monitors,
                     orphaned_claims: Vec::new(),
+                    retained_withdrawal: None,
                 });
             }
         };
 
         let wiring = match candidate_framework_generation.as_deref() {
-            Some(generation) => self
-                .integrator
-                .wire_prepared(agent, generation)
-                .await
-                .map(Some)
-                .map_err(|error| error.to_string()),
+            Some(generation) => self.integrator.wire_prepared(agent, generation).await.map(Some),
             None => Ok(None),
         };
-        let candidate_outcome = match wiring {
+        // A failed apply may still hold framework cleanup debt: `wire_prepared`
+        // returns the exact partial receipt when its own unwiring failed, and that
+        // receipt's clients stay connected until a retry withdraws them. Keep the
+        // typed error until the receipt and the candidate tokens are in hand.
+        let candidate_outcome: Result<AppliedCandidate, RejectedCandidate> = match wiring {
             Ok(wiring) => match register_plugin_agents(agent, &candidate_prepared.agents).await {
                 Ok(_) => {
                     crate::runtime::configure_intent_router(agent);
                     Ok((candidate, wiring))
                 }
                 Err(error) => {
+                    let mut retained_withdrawal = None;
                     if let Some(receipt) = wiring.as_ref()
-                        && let Err(error) = self.integrator.rollback(agent, receipt).await
+                        && let Err(rollback_error) = self.integrator.rollback(agent, receipt).await
                     {
-                        tracing::error!(%error, "framework plugin rollback failed after Subagent registration error");
+                        let retained = rollback_error
+                            .cleanup_receipt()
+                            .cloned()
+                            .unwrap_or_else(|| receipt.clone());
+                        retained_withdrawal = Some((
+                            retained,
+                            claims_from_ownership(&candidate_mcp_ownership),
+                        ));
                     }
                     unload_application_components(agent, &candidate_prepared).await;
                     Err((
                         format!("Plugin Subagent registration failed: {error}"),
-                        candidate,
+                        retained_withdrawal,
                     ))
                 }
             },
-            Err(error) => Err((format!("Plugin wiring failed: {error}"), candidate)),
+            Err(error) => {
+                let retained_withdrawal = error.cleanup_receipt().cloned().map(|receipt| {
+                    (receipt, claims_from_ownership(&candidate_mcp_ownership))
+                });
+                Err((format!("Plugin wiring failed: {error}"), retained_withdrawal))
+            }
         };
 
         match candidate_outcome {
@@ -2616,12 +2759,33 @@ impl PluginRuntimeService {
                 previous_mcp_declarations,
                 previous_prepared,
             }),
-            Err((error, _candidate_registry)) => {
-                // The candidate wiring has already been withdrawn, but the exact
-                // ownership tokens must survive this error as a receipt: releasing
-                // them here would silently forget a partial installation. Release
-                // them exactly once now so the previous generation can restore its
-                // own claims; a later receipt retry is an idempotent no-op.
+            Err((error, Some((wiring, claims)))) => {
+                // The candidate wiring could not be withdrawn, so its clients (and
+                // the names they hold) are still live. Nothing is released and the
+                // previous generation is not restored: the framework still owes its
+                // own cleanup debt, which blocks a replacement wiring. The exact
+                // receipt and tokens travel to the ledger, which now owns the
+                // withdrawal-before-release ordering.
+                Err(FailedAgentComponents {
+                    error: format!(
+                        "{error}; the partially wired plugin generation could not be withdrawn, so its exact wiring receipt stays retryable and no MCP name was released"
+                    ),
+                    registry: previous_registry,
+                    framework_components: HashMap::new(),
+                    framework_generation: None,
+                    framework_receipt: None,
+                    mcp_ownership: HashMap::new(),
+                    prepared: PreparedApplicationComponents::default(),
+                    candidate_monitors,
+                    orphaned_claims: Vec::new(),
+                    retained_withdrawal: Some((wiring, claims)),
+                })
+            }
+            Err((error, None)) => {
+                // The candidate wiring was fully withdrawn, so the exact ownership
+                // tokens are the only surviving obligation. Release them exactly
+                // once now so the previous generation can restore its own claims;
+                // the orphaned receipt retry is an idempotent no-op.
                 let orphaned_claims = claims_from_ownership(&candidate_mcp_ownership);
                 release_plugin_mcp_claims(&mut ownership_guard, &candidate_mcp_ownership);
                 let restored_mcp_ownership = match claim_plugin_mcp_names(
@@ -2642,6 +2806,7 @@ impl PluginRuntimeService {
                             prepared: PreparedApplicationComponents::default(),
                             candidate_monitors,
                             orphaned_claims: Vec::new(),
+                            retained_withdrawal: None,
                         });
                     }
                 };
@@ -2683,6 +2848,7 @@ impl PluginRuntimeService {
                     prepared: previous_prepared,
                     candidate_monitors,
                     orphaned_claims,
+                    retained_withdrawal: None,
                 })
             }
         }
@@ -2906,5 +3072,28 @@ impl PluginRuntimeService {
             &agent_name,
         )
         .await;
+    }
+}
+
+impl Drop for PluginRuntimeService {
+    /// Last line of defence for the receipt invariant: an owner may only let a
+    /// receipt out of scope by settling it or by handing it to a live retry
+    /// owner. A runtime dropped while still unsettled therefore parks its ledger
+    /// in the process-level owner instead of dropping the obligations with it.
+    fn drop(&mut self) {
+        let Ok(mut state) = self.state.try_lock() else {
+            tracing::error!(
+                "plugin runtime dropped while its ledger was still locked; unsettled cleanup receipts could not be parked"
+            );
+            return;
+        };
+        if state.cleanup_receipts.is_empty() {
+            return;
+        }
+        let descriptions = retain_cleanup_receipts(std::mem::take(&mut state.cleanup_receipts));
+        tracing::error!(
+            receipts = descriptions.len(),
+            "plugin runtime dropped with unsettled cleanup receipts; parked them in the process retry ledger"
+        );
     }
 }

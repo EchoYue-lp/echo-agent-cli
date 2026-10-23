@@ -2143,11 +2143,12 @@ done
         // This is exactly the conversion `new_owned` uses when the initial
         // generation fails: the failed service hands its receipts to the caller.
         let failure = runtime.into_bootstrap_failure(reload_error).await;
-        assert!(failure.error.to_string().contains("injected activation failure"));
-        let receipts = &failure.receipts;
+        assert!(failure.error().to_string().contains("injected activation failure"));
+        let receipts = failure.receipts();
         assert_eq!(receipts.len(), 1, "retained receipts: {receipts:?}");
         let claims = receipts
-            .first()
+            .iter()
+            .next()
             .ok_or_else(|| "bootstrap failure retained no receipt".to_string())?
             .mcp_claims();
         assert!(
@@ -2159,6 +2160,9 @@ done
         let (error, receipts) = failure.into_parts();
         assert!(error.to_string().contains("injected activation failure"));
         assert_eq!(receipts.len(), 1);
+        // Dropping these would park them in the process ledger; this test owns
+        // them explicitly instead so the ledger stays clean for other tests.
+        assert_eq!(receipts.park().len(), 1);
         Ok(())
     }
 
@@ -2189,11 +2193,11 @@ done
         .ok_or_else(|| "invalid initial generation unexpectedly bootstrapped".to_string())?;
 
         assert!(
-            failure.error.to_string().contains("frontmatter"),
+            failure.error().to_string().contains("frontmatter"),
             "bootstrap error: {}",
-            failure.error
+            failure.error()
         );
-        assert!(failure.receipts.is_empty());
+        assert!(failure.receipts().is_empty());
         assert!(failure.to_string().contains("cleanup receipt(s) retained"));
         Ok(())
     }
@@ -2289,5 +2293,454 @@ done
                 .any(|error| error.contains("must begin with YAML frontmatter"))
         );
         Ok(())
+    }
+
+    // ── Receipt ownership regressions (R-T2) ──
+    //
+    // Three defects are covered here:
+    //   A. A production bootstrap failure must not downcast its cleanup
+    //      receipts to log text.
+    //   B. A replacement whose previous framework withdrawal fails must keep the
+    //      exact wiring receipt and MCP tokens, stop the replacement, and never
+    //      release a name whose client is still connected.
+    //   C. Cancelling a retry mid-await must leave the receipt in the ledger.
+
+    /// Re-run one test in a child process with an isolated product data root.
+    ///
+    /// `RegistrySource::Default` scans the process-wide EKO data root, so a real
+    /// `AgentRuntime` bootstrap must not see (or write to) the developer's
+    /// `~/.eko`. The child owns a throwaway root and a private parked-receipt
+    /// ledger for the whole process lifetime.
+    fn isolated_bootstrap_child(name: &str) -> Result<bool, String> {
+        if std::env::var_os("EKO_BOOTSTRAP_ISOLATED").is_some() {
+            return Ok(false);
+        }
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let output = std::process::Command::new(
+            std::env::current_exe().map_err(|error| error.to_string())?,
+        )
+        .args(["--exact", name, "--nocapture"])
+        .env("EKO_BOOTSTRAP_ISOLATED", "1")
+        .env("EKO_DATA_DIR", temp.path().join("user-data"))
+        .output()
+        .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "isolated bootstrap test failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(true)
+    }
+
+    fn bootstrap_test_config() -> crate::config::EkoConfig {
+        let mut config = crate::config::EkoConfig::default();
+        config.model.default_model_id = Some("fixture:test-model".to_string());
+        config.model_providers.insert(
+            "fixture".to_string(),
+            crate::config::ModelProviderConfig {
+                base_url: Some("http://127.0.0.1:9/v1".to_string()),
+                requires_api_key: false,
+                ..Default::default()
+            },
+        );
+        config
+            .configured_models
+            .push(crate::config::ConfiguredModel {
+                id: "fixture:test-model".to_string(),
+                provider: "fixture".to_string(),
+                model: "test-model".to_string(),
+                ..Default::default()
+            });
+        config
+    }
+
+    /// Defect A: the real `AgentRuntime` bootstrap consumer must hand a failed
+    /// generation's receipts to a live owner instead of dropping them.
+    #[test]
+    fn bootstrap_failure_parks_receipts_owned_by_the_next_bootstrap() -> Result<(), String> {
+        const NAME: &str = "plugin_runtime::tests::bootstrap_failure_parks_receipts_owned_by_the_next_bootstrap";
+        if isolated_bootstrap_child(NAME)? {
+            return Ok(());
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let project = temp.path().join("project");
+            std::fs::create_dir_all(&project).map_err(|error| error.to_string())?;
+            let project = std::fs::canonicalize(&project).map_err(|error| error.to_string())?;
+            let plugin = project.join(".echo-agent/plugins/bootstrap-fixture");
+            PluginRuntimeService::scaffold(&plugin, "bootstrap-fixture")
+                .map_err(|error| error.to_string())?;
+            // The candidate generation claims its MCP name while wiring, then
+            // fails while registering its Subagent (`max_turns: 0` is rejected by
+            // the builder). That is the production bootstrap shape that leaves an
+            // exact cleanup claim behind.
+            std::fs::write(
+                plugin.join("mcp.json"),
+                serde_json::json!({
+                    "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+                    "mcpServers": {"bootstrap": {"type": "streamable-http", "url": "http://127.0.0.1:9/mcp"}}
+                })
+                .to_string(),
+            )
+            .map_err(|error| error.to_string())?;
+            std::fs::write(
+                plugin.join("agents/example.md"),
+                "---\nname: bootstrap-fixture-specialist\ndescription: Bootstrap fixture Subagent\nreadonly: true\nmax_turns: 0\n---\nReturn the requested result.\n",
+            )
+            .map_err(|error| error.to_string())?;
+
+            let error = bootstrap_runtime(temp.path(), &project)
+                .await
+                .err()
+                .ok_or_else(|| {
+                    "plugin bootstrap with an unwireable MCP server unexpectedly succeeded"
+                        .to_string()
+                })?;
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("Plugin Subagent registration failed"),
+                "fixture did not reach the post-claim bootstrap failure: {rendered}"
+            );
+            assert!(
+                rendered.contains("process retry ledger"),
+                "bootstrap error must report the parked receipts: {rendered}"
+            );
+
+            // The receipt object survived: a live owner still knows the exact
+            // plugin:name claim, not merely a formatted log line.
+            let parked = parked_cleanup_receipts_for_root(&project);
+            assert!(
+                !parked.is_empty(),
+                "bootstrap failure dropped every cleanup receipt"
+            );
+            assert!(
+                parked
+                    .iter()
+                    .flat_map(|receipt| receipt.mcp_claims())
+                    .any(|claim| claim.plugin_id() == "bootstrap-fixture"
+                        && claim.name() == "bootstrap"),
+                "parked receipt lost the exact ownership claim: {parked:?}"
+            );
+            assert!(
+                parked_cleanup_debt_roots().contains(&project),
+                "parked debt roots must report the failed project"
+            );
+
+            // The next real bootstrap for this root adopts and settles the debt.
+            std::fs::write(
+                plugin.join("agents/example.md"),
+                "---\nname: bootstrap-fixture-specialist\ndescription: Bootstrap fixture Subagent\nreadonly: true\nmax_turns: 4\n---\nReturn the requested result.\n",
+            )
+            .map_err(|error| error.to_string())?;
+            let restarted = bootstrap_runtime(temp.path(), &project)
+                .await
+                .map_err(|error| format!("second plugin bootstrap failed: {error}"))?;
+            assert!(
+                restarted.plugin_runtime.cleanup_receipts().await.is_empty(),
+                "the adopting runtime kept parked receipts in its own ledger"
+            );
+            assert!(
+                parked_cleanup_receipts_for_root(&project).is_empty(),
+                "the parked receipt was not taken over by the next bootstrap"
+            );
+            restarted
+                .plugin_runtime
+                .shutdown()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+    }
+
+    async fn bootstrap_runtime(
+        temp_root: &Path,
+        project: &Path,
+    ) -> anyhow::Result<crate::runtime::AgentRuntime> {
+        let browser = crate::browser::BrowserRuntime::start(crate::browser::BrowserConfig {
+            enabled: false,
+            extension_enabled: false,
+            session_dir: temp_root.join("browser"),
+            ..Default::default()
+        })
+        .await;
+        crate::runtime::AgentRuntime::bootstrap(
+            &bootstrap_test_config(),
+            crate::infra::AgentCreateParams {
+                working_dir: Some(project.to_path_buf()),
+                browser_runtime: Some(browser),
+                ..Default::default()
+            },
+            temp_root.join("missing-mcp.json"),
+        )
+        .await
+    }
+
+    /// Publish a newer framework generation behind the runtime's back.
+    ///
+    /// The runtime still holds the earlier receipt, so the real
+    /// `PluginIntegrator` now refuses to roll it back (`StaleReceipt`). That is a
+    /// genuine withdrawal failure produced by the framework, not a test seam.
+    async fn supersede_framework_generation(
+        runtime: &Arc<PluginRuntimeService>,
+    ) -> Result<u64, String> {
+        let root = runtime.project_root().await;
+        let receipt = runtime
+            .state
+            .lock()
+            .await
+            .framework_receipt
+            .clone()
+            .ok_or_else(|| "runtime has no framework wiring receipt".to_string())?;
+        runtime
+            .agent_handle
+            .write_async(|agent| {
+                let integrator = runtime.integrator.clone();
+                Box::pin(async move {
+                    integrator
+                        .rollback(agent, &receipt)
+                        .await
+                        .map_err(|error| error.to_string())
+                })
+            })
+            .await?;
+        let mut registry = runtime.registry_for(root);
+        runtime
+            .scan_registry(&mut registry)
+            .map_err(|error| error.to_string())?;
+        let superseding = runtime.integrator.prepare(&mut registry).await;
+        let wired = runtime
+            .agent_handle
+            .write_async(|agent| {
+                let integrator = runtime.integrator.clone();
+                Box::pin(async move {
+                    integrator
+                        .wire_prepared(agent, superseding.as_ref())
+                        .await
+                        .map_err(|error| error.to_string())
+                })
+            })
+            .await?;
+        Ok(wired.generation())
+    }
+
+    /// Defect B: replacement must stop and keep the exact wiring receipt and
+    /// tokens when the previous generation cannot be withdrawn.
+    #[tokio::test]
+    async fn replacement_with_unwithdrawable_generation_keeps_claims_and_receipt()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let ownership = McpNameOwnershipRegistry::new(Vec::<String>::new());
+        let alpha = write_fixture_at(
+            temp.path().join(".echo-agent/plugins/alpha-fixture"),
+            "alpha-fixture",
+        )?;
+        write_mcp_fixture(&alpha, "shared")?;
+        let runtime = service_with_ownership(temp.path(), Arc::clone(&ownership)).await?;
+        let owner_token = claim_token(&runtime, "alpha-fixture", "shared").await?;
+
+        let superseding_generation = supersede_framework_generation(&runtime).await?;
+        assert!(
+            superseding_generation > 0,
+            "framework generation was not superseded"
+        );
+
+        // A candidate that re-declares the same name for the same owner.
+        let beta = write_fixture_at(
+            temp.path().join(".echo-agent/plugins/beta-fixture"),
+            "beta-fixture",
+        )?;
+        write_mcp_fixture(&beta, "beta")?;
+
+        let error = runtime
+            .reload()
+            .await
+            .err()
+            .ok_or_else(|| "replacement unexpectedly reported success".to_string())?;
+        assert!(
+            error
+                .to_string()
+                .contains("framework plugin rollback failed before replacement"),
+            "replacement did not stop at the failed withdrawal: {error}"
+        );
+
+        // The exact old token still owns the name: nothing was released while the
+        // old MCP client is still attached to the Agent, and no fresh owner may
+        // take the name over.
+        {
+            let mut guard = ownership.lock().await;
+            assert!(
+                guard.owns_plugin("alpha-fixture", "shared", owner_token),
+                "failed withdrawal released the live MCP name token"
+            );
+            assert!(
+                guard.claim_plugin("intruder-fixture", "shared").is_err(),
+                "a new owner took a name whose client was never withdrawn"
+            );
+            assert!(
+                guard
+                    .validate_plugin_claim("beta-fixture", "shared", None)
+                    .is_err(),
+                "beta could claim a name the aborted replacement never released"
+            );
+        }
+
+        // The obligation is a real receipt in the ledger, carrying the wiring and
+        // the exact token, and the runtime refuses to describe a live generation.
+        {
+            let state = runtime.state.lock().await;
+            assert!(
+                state.framework_receipt.is_none(),
+                "the aborted generation is still reported as live"
+            );
+            assert!(
+                state.prepared.agents.is_empty(),
+                "the aborted generation still exposes application components"
+            );
+        }
+        let receipts = runtime.cleanup_receipts().await;
+        assert_eq!(receipts.len(), 1, "retained receipts: {receipts:?}");
+        let retained = receipts
+            .first()
+            .ok_or_else(|| "aborted replacement retained no receipt".to_string())?;
+        assert!(
+            matches!(&retained.settlement, CleanupSettlement::Framework { .. }),
+            "the receipt lost the framework wiring: {retained:?}"
+        );
+        assert!(
+            retained
+                .mcp_claims()
+                .iter()
+                .any(|claim| claim.plugin_id() == "alpha-fixture"
+                    && claim.name() == "shared"
+                    && claim.token() == owner_token),
+            "the receipt lost the exact ownership token: {retained:?}"
+        );
+        assert_eq!(retained.attempts, 0);
+
+        // The next retry really attempts the withdrawal again and still refuses to
+        // report success while it cannot settle.
+        let retry_error = runtime
+            .reload()
+            .await
+            .err()
+            .ok_or_else(|| "a retry reported success with unsettled receipts".to_string())?;
+        assert!(
+            retry_error
+                .to_string()
+                .contains("cannot report success while plugin cleanup receipts remain unsettled"),
+            "retry error: {retry_error}"
+        );
+        let receipts = runtime.cleanup_receipts().await;
+        assert_eq!(receipts.len(), 1, "retry dropped the receipt: {receipts:?}");
+        assert_eq!(
+            receipts.first().map(|receipt| receipt.attempts),
+            Some(1),
+            "the retry never attempted the withdrawal"
+        );
+
+        drop(runtime);
+        // The aborted generation's debt is permanent in this fixture; do not leak
+        // it into the process-level ledger of the surrounding test binary.
+        take_parked_cleanup_receipts(temp.path());
+        Ok(())
+    }
+
+    /// Defect C: cancelling a caller while a receipt is being settled must leave
+    /// the receipt in the ledger, and the next retry must attempt it again.
+    #[tokio::test]
+    async fn cancelled_receipt_retry_keeps_the_receipt_for_the_next_attempt()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        write_fixture(temp.path())?;
+        let runtime = service(temp.path()).await?;
+        let lifecycle = Arc::new(LifecycleCounts::default());
+        let mut manager = PluginLifecycleManager::new();
+        manager
+            .register(
+                "runtime-fixture",
+                Arc::new(TestLifecycle(Arc::clone(&lifecycle))),
+            )
+            .map_err(|error| error.to_string())?;
+        manager
+            .activate("runtime-fixture")
+            .map_err(|error| error.to_string())?;
+        let receipt = CleanupReceipt::owned_lifecycle(
+            temp.path().to_path_buf(),
+            "cancelled retry fixture".to_string(),
+            manager,
+        );
+
+        // Deterministic cancellation hook: the test itself holds the manager lock
+        // that settlement must acquire, so the retry parks exactly on its await.
+        let handle = receipt.clone();
+        let manager_guard = match &handle.settlement {
+            CleanupSettlement::OwnedLifecycle { manager } => {
+                Arc::clone(manager).lock_owned().await
+            }
+            _ => return Err("fixture receipt is not an owned lifecycle".to_string()),
+        };
+        runtime.state.lock().await.cleanup_receipts.push(receipt);
+
+        let retry = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                let mut state = runtime.state.lock().await;
+                runtime.retry_cleanup_receipts(&mut state).await
+            })
+        };
+        let mut parked = false;
+        for _ in 0..10_000 {
+            if runtime.state.try_lock().is_err() {
+                parked = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(parked, "the retry never entered its settlement await");
+        retry.abort();
+        let _ = retry.await;
+        drop(manager_guard);
+
+        let receipts = runtime.cleanup_receipts().await;
+        assert_eq!(
+            receipts.len(),
+            1,
+            "cancelled retry dropped the cleanup receipt: {receipts:?}"
+        );
+        assert!(
+            matches!(
+                receipts.first().map(|receipt| &receipt.settlement),
+                Some(CleanupSettlement::OwnedLifecycle { .. })
+            ),
+            "the surviving receipt is not the cancelled one: {receipts:?}"
+        );
+
+        // The next retry still attempts settlement: the injected shutdown failure
+        // is observed, then the following retry settles the receipt.
+        lifecycle
+            .shutdown_failures_remaining
+            .store(1, Ordering::SeqCst);
+        let failing = runtime
+            .reload()
+            .await
+            .err()
+            .ok_or_else(|| "retry after cancellation reported success".to_string())?;
+        assert!(
+            failing.to_string().contains("injected shutdown failure"),
+            "retry error: {failing}"
+        );
+        assert_eq!(lifecycle.shutdown.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.cleanup_receipts().await.len(), 1);
+
+        runtime.reload().await.map_err(|error| error.to_string())?;
+        assert!(runtime.cleanup_receipts().await.is_empty());
+        assert_eq!(lifecycle.shutdown.load(Ordering::SeqCst), 2);
+        runtime.shutdown().await.map_err(|error| error.to_string())
     }
 }
