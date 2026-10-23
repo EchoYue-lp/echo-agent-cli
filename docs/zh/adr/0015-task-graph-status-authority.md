@@ -24,7 +24,7 @@ framework 的 exact-claim interruption request 先持久化，再信号通知原
 内部 spec/execution join 与可丢弃 checkpoint 保留完整 canonical `TaskExecution`，包括缺失
 结果与显式 JSON null 的差异以及 `interruption_requested`。graph commit 和 execution event
 通过同一 journal 无损保留这些事实；旧 query checkpoint 必须从 journal 重放。`TaskSpec`、
-`TodoItem` IPC 不变。原 physical owner intent 尚未结算时，boot recovery 与重复执行均被拒绝，
+`TodoItem` IPC 不变。当前进程的原 physical owner intent 尚未结算时，boot recovery 与重复执行均被拒绝，
 不把未知观察转换成新的 Task 状态。
 
 
@@ -36,7 +36,7 @@ framework 的 exact-claim interruption request 先持久化，再信号通知原
 `RunStateSnapshot.tasks` 直接保存 framework `TaskExecution`，不再定义 EKO 镜像类型；`PlanTask`
 只在读取 plan specification 和 execution projection 时临时组合，`TodoItem` 仍是单向 UI 投影。
 
-启动恢复将合法未结算 physical-owner intent 视为该精确 run 的待观察事实：在原 run 锁内保留 run、command cell 及待处理 Subagent 控制事实，继续恢复其它无关历史 run；畸形 intent 和真实存储错误仍报错。批次恢复和单 run 准入共用原证据读取与精确物理确认路径，不允许重放或合成终态收据。 continuation 消费既有 run 的 domain、route、attended mode、Goal 与 execution profile，内部续接指令不是新用户目标；实际 active workspace 与调用方 conversation/root 仍经原不可变身份校验，错配继续拒绝，RunStarted 投影使用返回的原 goal/route。
+启动恢复将合法未结算的当前进程 physical-owner intent 视为该精确 run 的待观察事实：在原 run 锁内保留 run、command cell 及待处理 Subagent 控制事实，继续恢复其它无关历史 run。旧进程准入 fence 仅按 [ADR 0049](0049-taskruntime-process-owner-recovery.md) 在 root 排他权威下解析，然后沿已有 interruption recovery 判断副作用；畸形 intent 和真实存储错误仍报错。批次恢复和单 run 准入共用原证据读取与精确物理确认路径，不允许重放或合成终态收据。 continuation 消费既有 run 的 domain、route、attended mode、Goal 与 execution profile，内部续接指令不是新用户目标；实际 active workspace 与调用方 conversation/root 仍经原不可变身份校验，错配继续拒绝，RunStarted 投影使用返回的原 goal/route。
 
 
 Continuation 的既有进展判定及 fingerprint 仅排除 RecoveryBlocked/RecoveryResolved 中的私有 physical_owner_intent 元数据，真实业务恢复及任务事件仍算进展。原 explicit-resume 的 Goal/revision 和无进展上限保持。canonical BEFORE 证据排除了“未确认 owner fence 被清后重放”的假设：每个原 owner 都在下一轮前完成并获确认；实际缺陷是元数据重置了业务进展预算。原 canonical journal 仍是唯一权威。

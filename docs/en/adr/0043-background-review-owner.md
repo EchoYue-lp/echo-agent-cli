@@ -40,3 +40,7 @@ Tokio's [graceful shutdown guidance](https://tokio.rs/tokio/topics/shutdown) sep
 ## Verification
 
 Review tests drive a real lazy `BackgroundReviewHandle` through app-core admission and park the Memory observer after the durable write. Caller drop and shutdown must both join the child, expose an interrupted receipt with the committed Memory effect, and avoid inventing an Inbox candidate. Bootstrap regressions reopen scoped debt using the persisted workspace identity and check owner reuse. Desktop exit tests exercise the real application lifecycle owner through the same returning-loop adapter; they do not claim to automate an OS window or forced process termination.
+
+## Review result projection
+
+A returned candidate remains visible when `ReviewOutcome.error` is present. GUI and TUI show the operation ID and the error alongside the candidate's content and evidence. `persisted = Some(true)`, `Some(false)` and `None` mean persisted, not persisted and unknown respectively; they do not imply an Inbox entry. Only `BackgroundReviewSettlement.evidence_candidate` identifies an actual Review Inbox receipt. A failed result with no candidate is presented as a failure, and a healthy empty result retains the existing nothing-to-save message.

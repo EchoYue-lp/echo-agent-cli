@@ -3897,11 +3897,7 @@ Read the runtime path and found one missing branch.
 
     /// Attempt-owned execution evidence that looks exactly like success:
     /// artifacts, verification, and touched files all set.
-    fn success_execution_summary(
-        run_id: &str,
-        task_id: &str,
-        text: &str,
-    ) -> TaskExecutionSummary {
+    fn success_execution_summary(run_id: &str, task_id: &str, text: &str) -> TaskExecutionSummary {
         let mut outcome = SubagentOutcome::terminal(SubagentStatus::Completed, text, Vec::new());
         outcome.artifacts = vec![echo_agent::subagent::SubagentArtifact {
             path: "src/settled.rs".to_string(),
@@ -3950,7 +3946,11 @@ Read the runtime path and found one missing branch.
             .map_err(|error| error.to_string())?
             .iter()
             .any(|event| {
-                event.payload.get("kind").and_then(serde_json::Value::as_str) == Some(kind)
+                event
+                    .payload
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(kind)
             }))
     }
 
@@ -3977,6 +3977,331 @@ Read the runtime path and found one missing branch.
         }
     }
 
+    /// A stale or foreign physical claim must not re-emit the current claim's
+    /// terminal status with the refused attempt's product evidence. Exercise
+    /// the real controller settlement and ExecSink, not a fabricated receipt.
+    #[tokio::test]
+    async fn superseded_controller_settlement_emits_no_terminal_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use echo_agent::tasks::{
+            RuntimeDagController, RuntimeTaskResolution, RuntimeTaskResolutionRequest as Request,
+        };
+
+        for identity in ["foreign", "stale"] {
+            let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+            let _resource_scope = store.test_resource_scope();
+            let run_id = seed_run(&store, vec![solo_readonly_task("reviewed")])?;
+            let first_claim = claim_seeded_task(&store, &run_id)?;
+            let current_claim = if identity == "stale" {
+                store.settle_runtime_task_resolution(
+                    &run_id,
+                    "reviewed",
+                    &first_claim,
+                    Request::Requeue {
+                        failure_fingerprint: None,
+                        error: "retry admitted attempt".to_string(),
+                        exhaustion: echo_agent::tasks::RuntimeRetryExhaustion::Failed,
+                    },
+                    RuntimeTaskProductSettlement::default(),
+                )?;
+                claim_seeded_task(&store, &run_id)?
+            } else {
+                first_claim.clone()
+            };
+            let mut refused_claim = first_claim;
+            if identity == "foreign" {
+                refused_claim.claim_id = "foreign-physical-claim".to_string();
+            }
+            let runtime_task = store
+                .load_runtime_plan_snapshot(&run_id)?
+                .tasks
+                .into_iter()
+                .find(|task| task.spec.id == "reviewed")
+                .ok_or("claimed task missing")?;
+            let events = Arc::new(std::sync::Mutex::new(Vec::<ExecEvent>::new()));
+            let captured = events.clone();
+            let trace_sink: ExecSink = Arc::new(move |event| {
+                captured
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(event);
+            });
+            let controller = EkoRuntimeDagController {
+                store: store.clone(),
+                blocking: TaskRuntimeOperation::new(store.clone()),
+                dispatcher: Arc::new(ScriptedDispatcher::new()),
+                reviewer_llm: None,
+                write_sem: Arc::new(Semaphore::new(1)),
+                shell_sem: Arc::new(Semaphore::new(1)),
+                llm_sem: Arc::new(Semaphore::new(1)),
+                file_write_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                trace_sink: Some(trace_sink),
+                cancel: CancellationToken::new(),
+                resolution_metadata: std::sync::Mutex::new(HashMap::new()),
+                dispatch_failures: std::sync::Mutex::new(HashMap::new()),
+            };
+            let product = |text: &str, outcome| RuntimeTaskProductSettlement {
+                summary: Some(text.to_string()),
+                execution_summary: Some(success_execution_summary(&run_id, "reviewed", text)),
+                review: Some(review_result(&run_id, "reviewed", outcome)),
+                diagnostic_note: Some(text.to_string()),
+                typed_terminal: None,
+            };
+            controller.stage_resolution_metadata(
+                &current_claim.claim_id,
+                product("accepted current attempt", ReviewOutcome::Pass),
+            )?;
+            assert_eq!(
+                controller
+                    .settle_resolution(&run_id, &current_claim, &runtime_task, Request::Completed)
+                    .await?,
+                RuntimeTaskResolution::Completed
+            );
+            {
+                let observed = events.lock().map_err(|_| "event mutex poisoned")?;
+                assert_eq!(observed.len(), 1);
+                let event = observed.first().ok_or("accepted event missing")?;
+                assert_eq!(event.event, RuntimeEventKind::TaskCompleted);
+                assert_eq!(
+                    event.payload.get("summary"),
+                    Some(&serde_json::json!("accepted current attempt"))
+                );
+            }
+            let sequence = store
+                .get_run_state(&run_id)?
+                .map(|state| state.journal_sequence)
+                .ok_or("run state missing")?;
+
+            controller.stage_resolution_metadata(
+                &refused_claim.claim_id,
+                product("refused old attempt", ReviewOutcome::NeedsFix),
+            )?;
+            assert_eq!(
+                controller
+                    .settle_resolution(
+                        &run_id,
+                        &refused_claim,
+                        &runtime_task,
+                        Request::Blocked {
+                            error: "refused old attempt".to_string(),
+                            disposition: echo_agent::tasks::RuntimeStopDisposition::Pause,
+                        },
+                    )
+                    .await?,
+                RuntimeTaskResolution::Superseded
+            );
+            assert_eq!(
+                events.lock().map_err(|_| "event mutex poisoned")?.len(),
+                1,
+                "{identity}: a refused attempt must not emit the current task's terminal status"
+            );
+            assert_eq!(
+                store
+                    .get_run_state(&run_id)?
+                    .map(|state| state.journal_sequence),
+                Some(sequence),
+                "{identity}: the refused attempt must append no product facts"
+            );
+            assert_eq!(
+                store
+                    .get_summary(&run_id, "reviewed")?
+                    .map(|summary| summary.outcome.summary),
+                Some("accepted current attempt".to_string())
+            );
+            let reviews = store.list_reviews(&run_id, "reviewed")?;
+            assert_eq!(reviews.len(), 1);
+            assert!(matches!(
+                reviews.first().map(|review| &review.outcome),
+                Some(ReviewOutcome::Pass)
+            ));
+        }
+        Ok(())
+    }
+
+    /// A failure fallback can lose the exact-claim CAS to a durable stop. The
+    /// journal and live stream must describe that winner while keeping the
+    /// original failure separately available for diagnosis.
+    #[tokio::test]
+    async fn abandoned_claim_projects_the_committed_interruption_and_keeps_failure_diagnostic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use echo_agent::tasks::{
+            RuntimeClaimAbandonment, RuntimeDagController, RuntimeInterruptionDisposition,
+            RuntimeTaskSettlementOutcome, TaskStatus,
+        };
+
+        for interruption in ["pause", "cancel", "none"] {
+            let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+            let _resource_scope = store.test_resource_scope();
+            let run_id = seed_run(&store, vec![solo_readonly_task("abandoned")])?;
+            let claim = claim_seeded_task(&store, &run_id)?;
+            let runtime_task = store
+                .load_runtime_plan_snapshot(&run_id)?
+                .tasks
+                .into_iter()
+                .find(|task| task.spec.id == "abandoned")
+                .ok_or("claimed task missing")?;
+            let events = Arc::new(std::sync::Mutex::new(Vec::<ExecEvent>::new()));
+            let captured = events.clone();
+            let trace_sink: ExecSink = Arc::new(move |event| {
+                captured
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(event);
+            });
+            let controller = EkoRuntimeDagController {
+                store: store.clone(),
+                blocking: TaskRuntimeOperation::new(store.clone()),
+                dispatcher: Arc::new(ScriptedDispatcher::new()),
+                reviewer_llm: None,
+                write_sem: Arc::new(Semaphore::new(1)),
+                shell_sem: Arc::new(Semaphore::new(1)),
+                llm_sem: Arc::new(Semaphore::new(1)),
+                file_write_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                trace_sink: Some(trace_sink),
+                cancel: CancellationToken::new(),
+                resolution_metadata: std::sync::Mutex::new(HashMap::new()),
+                dispatch_failures: std::sync::Mutex::new(HashMap::new()),
+            };
+            let disposition = match interruption {
+                "pause" => Some(RuntimeInterruptionDisposition::Paused {
+                    reason: "durable pause wins".to_string(),
+                }),
+                "cancel" => Some(RuntimeInterruptionDisposition::Cancelled),
+                _ => None,
+            };
+            if let Some(disposition) = disposition {
+                assert!(
+                    controller
+                        .request_task_interruption(
+                            &run_id,
+                            &runtime_task,
+                            &claim,
+                            disposition.clone(),
+                        )
+                        .await?
+                );
+                let persisted = store.load_runtime_plan_snapshot(&run_id)?;
+                assert_eq!(
+                    persisted.tasks.first().and_then(|task| task.execution.interruption_requested.as_ref()),
+                    Some(&disposition),
+                    "the exact-claim stop must be durable before abandonment"
+                );
+            }
+
+            let failure = "original abandonment failure";
+            let (expected_status, expected_summary, expected_label, expected_detail, expected_event) =
+                match interruption {
+                    "pause" => (
+                        TaskStatus::Paused("durable pause wins".to_string()),
+                        "durable pause wins",
+                        "paused",
+                        Some("durable pause wins"),
+                        RuntimeEventKind::TaskBlocked,
+                    ),
+                    "cancel" => (
+                        TaskStatus::Cancelled,
+                        "dispatch cancelled before resolution",
+                        "cancelled",
+                        None,
+                        RuntimeEventKind::TaskCancelled,
+                    ),
+                    _ => (
+                        TaskStatus::Failed(failure.to_string()),
+                        failure,
+                        "failed",
+                        Some(failure),
+                        RuntimeEventKind::TaskFailed,
+                    ),
+                };
+            let outcome = controller
+                .abandon_claim(
+                    &run_id,
+                    &claim,
+                    &runtime_task,
+                    RuntimeClaimAbandonment::Failed {
+                        error: failure.to_string(),
+                    },
+                )
+                .await?;
+            assert_eq!(
+                outcome,
+                RuntimeTaskSettlementOutcome::Settled {
+                    status: expected_status.clone(),
+                }
+            );
+            assert_eq!(
+                store.runtime_task_execution(&run_id, "abandoned")?.map(|execution| execution.status),
+                Some(expected_status)
+            );
+            let journal = store.list_events(&run_id, 0)?;
+            let terminal = journal
+                .iter()
+                .rev()
+                .find(|event| {
+                    event.task_id.as_deref() == Some("abandoned")
+                        && event.payload.get("status").and_then(serde_json::Value::as_str)
+                            == Some(expected_label)
+                })
+                .ok_or("committed task event missing")?;
+            assert_eq!(
+                terminal.payload.get("summary").and_then(serde_json::Value::as_str),
+                Some(expected_summary),
+                "{interruption}: the task journal must describe the committed winner"
+            );
+            assert_eq!(
+                terminal.payload.get("status_detail").and_then(serde_json::Value::as_str),
+                expected_detail
+            );
+            if interruption != "none" {
+                assert!(journal.iter().any(|event| {
+                    event.payload.get("kind").and_then(serde_json::Value::as_str)
+                        == Some("abandoned_attempt_diagnostic")
+                        && event.payload.get("message").and_then(serde_json::Value::as_str)
+                            == Some(failure)
+                }), "{interruption}: retain the failure separately from the final summary");
+            }
+            {
+                let observed = events.lock().map_err(|_| "event mutex poisoned")?;
+                assert_eq!(observed.len(), 1);
+                let event = observed.first().ok_or("terminal live event missing")?;
+                assert_eq!(event.event, expected_event);
+                assert_eq!(
+                    event.payload.get("summary").and_then(serde_json::Value::as_str),
+                    Some(expected_summary)
+                );
+                assert_eq!(
+                    event.payload.get("terminal_status").and_then(serde_json::Value::as_str),
+                    Some(expected_label)
+                );
+                assert_eq!(
+                    event.payload.get("status_detail").and_then(serde_json::Value::as_str),
+                    expected_detail
+                );
+            }
+            let sequence = store.get_run_state(&run_id)?.map(|state| state.journal_sequence);
+            assert_eq!(
+                controller
+                    .abandon_claim(
+                        &run_id,
+                        &claim,
+                        &runtime_task,
+                        RuntimeClaimAbandonment::Failed {
+                            error: "superseded repeated abandonment".to_string(),
+                        },
+                    )
+                    .await?,
+                RuntimeTaskSettlementOutcome::Superseded
+            );
+            assert_eq!(events.lock().map_err(|_| "event mutex poisoned")?.len(), 1);
+            assert_eq!(
+                store.get_run_state(&run_id)?.map(|state| state.journal_sequence),
+                sequence,
+                "{interruption}: superseded abandonment must append no journal facts"
+            );
+        }
+        Ok(())
+    }
+
     /// Defect B regression: a review gate that returns after a durable
     /// interruption must not persist the completed execution's success summary.
     ///
@@ -3988,8 +4313,8 @@ Read the runtime path and found one missing branch.
     /// the review must both be refused instead of persisted for a task the user
     /// already stopped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn review_after_durable_interruption_publishes_no_success_evidence()
-    -> Result<(), String> {
+    async fn review_after_durable_interruption_publishes_no_success_evidence() -> Result<(), String>
+    {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let _resource_scope = store.test_resource_scope();
         let run_id = seed_run(&store, vec![solo_readonly_task("reviewed")])?;
@@ -4008,7 +4333,11 @@ Read the runtime path and found one missing branch.
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
-        assert!(store.request_cancel(&run_id).map_err(|error| error.to_string())?);
+        assert!(
+            store
+                .request_cancel(&run_id)
+                .map_err(|error| error.to_string())?
+        );
         assert_eq!(
             store
                 .get_run(&run_id)
@@ -4108,7 +4437,10 @@ Read the runtime path and found one missing branch.
                 && payload.get("touched_files").is_none(),
             "live payload must not expose success evidence, got {payload}"
         );
-        assert_ne!(payload["summary"], "execution finished before the cancellation was observed");
+        assert_ne!(
+            payload["summary"],
+            "execution finished before the cancellation was observed"
+        );
 
         drop(driver);
         Ok(())
@@ -4125,9 +4457,8 @@ Read the runtime path and found one missing branch.
     async fn interruption_matrix_acceptance_matches_live_payload() -> Result<(), String> {
         for interrupt in ["cancel", "pause"] {
             for outcome in ["completion", "abandon"] {
-                let store = Arc::new(
-                    TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
-                );
+                let store =
+                    Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
                 let _resource_scope = store.test_resource_scope();
                 let run_id = seed_run(&store, vec![solo_readonly_task("reviewed")])?;
                 let claim = claim_seeded_task(&store, &run_id)?;
@@ -4137,11 +4468,22 @@ Read the runtime path and found one missing branch.
                     .map_err(|error| error.to_string())?;
 
                 if interrupt == "cancel" {
-                    assert!(store.request_cancel(&run_id).map_err(|error| error.to_string())?);
+                    assert!(
+                        store
+                            .request_cancel(&run_id)
+                            .map_err(|error| error.to_string())?
+                    );
                 } else {
-                    assert!(store.request_pause(&run_id).map_err(|error| error.to_string())?);
+                    assert!(
+                        store
+                            .request_pause(&run_id)
+                            .map_err(|error| error.to_string())?
+                    );
                 }
-                assert!(token.is_cancelled(), "{interrupt}: driver token must be cancelled");
+                assert!(
+                    token.is_cancelled(),
+                    "{interrupt}: driver token must be cancelled"
+                );
 
                 if outcome == "abandon" {
                     let fallback = if interrupt == "cancel" {
@@ -4251,8 +4593,8 @@ Read the runtime path and found one missing branch.
     /// The fix must not over-reach: a non-success review gate on a healthy run
     /// keeps its execution evidence and review history.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn needs_fix_review_without_interruption_keeps_execution_evidence()
-    -> Result<(), String> {
+    async fn needs_fix_review_without_interruption_keeps_execution_evidence() -> Result<(), String>
+    {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let _resource_scope = store.test_resource_scope();
         let run_id = seed_run(&store, vec![solo_readonly_task("reviewed")])?;
@@ -4315,5 +4657,4 @@ Read the runtime path and found one missing branch.
         );
         Ok(())
     }
-
 }

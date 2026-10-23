@@ -1451,12 +1451,21 @@ done
         assert_eq!(counts.activate.load(Ordering::SeqCst), 2);
         assert_eq!(counts.deactivate.load(Ordering::SeqCst), 2);
         #[cfg(unix)]
-        assert!(runtime.lsp.manager.read().await.running_servers().is_empty());
+        assert!(
+            runtime
+                .lsp
+                .manager
+                .read()
+                .await
+                .running_servers()
+                .is_empty()
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn canonical_compose_binds_cold_workspace_owner_before_boot_dispatch() -> anyhow::Result<()> {
+    async fn canonical_compose_binds_cold_workspace_owner_before_boot_dispatch()
+    -> anyhow::Result<()> {
         const NAME: &str = "plugin_runtime::tests::canonical_compose_binds_cold_workspace_owner_before_boot_dispatch";
         if std::env::var_os("EKO_BOOTSTRAP_ISOLATED").is_none() {
             let directory = tempfile::tempdir()?;
@@ -1465,20 +1474,47 @@ done
                 .env("EKO_BOOTSTRAP_ISOLATED", "1")
                 .env("EKO_DATA_DIR", directory.path().join("user-data"))
                 .output()?;
-            assert!(output.status.success(), "isolated compose failed: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "isolated compose failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return Ok(());
         }
-        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).with_test_writer().try_init();
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .try_init();
         use crate::runtime::{AgentRuntime, ApplicationLifecycleReason, ApplicationServices};
-        use crate::tasks::task_runtime::{AttendedMode, DomainProfile, RunPlanPolicy, TaskRunExecutionProfile, TaskRunStatus, TaskRuntimeStore};
-        use crate::workspace::{WorkspaceKind, layout::WorkspaceLayout, registry::WorkspaceRegistry};
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, RunPlanPolicy, TaskRunExecutionProfile, TaskRunStatus,
+            TaskRuntimeStore,
+        };
+        use crate::workspace::{
+            WorkspaceKind, layout::WorkspaceLayout, registry::WorkspaceRegistry,
+        };
 
         let directory = tempfile::tempdir()?;
         let registry = WorkspaceRegistry::new()?;
-        let workspace = registry.create_at("cold-compose", WorkspaceKind::General, directory.path().join("cold"))?;
+        let workspace = registry.create_at(
+            "cold-compose",
+            WorkspaceKind::General,
+            directory.path().join("cold"),
+        )?;
         let task_root = WorkspaceLayout::tasks(&workspace.root);
         let store = TaskRuntimeStore::open_for_workspace(&task_root, workspace.id.to_string())?;
-        store.create_run_with_profile("cold-original", &workspace.id.to_string(), "cold-conversation", "cold-message", DomainProfile::General, "Reply once with the requested result", "agent_autonomous", AttendedMode::Unattended, TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect))?;
+        store.create_run_with_profile(
+            "cold-original",
+            &workspace.id.to_string(),
+            "cold-conversation",
+            "cold-message",
+            DomainProfile::General,
+            "Reply once with the requested result",
+            "agent_autonomous",
+            AttendedMode::Unattended,
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+        )?;
         store.configure_run_continuation("cold-original", true, true, None, None)?;
         store.transition_run("cold-original", TaskRunStatus::Running)?;
         drop(store);
@@ -1503,51 +1539,122 @@ done
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let (server_stop, server_stopped) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move { axum::serve(listener, router).with_graceful_shutdown(async { let _ = server_stopped.await; }).await });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = server_stopped.await;
+                })
+                .await
+        });
         let mut config = crate::config::EkoConfig::default();
         config.model.default_model_id = Some("fixture:test-model".to_string());
-        config.model_providers.insert("fixture".to_string(), crate::config::ModelProviderConfig { base_url: Some(format!("http://{address}/v1")), requires_api_key: false, ..Default::default() });
-        config.configured_models.push(crate::config::ConfiguredModel { id: "fixture:test-model".to_string(), provider: "fixture".to_string(), model: "test-model".to_string(), ..Default::default() });
+        config.model_providers.insert(
+            "fixture".to_string(),
+            crate::config::ModelProviderConfig {
+                base_url: Some(format!("http://{address}/v1")),
+                requires_api_key: false,
+                ..Default::default()
+            },
+        );
+        config
+            .configured_models
+            .push(crate::config::ConfiguredModel {
+                id: "fixture:test-model".to_string(),
+                provider: "fixture".to_string(),
+                model: "test-model".to_string(),
+                ..Default::default()
+            });
         let project = directory.path().join("project");
         std::fs::create_dir_all(&project)?;
-        let browser = crate::browser::BrowserRuntime::start(crate::browser::BrowserConfig { enabled: false, extension_enabled: false, session_dir: directory.path().join("browser"), ..Default::default() }).await;
-        let runtime = Arc::new(AgentRuntime::bootstrap(&config, crate::infra::AgentCreateParams { working_dir: Some(project), browser_runtime: Some(browser), ..Default::default() }, directory.path().join("missing-mcp.json")).await?);
+        let browser = crate::browser::BrowserRuntime::start(crate::browser::BrowserConfig {
+            enabled: false,
+            extension_enabled: false,
+            session_dir: directory.path().join("browser"),
+            ..Default::default()
+        })
+        .await;
+        let runtime = Arc::new(
+            AgentRuntime::bootstrap(
+                &config,
+                crate::infra::AgentCreateParams {
+                    working_dir: Some(project),
+                    browser_runtime: Some(browser),
+                    ..Default::default()
+                },
+                directory.path().join("missing-mcp.json"),
+            )
+            .await?,
+        );
         // The real plugin scheduler read guard lets pool initialization and
         // boot admission proceed, but holds compose before its late state bind.
         let plugin = runtime.plugin_runtime.clone();
         let scheduler_guard = plugin.scheduler.read().await;
         let runtime_for_compose = runtime.clone();
-        let compose = tokio::spawn(async move { ApplicationServices::compose(&runtime_for_compose, None, None, echo_agent::tools::permission::PermissionMode::Default).await });
+        let compose = tokio::spawn(async move {
+            ApplicationServices::compose(
+                &runtime_for_compose,
+                None,
+                None,
+                echo_agent::tools::permission::PermissionMode::Default,
+            )
+            .await
+        });
         let reached_boot_resume = AtomicBool::new(false);
         let reached_late_bind = AtomicBool::new(false);
         let observation = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let cold = TaskRuntimeStore::open_for_workspace(&task_root, workspace.id.to_string())?;
-                let resumed = cold.list_events("cold-original", 0)?.iter().any(|event| event.event_type == crate::tasks::task_runtime::RuntimeEventKind::RunContinuationResumed);
-                if resumed { reached_boot_resume.store(true, Ordering::SeqCst); }
-                if resumed && plugin.state.try_lock().is_err() { reached_late_bind.store(true, Ordering::SeqCst); break; }
+                let cold =
+                    TaskRuntimeStore::open_for_workspace(&task_root, workspace.id.to_string())?;
+                let resumed = cold.list_events("cold-original", 0)?.iter().any(|event| {
+                    event.event_type
+                        == crate::tasks::task_runtime::RuntimeEventKind::RunContinuationResumed
+                });
+                if resumed {
+                    reached_boot_resume.store(true, Ordering::SeqCst);
+                }
+                if resumed && plugin.state.try_lock().is_err() {
+                    reached_late_bind.store(true, Ordering::SeqCst);
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
             entered.notified().await;
             Ok::<_, anyhow::Error>(())
-        }).await;
+        })
+        .await;
         let compose_was_held = !compose.is_finished();
         // Always release the actual provider and plugin locks, and join the
         // real compose/shutdown/server before reporting a failed observation.
         release.add_permits(16);
         drop(scheduler_guard);
         let services = compose.await??;
-        let shutdown = services.settle(ApplicationLifecycleReason::Shutdown, None).await;
+        let shutdown = services
+            .settle(ApplicationLifecycleReason::Shutdown, None)
+            .await;
         let _ = server_stop.send(());
         server.await??;
         shutdown.into_result()?;
-        assert!(compose_was_held, "compose bypassed its original scheduler bind barrier");
+        assert!(
+            compose_was_held,
+            "compose bypassed its original scheduler bind barrier"
+        );
         if observation.is_err() {
             let cold = TaskRuntimeStore::open_for_workspace(&task_root, workspace.id.to_string())?;
-            eprintln!("compose observation phases: boot_resumed={} late_bind={} provider_calls={} run={:?} journal={}", reached_boot_resume.load(Ordering::SeqCst), reached_late_bind.load(Ordering::SeqCst), calls.load(Ordering::SeqCst), cold.get_run("cold-original")?, serde_json::to_string(&cold.list_events("cold-original", 0)?)?);
+            eprintln!(
+                "compose observation phases: boot_resumed={} late_bind={} provider_calls={} run={:?} journal={}",
+                reached_boot_resume.load(Ordering::SeqCst),
+                reached_late_bind.load(Ordering::SeqCst),
+                calls.load(Ordering::SeqCst),
+                cold.get_run("cold-original")?,
+                serde_json::to_string(&cold.list_events("cold-original", 0)?)?
+            );
         }
         observation??;
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "cold boot must dispatch the original run exactly once");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "cold boot must dispatch the original run exactly once"
+        );
         Ok(())
     }
 
@@ -1696,8 +1803,8 @@ done
     }
 
     async fn test_scheduler(root: &Path) -> Result<Arc<SchedulerRunner>, String> {
-        let cron_store = crate::scheduler::CronTaskStore::new()
-            .with_path(root.join("cron-tasks.json"));
+        let cron_store =
+            crate::scheduler::CronTaskStore::new().with_path(root.join("cron-tasks.json"));
         let fire_fn: echo_agent::scheduler::FireFn =
             Arc::new(|_| Box::pin(async { Ok("fixture monitor fired".to_string()) }));
         SchedulerRunner::new(
@@ -1733,9 +1840,7 @@ done
             )
             .await
             .map_err(|error| error.to_string())?;
-        lifecycle
-            .fail_next_activation
-            .store(true, Ordering::SeqCst);
+        lifecycle.fail_next_activation.store(true, Ordering::SeqCst);
 
         let beta_source = write_fixture_at(temp.path().join("beta-source"), "beta-fixture")?;
         write_mcp_fixture(&beta_source, "beta")?;
@@ -1746,7 +1851,12 @@ done
             .ok_or_else(|| "failing install unexpectedly succeeded".to_string())?;
         assert!(error.to_string().contains("injected activation failure"));
         assert!(runtime.get("beta-fixture").await.is_none());
-        assert!(!temp.path().join(".echo-agent/plugins/beta-fixture").exists());
+        assert!(
+            !temp
+                .path()
+                .join(".echo-agent/plugins/beta-fixture")
+                .exists()
+        );
 
         let receipts = runtime.cleanup_receipts().await;
         assert_eq!(receipts.len(), 1, "retained receipts: {receipts:?}");
@@ -1792,7 +1902,8 @@ done
     }
 
     #[tokio::test]
-    async fn failed_uninstall_retains_lifecycle_cleanup_receipt_and_retries() -> Result<(), String> {
+    async fn failed_uninstall_retains_lifecycle_cleanup_receipt_and_retries() -> Result<(), String>
+    {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let plugin = write_fixture(temp.path())?;
         let runtime = service(temp.path()).await?;
@@ -1888,12 +1999,7 @@ done
         if settled.is_err() {
             let receipts = runtime.cleanup_receipts().await;
             let present = runtime.get("runtime-fixture").await.is_some();
-            let settlements = runtime
-                .mutation_supervisor
-                .lock()
-                .await
-                .settlements
-                .len();
+            let settlements = runtime.mutation_supervisor.lock().await.settlements.len();
             return Err(format!(
                 "cancelled plugin uninstall lost its cleanup receipt: plugin_present={present}, receipts={}, shutdowns={}, settlements={settlements}",
                 receipts.len(),
@@ -1914,8 +2020,8 @@ done
     }
 
     #[tokio::test]
-    async fn same_name_takeover_is_rejected_without_releasing_the_owner_token()
-    -> Result<(), String> {
+    async fn same_name_takeover_is_rejected_without_releasing_the_owner_token() -> Result<(), String>
+    {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let ownership = McpNameOwnershipRegistry::new(Vec::<String>::new());
         let alpha = write_fixture_at(
@@ -1923,7 +2029,9 @@ done
             "alpha-fixture",
         )?;
         write_mcp_fixture(&alpha, "shared")?;
-        ownership.claim_user_names(["user-shared".to_string()]).await;
+        ownership
+            .claim_user_names(["user-shared".to_string()])
+            .await;
         let runtime = service_with_ownership(temp.path(), Arc::clone(&ownership)).await?;
         let alpha_token = claim_token(&runtime, "alpha-fixture", "shared").await?;
 
@@ -1942,7 +2050,12 @@ done
                 .contains("is declared by both 'alpha-fixture' and 'beta-fixture'"),
             "install error: {error}"
         );
-        assert!(!temp.path().join(".echo-agent/plugins/beta-fixture").exists());
+        assert!(
+            !temp
+                .path()
+                .join(".echo-agent/plugins/beta-fixture")
+                .exists()
+        );
         assert!(
             runtime.cleanup_receipts().await.is_empty(),
             "a rejected takeover must not fabricate a cleanup receipt"
@@ -2080,7 +2193,11 @@ done
             .await
             .err()
             .ok_or_else(|| "unsettleable monitor receipt was reported as settled".to_string())?;
-        assert!(error.to_string().contains("cleanup receipts remain unsettled"));
+        assert!(
+            error
+                .to_string()
+                .contains("cleanup receipts remain unsettled")
+        );
         {
             let guard = ownership.lock().await;
             assert!(
@@ -2099,7 +2216,11 @@ done
             .await
             .err()
             .ok_or_else(|| "reload reported success with an unsettled receipt".to_string())?;
-        assert!(reload_error.to_string().contains("cleanup receipts remain unsettled"));
+        assert!(
+            reload_error
+                .to_string()
+                .contains("cleanup receipts remain unsettled")
+        );
         assert_eq!(runtime.cleanup_receipts().await.len(), 1);
 
         let scheduler = test_scheduler(temp.path()).await?;
@@ -2131,9 +2252,7 @@ done
             )
             .await
             .map_err(|error| error.to_string())?;
-        lifecycle
-            .fail_next_activation
-            .store(true, Ordering::SeqCst);
+        lifecycle.fail_next_activation.store(true, Ordering::SeqCst);
         let reload_error = runtime
             .reload()
             .await
@@ -2143,7 +2262,12 @@ done
         // This is exactly the conversion `new_owned` uses when the initial
         // generation fails: the failed service hands its receipts to the caller.
         let failure = runtime.into_bootstrap_failure(reload_error).await;
-        assert!(failure.error().to_string().contains("injected activation failure"));
+        assert!(
+            failure
+                .error()
+                .to_string()
+                .contains("injected activation failure")
+        );
         let receipts = failure.receipts();
         assert_eq!(receipts.len(), 1, "retained receipts: {receipts:?}");
         let claims = receipts
@@ -2316,14 +2440,13 @@ done
             return Ok(false);
         }
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let output = std::process::Command::new(
-            std::env::current_exe().map_err(|error| error.to_string())?,
-        )
-        .args(["--exact", name, "--nocapture"])
-        .env("EKO_BOOTSTRAP_ISOLATED", "1")
-        .env("EKO_DATA_DIR", temp.path().join("user-data"))
-        .output()
-        .map_err(|error| error.to_string())?;
+        let output =
+            std::process::Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
+                .args(["--exact", name, "--nocapture"])
+                .env("EKO_BOOTSTRAP_ISOLATED", "1")
+                .env("EKO_DATA_DIR", temp.path().join("user-data"))
+                .output()
+                .map_err(|error| error.to_string())?;
         if !output.status.success() {
             return Err(format!(
                 "isolated bootstrap test failed: {}{}",
@@ -2360,7 +2483,8 @@ done
     /// generation's receipts to a live owner instead of dropping them.
     #[test]
     fn bootstrap_failure_parks_receipts_owned_by_the_next_bootstrap() -> Result<(), String> {
-        const NAME: &str = "plugin_runtime::tests::bootstrap_failure_parks_receipts_owned_by_the_next_bootstrap";
+        const NAME: &str =
+            "plugin_runtime::tests::bootstrap_failure_parks_receipts_owned_by_the_next_bootstrap";
         if isolated_bootstrap_child(NAME)? {
             return Ok(());
         }
@@ -2654,8 +2778,8 @@ done
     /// Defect C: cancelling a caller while a receipt is being settled must leave
     /// the receipt in the ledger, and the next retry must attempt it again.
     #[tokio::test]
-    async fn cancelled_receipt_retry_keeps_the_receipt_for_the_next_attempt()
-    -> Result<(), String> {
+    async fn cancelled_receipt_retry_keeps_the_receipt_for_the_next_attempt() -> Result<(), String>
+    {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         write_fixture(temp.path())?;
         let runtime = service(temp.path()).await?;
@@ -2680,9 +2804,7 @@ done
         // that settlement must acquire, so the retry parks exactly on its await.
         let handle = receipt.clone();
         let manager_guard = match &handle.settlement {
-            CleanupSettlement::OwnedLifecycle { manager } => {
-                Arc::clone(manager).lock_owned().await
-            }
+            CleanupSettlement::OwnedLifecycle { manager } => Arc::clone(manager).lock_owned().await,
             _ => return Err("fixture receipt is not an owned lifecycle".to_string()),
         };
         runtime.state.lock().await.cleanup_receipts.push(receipt);
@@ -2742,5 +2864,454 @@ done
         assert!(runtime.cleanup_receipts().await.is_empty());
         assert_eq!(lifecycle.shutdown.load(Ordering::SeqCst), 2);
         runtime.shutdown().await.map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn parked_framework_receipt_uses_original_agent_and_registry() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture_at(
+            temp.path().join(".echo-agent/plugins/alpha-fixture"),
+            "alpha-fixture",
+        )?;
+        write_mcp_fixture(&plugin, "shared")?;
+        let original_registry = McpNameOwnershipRegistry::new(Vec::<String>::new());
+        let original = service_with_ownership(temp.path(), Arc::clone(&original_registry)).await?;
+        let original_agent = original.agent_handle.clone();
+        let original_token = claim_token(&original, "alpha-fixture", "shared").await?;
+        {
+            let mut state = original.state.lock().await;
+            let wiring = state
+                .framework_receipt
+                .take()
+                .ok_or_else(|| "original runtime has no wiring receipt".to_string())?;
+            let claims = claims_from_ownership(&std::mem::take(&mut state.mcp_ownership));
+            state.cleanup_receipts.push(CleanupReceipt::framework(
+                temp.path().to_path_buf(),
+                "park original target".to_string(),
+                wiring,
+                claims,
+            ));
+        }
+        drop(original);
+        assert!(
+            original_agent
+                .read(|agent| agent
+                    .skill_descriptors()
+                    .iter()
+                    .any(|skill| skill.name == "alpha-fixture-example"))
+                .await
+        );
+        let replacement_registry = McpNameOwnershipRegistry::new(Vec::<String>::new());
+        let replacement =
+            service_with_ownership(temp.path(), Arc::clone(&replacement_registry)).await?;
+        let replacement_token = claim_token(&replacement, "alpha-fixture", "shared").await?;
+        // Independent registries issue the same first token. Token equality is
+        // insufficient authority to release a lease in another registry.
+        assert_eq!(original_token, replacement_token);
+        assert!(
+            replacement_registry.lock().await.owns_plugin(
+                "alpha-fixture",
+                "shared",
+                replacement_token,
+            ),
+            "adopting old debt released the new runtime's lease"
+        );
+        assert!(
+            !original_registry
+                .lock()
+                .await
+                .owns_plugin("alpha-fixture", "shared", original_token,),
+            "original registry never settled its exact lease"
+        );
+        assert!(
+            !original_agent
+                .read(|agent| agent
+                    .skill_descriptors()
+                    .iter()
+                    .any(|skill| skill.name == "alpha-fixture-example"))
+                .await,
+            "the externally retained original Agent kept its framework wiring"
+        );
+        assert!(parked_cleanup_receipts_for_root(temp.path()).is_empty());
+        replacement
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn constructor_rejects_unsettled_parked_monitor_before_publication() -> Result<(), String>
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        write_fixture(temp.path())?;
+        let original = service(temp.path()).await?;
+        {
+            let mut state = original.state.lock().await;
+            let monitors = state.prepared.monitors.clone();
+            state.cleanup_receipts.push(CleanupReceipt::monitors(
+                temp.path().to_path_buf(),
+                "original scheduler unavailable".to_string(),
+                monitors,
+            ));
+        }
+        drop(original);
+        let result = service(temp.path()).await;
+        let rejected = result.is_err();
+        if let Ok(runtime) = result {
+            let _ = runtime.shutdown().await;
+        }
+        // This fixture intentionally has no scheduler capable of settlement.
+        // Remove the test-owned permanent debt from the process ledger.
+        let retained = take_parked_cleanup_receipts(temp.path());
+        assert!(
+            rejected,
+            "constructor published a generation with old monitor cleanup unsettled"
+        );
+        assert!(
+            !retained.is_empty(),
+            "constructor lost its unsettled monitor receipt"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aborted_shutdown_waiter_does_not_drop_framework_withdrawal() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        write_fixture(temp.path())?;
+        let runtime = service(temp.path()).await?;
+        let agent = runtime.agent_handle.clone();
+        let (locked_sender, locked_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
+        let blocker = tokio::spawn(async move {
+            agent
+                .write_async(|_| {
+                    Box::pin(async move {
+                        let _ = locked_sender.send(());
+                        let _ = release_receiver.await;
+                    })
+                })
+                .await;
+        });
+        locked_receiver.await.map_err(|error| error.to_string())?;
+        let waiter = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move { runtime.shutdown().await })
+        };
+        wait_until_mutation_holds_state(&runtime).await?;
+        waiter.abort();
+        let _ = waiter.await;
+        release_sender
+            .send(())
+            .map_err(|_| "Agent lock owner stopped".to_string())?;
+        blocker.await.map_err(|error| error.to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), runtime.shutdown())
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert!(
+            !runtime
+                .agent_handle
+                .read(|agent| agent
+                    .skill_descriptors()
+                    .iter()
+                    .any(|skill| skill.name == "runtime-fixture-example"))
+                .await,
+            "cancelled shutdown forgot the wiring it removed from the live ledger"
+        );
+        assert!(runtime.cleanup_receipts().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parked_cleanup_retries_original_scheduler_and_lifecycle() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        write_fixture(temp.path())?;
+        let original = service(temp.path()).await?;
+        let lifecycle = Arc::new(LifecycleCounts::default());
+        original
+            .register_lifecycle(
+                "runtime-fixture",
+                Arc::new(TestLifecycle(Arc::clone(&lifecycle))),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let scheduler = test_scheduler(temp.path()).await?;
+        original
+            .bind_scheduler(Arc::clone(&scheduler))
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(scheduler.list_tasks().await.len(), 1);
+        {
+            let mut state = original.state.lock().await;
+            let monitors = state.prepared.monitors.clone();
+            state.cleanup_receipts.push(CleanupReceipt::live_lifecycle(
+                temp.path().to_path_buf(),
+                "original lifecycle cleanup".to_string(),
+                vec!["runtime-fixture".to_string()],
+            ));
+            state.cleanup_receipts.push(CleanupReceipt::monitors(
+                temp.path().to_path_buf(),
+                "original scheduler cleanup".to_string(),
+                monitors,
+            ));
+        }
+        drop(original);
+        let replacement = service(temp.path()).await?;
+        assert_eq!(
+            lifecycle.shutdown.load(Ordering::SeqCst),
+            1,
+            "cleanup called the replacement's empty lifecycle manager"
+        );
+        assert!(
+            scheduler.list_tasks().await.is_empty(),
+            "cleanup used the replacement's unbound scheduler"
+        );
+        assert!(replacement.cleanup_receipts().await.is_empty());
+        replacement
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn rejected_restore_retains_claims_without_reporting_a_live_generation()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
+        write_mcp_fixture(&plugin, "shared")?;
+        let ownership = McpNameOwnershipRegistry::new(Vec::<String>::new());
+        let runtime = service_with_ownership(temp.path(), Arc::clone(&ownership)).await?;
+        // The candidate reaches real framework wiring and then fails application
+        // Subagent construction. Replaying the old frozen framework generation
+        // is rejected by the canonical publication authority as AlreadyPublished.
+        std::fs::write(plugin.join("agents/example.md"),
+            "---\nname: runtime-fixture-specialist\ndescription: Restore rejection fixture\nreadonly: true\nmax_turns: 0\n---\nReturn the requested result.\n")
+            .map_err(|error| error.to_string())?;
+        let failure = runtime
+            .reload()
+            .await
+            .err()
+            .ok_or_else(|| "invalid candidate unexpectedly published".to_string())?;
+        assert!(
+            failure
+                .to_string()
+                .contains("rollback framework wiring failed"),
+            "{failure}"
+        );
+        {
+            let state = runtime.state.lock().await;
+            assert!(
+                state.framework_generation.is_none(),
+                "rejected restore was reported live"
+            );
+            assert!(state.framework_receipt.is_none());
+            assert!(
+                state.mcp_ownership.is_empty(),
+                "cleanup names remained presented as live ownership"
+            );
+            assert!(state.prepared.agents.is_empty());
+        }
+        let receipts = runtime.cleanup_receipts().await;
+        let retained = receipts
+            .iter()
+            .flat_map(CleanupReceipt::mcp_claims)
+            .filter(|claim| claim.plugin_id() == "runtime-fixture" && claim.name() == "shared")
+            .collect::<Vec<_>>();
+        assert!(
+            !retained.is_empty(),
+            "restore rejected after claims were taken, but lost their receipts"
+        );
+        let guard = ownership.lock().await;
+        assert!(
+            retained.iter().any(|claim| guard.owns_plugin(
+                "runtime-fixture",
+                "shared",
+                claim.token()
+            )),
+            "the issuing registry no longer holds any retained restore claim"
+        );
+        drop(guard);
+        std::fs::write(plugin.join("agents/example.md"),
+            "---\nname: runtime-fixture-specialist\ndescription: Restore rejection fixture\nreadonly: true\nmax_turns: 4\n---\nReturn the requested result.\n")
+            .map_err(|error| error.to_string())?;
+        runtime.reload().await.map_err(|error| error.to_string())?;
+        assert!(runtime.cleanup_receipts().await.is_empty());
+        runtime.shutdown().await.map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn partial_restore_failure_retains_issued_withdrawal_authority() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
+        write_mcp_fixture(&plugin, "shared")?;
+        let ownership = McpNameOwnershipRegistry::new(Vec::<String>::new());
+        let runtime = service_with_ownership(temp.path(), Arc::clone(&ownership)).await?;
+        let token = claim_token(&runtime, "runtime-fixture", "shared").await?;
+        let (issued, claims) = {
+            let mut state = runtime.state.lock().await;
+            (
+                state
+                    .framework_receipt
+                    .take()
+                    .ok_or_else(|| "issued wiring missing".to_string())?,
+                std::mem::take(&mut state.mcp_ownership),
+            )
+        };
+        // Exercise the typed framework-error adapter using a genuinely issued
+        // receipt. Its publication token must survive conversion and still be
+        // accepted by the real issuing Agent's rollback path.
+        let partial_error = echo_agent::plugin::PluginWiringError::RollbackFailed {
+            generation: issued.generation(),
+            diagnostics: "restore transport has not settled".to_string(),
+            receipt: Box::new(issued.clone()),
+        };
+        let mut failed = PluginRuntimeService::failed_framework_restore(
+            "candidate rejected".to_string(),
+            partial_error,
+            runtime.registry_for(temp.path().to_path_buf()),
+            claims,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(failed.framework_generation.is_none());
+        assert!(failed.framework_receipt.is_none());
+        assert!(failed.prepared.agents.is_empty());
+        let (retained, claims) = failed
+            .retained_withdrawal
+            .take()
+            .ok_or_else(|| "partial restore error was reduced to text".to_string())?;
+        assert_eq!(retained, issued, "framework publication identity was lost");
+        assert!(
+            claims
+                .iter()
+                .any(|claim| claim.token() == token && claim.name() == "shared")
+        );
+        {
+            let mut state = runtime.state.lock().await;
+            state.cleanup_receipts.push(CleanupReceipt::framework(
+                temp.path().to_path_buf(),
+                failed.error,
+                retained,
+                claims,
+            ));
+            let errors = runtime.retry_cleanup_receipts(&mut state).await;
+            assert!(
+                errors.is_empty(),
+                "issued withdrawal authority was not preserved: {errors:?}"
+            );
+            assert!(state.cleanup_receipts.is_empty());
+        }
+        assert!(
+            !ownership
+                .lock()
+                .await
+                .owns_plugin("runtime-fixture", "shared", token)
+        );
+        assert!(
+            !runtime
+                .agent_handle
+                .read(|agent| agent
+                    .skill_descriptors()
+                    .iter()
+                    .any(|skill| skill.name == "runtime-fixture-example"))
+                .await
+        );
+        runtime.shutdown().await.map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn failed_withdrawal_blocks_skill_and_pool_publication_until_settlement()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        write_fixture(temp.path())?;
+        let runtime = service(temp.path()).await?;
+        let skill_root = write_application_skill(temp.path(), "preserved-skill")?;
+        let source = "eko:user-skill:preserved-skill";
+        runtime
+            .enable_application_skill(
+                "preserved-skill".to_string(),
+                skill_root.clone(),
+                source.to_string(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        supersede_framework_generation(&runtime).await?;
+        let rejected_reload = runtime
+            .reload()
+            .await
+            .err()
+            .ok_or_else(|| "stale framework receipt unexpectedly withdrew".to_string())?;
+        assert!(
+            rejected_reload
+                .to_string()
+                .contains("framework plugin rollback failed")
+        );
+        let generation = runtime.state.lock().await.generation;
+        let preferences =
+            std::fs::read(&runtime.preferences_file).map_err(|error| error.to_string())?;
+        let enable = runtime
+            .enable_application_skill(
+                "preserved-skill".to_string(),
+                skill_root.clone(),
+                source.to_string(),
+            )
+            .await;
+        let disable = runtime
+            .disable_application_skill(
+                "preserved-skill".to_string(),
+                skill_root,
+                source.to_string(),
+            )
+            .await;
+        let pool = Arc::new(
+            AgentPool::new_for_test(runtime.agent_handle.clone(), None, None, 8, false).await,
+        );
+        let bind = runtime.bind_agent_pool(Arc::downgrade(&pool)).await;
+        let output_style = runtime.activate_output_style(None).await;
+        let theme = runtime.activate_theme(None).await;
+        for result in [
+            enable.map(|_| ()),
+            disable.map(|_| ()),
+            bind,
+            output_style,
+            theme.map(|_| ()),
+        ] {
+            let error = result.err().ok_or_else(|| {
+                "publication reported success while original withdrawal was unsettled".to_string()
+            })?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("cleanup receipts remain unsettled"),
+                "{error}"
+            );
+        }
+        agent_has_application_skill(&runtime.agent_handle, "preserved-skill", source, true).await?;
+        assert_eq!(
+            std::fs::read(&runtime.preferences_file).map_err(|error| error.to_string())?,
+            preferences
+        );
+        let state = runtime.state.lock().await;
+        assert_eq!(
+            state.generation, generation,
+            "blocked publication advanced the generation"
+        );
+        assert_eq!(state.cleanup_receipts.len(), 1);
+        assert_eq!(
+            state
+                .cleanup_receipts
+                .first()
+                .map(|receipt| receipt.attempts),
+            Some(5),
+            "every rejected entry point must retry the actual obligation"
+        );
+        drop(state);
+        drop(pool);
+        drop(runtime);
+        // The externally superseded receipt is intentionally permanent in this
+        // fixture; the test owns and removes that debt after proving admission.
+        let retained = take_parked_cleanup_receipts(temp.path());
+        assert_eq!(retained.len(), 1);
+        Ok(())
     }
 }

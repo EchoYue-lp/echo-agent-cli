@@ -110,3 +110,35 @@ The application retains explicit adapter code for Subagent construction, LSP,
 monitors and UI preferences. This is intentional product policy, not a second
 portable plugin parser. The additional prepared generation and per-target
 receipt plumbing is the cost of deterministic recovery and diagnostics.
+
+## Cleanup ownership after failed publication (2026-10-23)
+
+A cleanup receipt retains its original target authority: the Agent handle,
+framework wiring receipt, MCP ownership registry, and any scheduler or lifecycle
+manager needed to finish that operation. A project path is a lookup key only;
+it never authorizes replay against another Agent or a newly created registry.
+Registry-local numeric tokens are not interchangeable between instances.
+
+Failed bootstrap and runtime retirement retain the original cleanup authority
+through the existing application retry path. Parking never discards framework
+wiring or infers physical cleanup from an Agent or transport being dropped.
+Unsettled adoption rejects bootstrap before replacement publication. Every
+partial restore and pool rollback preserves the same exact receipts and fails
+closed rather than reporting an incompletely restored generation as live.
+
+Shutdown uses an independently owned settlement task. A caller waits for its
+receipt; cancelling that waiter cannot destroy the wiring or ownership tokens
+being withdrawn. This extends the existing supervisor rather than introducing
+a second plugin publication authority.
+
+MCP configuration admission and generation invalidation share one ordered
+boundary. A background connection rechecks its admitted generation under the
+Agent lock before starting framework preparation. An unchanged live client
+confirmed by a newer operation cannot subsequently be withdrawn by an older
+operation. Once preparation starts, its original task owns it through cleanup.
+
+This follows Tokio's [graceful shutdown](https://tokio.rs/tokio/topics/shutdown)
+and [cancellation safety](https://docs.rs/tokio/latest/tokio/macro.select.html#cancellation-safety)
+guidance: signalling or dropping an observer is distinct from joining the work
+that owns resources. EKO retains its existing product supervisor and the
+framework's exact publication receipts; no new framework API is needed.

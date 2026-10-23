@@ -411,6 +411,14 @@
       "legacyRemoved": true
     },
     {
+      "legacyPath": "adr/0049-taskruntime-process-owner-recovery.md",
+      "targetPath": "adr/0049-taskruntime-process-owner-recovery.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": false
+    },
+    {
       "legacyPath": "architecture.md",
       "targetPath": "architecture/overview.md",
       "kind": "architecture",

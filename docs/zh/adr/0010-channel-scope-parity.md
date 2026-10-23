@@ -102,10 +102,15 @@ incarnation ID。active pin 只保存已捕获 runtime/root 与 exact agent key�
     product-data I/O closure 执行，closure 持有 exact workspace receipt。手动压缩 journal safe point
     复用同一 product-data boundary。surface caller drop 不会分离已接受的 blocking work，shutdown
     join 同一 foreground/store owner。
-12. 产品 conversation 删除由 EKO tombstone 协调 TaskRun、tool、chat event 与 artifact 清理；最终
-    authority commit 调用 framework `delete_persisted_conversation`，一次枚举并删除该稳定 scope 的
-    全部 incarnation transcript/checkpoint，最后删除稳定 transcript。`ConversationCommitStarted` 后的
-    restart 会携 exact runtime store 重试 helper，不能只删稳定 conversation 而遗留 lineage。
+12. 产品 conversation 删除由 EKO tombstone 协调 TaskRun、tool、chat event 与 artifact 清理。
+    对 EKO 的 AtomicV1 conversation store 与 revisioned runtime store，最终 authority commit
+    调用 framework `delete_persisted_conversation_managed`。EKO 在
+    `ConversationCommitStarted` 前将包含 conversation、expected epoch 与 request identity 的
+    `ManagedConversationDelete` 持久化到 tombstone；正常调用、丢失确认后的重试及 restart 均复用
+    同一 request，不能按当前同名 conversation 重新生成请求。helper 通过 scope retirement
+    receipt 回收该稳定 scope 的 incarnation checkpoint；EKO 确认 retirement 为 `Completed` 或
+    `AlreadyCompleted` 后继续清理 incarnation transcript。冲突或未完成的 retirement 不得标记
+    删除完成，不能只删稳定 conversation 而遗留 lineage。
 
 ## 影响
 

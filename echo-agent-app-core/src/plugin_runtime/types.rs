@@ -279,10 +279,26 @@ impl PluginMcpNameClaim {
     }
 }
 
-/// What a cleanup receipt still owes. Receipts are values, not log lines: every
-/// variant carries enough authority to retry the exact withdrawal, and settling
-/// one twice is harmless.
+/// Original resource authorities retained when a receipt leaves its runtime.
+/// This deliberately holds no service Arc: pending debt cannot keep a service
+/// and its own receipt ledger alive through a permanent ownership cycle.
+struct CleanupAuthority {
+    agent_handle: AgentHandle,
+    mcp_ownership: Arc<McpNameOwnershipRegistry>,
+    scheduler: Option<Arc<SchedulerRunner>>,
+    registry_source: RegistrySource,
+}
+
+/// What a cleanup receipt still owes. Every variant preserves exact withdrawal
+/// authority, and settling an already settled obligation is harmless.
 enum CleanupSettlement {
+    /// An exported receipt always keeps its issuing target and registry. Project
+    /// roots are lookup keys only: token counters are local to a registry, and a
+    /// replacement runtime must never settle an old receipt using its own Agent.
+    OwnedAuthority {
+        authority: Arc<CleanupAuthority>,
+        receipt: Box<CleanupReceipt>,
+    },
     /// Exact MCP names whose owning components were already withdrawn from the
     /// Agent. Only these tokens may be released; no other owner is touched.
     McpNames { claims: Vec<PluginMcpNameClaim> },
@@ -324,6 +340,22 @@ pub(crate) struct CleanupReceipt {
 }
 
 impl CleanupReceipt {
+    fn bind_authority(self, authority: &Arc<CleanupAuthority>) -> Self {
+        if matches!(&self.settlement, CleanupSettlement::OwnedAuthority { .. }) {
+            return self;
+        }
+        Self {
+            root: self.root.clone(),
+            cause: self.cause.clone(),
+            attempts: self.attempts,
+            last_errors: self.last_errors.clone(),
+            settlement: CleanupSettlement::OwnedAuthority {
+                authority: Arc::clone(authority),
+                receipt: Box::new(self),
+            },
+        }
+    }
+
     fn mcp_names(root: PathBuf, cause: String, claims: Vec<PluginMcpNameClaim>) -> Self {
         Self::new(root, cause, CleanupSettlement::McpNames { claims })
     }
@@ -345,11 +377,7 @@ impl CleanupReceipt {
     }
 
     fn live_lifecycle(root: PathBuf, cause: String, plugin_ids: Vec<String>) -> Self {
-        Self::new(
-            root,
-            cause,
-            CleanupSettlement::LiveLifecycle { plugin_ids },
-        )
+        Self::new(root, cause, CleanupSettlement::LiveLifecycle { plugin_ids })
     }
 
     fn owned_lifecycle(root: PathBuf, cause: String, manager: PluginLifecycleManager) -> Self {
@@ -370,12 +398,7 @@ impl CleanupReceipt {
         Self::new(root, cause, CleanupSettlement::Monitors { tasks })
     }
 
-    fn plugin_uninstall(
-        root: PathBuf,
-        cause: String,
-        plugin_id: String,
-        keep_data: bool,
-    ) -> Self {
+    fn plugin_uninstall(root: PathBuf, cause: String, plugin_id: String, keep_data: bool) -> Self {
         Self::new(
             root,
             cause,
@@ -402,6 +425,7 @@ impl CleanupReceipt {
 
     pub(crate) fn mcp_claims(&self) -> &[PluginMcpNameClaim] {
         match &self.settlement {
+            CleanupSettlement::OwnedAuthority { receipt, .. } => receipt.mcp_claims(),
             CleanupSettlement::McpNames { claims }
             | CleanupSettlement::Framework { claims, .. } => claims,
             CleanupSettlement::LiveLifecycle { .. }
@@ -414,7 +438,10 @@ impl CleanupReceipt {
 
     pub(crate) fn plugin_id(&self) -> Option<&str> {
         match &self.settlement {
-            CleanupSettlement::LiveLifecycle { plugin_ids } => plugin_ids.first().map(String::as_str),
+            CleanupSettlement::OwnedAuthority { receipt, .. } => receipt.plugin_id(),
+            CleanupSettlement::LiveLifecycle { plugin_ids } => {
+                plugin_ids.first().map(String::as_str)
+            }
             CleanupSettlement::PluginUninstall { plugin_id, .. } => Some(plugin_id.as_str()),
             CleanupSettlement::McpNames { claims }
             | CleanupSettlement::Framework { claims, .. } => {
@@ -435,6 +462,9 @@ impl CleanupReceipt {
             .collect::<Vec<_>>()
             .join(",");
         let kind = match &self.settlement {
+            CleanupSettlement::OwnedAuthority { receipt, .. } => {
+                format!("original-authority({})", receipt.describe())
+            }
             CleanupSettlement::McpNames { .. } => format!("mcp-ownership({claims})"),
             CleanupSettlement::Framework { .. } => {
                 format!("framework-wiring+ownership({claims})")
@@ -465,6 +495,12 @@ impl CleanupReceipt {
 impl Clone for CleanupReceipt {
     fn clone(&self) -> Self {
         let settlement = match &self.settlement {
+            CleanupSettlement::OwnedAuthority { authority, receipt } => {
+                CleanupSettlement::OwnedAuthority {
+                    authority: Arc::clone(authority),
+                    receipt: receipt.clone(),
+                }
+            }
             CleanupSettlement::McpNames { claims } => CleanupSettlement::McpNames {
                 claims: claims.clone(),
             },

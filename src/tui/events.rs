@@ -4286,6 +4286,48 @@ async fn handle_tui_provider_command(app: &mut TuiApp, args: &str) {
     }
 }
 
+fn render_run_review_settlement(
+    settlement: &echo_agent_app_core::api::evolution::BackgroundReviewSettlement,
+    projection_error: Option<&str>,
+) -> String {
+    let outcome = &settlement.outcome;
+    let mut content = match &outcome.candidate {
+        Some(candidate) => format!(
+            "Candidate ({:?}, confidence {:.2}): {}\nEvidence: {}\n{}\n{}",
+            candidate.kind,
+            candidate.confidence,
+            candidate.content,
+            candidate.evidence,
+            match candidate.persisted {
+                Some(true) => "Saved as draft memory.",
+                Some(false) => "Not automatically saved as draft memory.",
+                None => "Draft-memory persistence is uncertain.",
+            },
+            match &settlement.evidence_candidate {
+                Some(stored) => {
+                    format!("Queued in Review Inbox as {}.", stored.candidate_id)
+                }
+                None => "No inbox candidate was produced.".to_string(),
+            }
+        ),
+        None if outcome.nothing_to_save && outcome.error.is_none() => {
+            "Run review found no durable candidate.".to_string()
+        }
+        None if outcome.nothing_to_save => "Run review produced no candidate.".to_string(),
+        None => outcome.actions.join("\n"),
+    };
+    // Memory persistence and Inbox settlement are separate facts. An error
+    // must not hide a supported candidate or turn an uncertain write into success.
+    content.push_str(&format!("\nReview {}", settlement.operation_id));
+    if let Some(error) = &outcome.error {
+        content.push_str(&format!("\nWarning: {error}"));
+    }
+    if let Some(error) = projection_error {
+        content.push_str(&format!("\nProjection remains pending: {error}"));
+    }
+    content
+}
+
 async fn handle_slash_command(
     app: &mut TuiApp,
     agent: &AgentHandle,
@@ -5321,43 +5363,15 @@ async fn handle_slash_command(
                 Err(error) => Err(error),
             };
             match settled {
-                Ok(settlement) if settlement.outcome.nothing_to_save => {
-                    let outcome = settlement.outcome;
-                    let content = outcome
-                        .error
-                        .map(|error| format!("Run review produced no candidate: {error}"))
-                        .unwrap_or_else(|| "Run review found no durable candidate.".to_string());
-                    app.messages.push(ChatMessage {
-                        role: MessageRole::System,
-                        content,
-                    });
-                }
                 Ok(settlement) => {
                     let projection = if settlement.evidence_candidate.is_some() {
                         Some(review_lease.settle_hot_memory_projection().await)
                     } else {
                         None
                     };
-                    let outcome = settlement.outcome;
-                    let mut content = match outcome.candidate {
-                        Some(candidate) => format!(
-                            "Candidate ({:?}, confidence {:.2}): {}\nEvidence: {}\n{}",
-                            candidate.kind,
-                            candidate.confidence,
-                            candidate.content,
-                            candidate.evidence,
-                            match settlement.evidence_candidate {
-                                Some(stored) => {
-                                    format!("Queued in Review Inbox as {}.", stored.candidate_id)
-                                }
-                                None => "No inbox candidate was produced.".to_string(),
-                            }
-                        ),
-                        None => outcome.actions.join("\n"),
-                    };
-                    if let Some(error) = projection.and_then(|receipt| receipt.error) {
-                        content.push_str(&format!("\nProjection remains pending: {error}"));
-                    }
+                    let projection_error = projection.and_then(|receipt| receipt.error);
+                    let content =
+                        render_run_review_settlement(&settlement, projection_error.as_deref());
                     app.messages.push(ChatMessage {
                         role: MessageRole::System,
                         content,
@@ -7671,8 +7685,9 @@ mod tests {
         execute_registered_tui_steer, format_conversation_input_fact, format_task_runtime_view,
         format_unattended_worktrees, handle_approval_key, handle_esc, move_cursor_vertical,
         project_tui_task_views, render_cancelled_event, render_conversation_input_receipt,
-        render_error_event, request_from_prepared, resolve_tui_workspace_file, retry_tui_task,
-        reverse_history_search, run_turn_binding_for_request, settle_planned_resume_foreground,
+        render_error_event, render_run_review_settlement, request_from_prepared,
+        resolve_tui_workspace_file, retry_tui_task, reverse_history_search,
+        run_turn_binding_for_request, settle_planned_resume_foreground,
         slash_command_allowed_while_busy, update_subagent_runs_from_execution,
         validate_tui_task_run_scope,
     };
@@ -7693,6 +7708,104 @@ mod tests {
     fn app() -> TuiApp {
         let theme = Theme::dark();
         TuiApp::new("test-model".to_string(), "test".to_string(), theme)
+    }
+
+    fn review_settlement(
+        persisted: Option<bool>,
+    ) -> echo_agent_app_core::api::evolution::BackgroundReviewSettlement {
+        echo_agent_app_core::api::evolution::BackgroundReviewSettlement {
+            operation_id: "review-operation-partial".to_string(),
+            outcome: echo_agent::evolution::ReviewOutcome {
+                run_id: "review-run-partial".to_string(),
+                actions: vec!["Proposed candidate for review".to_string()],
+                nothing_to_save: false,
+                candidate: Some(echo_agent::evolution::ReviewCandidate {
+                    kind: echo_agent::evolution::ReviewCandidateKind::DebuggingLesson,
+                    content: "Keep the candidate when cleanup fails.".to_string(),
+                    evidence: "Confirmed work preceded cleanup failure.".to_string(),
+                    confidence: 0.91,
+                    persisted,
+                }),
+                error: Some("Memory write completion is uncertain".to_string()),
+            },
+            evidence_candidate: None,
+        }
+    }
+
+    #[test]
+    fn run_review_result_shows_candidate_error_and_persistence_state() {
+        for (persisted, expected_status) in [
+            (None, "Draft-memory persistence is uncertain."),
+            (Some(false), "Not automatically saved as draft memory."),
+            (Some(true), "Saved as draft memory."),
+        ] {
+            let settlement = review_settlement(persisted);
+            let content =
+                render_run_review_settlement(&settlement, Some("projection write failed"));
+            assert!(content.contains("Keep the candidate when cleanup fails."));
+            assert!(content.contains("Confirmed work preceded cleanup failure."));
+            assert!(content.contains("Memory write completion is uncertain"));
+            assert!(content.contains(expected_status));
+            assert!(content.contains("review-operation-partial"));
+            assert!(content.contains("Projection remains pending: projection write failed"));
+            assert!(content.contains("No inbox candidate was produced."));
+            assert!(!content.contains("Queued in Review Inbox"));
+        }
+    }
+
+    #[test]
+    fn run_review_result_preserves_error_without_a_candidate() {
+        let mut settlement = review_settlement(None);
+        settlement.outcome.candidate = None;
+        let content = render_run_review_settlement(&settlement, None);
+        assert!(content.contains("Proposed candidate for review"));
+        assert!(content.contains("Memory write completion is uncertain"));
+        assert!(!content.contains("Queued in Review Inbox"));
+    }
+
+    #[test]
+    fn run_review_result_keeps_empty_and_failed_reviews_distinct() {
+        let mut settlement = review_settlement(None);
+        settlement.outcome.candidate = None;
+        settlement.outcome.nothing_to_save = true;
+        let failed = render_run_review_settlement(&settlement, None);
+        assert!(failed.contains("Run review produced no candidate."));
+        assert!(failed.contains("Warning: Memory write completion is uncertain"));
+        assert!(failed.contains("review-operation-partial"));
+        assert!(!failed.contains("found no durable candidate"));
+
+        settlement.outcome.error = None;
+        let empty = render_run_review_settlement(&settlement, None);
+        assert!(empty.contains("Run review found no durable candidate."));
+        assert!(empty.contains("review-operation-partial"));
+        assert!(!empty.contains("Warning:"));
+    }
+
+    #[test]
+    fn run_review_result_uses_only_the_confirmed_inbox_receipt() -> Result<(), String> {
+        let mut settlement = review_settlement(Some(false));
+        settlement.evidence_candidate = Some(
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 3,
+                "candidate_id": "durable-inbox-candidate",
+                "fingerprint": "candidate-fingerprint",
+                "kind": "debugging_lesson",
+                "scope": { "kind": "workspace", "id": "workspace-test" },
+                "content": "Keep the candidate when cleanup fails.",
+                "evidence": [],
+                "action": { "kind": "save_memory" },
+                "confidence": 0.91,
+                "status": "pending",
+                "revision": 1,
+                "created_at": "2026-10-23T00:00:00Z",
+                "updated_at": "2026-10-23T00:00:00Z"
+            }))
+            .map_err(|error| error.to_string())?,
+        );
+        let content = render_run_review_settlement(&settlement, None);
+        assert!(content.contains("Queued in Review Inbox as durable-inbox-candidate."));
+        assert!(!content.contains("No inbox candidate was produced."));
+        Ok(())
     }
 
     fn task_test_agent() -> Result<echo_agent::agent::AgentHandle, String> {

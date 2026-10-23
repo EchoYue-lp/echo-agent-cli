@@ -308,6 +308,14 @@ impl RootTransactionAuthority {
         &self.inner.root
     }
 
+    /// The OS lease proves exclusive root ownership; this nonce only tells
+    /// whether a durable driver belongs to this process. It must survive
+    /// dropping/reopening a root in the same process and is never a PID or TTL.
+    pub(crate) fn process_epoch(&self) -> &'static str {
+        static EPOCH: OnceLock<String> = OnceLock::new();
+        EPOCH.get_or_init(|| uuid::Uuid::new_v4().to_string())
+    }
+
     pub(crate) fn same_authority(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }

@@ -64,21 +64,9 @@ export function EvolutionPanel() {
 
   // ── Review state
   const [reviewing, setReviewing] = useState(false);
-  const [reviewResult, setReviewResult] = useState<{
-    success: boolean;
-    run_id: string;
-    actions: string[];
-    nothing_to_save: boolean;
-    candidate?: {
-      kind: 'user_preference' | 'project_fact' | 'debugging_lesson' | 'skill';
-      content: string;
-      evidence: string;
-      confidence: number;
-      persisted: boolean | null;
-    } | null;
-    error?: string | null;
-    evidence_candidate?: EvidenceCandidate | null;
-  } | null>(null);
+  const [reviewResult, setReviewResult] = useState<Awaited<
+    ReturnType<typeof evolutionApi.review>
+  > | null>(null);
   const [reviewError, setReviewError] = useState<string | null>(null);
 
   // ── Curator state
@@ -224,12 +212,10 @@ export function EvolutionPanel() {
     setReviewError(null);
     try {
       const res = await evolutionApi.review();
-      if (res.error && !res.success) {
-        setReviewError(
-          res.review_operation_id ? `${res.error} · Review ${res.review_operation_id}` : res.error
-        );
-      } else {
-        setReviewResult(res);
+      // A failed memory write may still leave a supported candidate and a
+      // durable Inbox receipt. Keep those facts alongside the reported error.
+      setReviewResult(res);
+      if (res.evidence_candidate || res.success) {
         await loadEvidence(evidenceFilter);
       }
     } catch (e: unknown) {
@@ -976,7 +962,9 @@ export function EvolutionPanel() {
             style={{ borderColor: 'var(--border-primary)' }}
           >
             <div className="flex items-center gap-2 mb-2">
-              {reviewResult.nothing_to_save ? (
+              {reviewResult.error || !reviewResult.success ? (
+                <AlertTriangle size={12} style={{ color: 'var(--color-warning, orange)' }} />
+              ) : reviewResult.nothing_to_save ? (
                 <Archive size={12} style={{ color: 'var(--text-tertiary)' }} />
               ) : (
                 <CheckCircle size={12} style={{ color: 'var(--color-success)' }} />
@@ -985,7 +973,12 @@ export function EvolutionPanel() {
                 运行: <span className="font-mono">{reviewResult.run_id.slice(0, 12)}</span>
               </span>
             </div>
-            {reviewResult.nothing_to_save ? (
+            {reviewResult.review_operation_id && (
+              <div className="mb-2 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+                Review {reviewResult.review_operation_id}
+              </div>
+            )}
+            {reviewResult.nothing_to_save && !reviewResult.error ? (
               <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
                 没有发现需要保存的内容。
               </p>
@@ -1011,6 +1004,7 @@ export function EvolutionPanel() {
                 <div>
                   类型: <span className="font-mono">{reviewResult.candidate.kind}</span>
                 </div>
+                <div className="mt-1 whitespace-pre-wrap">{reviewResult.candidate.content}</div>
                 <div className="mt-1">证据: {reviewResult.candidate.evidence}</div>
                 <div className="mt-1">
                   置信度: {reviewResult.candidate.confidence.toFixed(2)} ·{' '}
@@ -1019,6 +1013,11 @@ export function EvolutionPanel() {
                     : reviewResult.candidate.persisted === null
                       ? '保存状态待确认'
                       : '未自动保存'}
+                </div>
+                <div className="mt-1">
+                  {reviewResult.evidence_candidate
+                    ? `已加入 Review Inbox: ${reviewResult.evidence_candidate.candidate_id}`
+                    : '未生成 Review Inbox 候选。'}
                 </div>
               </div>
             )}

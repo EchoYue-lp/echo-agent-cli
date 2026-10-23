@@ -187,3 +187,31 @@ operations rather than caller future lifetime.
 See [ADR 0005](../adr/0005-foreground-continuation-owner.md),
 [ADR 0009](../adr/0009-taskruntime-async-io-and-ipc-boundary.md), and
 [ADR 0015](../adr/0015-task-graph-status-authority.md).
+
+## Failed publication and settlement evidence
+
+Plugin cleanup keeps the original Agent, framework receipt, name registry and
+other resource owners even when bootstrap fails. A subsequent bootstrap may
+find debt by project root, but it retries against those original owners before
+publishing its own generation. Unsettled debt rejects construction; cancelling
+a shutdown waiter does not cancel the owned shutdown operation. See
+[ADR 0022](../adr/0022-framework-prepared-plugin-generations.md).
+
+MCP background operations enter through the same generation admission boundary
+as configuration changes. An invalidated operation cannot start preparation
+after a newer generation has confirmed its connection; started preparation
+remains owned until its cleanup completes.
+
+TaskRuntime uses the framework settlement result to decide whether attempt
+evidence was accepted. `Superseded` rejects every request kind, appends no old
+product evidence and emits no terminal event or continuation wake for that
+attempt. Reading the current task status does not grant a stale claim the right
+to publish that status. Healthy blocked/failed diagnostic evidence is retained.
+
+## Canonical replay and review presentation
+
+Task journal replay treats a present canonical `TaskExecution` as the complete execution record. Legacy flat status, claim, result and retry fields are fallback inputs only when that record is absent. A malformed record or mismatched task identity fails replay instead of authorizing fallback.
+
+A Review candidate, its processing error, automatic Memory persistence and the application's Review Inbox receipt are independent facts. GUI and TUI retain the candidate and error together, distinguish persisted / not persisted / unknown, and only name an Inbox entry when the owner returned its actual evidence receipt. A local presentation never creates a new review outcome.
+
+EKO's registered revision store exposes execution CAS through the same per-run file lock and atomic journal batch as direct runtime settlement. The framework computes and validates claims, interruptions and execution changes. The adapter compares the complete expected execution map and relation revision, rejects relation/context/spec drift, and never invents a plan revision for execution-only changes. Abandoned attempts use the final committed status and summary for both journal and live projection; an overridden request failure remains a separate exact-claim diagnostic.

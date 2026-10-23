@@ -2298,13 +2298,17 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             .await?;
         let committed_payload = committed_task_payload(&receipt, staged_payload);
         // The live event projects the committed task status. A duplicate
-        // re-delivery is a no-op, and a late attempt must surface the
-        // interruption that actually won.
+        // re-delivery or superseded claim is a no-op. A superseded attempt
+        // cannot borrow the current claim's status to emit another terminal
+        // event or wake a continuation. A late result that commits an
+        // interruption still surfaces the interruption that actually won.
         let terminal_event = match receipt.committed_status.as_ref() {
             Some(status) => runtime_event_for_committed_status(status),
             None => None,
         };
-        let terminal_event = if receipt.settlement.is_duplicate() {
+        let terminal_event = if receipt.settlement.is_duplicate()
+            || receipt.resolution == echo_agent::tasks::RuntimeTaskResolution::Superseded
+        {
             None
         } else {
             terminal_event
@@ -2360,16 +2364,15 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                 (echo_agent::tasks::TaskStatus::Failed(error.clone()), error)
             }
         };
-        let payload = serde_json::json!({ "summary": &summary });
         let agent_role = Self::plan_task(runtime_task)?.agent_role;
         let run_id = run_id.to_string();
         let wake_run_id = run_id.clone();
         let task_id = runtime_task.spec.id.clone();
         let claim = claim.clone();
-        let (outcome, run) = self
+        let (outcome, committed_summary, run) = self
             .blocking
             .run("settle abandoned runtime task claim", move |store| {
-                let outcome = store.settle_runtime_task_claim(
+                let (outcome, committed_summary) = store.settle_runtime_task_claim_evidence(
                     &run_id,
                     &task_id,
                     &claim,
@@ -2377,14 +2380,15 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     Some(summary),
                 )?;
                 let run = store.get_run(&run_id)?;
-                Ok((outcome, run))
+                Ok((outcome, committed_summary, run))
             })
             .await?;
         if let echo_agent::tasks::RuntimeTaskSettlementOutcome::Settled { status } = &outcome
             && let Some(run) = run
         {
             // The exact-claim CAS may commit a stronger durable interruption.
-            // Emit only the committed status, never the requested fallback.
+            // Project its status and transaction-owned summary together,
+            // never the failed fallback that lost the exact-claim CAS.
             let terminal_event = match status {
                 echo_agent::tasks::TaskStatus::Cancelled => RuntimeEventKind::TaskCancelled,
                 echo_agent::tasks::TaskStatus::Paused(_) => RuntimeEventKind::TaskBlocked,
@@ -2395,6 +2399,16 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     ));
                 }
             };
+            let status_detail = match status {
+                echo_agent::tasks::TaskStatus::Paused(reason)
+                | echo_agent::tasks::TaskStatus::Failed(reason) => Some(reason.as_str()),
+                _ => None,
+            };
+            let payload = serde_json::json!({
+                "summary": committed_summary,
+                "terminal_status": committed_task_status_label(status),
+                "status_detail": status_detail,
+            });
             emit_exec(
                 self.trace_sink.as_ref(),
                 ExecEvent::task(

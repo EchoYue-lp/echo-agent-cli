@@ -35,37 +35,6 @@ fn lock_parked_receipts() -> std::sync::MutexGuard<'static, Vec<CleanupReceipt>>
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Reduce a receipt to the obligations that outlive its owning Agent.
-///
-/// Parking only happens once the runtime that wired the generation is gone (or
-/// failed to bootstrap), and an Agent owns every MCP client it wired: dropping
-/// the Agent drops the transports, and `Drop for StdioTransport` reaps the child
-/// process (`echo-agent/echo-integration/src/mcp/transport/stdio.rs`), while
-/// HTTP transports close with their client. The wiring itself can no longer be
-/// replayed because `PluginIntegrator::rollback` refuses a receipt issued for a
-/// different Agent authority. What survives is the exact name ownership token,
-/// which the shared `McpNameOwnershipRegistry` may still hold.
-fn parked_form(receipt: CleanupReceipt) -> CleanupReceipt {
-    let CleanupReceipt {
-        root,
-        cause,
-        attempts,
-        last_errors,
-        settlement,
-    } = receipt;
-    let settlement = match settlement {
-        CleanupSettlement::Framework { claims, .. } => CleanupSettlement::McpNames { claims },
-        settlement => settlement,
-    };
-    CleanupReceipt {
-        root,
-        cause,
-        attempts,
-        last_errors,
-        settlement,
-    }
-}
-
 /// Park receipts with the process-level retry owner and report them.
 ///
 /// The returned strings are diagnostics for logs and error context; the
@@ -77,7 +46,6 @@ pub(crate) fn retain_cleanup_receipts(receipts: Vec<CleanupReceipt>) -> Vec<Stri
     let mut descriptions = Vec::with_capacity(receipts.len());
     let mut parked = lock_parked_receipts();
     for receipt in receipts {
-        let receipt = parked_form(receipt);
         descriptions.push(receipt.describe());
         parked.push(receipt);
     }
@@ -86,8 +54,9 @@ pub(crate) fn retain_cleanup_receipts(receipts: Vec<CleanupReceipt>) -> Vec<Stri
 
 /// Move every parked receipt for one project root into the caller's ledger.
 ///
-/// Receipts for other roots stay parked: only a runtime bound to that root can
-/// know which scheduler, registry and name authority their settlement needs.
+/// Receipts for other roots stay parked. The root selects obligations to retry;
+/// each exported receipt retains its original target, registry and scheduler,
+/// so lookup never transfers authority to the replacement runtime.
 pub(crate) fn take_parked_cleanup_receipts(root: &Path) -> Vec<CleanupReceipt> {
     let mut parked = lock_parked_receipts();
     let mut taken = Vec::new();
@@ -155,10 +124,7 @@ impl RetainedCleanupReceipts {
     }
 
     pub(crate) fn describe(&self) -> Vec<String> {
-        self.receipts
-            .iter()
-            .map(CleanupReceipt::describe)
-            .collect()
+        self.receipts.iter().map(CleanupReceipt::describe).collect()
     }
 
     /// Exact `plugin:name=token` triples for every retained claim.
@@ -166,14 +132,7 @@ impl RetainedCleanupReceipts {
         self.receipts
             .iter()
             .flat_map(|receipt| receipt.mcp_claims().iter())
-            .map(|claim| {
-                format!(
-                    "{}:{}={:?}",
-                    claim.plugin_id(),
-                    claim.name(),
-                    claim.token()
-                )
-            })
+            .map(|claim| format!("{}:{}={:?}", claim.plugin_id(), claim.name(), claim.token()))
             .collect()
     }
 

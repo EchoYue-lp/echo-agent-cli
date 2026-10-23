@@ -962,10 +962,11 @@ pub(crate) struct RuntimeTaskResolutionReceipt {
     pub acceptance: SuccessEvidenceAcceptance,
     /// Summary text actually committed to the task projection, if any.
     pub committed_summary: Option<String>,
-    /// Task status read back from the committed graph.
+    /// Task status read back from the committed graph. For `Superseded` this
+    /// belongs to the current claim and grants no authority to publish an
+    /// event for the refused claim.
     pub committed_status: Option<echo_agent::tasks::TaskStatus>,
 }
-
 
 enum RunTurnClaimPreparation {
     Start(RuntimeJournalEvent),

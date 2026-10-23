@@ -58,7 +58,7 @@ impl SuccessEvidenceSettlement {
 ///
 /// [`SuccessEvidenceSettlement`] only classifies the claim against durable run
 /// state *before* the canonical settlement runs, so it cannot express the last
-/// word on whether the evidence was published. Two real paths reach a
+/// word on whether the evidence was published. Three real paths reach a
 /// settlement that refuses evidence while the classifier still reports
 /// [`SuccessEvidenceSettlement::Committed`]:
 ///
@@ -67,6 +67,9 @@ impl SuccessEvidenceSettlement {
 ///   [`echo_agent::tasks::RuntimeTaskResolution::Interrupted`];
 /// - a non-success attempt (review `NeedsFix`/`Blocked`) finishes its execution
 ///   after the run/claim was interrupted while the review gate was in flight.
+/// - a foreign or stale exact claim yields
+///   [`echo_agent::tasks::RuntimeTaskResolution::Superseded`], so none of that
+///   attempt's product evidence was accepted, regardless of its request kind.
 ///
 /// Live projections and the journal must be driven by this acceptance fact
 /// instead of [`SuccessEvidenceSettlement::is_late`]; otherwise the live
@@ -75,8 +78,8 @@ impl SuccessEvidenceSettlement {
 pub enum SuccessEvidenceAcceptance {
     /// The canonical settlement accepted the attempt's evidence.
     Accepted,
-    /// The attempt settled through an interruption or a non-success
-    /// resolution; none of its execution-success evidence may be published.
+    /// An interruption or superseded claim refused the attempt's evidence;
+    /// none of its execution-success evidence may be published.
     Rejected,
 }
 
