@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "decision": "docs/supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md",
-  "lock_sha256": "d804d2907ad283e6f6831cb37551bc0b09e6a169c24a50abe320a9ea0fddae84",
+  "lock_sha256": "cca90ea328dbdbb5ebf819b5afb8845714c202e5f5fd1b9c032811c35f0e1307",
   "consumer_inputs_sha256": "47bb8f6a1d67d4ab808903c04750d6eaf8d3ba3944d64e60eccc311f913cc22b",
   "accepted": [
     {
