@@ -547,12 +547,40 @@ fn runtime_event_for_committed_status(
     }
 }
 
+/// Build the attempt-owned, rich live payload before settlement decides.
+///
+/// Nothing here is trusted as committed: [`committed_task_payload`] filters
+/// these fields through the settlement receipt, so a refused attempt can never
+/// reach the live stream with its artifacts/verification intact.
+fn staged_task_payload(product: &RuntimeTaskProductSettlement) -> serde_json::Value {
+    product
+        .execution_summary
+        .as_ref()
+        .map(|summary| {
+            serde_json::json!({
+                "terminal_status": summary.outcome.status.as_str(),
+                "summary": &summary.outcome.summary,
+                "artifacts": &summary.outcome.artifacts,
+                "verification": &summary.outcome.verification,
+                "remaining_work": &summary.outcome.remaining_work,
+                "touched_files": &summary.outcome.touched_files,
+                "agent_failure": &product.typed_terminal,
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
 /// Build the live task payload from the committed settlement receipt.
 ///
 /// Accepted evidence keeps the attempt's rich fields (artifacts, verification,
-/// touched files) because the store committed them. Rejected (late) evidence
-/// is reduced to the interruption facts that actually settled, so the live
-/// stream cannot advertise a success the journal does not contain.
+/// touched files) because the store committed them. Rejected evidence is
+/// reduced to the interruption facts that actually settled, so the live stream
+/// cannot advertise a success the journal does not contain.
+///
+/// The decision is [`RuntimeTaskResolutionReceipt::acceptance`], not
+/// `settlement.is_late()`: a durable claim interruption keeps the run
+/// `Running`, so classification may still report `Committed` even though the
+/// canonical settlement refused the evidence.
 fn committed_task_payload(
     receipt: &RuntimeTaskResolutionReceipt,
     staged: serde_json::Value,
@@ -561,11 +589,12 @@ fn committed_task_payload(
         .committed_status
         .as_ref()
         .map(committed_task_status_label);
-    if receipt.settlement.is_late() {
+    if receipt.acceptance.is_rejected() {
         return serde_json::json!({
             "terminal_status": status_label,
             "summary": receipt.committed_summary,
             "settlement": receipt.settlement.as_str(),
+            "acceptance": receipt.acceptance.as_str(),
         });
     }
     let mut payload = staged;
@@ -580,6 +609,10 @@ fn committed_task_payload(
         object.insert(
             "settlement".to_string(),
             serde_json::json!(receipt.settlement.as_str()),
+        );
+        object.insert(
+            "acceptance".to_string(),
+            serde_json::json!(receipt.acceptance.as_str()),
         );
     }
     payload
@@ -2248,21 +2281,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         // The attempt's rich payload is only eligible when the durable
         // settlement accepts it; the committed receipt below decides what the
         // live stream may claim.
-        let staged_payload = product
-            .execution_summary
-            .as_ref()
-            .map(|summary| {
-                serde_json::json!({
-                    "terminal_status": summary.outcome.status.as_str(),
-                    "summary": &summary.outcome.summary,
-                    "artifacts": &summary.outcome.artifacts,
-                    "verification": &summary.outcome.verification,
-                    "remaining_work": &summary.outcome.remaining_work,
-                    "touched_files": &summary.outcome.touched_files,
-                    "agent_failure": &product.typed_terminal,
-                })
-            })
-            .unwrap_or_else(|| serde_json::json!({}));
+        let staged_payload = staged_task_payload(&product);
         let run_id = run_id.to_string();
         let wake_run_id = run_id.clone();
         let task_id = runtime_task.spec.id.clone();

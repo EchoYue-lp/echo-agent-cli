@@ -4404,21 +4404,97 @@ impl TaskRuntimeStore {
             // committed a successful resolution for this exact attempt.
             let committed_success =
                 outcome == echo_agent::tasks::RuntimeTaskResolution::Completed;
-            // Rejected success evidence never publishes the attempt's success
-            // text or review. Non-success resolutions (blocked/failed/
-            // cancelled) keep their product evidence so review history and
-            // diagnostics stay intact.
-            let rejected = settlement.is_late() || (success_request && !committed_success);
+            // The final run/task truth, not the pre-settlement classification,
+            // decides whether the attempt's execution-success evidence may be
+            // published. Three independent facts can refuse it:
+            //
+            // - the interruption-first classifier already proved the claim
+            //   late;
+            // - the committed task/run settled as an interruption. This is the
+            //   durable claim interruption case: an active driver requests the
+            //   interruption while the run stays `Running`, so classification
+            //   still reports `Committed` but the framework commits
+            //   `Interrupted`;
+            // - the requested success did not commit for this exact claim.
+            //
+            // A non-success resolution for a healthy attempt (review
+            // `NeedsFix`/`Blocked`, requeue, failure) is deliberately NOT an
+            // interruption: its execution summary and review stay published so
+            // review history, fix-task links and diagnostics survive.
+            let committed_task_status = graph
+                .snapshot
+                .tasks
+                .iter()
+                .find(|task| task.spec.id == task_id)
+                .map(|task| task.execution.status.clone());
+            let task_interrupted = matches!(
+                committed_task_status,
+                Some(
+                    echo_agent::tasks::TaskStatus::Cancelled
+                        | echo_agent::tasks::TaskStatus::Paused(_)
+                )
+            );
+            let run_interrupted = matches!(
+                run.status,
+                TaskRunStatus::Cancelled | TaskRunStatus::Paused
+            );
+            let rejected = settlement.is_late()
+                || task_interrupted
+                || run_interrupted
+                || (success_request && !committed_success);
+            let acceptance = if rejected {
+                SuccessEvidenceAcceptance::Rejected
+            } else {
+                SuccessEvidenceAcceptance::Accepted
+            };
             let committed_label = rejected.then_some("settlement superseded by interruption");
             let mut product_events = Vec::new();
             if outcome != echo_agent::tasks::RuntimeTaskResolution::Superseded {
+                // Rejected attempts publish neither the execution summary nor
+                // their review. A review describes work the user already
+                // interrupted (needs-fix gates, fix-task links, pass verdicts);
+                // attaching it to an interrupted task would resurrect product
+                // state the interruption cancelled. The rejection fact below is
+                // the durable record, and `diagnostic_note` still lands so the
+                // interruption reason stays inspectable.
                 if rejected {
-                    let (classification, late_reason) = match &settlement {
+                    // The journal keeps one rejection fact so replay can
+                    // explain why the attempt's evidence never landed. The
+                    // pre-settlement classification is preserved verbatim; a
+                    // `Committed` classification is exactly the case where the
+                    // durable settlement refused the evidence afterwards.
+                    let resolution_label = match &outcome {
+                        echo_agent::tasks::RuntimeTaskResolution::Completed => "completed",
+                        echo_agent::tasks::RuntimeTaskResolution::Interrupted { .. } => "interrupted",
+                        echo_agent::tasks::RuntimeTaskResolution::Pending => "pending",
+                        echo_agent::tasks::RuntimeTaskResolution::Skipped => "skipped",
+                        echo_agent::tasks::RuntimeTaskResolution::Failed { .. } => "failed",
+                        echo_agent::tasks::RuntimeTaskResolution::TimedOut { .. } => "timed_out",
+                        echo_agent::tasks::RuntimeTaskResolution::Blocked { .. } => "blocked",
+                        echo_agent::tasks::RuntimeTaskResolution::Cancelled => "cancelled",
+                        echo_agent::tasks::RuntimeTaskResolution::Superseded => "superseded",
+                    };
+                    let (classification, rejection_reason) = match &settlement {
                         SuccessEvidenceSettlement::Late(late) => (
                             serde_json::to_value(late).unwrap_or(serde_json::Value::Null),
                             Some(late.as_str()),
                         ),
-                        _ => (serde_json::json!({ "run_status": run.status }), None),
+                        _ if task_interrupted || run_interrupted => (
+                            serde_json::json!({
+                                "run_status": run.status,
+                                "task_status": committed_task_status,
+                                "committed_resolution": resolution_label,
+                            }),
+                            Some("settlement_interrupted"),
+                        ),
+                        _ => (
+                            serde_json::json!({
+                                "run_status": run.status,
+                                "task_status": committed_task_status,
+                                "committed_resolution": resolution_label,
+                            }),
+                            Some("settlement_not_committed"),
+                        ),
                     };
                     product_events.push(RuntimeJournalEvent::for_append(
                         run_id,
@@ -4428,7 +4504,8 @@ impl TaskRuntimeStore {
                         serde_json::json!({
                             "kind": "settlement_evidence_rejected",
                             "settlement": settlement.as_str(),
-                            "reason": late_reason,
+                            "acceptance": acceptance.as_str(),
+                            "reason": rejection_reason,
                             "classification": classification,
                             "claim_id": claim.claim_id,
                             "plan_revision": claim.revision,
@@ -4498,6 +4575,7 @@ impl TaskRuntimeStore {
             Ok(RuntimeTaskResolutionReceipt {
                 resolution: outcome,
                 settlement,
+                acceptance,
                 committed_summary,
                 committed_status,
             })

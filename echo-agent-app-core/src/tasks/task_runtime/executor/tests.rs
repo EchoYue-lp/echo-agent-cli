@@ -3806,6 +3806,7 @@ Read the runtime path and found one missing branch.
                     run_status: TaskRunStatus::Paused,
                 },
             ),
+            acceptance: crate::tasks::task_runtime::SuccessEvidenceAcceptance::Rejected,
             committed_summary: Some("settlement superseded by interruption".to_string()),
             committed_status: Some(paused.clone()),
         };
@@ -3817,6 +3818,7 @@ Read the runtime path and found one missing branch.
         let payload = committed_task_payload(&late, staged);
         assert_eq!(payload["terminal_status"], "paused");
         assert_eq!(payload["settlement"], "late");
+        assert_eq!(payload["acceptance"], "rejected");
         assert_ne!(payload["summary"], "late success");
         assert!(
             payload.get("artifacts").is_none(),
@@ -3827,10 +3829,43 @@ Read the runtime path and found one missing branch.
             Some(RuntimeEventKind::TaskBlocked)
         );
 
+        // Defect A shape: the pre-settlement classifier reported `Committed`
+        // because the durable claim interruption left the run `Running`, yet
+        // the canonical settlement refused the success. The live payload must
+        // still degrade: `is_late()` alone would leak the success fields.
+        let durable_cancel = echo_agent::tasks::TaskStatus::Cancelled;
+        let refused = RuntimeTaskResolutionReceipt {
+            resolution: echo_agent::tasks::RuntimeTaskResolution::Interrupted {
+                disposition: echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled,
+            },
+            settlement: crate::tasks::task_runtime::SuccessEvidenceSettlement::Committed,
+            acceptance: crate::tasks::task_runtime::SuccessEvidenceAcceptance::Rejected,
+            committed_summary: Some("settlement superseded by interruption".to_string()),
+            committed_status: Some(durable_cancel.clone()),
+        };
+        let refused_payload = committed_task_payload(
+            &refused,
+            serde_json::json!({
+                "terminal_status": "completed",
+                "summary": "interrupted success",
+                "artifacts": [{"path": "refused.txt"}],
+                "verification": [{"check": "cargo test", "status": "passed"}],
+            }),
+        );
+        assert_eq!(refused_payload["terminal_status"], "cancelled");
+        assert_eq!(refused_payload["acceptance"], "rejected");
+        assert_ne!(refused_payload["summary"], "interrupted success");
+        assert!(
+            refused_payload.get("artifacts").is_none()
+                && refused_payload.get("verification").is_none(),
+            "settlement-rejected evidence must not expose success payload fields"
+        );
+
         let completed = echo_agent::tasks::TaskStatus::Completed;
         let accepted = RuntimeTaskResolutionReceipt {
             resolution: echo_agent::tasks::RuntimeTaskResolution::Completed,
             settlement: crate::tasks::task_runtime::SuccessEvidenceSettlement::Committed,
+            acceptance: crate::tasks::task_runtime::SuccessEvidenceAcceptance::Accepted,
             committed_summary: Some("committed result".to_string()),
             committed_status: Some(completed.clone()),
         };
@@ -3845,6 +3880,7 @@ Read the runtime path and found one missing branch.
         assert_eq!(accepted_payload["terminal_status"], "completed");
         assert_eq!(accepted_payload["summary"], "committed result");
         assert_eq!(accepted_payload["settlement"], "committed");
+        assert_eq!(accepted_payload["acceptance"], "accepted");
         assert!(
             accepted_payload.get("artifacts").is_some(),
             "committed evidence keeps its rich payload"
@@ -3857,6 +3893,427 @@ Read the runtime path and found one missing branch.
             runtime_event_for_committed_status(&echo_agent::tasks::TaskStatus::Pending),
             None
         );
+    }
+
+    /// Attempt-owned execution evidence that looks exactly like success:
+    /// artifacts, verification, and touched files all set.
+    fn success_execution_summary(
+        run_id: &str,
+        task_id: &str,
+        text: &str,
+    ) -> TaskExecutionSummary {
+        let mut outcome = SubagentOutcome::terminal(SubagentStatus::Completed, text, Vec::new());
+        outcome.artifacts = vec![echo_agent::subagent::SubagentArtifact {
+            path: "src/settled.rs".to_string(),
+            kind: "patch".to_string(),
+            bytes: Some(42),
+            sha256: None,
+            producer_execution_id: None,
+            available: true,
+        }];
+        outcome.verification = vec![echo_agent::subagent::SubagentVerification {
+            check: "cargo test -p echo-agent-app-core".to_string(),
+            status: echo_agent::subagent::SubagentVerificationStatus::Passed,
+            details: "ok".to_string(),
+            source: echo_agent::subagent::SubagentEvidenceSource::Reported,
+        }];
+        outcome.touched_files.written = vec!["src/settled.rs".to_string()];
+        TaskExecutionSummary {
+            run_id: run_id.to_string(),
+            task_id: task_id.to_string(),
+            subagent_name: "reviewer".to_string(),
+            outcome,
+            decisions: Vec::new(),
+            next_implications: Vec::new(),
+            suggested_tasks: Vec::new(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn review_result(run_id: &str, task_id: &str, outcome: ReviewOutcome) -> ReviewResult {
+        ReviewResult {
+            id: format!("review-{run_id}-{task_id}"),
+            run_id: run_id.to_string(),
+            task_id: task_id.to_string(),
+            reviewer_agent: "reviewer".to_string(),
+            outcome,
+            issues: Vec::new(),
+            failure_fingerprint: None,
+            created_fix_task_id: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn has_note_kind(store: &TaskRuntimeStore, run_id: &str, kind: &str) -> Result<bool, String> {
+        Ok(store
+            .list_events(run_id, 0)
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|event| {
+                event.payload.get("kind").and_then(serde_json::Value::as_str) == Some(kind)
+            }))
+    }
+
+    fn claim_seeded_task(
+        store: &TaskRuntimeStore,
+        run_id: &str,
+    ) -> Result<echo_agent::tasks::TaskClaim, String> {
+        let snapshot = store
+            .load_runtime_plan_snapshot(run_id)
+            .map_err(|error| error.to_string())?;
+        let task = snapshot
+            .tasks
+            .first()
+            .cloned()
+            .ok_or_else(|| "seeded task missing".to_string())?;
+        match store
+            .claim_runtime_task(run_id, &task, snapshot.revision)
+            .map_err(|error| error.to_string())?
+        {
+            echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => Ok(claim),
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                Err("claim was not admitted".to_string())
+            }
+        }
+    }
+
+    /// Defect B regression: a review gate that returns after a durable
+    /// interruption must not persist the completed execution's success summary.
+    ///
+    /// Reproduces the real path with the canonical driver registration: a live
+    /// driver is admitted and registered, the user cancels, the cancellation
+    /// becomes a durable claim interruption while the run is still `Running`,
+    /// and only then does the review gate return `NeedsFix`/`Blocked`. The
+    /// canonical settlement commits `Interrupted`, so the execution summary and
+    /// the review must both be refused instead of persisted for a task the user
+    /// already stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_after_durable_interruption_publishes_no_success_evidence()
+    -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
+        let run_id = seed_run(&store, vec![solo_readonly_task("reviewed")])?;
+        let claim = claim_seeded_task(&store, &run_id)?;
+
+        // Register through the canonical driver admission path: this is what
+        // makes a cancellation durable at the claim while the run stays live.
+        let admission = store
+            .reserve_run_driver_admission(run_id.clone(), CancellationToken::new())
+            .map_err(|error| error.to_string())?;
+        let driver = store
+            .register_observed_run_driver::<()>(
+                admission,
+                store
+                    .lease_active_workspace_generation()
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(store.request_cancel(&run_id).map_err(|error| error.to_string())?);
+        assert_eq!(
+            store
+                .get_run(&run_id)
+                .map_err(|error| error.to_string())?
+                .map(|run| run.status),
+            Some(TaskRunStatus::Running),
+            "a live driver keeps the run Running while the claim interruption is durable"
+        );
+        let interrupted = store
+            .load_runtime_plan_snapshot(&run_id)
+            .map_err(|error| error.to_string())?
+            .tasks
+            .into_iter()
+            .find(|task| task.spec.id == "reviewed")
+            .ok_or_else(|| "claimed task missing".to_string())?;
+        assert_eq!(
+            interrupted.execution.interruption_requested,
+            Some(echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled),
+            "request_cancel must durably interrupt the exact claim, not just the process token"
+        );
+
+        let product = RuntimeTaskProductSettlement {
+            summary: Some("review needs fix".to_string()),
+            execution_summary: Some(success_execution_summary(
+                &run_id,
+                "reviewed",
+                "execution finished before the cancellation was observed",
+            )),
+            review: Some(review_result(&run_id, "reviewed", ReviewOutcome::NeedsFix)),
+            diagnostic_note: Some("review needs fix".to_string()),
+            typed_terminal: None,
+        };
+        let staged = staged_task_payload(&product);
+        let receipt = store
+            .settle_runtime_task_resolution(
+                &run_id,
+                "reviewed",
+                &claim,
+                echo_agent::tasks::RuntimeTaskResolutionRequest::Blocked {
+                    error: "review needs fix".to_string(),
+                    disposition: echo_agent::tasks::RuntimeStopDisposition::Pause,
+                },
+                product,
+            )
+            .map_err(|error| error.to_string())?;
+
+        // Durable truth first: no execution success evidence may land for an
+        // attempt the user already interrupted.
+        assert!(
+            !has_note_kind(&store, &run_id, "summary_persisted")?,
+            "no execution success summary may be persisted for an interrupted attempt"
+        );
+        assert!(
+            store
+                .get_summary(&run_id, "reviewed")
+                .map_err(|error| error.to_string())?
+                .is_none(),
+            "the summary projection must stay empty"
+        );
+        assert!(
+            store
+                .list_reviews(&run_id, "reviewed")
+                .map_err(|error| error.to_string())?
+                .is_empty(),
+            "the interrupted attempt's review must not land"
+        );
+        assert!(
+            has_note_kind(&store, &run_id, "settlement_evidence_rejected")?,
+            "the journal must keep one rejection fact"
+        );
+        assert!(
+            receipt.acceptance.is_rejected(),
+            "interrupted attempt must not accept its success evidence, got {:?}",
+            receipt.acceptance
+        );
+        assert!(
+            matches!(
+                receipt.resolution,
+                echo_agent::tasks::RuntimeTaskResolution::Interrupted { .. }
+            ),
+            "settlement must commit the interruption, got {:?}",
+            receipt.resolution
+        );
+        assert_eq!(
+            receipt.committed_status,
+            Some(echo_agent::tasks::TaskStatus::Cancelled)
+        );
+
+        // Live payload: the same staged attempt data the dispatch would emit
+        // must be degraded to the interruption truth.
+        let payload = committed_task_payload(&receipt, staged);
+        assert_eq!(payload["terminal_status"], "cancelled");
+        assert_eq!(payload["acceptance"], "rejected");
+        assert!(
+            payload.get("artifacts").is_none()
+                && payload.get("verification").is_none()
+                && payload.get("touched_files").is_none(),
+            "live payload must not expose success evidence, got {payload}"
+        );
+        assert_ne!(payload["summary"], "execution finished before the cancellation was observed");
+
+        drop(driver);
+        Ok(())
+    }
+
+    /// Defect A regression matrix: cancel/pause × completion/abandon.
+    ///
+    /// The cell the old implementation got wrong is "cancel × completion": the
+    /// durable claim interruption leaves the run `Running`, so the
+    /// interruption-first classifier still reports `Committed` while the
+    /// canonical settlement commits `Interrupted`. The receipt's acceptance
+    /// fact and the degraded live payload must agree in every cell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interruption_matrix_acceptance_matches_live_payload() -> Result<(), String> {
+        for interrupt in ["cancel", "pause"] {
+            for outcome in ["completion", "abandon"] {
+                let store = Arc::new(
+                    TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
+                );
+                let _resource_scope = store.test_resource_scope();
+                let run_id = seed_run(&store, vec![solo_readonly_task("reviewed")])?;
+                let claim = claim_seeded_task(&store, &run_id)?;
+                let token = CancellationToken::new();
+                let registration = store
+                    .register_run_cancellation(&run_id, token.clone())
+                    .map_err(|error| error.to_string())?;
+
+                if interrupt == "cancel" {
+                    assert!(store.request_cancel(&run_id).map_err(|error| error.to_string())?);
+                } else {
+                    assert!(store.request_pause(&run_id).map_err(|error| error.to_string())?);
+                }
+                assert!(token.is_cancelled(), "{interrupt}: driver token must be cancelled");
+
+                if outcome == "abandon" {
+                    let fallback = if interrupt == "cancel" {
+                        echo_agent::tasks::TaskStatus::Cancelled
+                    } else {
+                        echo_agent::tasks::TaskStatus::Paused("paused by user".to_string())
+                    };
+                    store
+                        .settle_runtime_task_claim(
+                            &run_id,
+                            "reviewed",
+                            &claim,
+                            fallback,
+                            Some("abandoned attempt".to_string()),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let committed = store
+                        .runtime_task_execution(&run_id, "reviewed")
+                        .map_err(|error| error.to_string())?
+                        .map(|execution| execution.status)
+                        .ok_or_else(|| format!("{interrupt}/{outcome}: task missing"))?;
+                    assert!(
+                        matches!(
+                            committed,
+                            echo_agent::tasks::TaskStatus::Cancelled
+                                | echo_agent::tasks::TaskStatus::Paused(_)
+                        ),
+                        "{interrupt}/{outcome}: abandoned task status was {committed:?}"
+                    );
+                    assert!(
+                        !has_note_kind(&store, &run_id, "summary_persisted")?,
+                        "{interrupt}/{outcome}: abandoned attempt kept a success summary"
+                    );
+                    drop(registration);
+                    continue;
+                }
+
+                let product = RuntimeTaskProductSettlement {
+                    summary: Some("late success".to_string()),
+                    execution_summary: Some(success_execution_summary(
+                        &run_id,
+                        "reviewed",
+                        "late success",
+                    )),
+                    review: Some(review_result(&run_id, "reviewed", ReviewOutcome::Pass)),
+                    diagnostic_note: None,
+                    typed_terminal: None,
+                };
+                let staged = staged_task_payload(&product);
+                let receipt = store
+                    .settle_runtime_task_resolution(
+                        &run_id,
+                        "reviewed",
+                        &claim,
+                        echo_agent::tasks::RuntimeTaskResolutionRequest::Completed,
+                        product,
+                    )
+                    .map_err(|error| error.to_string())?;
+
+                assert!(
+                    receipt.acceptance.is_rejected(),
+                    "{interrupt}/{outcome}: refused success evidence must be marked rejected, settlement={:?}",
+                    receipt.settlement
+                );
+                let committed = receipt
+                    .committed_status
+                    .clone()
+                    .ok_or_else(|| format!("{interrupt}/{outcome}: committed status missing"))?;
+                assert!(
+                    matches!(
+                        committed,
+                        echo_agent::tasks::TaskStatus::Cancelled
+                            | echo_agent::tasks::TaskStatus::Paused(_)
+                    ),
+                    "{interrupt}/{outcome}: task did not settle as interruption: {committed:?}"
+                );
+                assert!(
+                    !has_note_kind(&store, &run_id, "summary_persisted")?,
+                    "{interrupt}/{outcome}: refused success evidence persisted a summary"
+                );
+                assert!(
+                    store
+                        .get_summary(&run_id, "reviewed")
+                        .map_err(|error| error.to_string())?
+                        .is_none(),
+                    "{interrupt}/{outcome}: summary projection must stay empty"
+                );
+
+                let payload = committed_task_payload(&receipt, staged);
+                assert_eq!(
+                    payload["acceptance"], "rejected",
+                    "{interrupt}/{outcome}: payload and receipt acceptance disagree"
+                );
+                assert!(
+                    payload.get("artifacts").is_none()
+                        && payload.get("verification").is_none()
+                        && payload.get("touched_files").is_none(),
+                    "{interrupt}/{outcome}: live payload leaked success fields, got {payload}"
+                );
+                assert_ne!(payload["summary"], "late success");
+                drop(registration);
+            }
+        }
+        Ok(())
+    }
+
+    /// The fix must not over-reach: a non-success review gate on a healthy run
+    /// keeps its execution evidence and review history.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn needs_fix_review_without_interruption_keeps_execution_evidence()
+    -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
+        let run_id = seed_run(&store, vec![solo_readonly_task("reviewed")])?;
+        let claim = claim_seeded_task(&store, &run_id)?;
+
+        let product = RuntimeTaskProductSettlement {
+            summary: Some("review needs fix".to_string()),
+            execution_summary: Some(success_execution_summary(
+                &run_id,
+                "reviewed",
+                "execution finished",
+            )),
+            review: Some(review_result(&run_id, "reviewed", ReviewOutcome::NeedsFix)),
+            diagnostic_note: Some("review needs fix".to_string()),
+            typed_terminal: None,
+        };
+        let staged = staged_task_payload(&product);
+        let receipt = store
+            .settle_runtime_task_resolution(
+                &run_id,
+                "reviewed",
+                &claim,
+                echo_agent::tasks::RuntimeTaskResolutionRequest::Blocked {
+                    error: "review needs fix".to_string(),
+                    disposition: echo_agent::tasks::RuntimeStopDisposition::Pause,
+                },
+                product,
+            )
+            .map_err(|error| error.to_string())?;
+
+        assert!(
+            receipt.acceptance.is_accepted(),
+            "a healthy blocked review keeps its evidence, got {:?}",
+            receipt.acceptance
+        );
+        assert_eq!(
+            receipt.committed_status,
+            Some(echo_agent::tasks::TaskStatus::Blocked(
+                "review needs fix".to_string()
+            ))
+        );
+        assert!(
+            has_note_kind(&store, &run_id, "summary_persisted")?,
+            "healthy non-success attempts keep their execution summary"
+        );
+        assert_eq!(
+            store
+                .list_reviews(&run_id, "reviewed")
+                .map_err(|error| error.to_string())?
+                .len(),
+            1,
+            "healthy non-success attempts keep their review history"
+        );
+        let payload = committed_task_payload(&receipt, staged);
+        assert_eq!(payload["terminal_status"], "blocked");
+        assert_eq!(payload["acceptance"], "accepted");
+        assert!(
+            payload.get("artifacts").is_some() && payload.get("verification").is_some(),
+            "accepted evidence keeps its rich payload, got {payload}"
+        );
+        Ok(())
     }
 
 }

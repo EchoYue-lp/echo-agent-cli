@@ -102,8 +102,8 @@ pub use register::{
 pub use review::{BreakerAction, ReviewError, build_fix_task, requires_review, review_task};
 pub use revisioned_runtime::{apply_task_update, build_task_revision_service, commit_task_plan};
 pub use settlement_evidence::{
-    LateSuccessEvidence, SuccessEvidenceSettlement, classify_run_completion,
-    classify_success_evidence,
+    LateSuccessEvidence, SuccessEvidenceAcceptance, SuccessEvidenceSettlement,
+    classify_run_completion, classify_success_evidence,
 };
 pub use store::{
     AbandonedRunSettlement, BootAutoResumeBlocker, BootAutoResumeDecision, BootAutoResumeOutcome,

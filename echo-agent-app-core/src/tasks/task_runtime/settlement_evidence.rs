@@ -54,6 +54,50 @@ impl SuccessEvidenceSettlement {
     }
 }
 
+/// Final acceptance of one attempt's execution-success evidence.
+///
+/// [`SuccessEvidenceSettlement`] only classifies the claim against durable run
+/// state *before* the canonical settlement runs, so it cannot express the last
+/// word on whether the evidence was published. Two real paths reach a
+/// settlement that refuses evidence while the classifier still reports
+/// [`SuccessEvidenceSettlement::Committed`]:
+///
+/// - a durable claim interruption requested by an active driver keeps the run
+///   in `Running`, yet [`echo_agent::tasks::settle_runtime_resolution`] commits
+///   [`echo_agent::tasks::RuntimeTaskResolution::Interrupted`];
+/// - a non-success attempt (review `NeedsFix`/`Blocked`) finishes its execution
+///   after the run/claim was interrupted while the review gate was in flight.
+///
+/// Live projections and the journal must be driven by this acceptance fact
+/// instead of [`SuccessEvidenceSettlement::is_late`]; otherwise the live
+/// stream advertises artifacts/verification the journal never accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuccessEvidenceAcceptance {
+    /// The canonical settlement accepted the attempt's evidence.
+    Accepted,
+    /// The attempt settled through an interruption or a non-success
+    /// resolution; none of its execution-success evidence may be published.
+    Rejected,
+}
+
+impl SuccessEvidenceAcceptance {
+    pub const fn is_accepted(self) -> bool {
+        matches!(self, Self::Accepted)
+    }
+
+    pub const fn is_rejected(self) -> bool {
+        !self.is_accepted()
+    }
+
+    /// Stable wire label for journal payloads and logs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
 /// Why a piece of success evidence was classified as late.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
