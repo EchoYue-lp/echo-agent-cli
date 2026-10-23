@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use echo_agent::tasks::{
     DefaultTaskToolPolicy, PreparedTaskPolicy, RevisionedTaskGraph, RevisionedTaskStore,
-    RevisionedTaskStoreError, TaskCreateInput, TaskDraft, TaskGraphCommit, TaskGraphContext,
-    TaskPolicyError, TaskRevisionError, TaskRevisionService, TaskToolPolicy,
+    RevisionedTaskStoreError, TaskCreateInput, TaskDraft, TaskExecutionCommit, TaskGraphCommit,
+    TaskGraphContext, TaskPolicyError, TaskRevisionError, TaskRevisionService, TaskToolPolicy,
 };
 use echo_agent::tools::ToolContext;
 
@@ -82,6 +82,10 @@ impl EkoTaskGraphStore {
 
 #[async_trait]
 impl RevisionedTaskStore for EkoTaskGraphStore {
+    fn supports_runtime_execution(&self) -> bool {
+        true
+    }
+
     async fn load(
         &self,
         scope_id: &str,
@@ -178,6 +182,20 @@ impl RevisionedTaskStore for EkoTaskGraphStore {
             }
         }
         Ok(committed)
+    }
+
+    async fn compare_and_commit_execution(
+        &self,
+        scope_id: &str,
+        commit: TaskExecutionCommit,
+    ) -> Result<RevisionedTaskGraph, RevisionedTaskStoreError> {
+        let scope_id = scope_id.to_string();
+        self.blocking
+            .run_store("commit exact task execution graph", move |store| {
+                store.compare_and_commit_runtime_task_execution(&scope_id, commit)
+            })
+            .await
+            .map_err(store_error)
     }
 }
 
@@ -854,6 +872,155 @@ mod tests {
             risks: Vec::new(),
             execution_mode: TaskGraphExecutionMode::Sequential,
         }
+    }
+
+    #[tokio::test]
+    async fn execution_cas_adapter_commits_exact_claim_interruption_and_rejects_drift()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::types::TaskRunStatus;
+        use echo_agent::tasks::{RuntimeInterruptionDisposition, RuntimeTaskClaimOutcome};
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let _resource_scope = store.test_resource_scope();
+        let run_id = "execution-cas";
+        let service = build_task_revision_service(store.clone(), test_capabilities());
+        service
+            .create_from_tool(task_input("explorer"), &test_context(run_id))
+            .await?;
+        store.transition_run(run_id, TaskRunStatus::Running)?;
+        let adapter = EkoTaskGraphStore::new(store.clone());
+        assert!(adapter.supports_runtime_execution());
+        let initial = adapter.load(run_id).await?.ok_or("initial graph missing")?;
+        let task = initial.snapshot.tasks.first().ok_or("task missing")?;
+        let claim = match service
+            .claim_runtime_task(run_id, task, initial.snapshot.revision)
+            .await?
+        {
+            RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+            RuntimeTaskClaimOutcome::ReloadSnapshot => return Err("claim was not admitted".into()),
+        };
+        let disposition = RuntimeInterruptionDisposition::Paused {
+            reason: "pause through the registered execution CAS".to_string(),
+        };
+        assert!(
+            service
+                .request_runtime_task_interruption(
+                    run_id,
+                    &task.spec.id,
+                    &claim,
+                    disposition.clone()
+                )
+                .await?
+        );
+        let current = adapter.load(run_id).await?.ok_or("current graph missing")?;
+        assert_eq!(current.snapshot.revision, initial.snapshot.revision);
+        assert_eq!(current.context, initial.context);
+        assert_eq!(
+            current.snapshot.tasks.first().map(|task| &task.spec),
+            Some(&task.spec)
+        );
+        assert_eq!(
+            current
+                .snapshot
+                .tasks
+                .first()
+                .and_then(|task| task.execution.interruption_requested.as_ref()),
+            Some(&disposition)
+        );
+        assert_eq!(
+            store
+                .list_events(run_id, 0)?
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::PlanRevisionCommitted)
+                .count(),
+            1,
+            "claim and interruption must not invent a new relation revision"
+        );
+        let sequence = store
+            .get_run_state(run_id)?
+            .map(|state| state.journal_sequence);
+        for expected_executions in [
+            initial
+                .snapshot
+                .tasks
+                .iter()
+                .map(|task| (task.spec.id.clone(), task.execution.clone()))
+                .collect(),
+            std::collections::BTreeMap::new(),
+        ] {
+            assert!(
+                matches!(
+                    adapter
+                        .compare_and_commit_execution(
+                            run_id,
+                            TaskExecutionCommit {
+                                expected_revision: current.snapshot.revision,
+                                expected_executions,
+                                next: current.clone(),
+                            }
+                        )
+                        .await,
+                    Err(RevisionedTaskStoreError::Conflict { .. })
+                ),
+                "the complete execution map, including the task set, is a CAS fence"
+            );
+        }
+        for mutation in [
+            "revision", "context", "spec", "remove", "add", "identity", "claim",
+        ] {
+            let mut next = current.clone();
+            match mutation {
+                "revision" => next.snapshot.revision = next.snapshot.revision.saturating_add(1),
+                "context" => next.context.goal = "foreign context".to_string(),
+                "remove" => next.snapshot.tasks.clear(),
+                "add" => next.snapshot.tasks.push(task.clone()),
+                _ => {
+                    let task = next.snapshot.tasks.first_mut().ok_or("next task missing")?;
+                    match mutation {
+                        "spec" => task.spec.title = "changed relation".to_string(),
+                        "identity" => task.execution.task_id = "foreign execution".to_string(),
+                        "claim" => {
+                            let claim = task
+                                .execution
+                                .claim
+                                .as_mut()
+                                .ok_or("current claim missing")?;
+                            claim.attempt = claim.attempt.saturating_add(1);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let result = adapter
+                .compare_and_commit_execution(
+                    run_id,
+                    TaskExecutionCommit {
+                        expected_revision: current.snapshot.revision,
+                        expected_executions: current
+                            .snapshot
+                            .tasks
+                            .iter()
+                            .map(|task| (task.spec.id.clone(), task.execution.clone()))
+                            .collect(),
+                        next,
+                    },
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "{mutation}: execution CAS must reject graph/identity drift"
+            );
+            assert_eq!(
+                store
+                    .get_run_state(run_id)?
+                    .map(|state| state.journal_sequence),
+                sequence
+            );
+        }
+        let reloaded = adapter.load(run_id).await?.ok_or("graph disappeared")?;
+        assert_eq!(reloaded.snapshot.tasks, current.snapshot.tasks);
+        assert_eq!(reloaded.context, current.context);
+        Ok(())
     }
 
     #[tokio::test]

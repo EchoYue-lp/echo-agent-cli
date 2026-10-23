@@ -77,6 +77,8 @@ enum ReconcileOperation {
 enum ConnectOperationOutcome {
     Completed(echo_agent::mcp::McpTargetChange),
     Failed(String),
+    /// Superseded before the framework future was ever polled.
+    Superseded,
 }
 
 /// What the pass that issued a connection operation wants done with a result
@@ -96,6 +98,58 @@ struct ConnectOperation {
     decision: tokio::sync::watch::Sender<Option<LateConnectDecision>>,
 }
 
+/// Pointer identity of one agent (reconcile target) inside this runtime.
+///
+/// A runtime is shared by every workspace agent, so a server name alone does
+/// not identify a connection: the same name may be connected concurrently on
+/// several agents. `AgentHandle` exposes no stable textual id (its agent name
+/// is mutable), so identity is the address of the shared agent state. The
+/// address stays unique for the whole lifetime of a tracked operation: the
+/// background task keeps its own `AgentHandle` (an `Arc` clone) alive until the
+/// operation is terminal, so no other agent can be allocated at that address
+/// while a receipt for this one is still tracked.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AgentKey(usize);
+
+impl AgentKey {
+    fn of(agent: &AgentHandle) -> Self {
+        Self(Arc::as_ptr(agent.inner()) as usize)
+    }
+}
+
+/// Monotonic identity of one backgrounded connection operation.
+///
+/// The id is never reused, so an operation that finishes after its pass
+/// stopped waiting can always tell whether the client currently wired for its
+/// name is the one it published itself.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ConnectOperationId(u64);
+
+/// The physical client whose publication or unchanged confirmation an
+/// operation owns. A name can be rewired outside this runtime; retain its
+/// identity weakly so that an old withdrawal cannot address that new client.
+struct PublishedConnect {
+    operation: ConnectOperationId,
+    client: std::sync::Weak<echo_agent::mcp::McpClient>,
+}
+
+/// One target server of one agent, the granularity at which background
+/// connection operations are tracked and withdrawn.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BackgroundConnectTarget {
+    agent: AgentKey,
+    name: String,
+}
+
+impl BackgroundConnectTarget {
+    fn new(agent: &AgentHandle, name: &str) -> Self {
+        Self {
+            agent: AgentKey::of(agent),
+            name: name.to_string(),
+        }
+    }
+}
+
 /// Settlement receipt for one connection operation owned by a background task.
 ///
 /// A reconcile pass must never drop an in-flight framework preparation. The
@@ -107,6 +161,32 @@ struct ConnectOperation {
 /// unusable server name.
 struct BackgroundConnect {
     settled: tokio::sync::watch::Sender<bool>,
+}
+
+impl BackgroundConnect {
+    /// Resolve once the owning operation reached a terminal state. A dropped
+    /// sender also resolves: the operation cannot settle anything anymore.
+    async fn wait_settled(&self) {
+        let mut settled = self.settled.subscribe();
+        loop {
+            let is_settled = *settled.borrow();
+            if is_settled {
+                return;
+            }
+            if settled.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Result of the withdrawal a late connection operation performs for itself.
+enum LateWithdrawOutcome {
+    /// A newer operation published the live client, so this operation withdrew
+    /// nothing.
+    Superseded,
+    /// The framework was asked to disconnect this operation's own client.
+    Attempted(Result<echo_agent::mcp::McpTargetChange, String>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -262,6 +342,21 @@ impl Default for McpRuntimeSupervisor {
 struct WriterTestGate {
     started: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ConnectTestPoint {
+    BeforeAdmission,
+    BeforeFirstPoll,
+}
+
+#[cfg(test)]
+struct ConnectTestGate {
+    point: ConnectTestPoint,
+    generation: u64,
+    started: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[cfg(test)]
@@ -574,14 +669,26 @@ pub struct McpConfigRuntime {
     ownership: Arc<McpNameOwnershipRegistry>,
     deadlines: ReconcileDeadlines,
     /// Connection operations that outlived their reconcile pass and keep
-    /// running in a background task. Later passes serialize against these
-    /// before touching the same name.
-    background_connects: Mutex<BTreeMap<String, Arc<BackgroundConnect>>>,
+    /// running in a background task, keyed by the exact target (agent and
+    /// server name) and by operation identity. Later passes serialize against
+    /// these before touching the same target; the same server name on another
+    /// agent is a different entry and never replaces this one.
+    background_connects: Mutex<
+        BTreeMap<BackgroundConnectTarget, BTreeMap<ConnectOperationId, Arc<BackgroundConnect>>>,
+    >,
+    /// Operation that most recently published the live client for one target.
+    /// The framework addresses clients by name, so a late operation must prove
+    /// that the live client is still its own before withdrawing.
+    published_connects: Mutex<BTreeMap<BackgroundConnectTarget, PublishedConnect>>,
+    /// Allocates [`ConnectOperationId`]s for background connection operations.
+    next_connect_operation: AtomicU64,
     shutdown: CancellationToken,
     #[cfg(test)]
     writer_gate: Mutex<Option<WriterTestGate>>,
     #[cfg(test)]
     reconcile_faults: Mutex<ReconcileFaultQueue>,
+    #[cfg(test)]
+    connect_test_gates: Mutex<Vec<ConnectTestGate>>,
 }
 
 impl McpConfigRuntime {
@@ -607,11 +714,15 @@ impl McpConfigRuntime {
             ownership,
             deadlines: ReconcileDeadlines::default(),
             background_connects: Mutex::new(BTreeMap::new()),
+            published_connects: Mutex::new(BTreeMap::new()),
+            next_connect_operation: AtomicU64::new(0),
             shutdown: CancellationToken::new(),
             #[cfg(test)]
             writer_gate: Mutex::new(None),
             #[cfg(test)]
             reconcile_faults: Mutex::new(ReconcileFaultQueue::default()),
+            #[cfg(test)]
+            connect_test_gates: Mutex::new(Vec::new()),
         }
     }
 
@@ -637,8 +748,123 @@ impl McpConfigRuntime {
     }
 
     #[cfg(test)]
+    async fn pause_connect_at(&self, point: ConnectTestPoint, generation: u64) {
+        let gate = {
+            let mut gates = self.connect_test_gates.lock().await;
+            gates
+                .iter()
+                .position(|gate| gate.point == point && gate.generation == generation)
+                .map(|index| gates.remove(index))
+        };
+        if let Some(gate) = gate {
+            let _ = gate.started.send(());
+            let _ = gate.release.await;
+        }
+    }
+
+    /// Number of background connection operations that have not settled yet.
+    async fn outstanding_background_connects(&self) -> usize {
+        self.background_connects
+            .lock()
+            .await
+            .values()
+            .map(|operations| operations.len())
+            .sum()
+    }
+
+    #[cfg(test)]
     async fn background_connect_count(&self) -> usize {
-        self.background_connects.lock().await.len()
+        self.outstanding_background_connects().await
+    }
+
+    /// Publish one operation's receipt before its task starts, so a later pass
+    /// serializes against this exact target instead of starting a second
+    /// preparation for the same name.
+    async fn track_background_connect(
+        &self,
+        target: &BackgroundConnectTarget,
+        operation: ConnectOperationId,
+        receipt: Arc<BackgroundConnect>,
+    ) {
+        self.background_connects
+            .lock()
+            .await
+            .entry(target.clone())
+            .or_default()
+            .insert(operation, receipt);
+    }
+
+    /// Remove exactly this operation's receipt. A newer operation (or another
+    /// agent's operation for the same name) may be tracked for the same target
+    /// by now and must stay observable.
+    async fn untrack_background_connect(
+        &self,
+        target: &BackgroundConnectTarget,
+        operation: ConnectOperationId,
+    ) {
+        let mut background = self.background_connects.lock().await;
+        let Some(operations) = background.get_mut(target) else {
+            return;
+        };
+        operations.remove(&operation);
+        if operations.is_empty() {
+            background.remove(target);
+        }
+    }
+
+    async fn background_receipts(
+        &self,
+        target: &BackgroundConnectTarget,
+    ) -> Vec<Arc<BackgroundConnect>> {
+        self.background_connects
+            .lock()
+            .await
+            .get(target)
+            .map(|operations| operations.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Record the operation that published the live client for `target`.
+    ///
+    /// Always called while the target agent's write lock is held, which is the
+    /// same lock every framework connection mutation of that agent takes. The
+    /// record is therefore ordered against any later publication or withdrawal
+    /// for the same target.
+    async fn record_published_connect(
+        &self,
+        target: &BackgroundConnectTarget,
+        operation: ConnectOperationId,
+        client: &Arc<echo_agent::mcp::McpClient>,
+    ) {
+        self.published_connects.lock().await.insert(
+            target.clone(),
+            PublishedConnect {
+                operation,
+                client: Arc::downgrade(client),
+            },
+        );
+    }
+
+    async fn clear_published_connect(&self, target: &BackgroundConnectTarget) {
+        self.published_connects.lock().await.remove(target);
+    }
+
+    /// True when `operation` published the client that is currently wired for
+    /// `target`, i.e. withdrawing it cannot hit a newer client.
+    async fn owns_published_connect(
+        &self,
+        target: &BackgroundConnectTarget,
+        operation: ConnectOperationId,
+        client: &Arc<echo_agent::mcp::McpClient>,
+    ) -> bool {
+        self.published_connects
+            .lock()
+            .await
+            .get(target)
+            .is_some_and(|publication| {
+                publication.operation == operation
+                    && publication.client.ptr_eq(&Arc::downgrade(client))
+            })
     }
 
     #[cfg(test)]
@@ -994,7 +1220,7 @@ impl McpConfigRuntime {
         // dropped framework preparation would keep its manager ticket forever).
         // Their transports bound their own settlement, so shutdown observes them
         // instead of waiting unboundedly.
-        let outstanding = self.background_connects.lock().await.len();
+        let outstanding = self.outstanding_background_connects().await;
         if outstanding > 0 {
             tracing::warn!(
                 outstanding,
@@ -1119,72 +1345,99 @@ impl McpConfigRuntime {
         plan: ReconcilePlan,
     ) -> bool {
         // Phase 1 (no agent lock): observe connection operations that outlived
-        // an earlier pass. Their background tasks hold the agent write lock
+        // an earlier pass. Their background tasks hold this agent's write lock
         // while the framework future runs, so waiting for them here - where
-        // this pass holds no lock - is the only deadlock-free point.
+        // this pass holds no lock - is the only deadlock-free point. Only this
+        // exact target's receipts count: another agent connecting the same
+        // server name must neither mask nor be masked by them.
         let mut outstanding = BTreeSet::new();
         for name in plan.touched_names() {
             if reconcile_cancel.is_cancelled() || runtime.generation() != generation {
                 return false;
             }
             if !runtime
-                .observe_background_connect(&name, runtime.deadlines.connect)
+                .observe_background_connect(&agent, &name, runtime.deadlines.connect)
                 .await
             {
                 outstanding.insert(name);
             }
+        }
+        if !outstanding.is_empty() {
+            // Every operation that outlived its pass keeps this agent's write
+            // lock for as long as the framework future runs. Taking the lock
+            // here would wait without a bound, and a lock wait is not an
+            // operation outcome: reporting it as one would hide that this
+            // target is still unconfirmed. Stop before phase 2/3 instead; the
+            // caller keeps the retry frontier, so a later generation retries
+            // the same names.
+            tracing::warn!(
+                generation,
+                outstanding = outstanding.len(),
+                "MCP reconcile observed unsettled connection operations; pass stopped before phase 2"
+            );
+            return false;
         }
 
         // Phase 2: withdraw every server that must not stay connected, under
         // one write lock. A dropped disconnect future is safe: transports keep
         // cancellation-safe close receipts and the manager retains unsettled
         // clients as retryable cleanup debt, so a later pass can retry.
-        // `write_async` requires a future valid for every agent borrow, so the
-        // pass hands owned values to the closure instead of borrowing its own
-        // locals (the plan's connect list is still needed for phase 3).
-        let disconnect_names = plan.disconnect.clone();
-        let outstanding_for_pass = outstanding.clone();
-        let runtime_for_pass = Arc::clone(&runtime);
-        let cancel_for_pass = reconcile_cancel.clone();
-        let mut settled = agent
-            .write_async(move |agent| {
-                Box::pin(async move {
-                    let mut settled = true;
-                    'disconnect: {
-                        for name in &disconnect_names {
-                            if cancel_for_pass.is_cancelled()
-                                || runtime_for_pass.generation() != generation
-                            {
-                                settled = false;
-                                break 'disconnect;
-                            }
-                            if outstanding_for_pass.contains(name) {
-                                settled = false;
-                                continue;
-                            }
-                            match runtime_for_pass
-                                .disconnect_entry(agent, name, generation, &cancel_for_pass)
-                                .await
-                            {
-                                ReconcileOperation::Confirmed => {}
-                                ReconcileOperation::Superseded => {
-                                    settled = false;
-                                    break 'disconnect;
-                                }
-                                ReconcileOperation::Failed | ReconcileOperation::TimedOut => {
-                                    settled = false;
-                                }
-                            }
-                        }
+        //
+        // Acquiring the lock is itself bounded and cancellable: it can be
+        // owned by another target server's connection operation of this same
+        // agent (or by a turn), and the cancellation token is only observable
+        // after the lock is held. An unbounded `write_async` would let cancel,
+        // retry, config removal, and shutdown wait forever behind it.
+        let disconnect_targets = plan
+            .disconnect
+            .iter()
+            .map(|name| BackgroundConnectTarget::new(&agent, name))
+            .collect::<Vec<_>>();
+        let mut guard = match tokio::select! {
+            _ = reconcile_cancel.cancelled() => None,
+            acquired = tokio::time::timeout(
+                runtime.deadlines.connect,
+                agent.inner().write(),
+            ) => acquired.ok(),
+        } {
+            Some(guard) => guard,
+            None => {
+                tracing::warn!(
+                    generation,
+                    timeout_secs = runtime.deadlines.connect.as_secs_f64(),
+                    cancelled = reconcile_cancel.is_cancelled(),
+                    "MCP reconcile could not take the agent write lock; target stays unconfirmed"
+                );
+                return false;
+            }
+        };
+        let mut settled = true;
+        'disconnect: {
+            for target in &disconnect_targets {
+                if reconcile_cancel.is_cancelled() || runtime.generation() != generation {
+                    settled = false;
+                    break 'disconnect;
+                }
+                match runtime
+                    .disconnect_entry(&mut guard, target, generation, &reconcile_cancel)
+                    .await
+                {
+                    ReconcileOperation::Confirmed => {}
+                    ReconcileOperation::Superseded => {
+                        settled = false;
+                        break 'disconnect;
                     }
-                    // Tool projections may have been revoked by a partial pass,
-                    // so the prompt is refreshed on failures as well.
-                    let disabled_tools = agent.disabled_tool_names();
-                    crate::subagent_prompt::refresh_primary_system_prompt(agent, &disabled_tools);
-                    settled
-                })
-            })
-            .await;
+                    ReconcileOperation::Failed | ReconcileOperation::TimedOut => {
+                        settled = false;
+                    }
+                }
+            }
+        }
+        // Tool projections may have been revoked by a partial pass, so the
+        // prompt is refreshed on failures as well.
+        let disabled_tools = guard.disabled_tool_names();
+        crate::subagent_prompt::refresh_primary_system_prompt(&mut guard, &disabled_tools);
+        drop(guard);
 
         // Phase 3 (no lock): reconcile desired connections. Every operation is
         // owned by a background task that keeps the framework preparation alive
@@ -1193,10 +1446,6 @@ impl McpConfigRuntime {
         for (name, entry) in plan.connect {
             if reconcile_cancel.is_cancelled() || runtime.generation() != generation {
                 return false;
-            }
-            if outstanding.contains(&name) {
-                settled = false;
-                continue;
             }
             match runtime
                 .connect_entry(&agent, &name, entry, generation, &reconcile_cancel)
@@ -1219,10 +1468,11 @@ impl McpConfigRuntime {
     async fn disconnect_entry(
         self: &Arc<Self>,
         agent: &mut echo_agent::agent::ReactAgent,
-        name: &str,
+        target: &BackgroundConnectTarget,
         generation: u64,
         cancel: &CancellationToken,
     ) -> ReconcileOperation {
+        let name = target.name.as_str();
         if cancel.is_cancelled() || self.generation() != generation {
             return ReconcileOperation::Superseded;
         }
@@ -1234,8 +1484,15 @@ impl McpConfigRuntime {
                 .await;
         }
         let operation = agent.reconcile_mcp_entry(name, None);
-        self.run_bounded_disconnect(name, generation, deadline, cancel, Box::pin(operation))
-            .await
+        let outcome = self
+            .run_bounded_disconnect(name, generation, deadline, cancel, Box::pin(operation))
+            .await;
+        if outcome == ReconcileOperation::Confirmed {
+            // No client remains wired for this target, so no operation owns its
+            // publication anymore.
+            self.clear_published_connect(target).await;
+        }
+        outcome
     }
 
     /// Drive one disconnect to a bounded, observable outcome.
@@ -1309,11 +1566,19 @@ impl McpConfigRuntime {
         if cancel.is_cancelled() || self.generation() != generation {
             return ReconcileOperation::Superseded;
         }
+        #[cfg(test)]
+        self.pause_connect_at(ConnectTestPoint::BeforeAdmission, generation)
+            .await;
         let deadline = self.deadlines.connect;
-        let ConnectOperation {
+        let Some(ConnectOperation {
             mut result,
             decision,
-        } = self.spawn_connect_operation(agent, name, entry).await;
+        }) = self
+            .spawn_connect_operation(agent, name, entry, generation, cancel.clone())
+            .await
+        else {
+            return ReconcileOperation::Superseded;
+        };
         tokio::select! {
             _ = cancel.cancelled() => {
                 let _ = decision.send_replace(Some(LateConnectDecision::Withdraw));
@@ -1324,6 +1589,13 @@ impl McpConfigRuntime {
                 ReconcileOperation::Superseded
             }
             outcome = &mut result => {
+                // A durable commit can supersede this pass before its cancel
+                // token is signalled. Consume a receipt only while its epoch
+                // is current, including when result/cancel became ready together.
+                if cancel.is_cancelled() || self.generation() != generation {
+                    let _ = decision.send_replace(Some(LateConnectDecision::Withdraw));
+                    return ReconcileOperation::Superseded;
+                }
                 // The pass consumed the receipt, so a client this operation
                 // published belongs to this generation.
                 let _ = decision.send_replace(Some(LateConnectDecision::Keep));
@@ -1344,6 +1616,7 @@ impl McpConfigRuntime {
                         );
                         ReconcileOperation::Failed
                     }
+                    Ok(ConnectOperationOutcome::Superseded) => ReconcileOperation::Superseded,
                     Err(_) => {
                         tracing::warn!(
                             server = %name,
@@ -1368,51 +1641,143 @@ impl McpConfigRuntime {
         }
     }
 
+    /// Start a registered operation while preserving the cross-component lock
+    /// order. Plugin cleanup can hold name ownership while waiting for the
+    /// Agent, and durable commits hold `mutation_lock` while waiting for name
+    /// ownership. Never wait for `mutation_lock` while holding the Agent lock.
+    async fn run_admitted_connect(
+        self: &Arc<Self>,
+        agent: &AgentHandle,
+        target: &BackgroundConnectTarget,
+        operation: ConnectOperationId,
+        entry: McpServerEntry,
+        generation: u64,
+        cancel: &CancellationToken,
+    ) -> ConnectOperationOutcome {
+        loop {
+            let mut target_agent = tokio::select! {
+                _ = cancel.cancelled() => return ConnectOperationOutcome::Superseded,
+                _ = self.shutdown.cancelled() => return ConnectOperationOutcome::Superseded,
+                guard = agent.inner().write() => guard,
+            };
+            #[cfg(test)]
+            self.pause_connect_at(ConnectTestPoint::BeforeFirstPoll, generation)
+                .await;
+
+            let admission = match self.mutation_lock.try_lock() {
+                Ok(admission) => admission,
+                Err(_) => {
+                    drop(target_agent);
+                    // Wait without retaining the Agent, then try the pair
+                    // again. A commit or plugin cleanup can now make progress.
+                    let admission = tokio::select! {
+                        _ = cancel.cancelled() => return ConnectOperationOutcome::Superseded,
+                        _ = self.shutdown.cancelled() => return ConnectOperationOutcome::Superseded,
+                        guard = self.mutation_lock.lock() => guard,
+                    };
+                    if cancel.is_cancelled()
+                        || self.shutdown.is_cancelled()
+                        || self.generation() != generation
+                    {
+                        return ConnectOperationOutcome::Superseded;
+                    }
+                    drop(admission);
+                    continue;
+                }
+            };
+            if cancel.is_cancelled()
+                || self.shutdown.is_cancelled()
+                || self.generation() != generation
+            {
+                return ConnectOperationOutcome::Superseded;
+            }
+
+            // Validity and the framework's first poll are one admission step
+            // under the commit gate. Continue the exact same pending future
+            // after releasing that gate: dropping a preparation would strand
+            // its framework scope. No transport wait retains mutation_lock.
+            let result = {
+                let mut preparation =
+                    Box::pin(target_agent.reconcile_mcp_entry(&target.name, Some(entry)));
+                let first_poll = futures::future::poll_fn(|context| {
+                    std::task::Poll::Ready(std::future::Future::poll(preparation.as_mut(), context))
+                })
+                .await;
+                drop(admission);
+                match first_poll {
+                    std::task::Poll::Ready(result) => result,
+                    std::task::Poll::Pending => preparation.await,
+                }
+            };
+            return match result {
+                Ok(change) => {
+                    if matches!(
+                        change,
+                        echo_agent::mcp::McpTargetChange::Connected
+                            | echo_agent::mcp::McpTargetChange::Replaced
+                            | echo_agent::mcp::McpTargetChange::Unchanged
+                    ) && let Some(client) = target_agent.mcp_client(&target.name)
+                    {
+                        // Unchanged transfers confirmation authority for the
+                        // exact same physical client, so its previous operation
+                        // can no longer withdraw that confirmed connection.
+                        self.record_published_connect(target, operation, &client)
+                            .await;
+                    }
+                    let disabled_tools = target_agent.disabled_tool_names();
+                    crate::subagent_prompt::refresh_primary_system_prompt(
+                        &mut target_agent,
+                        &disabled_tools,
+                    );
+                    ConnectOperationOutcome::Completed(change)
+                }
+                Err(error) => ConnectOperationOutcome::Failed(error.to_string()),
+            };
+        }
+    }
+
     /// Register and spawn one framework connection operation.
     ///
     /// The settlement receipt is published before the task starts, so a pass
-    /// that arrives later serializes against this operation instead of starting
-    /// a second preparation for the same name.
+    /// that arrives later serializes against this exact target instead of
+    /// starting a second preparation for the same name. Receipts are keyed by
+    /// target (agent and name) *and* operation identity: another agent
+    /// connecting the same name cannot replace this operation's receipt, and a
+    /// late withdrawal can only address the client this operation published.
     async fn spawn_connect_operation(
         self: &Arc<Self>,
         agent: &AgentHandle,
         name: &str,
         entry: McpServerEntry,
-    ) -> ConnectOperation {
+        generation: u64,
+        cancel: CancellationToken,
+    ) -> Option<ConnectOperation> {
+        // Use the same gate as durable generation commits. If a newer commit
+        // wins first, an old pass can never register after the newer pass has
+        // observed an empty receipt frontier and confirmed its client. If this
+        // admission wins first, its receipt is visible before that commit can
+        // start phase 1. No framework preparation is polled under this guard.
+        let admission = self.mutation_lock.lock().await;
+        if cancel.is_cancelled() || self.shutdown.is_cancelled() || self.generation() != generation
+        {
+            return None;
+        }
+        let target = BackgroundConnectTarget::new(agent, name);
+        let operation =
+            ConnectOperationId(self.next_connect_operation.fetch_add(1, Ordering::AcqRel));
         let (result_sender, result) = tokio::sync::oneshot::channel();
         let (decision, decision_receiver) = tokio::sync::watch::channel(None);
         let (settled, _) = tokio::sync::watch::channel(false);
         let receipt = Arc::new(BackgroundConnect { settled });
-        let _ = self
-            .background_connects
-            .lock()
-            .await
-            .insert(name.to_string(), Arc::clone(&receipt));
+        self.track_background_connect(&target, operation, Arc::clone(&receipt))
+            .await;
         let runtime = Arc::clone(self);
         let agent = agent.clone();
         let operation_name = name.to_string();
+        drop(admission);
         tokio::spawn(async move {
-            let connect_name = operation_name.clone();
-            let outcome = agent
-                .write_async(move |agent| {
-                    Box::pin(async move {
-                        match agent.reconcile_mcp_entry(&connect_name, Some(entry)).await {
-                            Ok(change) => {
-                                // Capability projections reach the model only
-                                // through this refresh, so a confirmed
-                                // connection updates the prompt under the same
-                                // lock the framework operation used.
-                                let disabled_tools = agent.disabled_tool_names();
-                                crate::subagent_prompt::refresh_primary_system_prompt(
-                                    agent,
-                                    &disabled_tools,
-                                );
-                                ConnectOperationOutcome::Completed(change)
-                            }
-                            Err(error) => ConnectOperationOutcome::Failed(error.to_string()),
-                        }
-                    })
-                })
+            let outcome = runtime
+                .run_admitted_connect(&agent, &target, operation, entry, generation, &cancel)
                 .await;
             let published = matches!(
                 outcome,
@@ -1426,79 +1791,106 @@ impl McpConfigRuntime {
                 wait_for_late_connect_decision(decision_receiver, runtime.deadlines.connect).await;
             if decision == LateConnectDecision::Withdraw && published {
                 let withdraw_name = operation_name.clone();
+                let withdraw_runtime = Arc::clone(&runtime);
+                let withdraw_target = target.clone();
                 match agent
                     .write_async(move |agent| {
                         Box::pin(async move {
-                            let withdrawn = agent.reconcile_mcp_entry(&withdraw_name, None).await;
+                            // A newer operation may have replaced this
+                            // operation's client in the meantime. The framework
+                            // addresses clients by name, so the publication
+                            // record is the only way to withdraw this
+                            // operation's own client instead of a connection a
+                            // newer generation already confirmed.
+                            let Some(current_client) = agent.mcp_client(&withdraw_name) else {
+                                return LateWithdrawOutcome::Superseded;
+                            };
+                            if !withdraw_runtime
+                                .owns_published_connect(
+                                    &withdraw_target,
+                                    operation,
+                                    &current_client,
+                                )
+                                .await
+                            {
+                                return LateWithdrawOutcome::Superseded;
+                            }
+                            let withdrawn = agent
+                                .reconcile_mcp_entry(&withdraw_name, None)
+                                .await
+                                .map_err(|error| error.to_string());
                             if withdrawn.is_ok() {
+                                withdraw_runtime
+                                    .clear_published_connect(&withdraw_target)
+                                    .await;
                                 let disabled_tools = agent.disabled_tool_names();
                                 crate::subagent_prompt::refresh_primary_system_prompt(
                                     agent,
                                     &disabled_tools,
                                 );
                             }
-                            withdrawn
+                            LateWithdrawOutcome::Attempted(withdrawn)
                         })
                     })
                     .await
                 {
-                    Ok(change) => tracing::info!(
+                    LateWithdrawOutcome::Superseded => tracing::info!(
+                        server = %operation_name,
+                        "MCP late client was already replaced by a newer operation; nothing withdrawn"
+                    ),
+                    LateWithdrawOutcome::Attempted(Ok(change)) => tracing::info!(
                         server = %operation_name,
                         ?change,
                         "MCP connection completed after its pass stopped waiting; late client withdrawn"
                     ),
-                    Err(error) => tracing::warn!(
+                    LateWithdrawOutcome::Attempted(Err(error)) => tracing::warn!(
                         server = %operation_name,
                         %error,
                         "MCP late client withdrawal failed; the framework retains it as retryable cleanup debt"
                     ),
                 }
             }
+            runtime.untrack_background_connect(&target, operation).await;
             receipt.settled.send_replace(true);
-            let mut background = runtime.background_connects.lock().await;
-            if background
-                .get(&operation_name)
-                .is_some_and(|current| Arc::ptr_eq(current, &receipt))
-            {
-                background.remove(&operation_name);
-            }
         });
-        ConnectOperation { result, decision }
+        Some(ConnectOperation { result, decision })
     }
 
-    /// Observe one backgrounded connection without holding the agent lock.
+    /// Observe the background connection operations of one target without
+    /// holding the agent lock.
     ///
-    /// Returns true when no operation remains outstanding for `name`.
+    /// Returns true only when no operation remains outstanding for this exact
+    /// target. The same server name on another agent is a different target and
+    /// must neither mask nor be masked by these receipts.
     async fn observe_background_connect(
         self: &Arc<Self>,
+        agent: &AgentHandle,
         name: &str,
         deadline: std::time::Duration,
     ) -> bool {
-        let Some(receipt) = self.background_connects.lock().await.get(name).cloned() else {
+        let target = BackgroundConnectTarget::new(agent, name);
+        let receipts = self.background_receipts(&target).await;
+        if receipts.is_empty() {
             return true;
-        };
-        let mut settled = receipt.settled.subscribe();
-        let wait = async {
-            loop {
-                if *settled.borrow() {
-                    return;
-                }
-                if settled.changed().await.is_err() {
-                    return;
-                }
-            }
-        };
-        match tokio::time::timeout(deadline, wait).await {
-            Ok(()) => true,
-            Err(_) => {
-                tracing::warn!(
-                    server = %name,
-                    timeout_secs = deadline.as_secs_f64(),
-                    "MCP backgrounded connection is still running; this pass stays unconfirmed"
-                );
-                false
-            }
         }
+        let wait = async {
+            for receipt in &receipts {
+                receipt.wait_settled().await;
+            }
+        };
+        let settled_in_time = tokio::time::timeout(deadline, wait).await.is_ok();
+        // An operation registered after the snapshot is still outstanding, so
+        // never report the target converged on a stale snapshot.
+        let no_newer_receipt = self.background_receipts(&target).await.is_empty();
+        if settled_in_time && no_newer_receipt {
+            return true;
+        }
+        tracing::warn!(
+            server = %name,
+            timeout_secs = deadline.as_secs_f64(),
+            "MCP backgrounded connection is still running; this pass stays unconfirmed"
+        );
+        false
     }
 
     #[cfg(test)]
@@ -1702,6 +2094,7 @@ mod tests {
     /// a real transport instead of mocking the seam under test.
     struct HttpMcpFixture {
         endpoint: String,
+        requests: Arc<AtomicU64>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -1726,11 +2119,15 @@ mod tests {
                     }))
                     .build(),
             );
+            let requests = Arc::new(AtomicU64::new(0));
+            let handler_requests = Arc::clone(&requests);
             let router = axum::Router::new().route(
                 "/mcp",
                 axum::routing::post(move |body: String| {
                     let server = Arc::clone(&server);
+                    let requests = Arc::clone(&handler_requests);
                     async move {
+                        requests.fetch_add(1, Ordering::AcqRel);
                         if !delay.is_zero() {
                             tokio::time::sleep(delay).await;
                         }
@@ -1750,7 +2147,112 @@ mod tests {
                     tracing::warn!(%error, "fixture MCP HTTP server stopped");
                 }
             });
-            Ok(Self { endpoint, task })
+            Ok(Self {
+                endpoint,
+                requests,
+                task,
+            })
+        }
+
+        fn entry(&self) -> McpServerEntry {
+            McpServerEntry {
+                url: Some(self.endpoint.clone()),
+                ..Default::default()
+            }
+        }
+
+        fn request_count(&self) -> u64 {
+            self.requests.load(Ordering::Acquire)
+        }
+    }
+
+    impl Drop for HttpMcpFixture {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// In-process MCP server whose requests are answered only while its gate is
+    /// open.
+    ///
+    /// Arrival of a request is signaled to the test. Together with the gate
+    /// this gives deterministic control over how long a real framework client
+    /// preparation stays in flight: while it is blocked the owning agent's
+    /// write lock is held, without any sleep-based racing.
+    struct GatedMcpFixture {
+        endpoint: String,
+        gate: tokio::sync::watch::Sender<bool>,
+        arrivals: Arc<tokio::sync::Notify>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl GatedMcpFixture {
+        async fn start(tool_name: &str) -> anyhow::Result<Self> {
+            let server = Arc::new(
+                echo_agent::mcp::McpServer::builder()
+                    .name("fixture")
+                    .version("1.0.0")
+                    .tool(Arc::new(FixtureTool {
+                        name: tool_name.to_string(),
+                    }))
+                    .build(),
+            );
+            let arrivals = Arc::new(tokio::sync::Notify::new());
+            let handler_arrivals = Arc::clone(&arrivals);
+            let (gate, gate_receiver) = tokio::sync::watch::channel(false);
+            let router = axum::Router::new().route(
+                "/mcp",
+                axum::routing::post(move |body: String| {
+                    let server = Arc::clone(&server);
+                    let arrivals = Arc::clone(&handler_arrivals);
+                    let mut open = gate_receiver.clone();
+                    async move {
+                        arrivals.notify_one();
+                        loop {
+                            let is_open = *open.borrow();
+                            if is_open {
+                                break;
+                            }
+                            if open.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                        let response = server.handle_json_rpc(&body).await;
+                        if response.is_empty() {
+                            (axum::http::StatusCode::ACCEPTED, String::new())
+                        } else {
+                            (axum::http::StatusCode::OK, response)
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+            let task = tokio::spawn(async move {
+                if let Err(error) = axum::serve(listener, router).await {
+                    tracing::warn!(%error, "gated fixture MCP HTTP server stopped");
+                }
+            });
+            Ok(Self {
+                endpoint,
+                gate,
+                arrivals,
+                task,
+            })
+        }
+
+        fn open(&self) {
+            self.gate.send_replace(true);
+        }
+
+        fn close(&self) {
+            self.gate.send_replace(false);
+        }
+
+        /// Resolve once a request reached the gate. After this point the
+        /// requesting framework client holds its agent's write lock.
+        async fn wait_for_arrival(&self) {
+            self.arrivals.notified().await;
         }
 
         fn entry(&self) -> McpServerEntry {
@@ -1761,7 +2263,7 @@ mod tests {
         }
     }
 
-    impl Drop for HttpMcpFixture {
+    impl Drop for GatedMcpFixture {
         fn drop(&mut self) {
             self.task.abort();
         }
@@ -1849,6 +2351,44 @@ mod tests {
                 anyhow::anyhow!("MCP reconcile did not finish within the test window")
             })??;
             Ok(())
+        }
+
+        /// Await the newest pass without waiting for an older pass that the
+        /// test deliberately paused before operation registration.
+        async fn await_latest_reconcile(&self) -> anyhow::Result<()> {
+            let task = self
+                .runtime
+                .supervisor
+                .lock()
+                .await
+                .reconcile_tasks
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("no reconcile task was registered"))?;
+            tokio::time::timeout(std::time::Duration::from_secs(15), task.handle).await??;
+            Ok(())
+        }
+
+        async fn pause_connect(
+            &self,
+            point: ConnectTestPoint,
+            generation: u64,
+        ) -> (
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ) {
+            let (started, started_receiver) = tokio::sync::oneshot::channel();
+            let (release, release_receiver) = tokio::sync::oneshot::channel();
+            self.runtime
+                .connect_test_gates
+                .lock()
+                .await
+                .push(ConnectTestGate {
+                    point,
+                    generation,
+                    started,
+                    release: release_receiver,
+                });
+            (started_receiver, release)
         }
 
         async fn connected_servers(&self) -> Vec<String> {
@@ -2606,6 +3146,478 @@ mod tests {
             harness.retry_frontier().await,
             BTreeSet::from(["slow".to_string()])
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_generation_cannot_register_after_new_generation_confirmed() -> anyhow::Result<()>
+    {
+        let stale = HttpMcpFixture::start("stale_tool").await?;
+        let current = HttpMcpFixture::start("current_tool").await?;
+        let harness = ReconcileHarness::new(ReconcileDeadlines::default())?;
+        let stale_generation = harness.runtime.generation().saturating_add(1);
+        let (started, release) = harness
+            .pause_connect(ConnectTestPoint::BeforeAdmission, stale_generation)
+            .await;
+
+        harness
+            .runtime
+            .upsert_and_reconcile(harness.targets.clone(), "shared".to_string(), stale.entry())
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), started).await??;
+
+        // G1 passed its first validity check but has not registered a receipt.
+        // A real G2 mutation can therefore finish its complete reconcile pass.
+        harness
+            .runtime
+            .upsert_and_reconcile(
+                harness.targets.clone(),
+                "shared".to_string(),
+                current.entry(),
+            )
+            .await?;
+        harness.await_latest_reconcile().await?;
+        let confirmed = harness
+            .agent
+            .read(|agent| agent.mcp_client("shared"))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("G2 did not confirm its client"))?;
+        release
+            .send(())
+            .map_err(|_| anyhow::anyhow!("stale admission gate was dropped"))?;
+        harness.await_reconcile().await?;
+        harness.await_background_connections().await?;
+
+        let live = harness.agent.read(|agent| agent.mcp_client("shared")).await;
+        assert!(
+            live.as_ref()
+                .is_some_and(|client| Arc::ptr_eq(client, &confirmed)),
+            "G1 must not replace or withdraw a client G2 already confirmed"
+        );
+        assert_eq!(
+            stale.request_count(),
+            0,
+            "an operation superseded before registration must never start its transport"
+        );
+        let exposed = echo_agent::mcp::McpToolAdapter::exposed_name_for("shared", "current_tool");
+        assert!(harness.tool_names().await.contains(&exposed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_generation_cannot_start_preparation_after_waiting_for_agent_lock()
+    -> anyhow::Result<()> {
+        let stale = HttpMcpFixture::start("stale_tool").await?;
+        let current = HttpMcpFixture::start("current_tool").await?;
+        let harness = ReconcileHarness::new(ReconcileDeadlines::default())?;
+        let stale_generation = harness.runtime.generation().saturating_add(1);
+        let (started, release) = harness
+            .pause_connect(ConnectTestPoint::BeforeFirstPoll, stale_generation)
+            .await;
+
+        harness
+            .runtime
+            .upsert_and_reconcile(harness.targets.clone(), "shared".to_string(), stale.entry())
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), started).await??;
+        // G1 has a tracked receipt and its Agent write lock, but no framework
+        // preparation has been polled. G2 durably invalidates it at this seam.
+        harness
+            .runtime
+            .upsert_and_reconcile(
+                harness.targets.clone(),
+                "shared".to_string(),
+                current.entry(),
+            )
+            .await?;
+        release
+            .send(())
+            .map_err(|_| anyhow::anyhow!("stale preparation gate was dropped"))?;
+        harness.await_reconcile().await?;
+        harness.await_background_connections().await?;
+
+        assert_eq!(
+            stale.request_count(),
+            0,
+            "taking the Agent lock must not authorize an already superseded preparation"
+        );
+        let exposed = echo_agent::mcp::McpToolAdapter::exposed_name_for("shared", "current_tool");
+        assert!(harness.tool_names().await.contains(&exposed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unchanged_confirmation_transfers_the_live_client_before_old_withdrawal()
+    -> anyhow::Result<()> {
+        let fixture = HttpMcpFixture::start("fixture_tool").await?;
+        let harness = ReconcileHarness::new(ReconcileDeadlines::default())?;
+        // Keep the first real background operation's decision pending so the
+        // second operation can confirm the same physical client as Unchanged.
+        let first = harness
+            .runtime
+            .spawn_connect_operation(
+                &harness.agent,
+                "shared",
+                fixture.entry(),
+                harness.runtime.generation(),
+                CancellationToken::new(),
+            )
+            .await
+            .ok_or_else(|| anyhow::anyhow!("first operation was not admitted"))?;
+        let first_outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), first.result).await??;
+        assert_eq!(
+            first_outcome,
+            ConnectOperationOutcome::Completed(echo_agent::mcp::McpTargetChange::Connected)
+        );
+        let confirmed = harness
+            .agent
+            .read(|agent| agent.mcp_client("shared"))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("first operation did not publish its client"))?;
+
+        let second = harness
+            .runtime
+            .spawn_connect_operation(
+                &harness.agent,
+                "shared",
+                fixture.entry(),
+                harness.runtime.generation(),
+                CancellationToken::new(),
+            )
+            .await
+            .ok_or_else(|| anyhow::anyhow!("second operation was not admitted"))?;
+        let second_outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), second.result).await??;
+        assert_eq!(
+            second_outcome,
+            ConnectOperationOutcome::Completed(echo_agent::mcp::McpTargetChange::Unchanged)
+        );
+        second
+            .decision
+            .send(Some(LateConnectDecision::Keep))
+            .map_err(|_| anyhow::anyhow!("unchanged confirmation lost its settlement owner"))?;
+        first
+            .decision
+            .send(Some(LateConnectDecision::Withdraw))
+            .map_err(|_| anyhow::anyhow!("old withdrawal lost its settlement owner"))?;
+        harness.await_background_connections().await?;
+
+        let live = harness.agent.read(|agent| agent.mcp_client("shared")).await;
+        assert!(
+            live.as_ref()
+                .is_some_and(|client| Arc::ptr_eq(client, &confirmed)),
+            "the old operation must not withdraw a client the next operation confirmed unchanged"
+        );
+        let exposed = echo_agent::mcp::McpToolAdapter::exposed_name_for("shared", "fixture_tool");
+        assert!(harness.tool_names().await.contains(&exposed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_commit_does_not_keep_agent_locked_while_waiting_for_admission()
+    -> anyhow::Result<()> {
+        let stale = GatedMcpFixture::start("stale_tool").await?;
+        let current = HttpMcpFixture::start("current_tool").await?;
+        let harness = ReconcileHarness::new(ReconcileDeadlines::default())?;
+        let stale_generation = harness.runtime.generation().saturating_add(1);
+        let (started, release) = harness
+            .pause_connect(ConnectTestPoint::BeforeFirstPoll, stale_generation)
+            .await;
+        harness
+            .runtime
+            .upsert_and_reconcile(harness.targets.clone(), "shared".to_string(), stale.entry())
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), started).await??;
+
+        // Plugin cleanup may retain namespace ownership while asking for the
+        // Agent. A real config commit now owns mutation_lock and waits for
+        // that namespace, reproducing the other two edges of the lock cycle.
+        let ownership = harness.ownership.lock().await;
+        let runtime = Arc::clone(&harness.runtime);
+        let targets = harness.targets.clone();
+        let entry = current.entry();
+        let mutation = tokio::spawn(async move {
+            runtime
+                .upsert_and_reconcile(targets, "shared".to_string(), entry)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if harness.runtime.mutation_lock.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        release
+            .send(())
+            .map_err(|_| anyhow::anyhow!("lock-order preparation gate was dropped"))?;
+
+        let agent = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            harness.agent.inner().write(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("pending admission retained the Agent lock"))?;
+        // The owner that needed the Agent can now finish and release the
+        // namespace. G2 commits, supersedes G1, and uses the freed Agent.
+        drop(ownership);
+        tokio::time::timeout(std::time::Duration::from_secs(5), mutation).await???;
+        drop(agent);
+        harness.await_reconcile().await?;
+        harness.await_background_connections().await?;
+        let exposed = echo_agent::mcp::McpToolAdapter::exposed_name_for("shared", "current_tool");
+        assert!(harness.tool_names().await.contains(&exposed));
+        Ok(())
+    }
+
+    /// One `McpConfigRuntime` is shared by every workspace agent, so the same
+    /// server name can be connected concurrently on several agents. A fast
+    /// target settling must not take the slow target's receipt out of the
+    /// runtime's bookkeeping, and the slow target's late withdrawal must not
+    /// touch the connection the fast target already confirmed.
+    #[tokio::test]
+    async fn same_server_name_on_two_agents_keeps_an_independent_background_receipt()
+    -> anyhow::Result<()> {
+        let gated = GatedMcpFixture::start("fixture_tool").await?;
+        let harness = ReconcileHarness::new(ReconcileDeadlines {
+            connect: std::time::Duration::from_millis(150),
+            disconnect: std::time::Duration::from_secs(5),
+        })?;
+        let second_agent = AgentHandle::new(echo_agent::agent::ReactAgent::new(
+            echo_agent::agent::AgentConfig::minimal("fixture-model", "second-agent"),
+        ));
+
+        // The second agent starts already connected to the exact entry the
+        // shared pass hands to both targets, so its reconcile is a framework
+        // `Unchanged` no-op that settles immediately.
+        gated.open();
+        let pre_connected = second_agent
+            .write_async({
+                let entry = gated.entry();
+                move |agent| {
+                    Box::pin(async move { agent.reconcile_mcp_entry("shared", Some(entry)).await })
+                }
+            })
+            .await?;
+        assert_eq!(pre_connected, echo_agent::mcp::McpTargetChange::Connected);
+        // From here on the slow target's preparation blocks inside the
+        // framework client and holds that agent's write lock.
+        gated.close();
+
+        let plan = ReconcilePlan::between(
+            &McpConfigFile::default(),
+            &config_with("shared", gated.entry()),
+        );
+        let generation = harness.runtime.generation();
+        let slow = McpConfigRuntime::reconcile_target(
+            harness.agent.clone(),
+            Arc::clone(&harness.runtime),
+            generation,
+            CancellationToken::new(),
+            plan.clone(),
+        )
+        .await;
+        assert!(
+            !slow,
+            "a gated connection must report its target unconfirmed"
+        );
+        gated.wait_for_arrival().await;
+        // The slow target's agent write lock is held by its preparation, so
+        // reading its namespace here would wait for that lock; the publication
+        // state is asserted after the operation settles instead.
+
+        let fast = McpConfigRuntime::reconcile_target(
+            second_agent.clone(),
+            Arc::clone(&harness.runtime),
+            generation,
+            CancellationToken::new(),
+            plan.clone(),
+        )
+        .await;
+        assert!(fast, "the already-connected target reconciles immediately");
+
+        // A retry for the slow target must still see its own in-flight
+        // operation. If the fast target's receipt replaced it, phase 1 would
+        // report the target settled and the pass would then wait for the agent
+        // write lock that the slow operation holds.
+        let retry = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            McpConfigRuntime::reconcile_target(
+                harness.agent.clone(),
+                Arc::clone(&harness.runtime),
+                generation,
+                CancellationToken::new(),
+                plan.clone(),
+            ),
+        )
+        .await
+        .expect(
+            "the slow target's receipt must survive the fast target's settlement, \
+             so the retry does not wait for the agent write lock",
+        );
+        assert!(
+            !retry,
+            "a retry that observes an unsettled connection must report the target unconfirmed"
+        );
+        assert!(
+            harness.runtime.background_connect_count().await >= 1,
+            "the slow target's in-flight operation must still be tracked"
+        );
+
+        // Let the slow preparation finish: it publishes late, its pass already
+        // reported the target unconfirmed, so the operation withdraws its own
+        // client again.
+        gated.open();
+        harness.await_background_connections().await?;
+        assert!(
+            !harness
+                .connected_servers()
+                .await
+                .contains(&"shared".to_string()),
+            "a connection published after its own pass stopped waiting must be withdrawn"
+        );
+        assert!(
+            second_agent
+                .read(|agent| agent.list_mcp_servers())
+                .await
+                .contains(&"shared".to_string()),
+            "the slow target's late withdrawal must not disconnect the settled target's connection"
+        );
+        Ok(())
+    }
+
+    /// A pass that cannot confirm an earlier background connection must not
+    /// then block on the agent write lock which that connection holds. It has
+    /// to return in bounded time and report the target unconfirmed.
+    #[tokio::test]
+    async fn unsettled_background_connection_does_not_block_the_retry_on_the_agent_lock()
+    -> anyhow::Result<()> {
+        let gated = GatedMcpFixture::start("fixture_tool").await?;
+        let harness = ReconcileHarness::new(ReconcileDeadlines {
+            connect: std::time::Duration::from_millis(150),
+            disconnect: std::time::Duration::from_secs(5),
+        })?;
+        let plan = ReconcilePlan::between(
+            &McpConfigFile::default(),
+            &config_with("blocked", gated.entry()),
+        );
+        let generation = harness.runtime.generation();
+        let first = McpConfigRuntime::reconcile_target(
+            harness.agent.clone(),
+            Arc::clone(&harness.runtime),
+            generation,
+            CancellationToken::new(),
+            plan.clone(),
+        )
+        .await;
+        assert!(!first);
+        // The background task now owns the agent write lock.
+        gated.wait_for_arrival().await;
+
+        let retry = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            McpConfigRuntime::reconcile_target(
+                harness.agent.clone(),
+                Arc::clone(&harness.runtime),
+                generation,
+                CancellationToken::new(),
+                plan.clone(),
+            ),
+        )
+        .await
+        .expect("a pass that observes an unsettled connection must not wait unboundedly");
+        assert!(
+            !retry,
+            "the retry must report the target unconfirmed instead of claiming settlement"
+        );
+        Ok(())
+    }
+
+    /// Even when phase 1 converges, the write lock can be owned by another
+    /// target server's connection of the same agent. Acquiring it must be
+    /// bounded and cancellable, and shutdown must not wait for it forever.
+    #[tokio::test]
+    async fn reconcile_lock_and_shutdown_stay_bounded_while_a_connection_holds_the_lock()
+    -> anyhow::Result<()> {
+        let gated = GatedMcpFixture::start("fixture_tool").await?;
+        let harness = ReconcileHarness::new(ReconcileDeadlines {
+            connect: std::time::Duration::from_millis(150),
+            disconnect: std::time::Duration::from_secs(5),
+        })?;
+        let blocking_plan = ReconcilePlan::between(
+            &McpConfigFile::default(),
+            &config_with("blocking", gated.entry()),
+        );
+        let generation = harness.runtime.generation();
+        let first = McpConfigRuntime::reconcile_target(
+            harness.agent.clone(),
+            Arc::clone(&harness.runtime),
+            generation,
+            CancellationToken::new(),
+            blocking_plan,
+        )
+        .await;
+        assert!(!first);
+        gated.wait_for_arrival().await;
+
+        // A different name means phase 1 converges; only the lock can block.
+        let unrelated_plan = ReconcilePlan::between(
+            &config_with("unrelated", gated.entry()),
+            &McpConfigFile::default(),
+        );
+        let converged = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            McpConfigRuntime::reconcile_target(
+                harness.agent.clone(),
+                Arc::clone(&harness.runtime),
+                generation,
+                CancellationToken::new(),
+                unrelated_plan,
+            ),
+        )
+        .await
+        .expect("taking the agent write lock must be bounded");
+        assert!(
+            !converged,
+            "a pass that cannot take the agent write lock must report unconfirmed"
+        );
+
+        // The same lock is held while a registered pass waits for it; shutdown
+        // cancels and awaits that pass. An empty plan has no per-name cancel
+        // check before the lock, so the pass deterministically reaches the
+        // lock acquisition and only shutdown's cancellation can release it.
+        let runtime = Arc::clone(&harness.runtime);
+        let task_agent = harness.agent.clone();
+        let task_runtime = Arc::clone(&harness.runtime);
+        let task_cancel = CancellationToken::new();
+        let task_plan =
+            ReconcilePlan::between(&McpConfigFile::default(), &McpConfigFile::default());
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        runtime
+            .start_tracked_reconcile(task_cancel.clone(), {
+                let cancel = task_cancel.clone();
+                async move {
+                    let _ = started.send(());
+                    McpConfigRuntime::reconcile_target(
+                        task_agent,
+                        task_runtime,
+                        generation,
+                        cancel,
+                        task_plan,
+                    )
+                    .await;
+                }
+            })
+            .await;
+        started_rx
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), runtime.shutdown())
+            .await
+            .expect("shutdown must not wait unboundedly for the agent write lock");
         Ok(())
     }
 }

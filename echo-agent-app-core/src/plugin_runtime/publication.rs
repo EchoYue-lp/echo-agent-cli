@@ -48,6 +48,20 @@ struct AppliedAgentComponents {
     previous_prepared: PreparedApplicationComponents,
 }
 
+/// Exact framework wiring receipt plus the name tokens it still owns.
+///
+/// Produced whenever a withdrawal could not settle: the wiring object is the only
+/// authority that can retry the withdrawal, and the tokens may only be released
+/// after it succeeds.
+type RetainedWithdrawal = (PluginWiringResult, Vec<PluginMcpNameClaim>);
+
+/// Successfully applied candidate components plus their framework wiring.
+type AppliedCandidate = (PluginRegistry, Option<PluginWiringResult>);
+
+/// A candidate generation that could not be applied, with the withdrawal debt
+/// that must survive the failure.
+type RejectedCandidate = (String, Option<RetainedWithdrawal>);
+
 struct FailedAgentComponents {
     error: String,
     registry: PluginRegistry,
@@ -60,6 +74,11 @@ struct FailedAgentComponents {
     /// Candidate claims that were taken and are no longer backed by wired
     /// components. They must travel as cleanup receipts, never be dropped.
     orphaned_claims: Vec<PluginMcpNameClaim>,
+    /// Exact framework wiring receipt and name tokens whose withdrawal did not
+    /// settle. Their components may still be attached to the Agent, so the
+    /// caller must move them into the cleanup ledger and stop reporting the
+    /// affected generation as live. Nothing may be released while this is set.
+    retained_withdrawal: Option<RetainedWithdrawal>,
 }
 
 fn active_output_style_instructions(state: &PluginRuntimeState) -> Option<String> {

@@ -206,6 +206,12 @@ impl FileTaskShadow {
         Ok(authority)
     }
 
+    pub(crate) fn owner_process_epoch(&self) -> Result<&'static str, ShadowError> {
+        // Acquiring/retaining the canonical root authority is mandatory. A
+        // process nonce on its own is not proof that a previous owner died.
+        Ok(self.root_authority()?.process_epoch())
+    }
+
     fn with_root_read<T>(
         &self,
         operation: impl FnOnce(&Path) -> Result<T, ShadowError>,

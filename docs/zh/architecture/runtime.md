@@ -228,3 +228,25 @@ GUI、TUI、CLI 把框架惰性 handle 交给 app-core 的 generation-bound owne
 `echo-agent-learning` 用于验证 framework public facade，不应引入 EKO 文件 journal、review
 或 worktree policy。`echo-website` 是静态展示站，不依赖 agent runtime。因此本决策不修改
 framework examples 或 website。
+
+## 发布失败与结算证据
+
+插件 bootstrap 失败后，清理义务仍持有原 Agent、框架 wiring receipt、名称 registry 和
+其它原资源 owner。下一次 bootstrap 仅按项目目录检索债务，在发布新代前使用原 owner
+重试；未结算则构造失败。取消 shutdown 等待者不会取消独立持有资源的关停操作。
+参见 [ADR 0022](../adr/0022-framework-prepared-plugin-generations.md)。
+
+MCP 后台操作与配置 generation 变更共享准入边界。已经失效的旧操作不能在新代确认
+连接后再启动 preparation；已经开始的 preparation 则由原任务持有直到清理完成。
+
+TaskRuntime 按框架最终结算决定是否接受 attempt evidence。`Superseded` 对所有请求
+类型拒绝旧证据，不追加旧产品结果，也不为该 attempt 发布终态事件或唤醒 continuation。
+读到当前任务状态不代表旧 claim 获得发布权；健康 blocked/failed 的诊断证据仍保留。
+
+## Canonical 重放与 Review 展示
+
+任务 journal 中存在 canonical `TaskExecution` 时，它是完整 execution 记录。旧 flat status、claim、result 和 retry 字段仅在该记录缺失时作为 fallback；记录损坏或 task 身份不匹配必须拒绝重放，不能借 fallback 绕过。
+
+Review 候选、处理错误、自动 Memory 持久化和应用 Review Inbox 收据是独立事实。GUI 与 TUI 同时保留候选和错误，区分已持久化、未持久化和状态未知；只有 owner 返回真实 evidence receipt 时才能显示对应 Inbox 条目。展示层不产生新的 Review 结果。
+
+EKO 注册的 revision store 通过同一个 run 文件锁和原子 journal 批次提供 execution CAS。claim、中断和 execution 变化由框架计算、校验；应用适配器比较完整 expected execution map 与关系 revision，拒绝关系、context、spec 漂移，execution-only 变化不产生新的 plan revision。abandon attempt 的 journal 与直播使用同一最终提交状态和摘要，被覆盖的请求失败原因仅保留为带精确 claim 身份的独立诊断。

@@ -90,7 +90,7 @@ canonical `TaskExecution`, including an absent versus explicit-null result and
 `interruption_requested`. Graph commits and execution events preserve those
 facts in the same journal. Older query checkpoints are replayed from that
 journal; `TaskSpec` and `TodoItem` IPC remain unchanged. An unresolved original
-physical-owner intent blocks boot recovery and duplicate execution rather than
+physical-owner intent from the current process blocks boot recovery and duplicate execution rather than
 being converted into another Task status.
 
 
@@ -108,7 +108,7 @@ being converted into another Task status.
 - Future task lifecycle states must be added to framework `TaskStatus` first;
   Todo may deliberately collapse them for display but can never write back.
 
-Boot recovery treats a valid unresolved physical-owner intent as a disposition of that exact run: under its original run lock, leave the run, command cells and pending Subagent control facts unchanged and continue recovering unrelated historical runs. Malformed intent facts and storage failures still fail recovery. The same original evidence reader and exact physical acknowledgement path serve recovery and per-run admission; this does not authorize replay or synthesize a terminal receipt. A continuation consumes the canonical existing run domain, route, attended mode, Goal and execution profile; its internal instruction is not a new user goal. The actual active workspace and caller conversation/root still pass through the original immutable-identity validator, including negative mismatch checks; RunStarted projection uses the returned original goal/route.
+Boot recovery treats a valid unresolved current-process physical-owner intent as a disposition of that exact run: under its original run lock, leave the run, command cells and pending Subagent control facts unchanged and continue recovering unrelated historical runs. Previous-process admission fences are retired only under the exclusive root authority as specified in [ADR 0049](0049-taskruntime-process-owner-recovery.md), before the existing interruption recovery classifies effects. Malformed intent facts and storage failures still fail recovery. The same original evidence reader and exact physical acknowledgement path serve recovery and per-run admission; this does not authorize replay or synthesize a terminal receipt. A continuation consumes the canonical existing run domain, route, attended mode, Goal and execution profile; its internal instruction is not a new user goal. The actual active workspace and caller conversation/root still pass through the original immutable-identity validator, including negative mismatch checks; RunStarted projection uses the returned original goal/route.
 
 
 Continuation progress excludes only private physical_owner_intent metadata on RecoveryBlocked/RecoveryResolved from both the existing progress predicate and fingerprint. Real business recovery and task events still count. The original explicit-resume Goal/revision and no-progress limits remain unchanged. Canonical before evidence excluded an unconfirmed-owner fence replay: each original owner completed and was acknowledged before the next turn; the defect was metadata resetting the business-progress budget. The same canonical journal remains the only authority.

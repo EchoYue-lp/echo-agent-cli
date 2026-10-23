@@ -515,6 +515,7 @@ impl EventFoldState {
                             background_cells,
                             continuation,
                             finished_turns,
+                            invalid_execution,
                         );
                         apply_boot_recovery_todo_runtime(ev, todo_runtime);
                         if let Some(recovery) = ev.payload.get("recovery") {
@@ -702,49 +703,52 @@ impl EventFoldState {
                 | K::TaskBlocked
                 | K::TaskStatusChanged => {
                     if let Some(task_id) = ev.task_id.as_ref() {
-                        let status = ev
-                            .payload
-                            .get("status")
-                            .and_then(|value| task_status_from_event(value, &ev.payload));
-                        if let Some(status) = status {
-                            #[allow(clippy::collapsible_if)]
-                            // nested let-Option guard reads clearer than a let-chain
-                            if let Some(t) = tasks.iter_mut().find(|t| &t.id == task_id) {
-                                if let Some(execution) = ev.payload.get("execution") {
-                                    match serde_json::from_value::<echo_agent::tasks::TaskExecution>(
-                                        execution.clone(),
-                                    ) {
-                                        Ok(execution) if execution.task_id == *task_id => {
-                                            *t = PlanTask::from_parts(t.spec(), execution);
-                                        }
-                                        Ok(_) => {
-                                            *invalid_execution = Some(
-                                                "canonical task execution identity mismatch"
-                                                    .to_string(),
-                                            )
-                                        }
-                                        Err(error) => *invalid_execution = Some(error.to_string()),
+                        if let Some(execution) = ev.payload.get("execution") {
+                            // Canonical execution is one indivisible snapshot.
+                            // Flat fields are legacy projections and must never
+                            // overwrite its status, claim, or retry metadata.
+                            // Invalid canonical data fails closed, even when a
+                            // seemingly valid legacy status is also present.
+                            match serde_json::from_value::<echo_agent::tasks::TaskExecution>(
+                                execution.clone(),
+                            ) {
+                                Ok(execution) if execution.task_id == *task_id => {
+                                    if let Some(task) =
+                                        tasks.iter_mut().find(|task| &task.id == task_id)
+                                    {
+                                        *task = PlanTask::from_parts(task.spec(), execution);
                                     }
                                 }
-                                t.status = status;
+                                Ok(_) => {
+                                    *invalid_execution = Some(
+                                        "canonical task execution identity mismatch".to_string(),
+                                    );
+                                }
+                                Err(error) => *invalid_execution = Some(error.to_string()),
+                            }
+                        } else if let Some(task) = tasks.iter_mut().find(|task| &task.id == task_id)
+                        {
+                            if let Some(status) = ev
+                                .payload
+                                .get("status")
+                                .and_then(|value| task_status_from_event(value, &ev.payload))
+                            {
+                                task.status = status;
                                 if let Some(value) = ev.payload.get("claim") {
-                                    t.claim = serde_json::from_value(value.clone()).ok();
+                                    task.claim = serde_json::from_value(value.clone()).ok();
                                 }
                             }
-                        }
-                        if let Some(retry_count) = ev
-                            .payload
-                            .get("retry_count")
-                            .and_then(|value| value.as_u64())
-                            .and_then(|value| u32::try_from(value).ok())
-                            && let Some(task) = tasks.iter_mut().find(|task| &task.id == task_id)
-                        {
-                            task.retry_count = retry_count;
-                        }
-                        if let Some(value) = ev.payload.get("failure_fingerprint")
-                            && let Some(task) = tasks.iter_mut().find(|task| &task.id == task_id)
-                        {
-                            task.failure_fingerprint = value.as_str().map(str::to_string);
+                            if let Some(retry_count) = ev
+                                .payload
+                                .get("retry_count")
+                                .and_then(|value| value.as_u64())
+                                .and_then(|value| u32::try_from(value).ok())
+                            {
+                                task.retry_count = retry_count;
+                            }
+                            if let Some(value) = ev.payload.get("failure_fingerprint") {
+                                task.failure_fingerprint = value.as_str().map(str::to_string);
+                            }
                         }
                         apply_todo_runtime_event(
                             todo_runtime.entry(task_id.clone()).or_default(),
@@ -1639,6 +1643,7 @@ fn apply_boot_recovery(
     background_cells: &mut std::collections::BTreeMap<String, BackgroundCellState>,
     continuation: &mut Option<RunContinuationState>,
     finished_turns: &mut std::collections::BTreeSet<String>,
+    invalid_execution: &mut Option<String>,
 ) {
     let Some(recovery) = event.payload.get("recovery") else {
         return;
@@ -1669,15 +1674,21 @@ fn apply_boot_recovery(
         turn.error_fingerprint = Some("process_interrupted".to_string());
         state.last_turn = Some(turn);
     }
-    state.pause = (target == TaskRunStatus::Paused).then(|| RunPause {
-        reason: RunPauseReason::BootRecovery,
-        detail: recovery
-            .get("pause")
-            .and_then(|value| value.get("detail"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        changed_at: event.timestamp,
-    });
+    if recovery
+        .get("preserve_pause")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        state.pause = (target == TaskRunStatus::Paused).then(|| RunPause {
+            reason: RunPauseReason::BootRecovery,
+            detail: recovery
+                .get("pause")
+                .and_then(|value| value.get("detail"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            changed_at: event.timestamp,
+        });
+    }
 
     if let Some(cells) = recovery.get("cells").and_then(serde_json::Value::as_array) {
         for recovered in cells {
@@ -1732,6 +1743,25 @@ fn apply_boot_recovery(
             let Some(task_id) = recovered.get("task_id").and_then(serde_json::Value::as_str) else {
                 continue;
             };
+            if let Some(value) = recovered.get("execution") {
+                match serde_json::from_value::<echo_agent::tasks::TaskExecution>(value.clone()) {
+                    Ok(execution) if execution.task_id == task_id => {
+                        if let Some(task) = tasks.iter_mut().find(|task| task.id == task_id) {
+                            *task = PlanTask::from_parts(task.spec(), execution);
+                        } else {
+                            *invalid_execution = Some(
+                                "boot recovery execution is outside committed plan".to_string(),
+                            );
+                        }
+                    }
+                    Ok(_) => {
+                        *invalid_execution =
+                            Some("boot recovery execution identity mismatch".to_string())
+                    }
+                    Err(error) => *invalid_execution = Some(error.to_string()),
+                }
+                continue;
+            }
             let Some(status) = recovered
                 .get("status")
                 .and_then(|value| task_status_from_event(value, recovered))
@@ -1871,6 +1901,192 @@ mod tests {
             interruption_requested: None,
             sort_order: 0,
         }
+    }
+
+    fn task_replay_fixture() -> Result<Vec<RuntimeTaskEvent>, Box<dyn std::error::Error>> {
+        let store = fresh()?;
+        store.create_run(
+            "replay-run",
+            "ws",
+            "conversation",
+            "message",
+            DomainProfile::General,
+            "rebuild task execution",
+            "task",
+            AttendedMode::Attended,
+        )?;
+        store.attach_plan_for_test(&TaskPlan {
+            plan_id: "replay-plan".to_string(),
+            run_id: "replay-run".to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: crate::tasks::task_runtime::task_goal_sha256("rebuild task execution"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Parallel,
+            tasks: vec![sample_task("task-1", PlanTaskKind::Investigation)],
+        })?;
+        Ok(store.list_events("replay-run", 0)?)
+    }
+
+    fn task_replay_event(
+        event_type: RuntimeEventKind,
+        payload: serde_json::Value,
+    ) -> RuntimeTaskEvent {
+        RuntimeTaskEvent {
+            seq: i64::MAX,
+            run_id: "replay-run".to_string(),
+            task_id: Some("task-1".to_string()),
+            step_id: None,
+            event_type,
+            payload,
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn task_execution_event_kinds() -> [RuntimeEventKind; 8] {
+        [
+            RuntimeEventKind::TaskStarted,
+            RuntimeEventKind::TaskCompleted,
+            RuntimeEventKind::TaskFailed,
+            RuntimeEventKind::TaskCancelled,
+            RuntimeEventKind::TaskTimedOut,
+            RuntimeEventKind::TaskSkipped,
+            RuntimeEventKind::TaskBlocked,
+            RuntimeEventKind::TaskStatusChanged,
+        ]
+    }
+
+    #[test]
+    fn canonical_execution_replay_preserves_complete_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = task_replay_fixture()?;
+        let mut canonical = echo_agent::tasks::TaskExecution::pending("task-1");
+        canonical.status = echo_agent::tasks::TaskStatus::Retrying {
+            attempt: 2,
+            last_error: "canonical retry error".to_string(),
+        };
+        canonical.retry_count = 1;
+        canonical.failure_fingerprint = Some("canonical fingerprint".to_string());
+        canonical.claim = Some(echo_agent::tasks::TaskClaim::new(
+            1,
+            2,
+            "spec hash".to_string(),
+        ));
+        canonical.result = Some(serde_json::Value::Null);
+        canonical.interruption_requested =
+            Some(echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled);
+        for kind in task_execution_event_kinds() {
+            for include_flat_status in [true, false] {
+                let mut payload = serde_json::json!({
+                    "execution": canonical,
+                    "retry_count": 9,
+                    "failure_fingerprint": "stale fingerprint",
+                    "claim": null,
+                });
+                if include_flat_status {
+                    payload
+                        .as_object_mut()
+                        .ok_or("payload is not an object")?
+                        .insert("status".to_string(), serde_json::json!("retrying"));
+                    payload
+                        .as_object_mut()
+                        .ok_or("payload is not an object")?
+                        .insert(
+                            "status_detail".to_string(),
+                            serde_json::json!("stale retry error"),
+                        );
+                }
+                let mut events = base.clone();
+                events.push(task_replay_event(kind, payload));
+                let rebuilt = fold_fixture_for_test(&events)?;
+                let task = rebuilt
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == "task-1")
+                    .ok_or("task-1 is missing from replay")?;
+                assert_eq!(
+                    task.execution(),
+                    canonical,
+                    "event {kind:?}, flat status: {include_flat_status}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_execution_replay_rejects_corrupt_or_foreign_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = task_replay_fixture()?;
+        for kind in task_execution_event_kinds() {
+            for include_flat_status in [true, false] {
+                for execution in [
+                    serde_json::json!({"task_id": "task-1", "status": "retrying"}),
+                    serde_json::to_value(echo_agent::tasks::TaskExecution::pending("other-task"))?,
+                    serde_json::Value::Null,
+                ] {
+                    let mut payload = serde_json::json!({"execution": execution});
+                    if include_flat_status {
+                        payload
+                            .as_object_mut()
+                            .ok_or("payload is not an object")?
+                            .insert("status".to_string(), serde_json::json!("running"));
+                    }
+                    let mut events = base.clone();
+                    events.push(task_replay_event(kind, payload));
+                    assert!(
+                        matches!(
+                            fold_fixture_for_test(&events),
+                            Err(RebuildError::InvalidExecution(_))
+                        ),
+                        "event {kind:?}, flat status: {include_flat_status}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_execution_replay_retains_flat_legacy_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = task_replay_fixture()?;
+        let claim = echo_agent::tasks::TaskClaim::new(1, 2, "legacy spec hash".to_string());
+        for kind in task_execution_event_kinds() {
+            let mut events = base.clone();
+            events.push(task_replay_event(
+                kind,
+                serde_json::json!({
+                    "status": "retrying",
+                    "status_detail": "legacy retry error",
+                    "retry_count": 1,
+                    "claim": claim,
+                    "failure_fingerprint": "legacy fingerprint",
+                }),
+            ));
+            let rebuilt = fold_fixture_for_test(&events)?;
+            let task = rebuilt
+                .tasks
+                .iter()
+                .find(|task| task.id == "task-1")
+                .ok_or("task-1 is missing from replay")?;
+            assert_eq!(
+                task.status,
+                echo_agent::tasks::TaskStatus::Retrying {
+                    attempt: 1,
+                    last_error: "legacy retry error".to_string(),
+                }
+            );
+            assert_eq!(task.retry_count, 1);
+            assert_eq!(task.claim.as_ref(), Some(&claim));
+            assert_eq!(
+                task.failure_fingerprint.as_deref(),
+                Some("legacy fingerprint")
+            );
+        }
+        Ok(())
     }
 
     /// Gate 1: rebuild from events == read from SQL. Drives a full run lifecycle

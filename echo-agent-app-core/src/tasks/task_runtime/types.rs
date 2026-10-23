@@ -1433,6 +1433,10 @@ pub(crate) struct PhysicalOwnerIntent {
     pub(crate) owner_id: String,
     pub(crate) execution_id: Option<String>,
     pub(crate) workspace_id: String,
+    /// Stamped only by the current producer while it owns the root lease.
+    /// Absent on journals written before process-scoped owner fencing.
+    #[serde(default)]
+    pub(crate) process_epoch: Option<String>,
     #[serde(default)]
     pub(crate) physical_terminal_observed: bool,
 }

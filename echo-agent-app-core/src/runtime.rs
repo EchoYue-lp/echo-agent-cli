@@ -1803,9 +1803,10 @@ impl AgentRuntime {
         // ── 10. Plugins ──
         // Discovery, initial wiring, and later live mutations all go through
         // one runtime owner. This avoids bootstrap/reload double registration.
-        // The owned constructor returns the cleanup obligations it could not
-        // settle; the success path has none to adopt (the initial generation is
-        // committed before it returns), so only the failure path carries them.
+        // A failed initial generation hands back the cleanup obligations it could
+        // not settle; the failed runtime is gone, so they are parked with the
+        // process-level retry owner that the next bootstrap for this project
+        // adopts and retries.
         let plugin_runtime = match crate::plugin_runtime::PluginRuntimeService::new_owned(
             agent_handle.clone(),
             lsp_runtime,
@@ -1818,23 +1819,27 @@ impl AgentRuntime {
                 let (error, cleanup_receipts) = failure.into_parts();
                 // A failed initial plugin generation can leave cleanup
                 // obligations behind — most importantly exact MCP name
-                // ownership tokens. Dropping them would silently strand names
-                // that every later plugin boot must be able to claim, so each
-                // receipt is logged here and recorded in the rollback receipt,
-                // whose Display is the returned error's message. There is no
-                // plugin runtime owner left to adopt them into.
-                let descriptions = cleanup_receipts
-                    .iter()
-                    .map(|cleanup| cleanup.describe())
-                    .collect::<Vec<_>>();
-                for (index, description) in descriptions.iter().enumerate() {
+                // ownership tokens. They must never be reduced to text: parking
+                // them keeps a live owner that retries the exact obligations on
+                // the next bootstrap instead of stranding names forever.
+                for (index, description) in cleanup_receipts.describe().iter().enumerate() {
                     tracing::error!(
                         receipt = index.saturating_add(1),
-                        total = descriptions.len(),
+                        total = cleanup_receipts.len(),
                         cleanup = %description,
-                        "plugin runtime bootstrap left an unsettled cleanup receipt"
+                        "plugin runtime bootstrap parked an unsettled cleanup receipt"
                     );
                 }
+                let descriptions = cleanup_receipts.park();
+                let error = if descriptions.is_empty() {
+                    error
+                } else {
+                    error.context(format!(
+                        "plugin runtime bootstrap retained {} cleanup receipt(s) in the process retry ledger: {}",
+                        descriptions.len(),
+                        descriptions.join("; ")
+                    ))
+                };
                 let mut receipt = bootstrap_lifecycle
                     .settle(ApplicationLifecycleReason::BootstrapRollback, Some(error))
                     .await;

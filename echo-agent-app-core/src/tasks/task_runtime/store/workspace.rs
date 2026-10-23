@@ -952,12 +952,21 @@ pub(crate) struct RuntimeTaskResolutionReceipt {
     pub resolution: echo_agent::tasks::RuntimeTaskResolution,
     /// Interruption-first classification of the attempted evidence.
     pub settlement: SuccessEvidenceSettlement,
+    /// Final acceptance of the attempt's execution-success evidence.
+    ///
+    /// This is the last word, decided after the canonical settlement ran:
+    /// `settlement` can still report `Committed` when a durable claim
+    /// interruption kept the run `Running`, or when a non-success attempt
+    /// (review `NeedsFix`/`Blocked`) reached settlement after its run/claim was
+    /// interrupted. Consumers project the live payload from this fact.
+    pub acceptance: SuccessEvidenceAcceptance,
     /// Summary text actually committed to the task projection, if any.
     pub committed_summary: Option<String>,
-    /// Task status read back from the committed graph.
+    /// Task status read back from the committed graph. For `Superseded` this
+    /// belongs to the current claim and grants no authority to publish an
+    /// event for the refused claim.
     pub committed_status: Option<echo_agent::tasks::TaskStatus>,
 }
-
 
 enum RunTurnClaimPreparation {
     Start(RuntimeJournalEvent),

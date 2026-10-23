@@ -22,6 +22,19 @@ The framework exact-clear operation retires the incarnation checkpoint. EKO
 then deletes that incarnation's separate transcript using its managed epoch;
 neither step deletes the stable product conversation or another sender's data.
 
+Product deletion uses EKO's tombstone to coordinate TaskRun, tool, chat event,
+and artifact cleanup. With EKO's AtomicV1 conversation store and revisioned
+runtime store, the authority commit calls
+`delete_persisted_conversation_managed`. Before `ConversationCommitStarted`,
+EKO persists the `ManagedConversationDelete`, including the conversation,
+expected epoch, and request identity, in that tombstone. Normal execution,
+retries after a lost acknowledgement, and restart reuse that same request;
+they must not prepare a new request from a recreated conversation with the
+same ID. The helper retires the scope's incarnation checkpoints. EKO requires
+a `Completed` or `AlreadyCompleted` retirement receipt before continuing
+incarnation transcript cleanup; conflicts or incomplete retirement do not
+count as completed deletion and must not leave lineage behind.
+
 ## Consequences
 
 Every surface preserves sender isolation and exact root/current-turn control.

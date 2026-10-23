@@ -40,3 +40,7 @@ Tokio 的[优雅关闭说明](https://tokio.rs/tokio/topics/shutdown)区分取�
 ## 验证
 
 Review 回归经 app-core 准入驱动真实惰性 `BackgroundReviewHandle`，在持久 Memory 写入后阻塞 observer。调用方丢弃和 shutdown 都必须 join 子任务，暴露已提交 Memory 效果的 interrupted 收据，并且不能伪造 Inbox 候选。bootstrap 回归用持久 workspace 身份重开 scoped 债务并检查 owner 复用。桌面退出回归通过与真实入口共用的返回式事件循环 adapter 执行真实应用生命周期 owner；不宣称自动操作 OS 窗口或覆盖强制终止进程。
+
+## Review 结果投影
+
+`ReviewOutcome.error` 与候选可以同时存在。GUI、TUI 保留候选内容和证据，并同时展示 operation ID 和错误。`persisted = Some(true)`、`Some(false)`、`None` 分别表示已持久化、未持久化、状态未知，不能据此推断 Inbox 已有条目；只有 `BackgroundReviewSettlement.evidence_candidate` 才标识真实 Review Inbox 收据。没有候选的失败按失败展示，健康空结果保留原有无需保存提示。

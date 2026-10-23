@@ -843,14 +843,15 @@ impl TaskRuntimeStore {
         let root = self.lifecycle_retention()?;
         let resources = std::sync::Arc::new(RunDriverResources::default());
         let generation = self.lease_active_workspace_generation()?;
-        let intent = PhysicalOwnerIntent {
+        let mut intent = PhysicalOwnerIntent {
             run_id: run_id.to_string(),
             owner_id: format!("eko-tool-owner:{}", uuid::Uuid::new_v4()),
             execution_id: None,
             workspace_id: self.active_workspace_id(),
+            process_epoch: None,
             physical_terminal_observed: false,
         };
-        self.begin_physical_owner_intent(&intent)?;
+        self.begin_physical_owner_intent(&mut intent)?;
         resources.retain(receipt).map_err(|_| {
             StoreError::InvalidPlan("new tool resource owner was already settled".to_string())
         })?;
@@ -1399,8 +1400,8 @@ impl TaskRuntimeStore {
             let (mut result, should_settle, mut intent) = match start {
                 Ok(RunDriverStart::Execute(future)) => {
                     let workspace_id = settlement_store.shadow_generation.lock().unwrap_or_else(|error| error.into_inner()).workspace_id.clone();
-                    let intent = PhysicalOwnerIntent { run_id: run_id.clone(), owner_id: driver_execution_context_id.clone(), execution_id: None, workspace_id, physical_terminal_observed: false };
-                    match settlement_store.begin_physical_owner_intent(&intent) {
+                    let mut intent = PhysicalOwnerIntent { run_id: run_id.clone(), owner_id: driver_execution_context_id.clone(), execution_id: None, workspace_id, process_epoch: None, physical_terminal_observed: false };
+                    match settlement_store.begin_physical_owner_intent(&mut intent) {
                         Ok(()) => {
                             let result = match tokio::spawn(future).await {
                                 Ok(result) => result,
@@ -3724,6 +3725,69 @@ impl TaskRuntimeStore {
         }))
     }
 
+    /// Persist the framework's execution-only CAS without advancing relation
+    /// revision. The run lock is shared with direct claim/settlement adapters,
+    /// so those paths cannot overwrite an intervening durable stop or retry.
+    pub(crate) fn compare_and_commit_runtime_task_execution(
+        &self,
+        run_id: &str,
+        commit: echo_agent::tasks::TaskExecutionCommit,
+    ) -> Result<echo_agent::tasks::RevisionedTaskGraph, StoreError> {
+        self.with_run_lock(run_id, || {
+            let current = self
+                .load_revisioned_task_graph(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            let current_executions = current
+                .snapshot
+                .tasks
+                .iter()
+                .map(|task| (task.spec.id.clone(), task.execution.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            if current.snapshot.revision != commit.expected_revision
+                || current_executions != commit.expected_executions
+            {
+                return Err(StoreError::PlanConflict {
+                    run_id: run_id.to_string(),
+                    expected: commit.expected_revision,
+                    current: current.snapshot.revision,
+                });
+            }
+            // This is the persistence boundary, not another task validator:
+            // relation changes use compare_and_commit_revisioned_task_graph;
+            // claim validity is checked by the existing framework authority.
+            if commit.next.snapshot.revision != current.snapshot.revision
+                || commit.next.context != current.context
+                || commit
+                    .next
+                    .snapshot
+                    .tasks
+                    .iter()
+                    .map(|task| &task.spec)
+                    .ne(current.snapshot.tasks.iter().map(|task| &task.spec))
+                || commit
+                    .next
+                    .snapshot
+                    .tasks
+                    .iter()
+                    .any(|task| task.execution.task_id != task.spec.id)
+            {
+                return Err(StoreError::InvalidPlan(
+                    "execution CAS cannot change task relations, context, revision or execution identity"
+                        .to_string(),
+                ));
+            }
+            echo_agent::tasks::validate_runtime_snapshot_claims(&commit.next.snapshot)?;
+            self.persist_runtime_execution_changes(
+                run_id,
+                &current.snapshot,
+                &commit.next.snapshot,
+                None,
+                Vec::new(),
+            )?;
+            Ok(commit.next)
+        })
+    }
+
     /// Persist one framework-computed graph candidate with optimistic
     /// concurrency. Patch semantics and DAG validation have already run in
     /// `TaskRevisionService`; this adapter only validates the EKO extension and
@@ -4402,23 +4466,106 @@ impl TaskRuntimeStore {
             } = product;
             // Success evidence may only be published when the framework
             // committed a successful resolution for this exact attempt.
-            let committed_success =
-                outcome == echo_agent::tasks::RuntimeTaskResolution::Completed;
-            // Rejected success evidence never publishes the attempt's success
-            // text or review. Non-success resolutions (blocked/failed/
-            // cancelled) keep their product evidence so review history and
-            // diagnostics stay intact.
-            let rejected = settlement.is_late() || (success_request && !committed_success);
-            let committed_label = rejected.then_some("settlement superseded by interruption");
+            let committed_success = outcome == echo_agent::tasks::RuntimeTaskResolution::Completed;
+            // The final run/task truth, not the pre-settlement classification,
+            // decides whether the attempt's execution-success evidence may be
+            // published. Four independent facts can refuse it:
+            //
+            // - the exact claim was superseded, so this attempt committed no
+            //   resolution or product evidence;
+            // - the interruption-first classifier already proved the claim
+            //   late;
+            // - the committed task/run settled as an interruption. This is the
+            //   durable claim interruption case: an active driver requests the
+            //   interruption while the run stays `Running`, so classification
+            //   still reports `Committed` but the framework commits
+            //   `Interrupted`;
+            // - the requested success did not commit for this exact claim.
+            //
+            // A non-success resolution for a healthy attempt (review
+            // `NeedsFix`/`Blocked`, requeue, failure) is deliberately NOT an
+            // interruption: its execution summary and review stay published so
+            // review history, fix-task links and diagnostics survive.
+            let committed_task_status = graph
+                .snapshot
+                .tasks
+                .iter()
+                .find(|task| task.spec.id == task_id)
+                .map(|task| task.execution.status.clone());
+            let task_interrupted = matches!(
+                committed_task_status,
+                Some(
+                    echo_agent::tasks::TaskStatus::Cancelled
+                        | echo_agent::tasks::TaskStatus::Paused(_)
+                )
+            );
+            let run_interrupted =
+                matches!(run.status, TaskRunStatus::Cancelled | TaskRunStatus::Paused);
+            let superseded = outcome == echo_agent::tasks::RuntimeTaskResolution::Superseded;
+            let rejected = superseded
+                || settlement.is_late()
+                || task_interrupted
+                || run_interrupted
+                || (success_request && !committed_success);
+            let acceptance = if rejected {
+                SuccessEvidenceAcceptance::Rejected
+            } else {
+                SuccessEvidenceAcceptance::Accepted
+            };
+            // A superseded claim committed nothing. In particular it must not
+            // borrow the current claim's status to claim an interruption or
+            // publish its own summary as a newly accepted fact.
+            let committed_label =
+                (rejected && !superseded).then_some("settlement superseded by interruption");
             let mut product_events = Vec::new();
-            if outcome != echo_agent::tasks::RuntimeTaskResolution::Superseded {
+            if !superseded {
+                // Rejected attempts publish neither the execution summary nor
+                // their review. A review describes work the user already
+                // interrupted (needs-fix gates, fix-task links, pass verdicts);
+                // attaching it to an interrupted task would resurrect product
+                // state the interruption cancelled. The rejection fact below is
+                // the durable record, and `diagnostic_note` still lands so the
+                // interruption reason stays inspectable.
                 if rejected {
-                    let (classification, late_reason) = match &settlement {
+                    // The journal keeps one rejection fact so replay can
+                    // explain why the attempt's evidence never landed. The
+                    // pre-settlement classification is preserved verbatim; a
+                    // `Committed` classification is exactly the case where the
+                    // durable settlement refused the evidence afterwards.
+                    let resolution_label = match &outcome {
+                        echo_agent::tasks::RuntimeTaskResolution::Completed => "completed",
+                        echo_agent::tasks::RuntimeTaskResolution::Interrupted { .. } => {
+                            "interrupted"
+                        }
+                        echo_agent::tasks::RuntimeTaskResolution::Pending => "pending",
+                        echo_agent::tasks::RuntimeTaskResolution::Skipped => "skipped",
+                        echo_agent::tasks::RuntimeTaskResolution::Failed { .. } => "failed",
+                        echo_agent::tasks::RuntimeTaskResolution::TimedOut { .. } => "timed_out",
+                        echo_agent::tasks::RuntimeTaskResolution::Blocked { .. } => "blocked",
+                        echo_agent::tasks::RuntimeTaskResolution::Cancelled => "cancelled",
+                        echo_agent::tasks::RuntimeTaskResolution::Superseded => "superseded",
+                    };
+                    let (classification, rejection_reason) = match &settlement {
                         SuccessEvidenceSettlement::Late(late) => (
                             serde_json::to_value(late).unwrap_or(serde_json::Value::Null),
                             Some(late.as_str()),
                         ),
-                        _ => (serde_json::json!({ "run_status": run.status }), None),
+                        _ if task_interrupted || run_interrupted => (
+                            serde_json::json!({
+                                "run_status": run.status,
+                                "task_status": committed_task_status,
+                                "committed_resolution": resolution_label,
+                            }),
+                            Some("settlement_interrupted"),
+                        ),
+                        _ => (
+                            serde_json::json!({
+                                "run_status": run.status,
+                                "task_status": committed_task_status,
+                                "committed_resolution": resolution_label,
+                            }),
+                            Some("settlement_not_committed"),
+                        ),
                     };
                     product_events.push(RuntimeJournalEvent::for_append(
                         run_id,
@@ -4428,7 +4575,8 @@ impl TaskRuntimeStore {
                         serde_json::json!({
                             "kind": "settlement_evidence_rejected",
                             "settlement": settlement.as_str(),
-                            "reason": late_reason,
+                            "acceptance": acceptance.as_str(),
+                            "reason": rejection_reason,
                             "classification": classification,
                             "claim_id": claim.claim_id,
                             "plan_revision": claim.revision,
@@ -4498,6 +4646,7 @@ impl TaskRuntimeStore {
             Ok(RuntimeTaskResolutionReceipt {
                 resolution: outcome,
                 settlement,
+                acceptance,
                 committed_summary,
                 committed_status,
             })
@@ -4513,6 +4662,22 @@ impl TaskRuntimeStore {
         status: echo_agent::tasks::TaskStatus,
         summary: Option<String>,
     ) -> Result<echo_agent::tasks::RuntimeTaskSettlementOutcome, StoreError> {
+        self.settle_runtime_task_claim_evidence(run_id, task_id, claim, status, summary)
+            .map(|(outcome, _summary)| outcome)
+    }
+
+    /// Return the same summary that the exact-claim transaction persisted.
+    /// A durable stop can replace the requested fallback status; keeping its
+    /// summary in this transaction prevents live and journal projections from
+    /// describing two different outcomes.
+    pub(crate) fn settle_runtime_task_claim_evidence(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        claim: &echo_agent::tasks::TaskClaim,
+        status: echo_agent::tasks::TaskStatus,
+        summary: Option<String>,
+    ) -> Result<(echo_agent::tasks::RuntimeTaskSettlementOutcome, Option<String>), StoreError> {
         self.with_run_lock(run_id, || {
             let mut graph = self
                 .load_revisioned_task_graph(run_id)?
@@ -4522,16 +4687,54 @@ impl TaskRuntimeStore {
                 &mut graph.snapshot,
                 task_id,
                 claim,
-                status,
+                status.clone(),
             )?;
+            let mut diagnostic_events = Vec::new();
+            let committed_summary = match &outcome {
+                echo_agent::tasks::RuntimeTaskSettlementOutcome::Superseded => None,
+                echo_agent::tasks::RuntimeTaskSettlementOutcome::Settled {
+                    status: committed,
+                } if committed == &status => summary.clone(),
+                echo_agent::tasks::RuntimeTaskSettlementOutcome::Settled {
+                    status: committed,
+                } => {
+                    // The fallback error remains inspectable, but it must not
+                    // become the summary of the interruption that won the CAS.
+                    if let Some(message) = summary.as_ref() {
+                        diagnostic_events.push(RuntimeJournalEvent::for_append(
+                            run_id,
+                            Some(task_id),
+                            None,
+                            RuntimeEventKind::Note,
+                            serde_json::json!({
+                                "kind": "abandoned_attempt_diagnostic",
+                                "message": message,
+                                "requested_status": status,
+                                "committed_status": committed,
+                                "claim_id": claim.claim_id,
+                                "plan_revision": claim.revision,
+                                "attempt": claim.attempt,
+                                "spec_hash": claim.spec_hash,
+                            }),
+                        ));
+                    }
+                    match committed {
+                        echo_agent::tasks::TaskStatus::Paused(reason) => Some(reason.clone()),
+                        echo_agent::tasks::TaskStatus::Cancelled => {
+                            Some("dispatch cancelled before resolution".to_string())
+                        }
+                        _ => None,
+                    }
+                }
+            };
             self.persist_runtime_execution_changes(
                 run_id,
                 &before,
                 &graph.snapshot,
-                summary.as_deref(),
-                Vec::new(),
+                committed_summary.as_deref(),
+                diagnostic_events,
             )?;
-            Ok(outcome)
+            Ok((outcome, committed_summary))
         })
     }
 
@@ -5153,7 +5356,7 @@ impl TaskRuntimeStore {
         })
     }
 
-    fn begin_physical_owner_intent(&self, intent: &PhysicalOwnerIntent) -> Result<(), StoreError> {
+    fn begin_physical_owner_intent(&self, intent: &mut PhysicalOwnerIntent) -> Result<(), StoreError> {
         if intent.run_id.trim().is_empty()
             || intent.owner_id.trim().is_empty()
             || intent.workspace_id.trim().is_empty()
@@ -5162,6 +5365,9 @@ impl TaskRuntimeStore {
                 "physical owner intent identity is empty".to_string(),
             ));
         }
+        // This is the only new-owner journal boundary. Callers cannot omit or
+        // supply a foreign epoch, including when retaining an uncertain tool.
+        intent.process_epoch = Some(self.shadow.owner_process_epoch()?.to_string());
         self.with_run_lock(&intent.run_id, || {
             self.require_physical_owner_settled_locked(&intent.run_id)?;
             self.commit_runtime_event(RuntimeJournalEvent::for_append(
@@ -5280,14 +5486,33 @@ impl TaskRuntimeStore {
     /// repairs those files from the event tail without appending a duplicate.
     pub fn recover_incomplete(&self) -> Result<usize, StoreError> {
         let _operation = self.shadow_operation()?;
-        const INTERRUPTED: &[TaskRunStatus] = &[TaskRunStatus::Running, TaskRunStatus::Paused];
-        let zombies = self.list_runs_in(INTERRUPTED)?;
+        // A crash can also interrupt the acknowledgement after terminal
+        // settlement. Clear only its obsolete admission fence; never rewrite
+        // the already committed product status or count it as recovered work.
+        let zombies = self.list_runs_in(&[
+            TaskRunStatus::Pending,
+            TaskRunStatus::Running,
+            TaskRunStatus::Paused,
+            TaskRunStatus::Completed,
+            TaskRunStatus::Failed,
+            TaskRunStatus::Cancelled,
+        ])?;
         let mut recovered = 0_usize;
         for run in &zombies {
             let changed = match run.status {
                 TaskRunStatus::Running => self.recover_interrupted_run(run)?,
-                TaskRunStatus::Paused => self.recover_paused_orphan_cells(run)?,
-                _ => false,
+                TaskRunStatus::Paused => self.recover_interrupted_run(run)?,
+                _ => {
+                    self.with_run_lock(&run.run_id, || {
+                        if let Some(events) = self.interrupted_process_owner_events_locked(&run.run_id)?
+                            && !events.is_empty()
+                        {
+                            self.commit_runtime_events(&run.run_id, events)?;
+                        }
+                        Ok(())
+                    })?;
+                    false
+                }
             };
             if changed {
                 recovered = recovered.saturating_add(1);
@@ -5297,68 +5522,54 @@ impl TaskRuntimeStore {
         Ok(recovered)
     }
 
-    fn recover_paused_orphan_cells(&self, run: &TaskRun) -> Result<bool, StoreError> {
-        self.with_run_lock(&run.run_id, || {
-            // A valid retained owner is a per-run boot disposition. It must
-            // preserve cells, not abort independent recovery in this store.
-            if !self
-                .unsettled_physical_owner_intents_locked(&run.run_id)?
-                .is_empty()
-            {
-                return Ok(false);
-            }
-            let active = self
-                .list_background_cells(&run.run_id)?
-                .into_iter()
-                .filter(BackgroundCellState::is_active)
-                .collect::<Vec<_>>();
-            if active.is_empty() {
-                return Ok(false);
-            }
-            for cell in active {
-                let artifact_interrupted =
-                    cell.artifact_status == BackgroundCellArtifactStatus::Writing;
-                self.record_background_cell_finished_locked(
-                    &run.run_id,
-                    &cell.cell_id,
-                    &cell.name,
-                    BackgroundCellPhase::Failed,
-                    Some(BackgroundCellTerminalCause::Interrupted),
-                    Some("command cell was interrupted by process restart"),
-                    None,
-                    if artifact_interrupted {
-                        BackgroundCellArtifactStatus::Failed
-                    } else {
-                        cell.artifact_status
-                    },
-                    if artifact_interrupted {
-                        Some("artifact finalization was interrupted by process restart")
-                    } else {
-                        cell.artifact_message.as_deref()
-                    },
-                    cell.total_output_bytes,
-                    cell.output_truncated,
-                    cell.output_excerpt.as_deref(),
-                    cell.artifact_path.as_deref(),
-                    cell.artifact_sha256.as_deref(),
-                    cell.call_id.as_deref(),
-                )?;
-            }
-            Ok(true)
-        })
+    /// Retire only the admission fence of a previous process. This is not a
+    /// physical completion receipt: boot recovery below must still classify
+    /// interrupted tools, Subagents and command cells without replaying them.
+    fn interrupted_process_owner_events_locked(&self, run_id: &str) -> Result<Option<Vec<RuntimeJournalEvent>>, StoreError> {
+        let current_epoch = self.shadow.owner_process_epoch()?;
+        let intents = self.unresolved_physical_owner_intents(run_id)?;
+        if intents.iter().any(|intent| {
+            intent.process_epoch.as_ref().is_some_and(|epoch| uuid::Uuid::parse_str(epoch).is_err())
+        }) {
+            return Err(StoreError::RecoveryBlocked {
+                run_id: run_id.to_string(),
+                details: "physical owner intent contains an invalid process epoch".to_string(),
+            });
+        }
+        if intents.iter().any(|intent| intent.process_epoch.as_deref() == Some(current_epoch)) {
+            return Ok(None);
+        }
+        // The current process is the only producer while holding this OS
+        // lease and always stamps Some(current_epoch). None is therefore an
+        // old-version journal, never a currently admitted in-process owner.
+        let events = intents.into_iter().filter(|intent| {
+            intent.process_epoch.as_deref() != Some(current_epoch)
+        }).map(|intent| RuntimeJournalEvent::for_append(
+            run_id,
+            None,
+            intent.execution_id.as_deref(),
+            RuntimeEventKind::RecoveryResolved,
+            serde_json::json!({
+                "physical_owner_intent": intent,
+                "reason": "owner_process_interrupted",
+                "recovery_process_epoch": current_epoch,
+            }),
+        )).collect::<Vec<_>>();
+        Ok(Some(events))
     }
 
     fn recover_interrupted_run(&self, run: &TaskRun) -> Result<bool, StoreError> {
         self.with_run_lock(&run.run_id, || {
-            // Unknown belongs to this exact owner; other historical runs
-            // retain the existing recovery path. Malformed facts still error.
-            if !self.unsettled_physical_owner_intents_locked(&run.run_id)?.is_empty() {
+            // Fence retirement is prepared, never published before the same
+            // atomic batch classifies interrupted effects and task requests.
+            // A live current-process owner remains a per-run disposition.
+            let Some(mut recovery_events) = self.interrupted_process_owner_events_locked(&run.run_id)? else {
                 return Ok(false);
-            }
+            };
             let state = self
                 .get_run_state(&run.run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run.run_id.clone()))?;
-            if state.run.status != TaskRunStatus::Running {
+            if !matches!(state.run.status, TaskRunStatus::Running | TaskRunStatus::Paused) {
                 let was_boot_recovered = state
                     .continuation
                     .as_ref()
@@ -5399,6 +5610,29 @@ impl TaskRuntimeStore {
             let plan = self.get_plan(&run.run_id)?;
             let active_subagents = self.active_subagent_boundaries(&run.run_id)?;
             let active_tools = self.active_tool_boundaries(&run.run_id)?;
+            for task_id in active_tools
+                .iter()
+                .filter(|tool| !tool.replay_safe)
+                .map(|tool| &tool.task_id)
+                .chain(active_subagents.iter().filter(|subagent| !subagent.replay_safe).map(|subagent| &subagent.task_id))
+            {
+                if !plan.as_ref().is_some_and(|plan| plan.tasks.iter().any(|task| &task.id == task_id)) {
+                    return Err(StoreError::RecoveryBlocked {
+                        run_id: run.run_id.clone(),
+                        details: format!("unsafe side effect belongs to task {task_id} outside the committed plan"),
+                    });
+                }
+            }
+            let was_paused = state.run.status == TaskRunStatus::Paused;
+            let has_interrupted_work = state.tasks.iter().any(|task| task.status.is_running())
+                || active_turn.is_some() || !orphan_cells.is_empty()
+                || !active_subagents.is_empty() || !active_tools.is_empty();
+            if was_paused && !has_interrupted_work {
+                if !recovery_events.is_empty() {
+                    self.commit_runtime_events(&run.run_id, recovery_events)?;
+                }
+                return Ok(false);
+            }
             let conversational_without_plan = plan.is_none()
                 && state.execution_profile.provenance == TaskRunProvenance::ConversationTurn;
             let completed_turn_waiting_for_settlement = conversational_without_plan
@@ -5411,19 +5645,32 @@ impl TaskRuntimeStore {
                     .as_ref()
                     .and_then(|continuation| continuation.last_turn.as_ref())
                     .is_some_and(|turn| turn.status == RunTurnStatus::Ended);
-            let recovery_target = if completed_turn_waiting_for_settlement {
+            let recovery_target = if was_paused {
+                TaskRunStatus::Paused
+            } else if completed_turn_waiting_for_settlement {
                 TaskRunStatus::Completed
             } else if conversational_without_plan {
                 TaskRunStatus::Cancelled
             } else {
                 TaskRunStatus::Paused
             };
-            let running_task_ids = state
+            let mut running_task_ids = state
                 .tasks
                 .iter()
                 .filter(|task| task.status.is_running())
                 .map(|task| task.task_id.clone())
                 .collect::<Vec<_>>();
+            for task_id in active_tools.iter().filter(|tool| !tool.replay_safe).map(|tool| &tool.task_id)
+                .chain(active_subagents.iter().filter(|subagent| !subagent.replay_safe).map(|subagent| &subagent.task_id))
+            {
+                if !running_task_ids.contains(task_id) {
+                    running_task_ids.push(task_id.clone());
+                }
+            }
+            let mut recovery_graph = self.load_revisioned_task_graph(&run.run_id)?;
+            if let Some(graph) = recovery_graph.as_ref() {
+                echo_agent::tasks::validate_runtime_snapshot_claims(&graph.snapshot)?;
+            }
             let mut recovered_tasks = Vec::with_capacity(running_task_ids.len());
             for task_id in running_task_ids {
                 let task = plan
@@ -5452,7 +5699,31 @@ impl TaskRuntimeStore {
                     .iter()
                     .find(|boundary| boundary.task_id == task_id && !boundary.replay_safe)
                     .cloned();
-                let (next_status, summary) = if completed_subagent.is_some() {
+                let original_execution = task.map(PlanTask::execution);
+                let accepted_interruption = original_execution.as_ref()
+                    .is_some_and(|execution| execution.interruption_requested.is_some());
+                // Only the framework decides the accepted exact-claim
+                // interruption. Keep the resulting complete execution so
+                // replay cannot orphan or forget that durable request.
+                let settled_execution = if accepted_interruption {
+                    let claim = original_execution.as_ref().and_then(|execution| execution.claim.as_ref())
+                        .ok_or_else(|| StoreError::RecoveryBlocked { run_id: run.run_id.clone(), details: "accepted task interruption has no original claim".to_string() })?;
+                    let graph = recovery_graph.as_mut().ok_or_else(|| StoreError::PlanNotFound(run.run_id.clone()))?;
+                    let resolution = echo_agent::tasks::settle_runtime_resolution(
+                        &mut graph.snapshot, &task_id, claim,
+                        echo_agent::tasks::RuntimeTaskResolutionRequest::Failed { error: "physical driver process interrupted".to_string() },
+                    )?;
+                    if !matches!(resolution, echo_agent::tasks::RuntimeTaskResolution::Interrupted { .. }) {
+                        return Err(StoreError::RecoveryBlocked { run_id: run.run_id.clone(), details: "original task interruption could not be settled".to_string() });
+                    }
+                    Some(graph.snapshot.tasks.iter().find(|task| task.spec.id == task_id)
+                        .map(|task|task.execution.clone()).ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?)
+                } else { None };
+                let (next_status, summary) = if let Some(execution) = settled_execution.as_ref() {
+                    (execution.status.clone(), "accepted interruption settled after owner process ended")
+                } else if let Some(execution) = original_execution.as_ref().filter(|execution| !execution.status.is_running()) {
+                    (execution.status.clone(), "interrupted side effect requires inspection")
+                } else if completed_subagent.is_some() {
                     (
                         echo_agent::tasks::TaskStatus::Pending,
                         "Subagent completed before interruption; pending review",
@@ -5470,7 +5741,7 @@ impl TaskRuntimeStore {
                         "interrupted; pending resume",
                     )
                 };
-                let blocker = if matches!(&next_status, echo_agent::tasks::TaskStatus::Blocked(_)) {
+                let blocker = if active_tool.is_some() || active_subagent.is_some() {
                     let (boundary_execution_id, call_id, tool_name) =
                         if let Some(tool) = active_tool {
                             (tool.execution_id, Some(tool.call_id), Some(tool.tool_name))
@@ -5483,11 +5754,16 @@ impl TaskRuntimeStore {
                         "execution_id": boundary_execution_id,
                         "call_id": call_id,
                         "tool_name": tool_name,
-                        "reason": summary,
+                        "reason": "mutating side effect is indeterminate after restart",
                     }))
                 } else {
                     None
                 };
+                let execution = settled_execution.or_else(|| original_execution.map(|mut execution| {
+                    execution.status = next_status.clone();
+                    execution.claim = None;
+                    execution
+                }));
                 let (status_name, status_detail) = task_status_wire(&next_status);
                 recovered_tasks.push(serde_json::json!({
                     "task_id": task_id,
@@ -5495,6 +5771,7 @@ impl TaskRuntimeStore {
                     "status_detail": status_detail,
                     "summary": summary,
                     "blocker": blocker,
+                    "execution": execution,
                 }));
             }
             let recovered_subagents = active_subagents
@@ -5535,7 +5812,7 @@ impl TaskRuntimeStore {
                 None,
                 RuntimeEventKind::RunStatusChanged,
                 serde_json::json!({
-                    "from": TaskRunStatus::Running.as_str(),
+                    "from": state.run.status.as_str(),
                     "to": recovery_target.as_str(),
                     "recovery": {
                         "kind": "boot_recovery",
@@ -5545,6 +5822,7 @@ impl TaskRuntimeStore {
                             "recovered from running (interrupted by process restart)"
                         },
                         "active_turn": active_turn,
+                        "preserve_pause": was_paused,
                         "pause": (recovery_target == TaskRunStatus::Paused).then(|| serde_json::json!({
                             "reason": RunPauseReason::BootRecovery.as_str(),
                             "detail": "the application process ended while this run was active",
@@ -5556,7 +5834,32 @@ impl TaskRuntimeStore {
                     },
                 }),
             );
-            let mut recovery_events = vec![recovery_event];
+            recovery_events.push(recovery_event);
+            if was_paused {
+                // Paused cell consumers already use this terminal event.
+                // Retain it in the SAME batch as owner retirement and unsafe
+                // effect barriers, instead of publishing it piecemeal.
+                for cell in state.background_cells.iter().filter(|cell| cell.is_active()) {
+                    let artifact_interrupted = cell.artifact_status == BackgroundCellArtifactStatus::Writing;
+                    recovery_events.push(RuntimeJournalEvent::for_append(
+                        &run.run_id, None, cell.call_id.as_deref(), RuntimeEventKind::BackgroundCellFinished,
+                        serde_json::json!({
+                            "cell_id": cell.cell_id, "name": retention.sanitize_text(&cell.name),
+                            "phase": BackgroundCellPhase::Failed,
+                            "terminal_cause": BackgroundCellTerminalCause::Interrupted,
+                            "terminal_message": "command cell was interrupted by process restart",
+                            "exit_code": null,
+                            "artifact_status": if artifact_interrupted { BackgroundCellArtifactStatus::Failed } else { cell.artifact_status },
+                            "artifact_message": if artifact_interrupted { Some("artifact finalization was interrupted by process restart") } else { cell.artifact_message.as_deref() },
+                            "total_output_bytes": cell.total_output_bytes,
+                            "output_truncated": cell.output_truncated,
+                            "output_excerpt": cell.output_excerpt.as_deref().map(|text|retention.sanitize_text(text)),
+                            "artifact_path": cell.artifact_path, "artifact_sha256": cell.artifact_sha256,
+                            "call_id": cell.call_id,
+                        }),
+                    ));
+                }
+            }
             if recovery_target == TaskRunStatus::Cancelled {
                 recovery_events.push(RuntimeJournalEvent::for_append(
                     &run.run_id,
