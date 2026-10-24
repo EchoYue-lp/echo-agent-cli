@@ -2,7 +2,6 @@
 import type { BrowserCommand } from './BrowserCommand';
 import type { ExtensionRequestScope } from './ExtensionRequestScope';
 import type { HookCommand } from './HookCommand';
-import type { LspCommand } from './LspCommand';
 import type { McpCommand } from './McpCommand';
 import type { PluginCommand } from './PluginCommand';
 import type { SkillCommand } from './SkillCommand';
@@ -16,6 +15,5 @@ export type ExtensionCommandRequest = {
   | { extension: 'plugins'; command: PluginCommand }
   | { extension: 'mcp'; command: McpCommand }
   | { extension: 'hooks'; command: HookCommand }
-  | { extension: 'lsp'; command: LspCommand }
   | { extension: 'browser'; command: BrowserCommand }
 );

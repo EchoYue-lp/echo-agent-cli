@@ -163,8 +163,6 @@ pub fn build_tauri_app(
             commands::hooks::list_hook_events,
             commands::hooks::reload_hooks,
             commands::hooks::test_hook,
-            // LSP
-            commands::lsp::lsp_control,
             // Providers
             commands::providers::list_model_providers,
             commands::providers::upsert_model_provider,

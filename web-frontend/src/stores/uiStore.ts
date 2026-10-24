@@ -6,7 +6,6 @@ export type SettingsTabId =
   | 'overview'
   | 'tools'
   | 'mcp'
-  | 'lsp'
   | 'skills'
   | 'memory'
   | 'config'

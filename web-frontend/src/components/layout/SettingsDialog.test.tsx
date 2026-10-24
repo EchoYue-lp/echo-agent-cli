@@ -34,6 +34,14 @@ afterEach(() => {
 });
 
 describe('optional settings screens', () => {
+  it('retires LSP navigation and safely falls back from an obsolete settings key', () => {
+    useUiStore.setState({ settingsOpen: true, activeSettingsTab: 'lsp' as never });
+    render(<SettingsDialog />);
+    expect(screen.queryByRole('button', { name: /^LSP/ })).toBeNull();
+    expect(screen.getByText('运行与记录')).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
   it('keeps navigation, close and the workspace available during delayed or failed imports', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
     let mounts = 0;

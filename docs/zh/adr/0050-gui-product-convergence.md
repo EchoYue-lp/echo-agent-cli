@@ -70,7 +70,9 @@ EKO 是本地个人助理，不是线上多用户服务。已批准方向以 GUI
 分离、保留持久权威，不意味着它们要求 GUI-only，也不声称 EKO 实现了这些系统。
 GUI-only 和具名协议退役来自用户已批准的产品决定，机制复用 EKO 现有 owner。
 
-## 影响、恢复与验收
+## 影响
+
+### 恢复与验收
 
 本机 annotated tag `pre-retirement-2026-10-24` 与
 `chore/Echoyue/full-capabilities-baseline` 分支均解析到
@@ -81,7 +83,7 @@ GUI-only 和具名协议退役来自用户已批准的产品决定，机制复�
 本 ADR 替代旧的 EKO 终端入口扩张/对等与 A2A/LSP 保留目标，包括历史 ADR 0010、0012、
 0017、0042 的相关范围假设；其历史源码和实现证据保留，不把当前生产架构改写成已经退役。
 
-本切片仅改规则、双语 ADR/架构页和 parity 登记。表达已批准方向无需改 Rust/TS、manifest/
+最初的文档切片仅改规则、双语 ADR/架构页和 parity 登记。表达已批准方向无需改 Rust/TS、manifest/
 lock、生成合同、CI 或 examples。README、功能总览和快速开始继续描述当前已实现基线，
 随实际退役再修改操作承诺。官网 owner 应镜像审阅后的正式页面并区分现状与目标，不将退役
 宣传为已交付。
@@ -100,3 +102,16 @@ Task/Subagent 恢复、终端清理、隐藏窗口运行和真正退出结算，
 框架删除前须验收 EKO/SDK 已不再请求或调用 A2A/LSP；随后核对活跃实现、注册、feature、
 宣传确已退出，并通过剩余消费者/examples/CI 矩阵。文档 parity 或源码搜索本身不是运行时或
 原生验收。
+
+
+## EKO 消费者实现
+
+EKO 移除 `lsp` feature 请求、五工具注册、manager、插件 LSP 代分支、扩展命令/类型投影、
+配置热重载、GUI 设置与 invoke 注册。PluginRuntimeService 独立保留根目录权威和全部原
+publication/rollback/cleanup 收据。退役组件明确诊断，用户文件保留，混合插件继续处理合法
+组件。框架 A2A/LSP 实现与独立终端入口仍在；本消费者改动不代表 SDK 完成或框架已删除。
+退役诊断直接消费框架桥接 `e4e50396876c5e7e85b52cdc3dbb510bab9c4f4d` 的既有
+`PreparedPluginSet::diagnostics()`，保留完整冻结诊断的组件、插件、来源路径与严重程度，
+仅为 `lsp` 组件映射 EKO 产品退役文案。不依赖 LSP 专属公开元数据，也不在 prepare 后重读文件。
+框架加法诊断先行，EKO 再切换，后续框架物理删除继续保留通用旧输入诊断而不保留执行器。
+原 applicability 与非 LSP Error 拒绝策略不变，不新增 decoder 或状态权威。

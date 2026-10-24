@@ -140,14 +140,7 @@ impl ExtensionControlService {
         runtime.rebind_workspace(root).await
     }
 
-    pub async fn reload_plugin_lsp(
-        &self,
-        runtime: Arc<crate::plugin_runtime::PluginRuntimeService>,
-        root: PathBuf,
-    ) -> anyhow::Result<usize> {
-        let _mutation = self.mutation.lock().await;
-        runtime.reload_lsp_generation(root).await
-    }
+
 
     pub async fn reload_plugins(
         self: &Arc<Self>,
@@ -1620,92 +1613,9 @@ impl ExtensionControlService {
         Ok(())
     }
 
-    pub async fn lsp_command(
-        self: &Arc<Self>,
-        state: &AppState,
-        action: &str,
-        language: Option<&str>,
-    ) -> anyhow::Result<String> {
-        self.lsp_command_scoped(state, None, action, language).await
-    }
 
-    pub async fn lsp_command_scoped(
-        self: &Arc<Self>,
-        state: &AppState,
-        runtime: Option<&ScopedChatRuntime>,
-        action: &str,
-        language: Option<&str>,
-    ) -> anyhow::Result<String> {
-        let context = self.scoped_context(state, runtime).await?;
-        let specialist = context.plugin_runtime();
-        match action {
-            "list" | "ls" => {
-                let _read = self.mutation.lock().await;
-                let languages = specialist.lsp_configured_languages().await;
-                Ok(if languages.is_empty() {
-                    "No language servers are configured.".to_string()
-                } else {
-                    languages.join("\n")
-                })
-            }
-            "status" | "" => {
-                let _read = self.mutation.lock().await;
-                let statuses = specialist.lsp_status().await;
-                Ok(if statuses.is_empty() {
-                    "No language servers are configured.".to_string()
-                } else {
-                    statuses
-                        .into_iter()
-                        .map(|status| {
-                            let state = if status.running && status.initialized {
-                                "ready"
-                            } else if status.running {
-                                "starting"
-                            } else {
-                                "stopped"
-                            };
-                            status.last_error.map_or_else(
-                                || format!("{}: {state}", status.language),
-                                |error| format!("{}: {state} ({error})", status.language),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-            }
-            "start" | "stop" | "restart" => {
-                let language = language
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("lsp {action} requires a language"))?
-                    .to_string();
-                let action = action.to_string();
-                let flow = state
-                    .session
-                    .product_data_io
-                    .begin_owned_flow("settle LSP control mutation")
-                    .map_err(anyhow::Error::new)?;
-                let service = Arc::clone(self);
-                await_owned_extension_settlement(
-                    flow,
-                    async move {
-                        let _mutation = service.mutation.lock().await;
-                        let _control = context;
-                        if action == "start" {
-                            specialist.lsp_start(language.clone()).await?;
-                        } else if action == "stop" {
-                            specialist.lsp_stop(language.clone()).await?;
-                        } else {
-                            specialist.lsp_restart(language.clone()).await?;
-                        }
-                        Ok(format!("Language server '{language}' {action}ed."))
-                    },
-                    |error| anyhow::anyhow!("LSP settlement task failed: {error}"),
-                )
-                .await
-            }
-            _ => anyhow::bail!("usage: lsp <list|status|start|stop|restart> [language]"),
-        }
-    }
+
+
 
     pub async fn browser_command(
         self: &Arc<Self>,

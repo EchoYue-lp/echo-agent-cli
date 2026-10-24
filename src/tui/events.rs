@@ -5840,12 +5840,8 @@ async fn handle_slash_command(
                 content,
             });
         }
-        Some(command @ (SlashCommand::Lsp | SlashCommand::Browser)) => {
-            let root = match command {
-                SlashCommand::Lsp => "lsp",
-                SlashCommand::Browser => "browser",
-                _ => return,
-            };
+        Some(SlashCommand::Browser) => {
+            let root = "browser";
             let receipt = crate::cli::extension_surface::dispatch_extension_command(
                 app.app_state.as_ref(),
                 app.conversation_id.as_deref(),
@@ -6746,7 +6742,12 @@ async fn handle_slash_command(
         None => {
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
-                content: format!("Unknown command: {command}"),
+                content: if command == "/lsp" {
+                    "LSP has been retired from EKO; language-server commands are unsupported"
+                        .to_string()
+                } else {
+                    format!("Unknown command: {command}")
+                },
             });
         }
     }

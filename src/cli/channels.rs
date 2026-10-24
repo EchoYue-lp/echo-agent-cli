@@ -7052,12 +7052,20 @@ mod tests {
     #[cfg(feature = "channels")]
     #[test]
     fn typed_extension_parser_claims_all_families_before_the_model() -> Result<(), String> {
+        assert!(
+            super::parse_channel_extension_input(
+                "/lsp status",
+                "retired-request",
+                "retired-operation"
+            )
+            .is_err_and(|message| message.contains("retired"))
+        );
+
         for command in [
             "/skills list",
             "/plugins list",
             "/mcp list",
             "/hooks list",
-            "/lsp status",
             "/browser status",
         ] {
             let parsed = super::parse_channel_extension_input(command, "request-1", "operation-1")?

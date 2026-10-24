@@ -1036,7 +1036,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lsp_rebind_and_gui_cli_mutations_share_one_admission() -> Result<(), String> {
+    async fn plugin_rebind_and_gui_cli_mutations_share_one_admission() -> Result<(), String> {
         let fixture = fanout_fixture(1).await?;
         let service = Arc::clone(&fixture.state.extension_control);
         let target = fixture

@@ -59,11 +59,11 @@ review, worktree, and surface control. See [runtime architecture](./architecture
 
 EKO integrates transactional file edits, workspace diff, analytics execution,
 interactive terminal sessions, Browser/Chrome, workflow catalog, structured
-extraction, MCP, LSP, Tool output projections, model-driven Agent collaboration controls,
+extraction, MCP, Tool output projections, model-driven Agent collaboration controls,
 Hooks/Webhooks, Plugins, and Skills.
 
 `ExtensionControlService` is the EKO mutation admission for Skills, Plugins,
-MCP, Hooks, LSP, and Browser. It delegates to specialist owners and does not
+MCP, Hooks, and Browser. It delegates to specialist owners and does not
 create a second registry, manager, or store. Skill enablement uses one atomic
 flat policy and immediate typed reconciliation; captured workspace identity and
 the same command authority are shared across GUI, TUI, CLI/JSONL, and channels.
@@ -113,3 +113,13 @@ validator, while Hooks remain application/plugin configuration. Repository
 `.agents/skills/` files guide development of EKO and are not product runtime
 content. The current project's `AGENTS.md` chain enters the same instruction
 projection. See [ADR 0041](./adr/0041-external-only-skills.md).
+
+
+### Retired LSP consumer
+
+EKO no longer requests the framework LSP feature, registers language-server tools,
+or exposes LSP commands/settings/IPC. Old configuration and plugin declarations
+receive explicit retirement diagnostics without deleting user files. Mixed plugins
+retain legal components and their existing publication/cleanup receipts. Framework
+A2A/LSP APIs still exist pending both consumers' acceptance; console surfaces,
+IM, cron, MCP and Subagent are retained in this consumer-only change.

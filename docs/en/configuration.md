@@ -147,3 +147,5 @@ driver, TaskRuntime, HITL, and memory authority as GUI and TUI.
 | `EKO_UV_PATH` | `uv` path for analytics runtime |
 | `RUST_LOG` | Rust log filter |
 | `HTTP_PROXY` / `HTTPS_PROXY` | HTTP proxy |
+
+Legacy `.lsp.yaml` is no longer parsed or hot-reloaded. Discovery only reports that LSP has retired; the original file is preserved.

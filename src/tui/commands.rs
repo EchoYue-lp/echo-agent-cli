@@ -123,7 +123,6 @@ pub enum SlashCommand {
     Analysis,
     Papers,
     Terminal,
-    Lsp,
 
     // -- Git --
     Git,
@@ -223,7 +222,6 @@ impl SlashCommand {
             Self::Analysis => "Create, inspect, and run file-backed analyses",
             Self::Papers => "Manage research sources, evidence, and systematic reviews",
             Self::Terminal => "Manage and attach to interactive terminal sessions",
-            Self::Lsp => "Inspect and manage workspace language servers",
 
             Self::Git => "Run a git command",
             Self::Worktrees => "Review and clean retained EKO worktrees",
@@ -314,8 +312,7 @@ impl SlashCommand {
             | Self::Browser
             | Self::Analysis
             | Self::Papers
-            | Self::Terminal
-            | Self::Lsp => Category::Coding,
+            | Self::Terminal => Category::Coding,
             Self::Git | Self::Worktrees => Category::Git,
             Self::Pipeline | Self::Workflow | Self::Extract => Category::Pipeline,
             Self::Permission => Category::Security,
@@ -359,7 +356,6 @@ impl SlashCommand {
             Self::Terminal => {
                 "[list|create <id> [cwd] [rows] [cols]|attach <id>|write <id> <data>|resize <id> <rows> <cols>|close <id>]"
             }
-            Self::Lsp => "[list|status|start <language>|stop <language>|restart <language>]",
             Self::Git => "<git-args>",
             Self::Worktrees => "[list|cleanup|merge <run-id>|discard <run-id>]",
             Self::Pipeline => "[list|run <name>]",
@@ -569,13 +565,13 @@ mod tests {
         let terminal = "terminal"
             .parse::<SlashCommand>()
             .map_err(|error| error.to_string())?;
-        let lsp = "lsp"
-            .parse::<SlashCommand>()
-            .map_err(|error| error.to_string())?;
         assert_eq!(terminal.category(), Category::Coding);
         assert!(terminal.usage().contains("attach <id>"));
-        assert_eq!(lsp.category(), Category::Coding);
-        assert!(lsp.usage().contains("restart <language>"));
+        assert!("lsp".parse::<SlashCommand>().is_err());
+        let browser = "browser"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(browser.category(), Category::Coding);
         Ok(())
     }
 

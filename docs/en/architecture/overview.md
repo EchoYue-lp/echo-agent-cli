@@ -2,8 +2,8 @@
 
 This page separates the current production architecture of `echo-agent-cli`
 from the approved convergence target in [ADR 0050](../adr/0050-gui-product-convergence.md).
-The framework owns ReAct, tools, memory, MCP and workflows. LSP remains present
-in the inspected baseline but is approved for retirement together with A2A;
+The framework owns ReAct, tools, memory, MCP and workflows. EKO has removed its LSP consumer paths; framework A2A/LSP APIs remain present
+until both consumers pass acceptance;
 framework public contracts remain owned by `echo-agent`.
 
 ## Product Boundary
@@ -178,3 +178,22 @@ return to the overview, while reloading the application retries its module load.
 Browser fixture screenshots establish theme/layout coverage separately from native
 Tauri window acceptance. This visual layer adds no chat, HITL, task, terminal or
 plugin execution state, nor a new component framework or theme store.
+
+
+### LSP consumer boundary
+
+Primary bootstrap and scoped AgentPool construction no longer install the five
+LSP tools or managers. `PluginRuntimeService` keeps an explicit project-root lock
+independent of any language service; the root changes only at the original
+publication/fail-closed boundary. MCP ownership tokens, lifecycle rollback,
+monitor replacement and parked cleanup receipts keep their existing owners.
+
+Only retired LSP component diagnostics are nonfatal to a mixed prepared generation;
+other component failures retain the existing rejection policy. Reload receipts
+report the retired component while legal Skills/MCP/Subagent/monitor/theme/style
+components continue. The complete generic frozen diagnostics (including warnings)
+retain severity and source identity in the existing receipt messages. EKO has no
+LSP-specific document/field/method dependency. Late file changes cannot alter a
+generation's receipts; cache invalidation uses the original framework integrator. Legacy config recognition is diagnostic only. Settings retain
+lazy loading and local ErrorBoundary behavior; unknown old `lsp` keys use overview,
+and old typed/invoke requests fail through existing unsupported/serde boundaries.

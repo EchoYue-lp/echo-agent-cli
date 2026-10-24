@@ -252,8 +252,11 @@ reconnect display, and hide/quit/restart acceptance must precede console removal
 
 ### LSP consumer decoupling
 
-LSP remains active in this baseline. These are future removal obligations,
-not a claim that removal has happened:
+The following table records the pre-retirement source inventory at the fixed
+full-capability baseline. EKO source now removes these runtime consumers; it is
+retained here to make the old-to-new disposition recoverable, not to advertise
+current LSP support. Framework API deletion and SDK acceptance remain separately
+owned. Rust/GUI validation of this consumer change is recorded with delivery.
 
 | Consumer | Exact future decoupling scope |
 | --- | --- |

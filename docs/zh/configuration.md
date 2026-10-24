@@ -222,9 +222,8 @@ Hook 合并顺序从低到高：
 2. `~/.eko/hooks.yaml`
 3. `<project>/.eko/hooks.yaml`
 
-config watcher 监听 create/modify/remove 和原子保存；Hooks 与 global/workspace
-`.lsp.yaml` 通过 `ExtensionControlService` 热发布。修改 model/MCP/runtime topology 仍应通过
-对应统一 mutation 或重启，不依赖通用文件 watcher 猜测重建。Hook/LSP reload 使用 admission
+config watcher 监听 create/modify/remove 和原子保存；Hooks 通过 `ExtensionControlService` 热发布。修改 model/MCP/runtime topology 仍应通过
+对应统一 mutation 或重启，不依赖通用文件 watcher 猜测重建。Hook reload 使用 admission
 时捕获的 workspace project root，process cwd 不参与 workspace identity。
 
 Webhook endpoint 示例：
@@ -316,3 +315,5 @@ scope 的全部 incarnation checkpoint/transcript 和稳定 transcript。
 | `HTTP_PROXY` / `HTTPS_PROXY` | HTTP 代理                          |
 
 Provider API Key 使用各 Provider 的 `api_key_env`，无需维护固定厂商变量白名单。
+
+旧 `.lsp.yaml` 不再被解析或热重载；发现时只报告 LSP 已退役，保留文件原件。

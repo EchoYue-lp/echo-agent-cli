@@ -1,8 +1,7 @@
 # EKO 架构说明
 
 本文区分 `echo-agent-cli` 当前生产架构与 [ADR 0050](../adr/0050-gui-product-convergence.md)
-已批准的收敛目标。ReAct、tool、memory、MCP、workflow 等通用机制归框架；LSP 在所检查
-基线仍存在，但与 A2A 一同进入退役范围。框架公开合同继续由 `echo-agent` 自身维护。
+已批准的收敛目标。ReAct、tool、memory、MCP、workflow 等通用机制归框架；EKO 的 LSP 消费路径已移除；框架 A2A/LSP API 仍保留，等待两个消费者验收。框架公开合同继续由 `echo-agent` 自身维护。
 
 ## 产品边界
 
@@ -98,12 +97,12 @@ Browser 和基础 Agent 资源。GUI 通过 `AppState` 持有这些资源；TUI�
   graph、重试循环或终态 reducer。六个 `agent_*` 工具由 `AppState` 在共享 ToolManager
   上一次绑定，因而 GUI/TUI/CLI/channel 使用同一 schema、authority 和 fail-closed 校验。
 - `PluginRuntimeService`：保存 framework `PreparedPluginSet` 与 apply receipt，负责 EKO
-  Subagent/LSP/monitor/theme/style policy、target publication 和偏好持久化；portable component
+  Subagent/monitor/theme/style policy、target publication 和偏好持久化；portable component
   的解析、apply 与 rollback 只走 framework authority。
 - `McpConfigRuntime`：用户 `mcp.json` 的唯一写入与连接 reconciliation。
 - `BrowserRuntime`：托管 Chromium/Chrome backend 与 browser event projection。
 - `ExtensionControlService`：在当前 workspace generation 上协调 Skills、Hooks、MCP、
-  Plugin、LSP 和 Browser，是所有产品 surface 共享的 EKO mutation admission。
+  Plugin 和 Browser，是所有产品 surface 共享的 EKO mutation admission。
 - `WorkflowService` / `StructuredExtractionService`：EKO catalog、显式 runtime address、
   typed outcome 与 surface command adapter；Graph/`extract_json` 执行仍由 framework 拥有。
 
@@ -331,7 +330,7 @@ EKO 启动时把 framework 用户数据根设置为 `~/.eko`，也可用 `EKO_DA
 | 层                 | 唯一职责                                                                             |
 | ------------------ | ------------------------------------------------------------------------------------ |
 | framework          | Skill/Hook registry、MCP/LSP 协议与通用 manager                                      |
-| specialist runtime | Plugin scan/wiring、MCP reconcile、Hook/LSP/Browser 实际执行                         |
+| specialist runtime | Plugin scan/wiring、MCP reconcile、Hook/Browser 实际执行                         |
 | EKO app-core       | workspace generation capture、mutation admission、配置文件、生命周期和 typed receipt |
 | surface            | 参数转换和 receipt 渲染                                                              |
 
@@ -355,18 +354,18 @@ workspace generation 的 target receipt 已进入生产路径。GUI/headless boo
 delivery recovery 前调用 on-load reconcile，workspace create/switch settlement 也执行同一
 收敛路径。
 
-`ExtensionCommandDispatcher` 提供 Skills/Plugins/MCP/Hooks/LSP/Browser 的 surface-neutral
+`ExtensionCommandDispatcher` 提供 Skills/Plugins/MCP/Hooks/Browser 的 surface-neutral
 request/receipt。GUI 使用 typed Tauri IPC；JSONL 把 typed `ExtensionReceipt` 写入 canonical
 journal/event stream且不进入模型；CLI、TUI、channel 通过同一 app-core service 做文本适配和
-terminal settlement。MCP health 按 authority scope 保存，Hook/LSP 使用 captured project root，
-当前 Browser 和 LSP 通过五类入口共用该实现；这描述迁移前现状，不要求继续扩张终端入口或保留 LSP。
+terminal settlement。MCP health 按 authority scope 保存，Hook 使用 captured project root，
+Browser 继续通过现有入口共用该实现；LSP 消费已退出，不要求扩张待退役终端入口。
 
 Plugin 与 MCP mutation 在 admission 时一次捕获 global seed 和全部 loaded workspace target；
 receipt 固定 scope、workspace generation、previous/candidate prepared generation、typed
 settled/degraded status 与 bounded diagnostics；Tauri/frontend 只做无损 wire projection。
 fanout 不再从 `AppState` 重新枚举 follower。cold workspace 从 authority 当前 framework
 generation/revision 起步，再加入该 target 的 Project/Local overlay；monitor scheduler key 带
-target scope。`.lsp.yaml` 变更只发布受影响 target 的 LSP generation，不触发完整 Plugin reload。
+target scope。旧 `.lsp.yaml` 仅保留退休诊断，不触发语言服务或 Plugin 重载。
 详见 [ADR 0022](../adr/0022-framework-prepared-plugin-generations.md)。
 
 普通 Chat 的 framework envelope 由 app-core sink 做 durable journal 与 surface 投影，
@@ -425,3 +424,18 @@ Tauri 模式使用既有 `VITE_EKO_TAURI` 检测标记。
 
 浏览器隔离夹具的主题/布局截图与原生 Tauri 窗口验收分别取证。视觉层不新增 chat、HITL、
 任务、终端或插件执行状态，也不引入新组件框架或主题 store。
+
+
+### LSP 消费边界
+
+primary bootstrap 与 scoped AgentPool 构造不再安装五个 LSP 工具或 manager。
+`PluginRuntimeService` 独立保存 project-root 锁，仍在原发布成功/失败收敛点更新根目录。
+MCP ownership token、生命周期 rollback、monitor 替换和 parked cleanup receipt 继续由原 owner 结算。
+
+混合 prepared generation 只对已退役 LSP 组件诊断容忍，其它组件失败仍按原策略拒绝。
+reload 收据报告退役组件，合法 Skill/MCP/Subagent/monitor/theme/style 继续处理。
+完整通用冻结诊断（含 Warning）在既有收据文案中保留原严重程度与来源身份；
+EKO 不依赖 LSP 专属 document、字段或方法。晚到文件变化不改变已准备代的收据，
+cache invalidate 仍由原框架 integrator 拥有。
+旧配置识别仅供诊断；设置保留 lazy 与局部 ErrorBoundary，未知旧 `lsp` 键回到总览，旧 typed/invoke
+请求通过既有 unsupported/serde 边界明确失败。

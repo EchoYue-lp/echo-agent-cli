@@ -324,6 +324,7 @@ pub async fn discover_config() -> Result<serde_json::Value, IpcError> {
         .collect();
 
     Ok(serde_json::json!({
+        "diagnostics": inventory.diagnostics,
         "total": inventory.total_count(),
         "files": files,
     }))

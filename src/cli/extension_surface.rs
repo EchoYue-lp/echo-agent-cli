@@ -14,7 +14,6 @@ fn kind_for_root(root: &str) -> Option<ExtensionKind> {
         "plugins" => Some(ExtensionKind::Plugins),
         "mcp" => Some(ExtensionKind::Mcp),
         "hooks" => Some(ExtensionKind::Hooks),
-        "lsp" => Some(ExtensionKind::Lsp),
         "browser" => Some(ExtensionKind::Browser),
         _ => None,
     }
@@ -134,7 +133,6 @@ mod tests {
             ("plugins", "validate .", ExtensionKind::Plugins),
             ("mcp", "enable local", ExtensionKind::Mcp),
             ("hooks", "test PreToolUse *", ExtensionKind::Hooks),
-            ("lsp", "restart rust", ExtensionKind::Lsp),
             ("browser", "tabs list", ExtensionKind::Browser),
         ];
         for (root, arguments, expected) in commands {

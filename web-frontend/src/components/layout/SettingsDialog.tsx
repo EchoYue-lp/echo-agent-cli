@@ -20,7 +20,6 @@ import {
   Webhook,
   Timer,
   GitBranch,
-  Code2,
   LayoutDashboard,
   ChevronDown,
   ChevronRight,
@@ -85,9 +84,6 @@ const ObservabilityPanel = lazy(() =>
 const SandboxPanel = lazy(() =>
   import('../sandbox/SandboxPanel').then((module) => ({ default: module.SandboxPanel }))
 );
-const LspPanel = lazy(() =>
-  import('../lsp/LspPanel').then((module) => ({ default: module.LspPanel }))
-);
 interface SettingsItem {
   id: SettingsTabId;
   label: string;
@@ -134,7 +130,6 @@ const settingsGroups: SettingsGroup[] = [
         description: 'Agent 可用工具与权限',
       },
       { id: 'mcp', label: 'MCP', icon: Globe, maturity: 'core', description: '本地扩展服务连接' },
-      { id: 'lsp', label: 'LSP', icon: Code2, maturity: 'core', description: '项目语言服务' },
       {
         id: 'skills',
         label: '技能',
@@ -258,7 +253,6 @@ const panels: Record<SettingsTabId, React.FC> = {
   overview: SettingsOverview,
   tools: ToolsPanel,
   mcp: McpPanel,
-  lsp: LspPanel,
   skills: SkillsPanel,
   memory: MemoryPanel,
 

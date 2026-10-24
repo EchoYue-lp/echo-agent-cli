@@ -1432,7 +1432,6 @@ impl AgentRuntime {
     /// 7. Create hook bridges (task + subagent lifecycle)
     /// 8. Initialize unified memory
     /// 9. Load plugins (skills / hooks / MCP)
-    /// 10. Register LSP tools
     /// 11. Fire startup hook
     pub async fn bootstrap(
         app_config: &EkoConfig,
@@ -1790,15 +1789,10 @@ impl AgentRuntime {
             tracing::info!("Layered memory, evidence sink, and skill policy installed");
         }
 
-        // ── 9. LSP runtime ──
-        // Plugins and built-in project discovery share this single manager;
-        // plugin reload atomically replaces its contents while every LSP tool
-        // keeps the same Arc handle.
-        let lsp_project_root = agent_handle
+        let plugin_project_root = agent_handle
             .read(|agent| agent.working_dir())
             .await
             .unwrap_or_else(crate::data_root::user_data_dir);
-        let lsp_runtime = register_lsp_tools(&agent_handle, &lsp_project_root).await;
 
         // ── 10. Plugins ──
         // Discovery, initial wiring, and later live mutations all go through
@@ -1809,7 +1803,7 @@ impl AgentRuntime {
         // adopts and retries.
         let plugin_runtime = match crate::plugin_runtime::PluginRuntimeService::new_owned(
             agent_handle.clone(),
-            lsp_runtime,
+            plugin_project_root,
             mcp_config_runtime.ownership(),
         )
         .await
@@ -2021,65 +2015,6 @@ pub(crate) fn configure_intent_router(
         "IntentRouter replaced from committed skill catalog"
     );
     keyword_classifier
-}
-
-/// Register the shared LSP specialist for one explicit workspace identity.
-///
-/// The caller owns workspace selection. Keeping cwd fallback out of this
-/// function prevents a process-level directory from being mistaken for the
-/// active GUI/headless workspace during generation changes.
-pub(crate) async fn register_lsp_tools(
-    agent_handle: &AgentHandle,
-    project_root: &std::path::Path,
-) -> crate::plugin_runtime::PluginLspRuntime {
-    use echo_agent::lsp::LspManager;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
-
-    let config = crate::plugin_runtime::PluginLspRuntime::config_for_workspace(project_root);
-    if !config.servers.is_empty() {
-        tracing::info!(
-            root = %project_root.display(),
-            languages = config.servers.len(),
-            "LSP servers auto-discovered"
-        );
-    }
-
-    let mut lsp_manager = LspManager::new();
-    if let Err(error) = lsp_manager.load_config(&config) {
-        tracing::warn!(%error, "LSP config failed to load for workspace");
-    }
-    lsp_manager.set_project_root(project_root);
-    let languages: Vec<String> = lsp_manager
-        .configured_languages()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    for language in languages {
-        if let Err(error) = lsp_manager.start_server(&language).await {
-            tracing::warn!(%language, %error, "LSP server unavailable");
-        }
-    }
-
-    let shared_lsp = Arc::new(RwLock::new(lsp_manager));
-    agent_handle
-        .write_async(|a| {
-            let shared_lsp = shared_lsp.clone();
-            Box::pin(async move {
-                use echo_agent::tools::lsp::{
-                    LspDiagnosticsTool, LspFindReferencesTool, LspGotoDefinitionTool, LspHoverTool,
-                    LspStatusTool,
-                };
-                a.add_tool(Box::new(LspDiagnosticsTool::new(shared_lsp.clone())));
-                a.add_tool(Box::new(LspGotoDefinitionTool::new(shared_lsp.clone())));
-                a.add_tool(Box::new(LspFindReferencesTool::new(shared_lsp.clone())));
-                a.add_tool(Box::new(LspHoverTool::new(shared_lsp.clone())));
-                a.add_tool(Box::new(LspStatusTool::new(shared_lsp)));
-            })
-        })
-        .await;
-    tracing::info!("LSP tools registered");
-    crate::plugin_runtime::PluginLspRuntime::new(shared_lsp, config, project_root.to_path_buf())
 }
 
 #[cfg(test)]

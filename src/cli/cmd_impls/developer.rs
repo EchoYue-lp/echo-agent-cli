@@ -38,7 +38,7 @@ impl SlashCommand for DeveloperCommand {
         args: &'a [&'a str],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CommandOutcome> + Send + 'a>> {
         Box::pin(async move {
-            if matches!(self.name, "lsp" | "browser") {
+            if self.name == "browser" {
                 let receipt = crate::cli::extension_surface::dispatch_extension_command(
                     ctx.app_state.as_ref(),
                     ctx.conversation_id.as_deref(),

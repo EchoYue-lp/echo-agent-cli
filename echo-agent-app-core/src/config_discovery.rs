@@ -17,9 +17,8 @@
 //! | `local.md` | `<cwd>/.eko/` | Local directory instructions |
 //! | `plugin.json` | Plugin directories | Agent Plugin manifests |
 //! | `.eko/workspace.json` | Workspace directories | Workspace metadata |
-//! | `.lsp.yaml` | Project root | LSP server configuration |
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A discovered configuration file.
 #[derive(Debug, Clone)]
@@ -75,8 +74,6 @@ pub enum ConfigCategory {
     Plugin,
     /// Workspace metadata.
     Workspace,
-    /// LSP server configuration.
-    Lsp,
 }
 
 impl std::fmt::Display for ConfigCategory {
@@ -88,7 +85,6 @@ impl std::fmt::Display for ConfigCategory {
             Self::Instructions => write!(f, "instructions"),
             Self::Plugin => write!(f, "plugin"),
             Self::Workspace => write!(f, "workspace"),
-            Self::Lsp => write!(f, "lsp"),
         }
     }
 }
@@ -108,8 +104,8 @@ pub struct ConfigInventory {
     pub plugin_manifests: Vec<ConfigFile>,
     /// Workspace metadata files.
     pub workspace_configs: Vec<ConfigFile>,
-    /// LSP configuration files.
-    pub lsp_configs: Vec<ConfigFile>,
+    /// Unsupported legacy inputs, reported without parsing or deleting them.
+    pub diagnostics: Vec<String>,
 }
 
 impl ConfigInventory {
@@ -121,7 +117,6 @@ impl ConfigInventory {
             + self.instructions.len()
             + self.plugin_manifests.len()
             + self.workspace_configs.len()
-            + self.lsp_configs.len()
     }
 
     /// Get all files across all categories.
@@ -133,7 +128,6 @@ impl ConfigInventory {
         all.extend(self.instructions.iter());
         all.extend(self.plugin_manifests.iter());
         all.extend(self.workspace_configs.iter());
-        all.extend(self.lsp_configs.iter());
         all
     }
 
@@ -200,7 +194,8 @@ impl ConfigDiscovery {
         self.discover_instructions(&mut inventory);
         self.discover_plugin_manifests(&mut inventory);
         self.discover_workspace_configs(&mut inventory);
-        self.discover_lsp_configs(&mut inventory);
+        inventory.diagnostics =
+            retired_lsp_config_diagnostics(self.project_root.as_deref(), &self.data_root);
 
         inventory
     }
@@ -376,30 +371,6 @@ impl ConfigDiscovery {
             }
         }
     }
-
-    fn discover_lsp_configs(&self, inv: &mut ConfigInventory) {
-        // Project: <root>/.lsp.yaml
-        if let Some(ref root) = self.project_root {
-            let project = root.join(".lsp.yaml");
-            inv.lsp_configs.push(ConfigFile {
-                name: ".lsp.yaml (project)".into(),
-                path: project.clone(),
-                scope: ConfigScope::Project,
-                category: ConfigCategory::Lsp,
-                accessible: project.exists(),
-            });
-        }
-
-        // Global: ~/.eko/.lsp.yaml
-        let global = self.data_root.join(".lsp.yaml");
-        inv.lsp_configs.push(ConfigFile {
-            name: ".lsp.yaml (global)".into(),
-            path: global.clone(),
-            scope: ConfigScope::Global,
-            category: ConfigCategory::Lsp,
-            accessible: global.exists(),
-        });
-    }
 }
 
 impl Default for ConfigDiscovery {
@@ -410,9 +381,44 @@ impl Default for ConfigDiscovery {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
+/// Recognize retired inputs for diagnostics only. No parser, server or file mutation.
+pub(crate) fn retired_lsp_config_diagnostics(
+    project_root: Option<&Path>,
+    data_root: &Path,
+) -> Vec<String> {
+    let mut paths = vec![data_root.join(".lsp.yaml")];
+    if let Some(root) = project_root {
+        paths.extend(root.ancestors().map(|path| path.join(".lsp.yaml")));
+    }
+    paths.sort();
+    paths.dedup();
+    paths.into_iter().filter(|path| match std::fs::symlink_metadata(path) {
+            Ok(_) => true,
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        })
+        .map(|path| format!("LSP has been retired from EKO; unsupported configuration '{}' was not loaded and remains unchanged", path.display()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_lsp_config_is_diagnostic_only_and_preserved() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = temp.path().join(".lsp.yaml");
+        let content = b"invalid legacy config [";
+        std::fs::write(&path, content).map_err(|error| error.to_string())?;
+        let messages = retired_lsp_config_diagnostics(Some(temp.path()), temp.path());
+        assert_eq!(messages.len(), 1);
+        assert!(messages.iter().any(|message| message.contains("retired") && message.contains("remains unchanged")));
+        assert_eq!(
+            std::fs::read(path).map_err(|error| error.to_string())?,
+            content
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_config_discovery_creation() {

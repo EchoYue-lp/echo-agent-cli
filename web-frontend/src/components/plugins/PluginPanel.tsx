@@ -234,12 +234,15 @@ export function PluginPanel() {
       setDeveloperBusy(true);
       const report = await pluginApi.validate(requestScope, developerPath.trim());
       setMessage(
-        report.valid
+        report.valid && report.errors.length === 0
           ? {
               type: 'success',
               text: `Plugin '${report.name || 'unknown'}' is valid: ${report.components.join(', ')}`,
             }
-          : { type: 'error', text: report.errors.join('; ') || 'Validation failed' }
+          : {
+              type: 'error',
+              text: `${report.valid ? `Retained components valid: ${report.components.join(', ')}. ` : ''}${report.errors.join('; ') || 'Validation failed'}`,
+            }
       );
     } catch (e: any) {
       setMessage({ type: 'error', text: e.message || 'Validation failed' });

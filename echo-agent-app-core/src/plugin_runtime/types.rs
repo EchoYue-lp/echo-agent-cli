@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
-use echo_agent::lsp::{LspConfig, LspManager, LspServerStatus};
 use echo_agent::plugin::{
     AGENT_PLUGIN_SCHEMA_V1, InstallSource, PluginEntry, PluginIntegrator, PluginLifecycle,
     PluginLifecycleManager, PluginPreparationDiagnostic, PluginRegistry, PluginScope,
@@ -27,81 +26,6 @@ use crate::scheduler::{CronTask, SchedulerRunner};
 
 pub(crate) const OUTPUT_STYLE_PROJECTION: &str = "eko:plugin-output-style";
 
-#[derive(Clone)]
-pub struct PluginLspRuntime {
-    pub manager: Arc<RwLock<LspManager>>,
-    binding: Arc<RwLock<PluginLspBinding>>,
-}
-
-#[derive(Clone)]
-struct PluginLspBinding {
-    base_config: LspConfig,
-    project_root: PathBuf,
-}
-
-impl PluginLspRuntime {
-    pub fn new(
-        manager: Arc<RwLock<LspManager>>,
-        base_config: LspConfig,
-        project_root: PathBuf,
-    ) -> Self {
-        Self {
-            manager,
-            binding: Arc::new(RwLock::new(PluginLspBinding {
-                base_config,
-                project_root,
-            })),
-        }
-    }
-
-    /// Build the non-plugin LSP configuration for one workspace generation.
-    pub fn config_for_workspace(project_root: &Path) -> LspConfig {
-        let mut config = LspConfig::discover(project_root);
-        let global_lsp = crate::data_root::user_data_path(".lsp.yaml");
-        if global_lsp.is_file() {
-            match LspConfig::from_file(&global_lsp) {
-                Ok(global) => config.merge(global),
-                Err(error) => tracing::warn!(
-                    path = %global_lsp.display(),
-                    %error,
-                    "Failed to load global LSP config"
-                ),
-            }
-        }
-
-        let mut directory = Some(project_root);
-        let project_lsp = loop {
-            let Some(candidate_root) = directory else {
-                break None;
-            };
-            let candidate = candidate_root.join(".lsp.yaml");
-            if candidate.is_file() {
-                break Some(candidate);
-            }
-            directory = candidate_root.parent();
-        };
-        if let Some(project_lsp) = project_lsp {
-            match LspConfig::from_file(&project_lsp) {
-                Ok(project) => config.merge(project),
-                Err(error) => tracing::warn!(
-                    path = %project_lsp.display(),
-                    %error,
-                    "Failed to load project LSP config"
-                ),
-            }
-        }
-        config
-    }
-
-    async fn binding(&self) -> PluginLspBinding {
-        self.binding.read().await.clone()
-    }
-
-    async fn publish_binding(&self, binding: PluginLspBinding) {
-        *self.binding.write().await = binding;
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct ReloadSummary {
     pub total: usize,
@@ -110,7 +34,6 @@ pub struct ReloadSummary {
     pub hooks_registered: usize,
     pub mcp_connected: usize,
     pub agents_loaded: usize,
-    pub lsp_languages_loaded: usize,
     pub monitors_loaded: usize,
     pub themes_loaded: usize,
     pub output_styles_loaded: usize,
@@ -132,21 +55,22 @@ impl ReloadSummary {
             hooks_registered: wiring.map_or(0, |receipt| receipt.hooks_registered.len()),
             mcp_connected: wiring.map_or(0, |receipt| receipt.mcp_connected.len()),
             agents_loaded: application.agents.len(),
-            lsp_languages_loaded: application
-                .lsp_configs
-                .iter()
-                .map(|(_, config)| config.servers.len())
-                .sum(),
             monitors_loaded: application.monitors.len(),
             themes_loaded: application.themes.len(),
             output_styles_loaded: application.output_styles.len(),
             errors: generation
                 .into_iter()
                 .flat_map(PreparedPluginSet::diagnostics)
-                .filter(|diagnostic| {
-                    diagnostic.severity() == echo_agent::plugin::PluginDiagnosticSeverity::Error
+                .map(|diagnostic| {
+                    // Preserve the frozen diagnostic and its severity; EKO only adds
+                    // its product decision to the retired component's explanation.
+                    let severity = diagnostic.severity();
+                    if diagnostic.component() == "lsp" {
+                        format!("{severity:?}: LSP component has been retired from EKO; no language server was loaded; legacy input remains unchanged: {diagnostic}")
+                    } else {
+                        format!("{severity:?}: {diagnostic}")
+                    }
                 })
-                .map(ToString::to_string)
                 .collect(),
         }
     }
@@ -173,7 +97,6 @@ pub enum EkoPluginCapability {
     Skill,
     Hook,
     McpServer,
-    LspServer,
     Agent,
     Tool,
     Monitor,
@@ -187,7 +110,6 @@ impl EkoPluginCapability {
             Self::Skill => "Skills",
             Self::Hook => "Hooks",
             Self::McpServer => "MCP Servers",
-            Self::LspServer => "LSP Servers",
             Self::Agent => "Agents",
             Self::Tool => "Tools",
             Self::Monitor => "Monitors",
@@ -197,16 +119,19 @@ impl EkoPluginCapability {
     }
 }
 
-impl From<echo_agent::plugin::PluginCapability> for EkoPluginCapability {
-    fn from(capability: echo_agent::plugin::PluginCapability) -> Self {
-        match capability {
-            echo_agent::plugin::PluginCapability::Skill => Self::Skill,
-            echo_agent::plugin::PluginCapability::Hook => Self::Hook,
-            echo_agent::plugin::PluginCapability::McpServer => Self::McpServer,
-            echo_agent::plugin::PluginCapability::LspServer => Self::LspServer,
-            echo_agent::plugin::PluginCapability::Agent => Self::Agent,
-            echo_agent::plugin::PluginCapability::Tool => Self::Tool,
-        }
+impl EkoPluginCapability {
+    fn from_framework(capability: echo_agent::plugin::PluginCapability) -> Option<Self> {
+        use echo_agent::plugin::PluginCapability;
+        // Select supported portable components without depending on retired enum variants.
+        [
+            (PluginCapability::Skill, Self::Skill),
+            (PluginCapability::Hook, Self::Hook),
+            (PluginCapability::McpServer, Self::McpServer),
+            (PluginCapability::Agent, Self::Agent),
+            (PluginCapability::Tool, Self::Tool),
+        ]
+        .into_iter()
+        .find_map(|(supported, projection)| (capability == supported).then_some(projection))
     }
 }
 
@@ -214,7 +139,7 @@ pub fn plugin_capabilities(entry: &PluginEntry) -> Vec<EkoPluginCapability> {
     let mut capabilities = entry
         .inferred_capabilities()
         .into_iter()
-        .map(EkoPluginCapability::from)
+        .filter_map(EkoPluginCapability::from_framework)
         .collect::<Vec<_>>();
     if let Ok(eko) = crate::plugin_components::resolve_eko_components(&entry.root) {
         if eko.monitors_file.is_some() {
@@ -651,7 +576,7 @@ impl Default for PluginMutationSupervisor {
 
 pub struct PluginRuntimeService {
     agent_handle: AgentHandle,
-    lsp: PluginLspRuntime,
+    project_root: RwLock<PathBuf>,
     scheduler: RwLock<Option<Arc<SchedulerRunner>>>,
     mcp_ownership: Arc<McpNameOwnershipRegistry>,
     integrator: PluginIntegrator,

@@ -103,7 +103,9 @@ and retained durable authority. They do not prescribe GUI-only products or imply
 that EKO implements those systems. GUI-only scope and named protocol retirement
 are the user's approved product choices; existing EKO owners supply the mechanisms.
 
-## Impact, recovery and acceptance
+## Consequences
+
+### Recovery and acceptance
 
 The local annotated `pre-retirement-2026-10-24` tag and
 `chore/Echoyue/full-capabilities-baseline` branch both resolve to
@@ -119,7 +121,7 @@ and A2A/LSP retention, including scope assumptions in historical ADR 0010, 0012,
 0017 and 0042; their source and historical implementation evidence remain intact.
 The current production architecture is not rewritten as if retirement occurred.
 
-This documentation slice changes rules, bilingual ADR/architecture pages and
+The initial documentation slice changed rules, bilingual ADR/architecture pages and
 parity registration only. No Rust/TS, manifest/lock, generated contract, CI or
 example changes are needed to express the approved direction. README, feature
 and quickstart pages continue to describe the current implemented baseline;
@@ -148,3 +150,23 @@ console removal. EKO/SDK no longer requesting or invoking A2A/LSP must be accept
 before framework removal. Then verify absent active implementations, registrations,
 features and advertisements with remaining consumer/example/CI matrices. Documentation
 parity or a source search alone is not runtime or native acceptance.
+
+
+## EKO consumer implementation
+
+EKO removes its `lsp` feature requests, five tool registrations, managers, plugin
+LSP generation branches, extension command/type projections, configuration reload,
+GUI settings and invoke registration. `PluginRuntimeService` retains explicit root
+ownership and all original publication/rollback/cleanup receipts. Retired component
+requests are diagnosed, user files preserved, and mixed plugins retain legal
+components. Framework A2A/LSP code and independent console entries remain in place.
+This consumer-only change does not claim SDK completion or framework deletion.
+Retirement diagnostics consume the existing generic `PreparedPluginSet::diagnostics()`
+from framework bridge `e4e50396876c5e7e85b52cdc3dbb510bab9c4f4d`. EKO keeps every
+frozen diagnostic's component, plugin, source path and severity, and maps the `lsp`
+component to product retirement wording. It does not depend on LSP-specific public
+metadata or reread live plugin files after preparation.
+The bridge is additive and precedes the EKO consumer switch; later framework
+physical deletion retains generic old-input diagnostics without retaining a
+language-service executor. Original applicability and non-LSP Error rejection
+remain unchanged; no new decoder or state owner is introduced.

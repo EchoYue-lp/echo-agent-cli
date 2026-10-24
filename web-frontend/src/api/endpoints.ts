@@ -2336,7 +2336,6 @@ function pluginMutationFromReceipt(
   hooks_registered?: number;
   mcp_connected?: number;
   agents_loaded?: number;
-  lsp_languages_loaded?: number;
   monitors_loaded?: number;
   themes_loaded?: number;
   output_styles_loaded?: number;
@@ -2367,7 +2366,6 @@ function pluginMutationFromReceipt(
     hooks_registered: projection?.summary.hooks_registered,
     mcp_connected: projection?.summary.mcp_connected,
     agents_loaded: projection?.summary.agents_loaded,
-    lsp_languages_loaded: projection?.summary.lsp_languages_loaded,
     monitors_loaded: projection?.summary.monitors_loaded,
     themes_loaded: projection?.summary.themes_loaded,
     output_styles_loaded: projection?.summary.output_styles_loaded,
@@ -2625,7 +2623,6 @@ export const pluginApi = {
           hooks_registered?: number;
           mcp_connected?: number;
           agents_loaded?: number;
-          lsp_languages_loaded?: number;
           monitors_loaded?: number;
           themes_loaded?: number;
           output_styles_loaded?: number;
@@ -2927,22 +2924,4 @@ export const worktreeApi = {
     }),
   cleanupUnattended: (workspaceId: string) =>
     apiInvoke<UnattendedWorktreeCleanupResult>('cleanup_unattended_worktrees', { workspaceId }),
-};
-
-export interface LspControlResult {
-  message: string;
-  meta: ExtensionReceiptMeta;
-  receipt: ExtensionCommandReceipt;
-}
-
-export const lspApi = {
-  control: (requestScope: ExtensionRequestScope, action: string, language?: string) =>
-    apiInvoke<ExtensionCommandReceipt>('lsp_control', { requestScope, action, language }).then(
-      (receipt) => {
-        if (receipt.extension !== 'lsp' || receipt.meta.status !== 'settled' || !receipt.receipt) {
-          throw new Error(receipt.meta.error ?? 'LSP command did not settle');
-        }
-        return { message: receipt.receipt.message, meta: receipt.meta, receipt };
-      }
-    ),
 };

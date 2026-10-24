@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use echo_agent::agent::{Agent, ReactAgent, ReactAgentBuilder};
-use echo_agent::lsp::LspConfig;
 use echo_agent::plugin::{PluginVariables, PreparedPluginSet, ResolvedComponents};
 use echo_agent::subagent::{
     AgentFactory, ExecutionMode, FnAgentFactory, SubagentAccessMode, SubagentExecutionBoundary,
@@ -46,7 +45,6 @@ pub struct PluginOutputStyle {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PreparedApplicationComponents {
     pub agents: Vec<PreparedPluginAgent>,
-    pub lsp_configs: Vec<(String, LspConfig)>,
     pub monitors: Vec<CronTask>,
     pub themes: Vec<PluginThemeDefinition>,
     pub output_styles: Vec<PluginOutputStyle>,
@@ -108,7 +106,6 @@ pub(crate) fn prepare_application_components(
 ) -> Result<PreparedApplicationComponents, Vec<String>> {
     let mut prepared = PreparedApplicationComponents::default();
     let mut agent_names = HashSet::new();
-    let mut lsp_languages = HashSet::new();
     let mut monitor_ids = HashSet::new();
     let mut theme_names = HashSet::new();
     let mut output_style_names = HashSet::new();
@@ -139,29 +136,6 @@ pub(crate) fn prepare_application_components(
                     }
                 }
                 Err(error) => errors.push(error),
-            }
-        }
-
-        if let Some(document) = plugin.lsp_document() {
-            match LspConfig::from_yaml(document.contents()) {
-                Ok(config) => {
-                    let duplicate = config
-                        .servers
-                        .keys()
-                        .find(|language| lsp_languages.contains(*language));
-                    if let Some(language) = duplicate {
-                        errors.push(format!(
-                            "Plugin '{plugin_id}' declares duplicate LSP language '{language}'"
-                        ));
-                    } else {
-                        lsp_languages.extend(config.servers.keys().cloned());
-                        prepared.lsp_configs.push((plugin_id.to_string(), config));
-                    }
-                }
-                Err(error) => errors.push(format!(
-                    "Plugin '{plugin_id}' LSP config '{}': {error}",
-                    document.source_path().display()
-                )),
             }
         }
 
@@ -250,15 +224,7 @@ pub(crate) fn validate_application_component_files(
             errors.push(error);
         }
     }
-    if let Some(path) = &resolved.lsp_config_file
-        && let Err(error) = read_component_text(path, Some(variables))
-            .and_then(|content| LspConfig::from_yaml(&content))
-    {
-        errors.push(format!(
-            "Plugin '{plugin}' LSP config '{}': {error}",
-            path.display()
-        ));
-    }
+
     let eko_components = match resolve_eko_components(root) {
         Ok(components) => components,
         Err(error) => {

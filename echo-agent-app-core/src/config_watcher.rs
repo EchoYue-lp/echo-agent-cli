@@ -1,12 +1,12 @@
 //! Extension-config watcher — monitors the app config plus every registered
-//! workspace's `hooks.yaml`/`.lsp.yaml`, hot-reloads user hooks, LSP generations
+//! workspace's `hooks.yaml`, hot-reloads user hooks
 //! and webhook endpoints, and fires the `ConfigChange` lifecycle hook.
 //!
 //! ## Scope (intentional)
 //!
-//! Hooks, LSP generations and webhook endpoints are reloaded here. Model and
+//! Hooks and webhook endpoints are reloaded here. Model and
 //! MCP generations have separate application-owned publication paths; runtime
-//! limits still require a restart. LSP publication delegates through the shared
+//! limits still require a restart. Plugin publication delegates through the shared
 //! `ExtensionControlService` admission and `PluginRuntimeService` mutation owner,
 //! so this watcher never becomes a second mutation state machine.
 //!
@@ -101,7 +101,6 @@ struct RegisteredConfigTarget {
     identity: ConfigWatcherWorkspaceIdentity,
     root: PathBuf,
     agent: Weak<tokio::sync::RwLock<echo_agent::agent::ReactAgent>>,
-    plugin_runtime: Option<Weak<crate::plugin_runtime::PluginRuntimeService>>,
 }
 
 impl RegisteredConfigTarget {
@@ -109,22 +108,17 @@ impl RegisteredConfigTarget {
         identity: ConfigWatcherWorkspaceIdentity,
         root: PathBuf,
         agent: &AgentHandle,
-        plugin_runtime: Option<&Arc<crate::plugin_runtime::PluginRuntimeService>>,
+        _plugin_runtime: Option<&Arc<crate::plugin_runtime::PluginRuntimeService>>,
     ) -> Self {
         Self {
             identity,
             root,
             agent: Arc::downgrade(agent.inner()),
-            plugin_runtime: plugin_runtime.map(Arc::downgrade),
         }
     }
 
     fn agent(&self) -> Option<AgentHandle> {
         self.agent.upgrade().map(AgentHandle::from_arc)
-    }
-
-    fn plugin_runtime(&self) -> Option<Arc<crate::plugin_runtime::PluginRuntimeService>> {
-        self.plugin_runtime.as_ref().and_then(Weak::upgrade)
     }
 
     fn is_live(&self) -> bool {
@@ -663,11 +657,10 @@ fn config_watch_targets<'a>(
         targets.push(path.to_path_buf());
     }
     targets.push(crate::data_root::user_data_path("hooks.yaml"));
-    targets.push(crate::data_root::user_data_path(".lsp.yaml"));
     targets.extend(
         workspace_roots
             .into_iter()
-            .flat_map(|root| [root.join(".eko").join("hooks.yaml"), root.join(".lsp.yaml")]),
+            .map(|root| root.join(".eko").join("hooks.yaml")),
     );
     targets.sort();
     targets.dedup();
@@ -696,26 +689,15 @@ async fn handle_config_change(
     webhook_emitter: Option<&crate::webhook::WebhookEmitter>,
 ) {
     let path_str = changed_path.to_string_lossy().to_string();
-    let global_lsp = crate::data_root::user_data_path(".lsp.yaml");
+    if changed_path
+        .file_name()
+        .is_some_and(|name| name == ".lsp.yaml")
+    {
+        warn!(path = %changed_path.display(), "LSP has been retired from EKO; configuration is unsupported and remains unchanged");
+        return;
+    }
 
     for target in registered {
-        let is_lsp = changed_path
-            .file_name()
-            .is_some_and(|name| name == ".lsp.yaml");
-        if is_lsp {
-            let target_lsp = target.root.join(".lsp.yaml");
-            if changed_path != global_lsp && changed_path != target_lsp {
-                continue;
-            }
-            if let Some(runtime) = target.plugin_runtime()
-                && let Err(error) = extension_control
-                    .reload_plugin_lsp(runtime, target.root.clone())
-                    .await
-            {
-                warn!(workspace_root = %target.root.display(), %error, "LSP config publication rejected; keeping last known-good generation");
-            }
-            continue;
-        }
         let Some(agent) = target.agent() else {
             continue;
         };
@@ -765,16 +747,16 @@ mod tests {
     use echo_agent::testing::MockLlmClient;
 
     #[test]
-    fn watch_targets_include_hook_and_lsp_authorities() -> Result<(), String> {
+    fn watch_targets_include_hooks_but_exclude_retired_lsp() -> Result<(), String> {
         let current = std::env::current_dir().map_err(|error| error.to_string())?;
         let app = current.join("echo-agent.test.yaml");
         let targets = config_watch_targets(Some(&app), [current.as_path()]);
 
         assert!(targets.contains(&app));
         assert!(targets.contains(&crate::data_root::user_data_path("hooks.yaml")));
-        assert!(targets.contains(&crate::data_root::user_data_path(".lsp.yaml")));
+        assert!(!targets.contains(&crate::data_root::user_data_path(".lsp.yaml")));
         assert!(targets.contains(&current.join(".eko/hooks.yaml")));
-        assert!(targets.contains(&current.join(".lsp.yaml")));
+        assert!(!targets.contains(&current.join(".lsp.yaml")));
         Ok(())
     }
 
@@ -928,9 +910,7 @@ mod tests {
         std::fs::create_dir_all(bootstrap_root.join(".eko")).map_err(|error| error.to_string())?;
         std::fs::create_dir_all(workspace_root.join(".eko")).map_err(|error| error.to_string())?;
         let hook_path = workspace_root.join(".eko/hooks.yaml");
-        let lsp_path = workspace_root.join(".lsp.yaml");
         write_test_hook(&hook_path, "old-generation")?;
-        write_test_lsp(&lsp_path, "old-language")?;
 
         let bootstrap = test_agent()?;
         let old_agent = test_agent()?;
@@ -966,22 +946,6 @@ mod tests {
         assert_eq!(Arc::strong_count(old_agent.inner()), agent_strong_before);
         assert_eq!(Arc::strong_count(&old_plugin), plugin_strong_before);
         assert_eq!(hook_match_count(&old_agent, "old-generation").await, 1);
-        let plugin_generation_before = old_plugin.prepared_generation_identity().await;
-        handle
-            .trigger_change_for_test(lsp_path.clone())
-            .await
-            .map_err(|error| error.to_string())?;
-        assert!(
-            old_plugin
-                .lsp_configured_languages()
-                .await
-                .iter()
-                .any(|language| language == "old-language")
-        );
-        assert_eq!(
-            old_plugin.prepared_generation_identity().await,
-            plugin_generation_before
-        );
 
         assert!(
             handle
@@ -992,7 +956,6 @@ mod tests {
         assert!(!handle.registered_roots().await.contains(&workspace_root));
 
         write_test_hook(&hook_path, "new-generation")?;
-        write_test_lsp(&lsp_path, "new-language")?;
         let new_agent = test_agent()?;
         let new_plugin = crate::plugin_runtime::PluginRuntimeService::new_for_test(
             new_agent.clone(),
@@ -1013,17 +976,6 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         assert_eq!(hook_match_count(&new_agent, "new-generation").await, 1);
-        handle
-            .trigger_change_for_test(lsp_path.clone())
-            .await
-            .map_err(|error| error.to_string())?;
-        assert!(
-            new_plugin
-                .lsp_configured_languages()
-                .await
-                .iter()
-                .any(|language| language == "new-language")
-        );
 
         // A delayed delete settlement from generation 1 cannot unregister the
         // same-id replacement generation.
@@ -1034,13 +986,8 @@ mod tests {
                 .map_err(|error| error.to_string())?
         );
         write_test_hook(&hook_path, "new-generation-reloaded")?;
-        write_test_lsp(&lsp_path, "new-language-reloaded")?;
         handle
             .trigger_change_for_test(hook_path)
-            .await
-            .map_err(|error| error.to_string())?;
-        handle
-            .trigger_change_for_test(lsp_path)
             .await
             .map_err(|error| error.to_string())?;
 
@@ -1053,28 +1000,6 @@ mod tests {
             0
         );
         assert_eq!(hook_match_count(&old_agent, "old-generation").await, 1);
-        let new_languages = new_plugin.lsp_configured_languages().await;
-        assert!(
-            new_languages
-                .iter()
-                .any(|language| language == "new-language-reloaded")
-        );
-        assert!(
-            !new_languages
-                .iter()
-                .any(|language| language == "old-language")
-        );
-        let old_languages = old_plugin.lsp_configured_languages().await;
-        assert!(
-            old_languages
-                .iter()
-                .any(|language| language == "old-language")
-        );
-        assert!(
-            !old_languages
-                .iter()
-                .any(|language| language == "new-language-reloaded")
-        );
         assert!(handle.registered_roots().await.contains(&workspace_root));
         handle.shutdown().await.map_err(|error| error.to_string())?;
         old_plugin
@@ -1096,25 +1021,6 @@ mod tests {
             ),
         )
         .map_err(|error| error.to_string())
-    }
-
-    fn write_test_lsp(path: &Path, language: &str) -> Result<(), String> {
-        let config = echo_agent::lsp::LspConfigFile {
-            languages: std::collections::HashMap::from([(
-                language.to_string(),
-                echo_agent::lsp::LspServerConfig {
-                    language: language.to_string(),
-                    command: "test-language-server".to_string(),
-                    args: Vec::new(),
-                    extensions: vec![format!(".{language}")],
-                    env: std::collections::HashMap::new(),
-                    initialization_options: None,
-                    max_restarts: 0,
-                },
-            )]),
-        };
-        let yaml = serde_yaml::to_string(&config).map_err(|error| error.to_string())?;
-        std::fs::write(path, yaml).map_err(|error| error.to_string())
     }
 
     fn test_agent() -> Result<AgentHandle, String> {

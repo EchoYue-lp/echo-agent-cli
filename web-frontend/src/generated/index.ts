@@ -74,7 +74,6 @@ export * from './LlmApiProtocol';
 export * from './ModelInputModality';
 export * from './ModelProviderListResponse';
 export * from './ModelProviderView';
-export * from './LspCommand';
 export * from './McpCommand';
 export * from './McpCommandReceipt';
 export * from './McpConfigDocument';

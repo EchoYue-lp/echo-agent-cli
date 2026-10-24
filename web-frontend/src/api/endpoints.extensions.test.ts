@@ -13,7 +13,6 @@ import {
   browserExtensionDisposition,
   extensionApi,
   hooksApi,
-  lspApi,
   mcpConfigDisposition,
   pluginApi,
   skillsApi,
@@ -253,7 +252,6 @@ describe('typed Extension IPC adapters', () => {
             hooks_registered: 0,
             mcp_connected: 0,
             agents_loaded: 0,
-            lsp_languages_loaded: 0,
             monitors_loaded: 0,
             themes_loaded: 0,
             output_styles_loaded: 0,
@@ -289,24 +287,18 @@ describe('typed Extension IPC adapters', () => {
     });
   });
 
-  it('projects Hook and LSP receipts without JSON-shaped success envelopes', async () => {
-    bridge.apiInvoke
-      .mockResolvedValueOnce({
-        extension: 'hooks',
-        meta,
-        receipt: {
-          action: 'listed',
-          sources: {
-            items: [{ source: 'workspace_config', rules: 2 }],
-            omitted: 3,
-          },
+  it('projects Hook receipts without JSON-shaped success envelopes', async () => {
+    bridge.apiInvoke.mockResolvedValueOnce({
+      extension: 'hooks',
+      meta,
+      receipt: {
+        action: 'listed',
+        sources: {
+          items: [{ source: 'workspace_config', rules: 2 }],
+          omitted: 3,
         },
-      } satisfies ExtensionCommandReceipt)
-      .mockResolvedValueOnce({
-        extension: 'lsp',
-        meta,
-        receipt: { action: 'status', message: 'rust: running' },
-      } satisfies ExtensionCommandReceipt);
+      },
+    } satisfies ExtensionCommandReceipt);
 
     await expect(hooksApi.list(requestScope)).resolves.toMatchObject({
       sources: [
@@ -319,11 +311,6 @@ describe('typed Extension IPC adapters', () => {
       omitted: 3,
       meta,
       receipt: { extension: 'hooks' },
-    });
-    await expect(lspApi.control(requestScope, 'status')).resolves.toMatchObject({
-      message: 'rust: running',
-      meta,
-      receipt: { extension: 'lsp' },
     });
   });
 });

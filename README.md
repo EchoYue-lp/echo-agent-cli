@@ -26,7 +26,6 @@ EKO 是一个生产级的通用 Agent 产品，基于 Rust 生态构建，提供
 - 🔗 **Hooks 系统**：可配置的事件钩子，支持自定义工作流
 - 🎨 **现代化 GUI**：React + Tailwind CSS + typed Tauri IPC 实时投影
 - 🧠 **统一记忆系统**：User / Project / Local 三层记忆，支持自动提取
-- 🔧 **LSP 集成**：诊断、跳转定义、查找引用、悬停提示
 - 🔁 **自我进化**：轨迹回放、自我审查、自动改进
 
 ---
@@ -251,7 +250,6 @@ echo-agent-cli 启用以下 echo-agent 框架 features：
 | Feature                   | 描述                  |
 | ------------------------- | --------------------- |
 | `mcp`                     | MCP 协议支持          |
-| `lsp`                     | LSP 语言服务器集成    |
 | `human-loop`              | 人机协作循环          |
 | `subagent`                | 子 Agent 编排         |
 | `tasks`                   | 任务系统              |
@@ -372,7 +370,7 @@ EKO 不启用 framework `sqlite` feature；会话、runtime、memory 和 TaskRun
 | `/plugins` | `plugin` | 插件管理       |
 
 EKO 插件采用扁平包结构：根目录使用 `plugin.json`，Skills、MCP、Subagents、
-Hooks、LSP、monitors、themes 和 output styles 都从固定根位置发现，不使用
+Hooks、monitors、themes 和 output styles 都从固定根位置发现，不使用
 namespace 或组件路径声明。旧 `.echo-plugin/manifest.yaml` 不再支持。
 完整格式见 [echo-agent 插件系统文档](../echo-agent/docs/zh/32-plugin-system.md)。
 
@@ -541,7 +539,7 @@ echo-agent-app-core (共享应用库)
             ▼
 echo-agent (AI Agent 框架)
     ├── react agent loop / tool execution
-    ├── MCP / LSP / memory
+    ├── MCP / memory
     ├── Subagent / task DAG / workflow
     └── file stores / human-loop / model protocols
 ```
@@ -587,15 +585,12 @@ echo-agent (AI Agent 框架)
 
 支持 `/auto-memory` 从会话提取带证据候选，统一进入 Review Inbox，采纳后才写入长期记忆。
 
-### LSP 集成
+### 退役的语言服务
 
-当检测到 `.lsp.yaml` 配置时（项目目录或 `~/.eko/`），自动注册 LSP 工具：
-
-- 诊断信息获取
-- 跳转到定义
-- 查找引用
-- 悬停提示
-- LSP 状态查询
+EKO 不再请求 framework `lsp` feature，不注册语言服务工具，也不提供 `/lsp`、LSP 设置页或 IPC。
+旧 `.lsp.yaml` 与插件 `lsp.yaml` 只产生明确退休诊断，用户文件保持原样；混合插件仍处理合法组件。
+框架 A2A/LSP API 此阶段仍为其它消费者保留，待 EKO/SDK 去依赖共同验收后另行删除。
+独立 TUI、CLI/JSONL、IM、cron、终端与其它 Agent 能力本次继续保留。
 
 ---
 

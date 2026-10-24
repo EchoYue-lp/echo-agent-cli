@@ -593,11 +593,6 @@ impl AgentPool {
         let primary = pool.create_agent("__workspace_primary__").await?;
         let app_config = self.app_config.read().await.clone();
         crate::infra::load_user_hooks(&primary.handle, &app_config, Some(root.as_path())).await;
-        let lsp_runtime = if mcp_config_snapshot.is_some() {
-            Some(crate::runtime::register_lsp_tools(&primary.handle, &root).await)
-        } else {
-            None
-        };
         primary
             .handle
             .write(move |agent| {
@@ -661,15 +656,15 @@ impl AgentPool {
         if !loaded_project_skills.is_empty() {
             tracing::info!(skills = ?loaded_project_skills, "Loaded project-local Skills");
         }
-        let (plugin_runtime, mcp_ownership) = match (lsp_runtime, mcp_config_snapshot.as_ref()) {
-            (Some(lsp_runtime), Some(mcp_config)) => {
+        let (plugin_runtime, mcp_ownership) = match mcp_config_snapshot.as_ref() {
+            Some(mcp_config) => {
                 let ownership = crate::mcp_config_runtime::McpNameOwnershipRegistry::new(
                     mcp_config.mcp_servers.keys().cloned(),
                 );
                 let runtime =
                     match crate::plugin_runtime::PluginRuntimeService::new_owned_for_scope_after_agent_reset(
                         primary.handle.clone(),
-                        lsp_runtime,
+                        root.clone(),
                         Arc::clone(&ownership),
                         plugin_target_scope,
                         Some(authority_plugin_generation.clone()),

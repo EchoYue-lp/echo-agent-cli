@@ -11,5 +11,4 @@ export type ExtensionCommandReceipt =
   | { extension: 'plugins'; meta: ExtensionReceiptMeta; receipt: PluginCommandReceipt | null }
   | { extension: 'mcp'; meta: ExtensionReceiptMeta; receipt: McpCommandReceipt | null }
   | { extension: 'hooks'; meta: ExtensionReceiptMeta; receipt: HookCommandReceipt | null }
-  | { extension: 'lsp'; meta: ExtensionReceiptMeta; receipt: ExtensionMessageReceipt | null }
   | { extension: 'browser'; meta: ExtensionReceiptMeta; receipt: ExtensionMessageReceipt | null };

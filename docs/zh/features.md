@@ -56,18 +56,17 @@ launcher 不再维护跨 TaskRun metadata DAG 或轮询器。CLI 使用 `/tasks 
 | 工作流         | 一份 file-backed catalog 与 framework Graph executor；GUI/TUI/CLI/channel 共用服务       | `echo-agent-app-core/src/workflow_service.rs`          |
 | 结构化抽取     | pooled Agent `extract_json`、JSON Schema 输入/输出验证、typed 多 surface outcome         | `echo-agent-app-core/src/structured_extraction.rs`     |
 | MCP            | 一份用户 `mcp.json`、真实 reconcile、scope-keyed health、plugin name ownership           | `McpConfigRuntime` + Extension control                 |
-| LSP            | 自动发现、诊断、定义、引用、hover、repo map、五入口控制与配置热重载                      | framework LSP tools + `ExtensionControlService`        |
 | Tool output    | summary/detail 分离、opaque detail ref、cursor page、文件/JSONL 恢复                     | `echo-agent-app-core/src/tool_execution_projection.rs` |
 | Agent 协作控制面 | discriminated Conversation/TaskSubagent target、bounded list/inspect/message/followup/wait/interrupt | `echo-agent-app-core/src/agent_control.rs` |
 | Hooks/Webhooks | 生命周期事件、command/Subagent/MCP actions、配置热重载                                   | `echo-agent-app-core/src/hook_config_loader.rs`        |
-| Plugins        | framework prepared generation、captured target fanout、typed generation receipt、Subagents/LSP/scope-qualified monitors/themes/styles | `echo-agent-app-core/src/plugin_runtime/runtime.rs` |
+| Plugins        | framework prepared generation、captured target fanout、typed generation receipt、Subagents/scope-qualified monitors/themes/styles | `echo-agent-app-core/src/plugin_runtime/runtime.rs` |
 | Skills         | 递归发现、安装、启停、upstream staging sync、flat policy 原子写与即时 reconcile         | `skills_hub/` + `extension_control/skills.rs`                 |
 
 ### Extension Control Authority
 
 Agent 间通信和协作组编排由 AI 使用工具自动完成，GUI 不提供人工消息、组管理或协作动态控制台。用户通过 Sidechat/Forkchat 参与独立探索，现有对话与任务/Subagent 视图继续呈现执行和结果；模型工具、消息结算及其它 surface 的控制能力保留。
 
-`ExtensionControlService` 是 Skills、Plugins、MCP、Hooks、LSP、Browser 的 EKO mutation
+`ExtensionControlService` 是 Skills、Plugins、MCP、Hooks、Browser 的 EKO mutation
 admission，并把真实执行委托给既有 specialist owner。它不建立第二套 registry、manager 或
 store。
 
@@ -76,12 +75,11 @@ store。
   policy 并 reconcile，不保留 repair debt。
 - GUI 使用 generated typed generic IPC；JSONL 输出 journaled typed `ExtensionReceipt` 且不
   进入模型；CLI、TUI、channel 使用同一 app-core authority 并保留 terminal settlement。
-- Browser 与 LSP 的完整命令面在 GUI、TUI、CLI/JSONL 和 channel 可达。
-- MCP health 由 Extension control 按 authority scope 维护；Hook/LSP project identity 来自
+- Browser 的完整命令面在 GUI、TUI、CLI/JSONL 和 channel 可达。
+- MCP health 由 Extension control 按 authority scope 维护；Hook project identity 来自
   captured workspace root，不使用 process cwd。
 - Plugin portable components 只由 framework prepare/apply；EKO mutation 使用一次捕获的
-  workspace/ABA target cut。cold workspace 继承 committed framework generation，LSP config
-  更新不再触发完整 Plugin reload，monitor key 按 target scope 隔离；所有 surface 收到 overall
+  workspace/ABA target cut。cold workspace 继承 committed framework generation，monitor key 按 target scope 隔离；所有 surface 收到 overall
   status 以及 previous/candidate generation 的逐 target typed receipt。
 
 完整合同见 [Extension Control ADR](./adr/0012-extension-control-authority.md) 和
@@ -130,3 +128,11 @@ Hooks 继续属于 application/plugin configuration。仓库根 `.agents/skills/
 使用的 Agent 指导，不属于 EKO 产品运行时；当前项目 `AGENTS.md` 会作为项目 instruction
 projection 参与每个 Agent。详见 ADR
 [0041](./adr/0041-external-only-skills.md)。
+
+
+### 退役的 LSP 消费者
+
+EKO 不再请求框架 LSP feature、注册语言服务器工具或暴露 LSP 命令/设置/IPC。
+旧配置与插件声明给出明确退休诊断，不删除用户文件；混合插件保留合法组件及原发布/清理
+收据。框架 A2A/LSP API 仍存在，等待两个消费者验收后另行物理删除；本次不退役终端入口、
+IM、cron、MCP 或 Subagent。

@@ -14,7 +14,6 @@ pub mod conversations;
 pub mod extensions;
 pub mod files;
 pub mod hooks;
-pub mod lsp;
 pub mod mcp;
 pub mod memory;
 pub mod panels;
