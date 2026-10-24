@@ -1,273 +1,365 @@
-import { useRef, useEffect, useState } from 'react';
-import { isTauri, apiInvoke } from '../../lib/tauri-bridge';
+import { useEffect, useRef, useState } from 'react';
+import { terminalApi, type TerminalSession, type TerminalTarget } from '../../api/endpoints';
+import { errorMessage, isTauri } from '../../lib/tauri-bridge';
+import { useToastStore } from '../../stores/toastStore';
+import {
+  boundedTerminalQueue,
+  decodeTerminalBytes,
+  encodeTerminalBytes,
+  INPUT_QUEUE_BYTES,
+  OUTPUT_QUEUE_BYTES,
+  observeTerminal,
+} from './terminal-io';
 
+export type TerminalPhase = 'preparing' | 'starting' | 'running' | 'exited' | 'closing' | 'error';
+export interface TerminalViewState {
+  phase: TerminalPhase;
+  message?: string;
+  session?: TerminalSession;
+}
 interface TerminalProps {
   sessionId: string;
+  target?: TerminalTarget;
+  visible?: boolean;
+  closeRequest?: number;
+  onStateChange?: (id: string, state: TerminalViewState) => void;
+  onClosed?: (id: string) => void;
+}
+const LOCAL_TARGET: TerminalTarget = { kind: 'local' };
+interface ExitPayload {
+  id: string;
+  reason: string;
+  exit_code: number;
+  signal?: string | null;
+  error?: string | null;
 }
 
-// Base64 encode/decode helpers (works in both browser and node)
-function b64Encode(str: string): string {
-  // Use TextEncoder for proper UTF-8 handling
-  const bytes = new TextEncoder().encode(str);
-  let binary = '';
-  for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary);
-}
-
-function b64Decode(b64: string): string {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return new TextDecoder().decode(bytes);
-}
-
-export function Terminal({ sessionId }: TerminalProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const termRef = useRef<import('@xterm/xterm').Terminal | null>(null);
-  const fitAddonRef = useRef<import('@xterm/addon-fit').FitAddon | null>(null);
-  const [connected, setConnected] = useState(false);
-  const isTauriMode = isTauri();
-
-  // ── Tauri mode: PTY-backed terminal via IPC + xterm.js ──
+export function Terminal({
+  sessionId,
+  target = LOCAL_TARGET,
+  visible = true,
+  closeRequest = 0,
+  onStateChange,
+  onClosed,
+}: TerminalProps) {
+  const container = useRef<HTMLDivElement>(null);
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
+  const fitVisible = useRef<(() => void) | undefined>(undefined);
+  const requestClose = useRef<(() => Promise<void>) | undefined>(undefined);
+  const [state, setState] = useState<TerminalViewState>({ phase: 'preparing' });
+  const [issue, setIssue] = useState('');
+  const desktop = isTauri();
 
   useEffect(() => {
-    if (!isTauriMode) return;
-    if (!containerRef.current) return;
-
+    const element = container.current;
+    if (!element) return;
     let disposed = false;
-    let unlistenOutput: (() => void) | undefined;
-    let unlistenExit: (() => void) | undefined;
+    let resourcesDisposed = false;
+    let closeWanted = false;
+    let exit: ExitPayload | undefined;
+    let creation: Promise<TerminalSession> | undefined;
+    let backendId = sessionId;
+    let nativeClose: ReturnType<typeof terminalApi.close> | undefined;
+    let closeAttempt: Promise<void> | undefined;
+    let term: import('@xterm/xterm').Terminal | undefined;
     let observer: ResizeObserver | undefined;
-    let handleClick: (() => void) | undefined;
-    const cleanupResources = () => {
-      unlistenOutput?.();
-      unlistenOutput = undefined;
-      unlistenExit?.();
-      unlistenExit = undefined;
+    let socket: WebSocket | undefined;
+    let input: ReturnType<typeof boundedTerminalQueue> | undefined;
+    let output: ReturnType<typeof boundedTerminalQueue> | undefined;
+    const unlisten: Array<() => void> = [];
+    const disposables: Array<{ dispose(): void }> = [];
+    const report = (next: TerminalViewState) => {
+      if (!disposed) setState(next);
+      onStateChange?.(sessionId, next);
+    };
+    const reportIssue = (message: string) => {
+      if (!disposed) setIssue(message);
+    };
+    const cleanup = () => {
+      if (resourcesDisposed) return;
+      resourcesDisposed = true;
+      for (const release of unlisten.splice(0)) release();
       observer?.disconnect();
-      observer = undefined;
-      if (containerRef.current && handleClick) {
-        containerRef.current.removeEventListener('click', handleClick);
-      }
-      handleClick = undefined;
-      if (termRef.current) {
-        termRef.current.dispose();
-        termRef.current = null;
-      }
-      fitAddonRef.current = null;
+      for (const disposable of disposables.splice(0)) disposable.dispose();
+      input?.dispose();
+      output?.dispose();
+      socket?.close();
+      term?.dispose();
+      if (fitVisible.current === fit) fitVisible.current = undefined;
     };
-
-    // Dynamic import xterm.js (avoids SSR issues)
-    (async () => {
-      const [{ Terminal: XTerm }, { FitAddon }, { listen }] = await Promise.all([
-        import('@xterm/xterm'),
-        import('@xterm/addon-fit'),
-        import('@tauri-apps/api/event'),
-      ]);
-
-      if (disposed || !containerRef.current) return;
-
-      // Import CSS
-      await import('@xterm/xterm/css/xterm.css');
-
-      const fitAddon = new FitAddon();
-      const term = new XTerm({
-        cursorBlink: true,
-        fontSize: 13,
-        fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", Menlo, Monaco, monospace',
-        theme: {
-          background: '#0a0a0a',
-          foreground: '#e5e5e5',
-          cursor: '#e5e5e5',
-          selectionBackground: '#264f78',
-          black: '#1a1a1a',
-          red: '#f87171',
-          green: '#4ade80',
-          yellow: '#facc15',
-          blue: '#60a5fa',
-          magenta: '#c084fc',
-          cyan: '#22d3ee',
-          white: '#e5e5e5',
-          brightBlack: '#525252',
-          brightRed: '#fca5a5',
-          brightGreen: '#86efac',
-          brightYellow: '#fde047',
-          brightBlue: '#93c5fd',
-          brightMagenta: '#d8b4fe',
-          brightCyan: '#67e8f9',
-          brightWhite: '#fafafa',
-        },
-        allowProposedApi: true,
-      });
-
-      term.loadAddon(fitAddon);
-      term.open(containerRef.current);
-      fitAddon.fit();
-
-      termRef.current = term;
-      fitAddonRef.current = fitAddon;
-      setConnected(true);
-
-      // ── Listen for PTY output from Rust backend ──
-      unlistenOutput = await listen<{ id: string; data: string }>('terminal-output', (event) => {
-        if (event.payload.id === sessionId) {
-          const text = b64Decode(event.payload.data);
-          term.write(text);
+    const fit = () => {
+      if (!visibleRef.current || disposed || resourcesDisposed) return;
+      try {
+        fitAddon?.fit();
+        term?.focus();
+      } catch {
+        reportIssue('终端尺寸暂不可用；会话仍保留。');
+      }
+    };
+    let fitAddon: import('@xterm/addon-fit').FitAddon | undefined;
+    const close = (): Promise<void> => {
+      closeWanted = true;
+      input?.dispose();
+      if (closeAttempt) return closeAttempt;
+      closeAttempt = (async () => {
+        if (!creation) {
+          cleanup();
+          onClosed?.(sessionId);
+          return;
         }
-      });
-
-      // ── Listen for process exit ──
-      unlistenExit = await listen<{ id: string }>('terminal-exit', (event) => {
-        if (event.payload.id === sessionId) {
-          term.write('\r\n\x1b[90m[Process exited]\x1b[0m\r\n');
-          setConnected(false);
-        }
-      });
-
-      // ── Send user input to PTY ──
-      term.onData((data: string) => {
-        apiInvoke('write_terminal', {
-          id: sessionId,
-          data: b64Encode(data),
-        }).catch((e: unknown) => {
-          console.error('[Terminal] write_terminal failed:', e);
-          term.write(`\r\n\x1b[31m[Write error: ${e}]\x1b[0m\r\n`);
+        report({
+          phase: 'closing',
+          message: '等待原本地进程与输出读者结算；不证明远端副作用停止。',
         });
-      });
-
-      // ── Handle resize ──
-      term.onResize(({ rows, cols }: { rows: number; cols: number }) => {
-        apiInvoke('resize_terminal', {
-          id: sessionId,
-          rows,
-          cols,
-        }).catch((e: unknown) => {
-          console.warn('Failed to resize terminal:', e);
-        });
-      });
-
-      // Trigger initial resize to set correct dimensions
-      const { rows, cols } = fitAddon.proposeDimensions() ?? { rows: 24, cols: 80 };
-      term.resize(cols, rows);
-
-      // ── ResizeObserver for container size changes ──
-      observer = new ResizeObserver(() => {
-        if (fitAddonRef.current) {
-          try {
-            fitAddonRef.current.fit();
-          } catch {
-            // ignore fit errors during rapid resize
+        try {
+          // Observe the original native Promise. AbortSignal cannot cancel IPC.
+          // A rejected create may retain native cleanup. A pending create must
+          // not be interpreted as absence while it can still spawn.
+          await observeTerminal(
+            creation.then(
+              () => undefined,
+              () => undefined
+            )
+          );
+          if (!exit) {
+            if (!nativeClose) {
+              const original = terminalApi.close(backendId);
+              nativeClose = original;
+              void original.then(
+                () => {
+                  nativeClose = undefined;
+                },
+                () => {
+                  nativeClose = undefined;
+                }
+              );
+            }
+            const closed = await observeTerminal(nativeClose);
+            if (!closed.success) throw new Error('终端关闭未确认；原会话和目标保留。');
+            // closed=false is explicit current-service absence after create settled,
+            // not a claim that a remote process group has been terminated.
           }
+          cleanup();
+          onClosed?.(sessionId);
+        } catch (error) {
+          const message = `关闭尚未确认，可重试：${errorMessage(error)}`;
+          report({ phase: 'error', message });
+          if (disposed) useToastStore.getState().addToast('error', `终端 ${sessionId} ${message}`);
+        } finally {
+          closeAttempt = undefined;
         }
-      });
-      observer.observe(containerRef.current);
-
-      // Focus terminal on click
-      handleClick = () => term.focus();
-      containerRef.current.addEventListener('click', handleClick);
-      term.focus();
-
-      if (disposed) {
-        cleanupResources();
-      }
-    })().catch((e: unknown) => {
-      console.error('Failed to initialize terminal:', e);
-    });
-
-    return () => {
-      disposed = true;
-      cleanupResources();
+      })();
+      return closeAttempt;
     };
-  }, [sessionId, isTauriMode]);
+    requestClose.current = close;
+    fitVisible.current = fit;
 
-  // ── Web mode: WebSocket-backed terminal ──
-
-  useEffect(() => {
-    if (isTauriMode) return;
-    if (!containerRef.current) return;
-
-    let disposed = false;
-    let ws: WebSocket | null = null;
-
-    (async () => {
+    void (async () => {
       const [{ Terminal: XTerm }, { FitAddon }] = await Promise.all([
         import('@xterm/xterm'),
         import('@xterm/addon-fit'),
       ]);
-
-      if (disposed || !containerRef.current) return;
+      if (disposed || closeWanted) return;
       await import('@xterm/xterm/css/xterm.css');
-
-      const fitAddon = new FitAddon();
-      const term = new XTerm({
+      if (disposed || closeWanted) return;
+      fitAddon = new FitAddon();
+      term = new XTerm({
         cursorBlink: true,
         fontSize: 13,
-        fontFamily: '"JetBrains Mono", "Fira Code", Menlo, Monaco, monospace',
-        theme: {
-          background: '#0a0a0a',
-          foreground: '#e5e5e5',
-          cursor: '#e5e5e5',
-        },
+        scrollback: 2000,
+        fontFamily: '"JetBrains Mono", "Fira Code", Menlo, monospace',
+        theme: { background: '#0a0a0a', foreground: '#e5e5e5', cursor: '#e5e5e5' },
       });
-
       term.loadAddon(fitAddon);
-      term.open(containerRef.current);
-      fitAddon.fit();
-      termRef.current = term;
-      fitAddonRef.current = fitAddon;
-
-      // Connect WebSocket
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/api/terminal/${sessionId}/ws`;
-      ws = new WebSocket(wsUrl);
-
-      ws.onopen = () => setConnected(true);
-      ws.onclose = () => setConnected(false);
-      ws.onerror = () => setConnected(false);
-      ws.onmessage = (event) => {
+      term.open(element);
+      fit();
+      const currentTerm = term;
+      output = boundedTerminalQueue(
+        (bytes) => new Promise<void>((resolve) => currentTerm.write(bytes, resolve)),
+        reportIssue,
+        OUTPUT_QUEUE_BYTES,
+        '输出队列超限，已停止渲染后续输出；显示存在缺口，会话仍保留。'
+      );
+      const legacyInputDecoder = new TextDecoder();
+      input = boundedTerminalQueue(
+        async (bytes) => {
+          if (!creation) throw new Error('process not started');
+          await creation;
+          if (closeWanted) throw new Error('terminal is closing');
+          if (desktop) await terminalApi.write(sessionId, encodeTerminalBytes(bytes));
+          else {
+            if (socket?.readyState !== WebSocket.OPEN)
+              throw new Error('terminal socket is not open');
+            socket.send(
+              JSON.stringify({
+                type: 'input',
+                data: legacyInputDecoder.decode(bytes, { stream: true }),
+              })
+            );
+          }
+        },
+        reportIssue,
+        INPUT_QUEUE_BYTES,
+        '输入队列超限，已停止后续输入并丢弃未发送队列；在途输入可能已处理，不自动重放。'
+      );
+      const onExit = (payload: ExitPayload) => {
+        if (payload.id !== sessionId) return;
+        exit = payload;
+        input?.dispose();
+        report({
+          phase: 'exited',
+          message: `本地进程退出 ${payload.exit_code}${payload.signal ? ` (${payload.signal})` : ''}${payload.error ? `：${payload.error}` : ''}；远端副作用状态未被证明。`,
+        });
+      };
+      if (desktop) {
+        const { listen } = await import('@tauri-apps/api/event');
+        if (disposed || closeWanted) return;
+        const subscribe = async <T,>(name: string, receive: (payload: T) => void) => {
+          const release = await listen<T>(name, (event) => {
+            if (!resourcesDisposed) receive(event.payload);
+          });
+          if (disposed || resourcesDisposed || closeWanted) release();
+          else unlisten.push(release);
+        };
+        await Promise.all([
+          subscribe<{ id: string; data: string }>('terminal-output', (payload) => {
+            if (payload.id === sessionId) output?.push(decodeTerminalBytes(payload.data));
+          }),
+          subscribe<ExitPayload>('terminal-exit', onExit),
+          subscribe<{ id: string; message: string }>('terminal-issue', (payload) => {
+            if (payload.id === sessionId) {
+              reportIssue(payload.message);
+              report({ phase: 'error', message: payload.message });
+            }
+          }),
+          subscribe<{ skipped_events: number }>('terminal-gap', (payload) =>
+            reportIssue(
+              `终端传输遗漏 ${payload.skipped_events} 条聚合事件；本屏幕可能不完整，不支持历史重放。`
+            )
+          ),
+        ]);
+        if (disposed || closeWanted || resourcesDisposed) return;
+      } else if (target.kind === 'ssh') {
+        throw new Error('SSH 终端仅支持 EKO 桌面应用');
+      }
+      let pendingSize: { rows: number; cols: number } | undefined;
+      let resizing = false;
+      const flushResize = async () => {
+        if (resizing || !creation || !desktop) return;
+        resizing = true;
         try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === 'output') term.write(msg.data);
+          await creation;
+          while (pendingSize && !closeWanted && !exit && !disposed) {
+            const size = pendingSize;
+            pendingSize = undefined;
+            await terminalApi.resize(sessionId, size.rows, size.cols);
+          }
         } catch {
-          /* ignore */
+          reportIssue('终端尺寸更新失败；原会话保留。');
+        } finally {
+          resizing = false;
         }
       };
-
-      term.onData((data: string) => {
-        if (ws?.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'input', data }));
-        }
+      disposables.push(
+        currentTerm.onData((data) => {
+          if (creation && !closeWanted && !exit) input?.push(new TextEncoder().encode(data));
+        })
+      );
+      disposables.push(
+        currentTerm.onResize((size) => {
+          if (visibleRef.current && size.rows > 0 && size.cols > 0) {
+            pendingSize = size;
+            void flushResize();
+          }
+        })
+      );
+      observer = new ResizeObserver(fit);
+      observer.observe(element);
+      report({
+        phase: 'starting',
+        message: '正在启动本地进程；SSH 认证由终端中的系统 OpenSSH 处理。',
       });
-
-      term.focus();
-    })();
-
+      const size = fitAddon.proposeDimensions() ?? { rows: 24, cols: 80 };
+      creation = terminalApi.create({
+        id: sessionId,
+        target,
+        rows: Math.max(1, size.rows),
+        cols: Math.max(1, size.cols),
+      });
+      const info = await creation;
+      if (!desktop) backendId = info.id;
+      if (!exit && !closeWanted && !disposed)
+        report({
+          phase: 'running',
+          session: info,
+          message:
+            info.target.kind === 'ssh'
+              ? 'SSH 本地进程已启动；不代表远端认证成功。'
+              : '本地终端进程已启动。',
+        });
+      if (disposed || closeWanted) {
+        void close();
+        return;
+      }
+      if (!desktop) {
+        socket = new WebSocket(terminalApi.wsUrl(info.id));
+        socket.onmessage = (event) => {
+          try {
+            const payload = JSON.parse(event.data) as { type: string; data?: string };
+            if (payload.type === 'output' && typeof payload.data === 'string')
+              output?.push(new TextEncoder().encode(payload.data));
+          } catch {
+            reportIssue('终端传输格式无效；输出可能存在缺口。');
+          }
+        };
+        socket.onclose = () =>
+          report({ phase: 'error', message: '终端传输已断开；不证明本地进程退出。' });
+        socket.onerror = () => reportIssue('终端传输失败；不自动重连或重放。');
+      }
+      void flushResize();
+    })().catch((error) => {
+      if (!disposed && !closeWanted) report({ phase: 'error', message: errorMessage(error) });
+      cleanup();
+    });
     return () => {
       disposed = true;
-      ws?.close();
-      if (termRef.current) {
-        termRef.current.dispose();
-        termRef.current = null;
-      }
+      cleanup();
+      if (requestClose.current === close) requestClose.current = undefined;
+      // Keep observation of a dispatched create even after React teardown.
+      if (creation && !exit) void close();
     };
-  }, [sessionId, isTauriMode]);
+  }, [sessionId, target, desktop, onStateChange, onClosed]);
+
+  useEffect(() => {
+    if (visible) fitVisible.current?.();
+  }, [visible]);
+  useEffect(() => {
+    if (closeRequest > 0) void requestClose.current?.();
+  }, [closeRequest]);
 
   return (
-    <div className="flex flex-col h-full bg-[#0a0a0a] rounded-lg overflow-hidden">
-      {/* Status bar */}
-      <div className="flex items-center justify-between px-3 py-1 border-b border-gray-800">
-        <span className="text-[10px] text-gray-500 font-mono">EKO Terminal</span>
-        <span className={`text-[10px] ${connected ? 'text-green-500' : 'text-red-500'}`}>
-          {connected ? '● Connected' : '○ Disconnected'}
-        </span>
+    <div className="flex h-full flex-col overflow-hidden rounded-lg bg-[#0a0a0a]">
+      <div className="flex items-center justify-between border-b border-gray-800 px-3 py-1 text-[10px] text-gray-400">
+        <span className="font-mono">EKO Terminal</span>
+        <span>{state.message ?? state.phase}</span>
       </div>
-      {/* xterm.js container — tabIndex required for keyboard focus in Tauri WebView */}
+      {issue && (
+        <div role="alert" className="border-b border-amber-700 px-3 py-1 text-xs text-amber-300">
+          {issue}
+        </div>
+      )}
+      {state.phase === 'error' && (
+        <div role="alert" className="px-3 py-1 text-xs text-red-300">
+          {state.message}
+        </div>
+      )}
       <div
-        ref={containerRef}
+        ref={container}
         role="textbox"
         aria-label="终端"
         aria-multiline="true"
-        className="flex-1 min-h-0 p-1"
+        className="min-h-0 flex-1 p-1"
         tabIndex={0}
         style={{ outline: 'none' }}
       />

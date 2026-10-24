@@ -3,7 +3,9 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use base64::Engine;
-use echo_agent_app_core::api::terminal::{TerminalEvent, TerminalExitReason, TerminalService};
+use echo_agent_app_core::api::terminal::{
+    TerminalEvent, TerminalExitReason, TerminalService, TerminalTarget,
+};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +23,19 @@ struct OutputEvent {
 struct ExitEvent {
     id: String,
     reason: &'static str,
+    exit_code: u32,
+    signal: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct IssueEvent {
+    id: String,
+    message: String,
+}
+#[derive(Clone, Serialize)]
+struct GapEvent {
+    skipped_events: u64,
 }
 
 pub fn spawn_event_bridge(
@@ -43,18 +58,52 @@ pub fn spawn_event_bridge(
                         tracing::warn!(%error, "failed to emit terminal output");
                     }
                 }
-                Ok(TerminalEvent::Exited { id, reason }) => {
+                Ok(TerminalEvent::Exited {
+                    id,
+                    reason,
+                    exit_code,
+                    signal,
+                }) => {
+                    let error = match &reason {
+                        TerminalExitReason::ReadFailed(message) => Some(message.clone()),
+                        _ => None,
+                    };
                     let reason = match reason {
                         TerminalExitReason::ProcessExited => "process_exited",
                         TerminalExitReason::Closed => "closed",
                         TerminalExitReason::ReadFailed(_) => "read_failed",
                     };
-                    if let Err(error) = app_handle.emit("terminal-exit", ExitEvent { id, reason }) {
+                    if let Err(error) = app_handle.emit(
+                        "terminal-exit",
+                        ExitEvent {
+                            id,
+                            reason,
+                            exit_code,
+                            signal,
+                            error,
+                        },
+                    ) {
                         tracing::warn!(%error, "failed to emit terminal exit");
                     }
                 }
+                Ok(TerminalEvent::Issue { id, message }) => {
+                    if let Err(error) =
+                        app_handle.emit("terminal-issue", IssueEvent { id, message })
+                    {
+                        tracing::warn!(%error, "failed to emit terminal issue");
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "terminal event receiver lagged");
+                    // This receiver aggregates sessions: report skipped events, not
+                    // invented per-session byte loss or a recoverable VT snapshot.
+                    if let Err(error) = app_handle.emit(
+                        "terminal-gap",
+                        GapEvent {
+                            skipped_events: skipped,
+                        },
+                    ) {
+                        tracing::warn!(%error, "failed to emit terminal output gap");
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -69,17 +118,19 @@ pub async fn create_terminal(
     cwd: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
+    target: Option<TerminalTarget>,
 ) -> Result<serde_json::Value, IpcError> {
     // This is a direct user-operated local developer tool, not an agent-auto
     // execution path, so agent permission modes do not gate it.
     let info = state
         .app_state
         .terminal
-        .create(
+        .create_with_target(
             id,
             cwd.map(PathBuf::from),
             rows.unwrap_or(24),
             cols.unwrap_or(80),
+            target.unwrap_or_default(),
         )
         .await
         .map_err(IpcError::Internal)?;
@@ -131,10 +182,9 @@ pub async fn close_terminal(
         .close(&id)
         .await
         .map_err(IpcError::Internal)?;
-    if !closed {
-        return Err(IpcError::NotFound(format!("terminal '{id}' not found")));
-    }
-    Ok(serde_json::json!({ "success": true }))
+    // `closed` is true only for an original session whose child and reader
+    // settled. False reports absence; it does not claim remote termination.
+    Ok(serde_json::json!({ "success": true, "closed": closed }))
 }
 
 #[tauri::command]

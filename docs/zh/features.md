@@ -51,7 +51,7 @@ launcher 不再维护跨 TaskRun metadata DAG 或轮询器。CLI 使用 `/tasks 
 | 文件与代码修改 | canonical transactional `apply_patch`，不保留平行编辑工具                                | `echo-agent` tool registry                             |
 | Workspace diff | 显式 workspace generation、已验证 Git ref、app-core 统一结构化 hunk，Tauri 仅映射 wire DTO | `echo-agent-app-core/src/diff.rs`                      |
 | 代码执行与分析 | `run_code` 使用 EKO 锁定的 Python analytics runtime                                      | `echo-agent-app-core/src/analysis_runtime.rs`          |
-| Terminal       | 用户交互 terminal session 和 Agent shell 路径分离                                        | `echo-agent-app-core/src/terminal.rs`                  |
+| Terminal       | 本地/系统 OpenSSH 交互终端与 Agent shell 分离；源码已准备，原生/远端待验                                        | `echo-agent-app-core/src/terminal.rs`                  |
 | Browser/Chrome | 托管 Chromium、Chrome extension backend、tab/session/observation 与五入口控制            | Browser runtime + Extension dispatcher                 |
 | 工作流         | 一份 file-backed catalog 与 framework Graph executor；GUI/TUI/CLI/channel 共用服务       | `echo-agent-app-core/src/workflow_service.rs`          |
 | 结构化抽取     | pooled Agent `extract_json`、JSON Schema 输入/输出验证、typed 多 surface outcome         | `echo-agent-app-core/src/structured_extraction.rs`     |

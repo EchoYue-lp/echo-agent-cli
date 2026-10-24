@@ -1421,10 +1421,28 @@ export const analysisApi = {
 
 // ── Terminal API ────────────────────────────────────────────────────
 
+export type TerminalTarget =
+  | { kind: 'local' }
+  | { kind: 'ssh'; host: string; user?: string | null; port?: number | null };
+
 export interface TerminalSession {
   id: string;
-  cwd: string;
-  created_at: string;
+  pid: number;
+  target: TerminalTarget;
+}
+
+export interface TerminalCreateOptions {
+  id?: string;
+  cwd?: string;
+  rows?: number;
+  cols?: number;
+  target?: TerminalTarget;
+}
+
+export interface TerminalCloseResult {
+  success: boolean;
+  /** True only for an owned session whose child and reader settled; false is absence. */
+  closed: boolean;
 }
 
 export const terminalApi = {
@@ -1432,14 +1450,34 @@ export const terminalApi = {
     isTauri()
       ? apiInvoke<TerminalSession[]>('list_terminal_sessions')
       : get<TerminalSession[]>('/terminal'),
-  create: (cwd?: string) =>
-    isTauri()
-      ? apiInvoke<TerminalSession>('create_terminal', { id: `term-${Date.now()}`, cwd })
-      : post<TerminalSession>('/terminal', { cwd }),
+  create: (options?: TerminalCreateOptions | string) => {
+    const request: TerminalCreateOptions =
+      typeof options === 'string' ? { cwd: options } : (options ?? {});
+    const target = request.target ?? { kind: 'local' as const };
+    if (!isTauri() && target.kind === 'ssh') {
+      return Promise.reject<TerminalSession>(
+        new Error('SSH terminals require the EKO desktop application')
+      );
+    }
+    return isTauri()
+      ? apiInvoke<TerminalSession>('create_terminal', {
+          ...request,
+          id: request.id ?? `term-${crypto.randomUUID()}`,
+          target,
+        })
+      : post<TerminalSession>('/terminal', { cwd: request.cwd }).then((session) => ({
+          ...session,
+          target: session.target ?? { kind: 'local' as const },
+        }));
+  },
+  write: (id: string, data: string) =>
+    apiInvoke<{ success: boolean }>('write_terminal', { id, data }),
+  resize: (id: string, rows: number, cols: number) =>
+    apiInvoke<{ success: boolean }>('resize_terminal', { id, rows, cols }),
   close: (id: string) =>
     isTauri()
-      ? apiInvoke<{ closed: string }>('close_terminal', { id })
-      : del<{ closed: string }>(`/terminal/${id}`),
+      ? apiInvoke<TerminalCloseResult>('close_terminal', { id })
+      : del<TerminalCloseResult>(`/terminal/${id}`),
   wsUrl: (id: string) => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${protocol}//${window.location.host}/api/terminal/${id}/ws`;

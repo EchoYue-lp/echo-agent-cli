@@ -58,7 +58,8 @@ review, worktree, and surface control. See [runtime architecture](./architecture
 ## Tools and Extensions
 
 EKO integrates transactional file edits, workspace diff, analytics execution,
-interactive terminal sessions, Browser/Chrome, workflow catalog, structured
+interactive local/system-OpenSSH terminal sessions (source prepared; native/remote
+qualification pending), Browser/Chrome, workflow catalog, structured
 extraction, MCP, Tool output projections, model-driven Agent collaboration controls,
 Hooks/Webhooks, Plugins, and Skills.
 

@@ -1274,11 +1274,21 @@ fn drain_terminal_events(
             {
                 append_terminal_output(app, &bytes);
             }
-            Ok(TerminalEvent::Exited { id, reason })
+            Ok(TerminalEvent::Exited {
+                id,
+                reason,
+                exit_code,
+                signal,
+            }) if app.active_terminal_id.as_deref() == Some(id.as_str()) => {
+                app.active_terminal_id = None;
+                app.status_msg = format!(
+                    "Terminal '{id}' exited: {reason:?}, code {exit_code}, signal {signal:?}"
+                );
+            }
+            Ok(TerminalEvent::Issue { id, message })
                 if app.active_terminal_id.as_deref() == Some(id.as_str()) =>
             {
-                app.active_terminal_id = None;
-                app.status_msg = format!("Terminal '{id}' exited: {reason:?}");
+                app.status_msg = format!("Terminal '{id}' remains owned: {message}");
             }
             Ok(_) => {}
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return false,

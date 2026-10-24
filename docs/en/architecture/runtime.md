@@ -235,7 +235,7 @@ records the product decision. Paths below are repository-relative.
 | `src/cli/modes.rs::run_channels_mode` constructs QQ/Feishu adapters, `ChannelManager`, session factories and shutdown/join; `src/cli/channels.rs::AppChannelMessageHandler` and `ChannelSessionCoordinator`, plus `channels/{input_pump,outbound,tool_render}.rs`, handle IM identity, replies and settlement | Retain IM behavior and move its application lifecycle into shared app-core ownership before deleting the launch mode. Preserve `(channel, conversation, sender)`, session incarnations, input-pump shutdown/join, outbound/tool rendering and channel HITL. GUI bootstrap does not currently start this manager; configuration fields are not evidence of GUI IM management. |
 | `src/tauri/commands/panels.rs` reads/writes `crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED` | Move this shared memory switch and its consumers before deleting command modules. Retain GUI memory controls; do not delete the entire panels module. |
 | `echo-agent-app-core/src/runtime.rs::ApplicationServices::compose`, `ApplicationLifecycleOwner`; `state/app_state.rs::start_scheduler_and_task_service`; `scheduler/{mod,runner}.rs` | Retain shared bootstrap, TaskRun boot recovery, SchedulerRunner, file-backed cron definitions and delivery ledger. `src/tauri/commands/scheduler.rs` and `web-frontend/src/components/scheduler/SchedulerPanel.tsx` remain adapters over them. No alternate GUI scheduler or automatic replay policy. |
-| `echo-agent-app-core/src/terminal.rs::TerminalService`, `src/tauri/terminal.rs`, `web-frontend/src/components/terminal/` | Retain GUI PTY/xterm terminal create/write/resize/close and cleanup. Console product retirement does not retire an interactive terminal or Agent shell tool. SSH connection management remains a separate future outcome. |
+| `echo-agent-app-core/src/terminal.rs::TerminalService`, `src/tauri/terminal.rs`, `web-frontend/src/components/terminal/` | Retain GUI PTY/xterm terminal create/write/resize/close and cleanup. Console product retirement does not retire an interactive terminal or Agent shell tool. The source now accepts explicit local/system-OpenSSH targets through this same owner; Plan06 native/remote qualification remains pending (ADR 0051). |
 | `echo-agent-app-core/src/hitl/{dispatcher,channel_provider}.rs`; `src/tauri/commands/chat.rs::TauriHumanLoopHandler`; shared chat/pool/TaskRuntime owners | Retain generic HumanLoop request identity, GUI/IM response ownership, Task/Subagent and recovery. Audit `hitl/{tui_provider,repl_provider}.rs`, `src/cli/{jsonl,repl,editor,completion,keybindings,commands,command,extension_surface}.rs`, `cmd_impls/`, `src/tui/` and console render/config/tests/examples for console-only consumers before deletion; keep shared behavior through retained owners. |
 
 Desktop bootstrap already composes shared services, including scheduler startup,
@@ -302,3 +302,29 @@ ordinary AgentRouter messaging, Subagent, MCP and IM are retained.
    consumer matrices belong to the later implementation outcomes. Historic ADR
    surface-parity and LSP implementation descriptions record prior behavior; they
    cannot override ADR 0050's forward product scope.
+
+## Interactive local and SSH terminal sessions
+
+`TerminalService` owns the original PTY, child, reader thread and retained settlement
+handle. The desktop form accepts a host or existing SSH alias and optional account
+and port; the system `ssh` receives literal argv and owns authentication, existing
+configuration and host-key handling. EKO does not store credentials or infer login
+from process start. Manual interaction is separate from Agent ShellTool permissions.
+
+Each tab prepares xterm and Tauri listeners before create and stays mounted when
+selected away or hidden. Raw bytes go to xterm, with 2,000 scrollback lines, a 1 MiB
+output queue and 64 KiB input queue, both capped at 256 waiting chunks. Lag/overflow
+is visible; there is no history replay, automatic reconnect or command resend.
+Input overflow discards unsent queued input and stops further input on that view.
+
+Close has a bounded observation wait and preserves the original native operations.
+Only original child wait plus reader join permits session removal and one exit
+receipt carrying the real code/signal. Kill/wait/read errors retain the same owner
+and target; an irrecoverable read error cannot be erased by retry. App shutdown
+closes admission before draining and retains the existing lifecycle owner on
+failure. Direct-child settlement proves neither a process group nor remote side
+effects stopped. See [ADR 0051](../adr/0051-ssh-terminal-sessions.md).
+
+Qualification boundary: this change is source and Node evidence only. Rust tests,
+new Tauri binaries, native window/theme acceptance and authenticated remote
+interaction are not yet qualified; no platform or release support is claimed.

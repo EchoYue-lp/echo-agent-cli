@@ -629,6 +629,9 @@ impl ApplicationLifecycleOwner {
         // Phase one: no joins. Every producer sees admission close or a shared
         // cancellation broadcast before teardown waits on a dependent owner.
         self.root_cancel.cancel();
+        if let Some(state) = self.app_state.as_ref() {
+            state.terminal.begin_shutdown();
+        }
         if let Some(product_data_io) = self.product_data_io.as_ref()
             && let Err(error) = product_data_io.begin_shutdown()
         {
@@ -920,7 +923,8 @@ impl ApplicationLifecycleOwner {
         if let Some(state) = self.app_state.as_ref()
             && let Err(error) = state.terminal.close_all().await
         {
-            receipt.record("terminal sessions", error);
+            receipt.record_retained("terminal sessions original child/reader", error);
+            return (true, receipt);
         }
 
         if let Some(runtime) = self.plugin_runtime.as_ref()

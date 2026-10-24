@@ -489,6 +489,14 @@
       "sourceLanguage": "zh-mixed",
       "translationStatus": "reviewed",
       "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0051-ssh-terminal-sessions.md",
+      "targetPath": "adr/0051-ssh-terminal-sessions.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
     }
   ]
 }

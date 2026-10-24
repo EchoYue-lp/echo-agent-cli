@@ -692,16 +692,25 @@ pub(super) fn channel_terminal_stream(
                         yield Ok(ChannelOutboundDraft::stream(text));
                     }
                 }
-                Ok(echo_agent_app_core::api::terminal::TerminalEvent::Exited { id, reason })
+                Ok(echo_agent_app_core::api::terminal::TerminalEvent::Exited { id, reason, exit_code, signal })
                     if id == terminal_id =>
                 {
                     if let Some(text) = decoder.finish() {
                         yield Ok(ChannelOutboundDraft::stream(text));
                     }
                     yield Ok(ChannelOutboundDraft::terminal(
-                        format!("Terminal '{terminal_id}' exited: {reason:?}"),
+                        format!("Terminal '{terminal_id}' exited: {reason:?}, code {exit_code}, signal {signal:?}; remote side effects are not proven stopped"),
                     ));
                     break;
+                }
+                Ok(echo_agent_app_core::api::terminal::TerminalEvent::Issue { id, message }) if id == terminal_id => {
+                    accepted_events = accepted_events.saturating_add(1);
+                    if accepted_events > CHANNEL_TERMINAL_MAX_EVENTS || message.len() > CHANNEL_TERMINAL_MAX_BYTES.saturating_sub(accepted_bytes) {
+                        yield Ok(ChannelOutboundDraft::terminal(format!("Terminal '{terminal_id}' forwarding detached at its budget; original session retained.")));
+                        break;
+                    }
+                    accepted_bytes = accepted_bytes.saturating_add(message.len());
+                    yield Ok(ChannelOutboundDraft::ordinary(format!("Terminal '{terminal_id}' remains owned: {message}")));
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {

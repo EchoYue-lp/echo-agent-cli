@@ -7264,6 +7264,8 @@ mod tests {
             .send(TerminalEvent::Exited {
                 id: "bursty-terminal".to_string(),
                 reason: TerminalExitReason::ProcessExited,
+                exit_code: 0,
+                signal: None,
             })
             .map_err(|error| error.to_string())?;
         let message = InboundMessage::new(
@@ -7312,6 +7314,8 @@ mod tests {
             .send(TerminalEvent::Exited {
                 id: "utf8-terminal".to_string(),
                 reason: TerminalExitReason::ProcessExited,
+                exit_code: 0,
+                signal: None,
             })
             .map_err(|error| error.to_string())?;
         let message = InboundMessage::new(
@@ -7358,6 +7362,8 @@ mod tests {
             .send(TerminalEvent::Exited {
                 id: "ansi-terminal".to_string(),
                 reason: TerminalExitReason::ProcessExited,
+                exit_code: 0,
+                signal: None,
             })
             .map_err(|error| error.to_string())?;
         let message = InboundMessage::new(

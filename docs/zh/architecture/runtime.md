@@ -269,7 +269,7 @@ EKO 注册的 revision store 通过同一个 run 文件锁和原子 journal 批�
 | `src/cli/modes.rs::run_channels_mode` 构造 QQ/飞书 adapter、`ChannelManager`、session factory 和 shutdown/join；`src/cli/channels.rs::AppChannelMessageHandler`、`ChannelSessionCoordinator` 及 `channels/{input_pump,outbound,tool_render}.rs` 处理 IM identity、回复和结算 | 保留 IM 行为，先把应用生命周期迁入共享 app-core owner，再删启动模式。保留 `(channel, conversation, sender)`、session incarnation、input-pump 关闭/join、outbound/tool 呈现与 channel HITL。当前 GUI bootstrap 未启动此 manager，配置字段不代表 GUI IM 管理已交付。 |
 | `src/tauri/commands/panels.rs` 读写 `crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED` | 删除 command 模块前迁移共享记忆开关及调用点。保留 GUI 记忆控制，不整包删 panels。 |
 | `echo-agent-app-core/src/runtime.rs::ApplicationServices::compose`、`ApplicationLifecycleOwner`；`state/app_state.rs::start_scheduler_and_task_service`；`scheduler/{mod,runner}.rs` | 保留共享启动、TaskRun boot 恢复、SchedulerRunner、文件 cron 定义与投递账本。`src/tauri/commands/scheduler.rs` 和 `web-frontend/src/components/scheduler/SchedulerPanel.tsx` 仍是其适配层。不另建 GUI scheduler，不新增自动重放策略。 |
-| `echo-agent-app-core/src/terminal.rs::TerminalService`、`src/tauri/terminal.rs`、`web-frontend/src/components/terminal/` | 保留 GUI PTY/xterm 的创建、输入、resize、关闭和清理。终端产品入口退役不删除交互式终端或 Agent shell。SSH 连接管理另属后续结果。 |
+| `echo-agent-app-core/src/terminal.rs::TerminalService`、`src/tauri/terminal.rs`、`web-frontend/src/components/terminal/` | 保留 GUI PTY/xterm 的创建、输入、resize、关闭和清理。终端产品入口退役不删除交互式终端或 Agent shell。源码现已沿同一 owner 接受明确的本地/系统 OpenSSH 目标；Plan06 原生/远端验收仍未完成（ADR 0051）。 |
 | `echo-agent-app-core/src/hitl/{dispatcher,channel_provider}.rs`；`src/tauri/commands/chat.rs::TauriHumanLoopHandler`；共享 chat/pool/TaskRuntime owner | 保留通用 HumanLoop 请求身份、GUI/IM 回答 owner、Task/Subagent 与恢复。删前核对 `hitl/{tui_provider,repl_provider}.rs`、`src/cli/{jsonl,repl,editor,completion,keybindings,commands,command,extension_surface}.rs`、`cmd_impls/`、`src/tui/` 以及 console 呈现/配置/测试/示例的专属消费者；共享行为由保留 owner 承接。 |
 
 桌面 bootstrap 已通过 app-core 组合共享服务并启动 scheduler。事件循环使用 `run_return`，
@@ -318,3 +318,24 @@ MCP、IM 继续保留。
 4. 本切片验证双语文档、源码引用和 diff 范围；真实运行、原生桌面、IM 投递、cron 恢复与
    最终消费者矩阵由后续实现结果验收。历史 ADR 中的 surface 对等和 LSP 实现说明记录旧行为，
    不覆盖 ADR 0050 的未来产品范围。
+
+## 本地与 SSH 交互终端
+
+`TerminalService` 持有原 PTY、child、reader thread 和保留的 settlement handle。
+桌面表单接受 host 或现有 SSH alias，以及可选账号、端口；系统 `ssh` 接收独立 argv，
+处理认证、既有配置与 host-key。EKO 不保存凭据，不把本地进程启动解释为登录成功。
+用户手工操作与 Agent ShellTool 权限路径分离。
+
+各 tab 先准备 xterm 与 Tauri listeners 再 create，切换或隐藏仍保持挂载。raw bytes
+直接交给 xterm；scrollback 限 2,000 行，输出队列限 1 MiB，输入队列限 64 KiB，
+两者均限 256 个等待块。lag/超限明确可见，不支持历史重放、自动重连或命令重发。
+输入超限会丢弃未发送队列并停止该视图后续输入。
+
+关闭仅限制观察等待，原生操作继续由原 owner 结算。只有原 child wait 和 reader join
+均完成才移除会话并发布一次带真实 code/signal 的退出凭据。kill/wait/read 错误保留
+同一 owner 和目标；不可恢复的 read 错误不能靠重试抹除。应用退出先封闭准入再排空，
+失败时保留既有 lifecycle owner。direct-child 结算不证明整个进程组或远端副作用停止。
+见 [ADR 0051](../adr/0051-ssh-terminal-sessions.md)。
+
+验收边界：本变更当前只有源码与 Node 证据。Rust 测试、新 Tauri 二进制、原生窗口/主题
+及真实远端认证交互均未完成资格验证，不宣称平台支持或发布完成。

@@ -105,7 +105,28 @@ where
                     .await
                     .map_err(|error| format!("terminal output flush failed: {error}"))?;
             }
-            Ok(TerminalEvent::Exited { id, .. }) if id == terminal_id => return Ok(()),
+            Ok(TerminalEvent::Exited {
+                id,
+                reason,
+                exit_code,
+                signal,
+            }) if id == terminal_id => {
+                let notice = format!(
+                    "\n[terminal exited: {reason:?}, code {exit_code}, signal {signal:?}; no remote-side-effect completion claim]\n"
+                );
+                output
+                    .write_all(notice.as_bytes())
+                    .await
+                    .map_err(|error| format!("terminal exit write failed: {error}"))?;
+                return Ok(());
+            }
+            Ok(TerminalEvent::Issue { id, message }) if id == terminal_id => {
+                let notice = format!("\n[terminal remains owned: {message}]\n");
+                output
+                    .write_all(notice.as_bytes())
+                    .await
+                    .map_err(|error| format!("terminal issue write failed: {error}"))?;
+            }
             Ok(_) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 let notice = format!(

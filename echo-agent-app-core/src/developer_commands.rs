@@ -80,7 +80,14 @@ impl DeveloperCommandRegistry {
                 }
                 let lines = sessions
                     .into_iter()
-                    .map(|session| format!("{} (pid {})", session.id, session.pid))
+                    .map(|session| {
+                        format!(
+                            "{} (pid {}, {})",
+                            session.id,
+                            session.pid,
+                            session.target.label()
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 Ok(output(lines))
