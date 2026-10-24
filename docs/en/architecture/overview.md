@@ -153,3 +153,23 @@ EKO CI follows framework main; the SDK Host has its own exact framework pin,
 independent of the superproject gitlink. MCP, legal plugin components, local
 terminal control and SDK Host stdio are retained. This is an explicit product
 retirement, not permission to remove unused framework public APIs indiscriminately.
+
+
+### GUI visual primitives
+
+The GUI uses the existing `:root` / `.dark` semantic variables for surfaces,
+readable secondary text, control contrast, borders and elevation. `uiStore` remains
+the theme authority; plugin theme variables are inline overrides on the same root.
+Cards, status badges, switches and brand icons consume these variables. Status
+badges include a label and a distinct icon as well as color.
+
+The Agent and context pane headers share a 52px rhythm and 32px chrome controls.
+The left sidebar remains 264px, matching the existing context-pane geometry;
+context targets, resize preferences and the mounted primary conversation remain
+unchanged. Modal's backdrop blur and surface shadow are presentation only: portal,
+nested stack, inert layers, focus restoration, Tab and Escape retain their existing
+owner. Tauri mode uses the existing `VITE_EKO_TAURI` detection flag.
+
+Browser fixture screenshots establish theme/layout coverage separately from native
+Tauri window acceptance. This visual layer adds no chat, HITL, task, terminal or
+plugin execution state, nor a new component framework or theme store.

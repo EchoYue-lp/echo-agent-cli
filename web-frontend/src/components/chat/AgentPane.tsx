@@ -33,7 +33,7 @@ export function AgentPane({
       role={role}
       aria-label={ariaLabel}
     >
-      <header className="flex h-11 shrink-0 items-center border-b border-[var(--border-secondary)] bg-[var(--bg-chat)] px-3">
+      <header className="flex h-[52px] shrink-0 items-center border-b border-[var(--border-secondary)] bg-[var(--bg-primary)] px-3">
         {header}
       </header>
       <div

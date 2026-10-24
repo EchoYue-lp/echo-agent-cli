@@ -8,23 +8,25 @@ interface ToggleProps {
 export function Toggle({ checked, onChange, label, disabled = false }: ToggleProps) {
   return (
     <button
+      type="button"
       role="switch"
       aria-checked={checked}
       disabled={disabled}
       onClick={() => onChange(!checked)}
-      className="relative inline-flex shrink-0 cursor-pointer rounded-full transition-colors duration-200"
+      className="relative inline-flex shrink-0 cursor-pointer rounded-full disabled:cursor-not-allowed transition-colors duration-200"
       style={{
         width: 36,
         height: 20,
-        background: checked ? 'var(--accent)' : 'var(--text-tertiary)',
+        background: checked ? 'var(--accent)' : 'var(--text-secondary)',
         opacity: disabled ? 0.5 : 1,
       }}
       title={label}
     >
       {label && <span className="sr-only">{label}</span>}
       <span
-        className="absolute top-0.5 rounded-full bg-white shadow-[var(--shadow-sm)] transition-transform duration-200"
+        className="absolute top-0.5 rounded-full shadow-[var(--shadow-sm)] transition-transform duration-200"
         style={{
+          background: checked ? 'var(--text-on-accent)' : 'var(--bg-primary)',
           width: 16,
           height: 16,
           left: 2,

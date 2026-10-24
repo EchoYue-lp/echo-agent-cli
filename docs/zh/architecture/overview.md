@@ -406,3 +406,18 @@ cron occurrence 和 TaskRuntime 恢复规则处理，不重放结果未知的副
 EKO CI 跟踪 framework main，SDK Host 独立精确 pin 不由顶层 gitlink 替代。
 MCP、其它合法插件组件、本地终端控制与 SDK Host stdio 保留。此次具名能力退役不授权按应用
 调用数量随意删除框架公开 API。
+
+
+### GUI 视觉基础组件
+
+GUI 沿用 `:root` / `.dark` 语义变量统一表面、辅助文字、控件对比度、边框和层级。
+`uiStore` 继续拥有主题状态，插件主题仍通过同一根节点上的 inline 变量覆盖。
+Card、状态徽标、开关和品牌图标消费这些变量；状态徽标同时用文字、不同图标和颜色表达。
+
+Agent 与上下文面板统一使用 52px 标题节奏和 32px 图标控件。左栏保持 264px，与既有右栏
+尺寸计算一致；context target、resize 偏好与持续挂载的主会话不变。Modal 的遮罩模糊和表面
+阴影只属于呈现，portal、嵌套栈、inert、焦点恢复、Tab、Escape 继续由现有实现拥有。
+Tauri 模式使用既有 `VITE_EKO_TAURI` 检测标记。
+
+浏览器隔离夹具的主题/布局截图与原生 Tauri 窗口验收分别取证。视觉层不新增 chat、HITL、
+任务、终端或插件执行状态，也不引入新组件框架或主题 store。

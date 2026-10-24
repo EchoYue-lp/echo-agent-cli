@@ -13,9 +13,9 @@
   --color-border-dark: #23252a;
 
   /* Radius scale — only 3 values used across the app */
-  --radius-sm: 6px;
-  --radius: 8px;
-  --radius-lg: 12px;
+  --radius-sm: 8px;
+  --radius: 10px;
+  --radius-lg: 14px;
   --radius-full: 9999px;
 
   /* Typography */
@@ -30,25 +30,26 @@
  * Near-white work canvas, neutral side chrome, quiet blue accent.
  * ========================================================================== */
 :root {
+  color-scheme: light;
   --bg-primary: #ffffff;
-  --bg-secondary: #f5f6f7;
-  --bg-chat: #ffffff;
-  --bg-hover: #eceef0;
+  --bg-secondary: #f3f5f8;
+  --bg-chat: #fbfcfe;
+  --bg-hover: #e9edf3;
   --bg-input: #ffffff;
   --bg-user-msg: #2563eb;
   --bg-user-bubble: #eaf1fe; /* soft accent wash for the user prompt row */
   --bg-assistant-msg: transparent;
   --bg-code: #111827;
   --bg-code-header: #1f2937;
-  --bg-sidebar: #f3f4f5;
-  --bg-sidebar-hover: #e9ebed;
-  --bg-sidebar-active: #dfe2e5;
+  --bg-sidebar: #f3f5f8;
+  --bg-sidebar-hover: #e7ecf3;
+  --bg-sidebar-active: #e0e8f5;
   --bg-rail: #ffffff;
-  --bg-overlay: rgba(15, 23, 42, 0.42);
+  --bg-overlay: rgba(16, 24, 40, 0.36);
 
-  --text-primary: #20252b;
-  --text-secondary: #5d6670;
-  --text-tertiary: #9099a4;
+  --text-primary: #202938;
+  --text-secondary: #526074;
+  --text-tertiary: #68758a;
   --text-inverse: #ffffff;
   --text-on-accent: #ffffff;
   --text-on-soft-action: #20252b;
@@ -56,26 +57,26 @@
   --text-assistant-msg: #20252b;
   --text-link: #1d4ed8;
 
-  --border-primary: #dfe2e5;
-  --border-secondary: #eceef0;
+  --border-primary: #dce2eb;
+  --border-secondary: #e9edf3;
   --border-focus: #3b82f6;
 
-  --accent: #2563eb;
+  --accent: #255ad8;
   --accent-light: #60a5fa;
   --accent-bg: #e8f0ff;
   --action-soft: #f1f2f3;
   --action-soft-hover: #e5e7e9;
-  --action-run: #5db872; /* run = success green */
-  --action-run-hover: #4aa35f;
+  --action-run: #287c4d; /* run = success green */
+  --action-run-hover: #216940;
   --action-run-bg: #e8f3ea;
   --text-on-run: #ffffff;
 
-  --settings-dialog-bg: #f7f8f9;
-  --settings-sidebar-bg: #f1f2f3;
+  --settings-dialog-bg: #f3f5f8;
+  --settings-sidebar-bg: #f3f5f8;
   --settings-content-bg: #ffffff;
   --settings-panel-bg: #ffffff;
-  --settings-active-bg: #e2e4e6;
-  --settings-accent: #2563eb;
+  --settings-active-bg: #e0e8f5;
+  --settings-accent: #255ad8;
   --settings-accent-bg: #e8f0ff;
   --settings-text-on-accent: #ffffff;
 
@@ -111,54 +112,55 @@
  * Elevation via surface ladder + 0.5–1px hairlines, not drop shadows.
  * ========================================================================== */
 .dark {
-  --bg-primary: #141517; /* surface */
-  --bg-secondary: #0f1011; /* Carbon — cards sink below canvas */
-  --bg-chat: #08090a; /* Void — main canvas (darkest) */
-  --bg-hover: #1a1c1f;
-  --bg-input: #141517;
+  color-scheme: dark;
+  --bg-primary: #1b1f27; /* surface */
+  --bg-secondary: #151920; /* Carbon — cards sink below canvas */
+  --bg-chat: #11151c; /* Void — main canvas (darkest) */
+  --bg-hover: #262d38;
+  --bg-input: #1b1f27;
   --bg-user-msg: #3b82f6;
   --bg-user-bubble: #152233; /* soft accent wash for the user prompt row */
   --bg-assistant-msg: transparent;
   --bg-code: #07080a;
   --bg-code-header: #111315;
-  --bg-sidebar: #0f1011;
-  --bg-sidebar-hover: #1a1c1f;
-  --bg-sidebar-active: #23252a;
-  --bg-rail: #0f1011;
-  --bg-overlay: rgba(0, 0, 0, 0.7);
+  --bg-sidebar: #151920;
+  --bg-sidebar-hover: #262d38;
+  --bg-sidebar-active: #2b374a;
+  --bg-rail: #151920;
+  --bg-overlay: rgba(0, 0, 0, 0.58);
 
   --text-primary: #f3f4f6; /* Paper */
-  --text-secondary: #a8adb8; /* Mist */
-  --text-tertiary: #6b7079; /* Fog */
+  --text-secondary: #b5bfd0; /* Mist */
+  --text-tertiary: #8e9db4; /* Fog */
   --text-inverse: #08090a;
-  --text-on-accent: #ffffff;
+  --text-on-accent: #102039;
   --text-on-soft-action: #f3f4f6;
   --text-user-msg: #ffffff;
   --text-assistant-msg: #f3f4f6;
   --text-link: #93c5fd;
 
-  --border-primary: #23252a; /* hairline */
-  --border-secondary: #1a1c1f;
+  --border-primary: #343d4b; /* hairline */
+  --border-secondary: #252d39;
   --border-focus: #60a5fa;
 
-  --accent: #60a5fa;
+  --accent: #8bb8ff;
   --accent-light: #93c5fd;
-  --accent-bg: #10243f;
-  --action-soft: #1a1c1f;
-  --action-soft-hover: #23252a;
-  --action-run: #5db872;
-  --action-run-hover: #6dc980;
+  --accent-bg: #20324d;
+  --action-soft: #262d38;
+  --action-soft-hover: #343e4d;
+  --action-run: #76c696;
+  --action-run-hover: #8bd5a7;
   --action-run-bg: #0f2818;
-  --text-on-run: #ffffff;
+  --text-on-run: #102719;
 
-  --settings-dialog-bg: #0f1011;
-  --settings-sidebar-bg: #0a0b0c;
-  --settings-content-bg: #111315;
-  --settings-panel-bg: #141517;
-  --settings-active-bg: #23252a;
-  --settings-accent: #60a5fa;
-  --settings-accent-bg: #10243f;
-  --settings-text-on-accent: #08090a;
+  --settings-dialog-bg: #151920;
+  --settings-sidebar-bg: #151920;
+  --settings-content-bg: #11151c;
+  --settings-panel-bg: #1b1f27;
+  --settings-active-bg: #2b374a;
+  --settings-accent: #8bb8ff;
+  --settings-accent-bg: #20324d;
+  --settings-text-on-accent: #102039;
 
   /* Shadows — near-zero (Linear philosophy: borders carry elevation, not shadows) */
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
@@ -191,6 +193,8 @@
 
 body {
   margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
   font-family: var(--font-sans);
   background: var(--bg-chat);
   color: var(--text-primary);
@@ -403,25 +407,25 @@ body {
 
 /* Glass morphism - refined */
 .glass {
-  background: rgba(250, 249, 245, 0.7);
+  background: color-mix(in srgb, var(--bg-primary) 80%, transparent);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   border: 1px solid var(--border-primary);
 }
 .dark .glass {
-  background: rgba(15, 16, 17, 0.7);
+  background: color-mix(in srgb, var(--bg-primary) 80%, transparent);
   border: 1px solid var(--border-primary);
 }
 
 /* Stronger glass */
 .glass-strong {
-  background: rgba(250, 249, 245, 0.9);
+  background: color-mix(in srgb, var(--bg-primary) 94%, transparent);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   border: 1px solid var(--border-primary);
 }
 .dark .glass-strong {
-  background: rgba(15, 16, 17, 0.92);
+  background: color-mix(in srgb, var(--bg-primary) 94%, transparent);
   border: 1px solid var(--border-primary);
 }
 
@@ -565,7 +569,7 @@ body {
   padding: 7px 14px;
   background: var(--bg-code-header);
   font-size: 12px;
-  color: var(--text-tertiary);
+  color: var(--color-code-text);
 }
 .md-pre-copy {
   cursor: pointer;
@@ -573,7 +577,7 @@ body {
   border-radius: var(--radius-sm);
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: transparent;
-  color: var(--text-tertiary);
+  color: var(--color-code-text);
   font-size: 11px;
   transition:
     background 0.15s ease,
@@ -660,11 +664,12 @@ body {
 .btn-primary {
   background: var(--accent);
   border-color: transparent;
-  color: white;
+  color: var(--text-on-accent);
   box-shadow: 0 1px 2px color-mix(in srgb, var(--accent) 45%, transparent);
 }
 
 .btn-primary:hover {
+  background: var(--accent);
   filter: brightness(1.08);
   border-color: transparent;
   box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 40%, transparent);
@@ -762,4 +767,34 @@ textarea.input {
 .restore-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* Presentation only: Modal continues to own portal, stack and keyboard behavior. */
+.eko-modal-backdrop {
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.eko-modal-surface {
+  box-shadow: var(--shadow-xl);
+}
+
+/* Shared hit area and chrome; theme/plugin variables remain the only palette. */
+.eko-pane-control {
+  display: inline-flex;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  transition:
+    background 150ms ease,
+    color 150ms ease;
+}
+
+.eko-pane-control:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
 }
