@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { lazy, Suspense, useMemo, useState } from 'react';
 import type { CSSProperties } from 'react';
 import {
   X,
@@ -26,26 +26,68 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { useUiStore, type SettingsTabId } from '../../stores/uiStore';
-import { ConfigPanel } from '../config/ConfigPanel';
-import { SessionsPanel } from '../sessions/SessionsPanel';
-import { ArchivedConversationsPanel } from '../sessions/ArchivedConversationsPanel';
-import { AuditPanel } from '../audit/AuditPanel';
-import { CompressPanel } from '../compress/CompressPanel';
-import { ToolsPanel } from '../tools/ToolsPanel';
-import { McpPanel } from '../mcp/McpPanel';
-import { SkillsPanel } from '../skills/SkillsPanel';
-import { MemoryPanel } from '../memory/MemoryPanel';
-import { EvolutionPanel } from '../evolution/EvolutionPanel';
-import { ProviderPanel } from '../providers/ProviderPanel';
-import { PluginPanel } from '../plugins/PluginPanel';
-import { HooksPanel } from '../hooks/HooksPanel';
-import { SchedulerPanel } from '../scheduler/SchedulerPanel';
-import { WorktreePanel } from '../coding/WorktreePanel';
-import { ObservabilityPanel } from '../observability/ObservabilityPanel';
-import { SandboxPanel } from '../sandbox/SandboxPanel';
-import { LspPanel } from '../lsp/LspPanel';
 import { Modal } from '../common/Modal';
+import { ErrorBoundary } from '../common/ErrorBoundary';
 
+// Keep panel identities at module scope; closed settings should not eagerly load every screen.
+const ConfigPanel = lazy(() =>
+  import('../config/ConfigPanel').then((module) => ({ default: module.ConfigPanel }))
+);
+const SessionsPanel = lazy(() =>
+  import('../sessions/SessionsPanel').then((module) => ({ default: module.SessionsPanel }))
+);
+const ArchivedConversationsPanel = lazy(() =>
+  import('../sessions/ArchivedConversationsPanel').then((module) => ({
+    default: module.ArchivedConversationsPanel,
+  }))
+);
+const AuditPanel = lazy(() =>
+  import('../audit/AuditPanel').then((module) => ({ default: module.AuditPanel }))
+);
+const CompressPanel = lazy(() =>
+  import('../compress/CompressPanel').then((module) => ({ default: module.CompressPanel }))
+);
+const ToolsPanel = lazy(() =>
+  import('../tools/ToolsPanel').then((module) => ({ default: module.ToolsPanel }))
+);
+const McpPanel = lazy(() =>
+  import('../mcp/McpPanel').then((module) => ({ default: module.McpPanel }))
+);
+const SkillsPanel = lazy(() =>
+  import('../skills/SkillsPanel').then((module) => ({ default: module.SkillsPanel }))
+);
+const MemoryPanel = lazy(() =>
+  import('../memory/MemoryPanel').then((module) => ({ default: module.MemoryPanel }))
+);
+const EvolutionPanel = lazy(() =>
+  import('../evolution/EvolutionPanel').then((module) => ({ default: module.EvolutionPanel }))
+);
+const ProviderPanel = lazy(() =>
+  import('../providers/ProviderPanel').then((module) => ({ default: module.ProviderPanel }))
+);
+const PluginPanel = lazy(() =>
+  import('../plugins/PluginPanel').then((module) => ({ default: module.PluginPanel }))
+);
+const HooksPanel = lazy(() =>
+  import('../hooks/HooksPanel').then((module) => ({ default: module.HooksPanel }))
+);
+const SchedulerPanel = lazy(() =>
+  import('../scheduler/SchedulerPanel').then((module) => ({ default: module.SchedulerPanel }))
+);
+const WorktreePanel = lazy(() =>
+  import('../coding/WorktreePanel').then((module) => ({ default: module.WorktreePanel }))
+);
+const ObservabilityPanel = lazy(() =>
+  import('../observability/ObservabilityPanel').then((module) => ({
+    default: module.ObservabilityPanel,
+  }))
+);
+const SandboxPanel = lazy(() =>
+  import('../sandbox/SandboxPanel').then((module) => ({ default: module.SandboxPanel }))
+);
+const LspPanel = lazy(() =>
+  import('../lsp/LspPanel').then((module) => ({ default: module.LspPanel }))
+);
 interface SettingsItem {
   id: SettingsTabId;
   label: string;
@@ -212,13 +254,6 @@ const settingsGroups: SettingsGroup[] = [
   },
 ];
 
-const maturityLabel: Record<SettingsItem['maturity'], string> = {
-  core: '核心',
-  live: '可用',
-  advanced: '高级',
-  lab: '实验',
-};
-
 const panels: Record<SettingsTabId, React.FC> = {
   overview: SettingsOverview,
   tools: ToolsPanel,
@@ -250,7 +285,7 @@ function SettingsOverview() {
     items: SettingsItem[];
   }> = [
     {
-      title: '执行主链路',
+      title: '运行与记录',
       icon: BrainCircuit,
       items: [
         settingsGroups[0].items.find((item) => item.id === 'observability') ?? overviewItem,
@@ -290,23 +325,23 @@ function SettingsOverview() {
   ];
 
   return (
-    <div className="grid gap-4 md:grid-cols-2">
+    <div className="grid items-start gap-4 md:grid-cols-2">
       {workflows.map((workflow) => (
         <section
           key={workflow.title}
-          className="rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)] p-4"
+          className="rounded-xl border border-[var(--border-primary)] bg-[var(--bg-secondary)] p-4"
         >
           <div className="mb-3 flex items-center gap-2">
             <workflow.icon size={16} className="text-[var(--text-secondary)]" />
             <h3 className="text-sm font-semibold text-[var(--text-primary)]">{workflow.title}</h3>
           </div>
-          <div className="space-y-2">
+          <div className="space-y-1">
             {workflow.items.map(({ id, label, icon: Icon, maturity, description }) => (
               <button
                 key={`${workflow.title}-${id}`}
                 type="button"
                 onClick={() => setActiveSettingsTab(id)}
-                className="flex w-full items-start gap-3 rounded-md px-3 py-2 text-left transition-colors hover:bg-[var(--bg-hover)]"
+                className="flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
               >
                 <Icon size={15} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
                 <span className="min-w-0 flex-1">
@@ -314,11 +349,13 @@ function SettingsOverview() {
                     <span className="truncate text-sm font-medium text-[var(--text-primary)]">
                       {label}
                     </span>
-                    <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[9px] text-[var(--text-tertiary)]">
-                      {maturityLabel[maturity]}
-                    </span>
+                    {maturity === 'lab' && (
+                      <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]">
+                        实验
+                      </span>
+                    )}
                   </span>
-                  <span className="mt-0.5 block truncate text-xs text-[var(--text-tertiary)]">
+                  <span className="mt-1 block text-xs leading-relaxed text-[var(--text-secondary)]">
                     {description}
                   </span>
                 </span>
@@ -372,15 +409,18 @@ export function SettingsDialog() {
             设置
           </h2>
           <button
+            type="button"
             onClick={closeSettings}
             aria-label="关闭设置"
-            className="flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+            className="flex h-8 w-8 items-center justify-center rounded-lg text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
           >
             <X size={15} />
           </button>
         </div>
         <nav className="flex-1 overflow-y-auto p-3 space-y-5">
           <button
+            type="button"
+            aria-current={effectiveSettingsTab === 'overview' ? 'page' : undefined}
             onClick={() => setActiveSettingsTab('overview')}
             className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-all duration-150 ${
               effectiveSettingsTab === 'overview'
@@ -390,10 +430,7 @@ export function SettingsDialog() {
           >
             <LayoutDashboard size={15} className="shrink-0" />
             <span className="min-w-0 flex-1">
-              <span className="truncate text-[13px] font-medium">总览</span>
-              <span className="mt-0.5 block truncate text-[10px] font-normal text-[var(--text-tertiary)]">
-                核心工作流入口
-              </span>
+              <span className="truncate text-sm font-medium">总览</span>
             </span>
           </button>
           {settingsGroups.map((group) => (
@@ -412,7 +449,7 @@ export function SettingsDialog() {
                 className="flex w-full items-center gap-2 px-2.5 pb-2 text-left"
               >
                 <group.icon size={12} className="text-[var(--text-tertiary)]" />
-                <span className="flex-1 text-[11px] font-semibold uppercase text-[var(--text-tertiary)]">
+                <span className="flex-1 text-xs font-semibold text-[var(--text-secondary)]">
                   {group.label}
                 </span>
                 {group.tier === 'advanced' &&
@@ -429,24 +466,26 @@ export function SettingsDialog() {
                 group.items.map(({ id, label, icon: Icon, maturity, description }) => (
                   <button
                     key={id}
+                    type="button"
+                    title={description}
+                    aria-current={effectiveSettingsTab === id ? 'page' : undefined}
                     onClick={() => setActiveSettingsTab(id)}
-                    className={`flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left transition-all duration-150
+                    className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-all duration-150
                     ${
                       effectiveSettingsTab === id
                         ? 'bg-[var(--settings-active-bg)] text-[var(--text-primary)]'
                         : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
                     }`}
                   >
-                    <Icon size={15} className="mt-0.5 shrink-0" />
+                    <Icon size={16} className="shrink-0" />
                     <span className="min-w-0 flex-1">
                       <span className="flex min-w-0 items-center gap-2">
-                        <span className="truncate text-[13px] font-medium">{label}</span>
-                        <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[9px] text-[var(--text-tertiary)]">
-                          {maturityLabel[maturity]}
-                        </span>
-                      </span>
-                      <span className="mt-0.5 block truncate text-[10px] font-normal text-[var(--text-tertiary)]">
-                        {description}
+                        <span className="truncate text-sm font-medium">{label}</span>
+                        {maturity === 'lab' && (
+                          <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]">
+                            实验
+                          </span>
+                        )}
                       </span>
                     </span>
                   </button>
@@ -464,14 +503,14 @@ export function SettingsDialog() {
               <span className="text-sm font-semibold text-[var(--text-primary)]">
                 {effectiveItem?.label}
               </span>
-              {effectiveItem && (
-                <span className="rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[10px] text-[var(--text-tertiary)]">
-                  {maturityLabel[effectiveItem.maturity]}
+              {effectiveItem.maturity === 'lab' && (
+                <span className="rounded-md bg-[var(--bg-hover)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]">
+                  实验
                 </span>
               )}
             </div>
             {effectiveItem && (
-              <div className="mt-0.5 text-xs text-[var(--text-tertiary)]">
+              <div className="mt-1 text-xs text-[var(--text-secondary)]">
                 {effectiveItem.description}
               </div>
             )}
@@ -479,7 +518,44 @@ export function SettingsDialog() {
         </div>
         <div className="flex-1 overflow-y-auto">
           <div className="animate-fade-up p-6">
-            <Panel />
+            {/* A failed optional screen must leave the workspace and settings navigation mounted. */}
+            <ErrorBoundary
+              key={effectiveSettingsTab}
+              fallback={
+                <div role="alert" className="space-y-3 text-sm text-[var(--text-secondary)]">
+                  <p>此设置页面加载失败。你可以返回总览、关闭设置，或刷新页面后再试。</p>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      onClick={() => setActiveSettingsTab('overview')}
+                    >
+                      返回总览
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      onClick={() => window.location.reload()}
+                    >
+                      刷新页面
+                    </button>
+                  </div>
+                </div>
+              }
+            >
+              <Suspense
+                fallback={
+                  <div
+                    role="status"
+                    className="flex min-h-40 items-center justify-center text-sm text-[var(--text-secondary)]"
+                  >
+                    正在加载…
+                  </div>
+                }
+              >
+                <Panel />
+              </Suspense>
+            </ErrorBoundary>
           </div>
         </div>
       </div>

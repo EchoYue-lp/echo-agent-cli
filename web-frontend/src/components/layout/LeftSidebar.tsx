@@ -273,10 +273,12 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   return (
     <div className="flex h-full flex-col bg-[var(--bg-sidebar)] text-[var(--text-secondary)]">
       {/* Brand Header */}
-      <div className="flex h-11 items-center justify-between px-3">
+      <div className="flex h-14 items-center justify-between px-4">
         <div className="flex items-center gap-2">
           <BrandIcon size="md" />
-          <span className="text-sm font-semibold text-[var(--text-primary)]">EKO</span>
+          <span className="text-sm font-semibold tracking-tight text-[var(--text-primary)]">
+            EKO
+          </span>
         </div>
         <button
           onClick={toggleTheme}
@@ -288,17 +290,18 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       </div>
 
       {/* New Task + Search */}
-      <div className="space-y-1 px-2 pb-2">
+      <div className="space-y-2 px-3 pb-4">
         <button
+          type="button"
           onClick={() => onNewTask()}
-          className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-[13px] text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
+          className="btn btn-primary flex h-10 w-full items-center justify-start gap-2 px-3 text-sm"
         >
-          <Plus size={14} />
+          <Plus size={16} />
           新建任务
         </button>
 
         {workspaces.length > 0 && (
-          <div className="flex h-8 items-center gap-2 rounded-md px-2 transition-colors focus-within:bg-[var(--bg-sidebar-hover)]">
+          <div className="flex h-9 items-center gap-2 rounded-lg border border-transparent bg-[var(--bg-hover)] px-3 transition-colors focus-within:border-[var(--border-focus)]">
             <Search size={13} className="shrink-0 text-[var(--text-tertiary)]" />
             <input
               ref={searchInputRef}
@@ -309,6 +312,8 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
             />
             {searchQuery && (
               <button
+                type="button"
+                aria-label="清除搜索"
                 onClick={() => {
                   setSearchQuery('');
                   searchInputRef.current?.focus();
@@ -325,19 +330,19 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       {/* Search Results — conversation content matches */}
       {isSearchingContent && (
         <div className="border-b border-[var(--border-primary)] px-2 pb-2">
-          <div className="px-1 py-1 text-[10px] font-semibold uppercase text-[var(--text-tertiary)]">
+          <div className="px-1 py-1 text-xs font-semibold uppercase text-[var(--text-tertiary)]">
             搜索结果 ({visibleSearchResults.length})
           </div>
           {isSearching && (
             <div className="flex items-center gap-2 px-2 py-3">
               <Loader2 size={12} className="animate-spin text-[var(--text-tertiary)]" />
-              <span className="text-[11px] text-[var(--text-tertiary)]">搜索中...</span>
+              <span className="text-xs text-[var(--text-tertiary)]">搜索中...</span>
             </div>
           )}
           {!isSearching && visibleSearchResults.length === 0 && (
             <div className="px-2 py-3 text-center">
               <Search size={16} className="mx-auto mb-1 text-[var(--text-tertiary)]" />
-              <p className="text-[11px] text-[var(--text-tertiary)]">未找到匹配的对话</p>
+              <p className="text-xs text-[var(--text-tertiary)]">未找到匹配的对话</p>
             </div>
           )}
           {!isSearching &&
@@ -346,7 +351,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                 key={conv.conversation_id}
                 role="button"
                 tabIndex={0}
-                className="cursor-pointer rounded-md px-2 py-2 text-[12px] transition-colors hover:bg-[var(--bg-hover)]"
+                className="cursor-pointer rounded-md px-2 py-2 text-[13px] transition-colors hover:bg-[var(--bg-hover)]"
                 onClick={() => handleSelectConv(conv.conversation_id)}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' || event.key === ' ') {
@@ -361,7 +366,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                     {conv.title || '新对话'}
                   </span>
                 </div>
-                <div className="mt-0.5 flex items-center gap-2 text-[10px] text-[var(--text-tertiary)] pl-[17px]">
+                <div className="mt-0.5 flex items-center gap-2 text-xs text-[var(--text-tertiary)] pl-[17px]">
                   <span>{conv.message_count} 条消息</span>
                   <span>{new Date(conv.updated_at).toLocaleDateString()}</span>
                 </div>
@@ -413,7 +418,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                   }
                 }}
               >
-                <div className="flex h-8 items-center gap-2 px-2">
+                <div className="flex h-9 items-center gap-2 px-3">
                   {/* Expand arrow */}
                   {isActive ? (
                     isExpanded ? (
@@ -426,13 +431,13 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                   )}
 
                   <div
-                    className={`min-w-0 flex-1 truncate text-[13px] ${isActive ? 'font-medium' : ''}`}
+                    className={`min-w-0 flex-1 truncate text-sm ${isActive ? 'font-medium' : ''}`}
                     title={ws.root}
                   >
                     {ws.name}
                   </div>
 
-                  <div className="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <div className="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity">
                     <button
                       onClick={(e) => handleNewConversation(e, ws)}
                       className="rounded-md p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--accent)]"
@@ -462,7 +467,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
               {isExpanded && (
                 <div className="ml-7 border-l border-[var(--border-primary)] pb-1 pl-2">
                   <div className="mb-1 flex items-center justify-between px-2 py-1">
-                    <span className="text-[10px] font-medium text-[var(--text-tertiary)]">
+                    <span className="text-xs font-medium text-[var(--text-tertiary)]">
                       最近会话
                     </span>
                     <button
@@ -472,7 +477,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                         openSettings();
                         setActiveSettingsTab('archives');
                       }}
-                      className="flex items-center gap-1 rounded-md px-1.5 py-1 text-[10px] text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                      className="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
                       title="管理已归档会话"
                     >
                       <Archive size={11} />
@@ -482,12 +487,12 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                   {isConvLoading && visibleConvs.length === 0 && (
                     <div className="flex items-center gap-2 py-2 px-1">
                       <Loader2 size={12} className="animate-spin text-[var(--text-tertiary)]" />
-                      <span className="text-[11px] text-[var(--text-tertiary)]">加载中...</span>
+                      <span className="text-xs text-[var(--text-tertiary)]">加载中...</span>
                     </div>
                   )}
 
                   {!isConvLoading && visibleConvs.length === 0 && (
-                    <div className="py-2 px-1 text-[11px] text-[var(--text-tertiary)]">
+                    <div className="py-2 px-1 text-xs text-[var(--text-tertiary)]">
                       暂无对话，开始聊天吧
                     </div>
                   )}
@@ -499,7 +504,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                     return (
                       <div key={conv.id}>
                         <div
-                          className={`group relative rounded-md text-[12px] transition-colors
+                          className={`group relative rounded-md text-[13px] transition-colors
                             ${
                               activeConvId === conv.id
                                 ? 'bg-[var(--bg-sidebar-active)] font-medium text-[var(--text-primary)]'
@@ -525,12 +530,12 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                               </span>
                             </div>
                             {conv.messageCount > 0 && (
-                              <div className="mt-0.5 pl-[17px] text-[10px] text-[var(--text-tertiary)]">
+                              <div className="mt-0.5 pl-[17px] text-xs text-[var(--text-tertiary)]">
                                 {conv.messageCount} 条消息
                               </div>
                             )}
                           </button>
-                          <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                          <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100">
                             <button
                               type="button"
                               onClick={(e) => handleArchiveConversation(conv.id, e)}
@@ -549,7 +554,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                           return (
                             <div
                               key={child.conversation_id}
-                              className={`group relative ml-3 rounded-md border-l border-[var(--border-secondary)] pl-1 text-[11px] transition-colors ${
+                              className={`group relative ml-3 rounded-md border-l border-[var(--border-secondary)] pl-1 text-xs transition-colors ${
                                 activeConvId === child.conversation_id
                                   ? 'bg-[var(--bg-sidebar-active)] font-medium text-[var(--text-primary)]'
                                   : 'text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
@@ -577,7 +582,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                                     }
                                   }}
                                   aria-label={`重命名支线对话 ${child.title}`}
-                                  className="mx-2 my-1 h-6 w-[calc(100%_-_1rem)] rounded border border-[var(--accent)] bg-[var(--bg-primary)] px-1.5 text-[11px] text-[var(--text-primary)] outline-none disabled:opacity-60"
+                                  className="mx-2 my-1 h-6 w-[calc(100%_-_1rem)] rounded border border-[var(--accent)] bg-[var(--bg-primary)] px-1.5 text-xs text-[var(--text-primary)] outline-none disabled:opacity-60"
                                 />
                               ) : (
                                 <>
@@ -595,7 +600,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                                     <GitFork size={10} className="shrink-0 text-[var(--accent)]" />
                                     <span className="min-w-0 flex-1 truncate">{child.title}</span>
                                     <span
-                                      className={`shrink-0 text-[9px] ${child.status === 'failed' || child.status === 'degraded' ? 'text-[var(--color-error)]' : 'text-[var(--text-tertiary)]'}`}
+                                      className={`shrink-0 text-[11px] ${child.status === 'failed' || child.status === 'degraded' ? 'text-[var(--color-error)]' : 'text-[var(--text-tertiary)]'}`}
                                     >
                                       {SIDE_STATUS_LABEL[child.status]}
                                     </span>
@@ -609,12 +614,12 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                                         </span>
                                       )}
                                     {!child.degraded && childMeta && childMeta.messageCount > 0 && (
-                                      <span className="shrink-0 text-[9px] text-[var(--text-tertiary)]">
+                                      <span className="shrink-0 text-[11px] text-[var(--text-tertiary)]">
                                         {childMeta.messageCount}
                                       </span>
                                     )}
                                   </button>
-                                  <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                                  <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100">
                                     {child.launch_error && (
                                       <button
                                         type="button"
@@ -681,7 +686,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                           e.stopPropagation();
                           setShowAllConvs(true);
                         }}
-                        className="text-[11px] text-[var(--accent)] cursor-pointer hover:underline"
+                        className="text-xs text-[var(--accent)] cursor-pointer hover:underline"
                       >
                         查看更多 ({filteredConversations.length - MAX_RECENT_CONVERSATIONS})...
                       </button>
@@ -695,17 +700,17 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       </div>
 
       {/* Bottom actions */}
-      <div className="border-t border-[var(--border-primary)] px-2 py-2">
+      <div className="space-y-1 border-t border-[var(--border-primary)] px-3 py-3">
         <button
           onClick={toggleTerminal}
-          className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-all hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
+          className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
         >
           <Terminal size={14} />
           终端
         </button>
         <button
           onClick={openSettings}
-          className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-all hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
+          className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
         >
           <Settings size={14} />
           设置

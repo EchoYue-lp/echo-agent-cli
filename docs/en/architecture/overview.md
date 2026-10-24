@@ -170,6 +170,11 @@ unchanged. Modal's backdrop blur and surface shadow are presentation only: porta
 nested stack, inert layers, focus restoration, Tab and Escape retain their existing
 owner. Tauri mode uses the existing `VITE_EKO_TAURI` detection flag.
 
+The sidebar and settings use readable labels and keyboard-visible actions. Settings
+screens load on demand within the existing tab registry; loading or failure keeps
+navigation, close controls and the primary workspace mounted. A failed screen can
+return to the overview, while reloading the application retries its module load.
+
 Browser fixture screenshots establish theme/layout coverage separately from native
 Tauri window acceptance. This visual layer adds no chat, HITL, task, terminal or
 plugin execution state, nor a new component framework or theme store.

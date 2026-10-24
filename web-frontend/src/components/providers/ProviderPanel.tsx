@@ -345,7 +345,7 @@ export function ProviderPanel() {
         <button
           type="button"
           onClick={() => openProviderEditor(null)}
-          className="flex min-h-8 items-center gap-1.5 rounded-md bg-[var(--accent)] px-3 text-xs font-medium text-white"
+          className="flex min-h-8 items-center gap-1.5 rounded-md bg-[var(--accent)] px-3 text-xs font-medium text-[var(--text-on-accent)]"
         >
           <Plus size={14} /> 添加 Provider
         </button>
