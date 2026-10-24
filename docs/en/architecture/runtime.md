@@ -215,3 +215,87 @@ Task journal replay treats a present canonical `TaskExecution` as the complete e
 A Review candidate, its processing error, automatic Memory persistence and the application's Review Inbox receipt are independent facts. GUI and TUI retain the candidate and error together, distinguish persisted / not persisted / unknown, and only name an Inbox entry when the owner returned its actual evidence receipt. A local presentation never creates a new review outcome.
 
 EKO's registered revision store exposes execution CAS through the same per-run file lock and atomic journal batch as direct runtime settlement. The framework computes and validates claims, interruptions and execution changes. The adapter compares the complete expected execution map and relation revision, rejects relation/context/spec drift, and never invents a plan revision for execution-only changes. Abandoned attempts use the final committed status and summary for both journal and live projection; an overridden request failure remains a separate exact-claim diagnostic.
+
+
+## Product Convergence Disposition Inventory
+
+Status: approved target, implementation pending. This inventory was checked against
+`c262cfed8e77abed38a27c1fff93547997ec9486`, the local
+`pre-retirement-2026-10-24` tag and `chore/Echoyue/full-capabilities-baseline`
+branch. Both refs resolve to that commit. It records source reachability, not a
+new native GUI, IM or cron acceptance result. [ADR 0050](../adr/0050-gui-product-convergence.md)
+records the product decision. Paths below are repository-relative.
+
+### Console entry points and retained owners
+
+| Current source and reachable use | Future disposition and prerequisite |
+| --- | --- |
+| `Cargo.toml` defaults to `tui`; `src/main.rs` dispatches TUI/REPL/JSONL/channel paths, including a JSONL escape from a GUI build; `src/lib.rs` exposes CLI/TUI modules | Retire independent TUI/REPL/CLI/JSONL dispatch, console-only dependencies and help/configuration claims after retained paths are proven. A hidden flag or disabled default alone is insufficient. Keep a working desktop process entry. |
+| `src/cli/args.rs::Args` is also parsed by `src/tauri/desktop.rs::parse_desktop_args` | Move desktop argument ownership before removing console Args. Retain actual desktop consumers: model/project/config/MCP overrides and Finder `-psn_` filtering. Console resume/JSONL/permission/rendering flags do not become desktop requirements merely because Args contains them. |
+| `src/cli/modes.rs::run_channels_mode` constructs QQ/Feishu adapters, `ChannelManager`, session factories and shutdown/join; `src/cli/channels.rs::AppChannelMessageHandler` and `ChannelSessionCoordinator`, plus `channels/{input_pump,outbound,tool_render}.rs`, handle IM identity, replies and settlement | Retain IM behavior and move its application lifecycle into shared app-core ownership before deleting the launch mode. Preserve `(channel, conversation, sender)`, session incarnations, input-pump shutdown/join, outbound/tool rendering and channel HITL. GUI bootstrap does not currently start this manager; configuration fields are not evidence of GUI IM management. |
+| `src/tauri/commands/panels.rs` reads/writes `crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED` | Move this shared memory switch and its consumers before deleting command modules. Retain GUI memory controls; do not delete the entire panels module. |
+| `echo-agent-app-core/src/runtime.rs::ApplicationServices::compose`, `ApplicationLifecycleOwner`; `state/app_state.rs::start_scheduler_and_task_service`; `scheduler/{mod,runner}.rs` | Retain shared bootstrap, TaskRun boot recovery, SchedulerRunner, file-backed cron definitions and delivery ledger. `src/tauri/commands/scheduler.rs` and `web-frontend/src/components/scheduler/SchedulerPanel.tsx` remain adapters over them. No alternate GUI scheduler or automatic replay policy. |
+| `echo-agent-app-core/src/terminal.rs::TerminalService`, `src/tauri/terminal.rs`, `web-frontend/src/components/terminal/` | Retain GUI PTY/xterm terminal create/write/resize/close and cleanup. Console product retirement does not retire an interactive terminal or Agent shell tool. SSH connection management remains a separate future outcome. |
+| `echo-agent-app-core/src/hitl/{dispatcher,channel_provider}.rs`; `src/tauri/commands/chat.rs::TauriHumanLoopHandler`; shared chat/pool/TaskRuntime owners | Retain generic HumanLoop request identity, GUI/IM response ownership, Task/Subagent and recovery. Audit `hitl/{tui_provider,repl_provider}.rs`, `src/cli/{jsonl,repl,editor,completion,keybindings,commands,command,extension_surface}.rs`, `cmd_impls/`, `src/tui/` and console render/config/tests/examples for console-only consumers before deletion; keep shared behavior through retained owners. |
+
+Desktop bootstrap already composes shared services, including scheduler startup,
+through app-core. Its event loop uses `run_return` followed by
+`run_desktop_with_settlement`, preserving `ApplicationLifecycleOwner` settlement.
+`src/tauri/mod.rs` currently toggles window visibility through a global shortcut;
+this is not evidence that every close/tray/quit path has been accepted for the
+new product. Target behavior: hidden windows leave IM/cron alive while the
+process runs; actual exit stops admission, cancels and joins accepted work via
+existing owners. No daemon continues after exit. Restart retains existing
+conversation/session identity, occurrence idempotency and TaskRuntime recovery;
+uncertain side effects are not silently replayed. GUI IM management, failure and
+reconnect display, and hide/quit/restart acceptance must precede console removal.
+
+### LSP consumer decoupling
+
+LSP remains active in this baseline. These are future removal obligations,
+not a claim that removal has happened:
+
+| Consumer | Exact future decoupling scope |
+| --- | --- |
+| Features and tool registration | Remove the framework `lsp` requests in root and app-core `Cargo.toml` only in the implementation outcome. `runtime.rs::register_lsp_tools` is called at bootstrap and by `agent_pool/pool.rs` for workspace Agents; it registers diagnostics, definition, references, hover and status tools. Remove both call paths and manager ownership, not just GUI controls. |
+| Plugin preparation/publication | `plugin_components.rs` consumes plugin LSP documents and validates LSP configuration. `plugin_runtime/{types,runtime,publication}.rs` owns `PluginLspRuntime`, config discovery, generation replacement, reload, shutdown, `LspServer` capability and language-count projections. Remove only LSP fields/branches and their consumers, while preserving prepared plugin receipts, rollback/debt owners, Skills, Hooks, MCP, Subagent, monitors, themes and output styles. |
+| Configuration and shared command adapters | Remove `.lsp.yaml` discovery/watching and generation reload branches from `config_discovery.rs` / `config_watcher.rs`; remove LSP commands/kind/receipts in `extension_commands.rs`, LSP dispatch in `extension_control/service.rs` and developer help in `developer_commands.rs`. Audit `src/cli/cmd_impls/developer.rs`, `src/cli/extension_surface.rs`, `src/cli/channels.rs` and `src/tui/{commands,events}.rs`. Preserve the remaining extension dispatcher and watchers. |
+| Tauri settings and tool calls | Remove `src/tauri/commands/lsp.rs::lsp_control`, its module and invoke registration in `commands/mod.rs` / `src/tauri/mod.rs`; retire `LspPanel`, the LSP settings navigation in `SettingsDialog.tsx`, `uiStore.ts`, `api/endpoints.ts` and related tests. `commands/config.rs` is a retained general configuration API, not a standalone LSP controller; audit affected projections without deleting it wholesale. |
+| Generated and explanatory consumers | Narrow affected `web-frontend/src/generated/` extension/LSP types and barrel exports using the established generator only during implementation; reconcile docs, examples and feature/GUI/endpoint checks then. This document outcome changes no generated output, dependency lock, CI or example. |
+
+Old `.lsp.yaml` configuration and plugin requests for retired A2A/LSP capability
+must produce an explicit retired/unsupported-capability diagnostic. Removing
+parsing or discovery must not silently ignore those inputs or report successful
+component loading. Retain only the necessary input recognition and diagnostic
+boundary, without a retired executor/controller. Acceptance must exercise both
+old configuration and plugin requests and truthful loading of retained plugin
+components. Preserve user conversations, tasks, memory, plugin files and
+configuration files; none may be deleted as obsolete source code.
+
+The source search found no direct EKO `a2a` feature request or `a2a`/`A2A`
+production Rust use in root/app-core manifests and `src`/app-core source at this
+baseline. That bounded negative result does not inventory the framework or SDK.
+Their owners must retire their actual public APIs and exact accepted contracts;
+ordinary AgentRouter messaging, Subagent, MCP and IM are retained.
+
+### Ordering, preservation and evidence
+
+1. Decouple EKO and SDK consumers while the old framework API still exists.
+   EKO CI follows framework main; the SDK has its own exact framework revision,
+   independent of superproject gitlinks. Only after supported consumers build
+   without A2A/LSP may framework implementation and advertisements be removed.
+   New framework APIs continue to ship before consumers adopt them.
+2. Accept GUI-owned IM/cron startup, configuration, failure/reconnect, HITL,
+   shared recovery, hidden-window operation and real-exit cleanup before console
+   retirement. Keep ConversationStore facts, TaskRuntime `events.jsonl`, rebuildable
+   projections and file persistence; no SQLite or second graph/store.
+3. Keep the full-capability branch/tag as recovery anchors; restore through a new
+   task branch and reassess against future main, not by retargeting preserved refs.
+   Exa `4343f0b7` remains an independent local commit, with no push/main adoption
+   implied. Framework/SDK/website inventories and cross-repository restoration
+   evidence remain owned by their respective repositories/integrator.
+4. This slice validates bilingual document parity, source references and diff
+   scope. Actual runtime, native desktop, IM delivery, cron recovery and final
+   consumer matrices belong to the later implementation outcomes. Historic ADR
+   surface-parity and LSP implementation descriptions record prior behavior; they
+   cannot override ADR 0050's forward product scope.

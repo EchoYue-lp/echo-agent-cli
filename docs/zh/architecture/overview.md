@@ -1,18 +1,23 @@
 # EKO 架构说明
 
-本文描述 `echo-agent-cli` 当前生产架构。框架内部的 ReAct、tool、memory、MCP、LSP、
-workflow 等通用实现，以 `echo-agent` 仓库自己的文档和公开 API 为准。
+本文区分 `echo-agent-cli` 当前生产架构与 [ADR 0050](../adr/0050-gui-product-convergence.md)
+已批准的收敛目标。ReAct、tool、memory、MCP、workflow 等通用机制归框架；LSP 在所检查
+基线仍存在，但与 A2A 一同进入退役范围。框架公开合同继续由 `echo-agent` 自身维护。
 
 ## 产品边界
 
-EKO 是运行在用户机器上的本地个人助理。GUI、TUI、CLI/JSONL 和 channel 是同一
-Agent 能力的不同输入/渲染适配层，不是不同产品版本。
+EKO 是运行在用户机器上的本地个人助理。已批准目标只有 GUI 产品主入口，继续保留 IM 消息与
+cron 后台触发。GUI 内置终端、Agent shell、桌面启动参数和独立 SDK Host stdio 均继续保留。
+
+当前基线仍包含 TUI、REPL、CLI/JSONL 和 channel 适配。迁移期间共享服务继续拥有权威；
+旧的终端入口持续扩张与对等目标已被替代。实际删除终端入口必须等 GUI 接管 IM 生命周期、
+cron 与共享恢复并验收后进行。本次文档改动不删除运行入口或协议。
 
 | 层                           | 职责                                                                                                            |
 | ---------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `echo-agent`                 | ReAct、模型协议、tools、DAG、Subagent、memory/store trait、MCP/LSP、workflow 通用机制                           |
 | `echo-agent-app-core`        | EKO runtime、workspace、conversation、TaskRuntime 文件投影、AgentPool、HITL、Plugin、Browser、分析/研究产品策略 |
-| `src/cli` / `src/tui`        | CLI/REPL/TUI 输入、命令和渲染                                                                                   |
+| `src/cli` / `src/tui`        | 当前待退役的终端适配；先迁移 IM handler 与桌面共享依赖                                                                                   |
 | `src/tauri` / `web-frontend` | typed Tauri IPC、GUI 状态投影和交互                                                                             |
 | `src-tauri`                  | 桌面进程入口、窗口和平台能力                                                                                    |
 
@@ -47,7 +52,7 @@ ToolControl, Plugin/MCP/model publication and product receipt mapping.
 
 The split is namespace-preserving and item-boundary based, so JSON/JSONL,
 serde/TS bindings, file layout, error codes and five-surface behavior do not
-change. A product-neutral framework primitive does not wait for a second
+change during that split; this is not a requirement to expand retired product targets. A product-neutral framework primitive does not wait for a second
 consumer; placement is decided by standalone semantics, dependency direction,
 and independent framework tests, examples, and documentation. A separate EKO
 contracts/domain/runtime crate remains a distinct packaging decision and is
@@ -56,6 +61,8 @@ consumers justify it. See [ADR 0025](../adr/0025-app-core-global-modularization.
 and the cross-repository [framework capability placement audit](../../../../docs/2026-08-30-framework-capability-placement-audit.md).
 
 ## 运行时所有权
+
+当前实现（终端入口在完成迁移前仍存在）：
 
 ```text
 GUI / TUI / CLI / JSONL / Channel
@@ -352,7 +359,7 @@ delivery recovery 前调用 on-load reconcile，workspace create/switch settleme
 request/receipt。GUI 使用 typed Tauri IPC；JSONL 把 typed `ExtensionReceipt` 写入 canonical
 journal/event stream且不进入模型；CLI、TUI、channel 通过同一 app-core service 做文本适配和
 terminal settlement。MCP health 按 authority scope 保存，Hook/LSP 使用 captured project root，
-Browser 和 LSP 在五类产品入口功能对等。
+当前 Browser 和 LSP 通过五类入口共用该实现；这描述迁移前现状，不要求继续扩张终端入口或保留 LSP。
 
 Plugin 与 MCP mutation 在 admission 时一次捕获 global seed 和全部 loaded workspace target；
 receipt 固定 scope、workspace generation、previous/candidate prepared generation、typed
@@ -372,10 +379,30 @@ terminal、provider usage、context compaction 次数、final answer/message ide
 
 ## 不变量
 
-- GUI、TUI、CLI/JSONL、channel 功能对等，差异只在 transport 和 renderer。
+- 目标入口为 GUI，IM/cron 共享既有核心能力；当前终端入口待迁移验收后退役，不再扩张。
 - plan approval 不进入 TaskRun 状态机；plan 是 artifact，批准由 prompt/permission 驱动。
 - current workspace 只表示 UI focus，不是已接受 operation 的路由依据。
 - Task DAG、重试、取消、revision 语义只能有一个权威实现。
 - 通用 turn terminal 与 accounting 只能来自 framework `TurnReceipt`，surface/event sink 不重复推断。
 - EKO 使用文件/内存持久化，不启用 SQLite。
 - 只有 Subagent 术语，不建立第二种执行角色概念。
+
+
+## 产品收敛边界
+
+目标数据流为 GUI / IM / cron 进入既有 app-core 服务和 framework Agent / Task / Subagent。
+`ConversationStore` 与 TaskRuntime journal 分别拥有会话和任务事实，前端只做投影。
+EKO 使用文件/内存，不引入 SQLite；独立框架消费者的存储选项另行判断。
+
+GUI 保留 Side Conversation 导航与并行面板。IM 保留普通 conversation、Subagent 和已有 fork
+行为，不新增 Side Conversation 专用 wire contract。终端专属命令可以随入口退出，共享语义
+必须由保留的 owner 继续提供。
+
+隐藏 GUI 窗口只改变可见性；真正退出关闭准入并等待生命周期结算。重启沿既有 IM identity、
+cron occurrence 和 TaskRuntime 恢复规则处理，不重放结果未知的副作用，不承诺进程退出后继续
+运行。GUI 管理和原生生命周期验收仍是后续工作，见[源码处置清单](./runtime.md#产品收敛处置清单)。
+
+撤销 A2A/LSP 必须先让 EKO/SDK 消费者解除依赖，再删框架；新增通用 API 仍先交付框架。
+EKO CI 跟踪 framework main，SDK Host 独立精确 pin 不由顶层 gitlink 替代。
+MCP、其它合法插件组件、本地终端控制与 SDK Host stdio 保留。此次具名能力退役不授权按应用
+调用数量随意删除框架公开 API。

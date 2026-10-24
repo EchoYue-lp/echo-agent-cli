@@ -19,9 +19,13 @@ EKO 应用层:Rust workspace(`echo-agent-app-core` 应用核心 + Tauri 壳 `src
 
 **数据持久化:EKO 不需要 SQLite。** 对话历史/记忆用文件或内存实现;禁止引入或保留 SQLite 依赖(`SqliteStore`/`SqliteConversationStore`/echo-state 的 `sqlite` feature 在本仓库不启用)。禁止把"schema 迁移/前端契约"当作反对改动的理由——开发阶段无迁移负担,过时代码直接删。
 
-**多模式核心能力对等:TUI 与 GUI 是功能完全一样的完全体**,只是交互方式不同(对标 Claude Code 纯 TUI)。复杂任务/plan/subagent/任务运行时/HITL/记忆/附件等核心 Agent 能力必须对等。代码里"X 模式 doesn't use Y"的注释/None 传参是**待补缺口,不是产品定位**;禁止以"某模式不需要"为由拒绝接入核心能力。
+**产品目标：EKO 只保留 GUI 主入口，继续保留 IM 收发和 cron 后台触发。** 独立 TUI、REPL、CLI/JSONL 产品入口进入退役范围，不再要求扩张这些入口或维持它们与 GUI 的长期能力对等。GUI 内置终端、Agent shell、桌面启动参数、构建命令与独立 SDK Host stdio 不属于这次 CLI 产品入口退役。MCP、Task/Subagent、HITL、共享会话/任务恢复和文件持久化继续保留。
 
-只有依赖特定界面形态才成立的布局、窗口编排、侧栏或多面板交互可以由对应 surface 独有,但不得改变底层 Agent 能力、状态权威或其它 surface 已有行为。`Side Conversation` 是 GUI 的侧栏/并行面板能力:只由 GUI/Tauri 暴露创建、树形导航和支线管理入口,TUI、CLI/JSONL 与 channel 不新增 Side Conversation 专用命令或 wire contract,并保留已有普通 conversation、Subagent 和 `/fork` 行为。不得把这条例外扩展为其它核心能力不对等的理由。
+**当前事实与目标必须区分。** `pre-retirement-2026-10-24` 基线仍包含 TUI/REPL/CLI/JSONL 与 LSP；本次规则与 ADR 只固化已批准方向，不表示实现已删除。先让 GUI/app-core 接管 IM 连接、cron、共享启动与退出 owner，再实际删除独立终端入口；不得按 `src/cli` 目录名整包删除共享能力。隐藏窗口保留进程内后台服务；真正退出停止准入并等待既有生命周期结算，不承诺退出后继续运行。
+
+`Side Conversation` 继续是 GUI/Tauri 的侧栏与并行面板能力，提供创建、树形导航和支线管理。保留 IM 的普通 conversation、Subagent 和已有 fork 行为，不新增 Side Conversation 专用 channel wire contract。当前终端入口的普通 conversation、Subagent 和 `/fork` 实现随入口退役核对，不再作为长期保留终端入口的理由；底层共享能力不得连带删除。
+
+**A2A/LSP 是明确批准的跨仓能力退役，不能泛化为“EKO 没调用就删框架 API”。** `echo-agent` 仍是独立通用框架，合理公开 API 和其它存储实现由其自身复用语义决定。仅退役两类能力的生产实现、注册、feature 请求、配置、插件组件、工具调用和消费者合同，保留其它合法 Plugin/Skill/Hook/MCP/Subagent 能力。处置清单与验收见 [ADR 0050](docs/zh/adr/0050-gui-product-convergence.md) 和 [运行时清单](docs/zh/architecture/runtime.md#产品收敛处置清单)。
 
 ## 统一术语:只有 Subagent,没有 Worker(强制)
 
@@ -60,7 +64,7 @@ CI 对 lib/bins 强制 `-D clippy::unwrap_used -D clippy::expect_used -D clippy:
 
 本仓库是应用层,依赖 `echo-agent` 框架。动手写任何"能放框架、也能放应用"的功能前必须先回答分层:
 
-- 通用机制(依赖 DAG、重试、取消、revision safe point)归框架;EKO 产品策略(DomainProfile、reviewer 策略、worktree、文件权威、UI/TUI/CLI 投影)留应用。
+- 通用机制(依赖 DAG、重试、取消、revision safe point)归框架;EKO 产品策略(DomainProfile、reviewer 策略、worktree、文件权威、GUI/IM/cron 投影及待退役入口适配)留应用。
 - **动手前先搜完整仓库再新增**:按类型名、trait、字段、调用路径同时搜索本仓库与 `../echo-agent`,区分"已定义""已注册""主路径真实可达";禁止平行实现框架已有的语义。
 - 应用 adapter 保持薄且转换无损:只做类型转换、metadata 注入、产品 policy/hook;语义不同的字段不得压平。adapter 若开始出现 ready frontier、DAG 主循环、通用重试取消,说明分层失败,停下来重新设计。
 - 任务关系只有一个权威 API:框架默认 `task_create/task_update/task_list`,EKO 在此之上加 `task_execute`;`TaskPlan` 是版本化 artifact,`TodoItem` 是 UI 投影,不得各自拥有 store/状态机/执行器;禁止重新引入 `todo_write`、`plan_create/plan_patch/plan_execute` 等平行任务 CRUD。
@@ -113,6 +117,13 @@ npm run build
 
 开发阶段(非 main 分支)每个 commit 跑 focused test / `cargo check -p <crate>` 快检即可;全量门禁只在任务合并到 main 前跑。延后全量 ≠ 延后修复已知问题。
 
+### 构建并发与批次后清理(强制)
+
+- 同机最多两条 focused Rust 构建/测试并发，完整 all-feature/GUI/语言矩阵同一时间只运行一套；每条 Rust 构建 `jobs <= 2`，dev/test debuginfo 关闭。
+- 每个 worktree 使用自有独立 target，禁止与其它聊天或 primary 共用 `CARGO_TARGET_DIR`。重构建前后记录 `df`/`du`；可用空间低于 5 GiB 时停止新的重构建。
+- **每个编译/测试批次结束后及时 `cargo clean` 自有准确 target**：先把必要日志、真实退出状态以及需保留的 Host/制品保存到 target 外（原始日志放本仓 ignored `.echo-semantic/local/<task-id>/`）；再确认该 target 无活动 cargo/rustc/Host 或其它制品读取者，最后只清本任务准确 target。不能先删再声称证据或制品可恢复，不能误清其它聊天或 primary 缓存。
+- 纯文档/只读任务没有产生 Cargo 产物时明确报告不适用，不为形式清理无关目录。工作树、分支、未提交/未跟踪源码、stash、保留 tag 和原件的维护清理按独立授权及协调归属执行，不借 `cargo clean` 扩大范围。
+
 ## 文档同步(强制)
 
 - 任何代码修改同步检查对应文档与示例,确保实现与对外说明一致;不适用时在提交说明写明原因。
@@ -121,7 +132,8 @@ npm run build
 
 ## 跨仓库依赖与提交顺序
 
-- 本仓库 path 依赖 `../echo-agent`:框架新增 API 被 CLI 消费时,**必须先把框架改动合并进 echo-agent 的 main,再把本仓库的任务分支合并进 main**,最后更新上层 superproject 的 submodule 指针。
+- 本仓库 path 依赖 `../echo-agent`:框架新增 API 被 EKO 消费时,**必须先把框架改动合并进 echo-agent 的 main,再把本仓库的任务分支合并进 main**,最后更新上层 superproject 的 submodule 指针。
+- **撤销 API 顺序相反**：先在旧框架仍保留 API 时让 EKO 与 SDK 主线解除 A2A/LSP 依赖，再删除 framework 实现。EKO CI 跟踪 framework main，每个中间主线必须可构建；SDK Host 使用自身精确 framework pin，不由顶层 gitlink 替代，也不强迫为退役升级 pin。
 - CI 编译的 echo-agent 跟踪其 `main` 分支。**不要改回钉死 hash**:pin 会在框架每次演进后立刻过期,导致 CI 编译旧框架而本地门禁编译新框架,两边验证的不是同一份代码(2026-08-25 至 09-03 曾因此连续红盘)。
 - worktree 开发期间临时改过 `Cargo.toml` 绝对路径的,合并前必须改回相对路径:`echo-agent-cli/Cargo.toml` 用 `../echo-agent`,`echo-agent-app-core/Cargo.toml` 用 `../../echo-agent`。
 

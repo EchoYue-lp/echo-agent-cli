@@ -481,6 +481,14 @@
       "sourceLanguage": "zh-mixed",
       "translationStatus": "reviewed",
       "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0050-gui-product-convergence.md",
+      "targetPath": "adr/0050-gui-product-convergence.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
     }
   ]
 }

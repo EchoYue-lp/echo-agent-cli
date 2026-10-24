@@ -1,21 +1,29 @@
 # EKO Architecture Overview
 
-This page describes the current production architecture of `echo-agent-cli`.
-The ReAct engine, tools, memory, MCP, LSP, and workflow mechanisms are generic
-framework capabilities; their public contracts are documented in the sibling
-`echo-agent` repository.
+This page separates the current production architecture of `echo-agent-cli`
+from the approved convergence target in [ADR 0050](../adr/0050-gui-product-convergence.md).
+The framework owns ReAct, tools, memory, MCP and workflows. LSP remains present
+in the inspected baseline but is approved for retirement together with A2A;
+framework public contracts remain owned by `echo-agent`.
 
 ## Product Boundary
 
-EKO is a local personal assistant running on the user's machine. GUI, TUI,
-CLI/JSONL, and messaging channels are input and rendering adapters over one
-Agent product, not separate product editions.
+EKO is a local personal assistant running on the user's machine. The approved
+target has one GUI product entry, with IM messages and cron as retained background
+triggers. GUI terminals, Agent shell tools, desktop launch arguments and the
+independent SDK Host stdio protocol remain valid capabilities.
+
+The current baseline still contains TUI, REPL, CLI/JSONL and channel adapters.
+Their shared services remain authoritative during migration; the old requirement
+to keep expanding all console surfaces has been superseded. Removing console
+entry points must wait for GUI-owned IM lifecycle, cron and recovery acceptance.
+This documentation change does not delete any runtime entry or protocol.
 
 | Layer | Responsibility |
 | --- | --- |
 | `echo-agent` | ReAct, model protocols, tools, DAG, Subagent, memory/store traits, MCP/LSP, and workflows |
 | `echo-agent-app-core` | EKO runtime, workspace and conversation identity, TaskRuntime file projections, AgentPool, HITL, Plugin, Browser, analysis and research policy |
-| `src/cli` / `src/tui` | CLI, REPL and TUI input, commands and rendering |
+| `src/cli` / `src/tui` | Current console adapters awaiting retirement; IM handlers and shared desktop dependencies must move first |
 | `src/tauri` / `web-frontend` | typed Tauri IPC, GUI projection and interaction |
 | `src-tauri` | desktop process entry, windows and platform facilities |
 
@@ -45,7 +53,7 @@ generation, ToolControl, Plugin/MCP/model publication, and product receipt
 mapping.
 
 The split preserves JSON/JSONL, serde/TS bindings, file layout, error codes,
-and five-surface behavior. A product-neutral framework primitive is admitted by
+and current surface behavior; it does not require expanding retired product targets. A product-neutral framework primitive is admitted by
 standalone semantics, dependency direction, and independent tests, examples,
 and documentation; it does not wait for a second consumer. A separate EKO
 contracts/domain/runtime crate remains a packaging decision that requires
@@ -54,6 +62,8 @@ dependency isolation, compile measurements, and multiple EKO consumers. See
 [framework capability placement audit](../../../../docs/2026-08-30-framework-capability-placement-audit.md).
 
 ## Runtime Shape
+
+Current implementation (console entry points remain until migration):
 
 ```text
 GUI / TUI / CLI / JSONL / Channel
@@ -115,3 +125,31 @@ around framework task APIs.
 
 See [runtime](./runtime.md), [persistence](./persistence.md),
 [features](../features.md), and the relevant ADRs for detailed contracts.
+
+
+## Convergence Boundary
+
+The target flow is GUI / IM / cron into the existing app-core services and
+framework Agent / Task / Subagent runtime. `ConversationStore` and the TaskRuntime
+journal remain the respective conversation and task authorities; frontend state
+is a projection. EKO uses files and memory, without SQLite. Framework storage
+options for independent consumers remain a separate decision.
+
+The GUI retains Side Conversation navigation and parallel panels. IM retains its
+ordinary conversations, Subagent and existing fork behavior; it gains no dedicated
+Side Conversation wire contract. Console-specific commands can leave with their
+entry points while their shared semantics remain available through retained owners.
+
+Hiding a GUI window leaves the process alive; actual application exit closes
+admission and awaits lifecycle settlement. Restart uses existing IM identity,
+cron occurrence and TaskRuntime recovery rules, without replaying uncertain side
+effects or promising execution after process exit. GUI management and native
+lifecycle acceptance remain future work. See the [source-backed disposition
+inventory](./runtime.md#product-convergence-disposition-inventory).
+
+A2A/LSP withdrawal requires EKO and SDK consumers to stop depending on them before
+framework deletion. Additive framework APIs still ship before consumer adoption.
+EKO CI follows framework main; the SDK Host has its own exact framework pin,
+independent of the superproject gitlink. MCP, legal plugin components, local
+terminal control and SDK Host stdio are retained. This is an explicit product
+retirement, not permission to remove unused framework public APIs indiscriminately.

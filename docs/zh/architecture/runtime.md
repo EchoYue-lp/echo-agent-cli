@@ -250,3 +250,69 @@ TaskRuntime 按框架最终结算决定是否接受 attempt evidence。`Supersed
 Review 候选、处理错误、自动 Memory 持久化和应用 Review Inbox 收据是独立事实。GUI 与 TUI 同时保留候选和错误，区分已持久化、未持久化和状态未知；只有 owner 返回真实 evidence receipt 时才能显示对应 Inbox 条目。展示层不产生新的 Review 结果。
 
 EKO 注册的 revision store 通过同一个 run 文件锁和原子 journal 批次提供 execution CAS。claim、中断和 execution 变化由框架计算、校验；应用适配器比较完整 expected execution map 与关系 revision，拒绝关系、context、spec 漂移，execution-only 变化不产生新的 plan revision。abandon attempt 的 journal 与直播使用同一最终提交状态和摘要，被覆盖的请求失败原因仅保留为带精确 claim 身份的独立诊断。
+
+
+## 产品收敛处置清单
+
+状态：已批准目标，尚待实现。清单核对的源码为
+`c262cfed8e77abed38a27c1fff93547997ec9486`；本机
+`pre-retirement-2026-10-24` tag 与 `chore/Echoyue/full-capabilities-baseline`
+分支均解析到该提交。这是源码可达性记录，不是新的原生 GUI、IM 或 cron 验收结果。
+产品决定见 [ADR 0050](../adr/0050-gui-product-convergence.md)。以下路径均相对本仓根目录。
+
+### 终端入口与保留 owner
+
+| 当前源码与真实消费 | 后续处置与前置条件 |
+| --- | --- |
+| `Cargo.toml` 默认启用 `tui`；`src/main.rs` 分派 TUI/REPL/JSONL/channel，GUI build 仍可转入 JSONL；`src/lib.rs` 暴露 CLI/TUI 模块 | 保留路径验收后退役独立 TUI/REPL/CLI/JSONL 分派、终端专属依赖及帮助/配置说明。仅隐藏参数或禁用默认 feature 不算退出。保留可用的桌面进程入口。 |
+| `src/cli/args.rs::Args` 仍由 `src/tauri/desktop.rs::parse_desktop_args` 解析 | 删除 console Args 前迁移桌面参数归属。保留真实桌面消费者：model/project/config/MCP override 与 Finder `-psn_` 过滤。Args 中的 console resume/JSONL/permission/rendering 参数不因此成为桌面需求。 |
+| `src/cli/modes.rs::run_channels_mode` 构造 QQ/飞书 adapter、`ChannelManager`、session factory 和 shutdown/join；`src/cli/channels.rs::AppChannelMessageHandler`、`ChannelSessionCoordinator` 及 `channels/{input_pump,outbound,tool_render}.rs` 处理 IM identity、回复和结算 | 保留 IM 行为，先把应用生命周期迁入共享 app-core owner，再删启动模式。保留 `(channel, conversation, sender)`、session incarnation、input-pump 关闭/join、outbound/tool 呈现与 channel HITL。当前 GUI bootstrap 未启动此 manager，配置字段不代表 GUI IM 管理已交付。 |
+| `src/tauri/commands/panels.rs` 读写 `crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED` | 删除 command 模块前迁移共享记忆开关及调用点。保留 GUI 记忆控制，不整包删 panels。 |
+| `echo-agent-app-core/src/runtime.rs::ApplicationServices::compose`、`ApplicationLifecycleOwner`；`state/app_state.rs::start_scheduler_and_task_service`；`scheduler/{mod,runner}.rs` | 保留共享启动、TaskRun boot 恢复、SchedulerRunner、文件 cron 定义与投递账本。`src/tauri/commands/scheduler.rs` 和 `web-frontend/src/components/scheduler/SchedulerPanel.tsx` 仍是其适配层。不另建 GUI scheduler，不新增自动重放策略。 |
+| `echo-agent-app-core/src/terminal.rs::TerminalService`、`src/tauri/terminal.rs`、`web-frontend/src/components/terminal/` | 保留 GUI PTY/xterm 的创建、输入、resize、关闭和清理。终端产品入口退役不删除交互式终端或 Agent shell。SSH 连接管理另属后续结果。 |
+| `echo-agent-app-core/src/hitl/{dispatcher,channel_provider}.rs`；`src/tauri/commands/chat.rs::TauriHumanLoopHandler`；共享 chat/pool/TaskRuntime owner | 保留通用 HumanLoop 请求身份、GUI/IM 回答 owner、Task/Subagent 与恢复。删前核对 `hitl/{tui_provider,repl_provider}.rs`、`src/cli/{jsonl,repl,editor,completion,keybindings,commands,command,extension_surface}.rs`、`cmd_impls/`、`src/tui/` 以及 console 呈现/配置/测试/示例的专属消费者；共享行为由保留 owner 承接。 |
+
+桌面 bootstrap 已通过 app-core 组合共享服务并启动 scheduler。事件循环使用 `run_return`，
+随后由 `run_desktop_with_settlement` 保持 `ApplicationLifecycleOwner` 结算。
+`src/tauri/mod.rs` 当前通过全局快捷键切换窗口可见性；这不能证明所有关闭/托盘/退出路径
+已符合新产品并通过验收。目标行为：窗口隐藏时，进程内 IM/cron 继续运行；真正退出由原有
+owner 停止准入、取消并 join 已接受工作，退出后没有后台 daemon 继续执行。重启延续原有
+conversation/session identity、occurrence 幂等与 TaskRuntime 恢复，不静默重放结果未知的
+副作用。GUI IM 管理、失败/重连展示及隐藏/退出/重启验收必须先于终端入口删除。
+
+### LSP 消费者解除依赖
+
+LSP 在当前基线仍活跃。以下是后续必须退出的范围，不表示已经删除：
+
+| 消费者 | 精确的后续去依赖范围 |
+| --- | --- |
+| feature 与工具注册 | 在实现结果中移除根和 app-core `Cargo.toml` 对 framework `lsp` 的请求。`runtime.rs::register_lsp_tools` 在 bootstrap 和 `agent_pool/pool.rs` 的 workspace Agent 创建时调用，注册 diagnostics、definition、references、hover、status 工具。移除两条调用路径和 manager owner，不能只删 GUI。 |
+| 插件准备/发布 | `plugin_components.rs` 消费 plugin LSP document 并验证配置；`plugin_runtime/{types,runtime,publication}.rs` 拥有 `PluginLspRuntime`、配置发现、代替换、reload、shutdown、`LspServer` capability 和语言计数投影。仅移除 LSP 字段/分支和消费者，保留 prepared plugin receipt、rollback/debt owner、Skills、Hooks、MCP、Subagent、monitor、theme、output style。 |
+| 配置与共享命令适配 | 从 `config_discovery.rs` / `config_watcher.rs` 移除 `.lsp.yaml` 发现/监听和代重载分支；从 `extension_commands.rs` 移除 LSP command/kind/receipt，从 `extension_control/service.rs` 移除 LSP dispatch，从 `developer_commands.rs` 移除相关帮助。核对 `src/cli/cmd_impls/developer.rs`、`src/cli/extension_surface.rs`、`src/cli/channels.rs` 和 `src/tui/{commands,events}.rs`，保留其余 extension dispatcher 与 watcher。 |
+| Tauri 设置与工具调用 | 移除 `src/tauri/commands/lsp.rs::lsp_control`、`commands/mod.rs` / `src/tauri/mod.rs` 中的模块及 invoke 注册；退役 `LspPanel`、`SettingsDialog.tsx` LSP 导航、`uiStore.ts`、`api/endpoints.ts` 和相关测试。`commands/config.rs` 是保留的通用配置 API，并非独立 LSP controller；核对受影响投影，不整包删除。 |
+| 生成与说明消费者 | 只在实现阶段用既有生成器收窄 `web-frontend/src/generated/` 中受影响的 extension/LSP 类型和 barrel export，并同步 docs、examples 与 feature/GUI/endpoint 检查。本次文档结果不改生成物、依赖锁、CI 或示例。 |
+
+旧 `.lsp.yaml` 配置及插件请求退役的 A2A/LSP 能力时必须明确诊断已退役/不再支持。
+移除解析或发现不能静默忽略这些输入，也不能假报组件加载成功。仅保留必要的输入识别与
+诊断边界，不保留已退役的执行器/控制器。验收须覆盖旧配置和插件请求，以及保留插件组件
+的真实加载结果。用户会话、任务、记忆、插件文件和配置文件不得作为过时代码一并删除。
+
+在当前基线的根/app-core manifest 与 `src`/app-core Rust 源码中，搜索未发现 EKO 直接
+请求 `a2a` feature 或 `a2a`/`A2A` 生产调用。这个有界否定结论不等于框架/SDK 已盘点。
+它们的 owner 负责实际公开 API 与精确 accepted 合同退役；普通 AgentRouter 消息、Subagent、
+MCP、IM 继续保留。
+
+### 顺序、保留与证据
+
+1. 旧 framework API 仍存在时先让 EKO/SDK 解除依赖。EKO CI 跟踪 framework main，SDK 有
+   独立精确 framework revision，不由顶层 gitlink 替代。受支持消费者已能无 A2A/LSP 构建后
+   才删除框架实现及宣传；新增 framework API 继续先交付框架、后消费者采用。
+2. 先验收 GUI 所有的 IM/cron 启动、配置、失败/重连、HITL、共享恢复、隐藏窗口运行及真正
+   退出清理，再退役终端入口。保留 ConversationStore 事实、TaskRuntime `events.jsonl`、
+   可重建投影和文件持久化，不引入 SQLite 或第二套 graph/store。
+3. 保留完整能力 branch/tag 作为恢复锚点；恢复时新建任务分支并按届时 main 重评，不改指保留
+   refs。Exa `4343f0b7` 仍是本机独立提交，不隐含推送/合 main 授权。框架/SDK/官网清单与
+   跨仓恢复证据由各自仓库/集成负责人拥有。
+4. 本切片验证双语文档、源码引用和 diff 范围；真实运行、原生桌面、IM 投递、cron 恢复与
+   最终消费者矩阵由后续实现结果验收。历史 ADR 中的 surface 对等和 LSP 实现说明记录旧行为，
+   不覆盖 ADR 0050 的未来产品范围。
