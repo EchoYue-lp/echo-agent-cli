@@ -530,7 +530,7 @@ mod tests {
                     let permissions = std::fs::metadata(&legacy)
                         .map_err(|error| error.to_string())?
                         .permissions();
-                    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0))
+                    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o0))
                         .map_err(|error| error.to_string())?;
                     restore_permissions = Some((legacy.clone(), permissions));
                 }
@@ -543,7 +543,7 @@ mod tests {
                     let permissions = std::fs::metadata(&locked)
                         .map_err(|error| error.to_string())?
                         .permissions();
-                    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0))
+                    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o0))
                         .map_err(|error| error.to_string())?;
                     restore_permissions = Some((locked, permissions));
                 }
