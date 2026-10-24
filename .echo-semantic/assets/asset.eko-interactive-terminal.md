@@ -6,7 +6,7 @@ title: Existing EKO interactive terminal owner and view adapters
 asset_type: state_authority
 status: active
 risk: high
-observed_at: source:688b4e517f8a99abb3d08d6b7547d03bc9ef84216f708054829d385f788b27e5
+observed_at: source:230d0c7af649f29cef2002109e67167479b0894c28537c90eefe2d0746336829
 boundary_refs: [boundary.eko-framework-consumer-settlement]
 behavior_refs: []
 rule_refs: [rule.eko-framework-consumer-authorities]
@@ -63,3 +63,15 @@ id/pid/target 来自同一后端 Session；输出经原 PTY bytes/base64、raw U
 ## 未知与限制
 
 active 表示该原 owner 在生产入口可达，不表示完整产品已验收。原25个 focused Rust cases 只覆盖 ea4/2b/e4e；原 Node61files/314tests 只按当前425个前端输入精确不变复用。710a精六项依赖 metadata 资格不是编译/Clippy/native/远端资格，风险未修复或变为不可达。完整 Rust/GUI、真实 Tauri/SSH、其它平台、main/CI、发布及整个 Plan06 尚未完成。
+
+## 2026-10-25 私有结算别名的后继观察
+
+前一source观察为688b4e517f8a99abb3d08d6b7547d03bc9ef84216f708054829d385f788b27e5，d7fc原件、710风险资格与旧25case边界保留。当前仅在原terminal模块抽取私有透明TerminalSettlementSlot，两个引用点展开后精确恢复同一Arc/Mutex/Option/JoinHandle/Result类型，不增加owner、store、API或同步/生命周期行为。observed_at刷新只绑定该后继的当前源码；原40个历史语义对象及其status/观察不变。
+
+原focusedClippy在两处type_complexity自然101，CLI库未到；失败raw及exactclean1.2GiB/0保留。当前未重试Clippy，不把别名候选、metadata或旧710扫描写成通过；新9568绑定的原六工具方法/两次fresh扫描和下一Clippy的真实结果分别以任务回执记录。Node425字节未变，产品文档/示例/官网无需纯私有别名迁移；完整GUI/native/真实远端和Plan06仍未验。
+
+## 2026-10-25 focused Clippy 后继资格
+
+前一私有别名修复来源观察source:9f547aecb5c081047bcf82867a21515d83d490d701aed53a9a2a1b312f026cbf与原d7/710/101历史保持。后继另获一条focused租约后，原两package/lib/all-feature Clippy完整自然0，两个lib的rmeta已保存哈希，未运行tests/bins/examples/Node/native/远端。此处只更新当前来源观察和已执行资格，不改变原TerminalService唯一owner、前端观察角色或既有风险接受。
+
+observer的du临时文件竞争exit1、采样gap和同原Cargo组恢复另存，不把observer退出当compiler退出，也不声称连续RSS峰值。原命令完整raw/真实0/源guard/rmeta保存后，无targetreader才立即exactclean0移除5939files/1.2GiB，targetabsent并归还槽；资格不以留target等待review。完整矩阵、真实native/SSH、其它平台、main/CI和Plan06仍未资格。

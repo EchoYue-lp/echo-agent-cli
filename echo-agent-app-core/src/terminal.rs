@@ -135,13 +135,15 @@ struct TerminalTestControl {
     reader_ended: AtomicBool,
 }
 
+type TerminalSettlementSlot = Arc<Mutex<Option<JoinHandle<Result<(), String>>>>>;
+
 struct TerminalSession {
     info: TerminalSessionInfo,
     master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Arc<BlockingMutex<Box<dyn Write + Send>>>,
     // These are the original handles, retained across failed/cancelled observers.
     resources: BlockingMutex<TerminalResources>,
-    settlement: Arc<Mutex<Option<JoinHandle<Result<(), String>>>>>,
+    settlement: TerminalSettlementSlot,
     completed: BlockingMutex<Option<ExitStatus>>,
     close_requested: AtomicBool,
     exit_published: AtomicBool,
@@ -188,7 +190,7 @@ impl TerminalSession {
         size: PtySize,
         target: TerminalTarget,
         shell: Option<String>,
-        settlement: Arc<Mutex<Option<JoinHandle<Result<(), String>>>>>,
+        settlement: TerminalSettlementSlot,
     ) -> Result<(Arc<Self>, Box<dyn Read + Send>), String> {
         validate_dimensions(size.rows, size.cols)?;
         let target = target.normalized()?;

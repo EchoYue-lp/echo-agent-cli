@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.eko-ssh-source-checkpoint
 kind: evidence
-observed_at: source:688b4e517f8a99abb3d08d6b7547d03bc9ef84216f708054829d385f788b27e5
+observed_at: source:230d0c7af649f29cef2002109e67167479b0894c28537c90eefe2d0746336829
 source_refs:
 - echo-agent-app-core/src/terminal.rs
 - echo-agent-app-core/src/runtime.rs
@@ -58,3 +58,19 @@ source_refs 都指向当前可读取的正式源码、测试、ADR或精六项�
 正常artifact/task semantic的最终结果、后续local checkpoint身份另存任务回执；该结构证据本身不冒充门禁通过。原4ab/352的八项完整矩阵和Clippy101历史不会重标为SSH710全绿。本轮没有Rust/Clippy、native或真实远端执行；没有新制品因而不清理其它target。原SSH批次准确cargo clean已0，target不存在。
 
 真实认证不可用或任一窗口/主题/resize/Ctrl-C/多会话/断线/退出场景未实测时保持未验；进程启动和本地wait不证明登录或远端副作用停止。Linux/BSD GTK/glib及notification/zbus等六项接受的残余风险继续存在。Plan06保持ready，main/CI、发布和网站镜像只由协调者按精确已资格来源分别推进。
+
+## 2026-10-25 私有别名修复迭代
+
+保留前一d7fc/710/963快照和source:688b4e517f8a99abb3d08d6b7547d03bc9ef84216f708054829d385f788b27e5观察。此前Clippy原命令自然101，两项type_complexity指向同一个原结算slot嵌套类型；编译summary不另计第三lint，CLI/Tauri库本体未到。原raw、309秒左右真实耗时/资源、源无漂移、lsof无reader与exactcargo clean0/5863files1.2GiB均在 .echo-semantic/local/eko-ssh-focused-clippy/ 保留。
+
+获准最小修复仅terminal.rs一个私有透明TerminalSettlementSlot alias及原字段/参数两处引用，逆展开精确复原原字节，未改原Arc/Mutex/Option/JoinHandle/Result、分配、owner、控制流或同步/生命周期。Rust/build294真实consumer变为956859854b214d447fcdeb294152dc634d3cdb53290ecffc478b12394897c468；710不自动续期，独立增量review核透明等价及policy/decision候选后才安装唯一新指纹并追加epoch，原六完整身份/839包/lockcca90/helpers不变。
+
+本轮新原六工具方法和ownofficialDB actual/canonical-origin freshscan原件归 .echo-semantic/local/eko-ssh-alias-repair/，与旧710结果分开；每个真实scanner出口/六warning/0vuln与独立gate结果单列，不用本Evidence冒充执行或零warning。该迭代没有新的Clippy/Rust测试/Node矩阵/native/远端许可；旧25case/Node425只保原scope，新Clippy、完整RustGUI和整个Plan06资格仍待执行。当前observed_at是后继来源绑定，旧段落仍属前一明确快照，不重写其历史结论。
+
+## 2026-10-25 原同命令 Clippy 完整复验
+
+修复后source956859854b214d447fcdeb294152dc634d3cdb53290ecffc478b12394897c468另获focused批，原命令cargo clippy -p echo-agent-app-core -p echo-agent-cli --lib --all-features --locked -- -D warnings于2026-10-24T16:29:43.840Z–16:35:40.328Z完整自然0，signalnull、warning/error行0、raw未截断19919bytes/SHAfb3be75da4af6895311a4f6b927d00848705f01e9af04eabed666ffe04458ab5。两选中lib的真实rmeta为app-core SHA51894d121ff35e0f90da0565e2765d87394f625ca83e5ac303f40278ea0eacf3和CLI SHA4985faddf07c05de246b96ef7909c7760551df7778b2892805094e8c1f7d8132。它证明该两库及已启用feature生产分支的编译/lint，不是测试数、bin/example、native或真实SSH资格。
+
+任务observer因du读取临时归档并发消失exit1，原完整toolresponse在 .echo-semantic/local/eko-ssh-clippy-retry-9568/observer-original-tool-response.json，原script/样本及恢复记录同目录。原有效样本到16:30:09Z，恢复观察从16:34:48Z开始；该gap不隐去，所报RSS仅采样观察，不冒全程peak/无压力证明。恢复者attach同原runnerPGID8699/Cargo8730，没有重启Cargo或改argv/源码，时间预算仍从原开始计算；compiler的0只取原run-command receipt。
+
+该批Rust294/consumer9568、编译前完整963593edaca快照、5owned路径、pairedFe4e/lock/风险身份无漂移。保存完整raw/exit/argv/env/sourceguard/2rmeta哈希后，lsof准确target为1且stdout/stderr空；16:35:45Z exactcargo clean0移除5939files/1.2GiB，targetabsent/slotreturned，之后才做metadata收口。原Clippy101、old710、旧25case与Node425边界均保留；不重跑Node/25/full，也不推main/发布。后继当前observed_at包含本次真实资格附录，前一9f547aec来源与原失败段落仍是历史事实，不重标为当时已通过。
