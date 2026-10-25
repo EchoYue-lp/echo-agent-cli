@@ -134,6 +134,9 @@ export function TaskRuntimeList({
         kind: 'implementation',
         agent_role: 'general-purpose',
         domain_profile: plan.domain_profile,
+        // Preserve the displayed binding; the original revision service resolves the role.
+        domain_binding: plan.domain_binding,
+        domain_role: null,
         depends_on: [],
         parallel_group: null,
         execution_target: null,

@@ -157,6 +157,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         command_cell_runtime: None,
         product_data_io: None,
         execution_scope: None,
+        ..Default::default()
     };
     // ── Bootstrap Agent Runtime (shared TUI/GUI initialization) ──
     let runtime = echo_agent_app_core::api::runtime::AgentRuntime::bootstrap(
@@ -532,6 +533,7 @@ mod tests {
                 echo_agent_app_core::api::product_data_io::ProductDataIoService::new(),
             ),
             execution_scope: None,
+            ..Default::default()
         };
         let mut app_config = config::EkoConfig::default();
         app_config.model.default_model_id = Some("local-test:test-model".to_string());

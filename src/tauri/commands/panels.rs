@@ -1521,9 +1521,20 @@ struct WorktreeInfo {
 }
 
 struct ScopedWorktreeControl {
-    _control: echo_agent_app_core::api::state::ScopedWorkspaceControl,
+    _global: Option<echo_agent_app_core::api::state::ScopedWorkspaceControl>,
+    _project: Option<echo_agent_app_core::api::state::ScopedProjectResources>,
     repo_root: PathBuf,
     store: Option<Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>>,
+    files: Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+}
+
+impl ScopedWorktreeControl {
+    fn merge_lock(&self, root: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        match self.store.as_deref() {
+            Some(store) => store.project_worktree_lock(root),
+            None => echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(root),
+        }
+    }
 }
 
 async fn run_taskruntime_worktree_operation<T, E, F>(
@@ -1564,55 +1575,92 @@ where
 async fn worktree_control_for_workspace(
     state: &TauriState,
     workspace_id: &str,
+    workspace_generation: &str,
 ) -> Result<ScopedWorktreeControl, IpcError> {
-    let control = state
+    if workspace_id == "global" {
+        // Preserve only the explicit global local owner, never as a fallback.
+        let product =
+            super::product_data::scoped_control(state, workspace_id, workspace_generation).await?;
+        let control = state
+            .app_state
+            .workspace_control_for_scope(workspace_id)
+            .await
+            .map_err(|error| IpcError::Validation(error.to_string()))?;
+        let repo_root = product.project_root();
+        return Ok(ScopedWorktreeControl {
+            store: control.runtime().task_runtime(),
+            _global: Some(control),
+            _project: None,
+            repo_root,
+            files: Arc::new(echo_agent::tools::files::LocalFileSystem),
+        });
+    }
+    let project = state
         .app_state
-        .workspace_control_for_scope(workspace_id)
+        .project_resources_for_workspace(workspace_id, workspace_generation)
         .await
-        .map_err(|error| IpcError::Validation(error.to_string()))?;
-    let repo_root = control.project_root();
-    let store = control.runtime().task_runtime();
+        .map_err(IpcError::from)?;
+    let store = project.task_runtime().await.map_err(IpcError::from)?;
+    let repo_root = project.working_dir().to_path_buf();
+    let files = project.file_system();
     Ok(ScopedWorktreeControl {
-        _control: control,
+        _global: None,
+        _project: Some(project),
         repo_root,
-        store,
+        store: Some(store),
+        files,
     })
 }
 
-fn run_git(repo: &Path, args: &[&str]) -> Result<String, IpcError> {
+fn run_git(
+    store: Option<&echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
+    repo: &Path,
+    args: &[&str],
+) -> Result<String, IpcError> {
+    if let Some(store) = store {
+        return store
+            .project_run_git(repo, args)
+            .map_err(|error| IpcError::Validation(error.to_string()));
+    }
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
         .output()
-        .map_err(|e| IpcError::Internal(format!("Failed to run git: {e}")))?;
+        .map_err(|error| IpcError::Internal(format!("Failed to run git: {error}")))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(IpcError::Validation(if stderr.is_empty() {
-            format!("git {:?} failed", args)
-        } else {
-            stderr
-        }))
+        Err(IpcError::Validation(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ))
     }
 }
 
-fn git_repo_root(start: &Path) -> Result<PathBuf, IpcError> {
-    let root = run_git(start, &["rev-parse", "--show-toplevel"])?;
-    Ok(PathBuf::from(root))
+fn git_repo_root(control: &ScopedWorktreeControl) -> Result<PathBuf, IpcError> {
+    match control.store.as_deref() {
+        Some(store) => store
+            .project_git_repo_root(&control.repo_root)
+            .map_err(|error| IpcError::Validation(error.to_string())),
+        None => {
+            run_git(None, &control.repo_root, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
+        }
+    }
 }
 
-async fn git_repo_root_async(start: PathBuf) -> Result<PathBuf, IpcError> {
-    tokio::task::spawn_blocking(move || git_repo_root(&start))
-        .await
-        .map_err(|error| IpcError::Internal(format!("Failed to join git root lookup: {error}")))?
+async fn git_repo_root_async(
+    control: ScopedWorktreeControl,
+) -> Result<(ScopedWorktreeControl, PathBuf), IpcError> {
+    tokio::task::spawn_blocking(move || {
+        let root = git_repo_root(&control)?;
+        Ok((control, root))
+    })
+    .await
+    .map_err(|error| IpcError::Internal(format!("Failed to join git root lookup: {error}")))?
 }
 
 fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
-    let canonical_repo = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let canonical_repo = repo_root.to_path_buf();
     let mut items = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut current_head = String::new();
@@ -1625,7 +1673,7 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
         let Some(path_buf) = path.take() else {
             return;
         };
-        let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
+        let canonical = path_buf.clone();
         let display_branch = if branch.is_empty() {
             "(detached)".to_string()
         } else {
@@ -1677,7 +1725,11 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
     items
 }
 
-fn validate_branch_name(repo: &Path, branch: &str) -> Result<(), IpcError> {
+fn validate_branch_name(
+    control: &ScopedWorktreeControl,
+    repo: &Path,
+    branch: &str,
+) -> Result<(), IpcError> {
     if branch.trim().is_empty() {
         return Err(IpcError::Validation("Branch name cannot be empty".into()));
     }
@@ -1686,7 +1738,12 @@ fn validate_branch_name(repo: &Path, branch: &str) -> Result<(), IpcError> {
             "Branch name cannot start with '-' or contain whitespace".into(),
         ));
     }
-    run_git(repo, &["check-ref-format", "--branch", branch]).map(|_| ())
+    run_git(
+        control.store.as_deref(),
+        repo,
+        &["check-ref-format", "--branch", branch],
+    )
+    .map(|_| ())
 }
 
 fn default_worktree_path(repo_root: &Path, branch: &str) -> Result<PathBuf, IpcError> {
@@ -1710,25 +1767,34 @@ fn default_worktree_path(repo_root: &Path, branch: &str) -> Result<PathBuf, IpcE
     Ok(parent.join(format!("{repo_name}-{safe_branch}")))
 }
 
-fn validate_worktree_target(repo_root: &Path, target: &Path) -> Result<(), IpcError> {
+fn validate_worktree_target(
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+    repo_root: &Path,
+    target: &Path,
+) -> Result<(), IpcError> {
     let repo_parent = repo_root
         .parent()
         .ok_or_else(|| IpcError::Validation("Repository root has no parent directory".into()))?
-        .canonicalize()
-        .map_err(|e| IpcError::Validation(format!("Cannot resolve repository parent: {e}")))?;
+        .to_path_buf();
+    let repo_parent = files
+        .canonicalize(&repo_parent)
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
     let target_parent = target
         .parent()
         .ok_or_else(|| IpcError::Validation("Worktree path has no parent directory".into()))?;
-    let canonical_parent = target_parent
-        .canonicalize()
-        .map_err(|e| IpcError::Validation(format!("Cannot resolve worktree parent: {e}")))?;
+    let canonical_parent = files.canonicalize(target_parent).map_err(|error| {
+        IpcError::Validation(format!("Cannot resolve worktree parent: {error}"))
+    })?;
     if !canonical_parent.starts_with(&repo_parent) {
         return Err(IpcError::Validation(format!(
             "Worktree path must stay under repository parent: {}",
             repo_parent.display()
         )));
     }
-    if target.exists() {
+    if files
+        .exists(target)
+        .map_err(|error| IpcError::Validation(error.to_string()))?
+    {
         return Err(IpcError::Validation(format!(
             "Worktree path already exists: {}",
             target.display()
@@ -1741,17 +1807,25 @@ fn validate_worktree_target(repo_root: &Path, target: &Path) -> Result<(), IpcEr
 pub async fn list_worktrees(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
+    workspace_generation: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
-    let start = control.repo_root.clone();
-    let worktrees = tokio::task::spawn_blocking(move || {
-        let repo_root = git_repo_root(&start)?;
-        let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
-        Ok::<Vec<WorktreeInfo>, IpcError>(parse_worktree_list(&output, &repo_root))
-    })
-    .await
-    .map_err(|error| IpcError::Internal(format!("Failed to join worktree listing: {error}")))??;
-    drop(control);
+    let control =
+        worktree_control_for_workspace(&state, &workspace_id, &workspace_generation).await?;
+    let worktrees = state
+        .app_state
+        .session
+        .product_data_io
+        .run("list project worktrees", move || {
+            let repo_root = git_repo_root(&control)?;
+            let output = run_git(
+                control.store.as_deref(),
+                &repo_root,
+                &["worktree", "list", "--porcelain"],
+            )?;
+            Ok::<Vec<WorktreeInfo>, IpcError>(parse_worktree_list(&output, &repo_root))
+        })
+        .await
+        .map_err(super::product_data::blocking_error)??;
     Ok(json!(worktrees))
 }
 
@@ -1759,12 +1833,13 @@ pub async fn list_worktrees(
 pub async fn create_worktree(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
+    workspace_generation: String,
     branch: String,
     base: Option<String>,
     path: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
-    let start = control.repo_root.clone();
+    let control =
+        worktree_control_for_workspace(&state, &workspace_id, &workspace_generation).await?;
     let branch = branch.trim().to_string();
     let base_ref = base
         .and_then(|s| {
@@ -1772,33 +1847,47 @@ pub async fn create_worktree(
             (!trimmed.is_empty()).then_some(trimmed)
         })
         .unwrap_or_else(|| "HEAD".to_string());
-    let repo_root = git_repo_root_async(start).await?;
-    let merge_lock =
-        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
-    let _merge_guard = merge_lock.lock().await;
-    let created = tokio::task::spawn_blocking(move || {
-        validate_branch_name(&repo_root, &branch)?;
-        let target = path
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or(default_worktree_path(&repo_root, &branch)?);
-        validate_worktree_target(&repo_root, &target)?;
-        let target_str = target.to_string_lossy().to_string();
-        run_git(
-            &repo_root,
-            &["worktree", "add", "-b", &branch, &target_str, &base_ref],
-        )?;
-        let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
-        parse_worktree_list(&output, &repo_root)
-            .into_iter()
-            .find(|worktree| worktree.path == target_str)
-            .ok_or_else(|| {
-                IpcError::Internal("Created worktree was not found in git output".into())
-            })
-    })
-    .await
-    .map_err(|error| IpcError::Internal(format!("Failed to join worktree create: {error}")))??;
-    drop(control);
+    let (control, repo_root) = git_repo_root_async(control).await?;
+    let merge_guard = control.merge_lock(&repo_root).lock_owned().await;
+    let created = state
+        .app_state
+        .session
+        .product_data_io
+        .run("create project worktree", move || {
+            let _merge_guard = merge_guard;
+            validate_branch_name(&control, &repo_root, &branch)?;
+            let target = path
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+                .map(|path| {
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        repo_root.join(path)
+                    }
+                })
+                .unwrap_or(default_worktree_path(&repo_root, &branch)?);
+            validate_worktree_target(control.files.as_ref(), &repo_root, &target)?;
+            let target_str = target.to_string_lossy().to_string();
+            run_git(
+                control.store.as_deref(),
+                &repo_root,
+                &["worktree", "add", "-b", &branch, &target_str, &base_ref],
+            )?;
+            let output = run_git(
+                control.store.as_deref(),
+                &repo_root,
+                &["worktree", "list", "--porcelain"],
+            )?;
+            parse_worktree_list(&output, &repo_root)
+                .into_iter()
+                .find(|worktree| worktree.path == target_str)
+                .ok_or_else(|| {
+                    IpcError::Internal("Created worktree was not found in git output".into())
+                })
+        })
+        .await
+        .map_err(super::product_data::blocking_error)??;
     Ok(json!(created))
 }
 
@@ -1806,50 +1895,64 @@ pub async fn create_worktree(
 pub async fn remove_worktree(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
+    workspace_generation: String,
     path: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
-    let start = control.repo_root.clone();
-    let repo_root = git_repo_root_async(start).await?;
-    let merge_lock =
-        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
-    let _merge_guard = merge_lock.lock().await;
-    tokio::task::spawn_blocking(move || {
-        let target = PathBuf::from(path.trim());
-        if target.as_os_str().is_empty() {
-            return Err(IpcError::Validation("Worktree path cannot be empty".into()));
-        }
-        let canonical_repo = repo_root
-            .canonicalize()
-            .unwrap_or_else(|_| repo_root.clone());
-        let canonical_target = target.canonicalize().map_err(|error| {
-            IpcError::Validation(format!("Cannot resolve worktree path: {error}"))
-        })?;
-        if canonical_target == canonical_repo {
-            return Err(IpcError::Validation(
-                "Refusing to remove the primary repository worktree".into(),
-            ));
-        }
-        let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
-        let known = parse_worktree_list(&output, &repo_root)
-            .into_iter()
-            .any(|worktree| {
-                PathBuf::from(worktree.path)
-                    .canonicalize()
-                    .map(|path| path == canonical_target)
-                    .unwrap_or(false)
-            });
-        if !known {
-            return Err(IpcError::Validation(
-                "Path is not a registered git worktree".into(),
-            ));
-        }
-        let target_str = target.to_string_lossy().to_string();
-        run_git(&repo_root, &["worktree", "remove", &target_str]).map(|_| ())
-    })
-    .await
-    .map_err(|error| IpcError::Internal(format!("Failed to join worktree removal: {error}")))??;
-    drop(control);
+    let control =
+        worktree_control_for_workspace(&state, &workspace_id, &workspace_generation).await?;
+    let (control, repo_root) = git_repo_root_async(control).await?;
+    let merge_guard = control.merge_lock(&repo_root).lock_owned().await;
+    state
+        .app_state
+        .session
+        .product_data_io
+        .run("remove project worktree", move || {
+            let _merge_guard = merge_guard;
+            let target = PathBuf::from(path.trim());
+            if target.as_os_str().is_empty() {
+                return Err(IpcError::Validation("Worktree path cannot be empty".into()));
+            }
+            let canonical_repo = control
+                .files
+                .canonicalize(&repo_root)
+                .map_err(|error| IpcError::Validation(error.to_string()))?;
+            let canonical_target = control.files.canonicalize(&target).map_err(|error| {
+                IpcError::Validation(format!("Cannot resolve worktree path: {error}"))
+            })?;
+            if canonical_target == canonical_repo {
+                return Err(IpcError::Validation(
+                    "Refusing to remove the primary repository worktree".into(),
+                ));
+            }
+            let output = run_git(
+                control.store.as_deref(),
+                &repo_root,
+                &["worktree", "list", "--porcelain"],
+            )?;
+            let known = parse_worktree_list(&output, &repo_root)
+                .into_iter()
+                .any(|worktree| {
+                    control
+                        .files
+                        .canonicalize(&PathBuf::from(worktree.path))
+                        .map(|path| path == canonical_target)
+                        .unwrap_or(false)
+                });
+            if !known {
+                return Err(IpcError::Validation(
+                    "Path is not a registered git worktree".into(),
+                ));
+            }
+            let target_str = target.to_string_lossy().to_string();
+            run_git(
+                control.store.as_deref(),
+                &repo_root,
+                &["worktree", "remove", &target_str],
+            )
+            .map(|_| ())
+        })
+        .await
+        .map_err(super::product_data::blocking_error)??;
     Ok(json!({"success": true}))
 }
 
@@ -1857,19 +1960,21 @@ pub async fn remove_worktree(
 pub async fn list_unattended_worktrees(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
+    workspace_generation: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
-    let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
+    let control =
+        worktree_control_for_workspace(&state, &workspace_id, &workspace_generation).await?;
+    let (control, repo_root) = git_repo_root_async(control).await?;
     let store = control.store.clone();
 
     let unattended =
         run_taskruntime_worktree_operation(store, "list unattended worktrees", move |store| {
+            let _scope = control;
             echo_agent_app_core::api::tasks::task_runtime::worktree::list_unattended_worktrees(
                 &repo_root, store,
             )
         })
         .await?;
-    drop(control);
 
     let result: Vec<serde_json::Value> = unattended
         .into_iter()
@@ -1898,10 +2003,12 @@ pub async fn list_unattended_worktrees(
 pub async fn merge_unattended_worktree(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
+    workspace_generation: String,
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
-    let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
+    let control =
+        worktree_control_for_workspace(&state, &workspace_id, &workspace_generation).await?;
+    let (control, repo_root) = git_repo_root_async(control).await?;
     let store = control.store.clone();
     if let Some(store) = store.as_ref() {
         let lookup_run_id = run_id.clone();
@@ -1922,12 +2029,12 @@ pub async fn merge_unattended_worktree(
             "TaskRuntime store is unavailable for unattended worktree merge".to_string(),
         ));
     }
-    let merge_lock =
-        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
-    let _merge_guard = merge_lock.lock().await;
+    let merge_guard = control.merge_lock(&repo_root).lock_owned().await;
     let run_id_for_merge = run_id.clone();
     let outcome =
         run_taskruntime_worktree_operation(store, "merge unattended worktree", move |store| {
+            let _scope = control;
+            let _merge_guard = merge_guard;
             echo_agent_app_core::api::tasks::task_runtime::worktree::merge_unattended_worktree(
                 &repo_root,
                 &run_id_for_merge,
@@ -1935,7 +2042,6 @@ pub async fn merge_unattended_worktree(
             )
         })
         .await?;
-    drop(control);
 
     Ok(json!({
         "success": true,
@@ -1952,16 +2058,18 @@ pub async fn merge_unattended_worktree(
 pub async fn discard_unattended_worktree(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
+    workspace_generation: String,
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
-    let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
+    let control =
+        worktree_control_for_workspace(&state, &workspace_id, &workspace_generation).await?;
+    let (control, repo_root) = git_repo_root_async(control).await?;
     let store = control.store.clone();
-    let merge_lock =
-        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
-    let _merge_guard = merge_lock.lock().await;
+    let merge_guard = control.merge_lock(&repo_root).lock_owned().await;
     let run_id_for_discard = run_id.clone();
     run_taskruntime_worktree_operation(store, "discard unattended worktree", move |store| {
+        let _scope = control;
+        let _merge_guard = merge_guard;
         echo_agent_app_core::api::tasks::task_runtime::worktree::discard_unattended_worktree(
             &repo_root,
             &run_id_for_discard,
@@ -1969,7 +2077,6 @@ pub async fn discard_unattended_worktree(
         )
     })
     .await?;
-    drop(control);
 
     Ok(json!({"success": true, "discarded": run_id}))
 }
@@ -1978,21 +2085,22 @@ pub async fn discard_unattended_worktree(
 pub async fn cleanup_unattended_worktrees(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
+    workspace_generation: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
-    let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
+    let control =
+        worktree_control_for_workspace(&state, &workspace_id, &workspace_generation).await?;
+    let (control, repo_root) = git_repo_root_async(control).await?;
     let store = control.store.clone();
-    let merge_lock =
-        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
-    let _merge_guard = merge_lock.lock().await;
+    let merge_guard = control.merge_lock(&repo_root).lock_owned().await;
     let result =
         run_taskruntime_worktree_operation(store, "clean unattended worktrees", move |store| {
+            let _scope = control;
+            let _merge_guard = merge_guard;
             echo_agent_app_core::api::tasks::task_runtime::worktree::cleanup_unattended_worktrees(
                 &repo_root, store,
             )
         })
         .await?;
-    drop(control);
 
     Ok(json!({
         "removed": result.removed,
@@ -2065,6 +2173,132 @@ mod scoped_control_tests {
             result,
             Err(IpcError::Validation(message)) if message == "workspace was deleted"
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_worktree_commands_use_bound_store_and_original_unattended_algorithm()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tauri::commands::files::tests::{ProjectGitExecutor, namespaced_files};
+        let host = tempfile::tempdir()?;
+        let target = tempfile::tempdir()?;
+        let journal = tempfile::tempdir()?;
+        let visible = host.path().canonicalize()?;
+        let actual = target.path().canonicalize()?;
+        let git = |args: &[&str]| -> Result<(), Box<dyn std::error::Error>> {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&actual)
+                .output()?;
+            if !output.status.success() {
+                return Err(std::io::Error::other(
+                    String::from_utf8_lossy(&output.stderr).to_string(),
+                )
+                .into());
+            }
+            Ok(())
+        };
+        git(&["init", "-q"])?;
+        std::fs::write(actual.join("notes.txt"), "target initial\n")?;
+        std::fs::write(visible.join("notes.txt"), "host not a Git repo\n")?;
+        git(&["add", "--", "notes.txt"])?;
+        git(&[
+            "-c",
+            "user.name=EKO Test",
+            "-c",
+            "user.email=eko@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "target initial",
+        ])?;
+        let files = Arc::new(namespaced_files(&visible, &actual));
+        let store = Arc::new(echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore::new_in_memory_with_shadow_root(journal.path().join("tasks"))?);
+        store.bind_project_environment(
+            &store.active_workspace_id(),
+            echo_agent_app_core::api::workspace::ProjectLocation::Local {
+                path: visible.clone(),
+            },
+            1,
+            files.clone(),
+            Arc::new(ProjectGitExecutor {
+                files: files.clone(),
+            }),
+        )?;
+        let control = ScopedWorktreeControl {
+            _global: None,
+            _project: None,
+            repo_root: visible.clone(),
+            store: Some(store.clone()),
+            files,
+        };
+        let (control, repo) = git_repo_root_async(control).await?;
+        assert_eq!(repo, visible);
+        assert!(Arc::ptr_eq(
+            &control.merge_lock(&repo),
+            &store.project_worktree_lock(&repo)
+        ));
+        let operation_store = store.clone();
+        run_taskruntime_worktree_operation(Some(store), "test target worktree route", move |store| {
+            let _scope = control;
+            let output = run_git(store, &repo, &["worktree", "list", "--porcelain"])?;
+            let listed = parse_worktree_list(&output, &repo);
+            assert!(listed.first().is_some_and(|entry| entry.path == repo.to_string_lossy() && !entry.managed));
+            let unattended = echo_agent_app_core::api::tasks::task_runtime::worktree::list_unattended_worktrees(&repo, store).map_err(|error| IpcError::Internal(error.to_string()))?;
+            assert!(unattended.is_empty());
+            // A wrong local fallback cannot pass: the visible host directory
+            // contains no .git, while the actual provider target does.
+            assert_eq!(operation_store.project_git_repo_root(&repo).map_err(|error| IpcError::Internal(error.to_string()))?, repo);
+            Ok::<(), IpcError>(())
+        }).await?;
+        assert!(!visible.join(".git").exists());
+        assert_eq!(
+            std::fs::read_to_string(visible.join("notes.txt"))?,
+            "host not a Git repo\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn worktree_observer_cancel_keeps_original_lock_until_physical_closure_settles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let lock =
+            echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(root.path());
+        let guard = lock.clone().lock_owned().await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        let observer = tokio::spawn(run_taskruntime_worktree_operation(
+            None,
+            "test scoped worktree cancellation",
+            move |_| {
+                let retained_guard = guard;
+                let _ = entered_tx.send(());
+                release_rx.recv().map_err(|error| error.to_string())?;
+                drop(retained_guard);
+                let _ = settled_tx.send(());
+                Ok::<(), String>(())
+            },
+        ));
+        entered_rx.await?;
+        observer.abort();
+        assert!(observer.await.is_err());
+        assert!(lock.try_lock().is_err());
+        release_tx.send(())?;
+        settled_rx.await?;
+        assert!(lock.try_lock().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn worktree_projection_does_not_canonicalize_target_paths_on_host() {
+        let target = Path::new("/remote/不存在的项目🙂");
+        let output = "worktree /remote/不存在的项目🙂\nHEAD abcdef1234567890\nbranch refs/heads/main\n\nworktree /remote/不存在的项目🙂-review\nHEAD 1234567890abcdef\nbranch refs/heads/review\n\n";
+        let listed = parse_worktree_list(output, target);
+        assert_eq!(listed.len(), 2);
+        assert!(listed.first().is_some_and(|entry| !entry.managed));
+        assert!(listed.get(1).is_some_and(|entry| entry.managed && entry.path == "/remote/不存在的项目🙂-review"));
     }
 
     #[test]

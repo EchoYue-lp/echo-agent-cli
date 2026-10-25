@@ -1,7 +1,5 @@
 use std::collections::HashSet;
 
-use crate::tasks::task_runtime::DomainProfile;
-
 pub(crate) const MAX_MODEL_VISIBLE_TOOL_RESULT_TOKENS: usize = 4_000;
 #[cfg(test)]
 const MAX_REGISTERED_BUILTIN_TOOLS: usize = 64;
@@ -73,12 +71,6 @@ const WEB_SEARCH_TOOLS: &[&str] = &["web_search"];
 const WEB_FETCH_TOOLS: &[&str] = &["web_fetch"];
 const REPOSITORY_INSPECTION_TOOLS: &[&str] = &["diff"];
 const MEMORY_TOOLS: &[&str] = &["recall", "search_memory"];
-const ACADEMIC_RESEARCH_TOOLS: &[&str] = &[
-    "arxiv_search",
-    "semantic_scholar_search",
-    "pubmed_search",
-    "clinical_trials_search",
-];
 
 fn initial_groups() -> &'static [&'static [&'static str]] {
     const INITIAL: &[&[&str]] = &[
@@ -141,32 +133,6 @@ pub(crate) fn initial_visible_tools_for_task_run(registered: &[String]) -> HashS
         return registered.iter().cloned().collect();
     }
     visible_from_groups(task_run_groups(), registered)
-}
-
-/// Select the first-turn surface for one canonical TaskRun.
-///
-/// Academic research runs expose their provider search tools immediately so
-/// a background `create_complex_task` driver can retrieve and persist evidence
-/// without a separate foreground `tool_search` turn. Other domain tools remain
-/// deferred and all non-research profiles keep the normal mode budget.
-pub(crate) fn initial_visible_tools_for_profile(
-    domain_profile: DomainProfile,
-    registered: &[String],
-) -> HashSet<String> {
-    let mut visible = initial_visible_tools_for_task_run(registered);
-    if domain_profile == DomainProfile::AcademicResearch {
-        let registered = registered
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        visible.extend(
-            ACADEMIC_RESEARCH_TOOLS
-                .iter()
-                .filter(|name| registered.contains(**name))
-                .map(|name| (*name).to_string()),
-        );
-    }
-    visible
 }
 
 pub(crate) fn disabled_tools() -> HashSet<String> {
@@ -248,20 +214,20 @@ mod tests {
     }
 
     #[test]
-    fn academic_background_profile_exposes_only_registered_research_providers() {
+    fn task_run_visibility_keeps_specialist_capabilities_available_through_discovery() {
         let mut registered = policy_tool_names();
         registered.extend([
             "semantic_scholar_search".to_string(),
             "pubmed_search".to_string(),
         ]);
-        let academic =
-            initial_visible_tools_for_profile(DomainProfile::AcademicResearch, &registered);
-        let general = initial_visible_tools_for_profile(DomainProfile::General, &registered);
-
-        assert!(academic.contains("semantic_scholar_search"));
-        assert!(academic.contains("pubmed_search"));
-        assert!(!academic.contains("arxiv_search"));
-        assert!(!general.contains("semantic_scholar_search"));
+        let visible = initial_visible_tools_for_task_run(&registered);
+        assert!(
+            registered
+                .iter()
+                .any(|name| name == "semantic_scholar_search")
+        );
+        assert!(visible.contains("tool_search"));
+        assert!(!visible.contains("semantic_scholar_search"));
     }
 
     #[test]

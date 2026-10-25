@@ -32,6 +32,63 @@ pub struct InstructionProvider {
 }
 
 impl InstructionProvider {
+    /// Read project tiers through one selected provider while user memory and
+    /// EKO learned rules stay under their original local product-data owner.
+    /// Run this synchronous phase on the existing owned blocking boundary.
+    pub(crate) fn load_for_file_system(
+        working_dir: Option<&Path>,
+        state_dir: Option<&Path>,
+        files: &dyn echo_agent::tools::filesystem::FileSystem,
+    ) -> echo_agent::error::Result<Self> {
+        let project_root = working_dir
+            .map(|path| {
+                crate::utils::find_project_root_with_file_system(path, files)
+                    .map(|root| root.unwrap_or_else(|| path.to_path_buf()))
+            })
+            .transpose()?;
+        let project_level = project_optional_text(
+            files,
+            project_root
+                .as_deref()
+                .map(|root| root.join(".eko/project.md"))
+                .as_deref(),
+        )?;
+        let local_level = project_optional_text(
+            files,
+            working_dir
+                .map(|root| root.join(".eko/local.md"))
+                .as_deref(),
+        )?;
+        let repository_level =
+            repository_instructions_with_reader(working_dir, project_root.as_deref(), |path| {
+                project_optional_text(files, Some(path))
+            })?;
+        let user_level = strict_optional_text(Some(&crate::data_root::user_data_path("user.md")))?;
+        let agents_level = match state_dir {
+            Some(root) => strict_optional_text(Some(&root.join(LEARNED_RULES_FILE)))?,
+            None => None,
+        }
+        .map(|raw| crate::utils::strip_yaml_frontmatter(&raw));
+        let global_memory = crate::data_root::user_data_path("MEMORY.md");
+        let local_memory = match state_dir {
+            Some(root) => strict_optional_text(Some(&root.join("MEMORY.md")))?,
+            None => None,
+        };
+        let hot_memory = match local_memory {
+            Some(raw) => Some(raw),
+            None => strict_optional_text(Some(&global_memory))?,
+        }
+        .map(|raw| crate::utils::strip_yaml_frontmatter(&raw));
+        Ok(Self {
+            project_level,
+            user_level,
+            repository_level,
+            local_level,
+            agents_level,
+            hot_memory,
+        })
+    }
+
     /// Load every tier from disk.
     pub fn load() -> Self {
         let working_dir = std::env::current_dir().ok();
@@ -345,6 +402,16 @@ fn strict_repository_instructions(
     working_dir: Option<&Path>,
     project_root: Option<&Path>,
 ) -> std::io::Result<Option<String>> {
+    repository_instructions_with_reader(working_dir, project_root, |path| {
+        strict_optional_text(Some(path))
+    })
+}
+
+fn repository_instructions_with_reader<E: From<std::io::Error>>(
+    working_dir: Option<&Path>,
+    project_root: Option<&Path>,
+    read: impl Fn(&Path) -> Result<Option<String>, E>,
+) -> Result<Option<String>, E> {
     let Some(working_dir) = working_dir else {
         return Ok(None);
     };
@@ -357,7 +424,8 @@ fn strict_repository_instructions(
                 working_dir.display(),
                 scan_root.display()
             ),
-        ));
+        )
+        .into());
     }
     let mut directories = working_dir
         .ancestors()
@@ -369,7 +437,7 @@ fn strict_repository_instructions(
     for directory in directories {
         for name in ["AGENTS.override.md", "AGENTS.md"] {
             let path = directory.join(name);
-            let Some(content) = strict_optional_text(Some(&path))? else {
+            let Some(content) = read(&path)? else {
                 continue;
             };
             if content.trim().is_empty() {
@@ -384,6 +452,37 @@ fn strict_repository_instructions(
         }
     }
     Ok((!blocks.is_empty()).then(|| blocks.join("\n\n")))
+}
+
+fn project_optional_text(
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+    path: Option<&Path>,
+) -> echo_agent::error::Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let metadata = match files.symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(echo_agent::error::ReactError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || metadata.file_type.is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "instruction source {} must be a regular non-symlink file",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    String::from_utf8(files.read(path)?)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error).into())
 }
 
 impl Default for InstructionProvider {

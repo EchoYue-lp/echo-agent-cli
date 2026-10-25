@@ -2247,11 +2247,17 @@ mod workspace_transition_tests {
             seed_pool: Arc::downgrade(&seed_pool),
             agent_router: router,
         };
-        let target = crate::tasks::task_runtime::TaskExecutionTarget {
+        let mut target = crate::tasks::task_runtime::TaskExecutionTarget {
             group_id: group.group_id,
             subagent_role: "explorer".to_string(),
             address: member_address,
+            project_binding: None,
         };
+        target.project_binding =
+            crate::tasks::task_runtime::TaskExecutionTargetResolver::bind_project(
+                &resolver, &target,
+            )
+            .await?;
         let lease = crate::tasks::task_runtime::TaskExecutionTargetResolver::acquire(
             &resolver, &leader, &target,
         )
@@ -6082,6 +6088,7 @@ mod service_bootstrap_tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
                 plan_id: "healthy-plan".to_string(),
                 run_id: "healthy-global-run".to_string(),
                 revision: 1,
@@ -6331,6 +6338,7 @@ mod service_bootstrap_tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
                 plan_id: format!("{run_id}-plan"),
                 run_id: run_id.to_string(),
                 revision: 1,

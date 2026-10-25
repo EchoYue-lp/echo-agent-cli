@@ -23,6 +23,7 @@ use echo_agent_app_core::api::workspace::registry::WorkspaceRegistry;
 
 fn task_plan(run_id: &str) -> TaskPlan {
     TaskPlan {
+        domain_binding: None,
         plan_id: format!("plan:{run_id}"),
         run_id: run_id.to_string(),
         revision: 0,
@@ -258,10 +259,10 @@ async fn next_attempt_guidance_is_revision_bound_and_task_update_is_cas_bound() 
             reason: "rename the exact-attempt fixture".to_string(),
             operations: vec![TaskUpdateOperation::Update {
                 task_id: "task-a".to_string(),
-                patch: TaskPatch {
+                patch: Box::new(TaskPatch {
                     title: Some("Updated exact-attempt fixture".to_string()),
                     ..TaskPatch::default()
-                },
+                }),
             }],
         },
     )
@@ -305,10 +306,10 @@ async fn next_attempt_guidance_is_revision_bound_and_task_update_is_cas_bound() 
             reason: "must lose the stale CAS".to_string(),
             operations: vec![TaskUpdateOperation::Update {
                 task_id: "task-a".to_string(),
-                patch: TaskPatch {
+                patch: Box::new(TaskPatch {
                     description: Some("stale description".to_string()),
                     ..TaskPatch::default()
-                },
+                }),
             }],
         },
     )

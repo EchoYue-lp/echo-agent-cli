@@ -10,6 +10,16 @@ use std::path::{Path, PathBuf};
 /// Uses the shared marker set for both instruction loading and structural
 /// project context. The first matching ancestor is authoritative.
 pub fn find_project_root(start: &Path) -> Option<PathBuf> {
+    find_project_root_with_file_system(start, &echo_agent::tools::files::LocalFileSystem)
+        .ok()
+        .flatten()
+}
+
+/// Use the same marker precedence in the selected project's namespace.
+pub fn find_project_root_with_file_system(
+    start: &Path,
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+) -> echo_agent::error::Result<Option<PathBuf>> {
     const VCS_MARKERS: &[&str] = &[".git", ".hg", ".svn"];
     const FALLBACK_MARKERS: &[&str] = &[
         ".eko",
@@ -22,21 +32,21 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
     ];
     // A repository boundary outranks nested package manifests. Otherwise a
     // workspace such as `repo/crate/Cargo.toml` would hide `repo/AGENTS.md`.
-    if let Some(root) = start.ancestors().find(|directory| {
-        VCS_MARKERS
-            .iter()
-            .any(|marker| directory.join(marker).exists())
-    }) {
-        return Some(root.to_path_buf());
+    for directory in start.ancestors() {
+        for marker in VCS_MARKERS {
+            if files.exists(&directory.join(marker))? {
+                return Ok(Some(directory.to_path_buf()));
+            }
+        }
     }
-    start
-        .ancestors()
-        .find(|directory| {
-            FALLBACK_MARKERS
-                .iter()
-                .any(|marker| directory.join(marker).exists())
-        })
-        .map(Path::to_path_buf)
+    for directory in start.ancestors() {
+        for marker in FALLBACK_MARKERS {
+            if files.exists(&directory.join(marker))? {
+                return Ok(Some(directory.to_path_buf()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Strip a leading YAML frontmatter block (delimited by `---` fences on their

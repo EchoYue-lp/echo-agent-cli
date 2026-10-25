@@ -35,7 +35,10 @@ struct TurnContract {
 
 struct TurnRegistration {
     id: uuid::Uuid,
-    contract: TurnContract,
+    contract: Option<TurnContract>,
+    /// Already-read values belonging to this exact turn, never an I/O cache
+    /// for another turn or a replacement for the Workspace location owner.
+    project: Option<Arc<crate::infra::PreparedProjectContext>>,
 }
 
 /// Process-stable bridge from interactive turn ownership into model calls.
@@ -56,7 +59,27 @@ impl TurnPromptContextRegistry {
         origin: RunTurnOrigin,
         authorship: InstructionAuthorship,
     ) -> TurnPromptContextRegistration {
-        let turn_id = turn_id.into();
+        self.register_values(
+            turn_id.into(),
+            Some(TurnContract { origin, authorship }),
+            None,
+        )
+    }
+
+    pub(crate) fn register_project_context(
+        self: &Arc<Self>,
+        turn_id: String,
+        prepared: crate::infra::PreparedProjectContext,
+    ) -> TurnPromptContextRegistration {
+        self.register_values(turn_id, None, Some(Arc::new(prepared)))
+    }
+
+    fn register_values(
+        self: &Arc<Self>,
+        turn_id: String,
+        contract: Option<TurnContract>,
+        project: Option<Arc<crate::infra::PreparedProjectContext>>,
+    ) -> TurnPromptContextRegistration {
         let id = uuid::Uuid::new_v4();
         self.registrations
             .write()
@@ -65,7 +88,8 @@ impl TurnPromptContextRegistry {
                 turn_id.clone(),
                 TurnRegistration {
                     id,
-                    contract: TurnContract { origin, authorship },
+                    contract,
+                    project,
                 },
             );
         TurnPromptContextRegistration {
@@ -80,7 +104,15 @@ impl TurnPromptContextRegistry {
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .get(turn_id)
-            .map(|registration| registration.contract)
+            .and_then(|registration| registration.contract)
+    }
+
+    fn project_context(&self, turn_id: &str) -> Option<Arc<crate::infra::PreparedProjectContext>> {
+        self.registrations
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(turn_id)
+            .and_then(|registration| registration.project.clone())
     }
 
     pub fn contains(&self, turn_id: &str) -> bool {
@@ -101,6 +133,28 @@ pub struct TurnPromptContextRegistration {
     registry: Arc<TurnPromptContextRegistry>,
     turn_id: String,
     id: uuid::Uuid,
+}
+
+impl TurnPromptContextRegistration {
+    /// Publish only after the owned invocation's strict preparation succeeds.
+    /// The registration id fences an old guard from replacing a newer turn.
+    pub(crate) fn install_project_context(
+        &self,
+        prepared: crate::infra::PreparedProjectContext,
+    ) -> Result<(), String> {
+        let mut registrations = self
+            .registry
+            .registrations
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(registration) = registrations.get_mut(&self.turn_id)
+            && registration.id == self.id
+        {
+            registration.project = Some(Arc::new(prepared));
+            return Ok(());
+        }
+        Err("project turn registration changed before model admission".to_string())
+    }
 }
 
 impl Drop for TurnPromptContextRegistration {
@@ -175,6 +229,16 @@ impl PreModelContextProjector for EkoContextProjector {
     ) -> BoxFuture<'a, AgentResult<Vec<ContextProjection>>> {
         Box::pin(async move {
             let mut projections = self.task_runtime.project(context).await?;
+            if let Some(prepared) = context
+                .turn_id
+                .as_deref()
+                .and_then(|turn_id| self.turns.project_context(turn_id))
+            {
+                // Execute/reset and checkpoint restore can replace messages.
+                // Republish the same immutable values at the original model
+                // boundary; no fallible file read occurs in this projector.
+                projections.extend(prepared.projections());
+            }
             let contract = context
                 .turn_id
                 .as_deref()
@@ -189,14 +253,24 @@ impl PreModelContextProjector for EkoContextProjector {
                 context.conversation_id.as_deref(),
                 context.turn_id.as_deref(),
             ) {
-                (Some((service, scope)), Some(conversation_id), Some(turn_id)) => service
+                (Some((service, scope)), Some(conversation_id), Some(turn_id)) => match service
                     .project_pending_command_cell_watches(
                         scope.workspace_id(),
                         conversation_id,
                         turn_id,
                     )
                     .await
-                    .map_err(echo_agent::error::ReactError::Other)?,
+                {
+                    Ok(message) => message,
+                    Err(error) => {
+                        // The framework already treats this observer as an
+                        // optional warning. Its failure must not discard the
+                        // same batch's strictly prepared project rules or
+                        // fixed Domain method after Execute/reset.
+                        tracing::warn!(%error, "Pending command-cell watch projection failed");
+                        None
+                    }
+                },
                 _ => None,
             };
             projections.push(ContextProjection {
@@ -227,6 +301,258 @@ fn render_turn_contract(contract: TurnContract) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct VerificationEvents(std::sync::Mutex<Vec<echo_agent::agent::EventEnvelope>>);
+
+    #[async_trait::async_trait]
+    impl echo_agent::runtime::EventSink for VerificationEvents {
+        async fn on_event(
+            &self,
+            event: echo_agent::agent::EventEnvelope,
+        ) -> AgentResult<echo_agent::runtime::SinkControl> {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(event);
+            Ok(echo_agent::runtime::SinkControl::Continue)
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_verifications_share_root_and_run_without_sharing_project_projection()
+    -> anyhow::Result<()> {
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, RunPlanPolicy, TaskRunExecutionProfile, TaskRuntimeStore,
+        };
+        use echo_agent::agent::{AgentInvocationContext, EventIdentity, ReactAgentBuilder};
+        use echo_agent::runtime::{AgentTurnDriver, TurnMode, TurnOutcome, TurnRequest};
+        let fixture =
+            crate::tasks::task_runtime::project_environment_tests::EnvironmentFixture::new()
+                .map_err(anyhow::Error::msg)?;
+        // A real target repository bounds the existing VCS-first discovery;
+        // local namesakes and the fixture's escape rejection stay unchanged.
+        crate::tasks::task_runtime::worktree::run_git(
+            &fixture.target_root,
+            &["init", "-b", "main"],
+        )?;
+        let task_registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+        let turns = Arc::new(TurnPromptContextRegistry::new());
+        let binding = crate::domain_plugin::test_binding(false).map_err(anyhow::Error::msg)?;
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        store.create_run_for_active_workspace_with_domain(
+            &run_id,
+            "parallel-conversation",
+            "shared-root",
+            DomainProfile::General,
+            "verify independent targets",
+            "task",
+            AttendedMode::Attended,
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            Some(&binding),
+        )?;
+        let _domain = task_registry
+            .retain_for_invocation(&run_id, store)
+            .map_err(anyhow::Error::msg)?;
+        let events_root = fixture.data_root.join("watch-events");
+        let event_log = Arc::new(crate::chat_event_log::ChatEventLog::open(
+            &events_root,
+            crate::chat_event_log::ChatEventRetention::default(),
+        )?);
+        let watches = crate::tasks::task_runtime::command_cells::CommandCellRuntimeService::new(
+            fixture.executor.clone(),
+            event_log,
+            crate::product_data_io::ProductDataIoService::new(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let events_backup = fixture.data_root.join("watch-events-backup");
+        std::fs::rename(&events_root, &events_backup)?;
+        std::fs::write(&events_root, "unavailable optional watch source")?;
+        assert!(
+            watches
+                .project_pending_command_cell_watches(
+                    "workspace",
+                    "parallel-conversation",
+                    "verification-a",
+                )
+                .await
+                .is_err()
+        );
+        let mut cases = Vec::new();
+        let mut registrations = Vec::new();
+        for (execution, rule) in [
+            ("verification-a", "PROJECT_A_RULE"),
+            ("verification-b", "PROJECT_B_RULE"),
+        ] {
+            let cwd = fixture.visible_root.join(execution);
+            fixture.files.create_dir_all(&cwd)?;
+            fixture
+                .files
+                .write(&cwd.join("Cargo.toml"), b"fixture marker")?;
+            fixture
+                .files
+                .write(&cwd.join("AGENTS.md"), rule.as_bytes())?;
+            std::fs::create_dir_all(&cwd)?;
+            std::fs::write(cwd.join("AGENTS.md"), "WRONG_LOCAL_PROJECT_RULE")?;
+            fixture.files.write(
+                &cwd.join("probe.txt"),
+                format!("TARGET_FILE_{execution}").as_bytes(),
+            )?;
+            std::fs::write(cwd.join("probe.txt"), "WRONG_LOCAL_FILE")?;
+            let client = Arc::new(
+                echo_agent::testing::MockLlmClient::new()
+                    .then_tool_call(
+                        format!("read-{execution}"),
+                        "read_file",
+                        r#"{"path":"probe.txt"}"#,
+                    )
+                    .with_response("verified"),
+            );
+            let mut agent = ReactAgentBuilder::new()
+                .name(execution)
+                .model("verification-test")
+                .system_prompt("PRIMARY_VERIFICATION_ROLE")
+                .auto_project_rules(false)
+                .file_system(fixture.files.clone())
+                .working_dir(cwd.clone())
+                .llm_client(client.clone())
+                .tool(Box::new(
+                    echo_agent::tools::files::files::ReadFileTool::new()
+                        .with_file_system(fixture.files.clone()),
+                ))
+                .max_iterations(2)
+                .build()?;
+            agent.set_sandbox_executor(fixture.executor.clone());
+            agent.set_pre_model_context_projector(Some(Arc::new(
+                EkoContextProjector::new(task_registry.clone(), turns.clone())
+                    .with_command_cell_watches(
+                        watches.clone(),
+                        crate::workspace::WorkspaceExecutionScope::workspace(
+                            &crate::workspace::WorkspaceId::from_raw("workspace".to_string()),
+                            &cwd,
+                        ),
+                    ),
+            )));
+            let prepared = crate::infra::prepare_dynamic_project_context(
+                Some(&cwd),
+                None,
+                fixture.files.clone(),
+                fixture.executor.clone(),
+                Vec::new(),
+                agent.config().get_token_limit(),
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            registrations.push(turns.register_project_context(execution.to_string(), prepared));
+            let invocation = AgentInvocationContext {
+                working_dir: Some(cwd),
+                runtime: Some(echo_agent::tools::ExternalRunContext {
+                    conversation_id: Some("parallel-conversation".to_string()),
+                    run_id: Some(run_id.clone()),
+                    turn_id: Some(execution.to_string()),
+                    execution_id: Some(execution.to_string()),
+                    message_id: Some("shared-root".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let identity = EventIdentity::from_invocation(&invocation)?;
+            let request = TurnRequest::new(identity, "verify")
+                .mode(TurnMode::Execute)
+                .invocation(invocation);
+            cases.push((
+                agent,
+                client,
+                request,
+                VerificationEvents::default(),
+                execution,
+                rule,
+            ));
+        }
+        let first = cases
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("first verification absent"))?;
+        let second = cases
+            .get(1)
+            .ok_or_else(|| anyhow::anyhow!("second verification absent"))?;
+        // Both exact registrations exist before either model starts. No sleep
+        // or scheduler ordering can hide one turn overwriting the other.
+        let (a, b) = tokio::join!(
+            AgentTurnDriver.drive(&first.0, first.2.clone(), &first.3),
+            AgentTurnDriver.drive(&second.0, second.2.clone(), &second.3),
+        );
+        assert_eq!(a?.outcome, TurnOutcome::Completed);
+        assert_eq!(b?.outcome, TurnOutcome::Completed);
+        for (_, client, _, events, execution, rule) in &cases {
+            let calls = client.all_calls();
+            assert_eq!(calls.len(), 2);
+            let text = calls
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("verification model call absent"))?
+                .iter()
+                .filter_map(|message| message.content.as_text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(text.matches(*rule).count(), 1);
+            assert!(text.contains(&binding.snapshot.method));
+            assert!(!text.contains("WRONG_LOCAL_PROJECT_RULE"));
+            let foreign = if *execution == "verification-a" {
+                "PROJECT_B_RULE"
+            } else {
+                "PROJECT_A_RULE"
+            };
+            assert!(!text.contains(foreign));
+            let after_tool = calls
+                .last()
+                .ok_or_else(|| anyhow::anyhow!("tool result model call absent"))?
+                .iter()
+                .filter_map(|message| message.content.as_text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(after_tool.contains(&format!("TARGET_FILE_{execution}")));
+            assert!(!after_tool.contains("WRONG_LOCAL_FILE"));
+            let foreign_file = if *execution == "verification-a" {
+                "TARGET_FILE_verification-b"
+            } else {
+                "TARGET_FILE_verification-a"
+            };
+            assert!(!after_tool.contains(foreign_file));
+            let events = events.0.lock().unwrap_or_else(|error| error.into_inner());
+            assert!(!events.is_empty());
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.turn_id.as_str() == *execution
+                        && event.execution_id.as_ref().map(|id| id.as_str()) == Some(*execution)
+                        && event.message_id.as_ref().map(|id| id.as_str()) == Some("shared-root")
+                        && event.run_id.as_ref().map(|id| id.as_str()) == Some(run_id.as_str()))
+            );
+        }
+        let mut registrations = registrations.into_iter();
+        drop(registrations.next());
+        assert!(!turns.contains("verification-a"));
+        assert!(turns.contains("verification-b"));
+        drop(registrations);
+        assert!(!turns.contains("verification-b"));
+        std::fs::remove_file(&events_root)?;
+        std::fs::rename(&events_backup, &events_root)?;
+        // Restoring the fixture does not acknowledge its earlier recovery
+        // failure. Let the original read/recovery owner settle that debt.
+        assert!(
+            watches
+                .project_pending_command_cell_watches(
+                    "workspace",
+                    "parallel-conversation",
+                    "verification-recovery",
+                )
+                .await
+                .map_err(anyhow::Error::msg)?
+                .is_none()
+        );
+        watches.shutdown().await.map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
 
     fn projection_context(turn_id: Option<&str>) -> ProjectionContext {
         ProjectionContext {

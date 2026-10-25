@@ -31,6 +31,7 @@ const FRAMEWORK_REACT: &str = include_str!("../../../echo-agent/src/agent/react/
 
 fn plan_for(run_id: &str, task_id: &str) -> TaskPlan {
     TaskPlan {
+        domain_binding: None,
         plan_id: format!("plan:{run_id}"),
         run_id: run_id.to_string(),
         revision: 0,

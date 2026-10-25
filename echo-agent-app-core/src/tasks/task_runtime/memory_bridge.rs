@@ -318,6 +318,8 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".into(),
             run_id: "r1".into(),
             revision: 1,

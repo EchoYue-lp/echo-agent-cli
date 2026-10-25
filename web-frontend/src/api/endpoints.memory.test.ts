@@ -87,40 +87,48 @@ describe('workspace-scoped memory API', () => {
   });
 
   it('keeps primary and unattended worktree IPC explicitly scoped', async () => {
-    await worktreeApi.list('workspace-c');
-    await worktreeApi.create('workspace-c', { branch: 'feature/c' });
-    await worktreeApi.remove('workspace-c', '/tmp/worktree-c');
-    await worktreeApi.listUnattended('workspace-c');
-    await worktreeApi.mergeUnattended('workspace-c', 'run-c');
-    await worktreeApi.discardUnattended('workspace-c', 'run-c');
-    await worktreeApi.cleanupUnattended('workspace-c');
+    const scope = { workspaceId: 'workspace-c', workspaceGeneration: 'generation-c' };
+    await worktreeApi.list(scope);
+    await worktreeApi.create(scope, { branch: 'feature/c' });
+    await worktreeApi.remove(scope, '/tmp/worktree-c');
+    await worktreeApi.listUnattended(scope);
+    await worktreeApi.mergeUnattended(scope, 'run-c');
+    await worktreeApi.discardUnattended(scope, 'run-c');
+    await worktreeApi.cleanupUnattended(scope);
 
     expect(bridge.apiInvoke).toHaveBeenNthCalledWith(1, 'list_worktrees', {
       workspaceId: 'workspace-c',
+      workspaceGeneration: 'generation-c',
     });
     expect(bridge.apiInvoke).toHaveBeenNthCalledWith(2, 'create_worktree', {
       workspaceId: 'workspace-c',
+      workspaceGeneration: 'generation-c',
       branch: 'feature/c',
       base: undefined,
       path: undefined,
     });
     expect(bridge.apiInvoke).toHaveBeenNthCalledWith(3, 'remove_worktree', {
       workspaceId: 'workspace-c',
+      workspaceGeneration: 'generation-c',
       path: '/tmp/worktree-c',
     });
     expect(bridge.apiInvoke).toHaveBeenNthCalledWith(4, 'list_unattended_worktrees', {
       workspaceId: 'workspace-c',
+      workspaceGeneration: 'generation-c',
     });
     expect(bridge.apiInvoke).toHaveBeenNthCalledWith(5, 'merge_unattended_worktree', {
       workspaceId: 'workspace-c',
+      workspaceGeneration: 'generation-c',
       runId: 'run-c',
     });
     expect(bridge.apiInvoke).toHaveBeenNthCalledWith(6, 'discard_unattended_worktree', {
       workspaceId: 'workspace-c',
+      workspaceGeneration: 'generation-c',
       runId: 'run-c',
     });
     expect(bridge.apiInvoke).toHaveBeenNthCalledWith(7, 'cleanup_unattended_worktrees', {
       workspaceId: 'workspace-c',
+      workspaceGeneration: 'generation-c',
     });
   });
 });

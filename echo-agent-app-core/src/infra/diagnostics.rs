@@ -181,19 +181,66 @@ pub async fn load_user_hooks(
     agent: &AgentHandle,
     app_config: &EkoConfig,
     project_root: Option<&std::path::Path>,
-) {
-    let load_result = crate::hook_config_loader::HookConfigLoader::load_merged_for_workspace(
-        app_config,
-        project_root,
+) -> std::result::Result<(), String> {
+    let files = agent
+        .read(|agent| {
+            agent
+                .file_system()
+                .unwrap_or_else(|| Arc::new(echo_agent::tools::files::LocalFileSystem))
+        })
+        .await;
+    let config = app_config.clone();
+    let root = project_root.map(std::path::Path::to_path_buf);
+    let load_result = tokio::task::spawn_blocking(move || {
+        crate::hook_config_loader::HookConfigLoader::load_merged_with_file_system(
+            &config,
+            root.as_deref(),
+            files.as_ref(),
+        )
+    })
+    .await
+    .map_err(|error| format!("User hook loader task failed: {error}"))?;
+    install_loaded_user_hooks(agent, &load_result).await?;
+    tracing::info!(
+        files = ?load_result.loaded_from,
+        "User hooks loaded in original inline/global/project order"
     );
-    for error in &load_result.errors {
-        tracing::warn!(%error, "User hook source was not loaded");
+    Ok(())
+}
+
+/// One UserConfig publication with each rule group's original I/O target.
+/// Rebuild/clear remains atomic at the existing registry source boundary.
+pub(crate) async fn install_loaded_user_hooks(
+    agent: &AgentHandle,
+    loaded: &crate::hook_config_loader::HooksLoadResult,
+) -> std::result::Result<(), String> {
+    if !loaded.errors.is_empty() {
+        return Err(loaded.errors.join("; "));
     }
-    let hooks_def = load_result.definition;
-    if hooks_def.is_empty() {
-        return;
-    }
-    let rule_count: usize = hooks_def.rules.values().map(Vec::len).sum();
+    let (local_executor, project_executor) = agent
+        .read(|agent| {
+            (
+                agent.default_skill_source().sandbox(),
+                agent.sandbox_manager().cloned(),
+            )
+        })
+        .await;
+    let origins = loaded
+        .origins
+        .iter()
+        .map(|origin| {
+            (
+                origin.definition.clone(),
+                origin.directory.to_string_lossy().into_owned(),
+                if origin.project {
+                    project_executor.clone()
+                } else {
+                    local_executor.clone()
+                },
+                origin.project,
+            )
+        })
+        .collect();
     agent
         .write_async(|a| {
             Box::pin(async move {
@@ -202,15 +249,11 @@ pub async fn load_user_hooks(
                 // 这里 clear 是为了支持 config reload(避免重复注册);
                 // 因为我们已把三源合并,clear 不会丢任何来源。
                 registry.clear_user_hooks();
-                registry.register_user_hooks(hooks_def);
+                registry.register_user_hooks_with_sources(origins);
             })
         })
         .await;
-    tracing::info!(
-        count = rule_count,
-        files = ?load_result.loaded_from,
-        "User hooks loaded (merged: inline eko.yaml + hooks.yaml files)"
-    );
+    Ok(())
 }
 
 /// Fire SessionStart("startup") hook after hooks are loaded.

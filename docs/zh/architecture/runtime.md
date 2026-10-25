@@ -1,5 +1,31 @@
 # RuntimeTaskService 适配决策
 
+## 项目工作区与真实位置
+
+工作空间、项目与工程对应同一个 Workspace，任务/会话归属它，TaskRun/PlanTask 列表呈现执行记录。创建 Workspace 支持已有本地文件夹、新建本地文件夹和 SSH 远程项目，新建任务不创建目录。代码位置与本机 `Workspace.root` 产品数据分离；旧 manifest 仍按原 `project_root`、`root` 解析，不移动旧目录。位置和验证后的执行身份同属原 manifest/`project_root_revision`，参见 [ADR 0055](../adr/0055-project-workspaces.md)。
+
+项目树、编辑器、changes/diff、Git/worktree 和 Agent 文件/命令使用同一 host 的实际位置。GUI 请求捕获 workspace ID 与 generation，迟到响应不能覆盖另一个位置版本。目录选择器仍浏览本机目录；远程路径由项目连接验证，不能在本机 canonicalize。提供者未承诺修改时间时返回 `null`。保存保持原锁/preimage 与真实目标的比较替换边界；远端不支持时明确报告，写结果不确定时保留诊断，不自动重放。
+
+六个非本机项目文件入口通过原 ProductDataIo 观察最多 30 秒；Unconfirmed 只表示本次等待结束，原物理工作和 host 占用继续保留。真正完成后才清原 operation id，迟到失败保留原失败收据。本机/global 路径不改等待方式。位置重绑和 host 关闭沿原 idle 门禁，普通焦点切换不改变后台任务的目标。该观察不替代 SSH 后端对远端终态与未知结果的证明。
+
+完成结果的封装继续携带同一原 operation，直到取出确认或未观察丢弃。成功写入通道缓存不构成交付确认：缓存被丢弃仍保留未读取错误，已实际读取的业务错误正常返回调用方。
+
+用户级规则、记忆、产品会话和 journal 留本机；项目 AGENTS、Skill 和 Subagent 来源读取实际项目。必需读取失败从原可失败的模型入口返回。fresh Subagent 在实际隔离 cwd 已知后准备不可变指令与项目信息，现有模型前投影接口在冷 Execute/reset 或恢复后发布同一份已读取事实，以原 marker 替换旧 checkpoint 投影；角色根提示词保持原权威。模型前投影不执行文件 I/O，也不承担错误准入判断。
+
+主智能体每轮通过原 turn registration 携带已准备的项目事实；显式提供环境、没有 store/run 的嵌入调用也走同一入口。原 EKO projector 同时保留 Domain/TaskRuntime、turn policy、hot memory 和命令观察。并行的主智能体验证使用已有 execution ID 作为该独立调用的 turn ID，原根消息继续作为触发来源。fresh 默认及 Plugin Subagent 将自己的真实 checkout 事实与原 Domain-only renderer 组合；本机产品数据回执始终是带身份的资源 guard，不是命令工作目录。
+
+应用内嵌配置与用户 hooks/Skills 保留本机文件与原本机执行器；项目 hooks/Skills 捕获项目文件与执行器，后续切换 host 执行器不改写已登记的来源。hooks 仍按内嵌、用户文件、项目文件的原顺序合并，并在同一个 UserConfig 槽位整体替换。项目读取失败会阻止初次加载，显式重载失败保留上次有效集合。自动文件监听只覆盖本机配置和本机项目；SSH 项目没有远端 notify/poller，使用既有显式重载读取同一远端目标。
+
+项目终端捕获项目身份；显式本地/独立 SSH tab 保持各自目标。人手终端不占 Agent 执行槽、不要求 LLM 或 full-auto。原 child/reader 结算前保持 host I/O receipt；退出先关闭用户 PTY，再结算其依赖，认证 master 等 Agent/file 使用者结算后关闭。源码和前端测试不代替真实远程写入、原生 GUI 或平台能力验收。
+
+## GUI 输入接收与草稿归属
+
+运行中的追加输入以原 `queue_chat_input` 返回的持久回执确认“已收到”，不等待模型、物理工具或 mailbox drain。frontier 刷新和 tracked-steer 观察仍由原输入服务与 attempt owner 完成。接收、drain、已进入上下文与终态是不同事实；接收不表示当前工具已停止或纠正已经执行。一次草稿在附件处理前固定 externalId、原 Workspace/generation、Conversation/new-chat epoch 与领域选择；准备后的文本和附件负载沿同一描述保留，重试不换身份、不偷换负载。Hook 的原 turn/view fence 与 GUI 的当前草稿、附件及挂载检查共同保护迟到回执：原持久事实保留，不能清新稿或投影到另一任务。显式领域仍按原 TaskRun 绑定，排队时不能自动改当前领域。
+
+普通首条发送以原保存者返回的真实会话地址继续准入。迟到创建不覆盖后继会话或新草稿，发送方不在保存后重新读取当前焦点来路由输入。Started 的直接接受证明和本地 slash command 成功，与输入持久化回执分开；GUI 仅在原提交和当前草稿仍匹配时清稿。
+
+首次创建期间的提交展示权在第一次等待前绑定原 Hook 代次和原准入对象；原保存者在选中真实会话前通知该对象，只有仍属于原代次的 null→真实 ID 变化可以迁移。Stop、卸载、换会话或新草稿后不能重新取得展示权。创建成功与后续列表刷新、界面观察异常分开处理，不因观察失败再次创建。`/clear` 的原 reset 可在后台结算原会话，但返回后只在原 Workspace、选择、加载代次和新稿 epoch 均未变化时清理当前投影；原当前会话 reset 失败后仍按既有行为清空。这些回调复用原会话生命周期，不新增第二份 store 或执行 owner。
+
 ## AgentRouter 阶段交接
 
 AgentRouter 直接使用公开的 typed
@@ -350,3 +376,21 @@ EKO 配置只提供新运行默认值。原 RunCreated 的执行 profile 拥有�
 ### GUI 渠道、cron 与真正退出
 
 原 IM owner 归位 app-core `channel_runtime`，bin 入口仅转发；ApplicationServices 与 Tauri 共用同一 Arc。ConfigState 只在 owned 持久化成功后发布 UUID revision，transport epoch 与 applied revision 保持各自含义。原生命周期 channels slot 持有 manager/coordinator/pump 句柄到真实物理结算；所有权未知时阻止依赖提前关闭。桌面 X 隐藏；明确退出在 Tokio 存活期间等待原 receipt 的 final 发布，其它 bounded 观察不变。已结算失败可为 final Err，Unknown 不构成 final。Cron 视图只消费原 edit/manual/history 收据和已有精确 run 事实。数据流、恢复边界、参考实现及待验 Rust/native 范围见 [ADR0053](../adr/0053-im-cron-gui-control.md)。
+
+## 绑定到 TaskRun 的领域插件
+
+专业方法通过原插件 prepare/publication 读取 EKO `domain.yaml`，不再由四套编译内
+profile 模板选择。原 RunCreated 事件保存唯一完整不可变绑定；TaskRun、graph metadata
+及 task extension 携带同一有界身份引用，原 journal/checkpoint fold 重建完整规则。
+动态图修改保留绑定、工具上限及最低 artifact/check/语义义务。
+
+primary、计划 Subagent、Verification 与 review 消费持久规则。原 pool lease 携带
+发布代和实际 Agent catalog 句柄，跨 workspace 目标也核自己的同一代。恢复执行核
+原身份，不用当前包静默改写旧任务。普通 General 对话保留原无 plan 快捷完成；轻量
+领域使用原固定 Summary 事务与真实事件证据，有正式义务则走真实图和原 CompletionGate。
+
+当前仍为源码实现：adhoc `agent_tool` 沿原物理 lease 投影与同一 registration 准入，
+原 model projector 在无结构化 prompt payload 时读取持久 method；GUI prepare 复用
+原 foreground 令牌。这些路径已新增回归定义，Rust 类型/测试、TypeScript 原生成、
+完整集成及 native/main 验收待做。见 [ADR0054](../adr/0054-task-bound-domain-plugins.md) 和
+[包示例](../../../examples/domain-plugin/README.md)。

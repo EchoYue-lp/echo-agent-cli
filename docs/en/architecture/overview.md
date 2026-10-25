@@ -197,3 +197,15 @@ LSP-specific document/field/method dependency. Late file changes cannot alter a
 generation's receipts; cache invalidation uses the original framework integrator. Legacy config recognition is diagnostic only. Settings retain
 lazy loading and local ErrorBoundary behavior; unknown old `lsp` keys use overview,
 and old typed/invoke requests fail through existing unsupported/serde boundaries.
+
+## Workspace and task navigation
+
+Workspace, project and engineering project name the same existing Workspace. The sidebar separates New task, Recent tasks and Workspaces. New task opens a normal Conversation draft in the selected Workspace; it does not create a directory or stop another conversation running in the background. Recent tasks are a bounded, on-demand read projection of the existing workspace-scoped conversations, with at most two metadata queries at once; archived and Side Conversations retain their existing presentation paths. They are not the TaskRun execution graph.
+
+The main composer places workspace selection and permissions at the lower left, and the real configured model selector at the lower right. Its workspace menu searches registered workspaces and opens the existing source form for an existing local directory, a new directory or an SSH device and remote directory. Remote entries display the verified execution location, never the local product-data folder. IM channels, scheduled tasks, terminal, settings, HITL and execution-task details remain reachable through their existing owners. The large primary composer is an explicit variant; Subagent inputs keep their compact layout.
+
+You can add input while the conversation is running. The “已收到” (Received) notice means that input has been saved; the unchanged submitted text and attachments clear without waiting for the model or tools to finish. It does not mean execution or task completion. Attachment preparation or admission failure preserves the draft, and retrying an unchanged draft reuses the same submission. Repeated send events during admission do not create another submission. Late results do not clear a newer draft after navigation, reopening a conversation or editing. Stop remains a separate action.
+
+Workspace/Conversation stores and backend lifecycle remain authoritative. Navigation uses transient UI intent and existing workspace generation checks to discard superseded selections; no second task store, recent-task database, permission model or SSH owner is introduced.
+
+The default desktop page uses the existing native system-font fallback stack and makes no default remote font request. User-configured theme fonts remain user-owned.

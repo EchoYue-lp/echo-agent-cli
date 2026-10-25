@@ -112,12 +112,13 @@ async fn drive_owned_agent_turn(
     disabled_tools: HashSet<String>,
     trace_sink: Option<ExecSink>,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
+    invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
 ) -> Result<(TurnReceipt, EkoAgentTurnObservation), ExecError> {
     let run_id = run.run_id.clone();
     let conversation_id = run.conversation_id.clone();
     let message_id = Some(run.root_message_id.clone()).filter(|value| !value.trim().is_empty());
     let turn_id = turn_id.to_string();
-    let prompt = prompt.to_string();
+    let mut prompt = prompt.to_string();
     let core_trace_sink = exec_trace_sink_to_core(trace_sink.clone());
     let trace_sink_for_scope = trace_sink.clone();
     let policy_run_id = run_id.clone();
@@ -132,13 +133,43 @@ async fn drive_owned_agent_turn(
         .await
         .map_err(|error| ExecError::Other(error.to_string()))?;
     let delegation_policy = crate::subagent_policy::primary_policy_for_binding(binding);
-    let working_dir = workspace_io
+    let domain_run_id = run.run_id.clone();
+    let domain_binding = blocking
+        .run("read original primary domain rules", move |store| {
+            Ok(store
+                .get_run_state(&domain_run_id)?
+                .and_then(|state| state.domain_binding))
+        })
+        .await
+        .map_err(|error| ExecError::Other(error.to_string()))?;
+    if let Some(binding) = domain_binding.as_ref() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&binding.prompt_instructions());
+    }
+    let allowed_tools = domain_binding
         .as_ref()
-        .map(|scope| scope.data_root().to_path_buf());
-    let resource_guards = workspace_io
+        .map(|binding| binding.effective_allowed_tools(&[]))
+        .transpose()
+        .map_err(ExecError::Other)?
+        .flatten();
+    let working_dir = blocking.project_working_dir();
+    let mut resource_guards = workspace_io
         .as_ref()
         .map(crate::state::WorkspaceIoInvocation::resource_guards)
         .unwrap_or_default();
+    resource_guards.extend(invocation_resources);
+    let prepared_project = prepare_project_agent(
+        primary_agent,
+        blocking.project_environment(),
+        working_dir.clone(),
+        resource_guards.clone(),
+    )
+    .await
+    .map_err(ExecError::Other)?;
+    let _project_projection = prepared_project.map(|prepared| {
+        crate::turn_context::turn_prompt_context_registry()
+            .register_project_context(turn_id.clone(), prepared)
+    });
     super::task_tools::with_run_context(
         run_id.clone(),
         cancel.clone(),
@@ -146,10 +177,8 @@ async fn drive_owned_agent_turn(
         async {
             let agent_inner = primary_agent.inner().clone();
             let agent = agent_inner.read().await;
-            let visible_tools = crate::tool_exposure::initial_visible_tools_for_profile(
-                run.domain_profile,
-                &agent.tool_names(),
-            );
+            let visible_tools =
+                crate::tool_exposure::initial_visible_tools_for_task_run(&agent.tool_names());
             crate::tool_exposure::record_schema_budget(&agent.tool_definitions(), &visible_tools);
             let mutating_tools: HashSet<String> = agent
                 .tool_names()
@@ -164,7 +193,7 @@ async fn drive_owned_agent_turn(
                 .filter(|runtime_state_id| Some(*runtime_state_id) != Some(&conversation_id))
                 .cloned();
             let invocation = echo_agent::agent::AgentInvocationContext {
-                allowed_tools: None,
+                allowed_tools,
                 history: None,
                 runtime_state_id,
                 transcript_generation_id,
@@ -237,12 +266,45 @@ pub async fn drive_agent_run(
     trace_sink: Option<ExecSink>,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<String, ExecError> {
+    drive_agent_run_with_resources(
+        store,
+        primary_agent,
+        run_id,
+        source_id,
+        fire_id,
+        prompt,
+        parent_cancel,
+        write_mode,
+        plan_policy,
+        trace_sink,
+        workspace_io,
+        Vec::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn drive_agent_run_with_resources(
+    store: Arc<TaskRuntimeStore>,
+    primary_agent: crate::agent_handle::AgentHandle,
+    run_id: &str,
+    source_id: &str,
+    fire_id: &str,
+    prompt: &str,
+    parent_cancel: CancellationToken,
+    write_mode: UnattendedWriteMode,
+    plan_policy: RunPlanPolicy,
+    trace_sink: Option<ExecSink>,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
+    invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
+) -> Result<String, ExecError> {
     let child_cancel = parent_cancel.child_token();
     let blocking = TaskRuntimeOperation::new(store.clone());
     let admission_run_id = run_id.to_string();
     let admission_cancel = child_cancel.clone();
     let (_cancel_registration, run_for_scope) = blocking
         .run("register agent-driven run", move |store| {
+            store.validate_run_project_binding(&admission_run_id)?;
             let registration = store
                 .register_run_cancellation(&admission_run_id, admission_cancel)
                 .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
@@ -253,6 +315,17 @@ pub async fn drive_agent_run(
         })
         .await
         .map_err(|error| ExecError::Other(format!("register run cancellation: {error}")))?;
+    // Ordinary General execution keeps its original projection ownership;
+    // only a bound domain needs this additional cross-spawn lifetime reference.
+    let _run_projection = if run_for_scope.domain_binding.is_some() {
+        Some(
+            super::compact_context::task_runtime_projection_registry()
+                .retain_for_invocation(run_id, store.clone())
+                .map_err(ExecError::Other)?,
+        )
+    } else {
+        None
+    };
     let attended_mode = run_for_scope.attended_mode;
     let prompt = unattended_run_prompt(prompt, attended_mode, write_mode);
     let mut disabled_tools =
@@ -277,6 +350,23 @@ pub async fn drive_agent_run(
         )));
     }
 
+    if blocking
+        .run("check original run plan policy", {
+            let run_id = run_id.to_string();
+            move |store| {
+                Ok(store
+                    .get_run_state(&run_id)?
+                    .map(|state| state.execution_profile.plan_policy))
+            }
+        })
+        .await
+        .map_err(|error| ExecError::Other(error.to_string()))?
+        != Some(plan_policy)
+    {
+        return Err(ExecError::Other(
+            "Run driver plan policy differs from its original admission".to_string(),
+        ));
+    }
     let mut origin = RunTurnOrigin::User;
     loop {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -311,36 +401,18 @@ pub async fn drive_agent_run(
             disabled_tools.clone(),
             trace_sink.clone(),
             workspace_io.clone(),
+            invocation_resources.clone(),
         )
         .await?;
-        let mut terminal = turn_receipt.outcome;
-        let plan_exists = blocking
-            .run("inspect agent-driven run plan", {
-                let run_id = run_id.to_string();
-                move |store| store.get_plan(&run_id).map(|plan| plan.is_some())
-            })
-            .await
-            .map_err(|error| ExecError::Other(error.to_string()))?;
-        if matches!(&terminal, TurnOutcome::Completed)
-            && !child_cancel.is_cancelled()
-            && plan_policy == RunPlanPolicy::AllowDirect
-            && !plan_exists
-        {
-            if turn_observation.mutating_tool_observed {
-                terminal = TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
-                    "direct_mutation_requires_plan",
-                    "a mutating tool was attempted outside a materialized TaskPlan",
-                ));
-            } else if !turn_observation.output.trim().is_empty()
-                && let Err(error) =
-                    materialize_direct_completion(&store, run_id, turn_observation).await
-            {
-                terminal = TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
-                    "direct_completion",
-                    format!("failed to persist direct completion evidence: {error}"),
-                ));
-            }
-        }
+        finalize_direct_agent_observation(
+            &store,
+            run_id,
+            &mut turn_receipt,
+            turn_observation,
+            &child_cancel,
+        )
+        .await?;
+        let terminal = turn_receipt.outcome;
         if let TurnOutcome::Failed(failure) = &terminal {
             tracing::warn!(
                 source_id,
@@ -495,6 +567,50 @@ pub async fn drive_agent_run(
     Ok(run_id.to_string())
 }
 
+/// Both the foreground and background owners use the original single-Summary
+/// transaction, with evidence from the same real event collector.
+pub(crate) async fn finalize_direct_agent_observation(
+    store: &Arc<TaskRuntimeStore>,
+    run_id: &str,
+    receipt: &mut TurnReceipt,
+    observation: EkoAgentTurnObservation,
+    cancel: &CancellationToken,
+) -> Result<(), ExecError> {
+    let owned = run_id.to_string();
+    let (plan_policy, plan_exists) = TaskRuntimeOperation::new(store.clone())
+        .run("inspect direct completion policy", move |store| {
+            let state = store
+                .get_run_state(&owned)?
+                .ok_or_else(|| StoreError::RunNotFound(owned.clone()))?;
+            Ok((
+                state.execution_profile.plan_policy,
+                store.get_plan(&owned)?.is_some(),
+            ))
+        })
+        .await
+        .map_err(|error| ExecError::Other(error.to_string()))?;
+    if matches!(&receipt.outcome, TurnOutcome::Completed)
+        && !cancel.is_cancelled()
+        && plan_policy == RunPlanPolicy::AllowDirect
+        && !plan_exists
+    {
+        if observation.mutating_tool_observed {
+            receipt.outcome = TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+                "direct_mutation_requires_plan",
+                "a mutating tool was attempted outside a materialized TaskPlan",
+            ));
+        } else if !observation.output.trim().is_empty()
+            && let Err(error) = materialize_direct_completion(store, run_id, observation).await
+        {
+            receipt.outcome = TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+                "direct_completion",
+                format!("failed to persist direct completion evidence: {error}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn materialize_direct_completion(
     store: &Arc<TaskRuntimeStore>,
     run_id: &str,
@@ -520,6 +636,7 @@ async fn materialize_direct_completion(
     };
     let task_id = "direct-answer";
     let plan = TaskPlan {
+        domain_binding: run.domain_binding.clone(),
         plan_id: format!("plan:{run_id}"),
         run_id: run_id.to_string(),
         revision: 0,
@@ -531,6 +648,7 @@ async fn materialize_direct_completion(
         execution_mode: ExecutionMode::Sequential,
         tasks: vec![PlanTask {
             id: task_id.to_string(),
+            domain_binding: run.domain_binding.clone(),
             title,
             description: run.goal,
             kind: PlanTaskKind::Summary,

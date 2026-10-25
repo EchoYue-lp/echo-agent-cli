@@ -436,6 +436,7 @@ impl RetentionPins {
                         queue_revision: self.queue_revision,
                     },
                     payload: ConversationInputPayload {
+                        domain_plugin: None,
                         text: String::new(),
                         attachments: Vec::new(),
                         submitted_at_ms: 0,

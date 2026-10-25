@@ -12,6 +12,7 @@ interface AgentPaneProps {
   bodyAriaLive?: 'off' | 'polite' | 'assertive';
   bodyClassName?: string;
   onBodyScroll?: UIEventHandler<HTMLDivElement>;
+  layout?: 'conversation' | 'home';
 }
 
 export function AgentPane({
@@ -26,6 +27,7 @@ export function AgentPane({
   bodyAriaLive,
   bodyClassName = '',
   onBodyScroll,
+  layout = 'conversation',
 }: AgentPaneProps) {
   return (
     <section
@@ -37,16 +39,20 @@ export function AgentPane({
         {header}
       </header>
       <div
-        ref={bodyRef}
-        role={bodyRole}
-        aria-label={bodyAriaLabel}
-        aria-live={bodyAriaLive}
-        onScroll={onBodyScroll}
-        className={`min-h-0 flex-1 overflow-y-auto ${bodyClassName}`}
+        className={`flex min-h-0 flex-1 flex-col ${layout === 'home' ? 'justify-center overflow-y-auto pb-[min(12vh,100px)]' : ''}`}
       >
-        {children}
+        <div
+          ref={bodyRef}
+          role={bodyRole}
+          aria-label={bodyAriaLabel}
+          aria-live={bodyAriaLive}
+          onScroll={onBodyScroll}
+          className={`min-h-0 ${layout === 'home' ? 'shrink-0' : 'flex-1 overflow-y-auto'} ${bodyClassName}`}
+        >
+          {children}
+        </div>
+        {footer ? <footer className="shrink-0 bg-[var(--bg-chat)]">{footer}</footer> : null}
       </div>
-      {footer ? <footer className="shrink-0 bg-[var(--bg-chat)]">{footer}</footer> : null}
     </section>
   );
 }

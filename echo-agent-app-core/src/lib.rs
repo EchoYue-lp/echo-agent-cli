@@ -21,6 +21,7 @@ pub(crate) mod conversation_projection;
 pub(crate) mod data_root;
 pub(crate) mod developer_commands;
 pub(crate) mod diff;
+pub(crate) mod domain_plugin;
 pub(crate) mod error;
 pub(crate) mod evolution;
 pub(crate) mod export;

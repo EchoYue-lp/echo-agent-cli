@@ -7850,6 +7850,7 @@ mod tests {
         commit_task_plan(
             store.clone(),
             TaskPlan {
+                domain_binding: None,
                 plan_id: "tui-retry-plan".to_string(),
                 run_id: "tui-retry-closed".to_string(),
                 revision: 1,
@@ -7990,6 +7991,7 @@ mod tests {
             attachments: Vec::new(),
             run_resume: Some(TaskRunResumeWake {
                 identity: echo_agent_app_core::api::tasks::task_runtime::TaskRunResumeIdentity {
+                    project_binding: None,
                     run_id: "exact-run".to_string(),
                     workspace_id: "workspace-a".to_string(),
                     conversation_id: "conversation-a".to_string(),
@@ -9241,6 +9243,7 @@ mod tests {
             requirements: Vec::new(),
         };
         let run = echo_agent_app_core::api::tasks::task_runtime::TaskRun {
+            domain_binding: None,
             run_id: "same-run".to_string(),
             workspace_id: "workspace-b".to_string(),
             conversation_id: "conversation-b".to_string(),

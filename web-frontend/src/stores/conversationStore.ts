@@ -5,7 +5,7 @@ import { useToastStore } from './toastStore';
 import { useToolExecutionStore } from './toolExecutionStore';
 import { useSubagentRunStore } from './subagentRunStore';
 import { useTaskRuntimeStore } from './taskRuntimeStore';
-import { GLOBAL_WORKSPACE_ID } from '../lib/viewAddress';
+import { GLOBAL_WORKSPACE_ID, viewAddress, type ViewAddress } from '../lib/viewAddress';
 import type {
   ChatMessage,
   ConversationListItem,
@@ -67,7 +67,10 @@ interface ConversationState {
   /** Immediately detach the visible conversation projection during a workspace transition. */
   detachForWorkspace: (workspaceId: string) => void;
   /** Save current chat messages as a conversation (upsert) */
-  saveCurrent: (messages: ChatMessage[]) => Promise<void>;
+  saveCurrent: (
+    messages: ChatMessage[],
+    onCreated?: (address: ViewAddress) => void
+  ) => Promise<ViewAddress | null>;
   /** Load a conversation and display it */
   loadConversation: (id: string) => Promise<void>;
   /** Branch the canonical transcript immediately before one user turn. */
@@ -346,10 +349,13 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     }));
   },
 
-  saveCurrent: async (messages: ChatMessage[]) => {
+  saveCurrent: async (messages: ChatMessage[], onCreated?: (address: ViewAddress) => void) => {
     const activeId = get().activeId;
     const workspaceId = get().workspaceId;
-    if (messages.length === 0) return;
+    const originalLoadGeneration = loadGeneration;
+    const originalNewConversationEpoch = get().newConversationEpoch;
+    if (messages.length === 0) return null;
+    let savedId = activeId;
 
     const firstUserMsg = messages.find((m) => m.role === 'user');
     const title = firstUserMsg?.content?.slice(0, 50) || 'New Chat';
@@ -374,18 +380,40 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           messages: [],
         });
         if (import.meta.env.DEV) console.debug('[saveCurrent] save result:', res, 'newId:', newId);
-        if (get().workspaceId !== workspaceId) return;
-        set({ activeId: newId });
+        if (!res?.id || typeof res.id !== 'string')
+          throw new Error('Conversation save did not return its identity');
+        savedId = res.id;
+        // The save belongs to its original address even when selection moved.
+        // Only its original view may adopt the newly created identity.
+        if (
+          get().workspaceId === workspaceId &&
+          get().activeId === activeId &&
+          loadGeneration === originalLoadGeneration &&
+          get().newConversationEpoch === originalNewConversationEpoch
+        ) {
+          // Let the original sender bind its existing admission before the
+          // selection effect observes this one legitimate null-to-id change.
+          // A view observer failure cannot undo the successful canonical save.
+          try {
+            onCreated?.(viewAddress(workspaceId, savedId));
+          } catch (error) {
+            console.error('[saveCurrent] identity observer FAILED:', error);
+          }
+          set({ activeId: savedId });
+        }
       }
     } catch (e) {
       console.error('[saveCurrent] FAILED:', e);
-      return; // Don't attempt list refresh if save failed
+      return null; // Don't attempt list refresh if save failed
     }
+    if (!savedId) return null;
+    const savedAddress = viewAddress(workspaceId, savedId);
+    if (get().workspaceId !== workspaceId) return savedAddress;
 
     // Refresh list (best-effort, must not throw)
     try {
       const items = await conversationApi.list(workspaceId);
-      if (get().workspaceId !== workspaceId) return;
+      if (get().workspaceId !== workspaceId) return savedAddress;
       if (import.meta.env.DEV)
         console.debug('[saveCurrent] refreshed list:', items.length, 'conversations');
       const metas: ConversationMeta[] = items
@@ -398,6 +426,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     } catch (e) {
       console.error('[saveCurrent] refresh FAILED:', e);
     }
+    return savedAddress;
   },
 
   loadConversation: async (id: string) => {
@@ -746,13 +775,25 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
 
   clearCurrent: async () => {
     loadGeneration += 1;
+    const generation = loadGeneration;
+    const { workspaceId, activeId, newConversationEpoch } = get();
     loadingConversationId = null;
     set({ isLoading: false });
     try {
-      const { workspaceId, activeId } = get();
       if (activeId) await sessionApi.reset(workspaceId, activeId);
     } catch (e) {
       console.error('Failed to reset session while clearing chat:', e);
+    }
+
+    // The original reset still settles, but its late result must not erase a
+    // newer selection or a reopened instance of the same conversation.
+    if (
+      generation !== loadGeneration ||
+      get().workspaceId !== workspaceId ||
+      get().activeId !== activeId ||
+      get().newConversationEpoch !== newConversationEpoch
+    ) {
+      return;
     }
 
     useChatStore.getState().clearMessages();

@@ -454,6 +454,47 @@ pub async fn launch_task_run_resume(
     let generation_lease = store.lease_active_workspace_generation()?;
     let registration =
         store.register_observed_run_driver::<RunOutcome>(admission, generation_lease)?;
+    if let Some(snapshot) = store.get_run_state(&run_id)? {
+        if let Some(binding) = snapshot.domain_binding.as_ref() {
+            let verification = match pool_execution.as_ref() {
+                Some(lease) if Arc::ptr_eq(primary_agent.inner(), lease.agent().inner()) => {
+                    lease.verify_domain_binding(binding).await
+                }
+                _ => Err(
+                    "domain resume requires its original target Agent and live pool lease"
+                        .to_string(),
+                ),
+            };
+            if let Err(error) = verification {
+                registration.reject(error.clone());
+                return Err(StoreError::InvalidPlan(error));
+            }
+        } else if snapshot.run.domain_profile != DomainProfile::General {
+            let error =
+                "historical professional run cannot resume without its original plugin binding"
+                    .to_string();
+            registration.reject(error.clone());
+            return Err(StoreError::InvalidPlan(error));
+        }
+    }
+    let invocation_resources = match (
+        store
+            .get_run_state(&run_id)?
+            .and_then(|state| state.domain_binding),
+        pool_execution.as_ref(),
+    ) {
+        (Some(binding), Some(execution)) => {
+            let projection = super::compact_context::task_runtime_projection_registry()
+                .retain_for_invocation(&run_id, store.clone())
+                .map_err(StoreError::InvalidPlan)?;
+            vec![
+                execution
+                    .domain_resource_guard(&run_id, &binding, Some(Arc::new(projection)))
+                    .map_err(StoreError::InvalidPlan)?,
+            ]
+        }
+        _ => Vec::new(),
+    };
     TaskRuntimeOperation::new(store.clone())
         .run_owned("prepare exact TaskRun resume", move || {
             let mut registration = registration;
@@ -509,7 +550,7 @@ pub async fn launch_task_run_resume(
                         let reviewer_llm = primary_agent
                             .read(|agent| agent.llm_client().cloned())
                             .await;
-                        return execute_run(
+                        return execute_run_with_resources(
                             preparation_store,
                             Some(primary_agent),
                             reviewer_llm,
@@ -520,12 +561,13 @@ pub async fn launch_task_run_resume(
                             cancel,
                             super::memory_bridge::MemoryPolicy::BestEffortSettled,
                             workspace_io,
+                            invocation_resources,
                         )
                         .await
                         .map_err(super::store::RunDriverFailure::from);
                     }
 
-                    drive_agent_run(
+                    drive_agent_run_with_resources(
                         preparation_store.clone(),
                         primary_agent,
                         &preparation_run_id,
@@ -537,6 +579,7 @@ pub async fn launch_task_run_resume(
                         execution_profile.plan_policy,
                         trace_sink,
                         workspace_io,
+                        invocation_resources,
                     )
                     .await
                     .map_err(super::store::RunDriverFailure::from)?;

@@ -149,6 +149,9 @@ pub use echo_agent::agent::AgentSteerTurnOutcome as ConversationInputOutcome;
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export, rename = "ConversationInputPayload")]
 pub struct ConversationInputPayload {
+    #[serde(default)]
+    #[ts(optional)]
+    pub domain_plugin: Option<String>,
     pub text: String,
     pub attachments: Vec<crate::types::AttachmentData>,
     #[ts(type = "number")]
@@ -161,6 +164,22 @@ impl ConversationInputPayload {
         text: String,
         attachments: Vec<crate::types::AttachmentData>,
     ) -> Result<Self, ConversationInputError> {
+        Self::new_with_domain(text, attachments, None)
+    }
+
+    pub fn new_with_domain(
+        text: String,
+        attachments: Vec<crate::types::AttachmentData>,
+        domain_plugin: Option<String>,
+    ) -> Result<Self, ConversationInputError> {
+        if domain_plugin
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(ConversationInputError::Validation(
+                "domain_plugin must not be empty".to_string(),
+            ));
+        }
         if text.trim().is_empty() && attachments.is_empty() {
             return Err(ConversationInputError::Validation(
                 "conversation input must contain text or attachments".to_string(),
@@ -168,13 +187,23 @@ impl ConversationInputPayload {
         }
         crate::attachments::validate_attachment_batch(&attachments)
             .map_err(|error| ConversationInputError::Validation(error.to_string()))?;
-        let canonical = echo_agent::utils::canonical_json::canonical_json_bytes(&(
-            text.as_str(),
-            attachments.as_slice(),
-        ))
+        // Preserve the original General identity. A selected domain is part
+        // of the same durable queue payload, never reconstructed from the UI.
+        let canonical = match domain_plugin.as_deref() {
+            None => echo_agent::utils::canonical_json::canonical_json_bytes(&(
+                text.as_str(),
+                attachments.as_slice(),
+            )),
+            Some(plugin) => echo_agent::utils::canonical_json::canonical_json_bytes(&(
+                text.as_str(),
+                attachments.as_slice(),
+                plugin,
+            )),
+        }
         .map_err(|error| ConversationInputError::Validation(error.to_string()))?;
         let payload_sha256 = format!("{:x}", Sha256::digest(canonical));
         Ok(Self {
+            domain_plugin,
             text,
             attachments,
             submitted_at_ms: echo_agent::utils::time::now_millis(),
@@ -364,13 +393,25 @@ impl ConversationInputService {
         text: String,
         attachments: Vec<crate::types::AttachmentData>,
     ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        self.submit_with_domain(address, input_id, text, attachments, None)
+            .await
+    }
+
+    pub async fn submit_with_domain(
+        &self,
+        address: ConversationInputAddress,
+        input_id: String,
+        text: String,
+        attachments: Vec<crate::types::AttachmentData>,
+        domain_plugin: Option<String>,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
         validate_address(&address)?;
         if input_id.trim().is_empty() {
             return Err(ConversationInputError::Validation(
                 "conversation input id must not be empty".to_string(),
             ));
         }
-        let payload = ConversationInputPayload::new(text, attachments)?;
+        let payload = ConversationInputPayload::new_with_domain(text, attachments, domain_plugin)?;
         self.log
             .submit_conversation_input(address, input_id, payload)
             .await
@@ -2069,6 +2110,39 @@ mod tests {
         assert_eq!(terminal.phase, ConversationInputPhase::TurnSettled);
         assert!(terminal.drained);
         assert_eq!(terminal.outcome, Some(ConversationInputOutcome::Dropped));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod domain_input_tests {
+    use super::*;
+
+    #[test]
+    fn queued_domain_selection_is_durable_and_part_of_payload_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let general = ConversationInputPayload::new("inspect".to_string(), Vec::new())?;
+        let unchanged =
+            ConversationInputPayload::new_with_domain("inspect".to_string(), Vec::new(), None)?;
+        assert_eq!(general.payload_sha256, unchanged.payload_sha256);
+        let domain = ConversationInputPayload::new_with_domain(
+            "inspect".to_string(),
+            Vec::new(),
+            Some("evidence-domain".to_string()),
+        )?;
+        assert_ne!(general.payload_sha256, domain.payload_sha256);
+        let restored: ConversationInputPayload =
+            serde_json::from_slice(&serde_json::to_vec(&domain)?)?;
+        assert_eq!(restored.domain_plugin.as_deref(), Some("evidence-domain"));
+        assert_eq!(restored.payload_sha256, domain.payload_sha256);
+        assert!(
+            ConversationInputPayload::new_with_domain(
+                "inspect".to_string(),
+                Vec::new(),
+                Some(String::new())
+            )
+            .is_err()
+        );
         Ok(())
     }
 }

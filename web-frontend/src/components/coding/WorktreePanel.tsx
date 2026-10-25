@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   Check,
@@ -13,16 +13,18 @@ import {
   X,
 } from 'lucide-react';
 import { worktreeApi, type UnattendedWorktreeInfo, type WorktreeInfo } from '../../api/endpoints';
-import { workspaceIdForView } from '../../lib/viewAddress';
+import { productDataScope, productDataScopeKey } from '../../lib/productDataScope';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 
 type ReviewAction = 'merge' | 'discard';
 
 export function WorktreePanel() {
-  const workspaceId = useWorkspaceStore((state) => workspaceIdForView(state.current?.id));
-  const scopeRef = useRef({ workspaceId, generation: 0 });
-  if (scopeRef.current.workspaceId !== workspaceId) {
-    scopeRef.current = { workspaceId, generation: scopeRef.current.generation + 1 };
+  const workspace = useWorkspaceStore((state) => state.current);
+  const projectScope = useMemo(() => productDataScope(workspace), [workspace]);
+  const scopeKey = productDataScopeKey(projectScope);
+  const scopeRef = useRef({ scopeKey, generation: 0 });
+  if (scopeRef.current.scopeKey !== scopeKey) {
+    scopeRef.current = { scopeKey, generation: scopeRef.current.generation + 1 };
   }
   const scopeGeneration = scopeRef.current.generation;
   const fetchRequestRef = useRef(0);
@@ -49,10 +51,11 @@ export function WorktreePanel() {
   const [reviewActionScopeGeneration, setReviewActionScopeGeneration] = useState(-1);
 
   const requestIsCurrent = useCallback(
-    (requestWorkspaceId: string, requestGeneration: number) =>
-      scopeRef.current.workspaceId === requestWorkspaceId &&
+    (requestScopeKey: string, requestGeneration: number) =>
+      scopeRef.current.scopeKey === requestScopeKey &&
       scopeRef.current.generation === requestGeneration &&
-      workspaceIdForView(useWorkspaceStore.getState().current?.id) === requestWorkspaceId,
+      productDataScopeKey(productDataScope(useWorkspaceStore.getState().current)) ===
+        requestScopeKey,
     []
   );
   const visibleError = errorScopeGeneration === scopeGeneration ? error : null;
@@ -76,11 +79,11 @@ export function WorktreePanel() {
       setErrorScopeGeneration(requestGeneration);
       setError(null);
       const [allWorktrees, unattendedWorktrees] = await Promise.all([
-        worktreeApi.list(workspaceId),
-        worktreeApi.listUnattended(workspaceId),
+        worktreeApi.list(projectScope),
+        worktreeApi.listUnattended(projectScope),
       ]);
       if (
-        !requestIsCurrent(workspaceId, requestGeneration) ||
+        !requestIsCurrent(scopeKey, requestGeneration) ||
         fetchRequestRef.current !== requestToken
       )
         return;
@@ -89,7 +92,7 @@ export function WorktreePanel() {
       setUnattended(unattendedWorktrees);
     } catch (e) {
       if (
-        requestIsCurrent(workspaceId, requestGeneration) &&
+        requestIsCurrent(scopeKey, requestGeneration) &&
         fetchRequestRef.current === requestToken
       ) {
         setDataScopeGeneration(requestGeneration);
@@ -100,15 +103,20 @@ export function WorktreePanel() {
       }
     } finally {
       if (
-        requestIsCurrent(workspaceId, requestGeneration) &&
+        requestIsCurrent(scopeKey, requestGeneration) &&
         fetchRequestRef.current === requestToken
       ) {
         setLoading(false);
       }
     }
-  }, [requestIsCurrent, workspaceId]);
+  }, [requestIsCurrent, scopeKey, projectScope]);
 
   useEffect(() => {
+    setConfirmDelete(null);
+    setReviewAction(null);
+    setShowCreateForm(false);
+    setNewBranch('');
+    setNewBase('');
     void fetchWorktrees();
   }, [fetchWorktrees]);
 
@@ -123,12 +131,12 @@ export function WorktreePanel() {
     setCleaning(false);
     setCreating(true);
     try {
-      await worktreeApi.create(workspaceId, {
+      await worktreeApi.create(projectScope, {
         branch: newBranch.trim(),
         base: newBase.trim() || undefined,
       });
       if (
-        !requestIsCurrent(workspaceId, requestGeneration) ||
+        !requestIsCurrent(scopeKey, requestGeneration) ||
         actionRequestRef.current !== requestToken
       )
         return;
@@ -138,7 +146,7 @@ export function WorktreePanel() {
       await fetchWorktrees();
     } catch (e) {
       if (
-        requestIsCurrent(workspaceId, requestGeneration) &&
+        requestIsCurrent(scopeKey, requestGeneration) &&
         actionRequestRef.current === requestToken
       ) {
         setErrorScopeGeneration(requestGeneration);
@@ -146,7 +154,7 @@ export function WorktreePanel() {
       }
     } finally {
       if (
-        requestIsCurrent(workspaceId, requestGeneration) &&
+        requestIsCurrent(scopeKey, requestGeneration) &&
         actionRequestRef.current === requestToken
       ) {
         setCreating(false);
@@ -164,9 +172,9 @@ export function WorktreePanel() {
     setCleaning(false);
     setRemoving(path);
     try {
-      await worktreeApi.remove(workspaceId, path);
+      await worktreeApi.remove(projectScope, path);
       if (
-        !requestIsCurrent(workspaceId, requestGeneration) ||
+        !requestIsCurrent(scopeKey, requestGeneration) ||
         actionRequestRef.current !== requestToken
       )
         return;
@@ -174,7 +182,7 @@ export function WorktreePanel() {
       await fetchWorktrees();
     } catch (e) {
       if (
-        requestIsCurrent(workspaceId, requestGeneration) &&
+        requestIsCurrent(scopeKey, requestGeneration) &&
         actionRequestRef.current === requestToken
       ) {
         setErrorScopeGeneration(requestGeneration);
@@ -182,7 +190,7 @@ export function WorktreePanel() {
       }
     } finally {
       if (
-        requestIsCurrent(workspaceId, requestGeneration) &&
+        requestIsCurrent(scopeKey, requestGeneration) &&
         actionRequestRef.current === requestToken
       ) {
         setRemoving(null);
@@ -201,9 +209,9 @@ export function WorktreePanel() {
     setReviewing(runId);
     try {
       if (action === 'merge') {
-        const result = await worktreeApi.mergeUnattended(workspaceId, runId);
+        const result = await worktreeApi.mergeUnattended(projectScope, runId);
         if (
-          !requestIsCurrent(workspaceId, requestGeneration) ||
+          !requestIsCurrent(scopeKey, requestGeneration) ||
           actionRequestRef.current !== requestToken
         )
           return;
@@ -212,10 +220,10 @@ export function WorktreePanel() {
           setError(result.cleanup_warning);
         }
       } else {
-        await worktreeApi.discardUnattended(workspaceId, runId);
+        await worktreeApi.discardUnattended(projectScope, runId);
       }
       if (
-        !requestIsCurrent(workspaceId, requestGeneration) ||
+        !requestIsCurrent(scopeKey, requestGeneration) ||
         actionRequestRef.current !== requestToken
       )
         return;
@@ -223,7 +231,7 @@ export function WorktreePanel() {
       await fetchWorktrees();
     } catch (e) {
       if (
-        requestIsCurrent(workspaceId, requestGeneration) &&
+        requestIsCurrent(scopeKey, requestGeneration) &&
         actionRequestRef.current === requestToken
       ) {
         setErrorScopeGeneration(requestGeneration);
@@ -231,7 +239,7 @@ export function WorktreePanel() {
       }
     } finally {
       if (
-        requestIsCurrent(workspaceId, requestGeneration) &&
+        requestIsCurrent(scopeKey, requestGeneration) &&
         actionRequestRef.current === requestToken
       ) {
         setReviewing(null);
@@ -249,9 +257,9 @@ export function WorktreePanel() {
     setReviewing(null);
     setCleaning(true);
     try {
-      const result = await worktreeApi.cleanupUnattended(workspaceId);
+      const result = await worktreeApi.cleanupUnattended(projectScope);
       if (
-        !requestIsCurrent(workspaceId, requestGeneration) ||
+        !requestIsCurrent(scopeKey, requestGeneration) ||
         actionRequestRef.current !== requestToken
       )
         return;
@@ -262,7 +270,7 @@ export function WorktreePanel() {
       await fetchWorktrees();
     } catch (e) {
       if (
-        requestIsCurrent(workspaceId, requestGeneration) &&
+        requestIsCurrent(scopeKey, requestGeneration) &&
         actionRequestRef.current === requestToken
       ) {
         setErrorScopeGeneration(requestGeneration);
@@ -270,7 +278,7 @@ export function WorktreePanel() {
       }
     } finally {
       if (
-        requestIsCurrent(workspaceId, requestGeneration) &&
+        requestIsCurrent(scopeKey, requestGeneration) &&
         actionRequestRef.current === requestToken
       ) {
         setCleaning(false);

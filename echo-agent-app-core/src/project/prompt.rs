@@ -20,7 +20,7 @@ use echo_agent::tokenizer::{HeuristicTokenizer, Tokenizer};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const PROJECT_CONTEXT_PROJECTION: &str = "eko:project-context";
+pub(crate) const PROJECT_CONTEXT_PROJECTION: &str = "eko:project-context";
 
 /// Stable product-level operating contract. Dynamic project, memory, mode, and
 /// task context follows this cache-friendly prefix.
@@ -308,7 +308,7 @@ impl PromptAssembler {
         }
 
         // P7: Git context (low priority)
-        if let Some(git_ctx) = super::context::load_git_context(&ctx.root) {
+        if let Some(git_ctx) = &ctx.git_context {
             self.add_module(PromptModule {
                 name: "git_context".into(),
                 content: format!("## Git Status\n\n{git_ctx}"),

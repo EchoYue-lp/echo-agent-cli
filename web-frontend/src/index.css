@@ -33,7 +33,7 @@
   color-scheme: light;
   --bg-primary: #ffffff;
   --bg-secondary: #f3f5f8;
-  --bg-chat: #fbfcfe;
+  --bg-chat: #ffffff;
   --bg-hover: #e9edf3;
   --bg-input: #ffffff;
   --bg-user-msg: #2563eb;
@@ -41,9 +41,9 @@
   --bg-assistant-msg: transparent;
   --bg-code: #111827;
   --bg-code-header: #1f2937;
-  --bg-sidebar: #f3f5f8;
-  --bg-sidebar-hover: #e7ecf3;
-  --bg-sidebar-active: #e0e8f5;
+  --bg-sidebar: #f7f7f8;
+  --bg-sidebar-hover: #ededee;
+  --bg-sidebar-active: #e9e9ec;
   --bg-rail: #ffffff;
   --bg-overlay: rgba(16, 24, 40, 0.36);
 
@@ -755,6 +755,11 @@ textarea.input {
   outline-offset: 2px;
 }
 
+/* The primary composer's existing rounded frame owns its visible focus border. */
+[data-composer-variant='primary'] textarea:focus-visible {
+  outline: none;
+}
+
 /* Restore button (SessionsPanel) */
 .restore-btn {
   border: 1px solid var(--border-primary);
@@ -797,4 +802,14 @@ textarea.input {
 .eko-pane-control:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
+}
+
+/* Keep the workspace search's keyboard focus on its rounded shared surface. */
+.eko-workspace-search:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.eko-workspace-search input:focus-visible {
+  outline: none;
 }

@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "decision": "docs/supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md",
-  "lock_sha256": "cd05fc1c3ffa425b972d48a687486446ea70f24dea30282d096b4f2856fac335",
-  "consumer_inputs_sha256": "3b76ef95f80c6f68d2d1ae1a9d9e5555e628fb251322cd98d293fcf6de688d61",
+  "lock_sha256": "2f1f128b2ba6e1cac7e254d9a499d96926e860bbdce353ee71c94a0ba2289a57",
+  "consumer_inputs_sha256": "e50f45c974d30461edebdd4715defa2083f244d3c7692c9ff2c9fef6e0d5b875",
   "accepted": [
     {
       "name": "glib",

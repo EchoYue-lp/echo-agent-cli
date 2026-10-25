@@ -4,7 +4,8 @@ import { MessageBubble } from './MessageBubble';
 import { HitlDialog } from './HitlDialog';
 import { ChatInput } from './ChatInput';
 import { WelcomeScreen } from './WelcomeScreen';
-import { useTauriChat } from '../../hooks/useTauriChat';
+import { useTauriChat, type ChatSendSubmission } from '../../hooks/useTauriChat';
+import { productDataScope, sameProductDataScope } from '../../lib/productDataScope';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { useConversationStore } from '../../stores/conversationStore';
 import { useToastStore } from '../../stores/toastStore';
@@ -31,9 +32,11 @@ import type { Attachment } from '../../types/api';
 import type { QueuedChatInput } from '../../hooks/useTauriChat';
 import { useContextPaneStore } from '../../stores/contextPaneStore';
 import { useWorkspaceViewStore } from '../../stores/workspaceViewStore';
+import { useUiStore } from '../../stores/uiStore';
 import { useToolExecutionStore } from '../../stores/toolExecutionStore';
 import { dispatchGuiSlashCommand } from '../../lib/slashCommands';
 import { AgentPane } from './AgentPane';
+import { workspaceLocationLabel } from '../../lib/workspacePresentation';
 import { SideConversationDialog } from './SideConversationDialog';
 import type { ConfiguredModel } from '../../generated';
 
@@ -268,29 +271,90 @@ export function ChatPanel() {
   };
 
   const openPrimaryWorkbench = (view: 'analysis' | 'research' | 'workflow' | 'extract') => {
+    useUiStore.getState().beginNavigation();
     useContextPaneStore.getState().reset();
     openWorkspaceView(view);
   };
 
-  const handleSend = async (text: string, attachments?: Attachment[]) => {
+  const handleSend = async (
+    text: string,
+    attachments?: Attachment[],
+    submission?: ChatSendSubmission
+  ) => {
+    const workspace = productDataScope(useWorkspaceStore.getState().current);
+    const conversation = useConversationStore.getState();
+    const sourceConversationId = conversation.activeId;
+    const sourceEpoch = conversation.newConversationEpoch;
+    const targetIsCurrent = () =>
+      sameProductDataScope(workspace, productDataScope(useWorkspaceStore.getState().current)) &&
+      useConversationStore.getState().activeId === sourceConversationId &&
+      useConversationStore.getState().newConversationEpoch === sourceEpoch;
+    if (
+      submission &&
+      (useWorkspaceStore.getState().isLoading ||
+        !sameProductDataScope(submission, workspace) ||
+        submission.conversationId !== sourceConversationId ||
+        submission.newConversationEpoch !== sourceEpoch)
+    )
+      return false;
+
     if (!attachments?.length) {
-      const dispatched = await dispatchGuiSlashCommand(text, {
-        clear: clearCurrentChat,
-        tasks: openTasks,
-        analysis: () => openPrimaryWorkbench('analysis'),
-        research: () => openPrimaryWorkbench('research'),
-        browser: openBrowser,
-        files: openFiles,
-        workflows: () => openPrimaryWorkbench('workflow'),
-        extract: () => openPrimaryWorkbench('extract'),
+      if (
+        submission &&
+        (submission.payload.text !== text || submission.payload.attachments?.length)
+      )
+        return false;
+      // Local slash handlers may legitimately clear the selected conversation.
+      // Observe intervening selections so that command success cannot adopt a
+      // newer page or pretend to be an input journal receipt.
+      let superseded = false;
+      const unsubscribe = useConversationStore.subscribe((state) => {
+        if (
+          state.newConversationEpoch !== sourceEpoch ||
+          (state.activeId !== sourceConversationId && state.activeId !== null)
+        )
+          superseded = true;
       });
-      if (dispatched) return true;
+      try {
+        const command = dispatchGuiSlashCommand(text, {
+          clear: clearCurrentChat,
+          tasks: openTasks,
+          analysis: () => openPrimaryWorkbench('analysis'),
+          research: () => openPrimaryWorkbench('research'),
+          browser: openBrowser,
+          files: openFiles,
+          workflows: () => openPrimaryWorkbench('workflow'),
+          extract: () => openPrimaryWorkbench('extract'),
+        });
+        const commandEpoch = useUiStore.getState().navigationEpoch;
+        if (await command) {
+          const settledConversationId = useConversationStore.getState().activeId;
+          const canProject = () =>
+            !superseded &&
+            sameProductDataScope(
+              workspace,
+              productDataScope(useWorkspaceStore.getState().current)
+            ) &&
+            useConversationStore.getState().newConversationEpoch === sourceEpoch &&
+            useConversationStore.getState().activeId === settledConversationId &&
+            useUiStore.getState().navigationEpoch === commandEpoch;
+          try {
+            void Promise.resolve(submission?.onDirectAccepted?.(canProject)).catch((error) =>
+              console.warn('[ChatPanel] Local command draft acknowledgement failed:', error)
+            );
+          } catch (error) {
+            console.warn('[ChatPanel] Local command draft acknowledgement failed:', error);
+          }
+          return true;
+        }
+      } finally {
+        unsubscribe();
+      }
     }
-    if (activeSide) {
+    if (activeSide && targetIsCurrent())
       noteSideConversationTurnStarted(activeSide.conversation_id);
-    }
-    const sent = await sendMessage(text, attachments);
-    if (!sent && activeSide) {
+    const sent = await sendMessage(text, attachments, submission?.payload.domainPlugin, submission);
+    if (!sent && activeSide && targetIsCurrent()) {
       void useConversationStore.getState().init(activeSide.workspace_id);
     }
     return sent;
@@ -312,6 +376,7 @@ export function ChatPanel() {
       <AgentPane
         ariaLabel={activeSide ? '支线 Agent' : '主 Agent'}
         role="main"
+        layout={messages.length === 0 && !pendingHitlRequests.length ? 'home' : 'conversation'}
         bodyRef={scrollRef}
         bodyRole="log"
         bodyAriaLive="polite"
@@ -330,7 +395,9 @@ export function ChatPanel() {
                   ? activeSide.launch_error
                     ? 'Side Conversation · 首轮待重试'
                     : `Side Conversation · 已提交快照 ${activeSide.snapshot_message_count} 条`
-                  : currentWorkspace?.root || '选择或创建一个任务开始工作'}
+                  : currentWorkspace
+                    ? workspaceLocationLabel(currentWorkspace)
+                    : '新建任务，或选择一个工作空间'}
               </div>
             </div>
             <div className="ml-auto flex items-center gap-2 text-xs text-[var(--text-tertiary)]">
@@ -414,7 +481,7 @@ export function ChatPanel() {
           </>
         }
         footer={
-          <div className="border-t border-[var(--border-secondary)] pt-2">
+          <div className={messages.length === 0 ? 'pt-2' : 'pt-3'}>
             <div className="mx-auto w-full max-w-[980px] px-4 sm:px-6 lg:px-8">
               <HitlDialog
                 requests={pendingHitlRequests}
@@ -456,6 +523,7 @@ export function ChatPanel() {
               isStreaming={isStreaming}
               onCancel={cancel}
               queuedCount={queuedInputs.length}
+              home={messages.length === 0}
             />
           </div>
         }

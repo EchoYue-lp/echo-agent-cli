@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, render, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -7,6 +7,10 @@ const mocks = vi.hoisted(() => ({
   setThinking: vi.fn(),
   getPermissionMode: vi.fn(),
   workspaceId: 'workspace-a',
+  openWorkspaceDialog: vi.fn(),
+  switchWorkspace: vi.fn(),
+  remote: false,
+  navigationEpoch: 0,
 }));
 
 vi.mock('../../api/endpoints', () => ({
@@ -21,14 +25,47 @@ vi.mock('../../api/endpoints', () => ({
   },
 }));
 
-vi.mock('../../stores/workspaceStore', () => ({
-  useWorkspaceStore: (selector: (state: unknown) => unknown) =>
-    selector({ current: { id: mocks.workspaceId } }),
-}));
+vi.mock('../../stores/workspaceStore', () => {
+  const state = () => {
+    const current = {
+      id: mocks.workspaceId,
+      name: '示例项目',
+      root: '/private/product-data',
+      project_root: '/code/project',
+      metadata: {
+        tags: [],
+        project_execution_location: mocks.remote
+          ? { kind: 'ssh', user: 'echo', host: 'remote', port: null, path: '/srv/project' }
+          : { kind: 'local', path: '/code/project' },
+      },
+      product_data_generation: 'v1',
+    };
+    return { current, workspaces: [current], isLoading: false, switchTo: mocks.switchWorkspace };
+  };
+  return {
+    useWorkspaceStore: Object.assign((selector: (value: unknown) => unknown) => selector(state()), {
+      getState: state,
+    }),
+  };
+});
 
-vi.mock('../../stores/uiStore', () => ({
-  useUiStore: (selector: (state: unknown) => unknown) =>
-    selector({ setActiveSettingsTab: vi.fn() }),
+vi.mock('../../stores/uiStore', () => {
+  const state = {
+    setActiveSettingsTab: vi.fn(),
+    openWorkspaceDialog: mocks.openWorkspaceDialog,
+    get navigationEpoch() {
+      return mocks.navigationEpoch;
+    },
+    beginNavigation: () => ++mocks.navigationEpoch,
+  };
+  return {
+    useUiStore: Object.assign((selector: (value: unknown) => unknown) => selector(state), {
+      getState: () => state,
+    }),
+  };
+});
+vi.mock('../../stores/workspaceViewStore', () => ({
+  useWorkspaceViewStore: { getState: () => ({ openChat: vi.fn() }) },
 }));
 
 import { ChatInput } from './ChatInput';
@@ -39,6 +76,8 @@ describe('ChatInput thinking publication', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.workspaceId = 'workspace-a';
+    mocks.remote = false;
+    mocks.navigationEpoch = 0;
     localStorage.setItem('echo_thinking_level', 'high');
     mocks.getPermissionMode.mockResolvedValue({ mode: 'default' });
     mocks.listConfigured.mockResolvedValue({
@@ -85,5 +124,47 @@ describe('ChatInput thinking publication', () => {
     await waitFor(() => {
       expect(mocks.setThinking).toHaveBeenCalledWith('high', 'workspace-b');
     });
+  });
+  it('offers real workspace sources and restores keyboard focus after closing the menu', async () => {
+    const view = render(<ChatInput onSend={vi.fn()} />);
+    const trigger = view.getByRole('button', { name: '选择工作空间' });
+    fireEvent.click(trigger);
+    const search = view.getByRole('textbox', { name: '搜索工作空间' });
+    await waitFor(() => expect(document.activeElement).toBe(search));
+    fireEvent.change(search, { target: { value: 'does-not-exist' } });
+    expect(view.getByText('没有匹配的工作空间')).toBeTruthy();
+    fireEvent.keyDown(search, { key: 'Escape' });
+    expect(view.queryByRole('dialog', { name: '工作空间选择' })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+    for (const [label, source] of [
+      ['新建工作空间', 'new_local'],
+      ['打开本地文件夹', 'existing_local'],
+      ['连接远程 SSH 设备', 'ssh'],
+    ] as const) {
+      fireEvent.click(trigger);
+      fireEvent.click(view.getByRole('button', { name: label }));
+      expect(mocks.openWorkspaceDialog).toHaveBeenLastCalledWith(source);
+    }
+  });
+
+  it('shows the remote execution directory and keeps permission/model controls accessible', async () => {
+    mocks.remote = true;
+    const view = render(<ChatInput onSend={vi.fn()} />);
+    expect(view.getByRole('button', { name: '选择工作空间' }).getAttribute('title')).toBe(
+      'echo@remote · /srv/project'
+    );
+    expect(view.getByRole('button', { name: '权限配置' })).toBeTruthy();
+    await waitFor(() =>
+      expect(view.getByRole('button', { name: '选择模型' }).textContent).toContain('Model')
+    );
+    expect(view.getByRole('button', { name: '选择模型' }).getAttribute('title')).toBe(
+      'provider / model'
+    );
+    fireEvent.click(view.getByRole('button', { name: '选择工作空间' }));
+    expect(view.getByText('echo@remote · /srv/project')).toBeTruthy();
+    expect(view.queryByText('/private/product-data')).toBeNull();
+    fireEvent.pointerDown(document.body);
+    expect(view.queryByRole('dialog', { name: '工作空间选择' })).toBeNull();
+    await waitFor(() => expect(mocks.setThinking).toHaveBeenCalled());
   });
 });

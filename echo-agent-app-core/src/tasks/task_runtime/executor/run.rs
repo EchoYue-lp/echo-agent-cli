@@ -17,10 +17,41 @@ pub async fn execute_run(
     memory_policy: super::memory_bridge::MemoryPolicy,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<RunOutcome, ExecError> {
+    execute_run_with_resources(
+        store,
+        primary_agent,
+        reviewer_llm,
+        memory_generation,
+        run_store,
+        trace_sink,
+        run_id,
+        parent_cancel,
+        memory_policy,
+        workspace_io,
+        Vec::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_run_with_resources(
+    store: Arc<TaskRuntimeStore>,
+    primary_agent: Option<crate::agent_handle::AgentHandle>,
+    reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
+    memory_generation: Option<crate::evolution::ReviewGenerationLease>,
+    run_store: Option<Arc<dyn echo_agent::trace::RunStore>>,
+    trace_sink: Option<ExecSink>,
+    run_id: &str,
+    parent_cancel: CancellationToken,
+    memory_policy: super::memory_bridge::MemoryPolicy,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
+    invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
+) -> Result<RunOutcome, ExecError> {
     let blocking = TaskRuntimeOperation::new(store.clone());
     let initial_run_id = run_id.to_string();
     let (run, initial_plan) = blocking
         .run("load runtime execution admission", move |store| {
+            store.validate_run_project_binding(&initial_run_id)?;
             let run = store
                 .get_run(&initial_run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(initial_run_id.clone()))?;
@@ -31,6 +62,17 @@ pub async fn execute_run(
         })
         .await
         .map_err(|error| ExecError::Other(error.to_string()))?;
+    // Ordinary General execution keeps its original projection ownership;
+    // only a bound domain needs this additional cross-spawn lifetime reference.
+    let _run_projection = if run.domain_binding.is_some() {
+        Some(
+            super::compact_context::task_runtime_projection_registry()
+                .retain_for_invocation(run_id, store.clone())
+                .map_err(ExecError::Other)?,
+        )
+    } else {
+        None
+    };
     // The caller must have transitioned Pending → Running before spawning
     // the executor. Here we only accept Running.
     if run.status != TaskRunStatus::Running {
@@ -137,6 +179,7 @@ pub async fn execute_run(
             RealTaskDispatcher {
                 primary_agent: primary_agent.clone(),
                 workspace_io: workspace_io.clone(),
+                invocation_resources: invocation_resources.clone(),
             },
             reviewer_llm.clone(),
             run_id,
@@ -326,8 +369,9 @@ pub async fn execute_run(
                 return Ok(committed);
             }
         }
-        Err(ExecError::Framework(echo_agent::error::ReactError::ExecutionNotSettled { .. })) =>
-        {
+        Err(ExecError::Framework(echo_agent::error::ReactError::ExecutionNotSettled {
+            ..
+        })) => {
             // Observation is not a run resolution or a retry instruction.
         }
         Err(e) => {

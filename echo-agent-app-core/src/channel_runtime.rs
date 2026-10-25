@@ -6172,6 +6172,7 @@ mod tests {
             continuation_enabled: true,
             execution_profile:
                 crate::tasks::task_runtime::TaskRunExecutionProfile::conversation_turn(),
+            project_binding: None,
         };
         assert!(matches!(
             super::channel_resume_dispatch(identity.clone(), false, "surface-turn"),
@@ -7107,6 +7108,8 @@ mod tests {
             human_loop_provider: None,
         });
         let binding = RunTurnBinding {
+            domain_plugin: None,
+
             run_id: None,
             turn_id: "continuation-turn".to_string(),
             root_message_id: "root-turn".to_string(),

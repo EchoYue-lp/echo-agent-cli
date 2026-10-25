@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   deleteConversation: vi.fn(),
   setArchived: vi.fn(),
   resetSession: vi.fn(),
+  saveConversation: vi.fn(),
 }));
 
 vi.mock('../api/endpoints', () => ({
@@ -25,7 +26,7 @@ vi.mock('../api/endpoints', () => ({
     retrySide: mocks.retrySideConversation,
     markSideViewed: mocks.markSideConversationViewed,
     get: mocks.getConversation,
-    save: vi.fn(),
+    save: mocks.saveConversation,
     update: mocks.updateConversation,
     delete: mocks.deleteConversation,
     setArchived: mocks.setArchived,
@@ -92,6 +93,10 @@ beforeEach(() => {
     target_content: 'canonical user prompt',
   });
   mocks.resetSession.mockResolvedValue(undefined);
+  mocks.saveConversation.mockImplementation(async (_workspaceId, data) => ({
+    kind: 'primary',
+    id: data.id,
+  }));
   useChatStore.getState().clearMessages();
   useConversationStore.setState({
     workspaceId: 'global',
@@ -104,7 +109,173 @@ beforeEach(() => {
   });
 });
 
+describe('conversation clear identity', () => {
+  it.each(['other-conversation', 'conversation-a'])(
+    'keeps the newly loaded %s when an older reset completes',
+    async (nextConversationId) => {
+      const reset = deferred<undefined>();
+      mocks.resetSession.mockReturnValueOnce(reset.promise);
+      useConversationStore.setState({ activeId: 'conversation-a' });
+      useChatStore.getState().addUserMessage('old conversation');
+
+      const clearing = useConversationStore.getState().clearCurrent();
+      expect(mocks.resetSession).toHaveBeenCalledWith('global', 'conversation-a');
+      mocks.getConversation.mockResolvedValueOnce({
+        messages: [{ role: 'user', content: 'newly selected conversation' }],
+      });
+      await useConversationStore.getState().loadConversation(nextConversationId);
+      const messages = useChatStore.getState().messages;
+
+      reset.resolve(undefined);
+      await clearing;
+
+      expect(useConversationStore.getState().activeId).toBe(nextConversationId);
+      expect(useChatStore.getState().messages).toBe(messages);
+      expect(messages.map((message) => message.content)).toEqual(['newly selected conversation']);
+    }
+  );
+
+  it('keeps the newer blank draft and its text when an older reset completes', async () => {
+    const reset = deferred<undefined>();
+    mocks.resetSession.mockReturnValueOnce(reset.promise);
+    useConversationStore.setState({ activeId: 'conversation-a' });
+    useChatStore.getState().addUserMessage('old conversation');
+
+    const clearing = useConversationStore.getState().clearCurrent();
+    await useConversationStore.getState().startNew();
+    useChatStore.getState().addUserMessage('new blank draft');
+    const messages = useChatStore.getState().messages;
+
+    reset.resolve(undefined);
+    await clearing;
+
+    expect(useConversationStore.getState()).toMatchObject({
+      activeId: null,
+      newConversationEpoch: 1,
+      isLoading: false,
+    });
+    expect(useChatStore.getState().messages).toBe(messages);
+    expect(messages.map((message) => message.content)).toEqual(['new blank draft']);
+  });
+
+  it('keeps the new conversation when the older reset fails', async () => {
+    const reset = deferred<undefined>();
+    mocks.resetSession.mockReturnValueOnce(
+      reset.promise.then(() => {
+        throw new Error('old reset failed');
+      })
+    );
+    useConversationStore.setState({ activeId: 'conversation-a' });
+    const clearing = useConversationStore.getState().clearCurrent();
+    mocks.getConversation.mockResolvedValueOnce({
+      messages: [{ role: 'user', content: 'new conversation survives failed old reset' }],
+    });
+    await useConversationStore.getState().loadConversation('other-conversation');
+    const messages = useChatStore.getState().messages;
+
+    reset.resolve(undefined);
+    await clearing;
+
+    expect(useConversationStore.getState().activeId).toBe('other-conversation');
+    expect(useChatStore.getState().messages).toBe(messages);
+  });
+
+  it.each([false, true])(
+    'clears the original current conversation normally when reset failure is %s',
+    async (fails) => {
+      if (fails) mocks.resetSession.mockRejectedValueOnce(new Error('reset failed'));
+      useConversationStore.setState({ activeId: 'conversation-a' });
+      useChatStore.getState().addUserMessage('clear the original conversation');
+
+      await useConversationStore.getState().clearCurrent();
+
+      expect(mocks.resetSession).toHaveBeenCalledWith('global', 'conversation-a');
+      expect(useConversationStore.getState()).toMatchObject({ activeId: null, isLoading: false });
+      expect(useChatStore.getState().messages).toEqual([]);
+    }
+  );
+});
+
 describe('conversation message identity', () => {
+  it('returns the original saved address without selecting it after another conversation opens', async () => {
+    const created = deferred<{ kind: string; id: string }>();
+    mocks.saveConversation.mockReturnValueOnce(created.promise);
+    mocks.getConversation.mockResolvedValueOnce({
+      messages: [{ role: 'user', content: 'other conversation' }],
+    });
+    const saving = useConversationStore
+      .getState()
+      .saveCurrent([{ id: 'original', role: 'user', content: 'first task', timestamp: 1 }]);
+    const requestedId = String(mocks.saveConversation.mock.calls[0]?.[1].id);
+    expect(requestedId).not.toBe('undefined');
+    await useConversationStore.getState().loadConversation('other-conversation');
+    expect(useConversationStore.getState().activeId).toBe('other-conversation');
+    created.resolve({ kind: 'primary', id: requestedId });
+    expect(await saving).toEqual({ workspace_id: 'global', conversation_id: requestedId });
+    expect(useConversationStore.getState().activeId).toBe('other-conversation');
+    expect(useChatStore.getState().messages.map((message) => message.content)).toEqual([
+      'other conversation',
+    ]);
+  });
+
+  it('retains a newer blank draft when an old first-conversation save completes', async () => {
+    const created = deferred<{ kind: string; id: string }>();
+    mocks.saveConversation.mockReturnValueOnce(created.promise);
+    const saving = useConversationStore
+      .getState()
+      .saveCurrent([{ id: 'original', role: 'user', content: 'old draft', timestamp: 1 }]);
+    const requestedId = String(mocks.saveConversation.mock.calls[0]?.[1].id);
+    await useConversationStore.getState().startNew();
+    created.resolve({ kind: 'primary', id: requestedId });
+    expect(await saving).toEqual({ workspace_id: 'global', conversation_id: requestedId });
+    expect(useConversationStore.getState()).toMatchObject({
+      activeId: null,
+      newConversationEpoch: 1,
+    });
+    expect(useChatStore.getState().messages).toEqual([]);
+  });
+
+  it('selects its own first conversation and returns its confirmed address normally', async () => {
+    const address = await useConversationStore
+      .getState()
+      .saveCurrent([{ id: 'normal', role: 'user', content: 'normal first draft', timestamp: 1 }]);
+    const requestedId = String(mocks.saveConversation.mock.calls[0]?.[1].id);
+    expect(address).toEqual({ workspace_id: 'global', conversation_id: requestedId });
+    expect(useConversationStore.getState().activeId).toBe(requestedId);
+  });
+
+  it('notifies its original sender of the canonical address before selecting the first conversation', async () => {
+    const onCreated = vi.fn(() => {
+      expect(useConversationStore.getState().activeId).toBeNull();
+    });
+    const address = await useConversationStore
+      .getState()
+      .saveCurrent(
+        [{ id: 'normal', role: 'user', content: 'normal first draft', timestamp: 1 }],
+        onCreated
+      );
+
+    expect(onCreated).toHaveBeenCalledExactlyOnceWith(address);
+    expect(useConversationStore.getState().activeId).toBe(address?.conversation_id);
+  });
+
+  it('returns the successful canonical save even if the identity observer throws', async () => {
+    const onCreated = vi.fn(() => {
+      throw new Error('view observer failed');
+    });
+    const address = await useConversationStore
+      .getState()
+      .saveCurrent(
+        [{ id: 'normal', role: 'user', content: 'normal first draft', timestamp: 1 }],
+        onCreated
+      );
+    const requestedId = String(mocks.saveConversation.mock.calls[0]?.[1].id);
+
+    expect(address).toEqual({ workspace_id: 'global', conversation_id: requestedId });
+    expect(useConversationStore.getState().activeId).toBe(requestedId);
+    expect(mocks.saveConversation).toHaveBeenCalledTimes(1);
+  });
+
   it('persists the assistant message id used by TaskRuntime root_message_id', () => {
     const messages: ChatMessage[] = [
       {

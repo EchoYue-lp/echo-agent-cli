@@ -19,15 +19,18 @@ async fn execute_task(
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
+    invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
 ) -> TaskDispatchResult {
     let task_id = task.id.clone();
     let is_write = !task.kind.is_read_only();
     let load_run_id = run_id.clone();
-    let run_context = blocking
+    let (run_context, domain_binding) = blocking
         .run("load dispatch run identity", move |store| {
-            store
-                .get_run(&load_run_id)?
-                .ok_or(StoreError::RunNotFound(load_run_id))
+            store.validate_run_project_binding(&load_run_id)?;
+            let state = store
+                .get_run_state(&load_run_id)?
+                .ok_or(StoreError::RunNotFound(load_run_id))?;
+            Ok((state.run, state.domain_binding))
         })
         .await
         .map_err(|error| {
@@ -36,6 +39,53 @@ async fn execute_task(
                 format!("failed to load TaskRun identity: {error}"),
             )
         })?;
+    if task.domain_binding != run_context.domain_binding {
+        return Err(TaskDispatchFailure::failed(
+            task_id.clone(),
+            "PlanTask domain binding differs from its original TaskRun",
+        ));
+    }
+    if domain_binding.is_none() && run_context.domain_profile != DomainProfile::General {
+        return Err(TaskDispatchFailure::failed(
+            task_id.clone(),
+            "historical professional task has no trusted plugin binding",
+        ));
+    }
+    let effective_tools = if let Some(binding) = domain_binding.as_ref() {
+        let role = task.domain_role.as_ref().ok_or_else(|| {
+            TaskDispatchFailure::failed(
+                task_id.clone(),
+                "bound PlanTask lost its fixed Subagent provider",
+            )
+        })?;
+        if (task.kind == PlanTaskKind::Verification) != (task.agent_role == "primary") {
+            return Err(TaskDispatchFailure::failed(
+                task_id.clone(),
+                "domain task must reserve primary exclusively for Verification",
+            ));
+        }
+        if role.role_name != task.agent_role {
+            return Err(TaskDispatchFailure::failed(
+                task_id.clone(),
+                "PlanTask role differs from its fixed provider",
+            ));
+        }
+        let registry = primary_agent
+            .read(|agent| agent.subagent_registry().clone())
+            .await;
+        binding
+            .verify_task_role(role, &registry.list_available().await)
+            .map_err(|error| TaskDispatchFailure::failed(task_id.clone(), error))?;
+        let mut tools = binding
+            .effective_allowed_tools(&task.allowed_tools)
+            .map_err(|error| TaskDispatchFailure::failed(task_id.clone(), error))?
+            .map(|tools| tools.into_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        tools.sort();
+        tools
+    } else {
+        task.allowed_tools.clone()
+    };
     let workspace_id = run_context.workspace_id.clone();
     let conversation_id = run_context.conversation_id.clone();
     let root_message_id = run_context.root_message_id.clone();
@@ -300,10 +350,11 @@ async fn execute_task(
         &contract.isolation_requested,
         primary_agent.read(|agent| agent.working_dir()).await,
     );
-    let prompt_payload = crate::subagent_prompt::EkoPromptPayload::planned_task(
+    let prompt_payload = crate::subagent_prompt::EkoPromptPayload::planned_task_with_domain(
         &task,
         &dep_summaries,
         delegation_policy.can_delegate(),
+        domain_binding.as_ref(),
     )
     .to_value()
     .map_err(|error| {
@@ -465,7 +516,7 @@ async fn execute_task(
             &task_input,
             prompt_payload.clone(),
             prompt_context.clone(),
-            task.allowed_tools.clone(),
+            effective_tools.clone(),
             task_cancel.clone(),
             delegation_policy,
             trace_sink.clone(),
@@ -478,6 +529,7 @@ async fn execute_task(
             workspace_io.clone(),
             dispatch_uplink.clone(),
             claim.revision,
+            invocation_resources.clone(),
         )
         .await;
         match dispatch_result {
@@ -525,7 +577,7 @@ async fn execute_task(
             &task_input,
             prompt_payload.clone(),
             prompt_context.clone(),
-            task.allowed_tools.clone(),
+            effective_tools.clone(),
             task_cancel.clone(),
             delegation_policy,
             trace_sink.clone(),
@@ -538,6 +590,7 @@ async fn execute_task(
             workspace_io.clone(),
             dispatch_uplink.clone(),
             claim.revision,
+            invocation_resources.clone(),
         )
         .await;
         match dispatch_result {
@@ -588,7 +641,7 @@ async fn execute_task(
             &task,
             &contract,
         );
-        run_main_agent_task(
+        run_main_agent_task_with_resources(
             &primary_agent,
             blocking.clone(),
             &run_id,
@@ -598,6 +651,7 @@ async fn execute_task(
             task_cancel.clone(),
             trace_sink.clone(),
             workspace_io,
+            invocation_resources,
         )
         .await
     };
@@ -1143,6 +1197,7 @@ async fn run_readonly_subagent(
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
     uplink: echo_agent::tools::SubagentUplinkFn,
     plan_revision: u64,
+    invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
 ) -> Result<echo_agent::subagent::SubagentResult, ExecutionFailure> {
     primary_agent
         .read_async(|agent| {
@@ -1155,10 +1210,11 @@ async fn run_readonly_subagent(
             let message_id = message_id.map(|s| s.to_string());
             let core_trace_sink = exec_trace_sink_to_core(trace_sink);
             let attempt_identity = attempt_identity.clone();
-            let resource_guards = workspace_io
+            let mut resource_guards = workspace_io
                 .as_ref()
                 .map(crate::state::WorkspaceIoInvocation::resource_guards)
                 .unwrap_or_default();
+            resource_guards.extend(invocation_resources.clone());
             Box::pin(async move {
                 let runtime_context = Some(echo_agent::tools::ExternalRunContext {
                     conversation_id: None,
@@ -1257,6 +1313,7 @@ async fn run_writer_subagent(
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
     uplink: echo_agent::tools::SubagentUplinkFn,
     plan_revision: u64,
+    invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
 ) -> Result<echo_agent::subagent::SubagentResult, ExecutionFailure> {
     // Rebuild a multimodal Message when the run carries user attachments, so
     // the writer Subagent sees the same images/files as the primary agent would
@@ -1294,10 +1351,11 @@ async fn run_writer_subagent(
             let run_message = run_message.clone();
             let core_trace_sink = exec_trace_sink_to_core(trace_sink);
             let attempt_identity = attempt_identity.clone();
-            let resource_guards = workspace_io
+            let mut resource_guards = workspace_io
                 .as_ref()
                 .map(crate::state::WorkspaceIoInvocation::resource_guards)
                 .unwrap_or_default();
+            resource_guards.extend(invocation_resources.clone());
             Box::pin(async move {
                 let runtime_context = Some(echo_agent::tools::ExternalRunContext {
                     conversation_id: conversation_id.clone(),
@@ -1388,7 +1446,10 @@ fn tool_call_is_replay_safe(agent: &echo_agent::agent::ReactAgent, tool_name: &s
     })
 }
 
-fn tool_call_may_mutate_workspace(agent: &echo_agent::agent::ReactAgent, tool_name: &str) -> bool {
+pub(crate) fn tool_call_may_mutate_workspace(
+    agent: &echo_agent::agent::ReactAgent,
+    tool_name: &str,
+) -> bool {
     if UNATTENDED_DIRECT_MUTATION_TOOLS.contains(&tool_name) {
         return true;
     }
@@ -1445,6 +1506,7 @@ fn file_access_from_agent_tool(name: &str, args: &serde_json::Value) -> Option<(
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::result_large_err)]
+#[cfg(test)]
 async fn run_main_agent_task(
     primary_agent: &crate::agent_handle::AgentHandle,
     blocking: TaskRuntimeOperation,
@@ -1456,21 +1518,59 @@ async fn run_main_agent_task(
     trace_sink: Option<ExecSink>,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<(SubagentOutcome, String, ExecutionUsage), ExecutionFailure> {
+    run_main_agent_task_with_resources(
+        primary_agent,
+        blocking,
+        run_id,
+        task,
+        execution_id,
+        prompt,
+        cancel,
+        trace_sink,
+        workspace_io,
+        Vec::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+async fn run_main_agent_task_with_resources(
+    primary_agent: &crate::agent_handle::AgentHandle,
+    blocking: TaskRuntimeOperation,
+    run_id: &str,
+    task: &PlanTask,
+    execution_id: &str,
+    prompt: &str,
+    cancel: CancellationToken,
+    trace_sink: Option<ExecSink>,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
+    invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
+) -> Result<(SubagentOutcome, String, ExecutionUsage), ExecutionFailure> {
     let run_id = run_id.to_string();
     let execution_id = execution_id.to_string();
 
     // Preserve the user's attachments for primary verification tasks.
     let load_run_id = run_id.clone();
-    let run_record = blocking
+    let (run_record, domain_binding) = blocking
         .run("load primary task attachments", move |store| {
-            store
-                .get_run(&load_run_id)?
-                .ok_or(StoreError::RunNotFound(load_run_id))
+            let state = store
+                .get_run_state(&load_run_id)?
+                .ok_or(StoreError::RunNotFound(load_run_id))?;
+            Ok((state.run, state.domain_binding))
         })
         .await
         .map_err(|error| {
             ExecutionFailure::failed(format!("failed to load TaskRun identity: {error}"))
         })?;
+    let allowed_tools = match domain_binding.as_ref() {
+        Some(binding) => binding
+            .effective_allowed_tools(&task.allowed_tools)
+            .map_err(ExecutionFailure::failed)?,
+        None => {
+            (!task.allowed_tools.is_empty()).then(|| task.allowed_tools.iter().cloned().collect())
+        }
+    };
     let root_message_id = Some(run_record.root_message_id.clone());
     let policy_run_id = run_id.clone();
     let binding = blocking
@@ -1490,6 +1590,31 @@ async fn run_main_agent_task(
         crate::attachments::build_message_from_refs(prompt, &run_record.attachments).ok()
     };
 
+    let environment = resolve_task_project_environment(&blocking.store, task)
+        .await
+        .map_err(ExecutionFailure::failed)?;
+    let working_dir = primary_agent.read(|agent| agent.working_dir()).await;
+    let mut project_guards = workspace_io
+        .as_ref()
+        .map(crate::state::WorkspaceIoInvocation::resource_guards)
+        .unwrap_or_default();
+    project_guards.extend(invocation_resources.clone());
+    let prepared_project = prepare_project_agent(
+        primary_agent,
+        environment,
+        working_dir.clone(),
+        project_guards.clone(),
+    )
+    .await
+    .map_err(ExecutionFailure::failed)?;
+    // Each primary verification is already a distinct physical execution.
+    // Its root message is still the user's original trigger; using that root
+    // as this turn's key would collide with parallel target verifications.
+    let _project_projection = prepared_project.map(|prepared| {
+        crate::turn_context::turn_prompt_context_registry()
+            .register_project_context(execution_id.clone(), prepared)
+    });
+
     primary_agent
         .read_async(|agent| {
             let prompt = prompt.to_string();
@@ -1498,13 +1623,13 @@ async fn run_main_agent_task(
             let blocking = blocking.clone();
             let run_record = run_record.clone();
             let task = task.clone();
-            let working_dir = workspace_io
-                .as_ref()
-                .map(|scope| scope.data_root().to_path_buf());
-            let resource_guards = workspace_io
+            let allowed_tools = allowed_tools.clone();
+            let working_dir = working_dir.clone();
+            let mut resource_guards = workspace_io
                 .as_ref()
                 .map(crate::state::WorkspaceIoInvocation::resource_guards)
                 .unwrap_or_default();
+            resource_guards.extend(invocation_resources.clone());
             Box::pin(async move {
                 let visible_tools =
                     crate::tool_exposure::initial_visible_tools_for_task_run(&agent.tool_names());
@@ -1520,8 +1645,7 @@ async fn run_main_agent_task(
                     })
                     .cloned();
                 let invocation = echo_agent::agent::AgentInvocationContext {
-                    allowed_tools: (!task.allowed_tools.is_empty())
-                        .then(|| task.allowed_tools.iter().cloned().collect()),
+                    allowed_tools,
                     history: None,
                     runtime_state_id,
                     transcript_generation_id,
@@ -1529,7 +1653,7 @@ async fn run_main_agent_task(
                     runtime: Some(echo_agent::tools::ExternalRunContext {
                         conversation_id: Some(run_record.conversation_id.clone()),
                         run_id: Some(run_id.clone()),
-                        turn_id: root_message_id.clone(),
+                        turn_id: Some(execution_id.clone()),
                         execution_id: Some(execution_id.clone()),
                         isolation_id: None,
                         message_id: root_message_id,

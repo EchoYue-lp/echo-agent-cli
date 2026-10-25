@@ -1,5 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import { terminalApi, type TerminalSession, type TerminalTarget } from '../../api/endpoints';
+import {
+  terminalApi,
+  type TerminalCreateOptions,
+  type TerminalSession,
+  type TerminalTarget,
+  type ProductDataScope,
+} from '../../api/endpoints';
 import { errorMessage, isTauri } from '../../lib/tauri-bridge';
 import { useToastStore } from '../../stores/toastStore';
 import {
@@ -24,6 +30,11 @@ interface TerminalProps {
   closeRequest?: number;
   onStateChange?: (id: string, state: TerminalViewState) => void;
   onClosed?: (id: string) => void;
+  /** Original owner starts the process; this component only renders its PTY. */
+  createSession?: (options: TerminalCreateOptions) => Promise<TerminalSession>;
+  /** Project authentication has a separate owned close/handoff lifecycle. */
+  retainOnUnmount?: boolean;
+  projectScope?: ProductDataScope;
 }
 const LOCAL_TARGET: TerminalTarget = { kind: 'local' };
 interface ExitPayload {
@@ -41,6 +52,9 @@ export function Terminal({
   closeRequest = 0,
   onStateChange,
   onClosed,
+  createSession,
+  retainOnUnmount = false,
+  projectScope,
 }: TerminalProps) {
   const container = useRef<HTMLDivElement>(null);
   const visibleRef = useRef(visible);
@@ -50,6 +64,8 @@ export function Terminal({
   const [state, setState] = useState<TerminalViewState>({ phase: 'preparing' });
   const [issue, setIssue] = useState('');
   const desktop = isTauri();
+  const retainRef = useRef(retainOnUnmount);
+  retainRef.current = retainOnUnmount;
 
   useEffect(() => {
     const element = container.current;
@@ -281,9 +297,11 @@ export function Terminal({
         message: '正在启动本地进程；SSH 认证由终端中的系统 OpenSSH 处理。',
       });
       const size = fitAddon.proposeDimensions() ?? { rows: 24, cols: 80 };
-      creation = terminalApi.create({
+      creation = (createSession ?? terminalApi.create)({
         id: sessionId,
-        target,
+        target: projectScope ? undefined : target,
+        projectWorkspaceId: projectScope?.workspaceId,
+        projectWorkspaceGeneration: projectScope?.workspaceGeneration,
         rows: Math.max(1, size.rows),
         cols: Math.max(1, size.cols),
       });
@@ -299,7 +317,7 @@ export function Terminal({
               : '本地终端进程已启动。',
         });
       if (disposed || closeWanted) {
-        void close();
+        if (closeWanted || !retainRef.current) void close();
         return;
       }
       if (!desktop) {
@@ -327,9 +345,9 @@ export function Terminal({
       cleanup();
       if (requestClose.current === close) requestClose.current = undefined;
       // Keep observation of a dispatched create even after React teardown.
-      if (creation && !exit) void close();
+      if (creation && !exit && !retainRef.current) void close();
     };
-  }, [sessionId, target, desktop, onStateChange, onClosed]);
+  }, [sessionId, target, desktop, onStateChange, onClosed, createSession, projectScope]);
 
   useEffect(() => {
     if (visible) fitVisible.current?.();

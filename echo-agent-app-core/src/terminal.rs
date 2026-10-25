@@ -2,6 +2,7 @@
 //! another protocol client, execution owner, or source of authentication claims.
 
 use dashmap::DashMap;
+use echo_agent::tools::InvocationResourceGuard;
 use portable_pty::{CommandBuilder, ExitStatus, PtyPair, PtySize};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -13,6 +14,9 @@ use std::sync::{Arc, Mutex as BlockingMutex, Weak};
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
+
+mod project_ssh;
+pub use project_ssh::{ProjectSshConnection, ProjectSshFileSystem, ProjectSshSandbox};
 
 pub const MAX_TERMINAL_WRITE_BYTES: usize = 64 * 1024;
 const DEFAULT_EVENT_CAPACITY: usize = 256;
@@ -121,6 +125,11 @@ struct TerminalResources {
     reader_result: Option<Result<(), String>>,
     waited: Option<ExitStatus>,
     creation_error: Option<String>,
+    // A project authentication master and each mux terminal retain the same
+    // application-owned connection until original child wait AND reader join.
+    project_connection: Option<Arc<ProjectSshConnection>>,
+    project_operation: Option<project_ssh::ProjectSshOperation>,
+    resource_guards: Vec<InvocationResourceGuard>,
 }
 
 #[cfg(test)]
@@ -183,6 +192,7 @@ fn command_for_target(
 }
 
 impl TerminalSession {
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         service: &Arc<TerminalService>,
         id: String,
@@ -191,10 +201,15 @@ impl TerminalSession {
         target: TerminalTarget,
         shell: Option<String>,
         settlement: TerminalSettlementSlot,
+        project_launch: Option<project_ssh::ProjectTerminalLaunch>,
+        resource_guards: Vec<InvocationResourceGuard>,
     ) -> Result<(Arc<Self>, Box<dyn Read + Send>), String> {
         validate_dimensions(size.rows, size.cols)?;
         let target = target.normalized()?;
-        let command = command_for_target(&target, cwd, shell);
+        let (command, project_connection, project_operation) = match project_launch {
+            Some(launch) => (launch.command, Some(launch.connection), launch.operation),
+            None => (command_for_target(&target, cwd, shell), None, None),
+        };
         let pair: PtyPair = portable_pty::native_pty_system()
             .openpty(size)
             .map_err(|error| format!("failed to open PTY: {error}"))?;
@@ -224,6 +239,9 @@ impl TerminalSession {
                     reader_result: None,
                     waited: None,
                     creation_error: None,
+                    project_connection,
+                    project_operation,
+                    resource_guards,
                 }),
                 settlement,
                 completed: BlockingMutex::new(None),
@@ -392,6 +410,8 @@ pub struct TerminalService {
     sessions: DashMap<String, Arc<TerminalSession>>,
     events: broadcast::Sender<TerminalEvent>,
     creation_lock: Mutex<()>,
+    project_connections: DashMap<String, Arc<ProjectSshConnection>>,
+    project_creation_lock: Mutex<()>,
     shutting_down: AtomicBool,
     observation_timeout: Duration,
     #[cfg(test)]
@@ -408,6 +428,8 @@ impl TerminalService {
             sessions: DashMap::new(),
             events,
             creation_lock: Mutex::new(()),
+            project_connections: DashMap::new(),
+            project_creation_lock: Mutex::new(()),
             shutting_down: AtomicBool::new(false),
             observation_timeout: CLOSE_OBSERVATION_TIMEOUT,
             #[cfg(test)]
@@ -419,6 +441,9 @@ impl TerminalService {
     }
     pub fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
+        for connection in &self.project_connections {
+            connection.begin_shutdown();
+        }
     }
     pub async fn create(
         self: &Arc<Self>,
@@ -438,7 +463,20 @@ impl TerminalService {
         cols: u16,
         target: TerminalTarget,
     ) -> Result<TerminalSessionInfo, String> {
-        self.create_inner(id, cwd, rows, cols, target, None).await
+        self.create_with_target_and_resources(id, cwd, rows, cols, target, Vec::new())
+            .await
+    }
+    pub async fn create_with_target_and_resources(
+        self: &Arc<Self>,
+        id: String,
+        cwd: Option<PathBuf>,
+        rows: u16,
+        cols: u16,
+        target: TerminalTarget,
+        resource_guards: Vec<InvocationResourceGuard>,
+    ) -> Result<TerminalSessionInfo, String> {
+        self.create_inner_with_project(id, cwd, rows, cols, target, None, None, resource_guards)
+            .await
     }
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn create_with_shell_for_test(
@@ -449,10 +487,42 @@ impl TerminalService {
         cols: u16,
         shell: String,
     ) -> Result<TerminalSessionInfo, String> {
-        self.create_inner(id, cwd, rows, cols, TerminalTarget::Local, Some(shell))
-            .await
+        self.create_inner_with_project(
+            id,
+            cwd,
+            rows,
+            cols,
+            TerminalTarget::Local,
+            Some(shell),
+            None,
+            Vec::new(),
+        )
+        .await
     }
-    async fn create_inner(
+
+    #[cfg(test)]
+    pub(crate) async fn create_with_shell_and_resources_for_test(
+        self: &Arc<Self>,
+        id: String,
+        cwd: Option<PathBuf>,
+        shell: String,
+        resource_guards: Vec<InvocationResourceGuard>,
+    ) -> Result<TerminalSessionInfo, String> {
+        self.create_inner_with_project(
+            id,
+            cwd,
+            24,
+            80,
+            TerminalTarget::Local,
+            Some(shell),
+            None,
+            resource_guards,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_inner_with_project(
         self: &Arc<Self>,
         id: String,
         cwd: Option<PathBuf>,
@@ -460,6 +530,8 @@ impl TerminalService {
         cols: u16,
         target: TerminalTarget,
         shell: Option<String>,
+        project_launch: Option<project_ssh::ProjectTerminalLaunch>,
+        resource_guards: Vec<InvocationResourceGuard>,
     ) -> Result<TerminalSessionInfo, String> {
         let id = id.trim().to_string();
         if id.is_empty() {
@@ -473,6 +545,17 @@ impl TerminalService {
         }
         if self.sessions.contains_key(&id) {
             return Err(format!("terminal '{id}' already exists"));
+        }
+        if project_launch.is_none()
+            && self
+                .project_connections
+                .iter()
+                .any(|connection| connection.master_terminal_id() == id)
+        {
+            return Err(
+                "terminal id is reserved by an original project authentication preparation"
+                    .to_string(),
+            );
         }
         // Tokio can yield even for an uncontended lock under cooperative budget.
         // Acquire the original slot BEFORE spawn; no await may separate obtaining
@@ -494,6 +577,8 @@ impl TerminalService {
             target,
             shell,
             settlement,
+            project_launch,
+            resource_guards,
         )?;
         self.sessions.insert(id.clone(), Arc::clone(&session));
         let setup_error = match spawn_reader(Arc::clone(&session), reader) {
@@ -527,10 +612,16 @@ impl TerminalService {
         Ok(session.info.clone())
     }
     pub fn list(&self) -> Vec<TerminalSessionInfo> {
+        let authentication_ids = self
+            .project_connections
+            .iter()
+            .map(|connection| connection.master_terminal_id().to_string())
+            .collect::<std::collections::HashSet<_>>();
         let mut sessions = self
             .sessions
             .iter()
             .map(|entry| entry.value().info.clone())
+            .filter(|info| !authentication_ids.contains(&info.id))
             .collect::<Vec<_>>();
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
         sessions
@@ -555,18 +646,46 @@ impl TerminalService {
         self.session(id)?.resize(rows, cols).await
     }
     pub async fn close(&self, id: &str) -> Result<bool, String> {
+        if self
+            .project_connections
+            .iter()
+            .any(|connection| connection.master_terminal_id() == id)
+        {
+            return Err("project authentication master belongs to its project; close the draft/project connection through its original owner".to_string());
+        }
+        self.close_session(id).await
+    }
+    async fn close_session(&self, id: &str) -> Result<bool, String> {
         let Some(session) = self.sessions.get(id).map(|entry| Arc::clone(entry.value())) else {
             return Ok(false);
         };
         session.close().await?;
         Ok(true)
     }
-    pub async fn close_all(&self) -> Result<(), String> {
-        self.begin_shutdown();
+    /// Close human-operated local/mux sessions while retaining project masters
+    /// used by outstanding Agent/file work. The original lifecycle can call
+    /// this before waiting for host I/O, then call close_all after that work.
+    pub async fn close_interactive_sessions(&self) -> Result<(), String> {
+        // Local data protection: sealing creation first prevents a delayed
+        // snapshot close from killing a replacement with a reused caller id.
+        if !self.shutting_down.load(Ordering::Acquire) {
+            return Err(
+                "terminal shutdown admission must be closed before observing interactive sessions"
+                    .to_string(),
+            );
+        }
+        // First stop and observe ordinary terminals; they own mux-operation
+        // guards. A master must outlive its actual file/command/slave users.
         let ids = {
             let _creation = self.creation_lock.lock().await;
+            let authentication_ids = self
+                .project_connections
+                .iter()
+                .map(|connection| connection.master_terminal_id().to_string())
+                .collect::<std::collections::HashSet<_>>();
             self.sessions
                 .iter()
+                .filter(|entry| !authentication_ids.contains(entry.key()))
                 .map(|entry| entry.key().clone())
                 .collect::<Vec<_>>()
         };
@@ -574,6 +693,31 @@ impl TerminalService {
         for id in ids {
             if let Err(error) = self.close(&id).await {
                 errors.push(format!("{id}: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "interactive terminal sessions remain owned and unsettled: {}",
+                errors.join("; ")
+            ))
+        }
+    }
+    pub async fn close_all(&self) -> Result<(), String> {
+        self.begin_shutdown();
+        let mut errors = Vec::new();
+        if let Err(error) = self.close_interactive_sessions().await {
+            errors.push(error);
+        }
+        let owners = self
+            .project_connections
+            .iter()
+            .map(|connection| connection.key().clone())
+            .collect::<Vec<_>>();
+        for owner in owners {
+            if let Err(error) = self.close_project_ssh(&owner).await {
+                errors.push(format!("project {owner}: {error}"));
             }
         }
         if errors.is_empty() {
@@ -620,6 +764,14 @@ impl TerminalService {
             .lock()
             .map_err(|_| "terminal completion lock poisoned".to_string())?;
         *completed = Some(status.clone());
+        let mut resources = session
+            .resources
+            .lock()
+            .map_err(|_| "terminal resource lock poisoned".to_string())?;
+        resources.project_operation.take();
+        resources.project_connection.take();
+        resources.resource_guards.clear();
+        drop(resources);
         if self
             .sessions
             .remove_if(&session.info.id, |_, current| Arc::ptr_eq(current, session))
@@ -951,6 +1103,48 @@ mod tests {
             self.0.test.hold_reader.store(false, Ordering::Release);
             self.0.close_requested.store(true, Ordering::Release);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invocation_guard_survives_cancelled_observer_until_original_reader_join()
+    -> Result<(), String> {
+        struct DropCounter(Arc<AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let service = TerminalService::new();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        service
+            .create_inner_with_project(
+                "resource-retention".into(),
+                None,
+                24,
+                80,
+                TerminalTarget::Local,
+                Some("/bin/sh".into()),
+                None,
+                vec![InvocationResourceGuard::new(DropCounter(Arc::clone(
+                    &dropped,
+                )))],
+            )
+            .await?;
+        let session = service.session("resource-retention")?;
+        let _release = ReleaseReader(Arc::clone(&session));
+        session.test.hold_reader.store(true, Ordering::Release);
+        let closing = Arc::clone(&service);
+        let observer = tokio::spawn(async move { closing.close("resource-retention").await });
+        wait_for_reader(&session).await?;
+        observer.abort();
+        let _observation = observer.await;
+        assert_eq!(dropped.load(Ordering::Acquire), 0);
+        assert!(service.contains("resource-retention"));
+        session.test.hold_reader.store(false, Ordering::Release);
+        service.close("resource-retention").await?;
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+        Ok(())
     }
 
     #[cfg(unix)]

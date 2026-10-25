@@ -205,6 +205,9 @@ mod tests {
 
     fn writer(id: &str, files: &[&str]) -> PlanTask {
         PlanTask {
+            domain_binding: None,
+            domain_role: None,
+
             id: id.into(),
             title: id.into(),
             description: String::new(),

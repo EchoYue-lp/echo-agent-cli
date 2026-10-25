@@ -222,6 +222,45 @@ impl WorkspaceKind {
     }
 }
 
+/// Authoritative project location. EKO state remains at `Workspace::root`.
+///
+/// Remote paths deliberately stay strings: local path resolution must never
+/// reinterpret a remote directory or resolve a same-named local checkout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectLocation {
+    Local {
+        path: PathBuf,
+    },
+    Ssh {
+        host: String,
+        user: Option<String>,
+        port: Option<u16>,
+        path: String,
+    },
+}
+
+/// Creation intent, consumed once by the existing workspace lifecycle owner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectSource {
+    ExistingLocal {
+        path: PathBuf,
+    },
+    NewLocal {
+        parent: PathBuf,
+        directory_name: String,
+    },
+    Ssh {
+        host: String,
+        user: Option<String>,
+        port: Option<u16>,
+        path: String,
+        /// Ephemeral TerminalService owner; never persisted in the manifest.
+        connection_id: String,
+    },
+}
+
 // ── WorkspaceMetadata ───────────────────────────────────────────────
 
 /// 工作区元数据。
@@ -240,6 +279,15 @@ pub struct WorkspaceMetadata {
     /// second generation store.
     #[serde(default)]
     pub project_root_revision: u64,
+    /// The manifest owns location and revision together; legacy manifests
+    /// continue to resolve `project_root`, then `root`, without rewriting data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_location: Option<ProjectLocation>,
+    /// Verified execution identity for indirect locations (SSH config aliases
+    /// and remote paths). It is published atomically with the user location
+    /// and the existing revision, never reconstructed from a socket name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_execution_location: Option<ProjectLocation>,
 }
 
 // ── Workspace ───────────────────────────────────────────────────────
@@ -279,6 +327,34 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    pub fn project_location(&self) -> ProjectLocation {
+        self.metadata
+            .project_location
+            .clone()
+            .unwrap_or_else(|| ProjectLocation::Local {
+                path: self
+                    .project_root
+                    .clone()
+                    .unwrap_or_else(|| self.root.clone()),
+            })
+    }
+
+    /// A local project path is only available for a local location. Remote
+    /// consumers must select the host's transport, never fall back to root.
+    pub fn local_project_root(&self) -> Option<PathBuf> {
+        match self.project_location() {
+            ProjectLocation::Local { path } => Some(path),
+            ProjectLocation::Ssh { .. } => None,
+        }
+    }
+
+    pub fn execution_location(&self) -> ProjectLocation {
+        self.metadata
+            .project_execution_location
+            .clone()
+            .unwrap_or_else(|| self.project_location())
+    }
+
     /// 更新最后活跃时间为当前时间。
     pub fn touch(&mut self) {
         self.last_active = Utc::now();
@@ -458,6 +534,54 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(utc.product_data_generation.as_str())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_manifest_keeps_local_project_and_product_paths_distinct() -> anyhow::Result<()> {
+        let workspace: Workspace = serde_json::from_value(serde_json::json!({
+            "id": "legacy", "name": "Legacy", "root": "/local/product-data", "project_root": "/local/code",
+            "kind": {"type": "general"}, "metadata": {"tags": []},
+            "created_at": "2026-08-24T00:00:00Z", "last_active": "2026-08-24T00:00:00Z"
+        }))?;
+        assert_eq!(workspace.root, PathBuf::from("/local/product-data"));
+        assert_eq!(
+            workspace.project_location(),
+            ProjectLocation::Local {
+                path: PathBuf::from("/local/code")
+            }
+        );
+        assert_eq!(workspace.metadata.project_root_revision, 0);
+        assert!(workspace.metadata.project_execution_location.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_manifest_round_trip_preserves_raw_configuration_and_verified_identity()
+    -> anyhow::Result<()> {
+        let raw = ProjectLocation::Ssh {
+            host: "my-alias".to_string(),
+            user: None,
+            port: None,
+            path: "~/代码/../project".to_string(),
+        };
+        let actual = ProjectLocation::Ssh {
+            host: "resolved.example".to_string(),
+            user: Some("echo".to_string()),
+            port: Some(2222),
+            path: "/srv/project".to_string(),
+        };
+        let mut workspace: Workspace = serde_json::from_value(serde_json::json!({
+            "id": "remote", "name": "Remote", "root": "/local/data", "kind": {"type": "code"},
+            "created_at": "2026-08-24T00:00:00Z", "last_active": "2026-08-24T00:00:00Z"
+        }))?;
+        workspace.metadata.project_location = Some(raw.clone());
+        workspace.metadata.project_execution_location = Some(actual.clone());
+        let parsed: Workspace = serde_json::from_slice(&serde_json::to_vec(&workspace)?)?;
+        assert_eq!(parsed.project_location(), raw);
+        assert_eq!(parsed.execution_location(), actual);
+        assert!(parsed.local_project_root().is_none());
+        assert_eq!(parsed.root, PathBuf::from("/local/data"));
         Ok(())
     }
 }

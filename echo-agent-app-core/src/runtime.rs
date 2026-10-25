@@ -933,6 +933,17 @@ impl ApplicationLifecycleOwner {
                 receipt.record_retained("analysis original cleanup debt", error);
             }
         }
+        // Human PTYs may retain a Workspace I/O receipt. Close and observe
+        // only those sessions before joining host/data owners; the shared SSH
+        // authentication masters remain dependencies of Agent/file execution
+        // and are closed by the original close_all stage after it settles.
+        let mut interactive_terminal_uncertain = false;
+        if let Some(state) = self.app_state.as_ref()
+            && let Err(error) = state.terminal.close_interactive_sessions().await
+        {
+            interactive_terminal_uncertain = true;
+            receipt.record_retained("interactive terminal original child/reader", error);
+        }
         // Product-data admission was sealed in phase one. Extension mutations
         // hold an owned flow while their durable commit and specialist fanout
         // settle, so this join must complete while the pool and specialist
@@ -950,7 +961,8 @@ impl ApplicationLifecycleOwner {
         {
             receipt.record_retained("config watcher", error);
         }
-        let mut uncertain = scheduler_uncertain
+        let mut uncertain = interactive_terminal_uncertain
+            || scheduler_uncertain
             || channels_uncertain
             || self.external_owners.iter().any(|owner| owner.join_panicked);
         if let Some(state) = self.app_state.as_ref() {
@@ -1723,7 +1735,17 @@ impl AgentRuntime {
         // bug where eko.yaml inline hooks disappeared whenever any
         // hooks.yaml file existed.
         let hook_project_root = agent_handle.read(|agent| agent.working_dir()).await;
-        infra::load_user_hooks(&agent_handle, app_config, hook_project_root.as_deref()).await;
+        if let Err(error) =
+            infra::load_user_hooks(&agent_handle, app_config, hook_project_root.as_deref()).await
+        {
+            let receipt = bootstrap_lifecycle
+                .settle(
+                    ApplicationLifecycleReason::BootstrapRollback,
+                    Some(anyhow::Error::msg(error)),
+                )
+                .await;
+            return Err(anyhow::Error::new(receipt.into_error()));
+        }
 
         // ── 8b. Review integration — create when Store is available so
         //       /memory-review and session-end hooks can access it. ──
@@ -3985,6 +4007,104 @@ mod tests {
         if store.active_operation_count() != 0 {
             return Err("TaskRuntime operation supervisor remained active".to_string());
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn application_shutdown_closes_project_pty_before_host_io_teardown() -> anyhow::Result<()>
+    {
+        const NAME: &str =
+            "runtime::tests::application_shutdown_closes_project_pty_before_host_io_teardown";
+        if run_isolated_bootstrap_test(NAME)? {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let code = temp.path().join("project-code");
+        std::fs::create_dir(&code)?;
+        std::fs::write(code.join("keep.txt"), "user code")?;
+        let primary = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("mock-model")
+                .llm_client(Arc::new(echo_agent::testing::MockLlmClient::new()))
+                .build()?,
+        );
+        let io = crate::product_data_io::ProductDataIoService::new();
+        let state = Arc::new(AppState::from_shared(
+            primary.clone(),
+            None,
+            Arc::new(HitlDispatcher::new()),
+            None,
+            None,
+            EkoConfig::default(),
+            Arc::new(crate::mcp_config_runtime::McpConfigRuntime::from_snapshot(
+                temp.path().join("mcp.json"),
+                Default::default(),
+            )),
+            io.clone(),
+        )?);
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.bind_app_state(state.clone());
+        owner.bind_primary_agent(primary);
+        owner.bind_product_data_io(io);
+        let (workspace, _) = state
+            .create_project_workspace_owned(
+                "pty-project",
+                crate::workspace::WorkspaceKind::General,
+                crate::workspace::ProjectSource::ExistingLocal { path: code.clone() },
+            )
+            .await?;
+        let project = state
+            .project_resources_for_workspace(
+                workspace.id.as_str(),
+                &workspace.opaque_product_data_generation(),
+            )
+            .await?;
+        state
+            .terminal
+            .create_with_shell_and_resources_for_test(
+                "owned-project-pty".to_string(),
+                Some(project.working_dir().to_path_buf()),
+                "/bin/sh".to_string(),
+                project.resource_guards(),
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+        drop(project);
+        let busy_before = state
+            .ensure_workspace_idle_for_delete(&workspace.id)
+            .await
+            .is_err();
+        let controls_before = state
+            .workspace
+            .runtimes
+            .activity_snapshot()
+            .await?
+            .into_iter()
+            .find(|activity| activity.workspace_id == workspace.id)
+            .map(|activity| activity.active_controls)
+            .unwrap_or(0);
+        let initial = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            owner.start_join(initial).wait(),
+        )
+        .await?;
+        assert!(receipt.is_clean(), "project PTY did not settle: {receipt}");
+        assert!(busy_before);
+        assert_eq!(controls_before, 1);
+        assert!(state.terminal.list().is_empty());
+        let controls_after = state
+            .workspace
+            .runtimes
+            .activity_snapshot()
+            .await?
+            .into_iter()
+            .find(|activity| activity.workspace_id == workspace.id)
+            .map(|activity| activity.active_controls)
+            .unwrap_or(0);
+        assert_eq!(controls_after, 0);
+        assert_eq!(std::fs::read_to_string(code.join("keep.txt"))?, "user code");
         Ok(())
     }
 

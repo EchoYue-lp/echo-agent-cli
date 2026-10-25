@@ -139,6 +139,7 @@ impl AppState {
             ),
         };
         let conversation_binding = Arc::new(RwLock::new(global_conversation.clone()));
+        let terminal = crate::terminal::TerminalService::new();
 
         Ok(Self {
             connection: ConnectionState {
@@ -241,7 +242,8 @@ impl AppState {
                     crate::workspace::runtime::WorkspaceRuntimeRegistry::new_with_product_data_io(
                         product_data_io,
                     )
-                    .with_subagent_depth_defaults(subagent_depth_defaults),
+                    .with_subagent_depth_defaults(subagent_depth_defaults)
+                    .with_terminal_service(terminal.clone()),
                 ),
                 global_conversation,
                 transition: Arc::new(RwLock::new(())),
@@ -276,7 +278,7 @@ impl AppState {
             plugin_runtime: None,
             config_watcher: None,
             command_cell_runtime: None,
-            terminal: crate::terminal::TerminalService::new(),
+            terminal,
             browser_runtime: None,
             agent_router: crate::agent_router::AgentRouter::at_default_root(),
             agent_control_wake: Arc::new(std::sync::OnceLock::new()),
@@ -2447,6 +2449,30 @@ impl AppState {
                 name: name.to_string(),
                 kind,
                 root,
+                source: None,
+            })
+            .await?
+        {
+            WorkspaceSettlementOutcome::Created(workspace, created) => Ok((workspace, created)),
+            _ => anyhow::bail!("workspace create settlement returned an unexpected outcome"),
+        }
+    }
+
+    /// Three project sources share the original owned creation settlement.
+    /// A caller disappearing during filesystem/SSH preparation cannot abandon
+    /// an admitted publication or expose a half-created workspace.
+    pub async fn create_project_workspace_owned(
+        self: &Arc<Self>,
+        name: &str,
+        kind: crate::workspace::WorkspaceKind,
+        source: crate::workspace::ProjectSource,
+    ) -> anyhow::Result<(Workspace, bool)> {
+        match self
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::Create {
+                name: name.to_string(),
+                kind,
+                root: None,
+                source: Some(source),
             })
             .await?
         {
@@ -2460,13 +2486,80 @@ impl AppState {
         name: String,
         kind: crate::workspace::WorkspaceKind,
         root: Option<std::path::PathBuf>,
+        source: Option<crate::workspace::ProjectSource>,
     ) -> anyhow::Result<(Workspace, bool)> {
         let _lifecycle = self.workspace.transition.write().await;
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            anyhow::bail!("请输入项目名称");
+        }
+        let verified_remote = if let Some(crate::workspace::ProjectSource::Ssh {
+            host,
+            user,
+            port,
+            path,
+            connection_id,
+        }) = source.as_ref()
+        {
+            let connection = self
+                .terminal
+                .project_ssh(connection_id)
+                .map_err(anyhow::Error::msg)?;
+            let target = crate::terminal::TerminalTarget::Ssh {
+                host: host.clone(),
+                user: user.clone(),
+                port: *port,
+            };
+            let verified_path = connection
+                .verify_target_directory(target, path.clone())
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let crate::terminal::TerminalTarget::Ssh {
+                host: effective_host,
+                user: effective_user,
+                port: effective_port,
+            } = connection.effective_target().map_err(anyhow::Error::msg)?
+            else {
+                anyhow::bail!("SSH effective target is unavailable");
+            };
+            Some((
+                crate::workspace::ProjectLocation::Ssh {
+                    host: host.clone(),
+                    user: user.clone(),
+                    port: *port,
+                    path: path.clone(),
+                },
+                crate::workspace::ProjectLocation::Ssh {
+                    host: effective_host.clone(),
+                    user: effective_user.clone(),
+                    port: *effective_port,
+                    path: verified_path,
+                },
+            ))
+        } else {
+            None
+        };
+        let remote_owner =
+            if let Some(crate::workspace::ProjectSource::Ssh { connection_id, .. }) =
+                source.as_ref()
+            {
+                let workspace_id = crate::workspace::WorkspaceId::from_name(&name).to_string();
+                self.terminal
+                    .reassign_project_ssh(connection_id, &workspace_id)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                Some(workspace_id)
+            } else {
+                None
+            };
         let registry = Arc::clone(&self.workspace.registry);
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let workspace_id = crate::workspace::WorkspaceId::from_name(&name);
             let requested_root = root.clone().unwrap_or_else(|| registry.default_root(&name));
             if let Ok(existing) = registry.open(&workspace_id) {
+                if source.is_some() {
+                    anyhow::bail!("项目名称已存在，请从列表打开或使用其它名称");
+                }
                 let same_root = match (existing.root.canonicalize(), requested_root.canonicalize())
                 {
                     (Ok(existing), Ok(requested)) => existing == requested,
@@ -2481,16 +2574,33 @@ impl AppState {
                     existing.root.display()
                 );
             }
-            let workspace = match root {
-                Some(root) => registry
-                    .create_at(&name, kind, root)
-                    .map_err(anyhow::Error::msg),
-                None => registry.create(&name, kind).map_err(anyhow::Error::msg),
-            }?;
+            let workspace = if let Some((location, execution_location)) = verified_remote {
+                registry.create_project(&name, kind, location, Some(execution_location))?
+            } else if let Some(source) = source {
+                registry.create_local_project(&name, kind, source)?
+            } else {
+                match root {
+                    Some(root) => registry
+                        .create_at(&name, kind, root)
+                        .map_err(anyhow::Error::msg),
+                    None => registry.create(&name, kind).map_err(anyhow::Error::msg),
+                }?
+            };
             Ok((workspace, true))
         })
         .await
-        .map_err(|error| anyhow::anyhow!("workspace create task failed: {error}"))?
+        .map_err(|error| anyhow::anyhow!("workspace create task failed: {error}"))?;
+        if result.is_err()
+            && let Some(owner) = remote_owner
+        {
+            // Publication failed after connection handoff. The same detached
+            // transition observes physical connection cleanup; GUI teardown
+            // cannot assume its draft key still owns this connection.
+            if let Err(error) = self.terminal.close_project_ssh(&owner).await {
+                tracing::warn!(%error, "failed project creation retained SSH cleanup obligation");
+            }
+        }
+        result
     }
 
     pub async fn link_workspace_project_owned(
@@ -2663,6 +2773,41 @@ impl AppState {
         }
     }
 
+    /// Resolve a captured GUI project scope without creating an AgentPool or
+    /// requiring a configured model. Both IDs are checked before host admission.
+    pub async fn project_resources_for_workspace(
+        &self,
+        workspace_id: &str,
+        workspace_generation: &str,
+    ) -> anyhow::Result<ScopedProjectResources> {
+        let _lifecycle = self.workspace.transition.read().await;
+        let registry = self.workspace.registry.clone();
+        let id = crate::workspace::WorkspaceId::from_raw(workspace_id.to_string());
+        let workspace = self
+            .session
+            .product_data_io
+            .run("resolve GUI project resources", move || {
+                registry.inspect(&id)
+            })
+            .await
+            .map_err(anyhow::Error::msg)??;
+        validate_workspace_product_data_generation(Some(&workspace), workspace_generation)
+            .map_err(anyhow::Error::msg)?;
+        let (host, lease) = self
+            .workspace
+            .runtimes
+            .get_or_open_control(workspace)
+            .await?;
+        Ok(ScopedProjectResources {
+            host: host.clone(),
+            workspace: host.workspace().await,
+            working_dir: host.execution_scope().root().to_path_buf(),
+            files: host.project_file_system(),
+            executor: host.project_executor(),
+            lifetime: lease.io_lifetime(),
+        })
+    }
+
     /// Snapshot the immutable execution identity/root for a new turn.
     /// Existing turns retain their own snapshot across later focus changes.
     pub async fn current_execution_scope(&self) -> crate::workspace::WorkspaceExecutionScope {
@@ -2784,6 +2929,10 @@ impl AppState {
             .runtimes
             .shutdown_and_evict_if_idle(workspace_id)
             .await?;
+        self.terminal
+            .close_project_ssh(workspace_id.as_str())
+            .await
+            .map_err(anyhow::Error::msg)?;
         if let Some(hook) = self.workspace_delete_hook.as_ref() {
             hook.remove_workspace(workspace_id.as_str()).await?;
         }
@@ -5225,7 +5374,7 @@ impl AppState {
         workspace: Workspace,
     ) -> anyhow::Result<WorkspaceTransitionReceipt> {
         match self
-            .run_owned_workspace_transition(WorkspaceTransitionRequest::Switch(workspace))
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::Switch(Box::new(workspace)))
             .await?
         {
             WorkspaceSettlementOutcome::Transition(receipt) => Ok(receipt),
@@ -5237,15 +5386,99 @@ impl AppState {
         self: &Arc<Self>,
         workspace_id: crate::workspace::WorkspaceId,
     ) -> anyhow::Result<WorkspaceTransitionReceipt> {
+        self.switch_workspace_registered_with_connection(workspace_id, None)
+            .await
+    }
+
+    pub async fn switch_workspace_registered_with_connection(
+        self: &Arc<Self>,
+        workspace_id: crate::workspace::WorkspaceId,
+        connection_id: Option<String>,
+    ) -> anyhow::Result<WorkspaceTransitionReceipt> {
         match self
-            .run_owned_workspace_transition(WorkspaceTransitionRequest::SwitchRegistered(
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::SwitchRegistered {
                 workspace_id,
-            ))
+                connection_id,
+            })
             .await?
         {
             WorkspaceSettlementOutcome::Transition(receipt) => Ok(receipt),
             _ => anyhow::bail!("workspace switch settlement returned an unexpected outcome"),
         }
+    }
+
+    async fn reconnect_workspace_project_inner(
+        &self,
+        workspace_id: &crate::workspace::WorkspaceId,
+        connection_id: &str,
+    ) -> anyhow::Result<()> {
+        if connection_id == workspace_id.as_str() {
+            anyhow::bail!("Reconnection must hand off a newly prepared draft connection");
+        }
+        let _lifecycle = self.workspace.transition.write().await;
+        let workspace = self.workspace.registry.inspect(workspace_id)?;
+        let crate::workspace::ProjectLocation::Ssh {
+            host,
+            user,
+            port,
+            path,
+        } = workspace.project_location()
+        else {
+            anyhow::bail!("This project uses a local folder");
+        };
+        let connection = self
+            .terminal
+            .project_ssh(connection_id)
+            .map_err(anyhow::Error::msg)?;
+        let actual_path = connection
+            .verify_target_directory(
+                crate::terminal::TerminalTarget::Ssh { host, user, port },
+                path,
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let crate::terminal::TerminalTarget::Ssh { host, user, port } =
+            connection.effective_target().map_err(anyhow::Error::msg)?
+        else {
+            anyhow::bail!("SSH effective target is unavailable");
+        };
+        let actual = crate::workspace::ProjectLocation::Ssh {
+            host: host.clone(),
+            user: user.clone(),
+            port: *port,
+            path: actual_path,
+        };
+        if workspace.metadata.project_execution_location.as_ref() != Some(&actual) {
+            anyhow::bail!("远程主机或目录身份已变化；本次重连未修改项目位置");
+        }
+        self.ensure_workspace_idle_for_delete_inner(workspace_id)
+            .await?;
+        self.workspace
+            .runtimes
+            .shutdown_and_evict_if_idle(workspace_id)
+            .await?;
+        // Retirement is already physical. A later close/reassignment failure
+        // must not leave the current pointer referring to that retired host;
+        // the original transition receipt still reports the failure.
+        if self
+            .workspace
+            .current
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|host| host.id() == workspace_id)
+        {
+            *self.workspace.current.write().await = None;
+        }
+        self.terminal
+            .close_project_ssh(workspace_id.as_str())
+            .await
+            .map_err(anyhow::Error::msg)?;
+        self.terminal
+            .reassign_project_ssh(connection_id, workspace_id.as_str())
+            .await
+            .map_err(anyhow::Error::msg)?;
+        Ok(())
     }
 
     pub async fn exit_workspace(self: &Arc<Self>) -> anyhow::Result<WorkspaceTransitionReceipt> {
@@ -5329,22 +5562,35 @@ impl AppState {
         *settlement = Some(tokio::spawn(async move {
             let _marker = marker;
             match request {
-                WorkspaceTransitionRequest::Create { name, kind, root } => state
-                    .create_workspace_inner(name, kind, root)
+                WorkspaceTransitionRequest::Create {
+                    name,
+                    kind,
+                    root,
+                    source,
+                } => state
+                    .create_workspace_inner(name, kind, root, source)
                     .await
                     .map(|(workspace, created)| {
                         WorkspaceSettlementOutcome::Created(workspace, created)
                     }),
                 #[cfg(test)]
                 WorkspaceTransitionRequest::Switch(workspace) => {
-                    let receipt = state.switch_workspace_inner(workspace).await?;
+                    let receipt = state.switch_workspace_inner(*workspace).await?;
                     Ok(WorkspaceSettlementOutcome::Transition(
                         state
                             .reconcile_extension_skills_after_workspace_load(receipt)
                             .await,
                     ))
                 }
-                WorkspaceTransitionRequest::SwitchRegistered(workspace_id) => {
+                WorkspaceTransitionRequest::SwitchRegistered {
+                    workspace_id,
+                    connection_id,
+                } => {
+                    if let Some(connection_id) = connection_id {
+                        state
+                            .reconnect_workspace_project_inner(&workspace_id, &connection_id)
+                            .await?;
+                    }
                     let receipt = state
                         .switch_registered_workspace_inner(workspace_id)
                         .await?;

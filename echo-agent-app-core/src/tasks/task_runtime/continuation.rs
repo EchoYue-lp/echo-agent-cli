@@ -566,6 +566,8 @@ impl TaskContinuationRuntime {
 
             let turn_id = uuid::Uuid::new_v4().to_string();
             let binding = RunTurnBinding {
+                domain_plugin: None,
+
                 run_id: Some(run_id.clone()),
                 turn_id: turn_id.clone(),
                 root_message_id: launcher.root_message_id.clone(),

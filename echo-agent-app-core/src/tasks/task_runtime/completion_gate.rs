@@ -99,6 +99,7 @@ impl TaskRuntimeStore {
             .completion_gate_projection(run_id)?
             .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
         let run = projection.run.clone();
+        self.validate_run_project_binding(run_id)?;
         let Some(plan) = projection.plan.clone() else {
             return Ok(CompletionGateReport {
                 run_id: run_id.to_string(),
@@ -157,6 +158,7 @@ impl TaskRuntimeStore {
                 });
                 continue;
             };
+            let environment = self.task_project_environment(task)?;
             assessments.push(assess_requirement(
                 &run,
                 &plan,
@@ -164,6 +166,9 @@ impl TaskRuntimeStore {
                 requirement,
                 &projection,
                 &mut blockers,
+                environment
+                    .as_ref()
+                    .map(|environment| environment.files.as_ref()),
             ));
         }
 
@@ -220,6 +225,7 @@ fn assess_requirement(
     requirement: GoalRequirement,
     projection: &CompletionGateProjection,
     blockers: &mut Vec<RunCompletionBlocker>,
+    project_files: Option<&dyn echo_agent::tools::filesystem::FileSystem>,
 ) -> RequirementAssessment {
     let mut evidence = Vec::new();
     if let Some(skip) = projection.completion.requirement_skip(
@@ -399,7 +405,7 @@ fn assess_requirement(
             .artifacts
             .iter()
             .find(|item| artifact_matches(required, &item.path));
-        let verification = artifact.map(verify_artifact);
+        let verification = artifact.map(|artifact| verify_artifact(artifact, project_files));
         let (artifact_status, code, detail, producer, digest) =
             match (fresh, artifact, verification) {
                 (false, item, _) => (
@@ -614,7 +620,10 @@ enum ArtifactVerificationError {
     Unavailable(String),
 }
 
-fn verify_artifact(artifact: &SubagentArtifact) -> Result<String, ArtifactVerificationError> {
+fn verify_artifact(
+    artifact: &SubagentArtifact,
+    project_files: Option<&dyn echo_agent::tools::filesystem::FileSystem>,
+) -> Result<String, ArtifactVerificationError> {
     if !artifact.available {
         return Err(ArtifactVerificationError::Unavailable(format!(
             "artifact was reported unavailable: {}",
@@ -643,7 +652,30 @@ fn verify_artifact(artifact: &SubagentArtifact) -> Result<String, ArtifactVerifi
             artifact.path
         )));
     }
-    let actual = sha256_file(Path::new(&artifact.path)).map_err(|error| {
+    // Tool logs are captured locally by the original artifact writer and are
+    // read by read_artifact under its original root/physical-identity checks.
+    // Project outputs are re-read from the bound target, never a same-named
+    // local file. Model-declared hashes/producers are stripped upstream.
+    let actual = if artifact.kind != "tool_log"
+        && let Some(files) = project_files
+    {
+        match std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut reader = files
+                        .open_read(Path::new(&artifact.path))
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    sha256_reader(reader.as_mut())
+                })
+                .join()
+        }) {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::other("project artifact read bridge failed")),
+        }
+    } else {
+        sha256_file(Path::new(&artifact.path))
+    }
+    .map_err(|error| {
         ArtifactVerificationError::Unavailable(format!(
             "artifact '{}' could not be read: {error}",
             artifact.path
@@ -657,18 +689,36 @@ fn verify_artifact(artifact: &SubagentArtifact) -> Result<String, ArtifactVerifi
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = File::open(path)?;
+    sha256_reader(&mut file)
+}
+
+fn sha256_reader(reader: &mut dyn Read) -> std::io::Result<String> {
+    artifact_fingerprint(reader).map(|(digest, _)| digest)
+}
+
+pub(crate) fn artifact_fingerprint(reader: &mut dyn Read) -> std::io::Result<(String, u64)> {
     let mut digest = Sha256::new();
+    let mut bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
-        if let Some(chunk) = buffer.get(..read) {
-            digest.update(chunk);
-        }
+        let chunk = buffer.get(..read).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "artifact reader returned an invalid byte count",
+            )
+        })?;
+        digest.update(chunk);
+        let count =
+            u64::try_from(read).map_err(|error| std::io::Error::other(error.to_string()))?;
+        bytes = bytes
+            .checked_add(count)
+            .ok_or_else(|| std::io::Error::other("artifact byte count overflow"))?;
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok((format!("{:x}", digest.finalize()), bytes))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -694,6 +744,129 @@ pub(crate) fn artifact_matches(required: &str, actual: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn project_artifact_hash_streams_bounded_chunks_and_propagates_read_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = super::super::project_environment_tests::EnvironmentFixture::new()?;
+        let path = fixture.visible_root.join("multi-block.bin");
+        let bytes = vec![0x5a_u8; 5 * 64 * 1024 + 17];
+        fixture.files.write(&path, &bytes)?;
+        std::fs::write(&path, &bytes)?;
+        fixture
+            .reject_whole_reads
+            .store(true, std::sync::atomic::Ordering::Release);
+        let expected = sha256_bytes(&bytes);
+        let artifact = SubagentArtifact {
+            path: path.to_string_lossy().to_string(),
+            kind: "file".to_string(),
+            bytes: None,
+            sha256: Some(expected.clone()),
+            producer_execution_id: Some("observed-target-output".to_string()),
+            available: true,
+        };
+        assert_eq!(
+            verify_artifact(&artifact, Some(fixture.files.as_ref()))
+                .map_err(|error| format!("{error:?}"))?,
+            expected
+        );
+        let requests = fixture
+            .read_requests
+            .lock()
+            .map_err(|error| error.to_string())?;
+        assert!(requests.len() >= 6);
+        assert!(requests.iter().all(|requested| *requested <= 64 * 1024));
+        drop(requests);
+        fixture
+            .fail_after
+            .store(64 * 1024 + 13, std::sync::atomic::Ordering::Release);
+        assert!(
+            matches!(verify_artifact(&artifact, Some(fixture.files.as_ref())), Err(ArtifactVerificationError::Unavailable(message)) if message.contains("fixture streaming read failed"))
+        );
+        // The matching local decoy must never replace an unreadable target.
+        assert_eq!(std::fs::read(&path)?, bytes);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn original_completion_gate_reads_target_bytes_and_rejects_local_same_name()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = super::super::project_environment_tests::EnvironmentFixture::new()?;
+        let store = fixture.open("target.invalid", 7)?;
+        let binding = crate::domain_plugin::test_binding(false)?;
+        let path = fixture.visible_root.join("结果.txt");
+        std::fs::write(&path, b"LOCAL")?;
+        fixture.files.write(&path, b"TARGET")?;
+        store.create_run_for_active_workspace_with_domain(
+            "run",
+            "conversation",
+            "root",
+            DomainProfile::General,
+            "produce verified output",
+            "test",
+            AttendedMode::Attended,
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            Some(&binding),
+        )?;
+        store.attach_plan_for_test(&TaskPlan {
+            domain_binding: Some(binding.reference()),
+            plan_id: "plan".to_string(),
+            run_id: "run".to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("produce verified output"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: "task".to_string(),
+                title: "Produce output".to_string(),
+                description: "Read actual output".to_string(),
+                kind: PlanTaskKind::Investigation,
+                agent_role: "explorer".to_string(),
+                domain_binding: Some(binding.reference()),
+                domain_role: Some(binding.role_for_kind(PlanTaskKind::Investigation)?.clone()),
+                required_artifacts: vec![path.to_string_lossy().to_string()],
+                execution_checks: vec!["cargo test -p sample".to_string()],
+                ..PlanTask::default()
+            }],
+        })?;
+        persist_passed_evidence(&store, &path.to_string_lossy(), b"TARGET")?;
+        assert!(store.completion_gate_report("run")?.ready);
+        // A matching local decoy cannot prove bytes that changed or vanished
+        // on the actual target, even when the absolute path text is identical.
+        std::fs::write(&path, b"TARGET")?;
+        fixture.files.write(&path, b"CHANGED TARGET")?;
+        let report = store.completion_gate_report("run")?;
+        assert!(!report.ready);
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.code == CompletionBlockerCode::ArtifactHashMismatch)
+        );
+        fixture.files.remove_file(&path)?;
+        assert!(!store.completion_gate_report("run")?.ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn captured_tool_log_keeps_original_local_artifact_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = super::super::project_environment_tests::EnvironmentFixture::new()?;
+        let path = fixture.visible_root.join("captured-log.txt");
+        std::fs::write(&path, b"LOCAL CAPTURE")?;
+        fixture.files.write(&path, b"REMOTE DECOY")?;
+        let artifact = SubagentArtifact {
+            path: path.to_string_lossy().to_string(),
+            kind: "tool_log".to_string(),
+            bytes: None,
+            sha256: Some(sha256_bytes(b"LOCAL CAPTURE")),
+            producer_execution_id: Some("observed-call".to_string()),
+            available: true,
+        };
+        assert!(verify_artifact(&artifact, Some(fixture.files.as_ref())).is_ok());
+        Ok(())
+    }
     use chrono::Utc;
 
     use super::*;
@@ -717,6 +890,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "plan".to_string(),
             run_id: run.run_id,
             revision: 1,
@@ -830,15 +1005,17 @@ mod tests {
                 reason: "bind unchanged requirement to revised Goal".to_string(),
                 operations: vec![TaskUpdateOperation::Insert {
                     after_task_id: Some("task".to_string()),
-                    task: PlanTask {
-                        id: "goal-binding-review".to_string(),
-                        title: "Review clarified Goal".to_string(),
-                        description: "Check the clarified wording".to_string(),
-                        depends_on: vec!["task".to_string()],
-                        sort_order: 1,
-                        ..PlanTask::default()
-                    }
-                    .spec(),
+                    task: Box::new(
+                        PlanTask {
+                            id: "goal-binding-review".to_string(),
+                            title: "Review clarified Goal".to_string(),
+                            description: "Check the clarified wording".to_string(),
+                            depends_on: vec!["task".to_string()],
+                            sort_order: 1,
+                            ..PlanTask::default()
+                        }
+                        .spec(),
+                    ),
                 }],
             },
         )?;

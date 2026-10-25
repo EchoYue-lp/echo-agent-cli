@@ -100,19 +100,31 @@ pub struct ConfigWatcherRegistrationReceipt {
 struct RegisteredConfigTarget {
     identity: ConfigWatcherWorkspaceIdentity,
     root: PathBuf,
+    native_project: bool,
     agent: Weak<tokio::sync::RwLock<echo_agent::agent::ReactAgent>>,
 }
 
 impl RegisteredConfigTarget {
-    fn new(
+    async fn new(
         identity: ConfigWatcherWorkspaceIdentity,
         root: PathBuf,
         agent: &AgentHandle,
         _plugin_runtime: Option<&Arc<crate::plugin_runtime::PluginRuntimeService>>,
     ) -> Self {
+        let (root, native_project) = agent
+            .read(|agent| {
+                (
+                    agent.working_dir().unwrap_or(root),
+                    agent
+                        .file_system()
+                        .is_none_or(|files| files.paths_are_native()),
+                )
+            })
+            .await;
         Self {
             identity,
             root,
+            native_project,
             agent: Arc::downgrade(agent.inner()),
         }
     }
@@ -282,15 +294,21 @@ pub fn spawn_config_watcher(
     let registered_roots = Arc::new(tokio::sync::RwLock::new(vec![initial_root.clone()]));
     let task_registered_roots = Arc::clone(&registered_roots);
     let join = tokio::spawn(async move {
-        let mut registered = vec![RegisteredConfigTarget::new(
-            ConfigWatcherWorkspaceIdentity::global(),
-            initial_root,
-            &agent,
-            plugin_runtime.as_ref(),
-        )];
+        let mut registered = vec![
+            RegisteredConfigTarget::new(
+                ConfigWatcherWorkspaceIdentity::global(),
+                initial_root,
+                &agent,
+                plugin_runtime.as_ref(),
+            )
+            .await,
+        ];
         let mut targets = config_watch_targets(
             config_path.as_deref(),
-            registered.iter().map(|target| target.root.as_path()),
+            registered
+                .iter()
+                .filter(|target| target.native_project)
+                .map(|target| target.root.as_path()),
         );
 
         // Use a bounded async channel to receive filesystem events.
@@ -352,7 +370,7 @@ pub fn spawn_config_watcher(
                                 root,
                                 &agent,
                                 plugin_runtime.as_ref(),
-                            );
+                            ).await;
                             let result = register_workspace_target(target, &mut registration).await;
                             let _ = ack.send(Ok(result));
                         }
@@ -522,6 +540,7 @@ async fn refresh_registered_targets(
         context
             .registered
             .iter()
+            .filter(|target| target.native_project)
             .map(|target| target.root.as_path()),
     );
     reconcile_watched_directories(context.watcher, &next_targets, context.watched)?;
@@ -529,6 +548,7 @@ async fn refresh_registered_targets(
     let mut roots = context
         .registered
         .iter()
+        .filter(|target| target.native_project)
         .map(|target| target.root.clone())
         .collect::<Vec<_>>();
     roots.sort();

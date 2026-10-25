@@ -1377,6 +1377,7 @@ mod tests {
         echo_agent_app_core::api::tasks::task_runtime::commit_task_plan(
             store.clone(),
             TaskPlan {
+                domain_binding: None,
                 plan_id: format!("{run_id}-plan"),
                 run_id: run_id.to_string(),
                 revision: 1,

@@ -4,6 +4,7 @@ async fn replace_agent_plugin_generation(
     candidate: &AgentPluginGeneration,
     application_skill_repair: Option<&ApplicationSkillProjectionRepair>,
     skill_policy: Option<Arc<crate::evolution::ReviewIntegration>>,
+    local_state_dir: Option<std::path::PathBuf>,
 ) -> Result<(), String> {
     let previous = previous.clone();
     let candidate = candidate.clone();
@@ -22,7 +23,14 @@ async fn replace_agent_plugin_generation(
                 )
                 .await;
                 let plugin_registration = match registration {
-                    Ok(()) => register_plugin_agents(agent, &candidate.plugin_agents).await,
+                    Ok(()) => {
+                        register_plugin_agents(
+                            agent,
+                            &candidate.plugin_agents,
+                            local_state_dir.clone(),
+                        )
+                        .await
+                    }
                     Err(error) => Err(error),
                 };
                 if let Err(error) = plugin_registration {
@@ -37,7 +45,13 @@ async fn replace_agent_plugin_generation(
                     )
                     .await;
                     let restore_error = match descriptor_restore {
-                        Ok(()) => register_plugin_agents(agent, &previous.plugin_agents).await.err(),
+                        Ok(()) => register_plugin_agents(
+                            agent,
+                            &previous.plugin_agents,
+                            local_state_dir.clone(),
+                        )
+                        .await
+                        .err(),
                         Err(restore_error) => Some(restore_error),
                     };
                     crate::runtime::configure_intent_router(agent);
@@ -52,6 +66,12 @@ async fn replace_agent_plugin_generation(
                     .replace_system_context_projection(
                         crate::plugin_runtime::OUTPUT_STYLE_PROJECTION,
                         candidate.output_style.clone(),
+                    )
+                    .await;
+                agent
+                    .replace_system_context_projection(
+                        crate::plugin_runtime::DOMAIN_CATALOG_PROJECTION,
+                        candidate.domain_components.catalog_prompt(),
                     )
                     .await;
                 crate::runtime::configure_intent_router(agent);
@@ -110,6 +130,14 @@ async fn remove_agent_plugin_generation_inner(
         .map(|descriptor| descriptor.name.clone())
         .collect::<Vec<_>>();
     agent.unregister_skill_names(&removable).await;
+    if !preserve_project_skills {
+        agent
+            .replace_system_context_projection(
+                crate::plugin_runtime::DOMAIN_CATALOG_PROJECTION,
+                None,
+            )
+            .await;
+    }
 }
 
 impl Drop for AgentPool {

@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { workspaceApi, type Workspace } from '../api/endpoints';
+import { workspaceApi, type Workspace, type ProjectSource } from '../api/endpoints';
 import { useChatStore } from './chatStore';
 import { useConversationStore } from './conversationStore';
 import { useFileStore } from './fileStore';
@@ -20,6 +20,15 @@ function detachVisibleWorkspace(workspaceId: string): void {
   useSubagentRunStore.getState().clear();
   useBrowserStore.getState().clearWorkspace(workspaceId);
   useConversationStore.getState().detachForWorkspace(workspaceId);
+}
+
+async function recoverVisibleWorkspace(generation: number): Promise<void> {
+  const response = await workspaceApi.current();
+  if (generation !== workspaceGeneration) return;
+  const workspace = response.workspace;
+  useWorkspaceStore.setState({ current: workspace, isLoading: false });
+  useFileStore.getState().bindScope(productDataScope(workspace));
+  await useConversationStore.getState().init(workspace?.id ?? GLOBAL_WORKSPACE_ID);
 }
 
 function showTransitionWarning(
@@ -45,9 +54,14 @@ interface WorkspaceState {
   /** Initialize: load workspaces and current */
   init: () => Promise<void>;
   /** Switch to a workspace */
-  switchTo: (id: string) => Promise<void>;
+  switchTo: (id: string, connectionId?: string) => Promise<void>;
   /** Create and switch to a new workspace */
-  createAndSwitch: (name: string, kind?: string, root?: string) => Promise<Workspace>;
+  createAndSwitch: (
+    name: string,
+    kind?: string,
+    root?: string,
+    source?: ProjectSource
+  ) => Promise<Workspace>;
   /** Delete a workspace */
   delete: (id: string) => Promise<void>;
   /** Exit workspace (back to global mode) */
@@ -81,7 +95,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
   },
 
-  switchTo: async (id: string) => {
+  switchTo: async (id: string, connectionId?: string) => {
     const generation = workspaceGeneration + 1;
     workspaceGeneration = generation;
     const previousWorkspaceId = get().current?.id ?? GLOBAL_WORKSPACE_ID;
@@ -89,7 +103,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     set({ isLoading: true });
     try {
       if (import.meta.env.DEV) console.debug('[workspaceStore] switchTo:', id);
-      const res = await workspaceApi.switch(id);
+      const res = connectionId
+        ? await workspaceApi.switch(id, connectionId)
+        : await workspaceApi.switch(id);
       if (generation !== workspaceGeneration) return;
       if (import.meta.env.DEV)
         console.debug(
@@ -117,20 +133,39 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       console.error('[workspaceStore] Failed to switch workspace:', e);
       if (generation === workspaceGeneration) {
         detachVisibleWorkspace(previousWorkspaceId);
-        await useConversationStore.getState().init(previousWorkspaceId);
-        set({ isLoading: false });
+        try {
+          await recoverVisibleWorkspace(generation);
+        } catch (recoveryError) {
+          console.error('Failed to recover workspace focus:', recoveryError);
+        } finally {
+          if (generation === workspaceGeneration) set({ isLoading: false });
+        }
       }
       throw e;
     }
   },
 
-  createAndSwitch: async (name: string, kind?: string, root?: string) => {
+  createAndSwitch: async (name: string, kind?: string, root?: string, source?: ProjectSource) => {
     const generation = workspaceGeneration + 1;
     workspaceGeneration = generation;
     const previousWorkspaceId = get().current?.id ?? GLOBAL_WORKSPACE_ID;
     detachVisibleWorkspace(previousWorkspaceId);
     set({ isLoading: true });
-    const res = await workspaceApi.createAndSwitch(name, kind, root);
+    let res: Awaited<ReturnType<typeof workspaceApi.createAndSwitch>>;
+    try {
+      res = await workspaceApi.createAndSwitch(name, kind, root, source);
+    } catch (error) {
+      if (generation === workspaceGeneration) {
+        try {
+          await recoverVisibleWorkspace(generation);
+        } catch (recoveryError) {
+          console.error('Failed to recover workspace focus:', recoveryError);
+        } finally {
+          if (generation === workspaceGeneration) set({ isLoading: false });
+        }
+      }
+      throw error;
+    }
     if (!res.success) {
       if (generation === workspaceGeneration) {
         await useConversationStore.getState().init(previousWorkspaceId);
@@ -169,11 +204,18 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     const generation = workspaceGeneration + 1;
     workspaceGeneration = generation;
     detachVisibleWorkspace(get().current?.id ?? GLOBAL_WORKSPACE_ID);
-    const res = await workspaceApi.exit();
-    if (generation !== workspaceGeneration) return;
-    set({ current: null });
-    showTransitionWarning(res.transition);
-    useFileStore.getState().bindScope(productDataScope(null));
-    await useConversationStore.getState().init(GLOBAL_WORKSPACE_ID);
+    set({ isLoading: true });
+    try {
+      const res = await workspaceApi.exit();
+      if (generation !== workspaceGeneration) return;
+      set({ current: null });
+      showTransitionWarning(res.transition);
+      useFileStore.getState().bindScope(productDataScope(null));
+      await useConversationStore.getState().init(GLOBAL_WORKSPACE_ID);
+    } finally {
+      // The existing transition owns its busy projection through success or failure.
+      // A superseded exit must not clear a newer transition's loading state.
+      if (generation === workspaceGeneration) set({ isLoading: false });
+    }
   },
 }));

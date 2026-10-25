@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
-use echo_agent::sandbox::{SandboxExecutor, SandboxManager};
+use echo_agent::sandbox::SandboxExecutor;
 use echo_agent::tasks::{
     BackgroundCommandManager, BackgroundCommandManagerConfig, CommandCellTerminalObservation,
     CommandCellWatchCancellation, CommandCellWatchConfig, CommandCellWatcher,
@@ -275,11 +275,10 @@ pub struct CommandCellRuntimeService {
 
 impl CommandCellRuntimeService {
     pub fn new(
-        sandbox: Arc<SandboxManager>,
+        executor: Arc<dyn SandboxExecutor>,
         chat_events: Arc<crate::chat_event_log::ChatEventLog>,
         product_data_io: crate::product_data_io::ProductDataIoService,
     ) -> Result<Arc<Self>, String> {
-        let executor: Arc<dyn SandboxExecutor> = sandbox;
         let product_data_flow = product_data_io
             .begin_owned_flow("command-cell product-data projection")
             .map_err(|error| error.to_string())?;
@@ -578,6 +577,26 @@ impl CommandCellRuntimeService {
         Arc::new(ScopedCommandCellRegistry {
             service: self.clone(),
             execution_scope,
+            executor: None,
+        })
+    }
+
+    /// Keep the shared registry/observer owner while selecting this immutable
+    /// host's actual executor. `working_dir` still comes from each invocation,
+    /// including an isolated writer checkout; this never substitutes a root.
+    pub fn scoped_with_executor(
+        self: &Arc<Self>,
+        execution_scope: crate::workspace::WorkspaceExecutionScope,
+        store: Option<Arc<TaskRuntimeStore>>,
+        executor: Arc<dyn SandboxExecutor>,
+    ) -> Arc<dyn CommandCellRegistry> {
+        if let Some(store) = store.as_ref() {
+            self.bind_store(store);
+        }
+        Arc::new(ScopedCommandCellRegistry {
+            service: self.clone(),
+            execution_scope,
+            executor: Some(executor),
         })
     }
 
@@ -1512,6 +1531,7 @@ impl CommandCellRuntimeService {
 struct ScopedCommandCellRegistry {
     service: Arc<CommandCellRuntimeService>,
     execution_scope: crate::workspace::WorkspaceExecutionScope,
+    executor: Option<Arc<dyn SandboxExecutor>>,
 }
 
 impl ScopedCommandCellRegistry {
@@ -1923,9 +1943,23 @@ impl Tool for InterruptCommandCellWatchTool {
 impl CommandCellRegistry for ScopedCommandCellRegistry {
     fn launch(
         &self,
-        request: CommandCellRequest,
+        mut request: CommandCellRequest,
     ) -> BoxFuture<'_, Result<CommandCellLaunchReceipt, CommandCellError>> {
         Box::pin(async move {
+            if let Some(executor) = self.executor.as_ref() {
+                if request
+                    .executor
+                    .as_ref()
+                    .is_some_and(|requested| !Arc::ptr_eq(requested, executor))
+                {
+                    return Err(CommandCellError::Validation {
+                        message: "command-cell executor does not belong to the scoped project host"
+                            .to_string(),
+                    });
+                }
+                request.executor = Some(executor.clone());
+                request.require_sandbox = true;
+            }
             let owner = request.owner.clone();
             let name = request.command.chars().take(80).collect::<String>();
             let command_hash = format!("{:x}", Sha256::digest(request.command.as_bytes()));
@@ -1941,6 +1975,7 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
             let lookup_run_id = run_id.clone();
             let run = super::executor::TaskRuntimeOperation::new(store.clone())
                 .run_store("load command-cell TaskRun", move |store| {
+                    store.validate_run_project_binding(&lookup_run_id)?;
                     store.get_run(&lookup_run_id)
                 })
                 .await

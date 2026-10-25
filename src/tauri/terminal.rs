@@ -111,6 +111,10 @@ pub fn spawn_event_bridge(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri injects state; flat terminal target, dimensions and project identity feed the existing typed options"
+)]
 #[tauri::command]
 pub async fn create_terminal(
     state: tauri::State<'_, TauriState>,
@@ -119,9 +123,72 @@ pub async fn create_terminal(
     rows: Option<u16>,
     cols: Option<u16>,
     target: Option<TerminalTarget>,
+    project_workspace_id: Option<String>,
+    project_workspace_generation: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     // This is a direct user-operated local developer tool, not an agent-auto
     // execution path, so agent permission modes do not gate it.
+    if project_workspace_id.is_some() != project_workspace_generation.is_some() {
+        return Err(IpcError::Validation(
+            "项目终端需要完整的项目身份".to_string(),
+        ));
+    }
+    if let (Some(workspace_id), Some(generation)) =
+        (project_workspace_id, project_workspace_generation)
+    {
+        if cwd.is_some() || target.is_some() {
+            return Err(IpcError::Validation(
+                "项目终端不能同时指定独立目标或工作目录".to_string(),
+            ));
+        }
+        let project = state
+            .app_state
+            .project_resources_for_workspace(&workspace_id, &generation)
+            .await
+            .map_err(IpcError::from)?;
+        let info = match project.workspace().execution_location() {
+            echo_agent_app_core::api::workspace::ProjectLocation::Local { .. } => {
+                state
+                    .app_state
+                    .terminal
+                    .create_with_target_and_resources(
+                        id,
+                        Some(project.working_dir().to_path_buf()),
+                        rows.unwrap_or(24),
+                        cols.unwrap_or(80),
+                        TerminalTarget::Local,
+                        project.resource_guards(),
+                    )
+                    .await
+            }
+            echo_agent_app_core::api::workspace::ProjectLocation::Ssh {
+                host, user, port, ..
+            } => {
+                let connection = state
+                    .app_state
+                    .terminal
+                    .project_ssh(&workspace_id)
+                    .map_err(IpcError::Validation)?;
+                connection
+                    .verify_effective_target(&TerminalTarget::Ssh { host, user, port })
+                    .map_err(IpcError::Validation)?;
+                state
+                    .app_state
+                    .terminal
+                    .create_project_ssh_terminal(
+                        id,
+                        &workspace_id,
+                        &project.working_dir().to_string_lossy(),
+                        rows.unwrap_or(24),
+                        cols.unwrap_or(80),
+                        project.resource_guards(),
+                    )
+                    .await
+            }
+        }
+        .map_err(IpcError::Internal)?;
+        return serde_json::to_value(info).map_err(|error| IpcError::Internal(error.to_string()));
+    }
     let info = state
         .app_state
         .terminal

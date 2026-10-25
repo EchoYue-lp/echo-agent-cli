@@ -2447,4 +2447,1192 @@ mod tests {
         );
         Ok(())
     }
+
+    fn domain_components_for_test(
+        root: &std::path::Path,
+        content: &str,
+    ) -> Result<crate::domain_plugin::PreparedDomainComponents, String> {
+        use crate::domain_plugin::*;
+        let binding = test_binding(false)?;
+        let mut identity = binding.snapshot.plugin;
+        identity.content_sha256 = content_digest(&content)?;
+        let declaration = DomainDeclaration {
+            schema_version: 1,
+            method: binding.snapshot.method,
+            default_subagent_roles: Default::default(),
+            allowed_tools: Vec::new(),
+            required_artifacts: Vec::new(),
+            execution_checks: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            review_checklist: Vec::new(),
+            inputs: Vec::new(),
+        };
+        let mut components = PreparedDomainComponents::default();
+        components.plugins.insert(
+            identity.plugin_id.clone(),
+            PreparedDomainPlugin {
+                closure: vec![identity.plugin_id.clone()],
+                identity,
+                root: root.to_path_buf(),
+                declaration: Some(declaration),
+                inputs: Vec::new(),
+                binding_error: None,
+            },
+        );
+        Ok(components)
+    }
+
+    async fn publish_domain_for_test(
+        pool: &AgentPool,
+        components: crate::domain_plugin::PreparedDomainComponents,
+    ) -> TestResult {
+        let mut publication = pool
+            .begin_plugin_publication()
+            .await
+            .map_err(|error| error.to_string())?;
+        publication
+            .prepare(
+                AgentPluginGeneration::new(1, Vec::new(), Vec::new(), None)
+                    .with_domain_components(components, None),
+            )
+            .await?;
+        publication.commit().await
+    }
+
+    #[tokio::test]
+    async fn domain_target_lease_checks_its_own_generation_not_default_pool() -> TestResult {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let original = create_test_pool(2, false).await?;
+        let target = create_test_pool(2, false).await?;
+        let drifted = create_test_pool(2, false).await?;
+        publish_domain_for_test(
+            &original,
+            domain_components_for_test(directory.path(), "default content")?,
+        )
+        .await?;
+        publish_domain_for_test(
+            &target,
+            domain_components_for_test(directory.path(), "target content")?,
+        )
+        .await?;
+        publish_domain_for_test(
+            &drifted,
+            domain_components_for_test(directory.path(), "changed target content")?,
+        )
+        .await?;
+        let target_lease = target
+            .acquire("target")
+            .await
+            .map_err(|error| error.to_string())?;
+        let admitted_components = &target_lease
+            .domain_generation
+            .as_ref()
+            .ok_or("admitted domain data missing")?
+            .0;
+        assert!(Arc::ptr_eq(
+            admitted_components,
+            &target.agent_generation.read().await.domain_components
+        ));
+        let binding = target.bind_domain(&target_lease, "evidence-domain").await?;
+        target_lease.verify_domain_binding(&binding).await?;
+        assert!(
+            original
+                .verify_domain_binding(&target_lease, &binding)
+                .await
+                .is_err()
+        );
+        let drifted_lease = drifted
+            .acquire("target")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(drifted_lease.verify_domain_binding(&binding).await.is_err());
+        let same_target = create_test_pool(2, false).await?;
+        publish_domain_for_test(
+            &same_target,
+            domain_components_for_test(directory.path(), "target content")?,
+        )
+        .await?;
+        let same_lease = same_target
+            .acquire("target")
+            .await
+            .map_err(|error| error.to_string())?;
+        same_lease.verify_domain_binding(&binding).await?;
+        drop((target_lease, drifted_lease, same_lease));
+        assert_eq!(target.active_execution_count(), 0);
+        assert_eq!(drifted.active_execution_count(), 0);
+        assert_eq!(same_target.active_execution_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn domain_same_name_provider_replacement_is_rejected_without_leaking_lease() -> TestResult
+    {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let pool = create_test_pool(2, false).await?;
+        publish_domain_for_test(
+            &pool,
+            domain_components_for_test(directory.path(), "content")?,
+        )
+        .await?;
+        let lease = pool
+            .acquire("conversation")
+            .await
+            .map_err(|error| error.to_string())?;
+        let binding = pool.bind_domain(&lease, "evidence-domain").await?;
+        let registry = lease
+            .agent()
+            .read(|agent| agent.subagent_registry().clone())
+            .await;
+        let mut definition = registry
+            .list_available()
+            .await
+            .into_iter()
+            .find(|definition| definition.name == "explorer")
+            .ok_or("explorer missing")?;
+        definition.kind = echo_agent::subagent::SubagentKind::Plugin {
+            source: "unrelated-provider".to_string(),
+        };
+        registry
+            .register(definition, Box::new(create_test_agent()?))
+            .await;
+        assert!(lease.verify_domain_binding(&binding).await.is_err());
+        assert_eq!(pool.active_execution_count(), 1);
+        drop(lease);
+        assert_eq!(pool.active_execution_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_domain_publication_wait_does_not_release_original_execution() -> TestResult {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let pool = Arc::new(create_test_pool(2, false).await?);
+        publish_domain_for_test(
+            &pool,
+            domain_components_for_test(directory.path(), "content")?,
+        )
+        .await?;
+        let lease = pool
+            .acquire("conversation")
+            .await
+            .map_err(|error| error.to_string())?;
+        let binding = pool.bind_domain(&lease, "evidence-domain").await?;
+        let waiter_pool = pool.clone();
+        let waiter =
+            tokio::spawn(async move { waiter_pool.begin_plugin_publication().await.map(|_| ()) });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !pool.workspace_transitioning.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "publication did not close admission")?;
+        assert!(!waiter.is_finished());
+        assert_eq!(pool.active_execution_count(), 1);
+        waiter.abort();
+        assert!(waiter.await.is_err_and(|error| error.is_cancelled()));
+        lease.verify_domain_binding(&binding).await?;
+        assert_eq!(pool.active_execution_count(), 1);
+        drop(lease);
+        assert_eq!(pool.active_execution_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn domain_physical_projection_outlives_taken_parent_cell_without_another_slot()
+    -> TestResult {
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let pool = create_test_pool(2, false).await?;
+        publish_domain_for_test(&pool, domain_components_for_test(dir.path(), "physical")?).await?;
+        let execution = pool
+            .acquire("physical-parent")
+            .await
+            .map_err(|error| error.to_string())?;
+        let binding = pool.bind_domain(&execution, "evidence-domain").await?;
+        let process_before = pool.process_agent_execution.snapshot().active;
+        let cell = Arc::new(std::sync::Mutex::new(Some(execution)));
+        let guard = {
+            let owner = cell.lock().map_err(|_| "parent cell unavailable")?;
+            owner
+                .as_ref()
+                .ok_or("parent receipt missing")?
+                .domain_resource_guard("physical-run", &binding, None)?
+        };
+        let child = guard.clone();
+        cell.lock().map_err(|_| "parent cell unavailable")?.take();
+        drop(guard);
+        assert_eq!(pool.active_execution_count(), 1);
+        assert_eq!(
+            pool.process_agent_execution.snapshot().active,
+            process_before
+        );
+        let publication =
+            tokio::time::timeout(Duration::from_millis(20), pool.begin_plugin_publication()).await;
+        assert!(
+            publication.is_err(),
+            "taking the parent cell must not release actual child admission"
+        );
+        drop(child);
+        assert_eq!(pool.active_execution_count(), 0);
+        let publication =
+            tokio::time::timeout(Duration::from_secs(2), pool.begin_plugin_publication())
+                .await
+                .map_err(|_| "settled projection kept publication blocked")?
+                .map_err(|error| error.to_string())?;
+        drop(publication);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn domain_final_physical_projection_completes_original_supervised_cache_retirement()
+    -> TestResult {
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let pool = Arc::new(create_test_pool(2, false).await?);
+        publish_domain_for_test(&pool, domain_components_for_test(dir.path(), "physical")?).await?;
+        let execution = pool
+            .acquire("__task__:physical-retirement")
+            .await
+            .map_err(|error| error.to_string())?;
+        let binding = pool.bind_domain(&execution, "evidence-domain").await?;
+        let guard = execution.domain_resource_guard("physical-retirement", &binding, None)?;
+        let receipt =
+            pool.retain_for_supervised_run("__task__:physical-retirement".to_string(), execution);
+        let release = tokio::spawn(async move {
+            crate::tasks::task_runtime::store::RunDriverExecutionReceipt::release(Box::new(
+                receipt,
+            ))
+            .await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), async {
+                while !release.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(pool.active_execution_count(), 1);
+        assert_eq!(pool.pool_size().await, 1);
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), release)
+            .await
+            .map_err(|_| "original supervised release did not settle")?
+            .map_err(|error| error.to_string())?;
+        assert_eq!(pool.active_execution_count(), 0);
+        assert_eq!(pool.pool_size().await, 0);
+        Ok(())
+    }
+
+    async fn domain_dispatch_fixture() -> TestResult<(
+        tempfile::TempDir,
+        Arc<AgentPool>,
+        AgentHandle,
+        Arc<crate::tasks::task_runtime::store::TaskRuntimeStore>,
+        AgentPoolExecutionLease,
+        crate::domain_plugin::DomainBinding,
+        String,
+    )> {
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let primary = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .llm_client(Arc::new(echo_agent::testing::MockLlmClient::new()))
+                .enable_tools()
+                .enable_subagent()
+                .register_agent_dispatch_tool()
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let pool = Arc::new(AgentPool::new_for_test(primary.clone(), None, None, 2, false).await);
+        let mut components = domain_components_for_test(dir.path(), "dispatch")?;
+        let mut definition = echo_agent::subagent::SubagentDefinition::new(
+            "domain-expert",
+            "Inspect domain evidence",
+        );
+        definition.kind = echo_agent::subagent::SubagentKind::Plugin {
+            source: "evidence-domain".to_string(),
+        };
+        definition.access_mode = echo_agent::subagent::SubagentAccessMode::ReadOnly;
+        components.record_prepared_role(&definition)?;
+        publish_domain_for_test(&pool, components).await?;
+        pool.install_domain_registration_admission(&primary).await;
+        let key = format!("__task__:{}", uuid::Uuid::new_v4());
+        let lease = pool
+            .acquire(&key)
+            .await
+            .map_err(|error| error.to_string())?;
+        let binding = pool.bind_domain(&lease, "evidence-domain").await?;
+        let store = Arc::new(
+            crate::tasks::task_runtime::store::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        let run_id = uuid::Uuid::new_v4().to_string();
+        store
+            .create_run_for_active_workspace_with_domain(
+                &run_id,
+                "domain-conversation",
+                "root",
+                crate::tasks::task_runtime::DomainProfile::General,
+                "inspect",
+                "task",
+                crate::tasks::task_runtime::AttendedMode::Attended,
+                crate::tasks::task_runtime::TaskRunExecutionProfile::orchestrated(
+                    crate::tasks::task_runtime::RunPlanPolicy::AllowDirect,
+                ),
+                Some(&binding),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok((dir, pool, primary, store, lease, binding, run_id))
+    }
+
+    fn domain_dispatch_context(
+        lease: &AgentPoolExecutionLease,
+        binding: &crate::domain_plugin::DomainBinding,
+        store: Arc<crate::tasks::task_runtime::store::TaskRuntimeStore>,
+        run_id: &str,
+        cancel: echo_agent::agent::CancellationToken,
+    ) -> TestResult<echo_agent::tools::ToolContext> {
+        let projection =
+            crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
+                .retain_for_invocation(run_id, store)?;
+        Ok(echo_agent::tools::ToolContext {
+            run_id: Some(run_id.to_string()),
+            conversation_id: Some("domain-conversation".to_string()),
+            turn_id: Some("domain-turn".to_string()),
+            message_id: Some("root".to_string()),
+            execution_id: Some("domain-parent".to_string()),
+            call_id: Some("domain-call".to_string()),
+            cancel: Some(Arc::new(cancel)),
+            delegation_policy: Some(echo_agent::tasks::NestedDelegationPolicy {
+                can_spawn_subagents: true,
+                delegate_depth: 0,
+                max_delegate_depth: 1,
+            }),
+            resource_guards: vec![lease.domain_resource_guard(
+                run_id,
+                binding,
+                Some(Arc::new(projection)),
+            )?],
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn actual_agent_tool_checks_same_registration_provider_and_definition_before_factory()
+    -> TestResult {
+        for change in ["valid", "foreign-provider", "same-name-new-definition"] {
+            let (_dir, pool, primary, store, lease, binding, run_id) =
+                domain_dispatch_fixture().await?;
+            let registry = primary
+                .read(|agent| agent.subagent_registry().clone())
+                .await;
+            let mut definition = echo_agent::subagent::SubagentDefinition::new(
+                "domain-expert",
+                "Inspect domain evidence",
+            );
+            definition.kind = echo_agent::subagent::SubagentKind::Plugin {
+                source: if change == "foreign-provider" {
+                    "unrelated-provider"
+                } else {
+                    "evidence-domain"
+                }
+                .to_string(),
+            };
+            definition.access_mode = echo_agent::subagent::SubagentAccessMode::ReadOnly;
+            if change == "same-name-new-definition" {
+                definition.system_prompt = Some("Different method".to_string());
+            }
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = calls.clone();
+            registry
+                .register_factory(
+                    definition,
+                    Arc::new(echo_agent::subagent::FnAgentFactory::new(move || {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async {
+                            Ok(Box::new(
+                                echo_agent::testing::MockAgent::new("domain-expert")
+                                    .with_response("evidence inspected"),
+                            )
+                                as Box<dyn echo_agent::agent::Agent>)
+                        })
+                            as futures::future::BoxFuture<
+                                'static,
+                                echo_agent::error::Result<Box<dyn echo_agent::agent::Agent>>,
+                            >
+                    })),
+                )
+                .await;
+            let tool = primary
+                .read(|agent| agent.tool_manager().get_tool("agent_tool"))
+                .await
+                .ok_or("agent_tool missing")?;
+            let context = domain_dispatch_context(
+                &lease,
+                &binding,
+                store,
+                &run_id,
+                CancellationToken::new(),
+            )?;
+            let params = std::collections::HashMap::from([
+                ("agent_name".to_string(), serde_json::json!("domain-expert")),
+                ("task".to_string(), serde_json::json!("inspect evidence")),
+            ]);
+            let result = tool.execute_with_context(params, &context).await;
+            if change == "valid" {
+                let result = result.map_err(|error| error.to_string())?;
+                assert!(
+                    result.success,
+                    "the original bound registration should execute"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            } else {
+                assert!(
+                    result.as_ref().map_or(true, |result| !result.success),
+                    "invalid domain registration must be rejected"
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "rejection must precede factory effects"
+                );
+            }
+            drop(context);
+            drop(lease);
+            assert_eq!(pool.active_execution_count(), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actual_background_agent_tool_retains_original_physical_lease_until_cancelled_child_settles()
+    -> TestResult {
+        let (_dir, pool, primary, store, lease, binding, run_id) =
+            domain_dispatch_fixture().await?;
+        let registry = primary
+            .read(|agent| agent.subagent_registry().clone())
+            .await;
+        let mut definition = echo_agent::subagent::SubagentDefinition::new(
+            "domain-expert",
+            "Inspect domain evidence",
+        );
+        definition.kind = echo_agent::subagent::SubagentKind::Plugin {
+            source: "evidence-domain".to_string(),
+        };
+        definition.access_mode = echo_agent::subagent::SubagentAccessMode::ReadOnly;
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let factory_started = started.clone();
+        registry
+            .register_factory(
+                definition,
+                Arc::new(echo_agent::subagent::FnAgentFactory::new(move || {
+                    factory_started.add_permits(1);
+                    Box::pin(async {
+                        Ok(Box::new(
+                            echo_agent::testing::MockAgent::new("domain-expert").with_event_script(
+                                vec![echo_agent::testing::MockAgentStep::Delay(
+                                    Duration::from_secs(3600),
+                                )],
+                            ),
+                        )
+                            as Box<dyn echo_agent::agent::Agent>)
+                    })
+                        as futures::future::BoxFuture<
+                            'static,
+                            echo_agent::error::Result<Box<dyn echo_agent::agent::Agent>>,
+                        >
+                })),
+            )
+            .await;
+        let cancel = CancellationToken::new();
+        let context = domain_dispatch_context(&lease, &binding, store, &run_id, cancel.clone())?;
+        let tool = primary
+            .read(|agent| agent.tool_manager().get_tool("agent_tool"))
+            .await
+            .ok_or("agent_tool missing")?;
+        let result = tool
+            .execute_with_context(
+                std::collections::HashMap::from([
+                    ("agent_name".to_string(), serde_json::json!("domain-expert")),
+                    ("task".to_string(), serde_json::json!("inspect evidence")),
+                    ("background".to_string(), serde_json::json!(true)),
+                    ("mode".to_string(), serde_json::json!("fork")),
+                ]),
+                &context,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(result.success, "valid background dispatch must be accepted");
+        tokio::time::timeout(Duration::from_secs(2), started.acquire())
+            .await
+            .map_err(|_| "factory did not start")?
+            .map_err(|_| "factory start gate closed")?
+            .forget();
+        let process_active = pool.process_agent_execution.snapshot().active;
+        let key = lease
+            .physical
+            .admission
+            .as_ref()
+            .map(|(_, key)| key.clone())
+            .ok_or("physical key missing")?;
+        let receipt = pool.retain_for_supervised_run(key, lease);
+        drop(context);
+        let release = tokio::spawn(async move {
+            crate::tasks::task_runtime::store::RunDriverExecutionReceipt::release(Box::new(
+                receipt,
+            ))
+            .await;
+        });
+        assert_eq!(pool.active_execution_count(), 1);
+        assert_eq!(
+            pool.process_agent_execution.snapshot().active,
+            process_active
+        );
+        assert!(!release.is_finished());
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(3), release)
+            .await
+            .map_err(|_| "original supervised receipt did not settle after real child closure")?
+            .map_err(|error| error.to_string())?;
+        assert_eq!(pool.active_execution_count(), 0);
+        assert_eq!(pool.pool_size().await, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actual_agent_tool_uses_target_pool_retention_and_original_run_identity() -> TestResult
+    {
+        let (_original_dir, original, _primary, store, original_lease, binding, run_id) =
+            domain_dispatch_fixture().await?;
+        let (
+            _target_dir,
+            target,
+            target_primary,
+            _target_store,
+            target_lease,
+            target_binding,
+            _target_run,
+        ) = domain_dispatch_fixture().await?;
+        assert_eq!(
+            binding, target_binding,
+            "the target control must have identical prepared domain inputs"
+        );
+        target_lease.verify_domain_binding(&binding).await?;
+        let registry = target_primary
+            .read(|agent| agent.subagent_registry().clone())
+            .await;
+        let mut definition = echo_agent::subagent::SubagentDefinition::new(
+            "domain-expert",
+            "Inspect domain evidence",
+        );
+        definition.kind = echo_agent::subagent::SubagentKind::Plugin {
+            source: "evidence-domain".to_string(),
+        };
+        definition.access_mode = echo_agent::subagent::SubagentAccessMode::ReadOnly;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        registry
+            .register_factory(
+                definition,
+                Arc::new(echo_agent::subagent::FnAgentFactory::new(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async {
+                        Ok(Box::new(
+                            echo_agent::testing::MockAgent::new("domain-expert")
+                                .with_response("target evidence inspected"),
+                        )
+                            as Box<dyn echo_agent::agent::Agent>)
+                    })
+                        as futures::future::BoxFuture<
+                            'static,
+                            echo_agent::error::Result<Box<dyn echo_agent::agent::Agent>>,
+                        >
+                })),
+            )
+            .await;
+        let tool = target_primary
+            .read(|agent| agent.tool_manager().get_tool("agent_tool"))
+            .await
+            .ok_or("agent_tool missing")?;
+        let parameters = std::collections::HashMap::from([
+            ("agent_name".to_string(), serde_json::json!("domain-expert")),
+            (
+                "task".to_string(),
+                serde_json::json!("inspect target evidence"),
+            ),
+        ]);
+        let foreign = domain_dispatch_context(
+            &original_lease,
+            &binding,
+            store.clone(),
+            &run_id,
+            CancellationToken::new(),
+        )?;
+        let result = tool
+            .execute_with_context(parameters.clone(), &foreign)
+            .await;
+        assert!(result.as_ref().map_or(true, |result| !result.success));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a default-pool proof cannot admit another actual target"
+        );
+        let mut actual = domain_dispatch_context(
+            &target_lease,
+            &binding,
+            store,
+            &run_id,
+            CancellationToken::new(),
+        )?;
+        actual.run_id = Some(uuid::Uuid::new_v4().to_string());
+        let result = tool.execute_with_context(parameters.clone(), &actual).await;
+        assert!(result.as_ref().map_or(true, |result| !result.success));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "wrong Run identity must not become General"
+        );
+        actual.run_id = Some(run_id);
+        let result = tool
+            .execute_with_context(parameters, &actual)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            result.success,
+            "same binding on the real target lease must execute"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(actual);
+        drop(foreign);
+        drop(target_lease);
+        drop(original_lease);
+        assert_eq!(target.active_execution_count(), 0);
+        assert_eq!(original.active_execution_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actual_general_agent_tool_keeps_unbound_plugin_self_extension() -> TestResult {
+        let (_dir, pool, primary, store, lease, _binding, _run_id) =
+            domain_dispatch_fixture().await?;
+        let run_id = uuid::Uuid::new_v4().to_string();
+        store
+            .create_run_for_active_workspace_with_profile(
+                &run_id,
+                "general-conversation",
+                "root",
+                crate::tasks::task_runtime::DomainProfile::General,
+                "ordinary chat",
+                "chat",
+                crate::tasks::task_runtime::AttendedMode::Attended,
+                crate::tasks::task_runtime::TaskRunExecutionProfile::orchestrated(
+                    crate::tasks::task_runtime::RunPlanPolicy::AllowDirect,
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+        let _projection =
+            crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
+                .retain_for_invocation(&run_id, store)?;
+        let registry = primary
+            .read(|agent| agent.subagent_registry().clone())
+            .await;
+        let mut definition = echo_agent::subagent::SubagentDefinition::new(
+            "user-extension",
+            "Ordinary user extension",
+        );
+        definition.kind = echo_agent::subagent::SubagentKind::Plugin {
+            source: "user-selected-unrelated-package".to_string(),
+        };
+        registry
+            .register(
+                definition,
+                Box::new(
+                    echo_agent::testing::MockAgent::new("user-extension")
+                        .with_response("General extension completed"),
+                ),
+            )
+            .await;
+        let tool = primary
+            .read(|agent| agent.tool_manager().get_tool("agent_tool"))
+            .await
+            .ok_or("agent_tool missing")?;
+        let result = tool
+            .execute_with_context(
+                std::collections::HashMap::from([
+                    (
+                        "agent_name".to_string(),
+                        serde_json::json!("user-extension"),
+                    ),
+                    ("task".to_string(), serde_json::json!("ordinary task")),
+                ]),
+                &echo_agent::tools::ToolContext {
+                    run_id: Some(run_id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            result.success,
+            "an unbound General run keeps the original self-extension boundary"
+        );
+        drop(lease);
+        assert_eq!(pool.active_execution_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gui_domain_turn_reuses_original_token_at_process_capacity_one() -> TestResult {
+        use crate::chat_driver::{ChatDriverEvent, ChatSink};
+        use crate::tasks::task_runtime::{RunTurnBinding, RunTurnOrigin, TurnVisibility};
+        struct ObserveOriginalAdmission {
+            pool: Arc<AgentPool>,
+            maximum_tokens: Arc<AtomicUsize>,
+            events: Arc<std::sync::Mutex<Vec<ChatDriverEvent>>>,
+        }
+        impl ChatSink for ObserveOriginalAdmission {
+            fn on_event(&self, event: ChatDriverEvent) -> bool {
+                if let Ok(mut events) = self.events.lock() {
+                    events.push(event);
+                }
+                let Ok(leases) = self.pool.admission.leases.lock() else {
+                    return false;
+                };
+                self.maximum_tokens
+                    .fetch_max(leases.live.len(), Ordering::SeqCst);
+                self.pool.process_agent_execution.snapshot().active == 1
+            }
+        }
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let mut pool = create_test_pool(1, false).await?;
+        pool.process_agent_execution = Arc::new(AgentExecutionGovernor::new(1));
+        let pool = Arc::new(pool);
+        // Keep the real default router: classification consumes its own reply
+        // before the single Agent execution consumes the unchanged answer.
+        let client = Arc::new(echo_agent::testing::MockLlmClient::new().with_responses([
+            r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
+            "## Summary\nExact evidence inspected; no changes required.",
+        ]));
+        pool.set_llm_client_override_for_test(client.clone()).await;
+        publish_domain_for_test(&pool, domain_components_for_test(directory.path(), "gui")?)
+            .await?;
+        let conversation = uuid::Uuid::new_v4().to_string();
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let execution = pool
+            .acquire(&conversation)
+            .await
+            .map_err(|error| error.to_string())?;
+        let agent = execution.agent();
+        let held_execution = Arc::new(std::sync::Mutex::new(Some(execution)));
+        let store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        let _original_resource_scope = store.test_resource_scope();
+        let workspace = store.active_workspace_id();
+        let control = crate::foreground_turn::ForegroundTurnControl::default();
+        let foreground = control
+            .begin_scoped(
+                &workspace,
+                crate::foreground_turn::ForegroundTurnSurface::Gui,
+                &conversation,
+                &turn_id,
+            )
+            .map_err(|error| error.to_string())?;
+        foreground.retain_execution(held_execution.clone());
+        let maximum_tokens = Arc::new(AtomicUsize::new(0));
+        let observed_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: crate::workspace::WorkspaceExecutionScope::workspace(
+                &crate::workspace::WorkspaceId::from_name(&workspace),
+                directory.path(),
+            ),
+            workspace_io_receipt: None,
+            pool: Some(pool.clone()),
+            store: Some(store.clone()),
+            sink: Arc::new(ObserveOriginalAdmission {
+                pool: pool.clone(),
+                maximum_tokens: maximum_tokens.clone(),
+                events: observed_events.clone(),
+            }),
+            webhook_emitter: None,
+            conv_id: Some(conversation.clone()),
+            root_message_id: turn_id.clone(),
+            attachments: Vec::new(),
+            cancel: foreground.cancellation_token(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let prepared = crate::prepared_turn::PreparedUserTurn {
+            instruction: "Inspect this evidence".to_string(),
+            resources: Vec::new(),
+            authorship: crate::prepared_turn::InstructionAuthorship::User,
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::chat_driver::with_foreground_pool_execution(
+                Arc::downgrade(&held_execution),
+                crate::foreground_turn::drive_foreground_chat_with_bound_ingress(
+                    foreground,
+                    &agent,
+                    &prepared,
+                    resources,
+                    Some(RunTurnBinding {
+                        domain_plugin: Some("evidence-domain".to_string()),
+                        run_id: None,
+                        turn_id: turn_id.clone(),
+                        root_message_id: turn_id.clone(),
+                        origin: RunTurnOrigin::User,
+                        transcript_visibility: TurnVisibility::Visible,
+                        expected_resume: None,
+                    }),
+                    Arc::new(|_| Box::pin(async { Ok(()) })),
+                    |_| async { Ok(()) },
+                ),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            let physical = held_execution.try_lock().ok().and_then(|owner| {
+                owner.as_ref().map(|execution| {
+                    (
+                        execution.physical.projections.load(Ordering::Acquire),
+                        Arc::strong_count(&execution.physical),
+                    )
+                })
+            });
+            let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id);
+            // This fixture uses only its explicit Mock transport and static
+            // inputs. Read original facts after failure; never change a gate
+            // or retain another physical owner to produce a diagnostic.
+            let diagnostic = serde_json::json!({
+                "run_id": run_id,
+                "turn_id": turn_id,
+                "model_calls": client.call_count(),
+                "observed_tokens": maximum_tokens.load(Ordering::SeqCst),
+                "original_physical": physical,
+                "fixture_model_messages": client.all_calls(),
+                "observed_events": observed_events.try_lock()
+                    .map(|events| events.clone())
+                    .map_err(|_| "fixture event trace unavailable"),
+                "run_state": store.get_run_state(&run_id).map_err(|error| error.to_string()),
+                "plan": store.get_plan(&run_id).map_err(|error| error.to_string()),
+                "completion_gate": store.completion_gate_report(&run_id)
+                    .map_err(|error| error.to_string()),
+                "journal": store.list_events(&run_id, 0).map_err(|error| error.to_string()),
+            });
+            format!("GUI domain turn timed out: {diagnostic}")
+        })?
+        .map_err(|error| error.to_string())?;
+        assert_eq!(outcome, crate::chat_driver::TurnOutcome::Completed);
+        assert_eq!(client.call_count(), 2);
+        let requests = client.all_calls();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|messages| {
+                    messages.len() == 1
+                        && messages
+                            .first()
+                            .and_then(|message| message.content.as_text())
+                            .is_some_and(|text| text.starts_with("You are an intent classifier"))
+                })
+                .count(),
+            1,
+            "the original default router classifies exactly once"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|messages| {
+                    messages
+                        .last()
+                        .and_then(|message| message.content.as_text())
+                        .is_some_and(|text| {
+                            text.starts_with(&prepared.instruction)
+                                && text.contains("[bound_domain]")
+                        })
+                })
+                .count(),
+            1,
+            "the bound request reaches the actual Agent exactly once"
+        );
+        assert_eq!(
+            maximum_tokens.load(Ordering::SeqCst),
+            1,
+            "GUI prepare must not issue another counted token"
+        );
+        assert_eq!(pool.process_agent_execution.snapshot().active, 1);
+        let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id);
+        let snapshot = store
+            .get_run_state(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("domain RunCreated missing")?;
+        assert!(snapshot.domain_binding.is_some());
+        assert_eq!(
+            snapshot.run.status,
+            crate::tasks::task_runtime::TaskRunStatus::Completed
+        );
+        let events = store
+            .list_events(&run_id, 0)
+            .map_err(|error| error.to_string())?;
+        for kind in [
+            crate::tasks::task_runtime::RuntimeEventKind::RunTurnStarted,
+            crate::tasks::task_runtime::RuntimeEventKind::RunTurnFinished,
+        ] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event_type == kind)
+                    .count(),
+                1,
+                "the real default-router turn must not enter a continuation or retry"
+            );
+        }
+        assert_eq!(store.active_run_driver_count()?, 0);
+        assert!(
+            control
+                .snapshot_scoped(
+                    &workspace,
+                    crate::foreground_turn::ForegroundTurnSurface::Gui,
+                    &conversation
+                )
+                .is_none()
+        );
+        held_execution
+            .lock()
+            .map_err(|_| "GUI original cell unavailable")?
+            .take();
+        assert_eq!(pool.active_execution_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gui_existing_lease_rejects_foreign_pool_and_resumed_generation_drift_before_model()
+    -> TestResult {
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, RunPlanPolicy, RunTurnBinding, TaskRunExecutionProfile,
+            TaskRunResumeIdentity, TaskRunStatus, TaskRuntimeStore,
+        };
+        for mismatched_pool in [true, false] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let source = Arc::new(create_test_pool(2, false).await?);
+            let target = Arc::new(create_test_pool(2, false).await?);
+            publish_domain_for_test(
+                &source,
+                domain_components_for_test(directory.path(), "original-gui")?,
+            )
+            .await?;
+            publish_domain_for_test(
+                &target,
+                domain_components_for_test(directory.path(), "changed-gui")?,
+            )
+            .await?;
+            let client =
+                Arc::new(echo_agent::testing::MockLlmClient::new().with_response("must not run"));
+            source
+                .set_llm_client_override_for_test(client.clone())
+                .await;
+            target
+                .set_llm_client_override_for_test(client.clone())
+                .await;
+            let conversation = uuid::Uuid::new_v4().to_string();
+            let source_lease = source
+                .acquire(&conversation)
+                .await
+                .map_err(|error| error.to_string())?;
+            let original_binding = source.bind_domain(&source_lease, "evidence-domain").await?;
+            let execution = if mismatched_pool {
+                source_lease
+            } else {
+                drop(source_lease);
+                target
+                    .acquire(&conversation)
+                    .await
+                    .map_err(|error| error.to_string())?
+            };
+            let agent = execution.agent();
+            let held_execution = Arc::new(std::sync::Mutex::new(Some(execution)));
+            let store =
+                Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+            let _original_resource_scope = store.test_resource_scope();
+            let run_id = uuid::Uuid::new_v4().to_string();
+            store
+                .create_run_for_active_workspace_with_domain(
+                    &run_id,
+                    &conversation,
+                    "root",
+                    DomainProfile::General,
+                    "original goal",
+                    "task",
+                    AttendedMode::Attended,
+                    TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+                    Some(&original_binding),
+                )
+                .map_err(|error| error.to_string())?;
+            store
+                .transition_run(&run_id, TaskRunStatus::Running)
+                .map_err(|error| error.to_string())?;
+            store
+                .transition_run(&run_id, TaskRunStatus::Paused)
+                .map_err(|error| error.to_string())?;
+            let before = store
+                .get_run_state(&run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("original Run missing")?;
+            let mut binding = RunTurnBinding::resume_expected(
+                TaskRunResumeIdentity::capture(&before),
+                uuid::Uuid::new_v4().to_string(),
+            );
+            binding.domain_plugin = Some("evidence-domain".to_string());
+            let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+            let resources = Arc::new(crate::chat_resources::ChatResources {
+                execution_scope: crate::workspace::WorkspaceExecutionScope::workspace(
+                    &crate::workspace::WorkspaceId::from_name(&store.active_workspace_id()),
+                    directory.path(),
+                ),
+                workspace_io_receipt: None,
+                pool: Some(target),
+                store: Some(store.clone()),
+                sink: Arc::new(crate::chat_driver::ChannelChatSink::new(sender)),
+                webhook_emitter: None,
+                conv_id: Some(conversation),
+                root_message_id: binding.turn_id.clone(),
+                attachments: Vec::new(),
+                cancel: CancellationToken::new(),
+                review_integration: None,
+                memory_generation: None,
+                human_loop_provider: None,
+            });
+            let turn = crate::prepared_turn::PreparedUserTurn {
+                instruction: "resume".to_string(),
+                resources: Vec::new(),
+                authorship: crate::prepared_turn::InstructionAuthorship::User,
+            };
+            let result = crate::chat_driver::with_foreground_pool_execution(
+                Arc::downgrade(&held_execution),
+                crate::chat_driver::drive_chat_turn(&agent, &turn, resources, Some(binding)),
+            )
+            .await;
+            let error = result
+                .err()
+                .ok_or("mismatched original GUI lease unexpectedly ran")?
+                .to_string();
+            assert!(
+                error.contains(if mismatched_pool {
+                    "this pool's original live execution lease"
+                } else {
+                    "conflicts with the original TaskRun binding"
+                }),
+                "unexpected admission diagnostic: {error}"
+            );
+            assert_eq!(client.call_count(), 0);
+            let after = store
+                .get_run_state(&run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("Run disappeared")?;
+            assert_eq!(after.run.status, before.run.status);
+            assert_eq!(after.domain_binding, before.domain_binding);
+            assert_eq!(after.journal_sequence, before.journal_sequence);
+            held_execution
+                .lock()
+                .map_err(|_| "GUI original cell unavailable")?
+                .take();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actual_agent_tool_keeps_required_method_when_projection_reads_close_after_admission()
+    -> TestResult {
+        let (_dir, _pool, primary, store, lease, binding, run_id) =
+            domain_dispatch_fixture().await?;
+        let registry = primary
+            .read(|agent| agent.subagent_registry().clone())
+            .await;
+        let mut definition = echo_agent::subagent::SubagentDefinition::new(
+            "domain-expert",
+            "Inspect domain evidence",
+        );
+        definition.kind = echo_agent::subagent::SubagentKind::Plugin {
+            source: "evidence-domain".to_string(),
+        };
+        definition.access_mode = echo_agent::subagent::SubagentAccessMode::ReadOnly;
+        let client = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_response("Exact bound evidence inspected"),
+        );
+        let factory_client = client.clone();
+        let close_after_admission = store.clone();
+        let factories = Arc::new(AtomicUsize::new(0));
+        let factory_count = factories.clone();
+        registry.register_factory(definition, Arc::new(echo_agent::subagent::FnAgentFactory::new(move || {
+            let store = close_after_admission.clone();
+            let client = factory_client.clone();
+            let factories = factory_count.clone();
+            Box::pin(async move {
+                // F invokes this actual factory only after the real EKO policy
+                // accepted the selected registration. This makes a later
+                // TaskRuntimeOperation projection read fail without a new fault API.
+                store.begin_operation_shutdown().map_err(echo_agent::error::ReactError::Other)?;
+                factories.fetch_add(1, Ordering::SeqCst);
+                let mut agent = echo_agent::agent::ReactAgentBuilder::new().name("domain-expert")
+                    .llm_client(client).build()?;
+                crate::tasks::task_runtime::compact_context::install_domain_context_projection(&mut agent);
+                Ok(Box::new(agent) as Box<dyn echo_agent::agent::Agent>)
+            }) as futures::future::BoxFuture<'static, echo_agent::error::Result<Box<dyn echo_agent::agent::Agent>>>
+        }))).await;
+        let context = domain_dispatch_context(
+            &lease,
+            &binding,
+            store.clone(),
+            &run_id,
+            CancellationToken::new(),
+        )?;
+        let tool = primary
+            .read(|agent| agent.tool_manager().get_tool("agent_tool"))
+            .await
+            .ok_or("agent_tool missing")?;
+        let result = tool
+            .execute_with_context(
+                std::collections::HashMap::from([
+                    ("agent_name".to_string(), serde_json::json!("domain-expert")),
+                    ("task".to_string(), serde_json::json!("inspect evidence")),
+                ]),
+                &context,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            result.success,
+            "an already admitted invocation keeps its required immutable method"
+        );
+        assert_eq!(factories.load(Ordering::SeqCst), 1);
+        let read_run = run_id.clone();
+        let closed_read = crate::tasks::task_runtime::TaskRuntimeOperation::new(store)
+            .run_store(
+                "negative control: original projector read after operation shutdown",
+                move |store| store.get_run_state(&read_run),
+            )
+            .await;
+        assert!(
+            closed_read.is_err(),
+            "the late operation read must really be unavailable"
+        );
+        let requests = client.all_calls();
+        let messages = requests
+            .first()
+            .ok_or("admitted child did not reach the model")?;
+        assert!(
+            messages
+                .iter()
+                .filter_map(|message| message.content.as_text())
+                .any(|text| text
+                    .contains(crate::tasks::task_runtime::compact_context::DOMAIN_METHOD_MARKER)
+                    && text.contains(&binding.snapshot.method))
+        );
+        drop(context);
+        drop(lease);
+        Ok(())
+    }
 }

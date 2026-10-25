@@ -1,0 +1,18 @@
+schema_version: 1
+method: |
+  Inspect the actual inputs, record their provenance, and separate observations
+  from assumptions. Produce a concise report whose claims cite their evidence.
+default_subagent_roles:
+  investigation: explorer
+  review: reviewer
+  verification: primary
+allowed_tools: []
+required_artifacts:
+  - reports/evidence.md
+execution_checks: []
+acceptance_criteria:
+  - Material claims cite the inspected evidence and state remaining uncertainty.
+review_checklist:
+  - The conclusion stays within the evidence that was actually observed.
+inputs:
+  - method.txt

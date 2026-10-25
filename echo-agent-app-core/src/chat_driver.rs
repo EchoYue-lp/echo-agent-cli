@@ -42,6 +42,44 @@ use crate::tasks::task_runtime::types::{
     RunTurnBinding, RunTurnOrigin, RuntimeEventKind, TurnVisibility,
 };
 
+tokio::task_local! {
+    // Only a weak transport of the existing GUI owner. The invocation captures
+    // the real lease under the original cell lock, never clones an empty cell
+    // as a physical proof or keeps a strong carrier through receipt release.
+    static FOREGROUND_POOL_EXECUTION: std::sync::Weak<std::sync::Mutex<Option<crate::agent_pool::AgentPoolExecutionLease>>>;
+}
+
+/// Carry an already owned foreground pool receipt through the existing chat
+/// entry. This is application lifecycle plumbing, not a durable selection or
+/// another admission. Existing callers without a receipt keep their old path.
+pub async fn with_foreground_pool_execution<F: std::future::Future>(
+    execution: std::sync::Weak<
+        std::sync::Mutex<Option<crate::agent_pool::AgentPoolExecutionLease>>,
+    >,
+    future: F,
+) -> F::Output {
+    FOREGROUND_POOL_EXECUTION.scope(execution, future).await
+}
+
+fn foreground_pool_projection()
+-> Result<Option<crate::agent_pool::AgentPoolExecutionProjection>, String> {
+    FOREGROUND_POOL_EXECUTION
+        .try_with(|execution| {
+            let execution = execution
+                .upgrade()
+                .ok_or("original foreground pool owner is unavailable")?;
+            let owner = execution
+                .lock()
+                .map_err(|_| "original foreground pool receipt is unavailable")?;
+            owner
+                .as_ref()
+                .ok_or("original foreground pool receipt is no longer live")?
+                .project_for_invocation()
+                .map(Some)
+        })
+        .unwrap_or(Ok(None))
+}
+
 /// Complete product event stream consumed by every interactive surface.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
@@ -483,7 +521,7 @@ where
     ConfigureFuture: std::future::Future<Output = Result<(), String>>,
 {
     wait_for_previous_continuation_driver(&res, binding.as_ref()).await?;
-    let prepared = match prepare_chat_execution(turn, res, binding).await? {
+    let mut prepared = match prepare_chat_execution(turn, res, binding).await? {
         ChatExecutionPreparation::Ready(prepared) => prepared,
         ChatExecutionPreparation::Settled(outcome) => {
             return Ok(RunTurnDriveOutcome::Driven(outcome));
@@ -491,21 +529,25 @@ where
         ChatExecutionPreparation::Deferred => return Ok(RunTurnDriveOutcome::Deferred),
     };
     let acquire_cancel = prepared.cancel.clone();
-    let execution = match tokio::select! {
-        biased;
-        _ = acquire_cancel.cancelled() => {
-            prepared
-                .reject_before_driver_start("continuation cancelled during pool admission")
-                .await?;
-            return Err("continuation cancelled during pool admission".into());
-        }
-        result = pool.acquire(pool_key) => result,
-    } {
-        Ok(execution) => execution,
-        Err(error) => {
-            let message = format!("AgentPool admission failed: {error}");
-            prepared.reject_before_driver_start(&message).await?;
-            return Err(message.into());
+    let execution = if let Some(execution) = prepared.domain_admission.take() {
+        execution
+    } else {
+        match tokio::select! {
+            biased;
+            _ = acquire_cancel.cancelled() => {
+                prepared
+                    .reject_before_driver_start("continuation cancelled during pool admission")
+                    .await?;
+                return Err("continuation cancelled during pool admission".into());
+            }
+            result = pool.acquire(pool_key) => result,
+        } {
+            Ok(execution) => execution,
+            Err(error) => {
+                let message = format!("AgentPool admission failed: {error}");
+                prepared.reject_before_driver_start(&message).await?;
+                return Err(message.into());
+            }
         }
     };
     let agent = execution.agent();
@@ -575,6 +617,8 @@ struct PreparedChatExecution {
     drives_task_run: bool,
     store: Option<std::sync::Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
     foreground_progress: Option<crate::foreground_turn::ForegroundTurnProgress>,
+    domain_admission: Option<crate::agent_pool::AgentPoolExecutionLease>,
+    domain_projection: Option<crate::agent_pool::AgentPoolExecutionProjection>,
 }
 
 impl PreparedChatExecution {
@@ -620,6 +664,28 @@ impl PreparedChatExecution {
     }
 }
 
+fn check_resume_domain_selection(
+    requested: Option<&str>,
+    prepared: Option<&crate::domain_plugin::DomainBinding>,
+    original: Option<&crate::domain_plugin::DomainBinding>,
+) -> Result<(), String> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    let Some(original) = original else {
+        return Err("an existing General TaskRun cannot acquire a domain through resume; create a new domain-bound task".to_string());
+    };
+    if original.snapshot.plugin.plugin_id != requested
+        || prepared.is_some_and(|prepared| prepared != original)
+    {
+        return Err(
+            "explicit resume domain selection conflicts with the original TaskRun binding"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 async fn prepare_chat_execution(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
@@ -655,6 +721,7 @@ async fn prepare_chat_execution(
     // A store-less degraded execution (task runtime not yet bound) physically
     // cannot own a TaskRun and keeps the legacy unbound path.
     let mut binding = binding.unwrap_or_else(|| RunTurnBinding {
+        domain_plugin: None,
         run_id: res.store.is_some().then(|| {
             crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&default_turn_id)
         }),
@@ -692,6 +759,26 @@ async fn prepare_chat_execution(
     let formal_run_id = binding.run_id.clone().unwrap_or_else(|| {
         crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id)
     });
+    // Reject a conflicting explicit selection alongside the original binding
+    // checks, before registering an execution owner for an invalid request.
+    let resume_domain = if binding.expected_resume.is_some() && binding.domain_plugin.is_some() {
+        let store = res
+            .store
+            .as_ref()
+            .ok_or_else(|| "domain resume requires its original TaskRun owner".to_string())?;
+        let snapshot = store
+            .get_run_state(&formal_run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "domain resume original TaskRun is missing".to_string())?;
+        check_resume_domain_selection(
+            binding.domain_plugin.as_deref(),
+            None,
+            snapshot.domain_binding.as_ref(),
+        )?;
+        snapshot.domain_binding
+    } else {
+        None
+    };
     // Every turn registers its run driver before memory admission; with the
     // eager default binding (ADR 0037) every ordinary turn owns a formal
     // TaskRun from the first model boundary.
@@ -775,6 +862,46 @@ async fn prepare_chat_execution(
     let sink = res.sink.clone();
     let trace_sink = subagent_trace_sink_for(&sink);
     let store = res.store.clone();
+    let mut domain_projection = None;
+    let (domain_admission, selected_domain) =
+        if let Some(plugin_id) = binding.domain_plugin.as_deref() {
+            if plugin_id.trim().is_empty() || !drives_task_run {
+                return Err("domain selection requires a nonempty plugin id and TaskRun".into());
+            }
+            let pool = res
+                .pool
+                .as_ref()
+                .ok_or_else(|| "domain selection requires the original AgentPool".to_string())?;
+            let key = res
+                .conv_id
+                .as_deref()
+                .ok_or_else(|| "domain selection requires a conversation identity".to_string())?;
+            if let Some(projection) = foreground_pool_projection()? {
+                let selected = pool.bind_domain(projection.execution(), plugin_id).await?;
+                domain_projection = Some(projection);
+                (None, Some(selected))
+            } else {
+                let lease = match pool
+                    .lease_existing(key)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    Some(lease) => lease,
+                    None => pool.acquire(key).await.map_err(|error| error.to_string())?,
+                };
+                let selected = pool.bind_domain(&lease, plugin_id).await?;
+                (Some(lease), Some(selected))
+            }
+        } else {
+            (None, None)
+        };
+    if binding.expected_resume.is_some() {
+        check_resume_domain_selection(
+            binding.domain_plugin.as_deref(),
+            selected_domain.as_ref(),
+            resume_domain.as_ref(),
+        )?;
+    }
     if drives_task_run {
         let registration = task_driver_registration.take().ok_or_else(|| {
             "TaskRun-bound turn lost its driver registration during preparation".to_string()
@@ -795,12 +922,13 @@ async fn prepare_chat_execution(
         let owned_turn_id = turn_id.clone();
         let owned_trace_sink = trace_sink.clone();
         let owned_store = task_store.clone();
+        let selected_domain = selected_domain.clone();
         let claim = crate::tasks::task_runtime::TaskRuntimeOperation::new(task_store.clone())
             .run_owned("prepare and claim chat TaskRun", move || {
                 let mut registration = registration;
                 registration.mark_preparation_started();
                 if expected_resume.is_none() {
-                    if let Err(error) = ensure_bound_task_run(
+                    if let Err(error) = ensure_bound_task_run_with_domain(
                         &owned_store,
                         &owned_run_id,
                         owned_conversation_id.as_deref(),
@@ -808,6 +936,7 @@ async fn prepare_chat_execution(
                         &owned_instruction,
                         &owned_attachments,
                         Some(&owned_trace_sink),
+                        selected_domain.as_ref(),
                     ) {
                         registration.fail_preparation(error.to_string());
                         return Err(error);
@@ -894,6 +1023,8 @@ async fn prepare_chat_execution(
             drives_task_run,
             store,
             foreground_progress,
+            domain_admission,
+            domain_projection,
         },
     )))
 }
@@ -905,6 +1036,90 @@ async fn drive_prepared_chat(
     pool_execution: Option<crate::agent_pool::AgentPoolExecutionLease>,
     input_observer: Option<InputReceiptObserver>,
 ) -> Result<TurnReceipt, ChatTurnError> {
+    let mut pool_execution = pool_execution.or_else(|| prepared.domain_admission.take());
+    let mut domain_binding = None;
+    if let Some(store) = prepared.store.as_ref() {
+        let snapshot = store
+            .get_run_state(&prepared.formal_run_id)
+            .map_err(|error| error.to_string())?;
+        if let Some(snapshot) = snapshot {
+            if let Some(binding) = snapshot.domain_binding.as_ref() {
+                domain_binding = Some(binding.clone());
+                let check = async {
+                    let pool = prepared.resources.pool.as_ref().ok_or_else(|| {
+                        "domain execution requires its original AgentPool".to_string()
+                    })?;
+                    if pool_execution.is_none() && prepared.domain_projection.is_none() {
+                        prepared.domain_projection = foreground_pool_projection()?;
+                    }
+                    if pool_execution.is_none() && prepared.domain_projection.is_none() {
+                        let key = prepared.resources.conv_id.as_deref().ok_or_else(|| {
+                            "domain execution lost its conversation identity".to_string()
+                        })?;
+                        pool_execution = pool
+                            .lease_existing(key)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    let lease = pool_execution
+                        .as_ref()
+                        .or_else(|| {
+                            prepared
+                                .domain_projection
+                                .as_ref()
+                                .map(|projection| projection.execution())
+                        })
+                        .ok_or_else(|| {
+                            "domain execution has no original live pool lease".to_string()
+                        })?;
+                    if !std::sync::Arc::ptr_eq(agent.inner(), lease.agent().inner()) {
+                        return Err(
+                            "domain invocation Agent does not match its original execution lease"
+                                .to_string(),
+                        );
+                    }
+                    pool.verify_domain_binding(lease, binding).await
+                }
+                .await;
+                if let Err(error) = check {
+                    prepared.reject_before_driver_start(&error).await?;
+                    return Err(error.into());
+                }
+            } else if snapshot.run.domain_profile
+                != crate::tasks::task_runtime::DomainProfile::General
+            {
+                let error = "historical professional TaskRun has no trusted plugin binding; create a new domain-bound task";
+                prepared.reject_before_driver_start(error).await?;
+                return Err(error.into());
+            }
+        }
+    }
+    let run_projection = match (domain_binding.as_ref(), prepared.store.as_ref()) {
+        (Some(_), Some(store)) => Some(std::sync::Arc::new(
+            crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
+                .retain_for_invocation(&prepared.formal_run_id, store.clone())?,
+        )),
+        _ => None,
+    };
+    let original_execution = pool_execution.as_ref().or_else(|| {
+        prepared
+            .domain_projection
+            .as_ref()
+            .map(|projection| projection.execution())
+    });
+    let invocation_resources = match (domain_binding.as_ref(), original_execution) {
+        (Some(binding), Some(execution)) => vec![execution.domain_resource_guard(
+            &prepared.formal_run_id,
+            binding,
+            run_projection.clone(),
+        )?],
+        (Some(_), None) => return Err("domain invocation lost its physical pool receipt".into()),
+        _ => Vec::new(),
+    };
+    // Preparation may observe the already owned GUI lease, but it must not
+    // retain a control-stack proof while the supervisor awaits physical release.
+    // The actual invocation guard now holds the required original accounting.
+    drop(prepared.domain_projection.take());
     let continuation_dispatch_owned = prepared.binding.transcript_visibility
         == TurnVisibility::Internal
         && matches!(
@@ -957,9 +1172,12 @@ async fn drive_prepared_chat(
             if let Some(execution) = pool_execution {
                 receipt_owner.retain(execution)?;
             }
-            let _projection_registration =
-                crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
-                    .register(owned_run_id.clone(), store.clone());
+            let _projection_registration = run_projection.unwrap_or_else(|| {
+                std::sync::Arc::new(
+                    crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
+                        .register(owned_run_id.clone(), store.clone()),
+                )
+            });
             drive_registered_turn(RegisteredTurnDriver {
                 agent: owned_agent,
                 initial_turn: owned_turn,
@@ -973,6 +1191,7 @@ async fn drive_prepared_chat(
                 driver_execution_context,
                 foreground_progress,
                 input_observer,
+                invocation_resources,
             })
             .await
         });
@@ -999,6 +1218,7 @@ async fn drive_prepared_chat(
                     driver_execution_context: None,
                     origin: prepared.binding.origin,
                     transcript_visibility: TurnVisibility::Visible,
+                    invocation_resources,
                 },
                 input_observer,
             ),
@@ -1100,9 +1320,12 @@ struct RegisteredTurnDriver {
     driver_execution_context: String,
     foreground_progress: Option<crate::foreground_turn::ForegroundTurnProgress>,
     input_observer: Option<InputReceiptObserver>,
+    invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
 }
 
-async fn drive_registered_turn(driver: RegisteredTurnDriver) -> Result<TurnReceipt, ChatTurnError> {
+async fn drive_registered_turn(
+    mut driver: RegisteredTurnDriver,
+) -> Result<TurnReceipt, ChatTurnError> {
     if let Some(progress) = driver.foreground_progress.as_ref() {
         progress.bind_run_turn(&driver.run_id, &driver.binding.turn_id);
     }
@@ -1120,6 +1343,7 @@ async fn drive_registered_turn(driver: RegisteredTurnDriver) -> Result<TurnRecei
                 driver_execution_context: Some(driver.driver_execution_context.clone()),
                 origin: driver.binding.origin,
                 transcript_visibility: driver.binding.transcript_visibility,
+                invocation_resources: std::mem::take(&mut driver.invocation_resources),
             },
             driver.input_observer,
         ),
@@ -1167,6 +1391,7 @@ fn resolve_turn_memory_generation(
         .transpose()
 }
 
+#[cfg(test)]
 fn ensure_bound_task_run(
     store: &crate::tasks::task_runtime::TaskRuntimeStore,
     run_id: &str,
@@ -1175,6 +1400,29 @@ fn ensure_bound_task_run(
     goal: &str,
     attachments: &[crate::attachments::AttachmentRef],
     trace_sink: Option<&crate::tasks::task_runtime::task_tools::TraceSink>,
+) -> Result<(), crate::tasks::task_runtime::StoreError> {
+    ensure_bound_task_run_with_domain(
+        store,
+        run_id,
+        conversation_id,
+        turn_id,
+        goal,
+        attachments,
+        trace_sink,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_bound_task_run_with_domain(
+    store: &crate::tasks::task_runtime::TaskRuntimeStore,
+    run_id: &str,
+    conversation_id: Option<&str>,
+    turn_id: &str,
+    goal: &str,
+    attachments: &[crate::attachments::AttachmentRef],
+    trace_sink: Option<&crate::tasks::task_runtime::task_tools::TraceSink>,
+    selected_domain: Option<&crate::domain_plugin::DomainBinding>,
 ) -> Result<(), crate::tasks::task_runtime::StoreError> {
     use crate::tasks::task_runtime::{AttendedMode, DomainProfile, TaskRunStatus};
 
@@ -1196,10 +1444,25 @@ fn ensure_bound_task_run(
                 "agent_task_plan",
                 AttendedMode::Attended,
                 goal,
-                crate::tasks::task_runtime::TaskRunExecutionProfile::conversation_turn(),
+                selected_domain.map_or_else(
+                    crate::tasks::task_runtime::TaskRunExecutionProfile::conversation_turn,
+                    |binding| {
+                        crate::tasks::task_runtime::TaskRunExecutionProfile::orchestrated(
+                            if binding.requires_plan() {
+                                crate::tasks::task_runtime::RunPlanPolicy::RequirePlan
+                            } else {
+                                crate::tasks::task_runtime::RunPlanPolicy::AllowDirect
+                            },
+                        )
+                    },
+                ),
             ),
         };
-    let run = store.create_run_for_active_workspace_with_profile(
+    let persisted_domain = existing
+        .as_ref()
+        .and_then(|state| state.domain_binding.as_ref());
+    let effective_domain = selected_domain.or(persisted_domain);
+    let run = store.create_run_for_active_workspace_with_domain(
         run_id,
         conversation_id.unwrap_or("message:task"),
         turn_id,
@@ -1208,6 +1471,7 @@ fn ensure_bound_task_run(
         route,
         attended_mode,
         execution_profile,
+        effective_domain,
     )?;
     if !attachments.is_empty() {
         store.set_run_attachments(run_id, attachments)?;
@@ -1328,12 +1592,15 @@ struct ChatTurnModelScope {
     driver_execution_context: Option<String>,
     origin: RunTurnOrigin,
     transcript_visibility: TurnVisibility,
+    invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
 }
 
 struct EkoTurnEventSink {
     state: std::sync::Arc<std::sync::Mutex<EkoTurnEventSinkState>>,
     sender: tokio::sync::mpsc::Sender<EkoTurnProjectionRequest>,
     _projector_task: tokio::task::JoinHandle<()>,
+    domain_observation:
+        Option<std::sync::Arc<crate::tasks::task_runtime::executor::EkoAgentTurnSink>>,
 }
 
 struct EkoTurnEventSinkState {
@@ -1421,7 +1688,16 @@ impl EkoTurnEventSink {
             state,
             sender,
             _projector_task: projector_task,
+            domain_observation: None,
         }
+    }
+
+    fn with_domain_observation(
+        mut self,
+        observation: Option<std::sync::Arc<crate::tasks::task_runtime::executor::EkoAgentTurnSink>>,
+    ) -> Self {
+        self.domain_observation = observation;
+        self
     }
 
     fn finish(
@@ -1477,6 +1753,9 @@ impl EkoTurnEventSink {
 #[async_trait::async_trait]
 impl EventSink for EkoTurnEventSink {
     async fn on_event(&self, event: EventEnvelope) -> echo_agent::error::Result<SinkControl> {
+        if let Some(observation) = self.domain_observation.as_ref() {
+            observation.on_event(event.clone()).await?;
+        }
         let (acknowledgement, receiver) = tokio::sync::oneshot::channel();
         self.sender
             .send(EkoTurnProjectionRequest::Event {
@@ -1632,9 +1911,10 @@ async fn drive_chat_inner(
         driver_execution_context,
         origin,
         transcript_visibility,
+        invocation_resources,
     } = scope;
     // The turn preserves user-authored text (or a long-text artifact reference).
-    let msg: Message = turn.to_message().map_err(|e| {
+    let mut msg: Message = turn.to_message().map_err(|e| {
         tracing::error!(error = %e, "failed to build user message from prepared turn");
         format!("failed to build user message: {e}")
     })?;
@@ -1661,6 +1941,35 @@ async fn drive_chat_inner(
     };
     let delegation_policy =
         crate::subagent_policy::primary_policy_for_binding(subagent_depth_binding);
+    let domain_state = match (runtime_store.as_ref(), active_run_id.as_deref()) {
+        (Some(store), Some(run_id)) => store
+            .get_run_state(run_id)
+            .map_err(|error| error.to_string())?,
+        _ => None,
+    };
+    let domain_binding = domain_state
+        .as_ref()
+        .and_then(|state| state.domain_binding.as_ref());
+    if let Some(binding) = domain_binding {
+        let instructions = binding.prompt_instructions();
+        match &mut msg.content {
+            echo_agent::llm::types::MessageContent::Text(text) => {
+                text.push_str("\n\n");
+                text.push_str(&instructions);
+            }
+            echo_agent::llm::types::MessageContent::Parts(parts) => {
+                parts.push(echo_agent::llm::types::ContentPart::Text { text: instructions })
+            }
+            echo_agent::llm::types::MessageContent::Empty => {
+                msg.content = echo_agent::llm::types::MessageContent::Text(instructions)
+            }
+        }
+    }
+    let allowed_tools = domain_binding
+        .as_ref()
+        .map(|binding| binding.effective_allowed_tools(&[]))
+        .transpose()?
+        .flatten();
     // Scope the chat resources into a task_local so tools the agent calls
     // mid-ReAct (create_complex_task / check_run_status / cancel_run, Phase B3)
     // can reach pool/store/sink via `current_chat_resources()`.
@@ -1690,17 +1999,65 @@ async fn drive_chat_inner(
             .filter(|runtime_state_id| conversation_id.as_ref() != Some(runtime_state_id))
             .cloned();
 
-        let (working_dir, resource_guards) = res.workspace_io_receipt.as_ref().map_or_else(
-            || (Some(res.execution_scope.root().to_path_buf()), Vec::new()),
-            |receipt| {
-                (
-                    Some(receipt.data_root().to_path_buf()),
-                    vec![echo_agent::tools::InvocationResourceGuard::new(
-                        receipt.clone(),
-                    )],
-                )
+        // Product history and receipts stay on this machine. A remote project
+        // has its own execution namespace, already frozen by the turn scope;
+        // retaining its local receipt must never change the tool cwd.
+        let working_dir = Some(res.execution_scope.root().to_path_buf());
+        let mut resource_guards = res
+            .workspace_io_receipt
+            .as_ref()
+            .map(|receipt| receipt.invocation().resource_guards())
+            .unwrap_or_default();
+
+        resource_guards.extend(invocation_resources);
+
+        let project_environment = res
+            .store
+            .as_ref()
+            .and_then(|store| store.project_environment());
+        let project_inputs = match project_environment {
+            Some(environment) => Some((
+                environment.files,
+                environment.executor,
+                Some(environment.state_dir),
+            )),
+            None => match guard.file_system() {
+                Some(files) => Some((
+                    files,
+                    guard.sandbox_manager().cloned().ok_or_else(|| {
+                        ChatTurnError::from(
+                            "project invocation executor is unavailable".to_string(),
+                        )
+                    })?,
+                    res.workspace_io_receipt.as_ref().map(|receipt| {
+                        crate::workspace::layout::WorkspaceLayout::state_dir(receipt.data_root())
+                    }),
+                )),
+                None if res.workspace_io_receipt.is_some() => {
+                    return Err(ChatTurnError::from(
+                        "registered project invocation file environment is unavailable".to_string(),
+                    ));
+                }
+                // Minimal embeddings with neither a Workspace receipt nor an
+                // explicit provider retain their original context behavior.
+                None => None,
             },
-        );
+        };
+        if let Some((files, executor, local_state_dir)) = project_inputs {
+            let prepared = crate::infra::prepare_dynamic_project_context(
+                working_dir.as_deref(),
+                local_state_dir.as_deref(),
+                files,
+                executor,
+                resource_guards.clone(),
+                guard.config().get_token_limit(),
+            )
+            .await
+            .map_err(ChatTurnError::from)?;
+            _turn_projection_registration
+                .install_project_context(prepared)
+                .map_err(ChatTurnError::from)?;
+        }
 
         // `with_run_context` is task-local and does not cross the framework's
         // forked subagent `tokio::spawn`; ExternalRunContext is the value-carried
@@ -1716,7 +2073,7 @@ async fn drive_chat_inner(
         )
         .map_err(|error| error.to_string())?;
         let invocation = echo_agent::agent::AgentInvocationContext {
-            allowed_tools: None,
+            allowed_tools,
             history: None,
             runtime_state_id,
             transcript_generation_id,
@@ -1745,14 +2102,35 @@ async fn drive_chat_inner(
             run_budget: None,
             resource_guards,
         };
+        let domain_observation = domain_state
+            .as_ref()
+            .filter(|state| state.domain_binding.is_some())
+            .map(|state| {
+                let mutating_tools = guard
+                    .tool_names()
+                    .into_iter()
+                    .filter(|name| {
+                        crate::tasks::task_runtime::executor::tool_call_may_mutate_workspace(
+                            &guard, name,
+                        )
+                    })
+                    .collect();
+                std::sync::Arc::new(
+                    crate::tasks::task_runtime::executor::EkoAgentTurnSink::observe_chat(
+                        &state.run,
+                        mutating_tools,
+                    ),
+                )
+            });
         let eko_sink = EkoTurnEventSink::new(
             sink,
             webhook_observer,
-            active_run_id,
-            runtime_store,
+            active_run_id.clone(),
+            runtime_store.clone(),
             turn_id.clone(),
             transcript_visibility,
-        );
+        )
+        .with_domain_observation(domain_observation.clone());
         let request = TurnRequest::from_message(event_identity, msg)
             .mode(TurnMode::Execute)
             .cancel(cancel)
@@ -1768,10 +2146,25 @@ async fn drive_chat_inner(
                 Ok(()),
             )
         };
-        let receipt = receipt.map_err(ChatTurnError::from)?;
-        let effective_terminal =
+        let mut receipt = receipt.map_err(ChatTurnError::from)?;
+        receipt.outcome =
             effective_terminal_after_input_observer(receipt.outcome.clone(), observer_result);
-        eko_sink.finish(receipt, effective_terminal)
+        if let (Some(observation), Some(store), Some(run_id)) =
+            (domain_observation, runtime_store, active_run_id)
+        {
+            let observation = observation.finish(receipt.final_answer.as_deref());
+            crate::tasks::task_runtime::executor::finalize_direct_agent_observation(
+                &store,
+                &run_id,
+                &mut receipt,
+                observation,
+                &res.cancel,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+        let terminal = receipt.outcome.clone();
+        eko_sink.finish(receipt, terminal)
     })
     .await
 }
@@ -2369,6 +2762,8 @@ mod tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: format!("{run_id}-plan"),
                 run_id: run_id.to_string(),
                 revision: 1,
@@ -2489,6 +2884,7 @@ mod tests {
             &make_turn("continue"),
             resources,
             ChatTurnModelScope {
+                invocation_resources: Vec::new(),
                 turn_id: "setup-turn".to_string(),
                 bound_run_id: Some("setup-retry".to_string()),
                 driver_execution_context: None,
@@ -3226,6 +3622,8 @@ mod tests {
                     &turn,
                     resources,
                     RunTurnBinding {
+                        domain_plugin: None,
+
                         run_id: Some("pre-driver-cancel-run".to_string()),
                         turn_id: "pre-driver-cancel-turn".to_string(),
                         root_message_id: "pre-driver-cancel-root".to_string(),
@@ -3344,6 +3742,8 @@ mod tests {
                     &turn,
                     resources,
                     RunTurnBinding {
+                        domain_plugin: None,
+
                         run_id: Some("pre-driver-shutdown-run".to_string()),
                         turn_id: "pre-driver-shutdown-turn".to_string(),
                         root_message_id: "pre-driver-shutdown-root".to_string(),
@@ -3457,6 +3857,8 @@ mod tests {
                 &make_turn("winner"),
                 winner_resources,
                 Some(RunTurnBinding {
+                    domain_plugin: None,
+
                     run_id: Some("claim-race-run".to_string()),
                     turn_id: "winner-turn".to_string(),
                     root_message_id: "claim-race-root".to_string(),
@@ -3489,6 +3891,8 @@ mod tests {
             &make_turn("loser"),
             resources_for("loser-turn"),
             Some(RunTurnBinding {
+                domain_plugin: None,
+
                 run_id: Some("claim-race-run".to_string()),
                 turn_id: "loser-turn".to_string(),
                 root_message_id: "claim-race-root".to_string(),
@@ -3548,6 +3952,8 @@ mod tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&crate::tasks::task_runtime::TaskPlan {
+                domain_binding: None,
+
                 plan_id: "continuation-claim-plan".to_string(),
                 run_id: run_id.to_string(),
                 revision: 1,
@@ -3607,6 +4013,8 @@ mod tests {
             &make_turn("continue"),
             resources,
             RunTurnBinding {
+                domain_plugin: None,
+
                 run_id: Some(run_id.to_string()),
                 turn_id: "continuation-claim-turn".to_string(),
                 root_message_id: "continuation-claim-root".to_string(),
@@ -3715,6 +4123,8 @@ mod tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&crate::tasks::task_runtime::TaskPlan {
+                domain_binding: None,
+
                 plan_id: "existing-goal-plan".to_string(),
                 run_id: "existing-goal".to_string(),
                 revision: 1,
@@ -3907,6 +4317,8 @@ mod tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&crate::tasks::task_runtime::TaskPlan {
+                domain_binding: None,
+
                 plan_id: "stale-plan".to_string(),
                 run_id: "stale-resume".to_string(),
                 revision: 1,
@@ -4571,6 +4983,8 @@ mod tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: "boundary-plan".to_string(),
                 run_id: run_id.clone(),
                 revision: 1,
@@ -4797,6 +5211,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runless_project_turns_restore_current_target_rules_and_keep_product_data_local()
+    -> anyhow::Result<()> {
+        use echo_agent::agent::CancellationToken;
+        use std::sync::Arc;
+        let project =
+            crate::tasks::task_runtime::project_environment_tests::EnvironmentFixture::new()
+                .map_err(anyhow::Error::msg)?;
+        // Keep VCS discovery inside the modeled target namespace while the
+        // same-named local directory remains the deliberately wrong target.
+        crate::tasks::task_runtime::worktree::run_git(
+            &project.target_root,
+            &["init", "-b", "main"],
+        )?;
+        let client = Arc::new(
+            echo_agent::testing::MockLlmClient::new().with_responses(["first done", "second done"]),
+        );
+        let states: Arc<dyn echo_agent::state::RuntimeStateStore> = Arc::new(
+            echo_agent::state::FileRuntimeStateStore::new(project.data_root.join("checkpoints"))?,
+        );
+        let mut react = echo_agent::agent::ReactAgentBuilder::new()
+            .model("project-turn-test")
+            .system_prompt("PRIMARY_ROLE_BASELINE")
+            .auto_project_rules(false)
+            .file_system(project.files.clone())
+            .working_dir(project.visible_root.clone())
+            .llm_client(client.clone())
+            .state_store(states.clone())
+            .conversation_id("runless-project-checkpoint")
+            .react_checkpoint_interval(1)
+            .max_iterations(1)
+            .build()?;
+        react.set_sandbox_executor(project.executor.clone());
+        react.set_pre_model_context_projector(Some(Arc::new(
+            crate::turn_context::EkoContextProjector::new(
+                crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
+                crate::turn_context::turn_prompt_context_registry(),
+            ),
+        )));
+        let agent = AgentHandle::new(react);
+        for (name, rule) in [
+            ("first", "FIRST_TARGET_RULE"),
+            ("second", "SECOND_TARGET_RULE"),
+            ("unavailable", "MUST_NOT_REACH_MODEL"),
+        ] {
+            let cwd = project.visible_root.join(name);
+            project.files.create_dir_all(&cwd)?;
+            project
+                .files
+                .write(&cwd.join("Cargo.toml"), b"fixture marker")?;
+            project
+                .files
+                .write(&cwd.join("AGENTS.md"), rule.as_bytes())?;
+            std::fs::create_dir_all(&cwd)?;
+            std::fs::write(cwd.join("AGENTS.md"), "WRONG_LOCAL_RULE")?;
+            let turn_id = format!("runless-project-{name}");
+            let sink = Arc::new(MockChatSink::default());
+            let resources = Arc::new(crate::chat_resources::ChatResources {
+                execution_scope: crate::workspace::WorkspaceExecutionScope::global(cwd),
+                workspace_io_receipt: Some(
+                    crate::state::ScopedWorkspaceIoReceipt::global_for_test(
+                        project.data_root.clone(),
+                    ),
+                ),
+                pool: None,
+                store: None,
+                sink: sink.clone(),
+                webhook_emitter: None,
+                conv_id: Some("runless-project-checkpoint".to_string()),
+                root_message_id: turn_id.clone(),
+                attachments: Vec::new(),
+                cancel: CancellationToken::new(),
+                review_integration: None,
+                memory_generation: None,
+                human_loop_provider: None,
+            });
+            if name == "unavailable" {
+                project
+                    .fail_metadata
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            let result = drive_chat(&agent, &make_turn("continue"), resources).await;
+            if name == "unavailable" {
+                assert!(result.is_err());
+                assert_eq!(client.all_calls().len(), 2);
+                assert!(!crate::turn_context::turn_prompt_context_registry().contains(&turn_id));
+                continue;
+            }
+            let outcome = result.map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            assert_eq!(outcome, TurnOutcome::Completed);
+            assert!(
+                states
+                    .get_checkpoint("runless-project-checkpoint")
+                    .await?
+                    .is_some()
+            );
+            let calls = client.all_calls();
+            let text = calls
+                .last()
+                .ok_or_else(|| anyhow::anyhow!("model call absent"))?
+                .iter()
+                .filter_map(|message| message.content.as_text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(text.matches(rule).count(), 1);
+            assert!(!text.contains("WRONG_LOCAL_RULE"));
+            if name == "second" {
+                assert!(!text.contains("FIRST_TARGET_RULE"));
+            }
+            assert!(text.contains(crate::turn_context::TURN_CONTRACT_MARKER));
+            assert!(text.contains("PRIMARY_ROLE_BASELINE"));
+            assert!(
+                sink.events
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .iter()
+                    .all(|event| event.run_id.is_none())
+            );
+            assert!(!crate::turn_context::turn_prompt_context_registry().contains(&turn_id));
+        }
+        assert_eq!(client.all_calls().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn mismatched_task_runtime_workspace_is_rejected_before_agent_execution()
     -> Result<(), String> {
         let store = std::sync::Arc::new(
@@ -4908,6 +5446,151 @@ mod tests {
         match second.payload {
             AgentEvent::Token(t) => assert_eq!(t, "lo"),
             other => return Err(format!("second should be Token(lo); got {other:?}")),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_resume_selection_compares_the_complete_original_domain_binding()
+    -> Result<(), String> {
+        let original = crate::domain_plugin::test_binding(false)?;
+        check_resume_domain_selection(None, None, Some(&original))?;
+        check_resume_domain_selection(
+            Some(&original.snapshot.plugin.plugin_id),
+            Some(&original),
+            Some(&original),
+        )?;
+        let mut changed = original.snapshot.clone();
+        changed.method.push_str(" Changed method.");
+        let changed = crate::domain_plugin::DomainBinding::new(changed)?;
+        assert!(
+            check_resume_domain_selection(
+                Some(&original.snapshot.plugin.plugin_id),
+                Some(&changed),
+                Some(&original)
+            )
+            .is_err()
+        );
+        assert!(
+            check_resume_domain_selection(Some("another-domain"), Some(&changed), Some(&original))
+                .is_err()
+        );
+        assert!(
+            check_resume_domain_selection(
+                Some(&original.snapshot.plugin.plugin_id),
+                Some(&original),
+                None
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_domain_conflict_rejects_before_claim_and_attachment_mutation()
+    -> Result<(), String> {
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, RunPlanPolicy, TaskRunExecutionProfile,
+        };
+        use std::sync::Arc;
+        for original_domain in [false, true] {
+            let store = Arc::new(
+                crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                    .map_err(|error| error.to_string())?,
+            );
+            let _resource_scope = store.test_resource_scope();
+            let original = original_domain
+                .then(|| crate::domain_plugin::test_binding(false))
+                .transpose()?;
+            store
+                .create_run_for_active_workspace_with_domain(
+                    "domain-resume",
+                    "conversation",
+                    "root",
+                    DomainProfile::General,
+                    "original goal",
+                    "agent_task_plan",
+                    AttendedMode::Attended,
+                    TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+                    original.as_ref(),
+                )
+                .map_err(|error| error.to_string())?;
+            store
+                .transition_run(
+                    "domain-resume",
+                    crate::tasks::task_runtime::TaskRunStatus::Running,
+                )
+                .map_err(|error| error.to_string())?;
+            store
+                .configure_run_continuation("domain-resume", true, false, None, None)
+                .map_err(|error| error.to_string())?;
+            store
+                .request_pause("domain-resume")
+                .map_err(|error| error.to_string())?;
+            let before = store
+                .get_run_state("domain-resume")
+                .map_err(|error| error.to_string())?
+                .ok_or("resume run missing")?;
+            let before_events = serde_json::to_value(
+                store
+                    .list_events("domain-resume", 0)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            let expected = crate::tasks::task_runtime::TaskRunResumeIdentity::capture(&before);
+            let resources = Arc::new(crate::chat_resources::ChatResources {
+                execution_scope: test_execution_scope(),
+                workspace_io_receipt: None,
+                pool: None,
+                store: Some(store.clone()),
+                sink: Arc::new(MockChatSink::default()),
+                webhook_emitter: None,
+                conv_id: Some("conversation".to_string()),
+                root_message_id: "resume-turn".to_string(),
+                attachments: vec![crate::attachments::AttachmentRef {
+                    path: std::path::PathBuf::from("/tmp/domain-resume-not-admitted"),
+                    name: "not-admitted.txt".to_string(),
+                    mime_type: "text/plain".to_string(),
+                    source: Default::default(),
+                }],
+                cancel: echo_agent::agent::CancellationToken::new(),
+                review_integration: None,
+                memory_generation: None,
+                human_loop_provider: None,
+            });
+            let mut selection = RunTurnBinding::resume_expected(expected, "resume-turn");
+            selection.domain_plugin = Some("another-domain".to_string());
+            let rejected =
+                prepare_chat_execution(&make_turn("resume"), resources, Some(selection)).await;
+            let error = match rejected {
+                Err(error) => error.to_string(),
+                Ok(_) => return Err("conflicting domain resume unexpectedly prepared".to_string()),
+            };
+            assert!(
+                error.contains(if original_domain {
+                    "conflicts with the original TaskRun binding"
+                } else {
+                    "existing General TaskRun cannot acquire a domain"
+                }),
+                "resume must reject the explicit binding conflict before pool lookup"
+            );
+            let after = store
+                .get_run_state("domain-resume")
+                .map_err(|error| error.to_string())?
+                .ok_or("resume run disappeared")?;
+            assert_eq!(after.run.status, before.run.status);
+            assert_eq!(after.run.domain_binding, before.run.domain_binding);
+            assert!(after.run.attachments.is_empty());
+            assert_eq!(
+                serde_json::to_value(
+                    store
+                        .list_events("domain-resume", 0)
+                        .map_err(|error| error.to_string())?
+                )
+                .map_err(|error| error.to_string())?,
+                before_events
+            );
+            assert_eq!(store.active_run_driver_count()?, 0);
         }
         Ok(())
     }

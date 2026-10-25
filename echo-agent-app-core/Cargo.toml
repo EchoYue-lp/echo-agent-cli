@@ -28,6 +28,7 @@ base64 = "0.22"
 serde_yaml = { package = "yaml_serde", version = "0.10.7" }
 dashmap = "6"
 portable-pty = "0.9"
+openssh-sftp-client = { version = "=0.15.10", default-features = false }
 config = "0.14"
 notify = "8.2"
 tokio-util = "0.7"

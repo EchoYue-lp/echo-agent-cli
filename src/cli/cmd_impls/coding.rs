@@ -309,6 +309,7 @@ mod task_dag_tests {
             run_id: "run".to_string(),
             revision: 1,
             domain_profile: DomainProfile::General,
+            domain_binding: None,
             goal_revision: 1,
             goal_sha256: "goal".to_string(),
             assumptions: Vec::new(),

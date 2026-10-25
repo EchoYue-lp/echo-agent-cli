@@ -256,6 +256,7 @@ fn new_pending_run(
         conversation_id: conversation_id.to_string(),
         root_message_id: root_message_id.to_string(),
         domain_profile,
+        domain_binding: None,
         status: TaskRunStatus::Pending,
         goal: goal.to_string(),
         goal_revision: 1,
@@ -336,6 +337,11 @@ fn prepare_revisioned_graph_commit(
         })
         .unwrap_or_default();
     let plan_metadata: EkoPlanMetadata = serde_json::from_value(next.context.metadata.clone())?;
+    if plan_metadata.domain_binding != run.domain_binding {
+        return Err(StoreError::InvalidPlan(
+            "TaskPlan cannot change its TaskRun domain binding".to_string(),
+        ));
+    }
     if next.context.goal != run.goal {
         return Err(StoreError::GoalUpdateRejected {
             run_id: run_id.to_string(),
@@ -384,8 +390,15 @@ fn prepare_revisioned_graph_commit(
                 task.spec.id, task.execution.task_id
             )));
         }
-        specifications
-            .push(EkoTaskSpec::try_from(task.spec.clone()).map_err(StoreError::InvalidPlan)?);
+        let specification =
+            EkoTaskSpec::try_from(task.spec.clone()).map_err(StoreError::InvalidPlan)?;
+        if specification.domain_binding != run.domain_binding {
+            return Err(StoreError::InvalidPlan(format!(
+                "task '{}' changed its TaskRun domain binding",
+                specification.id
+            )));
+        }
+        specifications.push(specification);
     }
     if expected_revision.is_none()
         && next.snapshot.tasks.iter().any(|task| {
@@ -404,6 +417,7 @@ fn prepare_revisioned_graph_commit(
         run_id: run_id.to_string(),
         revision: next.snapshot.revision,
         domain_profile: plan_metadata.domain_profile,
+        domain_binding: run.domain_binding.clone(),
         goal_revision: run.goal_revision,
         goal_sha256: run.goal_sha256.clone(),
         assumptions: next.context.assumptions.clone(),

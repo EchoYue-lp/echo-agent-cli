@@ -1182,6 +1182,9 @@ mod tests {
 
     fn task(id: &str) -> PlanTask {
         PlanTask {
+            domain_binding: None,
+            domain_role: None,
+
             id: id.to_string(),
             title: format!("task {id}"),
             description: format!("do {id}"),
@@ -1432,6 +1435,8 @@ mod tests {
                     "base_revision": 0,
                     "skipped_task_ids": [],
                     "plan": PlanRevision {
+                        domain_binding: None,
+
                         plan_id: "plan-1".to_string(),
                         run_id: "plan".to_string(),
                         revision: 1,
@@ -1498,6 +1503,8 @@ mod tests {
                 .map_err(|error| error.to_string())?;
             store
                 .attach_plan_for_test(&TaskPlan {
+                    domain_binding: None,
+
                     plan_id: format!("plan-{run_id}"),
                     run_id: run_id.to_string(),
                     revision: 1,
@@ -1523,10 +1530,10 @@ mod tests {
                         },
                         TaskUpdateOperation::Update {
                             task_id: "first-a".to_string(),
-                            patch: TaskPatch {
+                            patch: Box::new(TaskPatch {
                                 title: Some("renamed first task".to_string()),
                                 ..Default::default()
-                            },
+                            }),
                         },
                     ],
                 },
@@ -2702,6 +2709,8 @@ mod tests {
                     "base_revision": 0,
                     "skipped_task_ids": [],
                     "plan": PlanRevision {
+                        domain_binding: None,
+
                         plan_id: "plan".to_string(),
                         run_id: "publish-degraded".to_string(),
                         revision: 1,
@@ -2799,6 +2808,8 @@ mod tests {
                     "base_revision": 0,
                     "skipped_task_ids": [],
                     "plan": PlanRevision {
+                        domain_binding: None,
+
                         plan_id: "plan".to_string(),
                         run_id: "hidden-degraded".to_string(),
                         revision: 1,

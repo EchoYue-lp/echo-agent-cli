@@ -4,12 +4,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useUiStore } from '../../stores/uiStore';
 import { TerminalDrawer } from './TerminalDrawer';
 import { Terminal } from './Terminal';
-import { terminalApi } from '../../api/endpoints';
+import { terminalApi, type Workspace } from '../../api/endpoints';
 
 const mocks = vi.hoisted(() => {
   window.localStorage.setItem('echo-theme', 'light');
   return {
     desktop: true,
+    workspace: null as Workspace | null,
     invoke: vi.fn(),
     listen: vi.fn(),
     terminals: [] as Array<{
@@ -20,6 +21,10 @@ const mocks = vi.hoisted(() => {
     handlers: new Map<string, Set<(event: { payload: Record<string, unknown> }) => void>>(),
   };
 });
+vi.mock('../../stores/workspaceStore', () => ({
+  useWorkspaceStore: (selector: (state: { current: Workspace | null }) => unknown) =>
+    selector({ current: mocks.workspace }),
+}));
 vi.mock('../../lib/tauri-bridge', async (original) => ({
   ...(await original<typeof import('../../lib/tauri-bridge')>()),
   isTauri: () => mocks.desktop,
@@ -68,6 +73,7 @@ vi.mock('@xterm/addon-fit', () => ({
 
 beforeEach(() => {
   mocks.desktop = true;
+  mocks.workspace = null;
   mocks.terminals.length = 0;
   mocks.handlers.clear();
   mocks.invoke.mockReset().mockImplementation(async (command, args) => {
@@ -101,6 +107,45 @@ function creates() {
 }
 
 describe('terminal drawer session observation', () => {
+  it('captures the project generation once and keeps an explicit local terminal separate', async () => {
+    mocks.workspace = {
+      id: 'remote-project',
+      name: '远程项目',
+      root: '/local/product-data',
+      kind: { type: 'code' },
+      metadata: {
+        tags: [],
+        project_location: {
+          kind: 'ssh',
+          host: 'alias',
+          user: 'echo',
+          port: null,
+          path: '/srv/project',
+        },
+      },
+      product_data_generation: 'project-generation-a',
+      created_at: '',
+      last_active: '',
+    };
+    const view = render(<TerminalDrawer />);
+    await waitFor(() => expect(creates()).toHaveLength(1));
+    expect(creates().at(0)?.at(1)).toMatchObject({
+      projectWorkspaceId: 'remote-project',
+      projectWorkspaceGeneration: 'project-generation-a',
+    });
+    expect(creates().at(0)?.at(1).target).toBeUndefined();
+    mocks.workspace = {
+      ...mocks.workspace,
+      id: 'another-project',
+      product_data_generation: 'generation-b',
+    };
+    view.rerender(<TerminalDrawer />);
+    expect(creates()).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: '新建独立本地终端' }));
+    await waitFor(() => expect(creates()).toHaveLength(2));
+    expect(creates().at(1)?.at(1).target).toEqual({ kind: 'local' });
+    expect(creates().at(1)?.at(1).projectWorkspaceId).toBeUndefined();
+  });
   it('waits for observers before creating the child', async () => {
     let ready: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {

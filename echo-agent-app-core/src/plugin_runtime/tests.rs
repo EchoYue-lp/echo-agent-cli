@@ -330,8 +330,9 @@ mod tests {
             }),
             "fixture must include a retained generic warning"
         );
-        let components = prepare_application_components(&prepared, "diagnostic-contract")
-            .map_err(|errors| errors.join("; "))?;
+        let components =
+            prepare_application_components(&prepared, "diagnostic-contract", &registry)
+                .map_err(|errors| errors.join("; "))?;
         let summary = ReloadSummary::from_components(1, 1, None, Some(&prepared), &components);
         assert_eq!(summary.errors.len(), prepared.diagnostics().len());
         for diagnostic in prepared.diagnostics() {
@@ -422,7 +423,7 @@ mod tests {
         assert_eq!(cached.generation(), prepared.generation());
         assert_eq!(cached.identity(), prepared.identity());
         assert_eq!(cached.diagnostics(), prepared.diagnostics());
-        let components = prepare_application_components(&prepared, "snapshot-test")
+        let components = prepare_application_components(&prepared, "snapshot-test", &registry)
             .map_err(|errors| errors.join("; "))?;
         let observed = ReloadSummary::from_components(1, 1, None, Some(&prepared), &components);
         assert!(
@@ -443,8 +444,9 @@ mod tests {
                 .all(|diagnostic| diagnostic.component() != "lsp")
         );
         std::fs::write(&legacy, "late legacy file").map_err(|error| error.to_string())?;
-        let clean_components = prepare_application_components(&clean, "snapshot-test")
-            .map_err(|errors| errors.join("; "))?;
+        let clean_components =
+            prepare_application_components(&clean, "snapshot-test", &clean_registry)
+                .map_err(|errors| errors.join("; "))?;
         let observed = ReloadSummary::from_components(1, 1, None, Some(&clean), &clean_components);
         assert!(
             !observed
@@ -482,7 +484,7 @@ mod tests {
             diagnostic.severity(),
             echo_agent::plugin::PluginDiagnosticSeverity::Error
         );
-        let components = prepare_application_components(&invalid, "snapshot-test")
+        let components = prepare_application_components(&invalid, "snapshot-test", &clean_registry)
             .map_err(|errors| errors.join("; "))?;
         let summary = ReloadSummary::from_components(1, 1, None, Some(&invalid), &components);
         assert!(
@@ -3546,6 +3548,159 @@ mod tests {
         // fixture; the test owns and removes that debt after proving admission.
         let retained = take_parked_cleanup_receipts(temp.path());
         assert_eq!(retained.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn domain_identity_uses_published_eko_definitions_not_runtime_timestamps_or_theme()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
+        let runtime = service(temp.path()).await?;
+        let mut registry = runtime.registry_for(temp.path().to_path_buf());
+        runtime
+            .scan_registry(&mut registry)
+            .map_err(|error| error.to_string())?;
+        let generation = runtime.integrator.prepare(&mut registry).await;
+        let prepare = || {
+            prepare_application_components(&generation, "identity-fixture", &registry)
+                .map_err(|errors| errors.join("; "))
+        };
+        let first = prepare()?;
+        let identity = first
+            .domains
+            .plugins
+            .get("runtime-fixture")
+            .ok_or("domain package missing")?
+            .identity
+            .clone();
+        assert_eq!(identity.version.as_deref(), Some("0.1.0"));
+        assert_eq!(
+            prepare()?
+                .domains
+                .plugins
+                .get("runtime-fixture")
+                .ok_or("domain package missing")?
+                .identity,
+            identity
+        );
+        std::fs::create_dir_all(plugin.join("themes")).map_err(|error| error.to_string())?;
+        std::fs::write(
+            plugin.join("themes/example.json"),
+            r##"{"name":"example","colors":{"background":"#222"}}"##,
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            prepare()?
+                .domains
+                .plugins
+                .get("runtime-fixture")
+                .ok_or("domain package missing")?
+                .identity,
+            identity
+        );
+        std::fs::write(plugin.join("monitors.yaml"), "monitors:\n  - name: daily-review\n    cron: \"0 0 * * * *\"\n    prompt: A different automated instruction\n").map_err(|error| error.to_string())?;
+        let changed_monitor = prepare()?
+            .domains
+            .plugins
+            .get("runtime-fixture")
+            .ok_or("domain package missing")?
+            .identity
+            .clone();
+        assert_ne!(changed_monitor, identity);
+        std::fs::create_dir_all(plugin.join("output-styles")).map_err(|error| error.to_string())?;
+        std::fs::write(
+            plugin.join("output-styles/evidence.md"),
+            "---\nname: evidence\n---\nCite exact evidence.\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let changed_style = prepare()?
+            .domains
+            .plugins
+            .get("runtime-fixture")
+            .ok_or("domain package missing")?
+            .identity
+            .clone();
+        assert_ne!(changed_style, changed_monitor);
+        assert_eq!(
+            generation.identity(),
+            runtime.integrator.prepare(&mut registry).await.identity()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn domain_prepare_blocks_persisting_decoded_sensitive_values_with_escapes()
+    -> Result<(), String> {
+        for secret in ["fixture\nprivate", "fixture\"private", "fixture\\private"] {
+            let temp = tempfile::tempdir().map_err(|_| "fixture directory unavailable")?;
+            let plugin = write_fixture(temp.path())?;
+            let path = plugin.join("plugin.json");
+            let mut manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&path).map_err(|_| "fixture manifest read failed")?,
+            )
+            .map_err(|_| "fixture manifest parse failed")?;
+            manifest.as_object_mut().ok_or("fixture manifest must be an object")?.insert("config".to_string(), serde_json::json!({
+                "credential": { "type": "string", "title": "Fixture credential", "sensitive": true, "default": secret }
+            }));
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&manifest).map_err(|_| "fixture manifest encoding failed")?,
+            )
+            .map_err(|_| "fixture manifest write failed")?;
+            let mut declaration = crate::domain_plugin::DomainDeclaration {
+                schema_version: 1,
+                method: format!("Private method: {secret}"),
+                default_subagent_roles: Default::default(),
+                allowed_tools: Vec::new(),
+                required_artifacts: Vec::new(),
+                execution_checks: Vec::new(),
+                acceptance_criteria: Vec::new(),
+                review_checklist: Vec::new(),
+                inputs: Vec::new(),
+            };
+            for private_rules in [false, true] {
+                if private_rules {
+                    declaration.method = "Safe method".to_string();
+                    declaration.review_checklist = vec![secret.to_string()];
+                }
+                std::fs::write(
+                    plugin.join("domain.yaml"),
+                    serde_yaml::to_string(&declaration)
+                        .map_err(|_| "fixture declaration encoding failed")?,
+                )
+                .map_err(|_| "fixture declaration write failed")?;
+                let runtime = service(temp.path()).await?;
+                let mut registry = runtime.registry_for(temp.path().to_path_buf());
+                runtime
+                    .scan_registry(&mut registry)
+                    .map_err(|_| "fixture registry scan failed")?;
+                let generation = runtime.integrator.prepare(&mut registry).await;
+                let prepared = prepare_application_components(
+                    &generation,
+                    "private-domain-fixture",
+                    &registry,
+                )
+                .map_err(|_| "fixture prepare failed")?;
+                assert!(
+                    prepared
+                        .domains
+                        .bind("runtime-fixture", None, &[])
+                        .is_err_and(
+                            |error| error.contains("contains sensitive configuration content")
+                        ),
+                    "sensitive declaration must not reach a persistable binding"
+                );
+                assert!(
+                    !prepared
+                        .domains
+                        .catalog_prompt()
+                        .unwrap_or_default()
+                        .contains(secret),
+                    "domain catalog must not expose a configured credential"
+                );
+            }
+        }
         Ok(())
     }
 }

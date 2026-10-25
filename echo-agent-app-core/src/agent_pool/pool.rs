@@ -36,7 +36,7 @@ pub struct AgentPool {
     /// conversation Agent instead of only the bootstrap primary.
     thinking_override: RwLock<Option<echo_agent::llm::ThinkingConfig>>,
     /// Exact plugin generation projected into existing and future agents.
-    agent_generation: RwLock<AgentPluginGeneration>,
+    agent_generation: Arc<RwLock<AgentPluginGeneration>>,
     /// Cancellation token for the cleanup monitor task.
     cleanup_cancel: CancellationToken,
     /// Sole owned cleanup monitor settlement handle. The monitor holds only a
@@ -178,6 +178,11 @@ impl PreparedAgentPoolPluginPublication<'_> {
                 &retired,
                 None,
                 self.pool.shared.review_integration.clone(),
+                self.pool
+                    .shared
+                    .workspace_data_root
+                    .as_deref()
+                    .map(crate::workspace::layout::WorkspaceLayout::state_dir),
             )
             .await
             {
@@ -244,6 +249,11 @@ impl PreparedAgentPoolPluginPublication<'_> {
                 &candidate,
                 application_skill_repair.as_ref(),
                 self.pool.shared.review_integration.clone(),
+                self.pool
+                    .shared
+                    .workspace_data_root
+                    .as_deref()
+                    .map(crate::workspace::layout::WorkspaceLayout::state_dir),
             )
             .await
             {
@@ -255,6 +265,11 @@ impl PreparedAgentPoolPluginPublication<'_> {
                         &self.previous,
                         application_skill_repair.as_ref(),
                         self.pool.shared.review_integration.clone(),
+                        self.pool
+                            .shared
+                            .workspace_data_root
+                            .as_deref()
+                            .map(crate::workspace::layout::WorkspaceLayout::state_dir),
                     )
                     .await
                     {
@@ -302,6 +317,11 @@ impl PreparedAgentPoolPluginPublication<'_> {
                 &self.previous,
                 self.application_skill_repair.as_ref(),
                 self.pool.shared.review_integration.clone(),
+                self.pool
+                    .shared
+                    .workspace_data_root
+                    .as_deref()
+                    .map(crate::workspace::layout::WorkspaceLayout::state_dir),
             )
             .await
             {
@@ -457,12 +477,12 @@ impl AgentPool {
             project_root: RwLock::new(runtime.project_root.clone()),
             permission_mode: RwLock::new(PermissionMode::Default),
             thinking_override: RwLock::new(None),
-            agent_generation: RwLock::new(AgentPluginGeneration::new(
+            agent_generation: Arc::new(RwLock::new(AgentPluginGeneration::new(
                 0,
                 skill_descriptors,
                 Vec::new(),
                 None,
-            )),
+            ))),
             cleanup_cancel: CancellationToken::new(),
             cleanup_handle: Mutex::new(None),
             conversation_store_override: RwLock::new(None),
@@ -520,6 +540,9 @@ impl AgentPool {
     )> {
         let WorkspaceAgentPoolResources {
             root,
+            execution_root,
+            file_system,
+            executor,
             project_root,
             kind,
             conversation_store,
@@ -542,7 +565,10 @@ impl AgentPool {
             subagent_event_bus: self.shared.subagent_event_bus.clone(),
             tool_manager: None,
             hook_registry: None,
-            sandbox_manager: self.shared.sandbox_manager.clone(),
+            sandbox_manager: Some(executor),
+            local_skill_executor: self.shared.local_skill_executor.clone(),
+            file_system: Some(file_system.clone()),
+            workspace_data_root: Some(root.clone()),
             store: Some(memory_store),
             conversation_store: Some(conversation_store),
             run_store: self.shared.run_store.clone(),
@@ -571,11 +597,11 @@ impl AgentPool {
             config: self.config.clone(),
             app_config: RwLock::new(self.app_config.read().await.clone()),
             conversation_model_overrides: RwLock::new(HashMap::new()),
-            working_dir: RwLock::new(Some(root.clone())),
+            working_dir: RwLock::new(Some(execution_root.clone())),
             project_root: RwLock::new(project_root),
             permission_mode: RwLock::new(*self.permission_mode.read().await),
             thinking_override: RwLock::new(self.thinking_override.read().await.clone()),
-            agent_generation: RwLock::new(authority_plugin_generation.clone()),
+            agent_generation: Arc::new(RwLock::new(authority_plugin_generation.clone())),
             cleanup_cancel: CancellationToken::new(),
             cleanup_handle: Mutex::new(None),
             conversation_store_override: RwLock::new(None),
@@ -592,7 +618,9 @@ impl AgentPool {
 
         let primary = pool.create_agent("__workspace_primary__").await?;
         let app_config = self.app_config.read().await.clone();
-        crate::infra::load_user_hooks(&primary.handle, &app_config, Some(root.as_path())).await;
+        crate::infra::load_user_hooks(&primary.handle, &app_config, Some(execution_root.as_path()))
+            .await
+            .map_err(anyhow::Error::msg)?;
         primary
             .handle
             .write(move |agent| {
@@ -810,7 +838,7 @@ impl AgentPool {
             project_root: RwLock::new(None),
             permission_mode: RwLock::new(PermissionMode::Default),
             thinking_override: RwLock::new(None),
-            agent_generation: RwLock::new(AgentPluginGeneration::default()),
+            agent_generation: Arc::new(RwLock::new(AgentPluginGeneration::default())),
             cleanup_cancel: CancellationToken::new(),
             cleanup_handle: Mutex::new(None),
             conversation_store_override: RwLock::new(None),
@@ -901,11 +929,17 @@ impl AgentPool {
                 }
             });
             let handle = existing.handle.clone();
-            let lease = self.admission.issue_process_scoped(
-                conversation_id,
-                handle,
-                &self.process_agent_execution,
-            )?;
+            let registry = existing.subagent_registry.clone();
+            let tools = existing.tool_manager.clone();
+            let lease = self
+                .admission
+                .issue_process_scoped(conversation_id, handle, &self.process_agent_execution)?
+                .with_plugin_generation(
+                    &*self.agent_generation.read().await,
+                    registry,
+                    tools,
+                    self.tool_control.clone(),
+                );
             drop(agents);
             return Ok(lease);
         }
@@ -966,11 +1000,15 @@ impl AgentPool {
             .map_err(|e| PoolError::AgentCreation(e.to_string()))?;
         let handle = pooled.handle.clone();
 
-        let lease = self.admission.issue_process_scoped(
-            conversation_id,
-            handle,
-            &self.process_agent_execution,
-        )?;
+        let lease = self
+            .admission
+            .issue_process_scoped(conversation_id, handle, &self.process_agent_execution)?
+            .with_plugin_generation(
+                &*self.agent_generation.read().await,
+                pooled.subagent_registry.clone(),
+                pooled.tool_manager.clone(),
+                self.tool_control.clone(),
+            );
         agents.insert(conversation_id.to_string(), pooled);
 
         tracing::info!(
@@ -1001,14 +1039,24 @@ impl AgentPool {
                 conversation_id: conversation_id.to_string(),
             });
         }
+        let generation = self.agent_generation.read().await;
         let lease = agents
             .get(conversation_id)
             .map(|pooled| {
-                self.admission.issue_process_scoped(
-                    conversation_id,
-                    pooled.handle.clone(),
-                    &self.process_agent_execution,
-                )
+                self.admission
+                    .issue_process_scoped(
+                        conversation_id,
+                        pooled.handle.clone(),
+                        &self.process_agent_execution,
+                    )
+                    .map(|lease| {
+                        lease.with_plugin_generation(
+                            &generation,
+                            pooled.subagent_registry.clone(),
+                            pooled.tool_manager.clone(),
+                            self.tool_control.clone(),
+                        )
+                    })
             })
             .transpose()?;
         drop(agents);
@@ -1112,6 +1160,9 @@ impl AgentPool {
         conversation_id: &str,
         execution: AgentPoolExecutionLease,
     ) -> bool {
+        // The original supervisor retains this receipt while real Subagent
+        // projections run. Do not hold the pool lock across their settlement.
+        execution.wait_for_physical_projections().await;
         let mut agents = self.agents.write().await;
         drop(execution);
         if self.admission.is_active(conversation_id) {
@@ -1647,12 +1698,76 @@ impl AgentPool {
     }
 
     /// Return the primary Agent for this pool generation.
+    pub(crate) async fn install_domain_registration_admission(&self, agent: &AgentHandle) {
+        let registry = agent.read(|agent| agent.subagent_registry().clone()).await;
+        registry
+            .set_registration_admission(Some(Arc::new(DomainRegistrationAdmission {
+                registry: Arc::downgrade(&registry),
+                generation: Arc::downgrade(&self.agent_generation),
+                admission: Arc::downgrade(&self.admission),
+                store: self.shared.task_runtime_store.as_ref().map(Arc::downgrade),
+            })))
+            .await;
+    }
+
     pub(crate) async fn primary_agent(&self) -> anyhow::Result<AgentHandle> {
         self.primary_agent
             .read()
             .await
             .clone()
             .ok_or_else(|| anyhow::anyhow!("AgentPool primary Agent is unavailable"))
+    }
+
+    /// The caller retains this same execution lease through invocation settlement.
+    /// Plugin publication cannot replace its prepared data or role catalog while
+    /// the lease is live; this is not a queue-time readiness observation.
+    pub(crate) async fn bind_domain(
+        &self,
+        lease: &AgentPoolExecutionLease,
+        plugin_id: &str,
+    ) -> Result<crate::domain_plugin::DomainBinding, String> {
+        self.require_domain_lease(lease)?;
+        let (components, style) = lease
+            .domain_generation
+            .as_ref()
+            .ok_or_else(|| "domain admission lease has no published generation".to_string())?;
+        let (registry, tools) = lease
+            .admitted_catalogs
+            .as_ref()
+            .ok_or_else(|| "domain admission lost its original Agent catalogs".to_string())?;
+        let definitions = registry.list_available().await;
+        let binding = components.bind(plugin_id, style.as_deref(), &definitions)?;
+        let policy = self
+            .tool_control
+            .snapshot()
+            .map_err(|error| error.to_string())?;
+        binding.check_capabilities(&tools.list_tools(), &policy.disabled_tools)?;
+        Ok(binding)
+    }
+
+    pub(crate) async fn verify_domain_binding(
+        &self,
+        lease: &AgentPoolExecutionLease,
+        binding: &crate::domain_plugin::DomainBinding,
+    ) -> Result<(), String> {
+        self.require_domain_lease(lease)?;
+        lease.verify_domain_binding(binding).await
+    }
+
+    fn require_domain_lease(&self, lease: &AgentPoolExecutionLease) -> Result<(), String> {
+        if !lease
+            .physical
+            .admission
+            .as_ref()
+            .is_some_and(|(owner, key)| {
+                Arc::ptr_eq(owner, &self.admission) && lease.owns(&self.admission, key)
+            })
+        {
+            return Err(
+                "domain execution requires this pool's original live execution lease".to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// Maximum number of non-background agents this pool may create.
@@ -1953,6 +2068,10 @@ impl AgentPool {
             .get(conversation_id)
             .cloned();
         let params = infra::AgentCreateParams {
+            file_system: self.shared.file_system.clone(),
+            sandbox_executor: self.shared.sandbox_manager.clone(),
+            local_skill_executor: self.shared.local_skill_executor.clone(),
+            workspace_data_root: self.shared.workspace_data_root.clone(),
             model,
             system_prompt: None,
             project: project_root
@@ -2084,9 +2203,16 @@ impl AgentPool {
                 .await
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
-        register_plugin_agents(&mut agent, &agent_generation.plugin_agents)
-            .await
-            .map_err(anyhow::Error::msg)?;
+        register_plugin_agents(
+            &mut agent,
+            &agent_generation.plugin_agents,
+            self.shared
+                .workspace_data_root
+                .as_deref()
+                .map(crate::workspace::layout::WorkspaceLayout::state_dir),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
         agent
             .replace_system_context_projection(
                 crate::plugin_runtime::OUTPUT_STYLE_PROJECTION,
@@ -2157,10 +2283,23 @@ impl AgentPool {
                 .await;
         }
 
+        // Capture the existing thread-safe catalog owners before the Agent
+        // is admitted. Domain tools must not re-enter its streaming RwLock.
+        self.install_domain_registration_admission(&handle).await;
+        let (registry, tools) = handle
+            .read(|agent| {
+                (
+                    agent.subagent_registry().clone(),
+                    agent.tool_manager().clone(),
+                )
+            })
+            .await;
         Ok(PooledAgent::new(
             handle,
             model_consumers,
             conversation_id.to_string(),
+            registry,
+            tools,
         ))
     }
 }

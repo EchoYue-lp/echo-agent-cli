@@ -2,13 +2,16 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { X, Plus, Minimize2 } from 'lucide-react';
 import { useUiStore } from '../../stores/uiStore';
 import { Terminal, type TerminalViewState } from './Terminal';
-import type { TerminalTarget } from '../../api/endpoints';
+import type { TerminalTarget, ProductDataScope } from '../../api/endpoints';
 import { isTauri } from '../../lib/tauri-bridge';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { productDataScope } from '../../lib/productDataScope';
 
 interface TerminalTab {
   id: string;
   label: string;
   target: TerminalTarget;
+  projectScope?: ProductDataScope;
   closeRequest: number;
   state: TerminalViewState;
 }
@@ -25,6 +28,7 @@ function hasControlCharacters(value: string): boolean {
 }
 
 export function TerminalDrawer() {
+  const workspace = useWorkspaceStore((store) => store.current);
   const terminalOpen = useUiStore((store) => store.terminalOpen);
   const hideTerminal = useUiStore((store) => store.closeTerminal);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
@@ -44,15 +48,16 @@ export function TerminalDrawer() {
     setTabs(next);
   }, []);
   const createTab = useCallback(
-    (target: TerminalTarget) => {
+    (target: TerminalTarget, projectScope?: ProductDataScope, label?: string) => {
       const id = `term-${crypto.randomUUID()}`;
       sequence.current += 1;
       updateTabs((current) => [
         ...current,
         {
           id,
-          label: `Terminal ${sequence.current}`,
+          label: label ?? `Terminal ${sequence.current}`,
           target,
+          projectScope,
           closeRequest: 0,
           state: { phase: 'preparing' },
         },
@@ -62,9 +67,21 @@ export function TerminalDrawer() {
     [updateTabs]
   );
   const createLocal = useCallback(() => createTab({ kind: 'local' }), [createTab]);
+  const createProject = useCallback(() => {
+    if (!workspace) {
+      createLocal();
+      return;
+    }
+    const location = workspace.metadata.project_location;
+    const target: TerminalTarget =
+      location?.kind === 'ssh'
+        ? { kind: 'ssh', host: location.host, user: location.user, port: location.port }
+        : { kind: 'local' };
+    createTab(target, productDataScope(workspace), `项目 ${workspace.name}`);
+  }, [workspace, createLocal, createTab]);
   useEffect(() => {
-    if (terminalOpen && tabRef.current.length === 0) createLocal();
-  }, [terminalOpen, createLocal]);
+    if (terminalOpen && tabRef.current.length === 0) createProject();
+  }, [terminalOpen, createProject]);
   const onState = useCallback(
     (id: string, state: TerminalViewState) => {
       updateTabs((current) => current.map((tab) => (tab.id === id ? { ...tab, state } : tab)));
@@ -188,13 +205,23 @@ export function TerminalDrawer() {
             </div>
           ))}
           <button
-            onClick={createLocal}
+            onClick={createProject}
             title="New terminal"
-            aria-label="新建本地终端"
+            aria-label={workspace ? '新建项目终端' : '新建本地终端'}
             className="rounded-md p-1 text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
           >
             <Plus size={14} />
           </button>
+          {workspace && (
+            <button
+              type="button"
+              onClick={createLocal}
+              aria-label="新建独立本地终端"
+              className="rounded px-2 py-1 text-xs text-[var(--text-secondary)]"
+            >
+              本地
+            </button>
+          )}
           <button
             disabled={!isTauri()}
             onClick={() => setSshForm((open) => !open)}
@@ -284,6 +311,7 @@ export function TerminalDrawer() {
             <Terminal
               sessionId={tab.id}
               target={tab.target}
+              projectScope={tab.projectScope}
               visible={terminalOpen && tab.id === activeId}
               closeRequest={tab.closeRequest}
               onStateChange={onState}

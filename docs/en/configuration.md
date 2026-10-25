@@ -165,3 +165,27 @@ Legacy `.lsp.yaml` is no longer parsed or hot-reloaded. Discovery only reports t
 Each active EKO channel approval, input or selection prompt supplies a response target. Reply with `/reply <response-target> <answer>`; use `/reply <response-target> /cancel` to decline. Approval answers retain `y`, `a`, `n [reason]` and `m [feedback]`; selection accepts its original option number or name. Free-text input preserves its answer suffix, including Unicode and newlines. A pending request is not answered by bare text. Missing, old, non-front or foreign-session targets are rejected and do not become normal chat; ordinary text without a pending request remains chat.
 
 Submission is distinct from the original provider/dispatcher's effective answer. GUI replies carry the original delivered scope and target across page changes; historical events without a target are not activated. See [ADR0053](adr/0053-im-cron-gui-control.md) for the contract and the pending Rust/native, live composition and IM/cron qualification boundaries. The identity source checkpoint does not claim that the complete channel management page or native platform delivery has been verified.
+
+## Domain method declarations
+
+An enabled plugin may add one package-root `domain.yaml`. It declares
+`schema_version: 1`, nonempty `method`, optional `default_subagent_roles`, and
+explicit `allowed_tools`, `required_artifacts`, `execution_checks`,
+`acceptance_criteria`, `review_checklist` and `inputs` lists. Unknown fields or
+invalid declarations reject the candidate through the original publication
+error path. No declaration means an ordinary plugin, not an implicit domain.
+Manifest name and optional version are not duplicated in this file.
+
+The existing chat/task request accepts optional `domain_plugin` (GUI camelCase
+`domainPlugin`). Omission keeps General. The original input queue stores that
+selection with its payload identity; it cannot change an active run by steering.
+New non-General `domain_profile` requests must select a plugin instead. Historical
+profile names remain readable; they do not authorize new professional execution.
+
+Inputs are normalized package-relative files. Selected/dependent package content,
+monitors, output styles and the actually active global style provider contribute
+to the binding; pure theme colors do not. A changed or missing source blocks new
+execution instead of replacing the run's original rules. Known sensitive values
+cannot be copied into a binding or journal. Manual terminal/MCP interaction is
+unaffected. See [the example](../../examples/domain-plugin/README.md). Current
+source work is uncompiled and adhoc background delegation remains incomplete.

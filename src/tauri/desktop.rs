@@ -196,6 +196,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         command_cell_runtime: None,
         product_data_io: None,
         execution_scope: None,
+        ..Default::default()
     };
 
     let runtime = echo_agent_app_core::api::runtime::AgentRuntime::bootstrap(

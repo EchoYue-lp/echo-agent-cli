@@ -175,6 +175,7 @@ trait TaskDispatcher: Send + Sync {
 struct RealTaskDispatcher {
     primary_agent: crate::agent_handle::AgentHandle,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
+    invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
 }
 
 async fn resolve_task_execution_agent(
@@ -219,8 +220,69 @@ async fn resolve_task_execution_agent(
         )
     })?;
     let lease = resolver.acquire(&leader, target).await?;
+    if let Some(binding) = blocking
+        .run("read target dispatch original domain binding", {
+            let run_id = run_id.to_string();
+            move |store| {
+                Ok(store
+                    .get_run_state(&run_id)?
+                    .and_then(|state| state.domain_binding))
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        lease.verify_domain_binding(&binding).await?;
+    }
     let agent = lease.agent();
     Ok((agent, Some(lease)))
+}
+
+async fn resolve_task_project_environment(
+    store: &TaskRuntimeStore,
+    task: &PlanTask,
+) -> Result<Option<super::store::ProjectExecutionEnvironment>, String> {
+    let Some(target) = task.execution_target.as_ref() else {
+        return Ok(store.project_environment());
+    };
+    let resolver = store
+        .execution_target_resolver()
+        .ok_or_else(|| "cross-workspace project resolver is unavailable".to_string())?;
+    let environment = resolver.project_environment(target).await?;
+    if environment.as_ref().map(|environment| &environment.binding)
+        != target.project_binding.as_ref()
+    {
+        return Err(
+            "cross-workspace project location changed after its PlanTask revision was accepted"
+                .to_string(),
+        );
+    }
+    Ok(environment)
+}
+
+async fn prepare_project_agent(
+    agent: &crate::agent_handle::AgentHandle,
+    environment: Option<super::store::ProjectExecutionEnvironment>,
+    working_dir: Option<std::path::PathBuf>,
+    resource_guards: Vec<echo_agent::tools::InvocationResourceGuard>,
+) -> Result<Option<crate::infra::PreparedProjectContext>, String> {
+    let Some(environment) = environment else {
+        return Ok(None);
+    };
+    // Read facts before the model driver, then bind the immutable result to
+    // its actual turn. Mutating current messages alone would be undone by
+    // Execute/checkpoint restore; no shared Agent preparation lock is needed.
+    let token_limit = agent.read(|agent| agent.config().get_token_limit()).await;
+    crate::infra::prepare_dynamic_project_context(
+        working_dir.as_deref(),
+        Some(&environment.state_dir),
+        environment.files,
+        environment.executor,
+        resource_guards,
+        token_limit,
+    )
+    .await
+    .map(Some)
 }
 
 impl TaskDispatcher for RealTaskDispatcher {
@@ -239,6 +301,7 @@ impl TaskDispatcher for RealTaskDispatcher {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TaskDispatchResult> + Send>> {
         let local_agent = self.primary_agent.clone();
         let workspace_io = self.workspace_io.clone();
+        let mut invocation_resources = self.invocation_resources.clone();
         Box::pin(async move {
             let run_id = context.run_id().to_owned();
             let cancel = context.cancellation_token().clone();
@@ -251,6 +314,24 @@ impl TaskDispatcher for RealTaskDispatcher {
             // A cross-workspace target needs its own target-runtime receipt.
             // Never reuse the leader workspace authority for that Agent.
             let workspace_io = target_lease.is_none().then_some(workspace_io).flatten();
+            if let Some(target) = target_lease.as_ref() {
+                let binding = store
+                    .get_run_state(&run_id)
+                    .map_err(|error| {
+                        TaskDispatchFailure::failed(task.id.clone(), error.to_string())
+                    })?
+                    .and_then(|state| state.domain_binding);
+                if let Some(binding) = binding {
+                    let projection = super::compact_context::task_runtime_projection_registry()
+                        .retain_for_invocation(&run_id, store.clone())
+                        .map_err(|error| TaskDispatchFailure::failed(task.id.clone(), error))?;
+                    invocation_resources = vec![
+                        target
+                            .domain_resource_guard(&run_id, &binding, Some(Arc::new(projection)))
+                            .map_err(|error| TaskDispatchFailure::failed(task.id.clone(), error))?,
+                    ];
+                }
+            }
             // Scope run_id + cancel + trace_sink into task-local so Subagent-internal
             // tools (task_*/task_execute, and their execute_with_context
             // fallback path) and L3 nested Subagents can read them.
@@ -280,6 +361,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                         cancel,
                         delegation_policy,
                         workspace_io,
+                        invocation_resources,
                     )
                     .await
                 },
@@ -337,12 +419,19 @@ impl TaskDispatcher for RealTaskDispatcher {
                 .read(|agent| agent.working_dir())
                 .await
                 .ok_or_else(|| "writer integration requires a Git working directory".to_string())?;
-            let repo_root =
-                tokio::task::spawn_blocking(move || super::worktree::git_repo_root(&working_dir))
-                    .await
-                    .map_err(|error| format!("failed to join repo-root lookup: {error}"))?
-                    .map_err(|error| error.to_string())?;
-            let merge_lock = super::worktree::repo_merge_lock(&repo_root);
+            let environment = resolve_task_project_environment(&store, &task).await?;
+            let lookup_environment = environment.clone();
+            let repo_root = tokio::task::spawn_blocking(move || {
+                super::worktree::git_repo_root_in_environment(
+                    &working_dir,
+                    lookup_environment.as_ref(),
+                )
+            })
+            .await
+            .map_err(|error| format!("failed to join repo-root lookup: {error}"))?
+            .map_err(|error| error.to_string())?;
+            let merge_lock =
+                super::worktree::repo_merge_lock_in_environment(&repo_root, environment.as_ref());
             let _merge_guard = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err("cancelled while waiting for worktree integration".to_string()),
@@ -388,12 +477,13 @@ impl TaskDispatcher for RealTaskDispatcher {
             let repo_for_merge = repo_root.clone();
             let label_for_merge = label.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                super::worktree::integrate_fork_worktree(
+                super::worktree::integrate_fork_worktree_in_environment(
                     &repo_for_merge,
                     &label_for_merge,
                     &task_id,
                     &execution_for_merge,
                     &ownership,
+                    environment.as_ref(),
                 )
             })
             .await
@@ -853,7 +943,7 @@ struct EkoAgentTurnState {
     mutating_tool_observed: bool,
 }
 
-struct EkoAgentTurnObservation {
+pub(crate) struct EkoAgentTurnObservation {
     output: String,
     observed_evidence: Vec<echo_agent::subagent::SubagentEvidence>,
     observed_artifacts: Vec<echo_agent::subagent::SubagentArtifact>,
@@ -867,7 +957,7 @@ struct EkoAgentTurnObservation {
 /// detection, typed failures, cancellation, and provider-reported receipt
 /// accounting. This sink owns only EKO product projection and persistence:
 /// `ExecEvent`, exact event-id usage, tool boundaries, evidence, and artifacts.
-struct EkoAgentTurnSink {
+pub(crate) struct EkoAgentTurnSink {
     context: EkoAgentTurnContext,
     trace_sink: Option<ExecSink>,
     primary_task: Option<PrimaryTaskTurnPersistence>,
@@ -877,6 +967,19 @@ struct EkoAgentTurnSink {
 }
 
 impl EkoAgentTurnSink {
+    /// Reuse the real evidence collector without a second persistence path.
+    /// The foreground sink alone keeps usage, trace and terminal authority.
+    pub(crate) fn observe_chat(run: &TaskRun, mutating_tools: HashSet<String>) -> Self {
+        Self {
+            context: EkoAgentTurnContext::run(run),
+            trace_sink: None,
+            primary_task: None,
+            run_turn: None,
+            mutating_tools,
+            state: std::sync::Mutex::new(EkoAgentTurnState::default()),
+        }
+    }
+
     fn for_run(
         run: &TaskRun,
         turn_id: &str,
@@ -922,7 +1025,7 @@ impl EkoAgentTurnSink {
         emit_exec(self.trace_sink.as_ref(), self.context.event(kind, payload));
     }
 
-    fn finish(&self, final_answer: Option<&str>) -> EkoAgentTurnObservation {
+    pub(crate) fn finish(&self, final_answer: Option<&str>) -> EkoAgentTurnObservation {
         let mut state = self
             .state
             .lock()
@@ -1530,6 +1633,13 @@ impl TaskRuntimeOperationSupervisor {
 }
 
 impl TaskRuntimeOperation {
+    fn project_working_dir(&self) -> Option<std::path::PathBuf> {
+        self.store.project_working_dir()
+    }
+
+    fn project_environment(&self) -> Option<super::store::ProjectExecutionEnvironment> {
+        self.store.project_environment()
+    }
     pub fn new(store: Arc<TaskRuntimeStore>) -> Self {
         let supervisor = store.operation_supervisor();
         Self { store, supervisor }

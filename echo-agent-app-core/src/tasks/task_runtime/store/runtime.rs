@@ -62,6 +62,8 @@ impl TaskRuntimeStore {
         workspace_id: impl Into<String>,
     ) -> Self {
         Self {
+            project_environment: std::sync::OnceLock::new(),
+            workspace_io_identity: std::sync::OnceLock::new(),
             subagent_depth_defaults: std::sync::Arc::new(
                 crate::subagent_policy::SubagentDepthDefaults::default(),
             ),
@@ -2231,8 +2233,79 @@ impl TaskRuntimeStore {
         attended_mode: AttendedMode,
         execution_profile: TaskRunExecutionProfile,
     ) -> Result<(TaskRun, bool), StoreError> {
+        self.create_run_with_domain_result(
+            run_id,
+            workspace_id,
+            conversation_id,
+            root_message_id,
+            domain_profile,
+            goal,
+            route,
+            attended_mode,
+            execution_profile,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_run_for_active_workspace_with_domain(
+        &self,
+        run_id: &str,
+        conversation_id: &str,
+        root_message_id: &str,
+        domain_profile: DomainProfile,
+        goal: &str,
+        route: &str,
+        attended_mode: AttendedMode,
+        execution_profile: TaskRunExecutionProfile,
+        domain_binding: Option<&crate::domain_plugin::DomainBinding>,
+    ) -> Result<TaskRun, StoreError> {
+        let _operation = self.shadow_operation()?;
+        self.create_run_with_domain_result(
+            run_id,
+            &self.active_workspace_id(),
+            conversation_id,
+            root_message_id,
+            domain_profile,
+            goal,
+            route,
+            attended_mode,
+            execution_profile,
+            domain_binding,
+        )
+        .map(|(run, _)| run)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_run_with_domain_result(
+        &self,
+        run_id: &str,
+        workspace_id: &str,
+        conversation_id: &str,
+        root_message_id: &str,
+        domain_profile: DomainProfile,
+        goal: &str,
+        route: &str,
+        attended_mode: AttendedMode,
+        execution_profile: TaskRunExecutionProfile,
+        domain_binding: Option<&crate::domain_plugin::DomainBinding>,
+    ) -> Result<(TaskRun, bool), StoreError> {
+        if let Some(binding) = domain_binding {
+            binding.validate().map_err(StoreError::InvalidPlan)?;
+            if domain_profile != DomainProfile::General {
+                return Err(StoreError::InvalidPlan("new domain tasks use the General host projection and an explicit plugin binding".to_string()));
+            }
+            if binding.requires_plan()
+                && execution_profile.plan_policy != RunPlanPolicy::RequirePlan
+            {
+                return Err(StoreError::InvalidPlan(
+                    "domain obligations require a committed task graph".to_string(),
+                ));
+            }
+        }
         self.with_run_lock(run_id, || {
             if let Some(existing) = self.get_run(run_id)? {
+                self.validate_run_project_binding(run_id)?;
                 let existing_profile = self
                     .get_run_state(run_id)?
                     .map(|snapshot| snapshot.execution_profile)
@@ -2250,6 +2323,9 @@ impl TaskRuntimeStore {
                     || existing.domain_profile != domain_profile
                     || existing.route != route
                     || existing.attended_mode != attended_mode
+                    || domain_binding.is_some_and(|binding| {
+                        existing.domain_binding.as_ref() != Some(&binding.reference())
+                    })
                     || existing_profile != requested_profile
                 {
                     return Err(StoreError::InvalidPlan(format!(
@@ -2265,7 +2341,7 @@ impl TaskRuntimeStore {
                 execution_profile.with_subagent_depth_limit(self.new_execution_subagent_depth())
             };
 
-            let run = new_pending_run(
+            let mut run = new_pending_run(
                 run_id,
                 workspace_id,
                 conversation_id,
@@ -2275,6 +2351,8 @@ impl TaskRuntimeStore {
                 route,
                 attended_mode,
             );
+
+            run.domain_binding = domain_binding.map(crate::domain_plugin::DomainBinding::reference);
 
             // U1c phase-0/0bc step-2: file is the write authority. Append the
             // RunCreated event to events.jsonl and rebuild plan.json — no SQL
@@ -2296,6 +2374,8 @@ impl TaskRuntimeStore {
                     "attended_mode": attended_mode.as_str(),
                     "created_at": echo_agent::utils::time::to_local(run.created_at).to_rfc3339(),
                     "execution_profile": execution_profile,
+                    "project_binding": self.project_execution_binding(),
+                    "domain_binding": domain_binding,
                 }),
             ))?;
             self.spill_objective_artifact_if_bounded(
@@ -3012,6 +3092,7 @@ impl TaskRuntimeStore {
         let snapshot = self
             .get_run_state(run_id)?
             .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        self.validate_project_binding(snapshot.project_binding.as_ref())?;
         let run = snapshot.run.clone();
         if let Some(expected) = expected
             && let Err(error) = expected.validate_resumable(&snapshot)
@@ -3311,6 +3392,9 @@ impl TaskRuntimeStore {
             blockers.push(BootAutoResumeBlocker::ActiveCommandCell);
         }
         if execution_profile.subagent_depth_limit.is_none()
+            || self
+                .validate_project_binding(snapshot.project_binding.as_ref())
+                .is_err()
             || !self.list_recovery_blockers(run_id)?.is_empty()
         {
             blockers.push(BootAutoResumeBlocker::RecoveryBlocker);
@@ -3729,6 +3813,7 @@ impl TaskRuntimeStore {
         let context_metadata = serde_json::to_value(EkoPlanMetadata {
             plan_id: plan.plan_id,
             domain_profile: plan.domain_profile,
+            domain_binding: run.domain_binding.clone(),
             goal_revision: plan.goal_revision,
             goal_sha256: plan.goal_sha256,
         })?;
@@ -3844,6 +3929,16 @@ impl TaskRuntimeStore {
                 .map(super::completion_gate::requirements_for_plan)
                 .unwrap_or_default();
             let current = self.load_revisioned_task_graph(run_id)?;
+            if let Some(binding) = self
+                .get_run_state(run_id)?
+                .and_then(|state| state.domain_binding)
+            {
+                super::revisioned_runtime::check_domain_graph_rules(
+                    &binding,
+                    &commit.next.snapshot.tasks,
+                )
+                .map_err(StoreError::InvalidPlan)?;
+            }
             let prepared = prepare_revisioned_graph_commit(run_id, &run, current.as_ref(), commit)?;
             let revalidated_requirements = previous_plan
                 .as_ref()
@@ -3921,6 +4016,16 @@ impl TaskRuntimeStore {
                 ));
             }
             let current = self.load_revisioned_task_graph(run_id)?;
+            if let Some(binding) = self
+                .get_run_state(run_id)?
+                .and_then(|state| state.domain_binding)
+            {
+                super::revisioned_runtime::check_domain_graph_rules(
+                    &binding,
+                    &commit.next.snapshot.tasks,
+                )
+                .map_err(StoreError::InvalidPlan)?;
+            }
             let prepared = prepare_revisioned_graph_commit(run_id, &run, current.as_ref(), commit)?;
             let task = prepared.plan.tasks.first().ok_or_else(|| {
                 StoreError::InvalidPlan("direct completion contains no task".to_string())
@@ -4005,13 +4110,31 @@ impl TaskRuntimeStore {
     /// Publish a pending run and revision 1 as one visible file generation.
     /// A process failure before the final rename leaves only a hidden staging
     /// directory, which startup removes without exposing a partial TaskRun.
-    pub(crate) fn compare_and_publish_initial_revisioned_task_graph(
+    pub(crate) fn compare_and_publish_initial_revisioned_task_graph_with_domain(
         &self,
         run: &TaskRun,
         trigger: &InitialRunTriggerMetadata,
         continuation: Option<(bool, bool, Option<u64>, Option<u64>)>,
+        domain_binding: Option<&crate::domain_plugin::DomainBinding>,
+        execution_profile: TaskRunExecutionProfile,
         commit: echo_agent::tasks::TaskGraphCommit,
     ) -> Result<echo_agent::tasks::RevisionedTaskGraph, StoreError> {
+        if let Some(binding) = domain_binding {
+            binding.validate().map_err(StoreError::InvalidPlan)?;
+        }
+        if run.domain_binding != domain_binding.map(crate::domain_plugin::DomainBinding::reference)
+        {
+            return Err(StoreError::InvalidPlan(
+                "initial RunCreated requires its complete original domain binding".to_string(),
+            ));
+        }
+        if domain_binding.is_some_and(|binding| binding.requires_plan())
+            && execution_profile.plan_policy != RunPlanPolicy::RequirePlan
+        {
+            return Err(StoreError::InvalidPlan(
+                "domain obligations require a real task graph".to_string(),
+            ));
+        }
         self.with_run_lock(&run.run_id, || {
             if self.get_run(&run.run_id)?.is_some() {
                 return Err(StoreError::PlanConflict {
@@ -4027,6 +4150,9 @@ impl TaskRuntimeStore {
                 return Err(StoreError::InvalidPlan(
                     "initial task publication requires an uncommitted pending run".to_string(),
                 ));
+            }
+            if let Some(binding) = domain_binding {
+                super::revisioned_runtime::check_domain_graph_rules(binding, &commit.next.snapshot.tasks).map_err(StoreError::InvalidPlan)?;
             }
             let prepared = prepare_revisioned_graph_commit(&run.run_id, run, None, commit)?;
             let timestamp = Utc::now();
@@ -4048,8 +4174,10 @@ impl TaskRuntimeStore {
                         "attended_mode": run.attended_mode.as_str(),
                         "attachments": run.attachments,
                         "created_at": echo_agent::utils::time::to_local(run.created_at).to_rfc3339(),
-                        "execution_profile": TaskRunExecutionProfile::default()
-                            .with_subagent_depth_limit(self.new_execution_subagent_depth()),
+                        "execution_profile": if execution_profile.subagent_depth_limit.is_some() { execution_profile }
+                            else { execution_profile.with_subagent_depth_limit(self.new_execution_subagent_depth()) },
+                        "domain_binding": domain_binding,
+                        "project_binding": self.project_execution_binding(),
                     }),
                     timestamp,
                 ),

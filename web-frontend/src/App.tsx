@@ -19,6 +19,7 @@ import { RequireAuth } from './components/Auth/RequireAuth';
 import { workspaceIdForView } from './lib/viewAddress';
 import { useContextPaneStore } from './stores/contextPaneStore';
 import { useWorkspaceViewStore } from './stores/workspaceViewStore';
+import { useToastStore } from './stores/toastStore';
 
 function App() {
   const initConversations = useConversationStore((s) => s.init);
@@ -38,6 +39,7 @@ function App() {
   const openFiles = useContextPaneStore((s) => s.openFiles);
   const openPrimaryWorkbench = useCallback(
     (view: 'analysis' | 'research' | 'workflow' | 'extract') => {
+      useUiStore.getState().beginNavigation();
       useContextPaneStore.getState().reset();
       openWorkspaceView(view);
     },
@@ -45,7 +47,9 @@ function App() {
   );
 
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [newTaskOpen, setNewTaskOpen] = useState(false);
+  const workspaceDialogOpen = useUiStore((state) => state.workspaceDialogOpen);
+  const workspaceDialogSource = useUiStore((state) => state.workspaceDialogSource);
+  const closeWorkspaceDialog = useUiStore((state) => state.closeWorkspaceDialog);
 
   // Initialize workspace and conversation stores on mount
   useEffect(() => {
@@ -79,7 +83,20 @@ function App() {
   }, [activeId, currentWorkspaceId, loadTaskRun]);
 
   const handleNewTask = useCallback(() => {
-    setNewTaskOpen(true);
+    if (useWorkspaceStore.getState().isLoading) {
+      useToastStore.getState().addToast('info', '工作空间正在切换，请稍候');
+      return;
+    }
+    const epoch = useUiStore.getState().beginNavigation();
+    void useConversationStore
+      .getState()
+      .startNew()
+      .then(() => {
+        if (useUiStore.getState().navigationEpoch === epoch) {
+          useWorkspaceViewStore.getState().openChat();
+        }
+      })
+      .catch(() => useToastStore.getState().addToast('error', '新建任务失败，请重试'));
   }, []);
 
   useKeyboardShortcuts({
@@ -96,11 +113,9 @@ function App() {
     () => [
       {
         id: 'new-chat',
-        label: 'New Task',
-        description: 'Create a new task workspace',
-        action: () => {
-          setNewTaskOpen(true);
-        },
+        label: '新建任务',
+        description: '在当前工作空间开始一个新任务',
+        action: handleNewTask,
         category: 'Chat',
       },
       {
@@ -248,6 +263,7 @@ function App() {
       openFiles,
       openSettings,
       openTasks,
+      handleNewTask,
       openPrimaryWorkbench,
       setActiveSettingsTab,
       toggleSidebar,
@@ -265,7 +281,11 @@ function App() {
           right={<ContextPane />}
         />
         <SettingsDialog />
-        <NewTaskDialog isOpen={newTaskOpen} onClose={() => setNewTaskOpen(false)} />
+        <NewTaskDialog
+          isOpen={workspaceDialogOpen}
+          onClose={closeWorkspaceDialog}
+          initialSource={workspaceDialogSource}
+        />
         <CommandPalette
           isOpen={paletteOpen}
           onClose={() => setPaletteOpen(false)}

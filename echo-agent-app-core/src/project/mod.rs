@@ -1,3 +1,4 @@
+pub(crate) mod agent_adapter;
 pub mod coding_loop;
 pub mod context;
 pub mod detector;

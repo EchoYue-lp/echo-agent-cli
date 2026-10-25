@@ -24,6 +24,7 @@ use crate::plugin_components::{
 };
 use crate::scheduler::{CronTask, SchedulerRunner};
 
+pub(crate) const DOMAIN_CATALOG_PROJECTION: &str = "eko:plugin-domain-catalog";
 pub(crate) const OUTPUT_STYLE_PROJECTION: &str = "eko:plugin-output-style";
 
 #[derive(Debug, Clone, Serialize)]

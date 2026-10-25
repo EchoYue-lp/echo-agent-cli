@@ -27,7 +27,7 @@ use echo_agent::compression::ContextProjection;
 use echo_agent::llm::types::Message;
 use sha2::{Digest, Sha256};
 
-const INSTRUCTION_CONTEXT_PROJECTION: &str = "eko:instruction-context";
+pub(crate) const INSTRUCTION_CONTEXT_PROJECTION: &str = "eko:instruction-context";
 pub(crate) const HOT_MEMORY_CONTEXT_PROJECTION: &str = "eko:hot-memory-context";
 
 /// One strictly-read instruction generation shared by the primary agent and
@@ -39,6 +39,12 @@ pub(crate) struct InstructionProjectionSnapshot {
 }
 
 impl InstructionProjectionSnapshot {
+    pub(crate) fn projection(&self) -> echo_agent::compression::ContextProjection {
+        echo_agent::compression::ContextProjection {
+            marker: INSTRUCTION_CONTEXT_PROJECTION.to_string(),
+            message: self.message.clone(),
+        }
+    }
     pub(crate) fn revision(&self) -> &str {
         &self.revision
     }
@@ -228,6 +234,22 @@ pub(crate) fn load_instruction_projection_strict_with_state(
         }
         None => InstructionProvider::load_for_strict(project_root)?,
     };
+    Ok(instruction_projection_from_provider(provider))
+}
+
+pub(crate) fn load_instruction_projection_with_file_system(
+    project_root: Option<&std::path::Path>,
+    state_dir: Option<&std::path::Path>,
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+) -> echo_agent::error::Result<InstructionProjectionSnapshot> {
+    Ok(instruction_projection_from_provider(
+        InstructionProvider::load_for_file_system(project_root, state_dir, files)?,
+    ))
+}
+
+fn instruction_projection_from_provider(
+    provider: InstructionProvider,
+) -> InstructionProjectionSnapshot {
     let suffix = provider
         .get_instruction_suffix()
         .filter(|value| !value.trim().is_empty())
@@ -237,10 +259,10 @@ pub(crate) fn load_instruction_projection_strict_with_state(
     if let Some(value) = suffix.as_deref() {
         hasher.update(value.as_bytes());
     }
-    Ok(InstructionProjectionSnapshot {
+    InstructionProjectionSnapshot {
         revision: format!("{:x}", hasher.finalize()),
         message: suffix.map(Message::system),
-    })
+    }
 }
 
 /// Publish an already-read snapshot. This function never touches disk, so all

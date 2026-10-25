@@ -8,7 +8,7 @@
 //! `TaskRuntimeStore`; the framework projection envelope protects it.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock, Weak};
 
 use echo_agent::agent::ReactAgent;
 use echo_agent::compression::{ContextProjection, PreModelContextProjector, ProjectionContext};
@@ -24,6 +24,7 @@ use super::types::{BackgroundCellState, PlanTask, TaskExecutionSummary, TodoItem
 pub const RUNTIME_RECOVERY_MARKER: &str = "[eko_runtime_recovery_capsule]";
 /// Stable objective contract projected separately from volatile recovery state.
 pub const RUNTIME_GOAL_MARKER: &str = "[eko_run_goal_contract]";
+pub(crate) const DOMAIN_METHOD_MARKER: &str = "[eko_bound_domain_method]";
 
 /// Marker emitted by the EKO Subagent prompt compiler for planned invocations.
 /// Protecting it keeps the per-task brief alive if a Subagent compact runs
@@ -40,17 +41,38 @@ const MAX_ITEMS_PER_FIELD: usize = 3;
 /// Projects the authoritative file-backed TaskRuntime state at every model boundary.
 pub struct TaskRuntimeContextProjector {
     registry: Arc<TaskRuntimeProjectionRegistry>,
+    domain_only: bool,
 }
 
 impl TaskRuntimeContextProjector {
     pub fn new(registry: Arc<TaskRuntimeProjectionRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            domain_only: false,
+        }
     }
+
+    pub(crate) fn domain_only(registry: Arc<TaskRuntimeProjectionRegistry>) -> Self {
+        Self {
+            registry,
+            domain_only: true,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DomainMethodProjection {
+    binding: crate::domain_plugin::DomainBindingRef,
+    instructions: String,
 }
 
 struct ProjectionRegistration {
     id: uuid::Uuid,
     store: Arc<TaskRuntimeStore>,
+    retention: Weak<TaskRuntimeProjectionRegistrationInner>,
+    // A projection of already admitted immutable RunCreated data. This dies
+    // with the original registration token; it is not another mutable store.
+    domain_method: Option<DomainMethodProjection>,
 }
 
 /// Process-stable registry bridging application run ownership across framework spawns.
@@ -70,25 +92,109 @@ impl TaskRuntimeProjectionRegistry {
         run_id: impl Into<String>,
         store: Arc<TaskRuntimeStore>,
     ) -> TaskRuntimeProjectionRegistration {
-        let run_id = run_id.into();
-        let id = uuid::Uuid::new_v4();
-        self.registrations
+        let mut registrations = self
+            .registrations
             .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(run_id.clone(), ProjectionRegistration { id, store });
-        TaskRuntimeProjectionRegistration {
-            registry: Arc::clone(self),
-            run_id,
-            id,
-        }
+            .unwrap_or_else(|error| error.into_inner());
+        self.register_locked(run_id.into(), store, &mut registrations)
     }
 
-    fn store(&self, run_id: &str) -> Option<Arc<TaskRuntimeStore>> {
+    fn register_locked(
+        self: &Arc<Self>,
+        run_id: String,
+        store: Arc<TaskRuntimeStore>,
+        registrations: &mut HashMap<String, ProjectionRegistration>,
+    ) -> TaskRuntimeProjectionRegistration {
+        let id = uuid::Uuid::new_v4();
+        let inner = Arc::new(TaskRuntimeProjectionRegistrationInner {
+            registry: self.clone(),
+            run_id: run_id.clone(),
+            id,
+        });
+        registrations.insert(
+            run_id,
+            ProjectionRegistration {
+                id,
+                store,
+                retention: Arc::downgrade(&inner),
+                domain_method: None,
+            },
+        );
+        TaskRuntimeProjectionRegistration { _inner: inner }
+    }
+
+    /// Reuse the actual run owner's registration rather than overwriting its
+    /// token when a task tool or cross-workspace physical invocation retains it.
+    pub(crate) fn retain_for_invocation(
+        self: &Arc<Self>,
+        run_id: &str,
+        store: Arc<TaskRuntimeStore>,
+    ) -> Result<TaskRuntimeProjectionRegistration, String> {
+        // Capture before publishing an invocation guard. The framework's
+        // pre-model projector is observational (errors do not stop execution),
+        // so a required method cannot depend on another fallible disk/operation
+        // read after this original, fallible application admission boundary.
+        let domain_method = store
+            .get_run_state(run_id)
+            .map_err(|error| error.to_string())?
+            .and_then(|snapshot| {
+                snapshot
+                    .domain_binding
+                    .map(|binding| (snapshot.run.domain_binding, binding))
+            })
+            .map(|(reference, binding)| {
+                binding.validate()?;
+                if reference.as_ref() != Some(&binding.reference()) {
+                    return Err(
+                        "TaskRun method projection does not match its original binding".to_string(),
+                    );
+                }
+                Ok(DomainMethodProjection {
+                    binding: binding.reference(),
+                    instructions: binding.prompt_instructions(),
+                })
+            })
+            .transpose()?;
+        let mut registrations = self
+            .registrations
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(existing) = registrations.get_mut(run_id) {
+            if !Arc::ptr_eq(&existing.store, &store) {
+                return Err("TaskRun projection is owned by another original store".to_string());
+            }
+            if existing.domain_method.is_some() && existing.domain_method != domain_method {
+                return Err(
+                    "TaskRun method projection cannot change its original binding".to_string(),
+                );
+            }
+            if let Some(inner) = existing.retention.upgrade() {
+                existing.domain_method = domain_method;
+                return Ok(TaskRuntimeProjectionRegistration { _inner: inner });
+            }
+        }
+        let token = self.register_locked(run_id.to_string(), store, &mut registrations);
+        if let Some(registration) = registrations.get_mut(run_id) {
+            registration.domain_method = domain_method;
+        }
+        Ok(token)
+    }
+
+    pub(crate) fn store(&self, run_id: &str) -> Option<Arc<TaskRuntimeStore>> {
         self.registrations
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .get(run_id)
             .map(|registration| Arc::clone(&registration.store))
+    }
+
+    fn domain_method(&self, run_id: &str) -> Option<String> {
+        self.registrations
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(run_id)
+            .and_then(|registration| registration.domain_method.as_ref())
+            .map(|projection| format!("{DOMAIN_METHOD_MARKER}\n{}", projection.instructions))
     }
 
     pub fn contains(&self, run_id: &str) -> bool {
@@ -105,13 +211,18 @@ impl Default for TaskRuntimeProjectionRegistry {
     }
 }
 
+#[derive(Clone)]
 pub struct TaskRuntimeProjectionRegistration {
+    _inner: Arc<TaskRuntimeProjectionRegistrationInner>,
+}
+
+struct TaskRuntimeProjectionRegistrationInner {
     registry: Arc<TaskRuntimeProjectionRegistry>,
     run_id: String,
     id: uuid::Uuid,
 }
 
-impl Drop for TaskRuntimeProjectionRegistration {
+impl Drop for TaskRuntimeProjectionRegistrationInner {
     fn drop(&mut self) {
         let mut registrations = self
             .registry
@@ -145,6 +256,15 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
                 .as_deref()
                 .map(super::task_tools::formal_run_id_for_turn);
             let run_id = context.run_id.as_deref().or(derived_run_id.as_deref());
+            let domain = run_id.and_then(|run_id| self.registry.domain_method(run_id));
+            if self.domain_only {
+                // Actual invocation resources retain this same registration.
+                // General None still clears an earlier domain marker.
+                return Ok(vec![ContextProjection {
+                    marker: DOMAIN_METHOD_MARKER.to_string(),
+                    message: domain.map(Message::user),
+                }]);
+            }
             let store = run_id.and_then(|run_id| self.registry.store(run_id));
             let (goal, recovery) = match (run_id, store) {
                 (Some(run_id), Some(store)) => {
@@ -170,6 +290,10 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
                     marker: RUNTIME_RECOVERY_MARKER.to_string(),
                     message: recovery.map(Message::user),
                 },
+                ContextProjection {
+                    marker: DOMAIN_METHOD_MARKER.to_string(),
+                    message: domain.map(Message::user),
+                },
             ])
         })
     }
@@ -179,6 +303,15 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
 pub async fn install_task_context_protection(agent: &ReactAgent) {
     let mut ctx = agent.context().lock().await;
     ctx.add_replaceable_protected_marker(TASK_CONTEXT_MARKER.to_string());
+    ctx.add_replaceable_protected_marker(DOMAIN_METHOD_MARKER.to_string());
+}
+
+/// Adhoc factory Agents consume the same persisted rules without inheriting
+/// another turn's transient selection or adding General planning instructions.
+pub(crate) fn install_domain_context_projection(agent: &mut ReactAgent) {
+    agent.set_pre_model_context_projector(Some(Arc::new(
+        TaskRuntimeContextProjector::domain_only(task_runtime_projection_registry()),
+    )));
 }
 
 /// Derive a compact, compression-safe view of the active runtime state.
@@ -712,6 +845,8 @@ mod tests {
             .transition_run("r1", TaskRunStatus::Running)
             .map_err(|err| format!("seed transition failed: {err}"))?;
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
             revision: 1,
@@ -959,6 +1094,8 @@ mod tests {
             .map_err(|err| format!("seed projection run failed: {err}"))?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: format!("plan-{run_id}"),
                 run_id: run_id.to_string(),
                 revision: 1,
@@ -993,6 +1130,33 @@ mod tests {
             .project(&projection_context(Some(run_id)))
             .await
             .map_err(|err| err.to_string())
+    }
+
+    #[test]
+    fn invocation_retains_original_projection_token_and_rejects_foreign_store() -> Result<(), String>
+    {
+        let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+        let store = seed_projection_store("retained-run", "original run")?;
+        let original = registry.register("retained-run", store.clone());
+        let retained = registry.retain_for_invocation("retained-run", store.clone())?;
+        assert!(Arc::ptr_eq(&original._inner, &retained._inner));
+        let other = seed_projection_store("retained-run", "other owner")?;
+        assert!(
+            registry
+                .retain_for_invocation("retained-run", other)
+                .is_err()
+        );
+        assert!(
+            registry
+                .store("retained-run")
+                .as_ref()
+                .is_some_and(|actual| Arc::ptr_eq(actual, &store))
+        );
+        drop(original);
+        assert!(registry.contains("retained-run"));
+        drop(retained);
+        assert!(!registry.contains("retained-run"));
+        Ok(())
     }
 
     #[tokio::test]

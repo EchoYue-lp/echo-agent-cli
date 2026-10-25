@@ -88,6 +88,12 @@ pub mod developer_commands {
 pub mod diff {
     pub use crate::diff::*;
 }
+pub mod domain_plugin {
+    pub use crate::domain_plugin::{
+        DomainBinding, DomainBindingRef, DomainInputDigest, DomainOutputStyleBinding,
+        DomainPluginIdentity, DomainRoleBinding, DomainRuleSnapshot,
+    };
+}
 pub mod error {
     pub use crate::error::*;
 }

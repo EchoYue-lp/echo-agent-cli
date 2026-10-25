@@ -3459,6 +3459,7 @@ mod tests {
         use echo_agent_app_core::api::tasks::task_runtime::{RunTurnOrigin, TaskRunResumeIdentity};
 
         let resume = TaskRunResumeIdentity {
+            project_binding: None,
             run_id: "taskrun-repl".to_string(),
             workspace_id: "workspace-repl".to_string(),
             conversation_id: "conversation-repl".to_string(),
@@ -3722,6 +3723,7 @@ mod tests {
                 payload_sha256: "hash".to_string(),
             },
             payload: ConversationInputPayload {
+                domain_plugin: None,
                 text: "hello".to_string(),
                 attachments: Vec::new(),
                 submitted_at_ms: 1,

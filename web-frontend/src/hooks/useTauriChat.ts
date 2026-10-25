@@ -7,6 +7,7 @@ import { useToolExecutionStore } from '../stores/toolExecutionStore';
 import { useWorkspaceStore } from '../stores/workspaceStore';
 import { isTauri, apiInvoke, errorMessage } from '../lib/tauri-bridge';
 import { workspaceIdForView } from '../lib/viewAddress';
+import { productDataScope, sameProductDataScope } from '../lib/productDataScope';
 import { handleChatEventEnvelope } from './chatEventHandler';
 import { ChatEventSequencer } from './chatEventSequencer';
 import { reorderById } from './queuedChat';
@@ -30,6 +31,27 @@ export type QueuedChatInput = {
   workspaceId: string;
   conversationId: string;
   identity: ConversationInputIdentity;
+};
+
+/** Capture identity/target before encoding; retain the prepared payload for retries. */
+export type ChatSendSubmission = {
+  readonly externalId: string;
+  readonly workspaceId: string;
+  readonly workspaceGeneration: string;
+  readonly conversationId: string | null;
+  readonly newConversationEpoch: number;
+  readonly payload: {
+    readonly text: string;
+    readonly attachments?: readonly Readonly<Attachment>[];
+    readonly domainPlugin?: string;
+  };
+  /** The original durable receipt; canProject also fences the private turn identity. */
+  readonly onPersisted?: (
+    receipt: ConversationInputReceipt,
+    canProject: () => boolean
+  ) => void | Promise<void>;
+  /** Ordinary admission proof, deliberately distinct from a durable input receipt. */
+  readonly onDirectAccepted?: (canProject: () => boolean) => void | Promise<void>;
 };
 
 type SendChatResult = {
@@ -57,20 +79,54 @@ type QueuedDispatch = {
   queueRevision: number;
 };
 
+type PendingChatAdmission = {
+  messageKey: string;
+  workspaceId: string;
+  conversationId: string | null;
+  identityGeneration: number;
+  events: ChatEventEnvelope[];
+};
+
 function chatStreamId(workspaceId: string, conversationId?: string, messageKey?: string): string {
   return JSON.stringify([workspaceId, conversationId ?? messageKey ?? '']);
+}
+
+function sameAttachments(
+  left: readonly Attachment[] | undefined,
+  right: readonly Attachment[] | undefined
+): boolean {
+  const expected = left ?? [];
+  const actual = right ?? [];
+  return (
+    expected.length === actual.length &&
+    expected.every((attachment, index) => {
+      const other = actual.at(index);
+      return (
+        other !== undefined &&
+        attachment.name === other.name &&
+        attachment.mime_type === other.mime_type &&
+        attachment.data === other.data &&
+        attachment.size === other.size &&
+        attachment.source === other.source
+      );
+    })
+  );
 }
 
 export function useTauriChat() {
   const activeConversationId = useConversationStore((state) => state.activeId);
   const newConversationEpoch = useConversationStore((state) => state.newConversationEpoch);
   const currentWorkspaceId = useWorkspaceStore((state) => workspaceIdForView(state.current?.id));
+  const currentWorkspaceGeneration = useWorkspaceStore(
+    (state) => productDataScope(state.current).workspaceGeneration
+  );
   const assistantIdRef = useRef<string | null>(null);
   const isCancelledRef = useRef(false);
   const activeTurnIdRef = useRef<string | null>(null);
   const currentMessageKeyRef = useRef<string | null>(null);
   const currentConversationIdRef = useRef<string | null>(activeConversationId);
   const currentWorkspaceIdRef = useRef(currentWorkspaceId);
+  const currentWorkspaceGenerationRef = useRef(currentWorkspaceGeneration);
   const identityGenerationRef = useRef(0);
   const previousActiveConversationIdRef = useRef(activeConversationId);
   const previousNewConversationEpochRef = useRef(newConversationEpoch);
@@ -81,10 +137,7 @@ export function useTauriChat() {
   const frontierRequestOrdinalRef = useRef(0);
   const frontierAppliedOrdinalRef = useRef(0);
   const dispatchingInputIdRef = useRef<string | null>(null);
-  const pendingAdmissionRef = useRef<{
-    messageKey: string;
-    events: ChatEventEnvelope[];
-  } | null>(null);
+  const pendingAdmissionRef = useRef<PendingChatAdmission | null>(null);
   const dispatchMessageRef = useRef<
     | ((
         text: string,
@@ -94,6 +147,30 @@ export function useTauriChat() {
     | null
   >(null);
   const [frontier, setFrontier] = useState<ConversationInputFrontier>(EMPTY_FRONTIER);
+
+  const captureInputProjection = useCallback(() => {
+    const generation = identityGenerationRef.current;
+    const workspaceScope = productDataScope(useWorkspaceStore.getState().current);
+    const conversationId = useConversationStore.getState().activeId;
+    const conversationEpoch = useConversationStore.getState().newConversationEpoch;
+    const activeTurnId = activeTurnIdRef.current;
+    const rootTurnId = currentMessageKeyRef.current;
+    return () => {
+      const conversation = useConversationStore.getState();
+      return (
+        identityGenerationRef.current === generation &&
+        sameProductDataScope(
+          workspaceScope,
+          productDataScope(useWorkspaceStore.getState().current)
+        ) &&
+        currentWorkspaceIdRef.current === workspaceScope.workspaceId &&
+        conversation.activeId === conversationId &&
+        conversation.newConversationEpoch === conversationEpoch &&
+        activeTurnIdRef.current === activeTurnId &&
+        currentMessageKeyRef.current === rootTurnId
+      );
+    };
+  }, []);
 
   const getActiveTurnSnapshot = useCallback(async () => {
     // Every dispatched GUI turn receives a durable conversation id before it
@@ -155,23 +232,38 @@ export function useTauriChat() {
   useEffect(() => {
     const previous = previousActiveConversationIdRef.current;
     const startsNewConversation = previousNewConversationEpochRef.current !== newConversationEpoch;
-    const workspaceChanged = currentWorkspaceIdRef.current !== currentWorkspaceId;
+    const workspaceChanged =
+      currentWorkspaceIdRef.current !== currentWorkspaceId ||
+      currentWorkspaceGenerationRef.current !== currentWorkspaceGeneration;
     if (previous === activeConversationId && !startsNewConversation && !workspaceChanged) return;
     currentWorkspaceIdRef.current = currentWorkspaceId;
+    currentWorkspaceGenerationRef.current = currentWorkspaceGeneration;
     previousActiveConversationIdRef.current = activeConversationId;
     previousNewConversationEpochRef.current = newConversationEpoch;
+    const previousIdentityGeneration = identityGenerationRef.current;
     identityGenerationRef.current += 1;
     frontierAppliedOrdinalRef.current = frontierRequestOrdinalRef.current;
 
+    const adoptsPendingAdmission =
+      pendingAdmissionRef.current !== null &&
+      pendingAdmissionRef.current.workspaceId === currentWorkspaceId &&
+      pendingAdmissionRef.current.conversationId === activeConversationId &&
+      pendingAdmissionRef.current.identityGeneration === previousIdentityGeneration;
     const adoptsCurrentTurn =
       !startsNewConversation &&
+      !workspaceChanged &&
       previous === null &&
       activeConversationId !== null &&
-      activeTurnIdRef.current !== null;
+      (activeTurnIdRef.current !== null || adoptsPendingAdmission);
     currentConversationIdRef.current = activeConversationId;
     frontierRef.current = EMPTY_FRONTIER;
     setFrontier(EMPTY_FRONTIER);
-    if (adoptsCurrentTurn) return;
+    if (adoptsCurrentTurn) {
+      if (adoptsPendingAdmission && pendingAdmissionRef.current) {
+        pendingAdmissionRef.current.identityGeneration = identityGenerationRef.current;
+      }
+      return;
+    }
 
     activeTurnIdRef.current = null;
     currentMessageKeyRef.current = null;
@@ -179,7 +271,15 @@ export function useTauriChat() {
     thinkingIdRef.current = null;
     isCancelledRef.current = false;
     pendingAdmissionRef.current = null;
-  }, [activeConversationId, currentWorkspaceId, newConversationEpoch]);
+  }, [activeConversationId, currentWorkspaceId, currentWorkspaceGeneration, newConversationEpoch]);
+
+  useEffect(
+    () => () => {
+      identityGenerationRef.current += 1;
+      pendingAdmissionRef.current = null;
+    },
+    []
+  );
 
   const dispatchNextQueued = useCallback((workspaceId: string, conversationId: string) => {
     if (
@@ -308,7 +408,12 @@ export function useTauriChat() {
   const handleEvent = useCallback(
     (event: ChatEventEnvelope) => {
       const pendingAdmission = pendingAdmissionRef.current;
-      if (pendingAdmission && pendingAdmission.messageKey === event.message_id) {
+      if (
+        pendingAdmission &&
+        pendingAdmission.messageKey === event.message_id &&
+        pendingAdmission.workspaceId === event.workspace_id &&
+        pendingAdmission.conversationId === event.conversation_id
+      ) {
         pendingAdmission.events.push(event);
         return;
       }
@@ -471,6 +576,8 @@ export function useTauriChat() {
     };
   }, [
     currentWorkspaceId,
+    currentWorkspaceGeneration,
+    newConversationEpoch,
     applyEvent,
     dispatchNextQueued,
     getActiveTurnSnapshot,
@@ -481,7 +588,13 @@ export function useTauriChat() {
   ]);
 
   const dispatchMessage = useCallback(
-    async (text: string, attachments?: Attachment[], queued?: QueuedDispatch) => {
+    async (
+      text: string,
+      attachments?: Attachment[],
+      queued?: QueuedDispatch,
+      domainPlugin?: string,
+      onDirectAccepted?: ChatSendSubmission['onDirectAccepted']
+    ) => {
       const store = useChatStore.getState();
       const displayAttachments = attachments?.map((a) => ({
         name: a.name,
@@ -495,35 +608,108 @@ export function useTauriChat() {
           ? crypto.randomUUID()
           : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const workspaceId = currentWorkspaceIdRef.current;
+      const workspaceScope = productDataScope(useWorkspaceStore.getState().current);
+      const conversationEpoch = useConversationStore.getState().newConversationEpoch;
+      let conversationId = useConversationStore.getState().activeId;
+      if (
+        queued &&
+        (queued.identity.address.workspace_id !== workspaceId ||
+          queued.identity.address.conversation_id !== conversationId)
+      )
+        return false;
+      let admission: PendingChatAdmission | null = null;
+      const isOriginalView = () => {
+        const conversation = useConversationStore.getState();
+        return (
+          sameProductDataScope(
+            workspaceScope,
+            productDataScope(useWorkspaceStore.getState().current)
+          ) &&
+          currentWorkspaceIdRef.current === workspaceId &&
+          conversation.activeId === conversationId &&
+          conversation.newConversationEpoch === conversationEpoch &&
+          !conversation.isLoading
+        );
+      };
+      const ownsAdmissionProjection = () =>
+        admission !== null &&
+        pendingAdmissionRef.current === admission &&
+        admission.identityGeneration === identityGenerationRef.current &&
+        isOriginalView();
+      const notifyDirectAccepted = (canProject: () => boolean) => {
+        const report = (error: unknown) => {
+          if (canProject())
+            useToastStore
+              .getState()
+              .addToast('warning', `消息已接受，界面状态同步失败：${errorMessage(error)}`);
+        };
+        try {
+          void Promise.resolve(onDirectAccepted?.(canProject)).catch(report);
+        } catch (error) {
+          report(error);
+        }
+      };
 
       try {
         identityGenerationRef.current += 1;
         isCancelledRef.current = false;
         thinkingIdRef.current = null;
+        // Capture the owner before the first await. Stop, unmount or another
+        // submission may invalidate it while canonical creation is pending.
+        admission = {
+          messageKey,
+          workspaceId,
+          conversationId,
+          identityGeneration: identityGenerationRef.current,
+          events: [],
+        };
+        if (isOriginalView()) pendingAdmissionRef.current = admission;
 
         // TaskRuntime runs are keyed by conversation_id. On the first turn there
         // is no active conversation yet, so create it before routing; otherwise
         // the backend falls back to a message-scoped id and the right rail loses
         // the run as soon as the conversation is later saved as conv-*.
-        if (!useConversationStore.getState().activeId) {
-          await useConversationStore.getState().saveCurrent([
-            {
-              id: messageKey,
-              role: 'user',
-              content: text || '(附件)',
-              timestamp: Date.now(),
-              attachments: displayAttachments,
-            },
-          ]);
+        if (!conversationId) {
+          const savedAddress = await useConversationStore.getState().saveCurrent(
+            [
+              {
+                id: messageKey,
+                role: 'user',
+                content: text || '(附件)',
+                timestamp: Date.now(),
+                attachments: displayAttachments,
+              },
+            ],
+            (address) => {
+              if (
+                admission &&
+                pendingAdmissionRef.current === admission &&
+                admission.identityGeneration === identityGenerationRef.current &&
+                isOriginalView()
+              ) {
+                admission.conversationId = address.conversation_id;
+              }
+            }
+          );
+          if (!savedAddress || savedAddress.workspace_id !== workspaceId) {
+            throw new Error('创建会话失败，无法启动 TaskRuntime。');
+          }
+          conversationId = savedAddress.conversation_id;
         }
 
-        const conversationState = useConversationStore.getState();
-        const conversationId = conversationState.activeId;
-        if (!conversationId || conversationState.workspaceId !== workspaceId) {
+        if (
+          !conversationId ||
+          !sameProductDataScope(
+            workspaceScope,
+            productDataScope(useWorkspaceStore.getState().current)
+          )
+        ) {
           throw new Error('创建会话失败，无法启动 TaskRuntime。');
         }
-        currentConversationIdRef.current = conversationId;
-        pendingAdmissionRef.current = { messageKey, events: [] };
+        admission.conversationId = conversationId;
+        if (ownsAdmissionProjection()) {
+          currentConversationIdRef.current = conversationId;
+        }
         const chatResult = await apiInvoke<SendChatResult>('send_chat_message', {
           request: {
             workspaceId,
@@ -535,11 +721,24 @@ export function useTauriChat() {
             messageKey,
             inputIdentity: queued?.identity,
             expectedQueueRevision: queued?.queueRevision,
+            ...(domainPlugin === undefined ? {} : { domainPlugin }),
           },
         });
-        const pendingEvents = pendingAdmissionRef.current?.events ?? [];
-        pendingAdmissionRef.current = null;
+        const pendingEvents = admission.events;
         const outcome = chatResult.kind ?? (chatResult.success === false ? undefined : 'started');
+
+        // Backend admission remains bound to its original address. A departed
+        // view must not consume its buffered events or overwrite the new view.
+        if (!ownsAdmissionProjection()) {
+          if (pendingAdmissionRef.current === admission) pendingAdmissionRef.current = null;
+          if (outcome === 'started') notifyDirectAccepted(() => false);
+          return (
+            outcome === 'started' ||
+            outcome === 'queued' ||
+            outcome === 'task_run_conflict' ||
+            outcome === 'interrupt_prompt'
+          );
+        }
 
         if (
           outcome === 'queued' ||
@@ -547,8 +746,14 @@ export function useTauriChat() {
           outcome === 'interrupt_prompt'
         ) {
           await refreshFrontier(workspaceId, conversationId);
+          if (!ownsAdmissionProjection()) {
+            if (pendingAdmissionRef.current === admission) pendingAdmissionRef.current = null;
+            return true;
+          }
+          pendingAdmissionRef.current = null;
           for (const event of pendingEvents) applyEvent(event);
           if (outcome !== 'queued' && chatResult.run_id && chatResult.goal) {
+            const admittedConversationId = conversationId;
             useTaskRuntimeStore.getState().openInterruptPrompt({
               runId: chatResult.run_id,
               goal: chatResult.goal,
@@ -571,7 +776,7 @@ export function useTauriChat() {
                   runId: chatResult.run_id,
                 });
                 useTaskRuntimeStore.getState().dismissInterruptPrompt();
-                const current = await refreshFrontier(workspaceId, conversationId);
+                const current = await refreshFrontier(workspaceId, admittedConversationId);
                 const selected = current.items.find(
                   (item) => item.receipt.identity.input_id === chatResult.input_id
                 );
@@ -594,10 +799,12 @@ export function useTauriChat() {
           throw new Error('后端未接受本次消息');
         }
 
+        pendingAdmissionRef.current = null;
         store.addUserMessage(text || '(附件)', displayAttachments);
         currentMessageKeyRef.current = chatResult.root_turn_id ?? messageKey;
         activeTurnIdRef.current = chatResult.active_turn_id ?? messageKey;
         assistantIdRef.current = store.startAssistantMessage(currentMessageKeyRef.current);
+        notifyDirectAccepted(captureInputProjection());
         for (const event of pendingEvents) applyEvent(event);
 
         // If the backend created a TaskRuntime run, load it so the right rail
@@ -612,20 +819,25 @@ export function useTauriChat() {
         }
         return true;
       } catch (e) {
-        pendingAdmissionRef.current = null;
+        const mayProject = admission ? ownsAdmissionProjection() : isOriginalView();
+        if (pendingAdmissionRef.current === admission) pendingAdmissionRef.current = null;
         console.error('[TauriChat] Failed to send message:', e);
-        useToastStore.getState().addToast('error', `发送失败：${errorMessage(e)}`);
-        assistantIdRef.current = null;
-        currentMessageKeyRef.current = null;
-        activeTurnIdRef.current = null;
-        const conversationId = useConversationStore.getState().activeId;
-        if (conversationId) {
-          void refreshFrontier(workspaceId, conversationId);
+        if (mayProject) {
+          useToastStore.getState().addToast('error', `发送失败：${errorMessage(e)}`);
+          assistantIdRef.current = null;
+          currentMessageKeyRef.current = null;
+          activeTurnIdRef.current = null;
+          if (conversationId) {
+            void refreshFrontier(workspaceId, conversationId).catch((error) => {
+              if (isOriginalView())
+                console.warn('[TauriChat] Failed to refresh input state:', error);
+            });
+          }
         }
         return false;
       }
     },
-    [applyEvent, refreshFrontier]
+    [applyEvent, captureInputProjection, refreshFrontier]
   );
 
   dispatchMessageRef.current = dispatchMessage;
@@ -633,25 +845,34 @@ export function useTauriChat() {
   const steerConversationInput = useCallback(
     async (queued: ConversationInputProjection, expectedQueueRevision: number) => {
       const conversationId = useConversationStore.getState().activeId;
+      const workspaceScope = productDataScope(useWorkspaceStore.getState().current);
       if (
         !conversationId ||
         conversationId !== queued.receipt.identity.address.conversation_id ||
-        currentWorkspaceIdRef.current !== queued.receipt.identity.address.workspace_id
+        currentWorkspaceIdRef.current !== queued.receipt.identity.address.workspace_id ||
+        workspaceScope.workspaceId !== queued.receipt.identity.address.workspace_id ||
+        currentWorkspaceGenerationRef.current !== workspaceScope.workspaceGeneration
       ) {
         return false;
       }
+      const activeTurnId = activeTurnIdRef.current;
+      const isCurrentSteer = captureInputProjection();
       try {
         const result = await apiInvoke<ConversationInputReceipt>('steer_chat_message', {
           workspaceId: queued.receipt.identity.address.workspace_id,
           conversationId,
-          expectedActiveTurnId: activeTurnIdRef.current,
+          expectedActiveTurnId: activeTurnId,
           identity: queued.receipt.identity,
           expectedQueueRevision,
         });
+        // The original journal owns delivery even after focus changes. A late
+        // receipt must not project into another turn or a reopened workspace.
+        if (!isCurrentSteer()) return result.drained;
         await refreshFrontier(
           queued.receipt.identity.address.workspace_id,
           queued.receipt.identity.address.conversation_id
         );
+        if (!isCurrentSteer()) return result.drained;
         if (!result.drained) {
           useToastStore.getState().addToast('info', '当前阶段不能插入，已保留在排队队列中');
           return false;
@@ -672,39 +893,119 @@ export function useTauriChat() {
           );
         return true;
       } catch (error) {
-        useToastStore.getState().addToast('error', `补充当前任务失败：${errorMessage(error)}`);
+        if (isCurrentSteer()) {
+          useToastStore.getState().addToast('error', `补充当前任务失败：${errorMessage(error)}`);
+        }
         return false;
       }
     },
-    [refreshFrontier]
+    [captureInputProjection, refreshFrontier]
   );
 
   const sendMessage = useCallback(
-    async (text: string, attachments?: Attachment[]) => {
-      const activeConversation = useConversationStore.getState().activeId;
+    async (
+      text: string,
+      attachments?: Attachment[],
+      domainPlugin?: string,
+      submission?: ChatSendSubmission
+    ) => {
+      const conversation = useConversationStore.getState();
+      const activeConversation = conversation.activeId;
+      const workspaceScope = productDataScope(useWorkspaceStore.getState().current);
+      if (
+        submission &&
+        (submission.externalId.trim().length === 0 ||
+          useWorkspaceStore.getState().isLoading ||
+          !sameProductDataScope(submission, workspaceScope) ||
+          currentWorkspaceIdRef.current !== workspaceScope.workspaceId ||
+          currentWorkspaceGenerationRef.current !== workspaceScope.workspaceGeneration ||
+          submission.conversationId !== activeConversation ||
+          submission.newConversationEpoch !== conversation.newConversationEpoch)
+      )
+        return false;
+      if (
+        submission &&
+        (submission.payload.text !== text ||
+          !sameAttachments(submission.payload.attachments, attachments) ||
+          submission.payload.domainPlugin !== domainPlugin)
+      ) {
+        useToastStore
+          .getState()
+          .addToast('error', '本次提交的内容或领域已改变，请使用新的草稿提交身份');
+        return false;
+      }
       const belongsToActiveConversation = activeConversation
         ? currentConversationIdRef.current === activeConversation
         : currentConversationIdRef.current === null && currentMessageKeyRef.current !== null;
       if (activeTurnIdRef.current && belongsToActiveConversation) {
         const id =
-          typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          submission?.externalId ??
+          (typeof crypto !== 'undefined' && 'randomUUID' in crypto
             ? crypto.randomUUID()
-            : `queued-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            : `queued-${Date.now()}-${Math.random().toString(36).slice(2)}`);
         if (!activeConversation) return false;
         const workspaceId = currentWorkspaceIdRef.current;
-        const receipt = await apiInvoke<ConversationInputReceipt>('queue_chat_input', {
-          workspaceId,
-          conversationId: activeConversation,
-          externalId: id,
-          text,
-          attachments: attachments && attachments.length > 0 ? attachments : undefined,
-        });
-        const current = await refreshFrontier(workspaceId, activeConversation);
-        const selected = current.items.find(
-          (item) => item.receipt.identity.input_id === receipt.identity.input_id
-        );
-        if (selected) {
-          await steerConversationInput(selected, current.queue_revision);
+        const canProject = captureInputProjection();
+        const onPersisted = submission?.onPersisted;
+        const payloadAttachments = attachments?.map((attachment) => ({ ...attachment }));
+        const reportObservationError = (error: unknown) => {
+          if (canProject()) {
+            useToastStore
+              .getState()
+              .addToast('warning', `输入已保存，后续状态同步失败：${errorMessage(error)}`);
+          }
+        };
+        let receipt: ConversationInputReceipt;
+        try {
+          receipt = await apiInvoke<ConversationInputReceipt>('queue_chat_input', {
+            workspaceId,
+            conversationId: activeConversation,
+            externalId: id,
+            text,
+            attachments:
+              payloadAttachments && payloadAttachments.length > 0 ? payloadAttachments : undefined,
+            ...(domainPlugin === undefined ? {} : { domainPlugin }),
+          });
+          if (
+            !receipt?.identity ||
+            receipt.identity.address.workspace_id !== workspaceId ||
+            receipt.identity.address.conversation_id !== activeConversation ||
+            !receipt.identity.input_id ||
+            !receipt.identity.payload_sha256 ||
+            !Number.isInteger(receipt.identity.revision) ||
+            receipt.identity.revision < 1 ||
+            !Number.isInteger(receipt.queue_revision) ||
+            receipt.queue_revision < 0 ||
+            typeof receipt.phase !== 'string'
+          ) {
+            throw new Error('后端没有返回本次输入的完整持久回执');
+          }
+        } catch (error) {
+          if (canProject())
+            useToastStore.getState().addToast('error', `发送失败：${errorMessage(error)}`);
+          return false;
+        }
+        // A successful queue admission is the durable fact. Never delay it on
+        // frontier/steer observation, or downgrade it if a view callback fails.
+        try {
+          void Promise.resolve(onPersisted?.(receipt, canProject)).catch(reportObservationError);
+        } catch (error) {
+          reportObservationError(error);
+        }
+        if (canProject()) {
+          void refreshFrontier(workspaceId, activeConversation)
+            .then((current) => {
+              if (!canProject()) return;
+              const selected = current.items.find(
+                (item) => item.receipt.identity.input_id === receipt.identity.input_id
+              );
+              // Preserve the original explicit-domain admission path. A queued
+              // selection cannot silently change the active TaskRun binding.
+              if (selected && domainPlugin === undefined) {
+                return steerConversationInput(selected, current.queue_revision);
+              }
+            })
+            .catch(reportObservationError);
         }
         return true;
       }
@@ -713,9 +1014,15 @@ export function useTauriChat() {
         currentMessageKeyRef.current = null;
         assistantIdRef.current = null;
       }
-      return dispatchMessage(text, attachments);
+      return dispatchMessage(
+        text,
+        attachments,
+        undefined,
+        domainPlugin,
+        submission?.onDirectAccepted
+      );
     },
-    [dispatchMessage, refreshFrontier, steerConversationInput]
+    [captureInputProjection, dispatchMessage, refreshFrontier, steerConversationInput]
   );
 
   const sendApproval = useCallback(

@@ -568,6 +568,7 @@ async fn bootstrap(
         command_cell_runtime: None,
         product_data_io: None,
         execution_scope: None,
+        ..Default::default()
     };
     let mcp_path =
         echo_agent_app_core::api::mcp_config_runtime::resolve_mcp_config_path(None, app_config);
@@ -1001,6 +1002,7 @@ async fn inject_control_events(
         commit_task_plan(
             store.clone(),
             TaskPlan {
+                domain_binding: None,
                 plan_id: "lh6-control-plan".to_string(),
                 run_id: run_id.to_string(),
                 revision: 1,

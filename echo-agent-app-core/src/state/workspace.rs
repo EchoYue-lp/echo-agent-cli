@@ -54,10 +54,14 @@ enum WorkspaceTransitionRequest {
         name: String,
         kind: crate::workspace::WorkspaceKind,
         root: Option<std::path::PathBuf>,
+        source: Option<crate::workspace::ProjectSource>,
     },
     #[cfg(test)]
-    Switch(Workspace),
-    SwitchRegistered(crate::workspace::WorkspaceId),
+    Switch(Box<Workspace>),
+    SwitchRegistered {
+        workspace_id: crate::workspace::WorkspaceId,
+        connection_id: Option<String>,
+    },
     Exit,
     Delete(crate::workspace::WorkspaceId),
     LinkProject {
@@ -195,24 +199,49 @@ pub struct WorkspaceIoInvocation {
     resource_guards: Vec<echo_agent::tools::InvocationResourceGuard>,
 }
 
-impl WorkspaceIoInvocation {
-    /// Recover the workspace scope carried by a framework tool context.
-    /// Formal writer Subagents cannot call task-control tools, so this path
-    /// only accepts the planning Agent's non-isolated product-data root.
-    pub(crate) fn from_context(context: &echo_agent::tools::ToolContext) -> Option<Self> {
-        let data_root = context.working_dir.clone()?;
-        let resource_guards = context
-            .resource_guards
-            .iter()
-            .filter(|guard| guard.retains::<ScopedWorkspaceIoReceipt>())
-            .cloned()
-            .collect::<Vec<_>>();
-        (resource_guards.len() == 1).then(|| Self {
-            data_root,
-            resource_guards,
-        })
-    }
+/// Borrowed project I/O resources for direct GUI operations. The registered
+/// Workspace host remains the owner; this is neither an Agent execution slot
+/// nor a second registry. Its original control receipt prevents relink/delete
+/// while physical file/terminal work still uses the captured generation.
+#[derive(Clone)]
+pub struct ScopedProjectResources {
+    pub(crate) host: Arc<crate::workspace::runtime::WorkspaceRuntimeHost>,
+    pub(crate) workspace: Workspace,
+    pub(crate) working_dir: std::path::PathBuf,
+    pub(crate) files: Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+    pub(crate) executor: Arc<dyn echo_agent::sandbox::SandboxExecutor>,
+    pub(crate) lifetime: crate::workspace::runtime::WorkspaceIoLease,
+}
 
+impl ScopedProjectResources {
+    pub async fn task_runtime(
+        &self,
+    ) -> anyhow::Result<Arc<crate::tasks::task_runtime::TaskRuntimeStore>> {
+        self.host.task_runtime().await
+    }
+    pub fn workspace(&self) -> &Workspace {
+        &self.workspace
+    }
+    pub fn working_dir(&self) -> &std::path::Path {
+        &self.working_dir
+    }
+    pub fn file_system(&self) -> Arc<dyn echo_agent::tools::filesystem::FileSystem> {
+        self.files.clone()
+    }
+    pub fn executor(&self) -> Arc<dyn echo_agent::sandbox::SandboxExecutor> {
+        self.executor.clone()
+    }
+    pub fn resource_guards(&self) -> Vec<echo_agent::tools::InvocationResourceGuard> {
+        ScopedWorkspaceIoReceipt {
+            _lifetime: Some(self.lifetime.clone()),
+            identity: crate::workspace::WorkspaceIoIdentity::workspace(&self.workspace),
+        }
+        .invocation()
+        .resource_guards()
+    }
+}
+
+impl WorkspaceIoInvocation {
     pub(crate) fn scoped_to_identity(
         context: &echo_agent::tools::ToolContext,
         expected: &crate::workspace::WorkspaceIoIdentity,
@@ -286,7 +315,7 @@ impl ScopedWorkspaceControl {
 
     /// Root for EKO-owned workspace data such as research and analyses.
     pub fn data_root(&self) -> &std::path::Path {
-        self.runtime.execution_scope().root()
+        self.runtime.workspace_io_identity.data_root()
     }
 
     pub fn workspace_id(&self) -> &str {
@@ -294,10 +323,7 @@ impl ScopedWorkspaceControl {
     }
 
     pub fn project_root(&self) -> std::path::PathBuf {
-        self.workspace
-            .as_ref()
-            .and_then(|workspace| workspace.project_root.clone())
-            .unwrap_or_else(|| self.runtime.execution_scope().root().to_path_buf())
+        self.runtime.execution_scope().root().to_path_buf()
     }
 
     /// Stable generation token for one registered workspace identity.
@@ -785,10 +811,93 @@ struct WorkspaceTaskExecutionTargetResolver {
     agent_router: Arc<crate::agent_router::AgentRouter>,
 }
 
+impl WorkspaceTaskExecutionTargetResolver {
+    async fn resolve_target_execution(
+        &self,
+        target: &crate::tasks::task_runtime::TaskExecutionTarget,
+    ) -> Result<Arc<crate::workspace::runtime::WorkspaceExecutionRuntime>, String> {
+        target.validate()?;
+        let workspace = self
+            .workspace_registry
+            .list()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|workspace| workspace.id == target.address.workspace_id)
+            .ok_or_else(|| {
+                format!(
+                    "workspace '{}' is not registered",
+                    target.address.workspace_id
+                )
+            })?;
+        let runtimes = self
+            .runtimes
+            .upgrade()
+            .ok_or_else(|| "original workspace runtime registry is unavailable".to_string())?;
+        let (host, _target_control) = runtimes
+            .get_or_open_control(workspace)
+            .await
+            .map_err(|error| error.to_string())?;
+        let conversation = host
+            .resources()
+            .conversation_store()
+            .get_conversation(&target.address.conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if conversation.is_none() {
+            return Err(format!(
+                "conversation '{}' does not exist in workspace '{}'",
+                target.address.conversation_id, target.address.workspace_id
+            ));
+        }
+        let seed_pool = self
+            .seed_pool
+            .upgrade()
+            .ok_or_else(|| "application AgentPool is unavailable".to_string())?;
+        let execution = host
+            .get_or_open_execution(&seed_pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        let nested: Arc<dyn crate::tasks::task_runtime::TaskExecutionTargetResolver> =
+            Arc::new(self.clone());
+        execution
+            .task_runtime()
+            .attach_execution_target_resolver(nested);
+        Ok(execution)
+    }
+
+    fn verify_project_binding(
+        target: &crate::tasks::task_runtime::TaskExecutionTarget,
+        store: &crate::tasks::task_runtime::TaskRuntimeStore,
+    ) -> Result<(), String> {
+        if target.project_binding != store.project_execution_binding() {
+            return Err("Target project location changed since task admission".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::tasks::task_runtime::TaskExecutionTargetResolver
     for WorkspaceTaskExecutionTargetResolver
 {
+    async fn bind_project(
+        &self,
+        target: &crate::tasks::task_runtime::TaskExecutionTarget,
+    ) -> Result<Option<crate::tasks::task_runtime::types::ProjectExecutionBinding>, String> {
+        let execution = self.resolve_target_execution(target).await?;
+        Ok(execution.task_runtime().project_execution_binding())
+    }
+
+    async fn project_environment(
+        &self,
+        target: &crate::tasks::task_runtime::TaskExecutionTarget,
+    ) -> Result<Option<crate::tasks::task_runtime::store::ProjectExecutionEnvironment>, String>
+    {
+        let execution = self.resolve_target_execution(target).await?;
+        Self::verify_project_binding(target, execution.task_runtime().as_ref())?;
+        Ok(execution.task_runtime().project_environment())
+    }
+
     async fn acquire(
         &self,
         leader: &crate::agent_router::AgentAddress,
@@ -827,51 +936,8 @@ impl crate::tasks::task_runtime::TaskExecutionTargetResolver
                 target.address.conversation_id
             ));
         }
-        let workspace = self
-            .workspace_registry
-            .list()
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .find(|workspace| workspace.id == target.address.workspace_id)
-            .ok_or_else(|| {
-                format!(
-                    "workspace '{}' is not registered",
-                    target.address.workspace_id
-                )
-            })?;
-        let runtimes = self
-            .runtimes
-            .upgrade()
-            .ok_or_else(|| "original workspace runtime registry is unavailable".to_string())?;
-        let host = runtimes
-            .get_or_open(workspace)
-            .await
-            .map_err(|error| error.to_string())?;
-        let conversation = host
-            .resources()
-            .conversation_store()
-            .get_conversation(&target.address.conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        if conversation.is_none() {
-            return Err(format!(
-                "conversation '{}' does not exist in workspace '{}'",
-                target.address.conversation_id, target.address.workspace_id
-            ));
-        }
-        let seed_pool = self
-            .seed_pool
-            .upgrade()
-            .ok_or_else(|| "application AgentPool is unavailable".to_string())?;
-        let execution = host
-            .get_or_open_execution(&seed_pool)
-            .await
-            .map_err(|error| error.to_string())?;
-        let nested: Arc<dyn crate::tasks::task_runtime::TaskExecutionTargetResolver> =
-            Arc::new(self.clone());
-        execution
-            .task_runtime()
-            .attach_execution_target_resolver(nested);
+        let execution = self.resolve_target_execution(target).await?;
+        Self::verify_project_binding(target, execution.task_runtime().as_ref())?;
         execution
             .pool()
             .acquire(&target.address.conversation_id)

@@ -24,6 +24,7 @@ export type SettingsTabId =
   | 'worktree';
 
 type Theme = 'light' | 'dark';
+export type WorkspaceSourceKind = 'existing_local' | 'new_local' | 'ssh';
 
 interface UiState {
   leftSidebarOpen: boolean;
@@ -32,6 +33,13 @@ interface UiState {
   theme: Theme;
   activePluginTheme: string | null;
   terminalOpen: boolean;
+  workspaceDialogOpen: boolean;
+  workspaceDialogSource: WorkspaceSourceKind;
+  /** Presentation intent only; canonical Workspace/Conversation stores own transitions. */
+  navigationEpoch: number;
+  beginNavigation: () => number;
+  openWorkspaceDialog: (source?: WorkspaceSourceKind) => void;
+  closeWorkspaceDialog: () => void;
   toggleLeftSidebar: () => void;
   openSettings: () => void;
   closeSettings: () => void;
@@ -105,6 +113,21 @@ export const useUiStore = create<UiState>((set, get) => ({
   theme: getInitialTheme(),
   activePluginTheme: null,
   terminalOpen: false,
+  workspaceDialogOpen: false,
+  workspaceDialogSource: 'existing_local',
+  navigationEpoch: 0,
+  beginNavigation: () => {
+    const epoch = get().navigationEpoch + 1;
+    set({ navigationEpoch: epoch });
+    return epoch;
+  },
+  openWorkspaceDialog: (source = 'existing_local') =>
+    set((state) => ({
+      workspaceDialogOpen: true,
+      workspaceDialogSource: source,
+      navigationEpoch: state.navigationEpoch + 1,
+    })),
+  closeWorkspaceDialog: () => set({ workspaceDialogOpen: false }),
 
   toggleLeftSidebar: () => set((s) => ({ leftSidebarOpen: !s.leftSidebarOpen })),
   openSettings: () => set({ settingsOpen: true, activeSettingsTab: 'overview' }),

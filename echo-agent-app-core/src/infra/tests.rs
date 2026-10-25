@@ -268,8 +268,8 @@ mod resolve_subagent_model_tests {
     };
     use crate::config::{ConfiguredModel, EkoConfig, ModelProviderConfig};
     use echo_agent::agent::ReactAgentBuilder;
-    use echo_agent::subagent::{SubagentPromptCompiler, SubagentRegistry};
     use echo_agent::sandbox::SandboxManager;
+    use echo_agent::subagent::{SubagentPromptCompiler, SubagentRegistry};
     use std::sync::Arc;
 
     fn test_command_cells()
@@ -294,7 +294,18 @@ mod resolve_subagent_model_tests {
     #[cfg(target_os = "linux")]
     fn linux_unshare_net_available() -> bool {
         std::process::Command::new("bwrap")
-            .args(["--unshare-net", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--", "true"])
+            .args([
+                "--unshare-net",
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--",
+                "true",
+            ])
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
@@ -524,6 +535,7 @@ mod resolve_subagent_model_tests {
             Arc::new(crate::analysis_runtime::AnalyticsRuntime::default()),
             true,
             None,
+            Arc::new(echo_agent::tools::files::LocalFileSystem),
         )?;
 
         assert!(subagent.sandbox_manager().is_some());
@@ -570,6 +582,7 @@ mod resolve_subagent_model_tests {
             Arc::new(crate::analysis_runtime::AnalyticsRuntime::default()),
             true,
             None,
+            Arc::new(echo_agent::tools::files::LocalFileSystem),
         )?;
         let result = subagent
             .tool_manager()
@@ -610,6 +623,7 @@ mod resolve_subagent_model_tests {
             Arc::new(crate::analysis_runtime::AnalyticsRuntime::default()),
             true,
             None,
+            Arc::new(echo_agent::tools::files::LocalFileSystem),
         )?;
 
         assert!(
@@ -646,6 +660,7 @@ mod resolve_subagent_model_tests {
             None,
             test_command_cells()?,
             None,
+            Arc::new(echo_agent::tools::files::LocalFileSystem),
         )?;
         assert_eq!(subagent.thinking(), Some(&low));
 
@@ -670,6 +685,7 @@ mod resolve_subagent_model_tests {
             None,
             test_command_cells()?,
             None,
+            Arc::new(echo_agent::tools::files::LocalFileSystem),
         )?;
         assert!(plain.thinking().is_none());
         Ok(())
@@ -699,6 +715,7 @@ mod resolve_subagent_model_tests {
             None,
             test_command_cells()?,
             None,
+            Arc::new(echo_agent::tools::files::LocalFileSystem),
         )?;
         let readonly_names = readonly.tool_names();
         for expected in ["wait", "stop_cell", "list_cells"] {
@@ -734,8 +751,8 @@ mod resolve_subagent_model_tests {
     }
 
     #[test]
-    fn readonly_subagent_uses_the_injected_workspace_memory_store()
-    -> echo_agent::error::Result<()> {
+    fn readonly_subagent_uses_the_injected_workspace_memory_store() -> echo_agent::error::Result<()>
+    {
         let memory_store: Arc<dyn echo_agent::memory::Store> =
             Arc::new(echo_agent::memory::InMemoryStore::new());
         let subagent = build_readonly_subagent_agent(
@@ -759,11 +776,12 @@ mod resolve_subagent_model_tests {
             None,
             test_command_cells()?,
             Some(memory_store.clone()),
+            Arc::new(echo_agent::tools::files::LocalFileSystem),
         )?;
 
-        let installed = subagent
-            .store()
-            .ok_or_else(|| echo_agent::error::ReactError::Other("memory store missing".to_string()))?;
+        let installed = subagent.store().ok_or_else(|| {
+            echo_agent::error::ReactError::Other("memory store missing".to_string())
+        })?;
         assert!(Arc::ptr_eq(installed, &memory_store));
         for tool in ["recall", "search_memory"] {
             assert!(subagent.tool_names().iter().any(|name| name == tool));

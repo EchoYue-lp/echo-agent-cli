@@ -1186,6 +1186,9 @@ fn flush_queued_triggers_locked(state: &mut ReviewBindingState) {
 /// internally on each review pass.
 pub struct ReviewIntegration {
     config: ReviewConfig,
+    /// Immutable project I/O of this original host. Learned rules and review
+    /// receipts remain in the local binding's EKO data directory.
+    project_file_system: Option<Arc<dyn echo_agent::tools::filesystem::FileSystem>>,
     /// Single authority for workspace directory, Store and generation. The
     /// pair must never be read or published through independent locks.
     binding: Arc<ReviewBindingControl>,
@@ -1207,6 +1210,44 @@ pub struct ReviewIntegration {
 }
 
 impl ReviewIntegration {
+    pub fn with_project_file_system(
+        mut self,
+        files: Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+    ) -> Self {
+        self.project_file_system = Some(files);
+        self
+    }
+
+    fn load_project_projection(
+        &self,
+        project_root: Option<&std::path::Path>,
+        state_dir: Option<&std::path::Path>,
+    ) -> Result<crate::unified_memory::InstructionProjectionSnapshot, String> {
+        let Some(files) = self.project_file_system.as_ref() else {
+            return crate::unified_memory::load_instruction_projection_strict_with_state(
+                project_root,
+                state_dir,
+            )
+            .map_err(|error| error.to_string());
+        };
+        // Review's existing projection pipeline is synchronous. A joined
+        // bridge lets its original loader use synchronous remote I/O without
+        // entering Tokio on a runtime thread or publishing a partial snapshot.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    crate::unified_memory::load_instruction_projection_with_file_system(
+                        project_root,
+                        state_dir,
+                        files.as_ref(),
+                    )
+                })
+                .join()
+        })
+        .map_err(|_| "project rule projection bridge failed".to_string())?
+        .map_err(|error| error.to_string())
+    }
+
     /// Create a new review integration with the given config.
     pub fn new(config: ReviewConfig, echo_agent_dir: PathBuf, store: Arc<dyn Store>) -> Self {
         Self::new_scoped_with_project_root(
@@ -1283,6 +1324,7 @@ impl ReviewIntegration {
         });
         Self {
             config,
+            project_file_system: None,
             binding: Arc::new(ReviewBindingControl {
                 state: Mutex::new(ReviewBindingState {
                     current: ReviewBinding {
@@ -1414,11 +1456,12 @@ impl ReviewIntegration {
         }
         let effects = promoter.promote_rule(proposal, &change_log).await?;
         let binding = self.binding_snapshot();
-        let snapshot = crate::unified_memory::load_instruction_projection_strict_with_state(
-            binding.project_root.as_deref(),
-            Some(&binding.echo_agent_dir),
-        )
-        .map_err(|error| RulePromotionError::Projection(error.to_string()))?;
+        let snapshot = self
+            .load_project_projection(
+                binding.project_root.as_deref(),
+                Some(&binding.echo_agent_dir),
+            )
+            .map_err(|error| RulePromotionError::Projection(error.to_string()))?;
         let (mut primaries, _) = self
             .rule_projection_targets
             .write()
@@ -1487,7 +1530,7 @@ impl ReviewIntegration {
         _lease: &ReviewGenerationLease,
     ) -> Result<crate::unified_memory::InstructionProjectionSnapshot, RulePromotionError> {
         let binding = self.binding_snapshot();
-        crate::unified_memory::load_instruction_projection_strict_with_state(
+        self.load_project_projection(
             binding.project_root.as_deref(),
             Some(&binding.echo_agent_dir),
         )
@@ -1539,11 +1582,9 @@ impl ReviewIntegration {
             if let Some(snapshot) = snapshots.get(project_root) {
                 return Ok(snapshot.clone());
             }
-            let snapshot = crate::unified_memory::load_instruction_projection_strict_with_state(
-                project_root.as_deref(),
-                Some(&binding.echo_agent_dir),
-            )
-            .map_err(|error| RulePromotionError::Projection(error.to_string()))?;
+            let snapshot = self
+                .load_project_projection(project_root.as_deref(), Some(&binding.echo_agent_dir))
+                .map_err(|error| RulePromotionError::Projection(error.to_string()))?;
             snapshots.insert(project_root.clone(), snapshot.clone());
             Ok(snapshot)
         };
@@ -2292,6 +2333,81 @@ pub fn format_review_report(report: &ReviewReport) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn rule_reload_uses_project_provider_and_keeps_learned_state_local() -> Result<(), String>
+    {
+        let fixture =
+            crate::tasks::task_runtime::project_environment_tests::EnvironmentFixture::new()?;
+        fixture
+            .files
+            .create_dir_all(&fixture.visible_root.join(".eko"))
+            .map_err(|error| error.to_string())?;
+        fixture
+            .files
+            .create_dir_all(&fixture.visible_root.join(".git"))
+            .map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(fixture.visible_root.join(".eko"))
+            .map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(fixture.visible_root.join(".git"))
+            .map_err(|error| error.to_string())?;
+        std::fs::write(fixture.visible_root.join(".eko/project.md"), "LOCAL_RULE")
+            .map_err(|error| error.to_string())?;
+        fixture
+            .files
+            .write(
+                &fixture.visible_root.join(".eko/project.md"),
+                b"TARGET_RULE",
+            )
+            .map_err(|error| error.to_string())?;
+        let state = fixture.data_root.join("local-review-state");
+        std::fs::create_dir_all(&state).map_err(|error| error.to_string())?;
+        std::fs::write(state.join("learned-rules.md"), "LOCAL_LEARNED_RULE")
+            .map_err(|error| error.to_string())?;
+        let integration = ReviewIntegration::new_with_project_root(
+            ReviewConfig::default(),
+            state.clone(),
+            Arc::new(echo_agent::memory::InMemoryStore::new()),
+            Some(fixture.visible_root.clone()),
+        )
+        .with_project_file_system(fixture.files.clone());
+        let first =
+            integration.load_project_projection(Some(&fixture.visible_root), Some(&state))?;
+        let local = crate::unified_memory::load_instruction_projection_strict_with_state(
+            Some(&fixture.visible_root),
+            Some(&state),
+        )
+        .map_err(|error| error.to_string())?;
+        assert_ne!(first.revision(), local.revision());
+        std::fs::write(
+            fixture.visible_root.join(".eko/project.md"),
+            "LOCAL_CHANGED",
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            first.revision(),
+            integration
+                .load_project_projection(Some(&fixture.visible_root), Some(&state))?
+                .revision()
+        );
+        std::fs::write(state.join("learned-rules.md"), "LOCAL_LEARNED_UPDATED")
+            .map_err(|error| error.to_string())?;
+        assert_ne!(
+            first.revision(),
+            integration
+                .load_project_projection(Some(&fixture.visible_root), Some(&state))?
+                .revision()
+        );
+        fixture
+            .files
+            .write(&fixture.visible_root.join(".eko/project.md"), &[0xff])
+            .map_err(|error| error.to_string())?;
+        assert!(
+            integration
+                .load_project_projection(Some(&fixture.visible_root), Some(&state))
+                .is_err()
+        );
+        Ok(())
+    }
     use super::super::background_review_owner::{ReviewAppendFault, ReviewTerminal};
     use super::*;
     use futures::future::BoxFuture;

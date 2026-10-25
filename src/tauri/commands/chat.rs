@@ -133,6 +133,8 @@ async fn settle_gui_input_attempt(
 pub struct SendChatMessageRequest {
     workspace_id: String,
     message: String,
+    #[serde(default)]
+    domain_plugin: Option<String>,
     conversation_id: Option<String>,
     message_key: Option<String>,
     attachments: Option<Vec<echo_agent_app_core::api::types::AttachmentData>>,
@@ -154,6 +156,7 @@ impl SendChatMessageRequest {
         Self {
             workspace_id,
             message,
+            domain_plugin: None,
             conversation_id: Some(conversation_id),
             message_key: Some(message_key),
             attachments: None,
@@ -688,6 +691,7 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
     let SendChatMessageRequest {
         workspace_id,
         message,
+        domain_plugin,
         conversation_id,
         message_key,
         attachments,
@@ -738,11 +742,12 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
         let input_id = stable_scoped_input_id(&address, ConversationInputSource::Gui, &message_key)
             .map_err(|error| IpcError::Validation(error.to_string()))?;
         let receipt = input_service
-            .submit(
+            .submit_with_domain(
                 address.clone(),
                 input_id,
                 message,
                 attachments.unwrap_or_default(),
+                domain_plugin,
             )
             .await
             .map_err(|error| IpcError::Validation(error.to_string()))?;
@@ -1135,6 +1140,20 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
     if let Some(batch) = staged_attachment_batch.take() {
         batch.commit();
     }
+    let run_binding = queued_input.payload.domain_plugin.clone().map(|plugin| {
+        use echo_agent_app_core::api::tasks::task_runtime::{
+            RunTurnBinding, RunTurnOrigin, TurnVisibility,
+        };
+        RunTurnBinding {
+            domain_plugin: Some(plugin),
+            run_id: None,
+            turn_id: message_key.clone(),
+            root_message_id: message_key.clone(),
+            origin: RunTurnOrigin::User,
+            transcript_visibility: TurnVisibility::Visible,
+            expected_resume: None,
+        }
+    });
     let terminal_service = input_service.clone();
     let terminal_address = address.clone();
     let terminal_attempt = input_attempt;
@@ -1150,12 +1169,14 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
         foreground_lease.retain_execution(held_execution.clone());
         let held_browser = Arc::new(tokio::sync::Mutex::new(Some(browser_approval_registration)));
         foreground_lease.retain(held_browser.clone());
-        let outcome =
-            echo_agent_app_core::api::foreground_turn::drive_foreground_chat_with_ingress(
+        let outcome = echo_agent_app_core::api::chat_driver::with_foreground_pool_execution(
+            Arc::downgrade(&held_execution),
+            echo_agent_app_core::api::foreground_turn::drive_foreground_chat_with_bound_ingress(
                 foreground_lease,
                 &agent_handle_clone,
                 &prepared_turn,
                 res,
+                run_binding,
                 input_observer,
                 move |outcome| {
                     let service = terminal_service.clone();
@@ -1177,8 +1198,9 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
                         Ok(())
                     }
                 },
-            )
-            .await;
+            ),
+        )
+        .await;
         if outcome
             .as_ref()
             .err()
@@ -1291,6 +1313,30 @@ pub async fn steer_chat_message(
         .find(|item| item.receipt.identity == identity)
         .cloned()
         .ok_or_else(|| IpcError::Validation("queued input is no longer pending".to_string()))?;
+    if let Some(selected) = queued.payload.domain_plugin.as_deref() {
+        let run_id = snapshot.run_id.as_deref().ok_or_else(|| {
+            IpcError::Validation("domain steer requires its original TaskRun identity".to_string())
+        })?;
+        let run = scoped_runtime
+            .task_runtime()
+            .ok_or_else(|| {
+                IpcError::Validation("domain steer requires its TaskRun owner".to_string())
+            })?
+            .get_run(run_id)
+            .map_err(|error| IpcError::Validation(error.to_string()))?
+            .ok_or_else(|| IpcError::Validation("domain steer TaskRun is missing".to_string()))?;
+        if run
+            .domain_binding
+            .as_ref()
+            .map(|binding| binding.plugin.plugin_id.as_str())
+            != Some(selected)
+        {
+            return Err(IpcError::Validation(
+                "a queued domain selection cannot change an active TaskRun; start a new turn"
+                    .to_string(),
+            ));
+        }
+    }
     let saved_attachments = queued.payload.attachments.clone();
     let ws_root = scoped_runtime.execution_scope().root();
     let uploads_dir = echo_agent_app_core::api::attachments::resolve_uploads_dir(Some(ws_root));
@@ -1682,6 +1728,10 @@ async fn validate_queue_address(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri injects state/app; this adapter preserves the established flat input address and payload"
+)]
 #[tauri::command]
 pub async fn queue_chat_input(
     state: tauri::State<'_, TauriState>,
@@ -1691,6 +1741,7 @@ pub async fn queue_chat_input(
     external_id: String,
     text: String,
     attachments: Option<Vec<echo_agent_app_core::api::types::AttachmentData>>,
+    domain_plugin: Option<String>,
 ) -> Result<ConversationInputReceipt, IpcError> {
     validate_queue_address(&state, &workspace_id, &conversation_id).await?;
     let address = conversation_input_address(&workspace_id, &conversation_id);
@@ -1702,11 +1753,12 @@ pub async fn queue_chat_input(
     let input_id = stable_scoped_input_id(&address, ConversationInputSource::Gui, &external_id)
         .map_err(|error| IpcError::Validation(error.to_string()))?;
     let receipt = service
-        .submit(
+        .submit_with_domain(
             address.clone(),
             input_id,
             text,
             attachments.unwrap_or_default(),
+            domain_plugin,
         )
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;

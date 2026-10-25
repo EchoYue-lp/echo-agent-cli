@@ -612,6 +612,9 @@ mod tests {
         verification: &[&str],
     ) -> PlanTask {
         PlanTask {
+            domain_binding: None,
+            domain_role: None,
+
             id: id.to_string(),
             title: id.to_string(),
             description: String::new(),
@@ -1679,6 +1682,8 @@ Read the runtime path and found one missing branch.
             )
             .map_err(|error| error.to_string())?;
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".into(),
             run_id: "r1".into(),
             revision: 1,
@@ -2296,6 +2301,8 @@ Read the runtime path and found one missing branch.
             )
             .map_err(|error| error.to_string())?;
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: format!("plan_{}", run_id),
             run_id: run_id.clone(),
             revision: 1,
@@ -2500,6 +2507,7 @@ Read the runtime path and found one missing branch.
                 crate::workspace::WorkspaceId::from_raw("ws_remote".to_string()),
                 "conv_remote",
             ),
+            project_binding: None,
         };
         let task = PlanTask {
             id: "remote-verification".to_string(),
@@ -2543,6 +2551,7 @@ Read the runtime path and found one missing branch.
         let outcome = execute_runtime_plan(
             store.clone(),
             RealTaskDispatcher {
+                invocation_resources: Vec::new(),
                 primary_agent: local_agent,
                 workspace_io: None,
             },
@@ -3104,7 +3113,7 @@ Read the runtime path and found one missing branch.
                     reason: "runtime evidence discovered a required follow-up".to_string(),
                     operations: vec![TaskUpdateOperation::Insert {
                         after_task_id: Some("first".to_string()),
-                        task: second.spec(),
+                        task: Box::new(second.spec()),
                     }],
                 },
             )
@@ -3299,6 +3308,8 @@ Read the runtime path and found one missing branch.
             )
             .map_err(|error| error.to_string())?;
         let attach_result = store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: format!("plan_{run_id}"),
             run_id,
             revision: 1,
@@ -4818,6 +4829,125 @@ Read the runtime path and found one missing branch.
             payload.get("artifacts").is_some() && payload.get("verification").is_some(),
             "accepted evidence keeps its rich payload, got {payload}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bound_light_domain_uses_original_summary_and_formal_domain_requires_real_graph()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for formal in [false, true] {
+            let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+            let binding = crate::domain_plugin::test_binding(formal)?;
+            let run_id = if formal {
+                "formal-domain"
+            } else {
+                "light-domain"
+            };
+            store.create_run_for_active_workspace_with_domain(
+                run_id,
+                "conversation",
+                "root",
+                DomainProfile::General,
+                "answer from evidence",
+                "agent_task_plan",
+                AttendedMode::Attended,
+                TaskRunExecutionProfile::orchestrated(if formal {
+                    RunPlanPolicy::RequirePlan
+                } else {
+                    RunPlanPolicy::AllowDirect
+                }),
+                Some(&binding),
+            )?;
+            store.transition_run(run_id, TaskRunStatus::Running)?;
+            store.configure_run_continuation(run_id, true, false, None, None)?;
+            store.claim_run_turn(run_id, "turn", RunTurnOrigin::User, TurnVisibility::Visible)?;
+            let run = store.get_run(run_id)?.ok_or("run missing")?;
+            let observation = EkoAgentTurnSink::observe_chat(&run, HashSet::new())
+                .finish(Some("Observed answer."));
+            let mut receipt = TurnReceipt::failed(
+                "turn",
+                echo_agent::error::AgentFailure::message("fixture", "initial"),
+            )?;
+            receipt.outcome = TurnOutcome::Completed;
+            receipt.final_answer = Some("Observed answer.".to_string());
+            finalize_direct_agent_observation(
+                &store,
+                run_id,
+                &mut receipt,
+                observation,
+                &CancellationToken::new(),
+            )
+            .await?;
+            assert!(matches!(receipt.outcome, TurnOutcome::Completed));
+            let plan = store.get_plan(run_id)?;
+            if formal {
+                assert!(
+                    plan.is_none(),
+                    "formal domain must not materialize a fake direct Summary"
+                );
+                assert!(!store.completion_gate_report(run_id)?.ready);
+            } else {
+                let plan = plan.ok_or("light domain Summary missing")?;
+                assert_eq!(plan.domain_binding, Some(binding.reference()));
+                assert_eq!(plan.tasks.len(), 1);
+                let task = plan.tasks.first().ok_or("Summary missing")?;
+                assert_eq!(task.kind, PlanTaskKind::Summary);
+                assert!(task.required_artifacts.is_empty());
+                assert!(task.execution_checks.is_empty());
+                assert!(task.acceptance_criteria.is_empty());
+                assert!(task.allowed_tools.is_empty());
+                assert_eq!(task.domain_binding, Some(binding.reference()));
+                assert!(store.completion_gate_report(run_id)?.ready);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bound_direct_observation_rejects_real_mutation_without_relaxing_summary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let binding = crate::domain_plugin::test_binding(false)?;
+        store.create_run_for_active_workspace_with_domain(
+            "mutating-domain",
+            "conversation",
+            "root",
+            DomainProfile::General,
+            "answer",
+            "agent_task_plan",
+            AttendedMode::Attended,
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            Some(&binding),
+        )?;
+        store.transition_run("mutating-domain", TaskRunStatus::Running)?;
+        store.configure_run_continuation("mutating-domain", true, false, None, None)?;
+        store.claim_run_turn(
+            "mutating-domain",
+            "turn",
+            RunTurnOrigin::User,
+            TurnVisibility::Visible,
+        )?;
+        let observation = EkoAgentTurnObservation {
+            output: "claimed answer".to_string(),
+            observed_evidence: Vec::new(),
+            observed_artifacts: Vec::new(),
+            mutating_tool_observed: true,
+        };
+        let mut receipt = TurnReceipt::failed(
+            "turn",
+            echo_agent::error::AgentFailure::message("fixture", "initial"),
+        )?;
+        receipt.outcome = TurnOutcome::Completed;
+        finalize_direct_agent_observation(
+            &store,
+            "mutating-domain",
+            &mut receipt,
+            observation,
+            &CancellationToken::new(),
+        )
+        .await?;
+        assert!(matches!(receipt.outcome, TurnOutcome::Failed(_)));
+        assert!(store.get_plan("mutating-domain")?.is_none());
         Ok(())
     }
 }

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Sparkles, Play, Clock, Loader2 } from 'lucide-react';
 import { sessionApi } from '../../api/endpoints';
 import { useConversationStore } from '../../stores/conversationStore';
+import { useUiStore } from '../../stores/uiStore';
 
 interface Suggestion {
   icon: React.ComponentType<{ size?: number; color?: string; className?: string }>;
@@ -17,6 +18,7 @@ const suggestions: Suggestion[] = [
 
 interface LatestSession {
   id: string;
+  workspaceId: string;
   title: string;
   updated_at: string;
   message_count: number;
@@ -27,6 +29,7 @@ export function WelcomeScreen({
 }: {
   onSuggestionClick: (text: string) => void;
 }) {
+  void onSuggestionClick;
   const loadConversation = useConversationStore((s) => s.loadConversation);
   const workspaceId = useConversationStore((s) => s.workspaceId);
 
@@ -36,6 +39,8 @@ export function WelcomeScreen({
 
   useEffect(() => {
     let cancelled = false;
+    setLatestSession(null);
+    setChecking(true);
 
     const checkLatest = async () => {
       try {
@@ -43,6 +48,7 @@ export function WelcomeScreen({
         if (!cancelled && res.found && res.id) {
           setLatestSession({
             id: res.id,
+            workspaceId,
             title: res.title || 'Untitled',
             updated_at: res.updated_at || '',
             message_count: res.message_count || 0,
@@ -62,7 +68,9 @@ export function WelcomeScreen({
   }, [workspaceId]);
 
   const handleResume = async () => {
-    if (!latestSession) return;
+    if (!latestSession || latestSession.workspaceId !== useConversationStore.getState().workspaceId)
+      return;
+    useUiStore.getState().beginNavigation();
     setResumeLoading(true);
     try {
       await loadConversation(latestSession.id);
@@ -89,35 +97,35 @@ export function WelcomeScreen({
   };
 
   return (
-    <div className="flex h-full flex-col items-center justify-center px-4">
-      <div className="mb-10 flex flex-col items-center">
-        <div className="animate-slide-up mb-5 flex h-10 w-10 items-center justify-center text-[var(--text-tertiary)]">
+    <div className="mx-auto flex w-full max-w-[980px] flex-col items-center px-6 pb-7 pt-8 text-center">
+      <div className="mb-2 flex flex-col items-center">
+        <div className="animate-slide-up mb-4 flex h-10 w-10 items-center justify-center rounded-2xl bg-[var(--bg-secondary)] text-[var(--text-secondary)]">
           <Sparkles size={20} />
         </div>
         <h1
-          className="animate-slide-up text-xl font-semibold text-[var(--text-primary)]"
+          className="animate-slide-up text-[clamp(28px,3.2vw,40px)] font-semibold tracking-[-0.04em] text-[var(--text-primary)]"
           style={{ animationDelay: '0.05s' }}
         >
-          今天有什么可以帮你的？
+          EKO，和你一起把事做好
         </h1>
         <p
           className="animate-slide-up mt-2 text-sm text-[var(--text-secondary)]"
           style={{ animationDelay: '0.1s' }}
         >
-          我是 EKO，你的智能协作助手
+          从一个想法开始，剩下的我们一起完成。
         </p>
       </div>
 
       {/* Continue last session */}
-      {!checking && latestSession && (
+      {!checking && latestSession && latestSession.workspaceId === workspaceId && (
         <div
-          className="animate-slide-up mb-6 w-full max-w-[960px]"
+          className="animate-slide-up mt-4 w-full max-w-[440px]"
           style={{ animationDelay: '0.12s' }}
         >
           <button
             onClick={handleResume}
             disabled={resumeLoading}
-            className="group flex w-full items-center gap-4 rounded-lg border border-[var(--border-primary)] bg-transparent p-4 text-left transition-colors duration-200 hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-60"
+            className="group flex w-full items-center gap-4 rounded-lg border border-[var(--border-primary)] bg-transparent p-3 text-left transition-colors duration-200 hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-60"
             style={{ borderColor: 'var(--border-primary)' }}
             onMouseEnter={(e) => {
               if (!resumeLoading) {
@@ -166,7 +174,7 @@ export function WelcomeScreen({
           <button
             key={i}
             onClick={() => onSuggestionClick(s.text)}
-            className="animate-slide-up group flex items-start gap-3 rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] p-4 text-left transition-all duration-200 hover:-translate-y-1 hover:shadow-[var(--shadow-lg)]"
+            className="animate-slide-up group flex items-start gap-3 rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] p-3 text-left transition-all duration-200 hover:-translate-y-1 hover:shadow-[var(--shadow-lg)]"
             style={{ animationDelay: `${0.1 + i * 0.05}s` }}
             onMouseEnter={(e) => {
               e.currentTarget.style.borderColor = s.colorHex;

@@ -41,6 +41,7 @@ function run(status: TaskRun['status']): TaskRun {
     conversation_id: 'conversation-1',
     root_message_id: 'message-1',
     domain_profile: 'ai_coding',
+    domain_binding: null,
     status,
     goal: 'analyze project',
     goal_revision: 1,

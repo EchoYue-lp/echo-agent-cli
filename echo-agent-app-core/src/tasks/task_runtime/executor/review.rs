@@ -195,13 +195,39 @@ async fn run_review_gate(
         return ReviewGateOutcome::Skipped;
     };
 
+    let domain_run_id = run_id.to_string();
+    let domain_binding = match blocking
+        .run("load fixed review domain rules", move |store| {
+            Ok(store
+                .get_run_state(&domain_run_id)?
+                .and_then(|state| state.domain_binding))
+        })
+        .await
+    {
+        Ok(binding) => binding,
+        Err(error) => {
+            return ReviewGateOutcome::Suspend {
+                reason: format!("domain review binding unavailable: {error}"),
+                review: None,
+            };
+        }
+    };
+
     // Retry transient review errors (LLM 5xx/timeout, JSON parse failures) up to
     // 2 times before suspending. Transient failures are expected in production
     // and should not block the run on the first hiccup.
     const MAX_REVIEW_RETRIES: u32 = 2;
     let mut retries: u32 = 0;
     let review = loop {
-        match super::review::review_task(&llm, run_id, task, subagent_output).await {
+        match super::review::review_task(
+            &llm,
+            run_id,
+            task,
+            subagent_output,
+            domain_binding.as_ref(),
+        )
+        .await
+        {
             Ok(review) => break review,
             Err(e) => {
                 retries += 1;

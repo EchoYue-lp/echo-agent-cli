@@ -333,3 +333,20 @@ Provider API Key 使用各 Provider 的 `api_key_env`，无需维护固定厂商
 EKO 渠道中的每个活动审批、输入或选择提示都会给出 response target。使用 `/reply <response-target> <answer>` 回复，使用 `/reply <response-target> /cancel` 拒绝。审批继续支持 `y`、`a`、`n [reason]`、`m [feedback]`；选择沿原选项数字或名称；自由输入保留 answer 后缀的中文、emoji 与换行。有 pending 时裸文本不回答请求。缺失、旧、非 front 或其它会话的 target 明确拒绝且不进入普通聊天；无 pending 的普通文本仍可聊天。
 
 submitted 不等于原 provider/dispatcher 已选定的 effective answer。GUI 回复携带原投递 scope/target，不因切页重绑，缺 target 的历史事件不重新激活。合同与待完成的 Rust/native、实际双端组合及 IM/cron 验收边界见 [ADR0053](adr/0053-im-cron-gui-control.md)。身份源码 checkpoint 不表示完整渠道管理页或原生平台投递已验证。
+
+## 领域方法声明
+
+已启用插件可在包根增加一份 `domain.yaml`，声明 `schema_version: 1`、非空 `method`、
+可选 `default_subagent_roles`，以及明确的 `allowed_tools`、`required_artifacts`、
+`execution_checks`、`acceptance_criteria`、`review_checklist`、`inputs` 列表。未知字段
+或非法声明沿原发布错误路径拒绝候选；无声明仍是普通插件。名称和可选版本只来自原
+manifest，不在此重复。
+
+原聊天/任务请求接受可选 `domain_plugin`（GUI 为 `domainPlugin`），省略保持 General。
+原输入队列把选择与 payload identity 一同持久化，steer 不能换掉活动 Run 的领域。
+新非 General `domain_profile` 请求须明确选择插件；历史枚举可读，但不再授权新专业执行。
+
+inputs 为规范化包内相对文件。选定包/依赖内容、monitors、output style 及实际全局
+style provider 进入绑定，纯 theme 颜色不进入。来源缺失或变化阻止新执行，不覆盖原规则；
+已知敏感值不得复制进绑定/journal。手动终端/MCP 操作不受该 Agent 政策控制。
+见 [示例](../../examples/domain-plugin/README.md)。当前源码未编译，adhoc 后台委派仍未闭合。

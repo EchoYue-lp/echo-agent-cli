@@ -202,6 +202,8 @@ impl FileTaskStore {
                 })
                 .collect();
         Ok(Some(TaskPlan {
+            domain_binding: plan.domain_binding,
+
             plan_id: plan.plan_id,
             run_id: plan.run_id,
             revision: plan.revision,
@@ -385,6 +387,9 @@ mod tests {
 
     fn task(id: &str, kind: PlanTaskKind) -> PlanTask {
         PlanTask {
+            domain_binding: None,
+            domain_role: None,
+
             id: id.to_string(),
             title: format!("task {id}"),
             description: format!("do {id}"),
@@ -429,6 +434,8 @@ mod tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: "rebuild-plan".to_string(),
                 run_id: "rebuild-run".to_string(),
                 revision: 1,
@@ -497,6 +504,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
             revision: 1,
@@ -588,6 +597,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
             revision: 1,
@@ -791,6 +802,8 @@ mod tests {
         let mut downstream = task("downstream", PlanTaskKind::Summary);
         downstream.depends_on = vec![upstream.id.clone()];
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "derived-block-plan".to_string(),
             run_id: "derived-block".to_string(),
             revision: 1,

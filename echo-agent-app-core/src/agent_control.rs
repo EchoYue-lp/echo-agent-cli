@@ -2433,6 +2433,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
                 plan_id: format!("plan-{run_id}"),
                 run_id: run_id.to_string(),
                 revision: 1,

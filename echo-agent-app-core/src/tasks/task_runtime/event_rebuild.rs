@@ -21,11 +21,11 @@ use super::types::{
     ActiveSubagentBoundary, ActiveToolBoundary, Artifact, ArtifactKind, AttendedMode,
     BackgroundCellArtifactStatus, BackgroundCellPhase, BackgroundCellState,
     BackgroundCellTerminalCause, BlockerAudit, DomainProfile, ExecutionMode, PhysicalOwnerIntent,
-    PlanRevision, PlanTask, ProviderRetryState, RecordedUserSteer, RecoveryBlocker, ReviewOutcome,
-    ReviewResult, RunContinuationState, RunPause, RunPauseReason, RunStateEventIndex,
-    RunStateSnapshot, RunTurnOrigin, RunTurnStatus, RunTurnSummary, RuntimeEventKind,
-    RuntimeTaskEvent, TaskExecutionSummary, TaskPlan, TaskRun, TaskRunExecutionProfile,
-    TaskRunStatus, TurnVisibility,
+    PlanRevision, PlanTask, ProjectExecutionBinding, ProviderRetryState, RecordedUserSteer,
+    RecoveryBlocker, ReviewOutcome, ReviewResult, RunContinuationState, RunPause, RunPauseReason,
+    RunStateEventIndex, RunStateSnapshot, RunTurnOrigin, RunTurnStatus, RunTurnSummary,
+    RuntimeEventKind, RuntimeTaskEvent, TaskExecutionSummary, TaskPlan, TaskRun,
+    TaskRunExecutionProfile, TaskRunStatus, TurnVisibility,
 };
 
 /// How many recent user steers the fold keeps for the recovery capsule.
@@ -232,6 +232,10 @@ pub struct RebuiltPlan {
     #[serde(default)]
     pub execution_profile: TaskRunExecutionProfile,
     #[serde(default)]
+    pub project_binding: Option<ProjectExecutionBinding>,
+    #[serde(default)]
+    pub domain_binding: Option<crate::domain_plugin::DomainBinding>,
+    #[serde(default)]
     pub(crate) event_index: RunStateEventIndex,
 }
 
@@ -242,6 +246,7 @@ impl RebuiltPlan {
             run_id: self.plan.run_id.clone(),
             revision: self.plan.revision,
             domain_profile: self.plan.domain_profile,
+            domain_binding: self.run.domain_binding.clone(),
             goal_revision: self.plan.goal_revision,
             goal_sha256: self.plan.goal_sha256.clone(),
             assumptions: self.plan.assumptions.clone(),
@@ -259,6 +264,8 @@ impl RebuiltPlan {
             background_cells: self.background_cells.clone(),
             recent_constraints: self.recent_constraints.clone(),
             execution_profile: self.execution_profile,
+            project_binding: self.project_binding.clone(),
+            domain_binding: self.domain_binding.clone(),
             journal_sequence,
             event_index: self.event_index.clone(),
         }
@@ -293,6 +300,10 @@ pub(crate) struct EventFoldState {
     recent_constraints: Vec<RecordedUserSteer>,
     #[serde(default)]
     execution_profile: TaskRunExecutionProfile,
+    #[serde(default)]
+    project_binding: Option<ProjectExecutionBinding>,
+    #[serde(default)]
+    domain_binding: Option<crate::domain_plugin::DomainBinding>,
     #[serde(default)]
     started_turns: std::collections::BTreeSet<String>,
     #[serde(default)]
@@ -349,7 +360,7 @@ impl EventFoldState {
     }
 
     pub(crate) fn has_current_query_projection_schema(&self) -> bool {
-        self.query_projection_schema == Some(3)
+        self.query_projection_schema == Some(4)
     }
 
     #[cfg(test)]
@@ -374,6 +385,8 @@ impl EventFoldState {
             continuation,
             recent_constraints,
             execution_profile,
+            project_binding,
+            domain_binding,
             started_turns,
             accounted_usage,
             accounted_compactions,
@@ -392,13 +405,34 @@ impl EventFoldState {
             sequence_overflow: _,
             missing_record_sequence: _,
         } = self;
-        *query_projection_schema = Some(3);
+        *query_projection_schema = Some(4);
         use RuntimeEventKind as K;
         for ev in std::slice::from_ref(event) {
             seen_run_ids.insert(ev.run_id.clone());
             match ev.event_type {
                 K::RunCreated => {
                     let p = &ev.payload;
+                    *domain_binding = match p.get("domain_binding").filter(|value| !value.is_null())
+                    {
+                        None => None,
+                        Some(value) => match serde_json::from_value::<
+                            crate::domain_plugin::DomainBinding,
+                        >(value.clone())
+                        {
+                            Ok(binding) => match binding.validate() {
+                                Ok(()) => Some(binding),
+                                Err(error) => {
+                                    *invalid_execution = Some(error);
+                                    None
+                                }
+                            },
+                            Err(_) => {
+                                *invalid_execution =
+                                    Some("RunCreated has an invalid domain binding".to_string());
+                                None
+                            }
+                        },
+                    };
                     let goal = p
                         .get("goal")
                         .and_then(|v| v.as_str())
@@ -426,6 +460,9 @@ impl EventFoldState {
                             .and_then(|v| v.as_str())
                             .and_then(DomainProfile::from_str)
                             .unwrap_or_default(),
+                        domain_binding: domain_binding
+                            .as_ref()
+                            .map(crate::domain_plugin::DomainBinding::reference),
                         status: TaskRunStatus::Pending,
                         goal_revision: p
                             .get("goal_revision")
@@ -460,6 +497,16 @@ impl EventFoldState {
                         .cloned()
                         .and_then(|value| serde_json::from_value(value).ok())
                         .unwrap_or_default();
+                    match p.get("project_binding").filter(|value| !value.is_null()) {
+                        None => *project_binding = None,
+                        Some(value) => match serde_json::from_value(value.clone()) {
+                            Ok(binding) => *project_binding = Some(binding),
+                            Err(error) => {
+                                *invalid_execution =
+                                    Some(format!("RunCreated project binding is invalid: {error}"));
+                            }
+                        },
+                    }
                 }
                 K::RunGoalUpdated => {
                     if let Some(r) = run.as_mut()
@@ -673,6 +720,8 @@ impl EventFoldState {
                             }
                         }
                         *plan = Some(TaskPlan {
+                            domain_binding: committed.domain_binding,
+
                             plan_id: committed.plan_id,
                             run_id: committed.run_id,
                             revision: committed.revision,
@@ -1384,6 +1433,8 @@ impl EventFoldState {
             continuation: self.continuation.clone(),
             recent_constraints: self.recent_constraints.clone(),
             execution_profile: self.execution_profile,
+            project_binding: self.project_binding.clone(),
+            domain_binding: self.domain_binding.clone(),
             event_index: RunStateEventIndex {
                 started_turns: self.started_turns.clone(),
                 accounted_usage: self.accounted_usage.clone(),
@@ -1405,6 +1456,7 @@ impl EventFoldState {
             run_id: rebuilt.plan.run_id.clone(),
             revision: rebuilt.plan.revision,
             domain_profile: rebuilt.plan.domain_profile,
+            domain_binding: rebuilt.run.domain_binding.clone(),
             goal_revision: rebuilt.plan.goal_revision,
             goal_sha256: rebuilt.plan.goal_sha256.clone(),
             assumptions: rebuilt.plan.assumptions.clone(),
@@ -1836,6 +1888,8 @@ fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
 
 fn empty_plan_for(run: &TaskRun) -> TaskPlan {
     TaskPlan {
+        domain_binding: run.domain_binding.clone(),
+
         plan_id: String::new(),
         run_id: run.run_id.clone(),
         revision: 0,
@@ -1878,6 +1932,9 @@ mod tests {
 
     fn sample_task(id: &str, kind: PlanTaskKind) -> PlanTask {
         PlanTask {
+            domain_binding: None,
+            domain_role: None,
+
             id: id.to_string(),
             title: format!("task {id}"),
             description: format!("do {id}"),
@@ -1916,6 +1973,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "replay-plan".to_string(),
             run_id: "replay-run".to_string(),
             revision: 1,
@@ -2111,6 +2170,8 @@ mod tests {
 
         // 2. attach a structured plan (the authoritative plan-creation path).
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
             revision: 1,
@@ -2202,6 +2263,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         s.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
             revision: 1,
@@ -2220,7 +2283,7 @@ mod tests {
                 reason: "refine investigation".to_string(),
                 operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
-                    patch: TaskPatch {
+                    patch: Box::new(TaskPatch {
                         title: Some("renamed".to_string()),
                         description: Some("new desc".to_string()),
                         kind: Some(PlanTaskKind::ReadOnlyReview),
@@ -2232,7 +2295,7 @@ mod tests {
                         execution_checks: None,
                         acceptance_criteria: None,
                         max_retries: None,
-                    },
+                    }),
                 }],
             },
         )?;

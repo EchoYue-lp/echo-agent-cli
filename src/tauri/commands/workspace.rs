@@ -2,6 +2,7 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
+use echo_agent_app_core::api::workspace::ProjectSource;
 #[cfg(test)]
 use echo_agent_app_core::api::workspace::Workspace;
 #[cfg(test)]
@@ -10,6 +11,62 @@ use echo_agent_app_core::api::workspace::WorkspaceKind;
 #[cfg(test)]
 use echo_agent_app_core::api::workspace::registry::WorkspaceRegistry;
 use std::sync::Arc;
+
+/// Authentication stays in the existing PTY owner; no password enters IPC,
+/// workspace metadata, a model prompt, or a persistent frontend store.
+#[tauri::command]
+pub async fn connect_project_ssh(
+    state: tauri::State<'_, TauriState>,
+    connection_id: String,
+    target: echo_agent_app_core::api::terminal::TerminalTarget,
+    rows: u16,
+    cols: u16,
+) -> Result<echo_agent_app_core::api::terminal::TerminalSessionInfo, IpcError> {
+    if !matches!(
+        target,
+        echo_agent_app_core::api::terminal::TerminalTarget::Ssh { .. }
+    ) {
+        return Err(IpcError::Validation("请选择 SSH 项目目标".to_string()));
+    }
+    state
+        .app_state
+        .terminal
+        .create_project_ssh_auth(connection_id, target, rows, cols)
+        .await
+        .map_err(IpcError::Validation)
+}
+
+#[tauri::command]
+pub async fn verify_project_ssh(
+    state: tauri::State<'_, TauriState>,
+    connection_id: String,
+    target: echo_agent_app_core::api::terminal::TerminalTarget,
+    path: String,
+) -> Result<serde_json::Value, IpcError> {
+    let connection = state
+        .app_state
+        .terminal
+        .project_ssh(&connection_id)
+        .map_err(IpcError::Validation)?;
+    let path = connection
+        .verify_target_directory(target, path)
+        .await
+        .map_err(IpcError::Validation)?;
+    Ok(serde_json::json!({"path": path}))
+}
+
+#[tauri::command]
+pub async fn close_project_ssh(
+    state: tauri::State<'_, TauriState>,
+    connection_id: String,
+) -> Result<(), IpcError> {
+    state
+        .app_state
+        .terminal
+        .close_project_ssh(&connection_id)
+        .await
+        .map_err(IpcError::Validation)
+}
 
 #[cfg(test)]
 fn same_workspace_root(left: &std::path::Path, right: &std::path::Path) -> bool {
@@ -54,8 +111,16 @@ async fn switch_opened_workspace(
     app_state: &Arc<echo_agent_app_core::api::AppState>,
     workspace_id: echo_agent_app_core::api::workspace::WorkspaceId,
 ) -> Result<serde_json::Value, IpcError> {
+    switch_opened_workspace_with_connection(app_state, workspace_id, None).await
+}
+
+async fn switch_opened_workspace_with_connection(
+    app_state: &Arc<echo_agent_app_core::api::AppState>,
+    workspace_id: echo_agent_app_core::api::workspace::WorkspaceId,
+    connection_id: Option<String>,
+) -> Result<serde_json::Value, IpcError> {
     let transition = app_state
-        .switch_workspace_registered(workspace_id.clone())
+        .switch_workspace_registered_with_connection(workspace_id.clone(), connection_id)
         .await
         .map_err(|error| IpcError::Internal(format!("Failed to switch workspace: {error}")))?;
     let conversation_count = match app_state.conversation_store().await {
@@ -116,6 +181,7 @@ pub async fn create_workspace(
     name: String,
     kind: Option<String>,
     root: Option<String>,
+    source: Option<ProjectSource>,
 ) -> Result<serde_json::Value, IpcError> {
     let ws_kind = kind
         .as_deref()
@@ -126,11 +192,24 @@ pub async fn create_workspace(
         crate::tauri::path_validator::validate_workspace_root(root_str)
             .map_err(IpcError::Validation)?;
     }
-    let (workspace, created) = state
-        .app_state
-        .create_workspace_owned(&name, ws_kind, root.map(std::path::PathBuf::from))
-        .await
-        .map_err(IpcError::from)?;
+    if source.is_some() && root.is_some() {
+        return Err(IpcError::Validation("请选择一个项目来源".to_string()));
+    }
+    let (workspace, created) = match source {
+        Some(source) => {
+            state
+                .app_state
+                .create_project_workspace_owned(&name, ws_kind, source)
+                .await
+        }
+        None => {
+            state
+                .app_state
+                .create_workspace_owned(&name, ws_kind, root.map(std::path::PathBuf::from))
+                .await
+        }
+    }
+    .map_err(IpcError::from)?;
     tracing::info!(workspace = %workspace.id, root = %workspace.root.display(), created, "Created or opened workspace via IPC");
     Ok(serde_json::json!({
         "success": true,
@@ -145,6 +224,7 @@ pub async fn create_and_switch_workspace(
     name: String,
     kind: Option<String>,
     root: Option<String>,
+    source: Option<ProjectSource>,
 ) -> Result<serde_json::Value, IpcError> {
     if let Some(ref root_str) = root {
         crate::tauri::path_validator::validate_workspace_root(root_str)
@@ -154,11 +234,24 @@ pub async fn create_and_switch_workspace(
         .as_deref()
         .map(WorkspaceKind::from_str_loose)
         .unwrap_or_default();
-    let (workspace, created) = state
-        .app_state
-        .create_workspace_owned(&name, workspace_kind, root.map(std::path::PathBuf::from))
-        .await
-        .map_err(IpcError::from)?;
+    if source.is_some() && root.is_some() {
+        return Err(IpcError::Validation("请选择一个项目来源".to_string()));
+    }
+    let (workspace, created) = match source {
+        Some(source) => {
+            state
+                .app_state
+                .create_project_workspace_owned(&name, workspace_kind, source)
+                .await
+        }
+        None => {
+            state
+                .app_state
+                .create_workspace_owned(&name, workspace_kind, root.map(std::path::PathBuf::from))
+                .await
+        }
+    }
+    .map_err(IpcError::from)?;
     match switch_opened_workspace(&state.app_state, workspace.id.clone()).await {
         Ok(mut response) => {
             if let Some(object) = response.as_object_mut() {
@@ -259,9 +352,10 @@ pub async fn delete_workspace(
 pub async fn switch_workspace(
     state: tauri::State<'_, TauriState>,
     id: String,
+    connection_id: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     let ws_id = echo_agent_app_core::api::workspace::WorkspaceId::from_raw(id.clone());
-    switch_opened_workspace(&state.app_state, ws_id)
+    switch_opened_workspace_with_connection(&state.app_state, ws_id, connection_id)
         .await
         .map_err(|error| match error {
             IpcError::Internal(message) if message.contains("not found") => {

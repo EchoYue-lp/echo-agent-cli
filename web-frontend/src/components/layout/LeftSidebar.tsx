@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import {
   Plus,
   Sun,
@@ -17,6 +17,9 @@ import {
   Loader2,
   RefreshCw,
   Archive,
+  Server,
+  CalendarClock,
+  MessagesSquare,
 } from 'lucide-react';
 import { BrandIcon } from '../common/BrandIcon';
 import { useUiStore } from '../../stores/uiStore';
@@ -25,11 +28,21 @@ import { useConversationStore } from '../../stores/conversationStore';
 import { conversationApi } from '../../api/endpoints';
 import type { Workspace } from '../../api/endpoints';
 import type { ConversationListItem } from '../../types/api';
-import { getWorkspaceKind } from '../../lib/workspaceKinds';
 import { fileSystem } from '../../lib/tauri-bridge';
-import { workspaceIdForView } from '../../lib/viewAddress';
+import { workspaceIdForView, GLOBAL_WORKSPACE_ID } from '../../lib/viewAddress';
+import { workspaceLocationLabel, workspaceIsRemote } from '../../lib/workspacePresentation';
+import { useToastStore } from '../../stores/toastStore';
+import { useWorkspaceViewStore } from '../../stores/workspaceViewStore';
 
 const MAX_RECENT_CONVERSATIONS = 5;
+const WORKSPACE_BATCH = 6;
+const RECENT_PER_WORKSPACE = 8;
+interface RecentTask {
+  workspaceId: string;
+  workspaceGeneration: string;
+  workspaceName: string;
+  conversation: ConversationListItem;
+}
 const SIDE_STATUS_LABEL = {
   idle: '空闲',
   queued: '排队',
@@ -46,9 +59,11 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const openSettings = useUiStore((s) => s.openSettings);
   const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
   const toggleTerminal = useUiStore((s) => s.toggleTerminal);
+  const openWorkspaceDialog = useUiStore((state) => state.openWorkspaceDialog);
 
   const workspaces = useWorkspaceStore((s) => s.workspaces);
   const current = useWorkspaceStore((s) => s.current);
+  const isWorkspaceLoading = useWorkspaceStore((state) => state.isLoading);
   const switchTo = useWorkspaceStore((s) => s.switchTo);
   const deleteWorkspace = useWorkspaceStore((s) => s.delete);
 
@@ -66,12 +81,145 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<ConversationListItem[]>([]);
+  const [searchResultScope, setSearchResultScope] = useState('');
+  const currentSearchScope = JSON.stringify([
+    current?.id ?? GLOBAL_WORKSPACE_ID,
+    current?.product_data_generation ?? GLOBAL_WORKSPACE_ID,
+  ]);
   const [isSearching, setIsSearching] = useState(false);
   const [showAllConvs, setShowAllConvs] = useState(false);
   const [renamingSideId, setRenamingSideId] = useState<string | null>(null);
   const [sideTitleDraft, setSideTitleDraft] = useState('');
   const [isRenamingSide, setIsRenamingSide] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const [recentTasks, setRecentTasks] = useState<RecentTask[]>([]);
+  const [recentWorkspaceCount, setRecentWorkspaceCount] = useState(WORKSPACE_BATCH);
+  const [recentVisibleCount, setRecentVisibleCount] = useState(4);
+  const [recentLoading, setRecentLoading] = useState(false);
+  const [recentError, setRecentError] = useState('');
+  const recentScopes = useMemo(
+    () => [
+      {
+        id: GLOBAL_WORKSPACE_ID,
+        generation: GLOBAL_WORKSPACE_ID,
+        name: '未分组任务',
+        lastActive: '',
+      },
+      ...workspaces
+        .map((workspace) => ({
+          id: workspace.id,
+          generation: workspace.product_data_generation,
+          name: workspace.name,
+          lastActive: workspace.last_active,
+        }))
+        .sort((a, b) =>
+          a.id === current?.id
+            ? -1
+            : b.id === current?.id
+              ? 1
+              : b.lastActive.localeCompare(a.lastActive)
+        ),
+    ],
+    [workspaces, current?.id]
+  );
+  useEffect(() => {
+    let cancelled = false;
+    const scopes = recentScopes.slice(0, recentWorkspaceCount);
+    const rows: RecentTask[] = [];
+    let next = 0;
+    let failed = 0;
+    setRecentLoading(true);
+    setRecentError('');
+    // Read only the explicitly requested finite batch, with two metadata reads at a time.
+    const readNext = async () => {
+      while (!cancelled && next < scopes.length) {
+        const scope = scopes[next++];
+        if (!scope) return;
+        try {
+          const items = await conversationApi.list(scope.id);
+          if (cancelled) return;
+          const actual = useWorkspaceStore
+            .getState()
+            .workspaces.find((item) => item.id === scope.id);
+          if (
+            scope.id !== GLOBAL_WORKSPACE_ID &&
+            actual?.product_data_generation !== scope.generation
+          )
+            continue;
+          rows.push(
+            ...items
+              .filter((item) => !item.archived && !item.side_conversation)
+              .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+              .slice(0, RECENT_PER_WORKSPACE)
+              .map((conversation) => ({
+                workspaceId: scope.id,
+                workspaceGeneration: scope.generation,
+                workspaceName: scope.name,
+                conversation,
+              }))
+          );
+        } catch {
+          failed += 1;
+        }
+      }
+    };
+    void Promise.all([readNext(), readNext()]).then(() => {
+      if (cancelled) return;
+      setRecentTasks(
+        rows.sort((a, b) => b.conversation.updated_at.localeCompare(a.conversation.updated_at))
+      );
+      setRecentError(failed ? `${failed} 个工作空间的最近任务暂时无法读取` : '');
+      setRecentLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [recentScopes, recentWorkspaceCount, conversations]);
+
+  const openRecentTask = async (task: RecentTask) => {
+    const epoch = useUiStore.getState().beginNavigation();
+    const before = useWorkspaceStore.getState();
+    const target = before.workspaces.find((workspace) => workspace.id === task.workspaceId);
+    if (
+      task.workspaceId !== GLOBAL_WORKSPACE_ID &&
+      target?.product_data_generation !== task.workspaceGeneration
+    ) {
+      useToastStore.getState().addToast('error', '工作空间已变化，请重新选择任务');
+      return;
+    }
+    try {
+      const currentId = before.current?.id ?? GLOBAL_WORKSPACE_ID;
+      const transition =
+        currentId === task.workspaceId
+          ? null
+          : task.workspaceId === GLOBAL_WORKSPACE_ID
+            ? before.exit()
+            : before.switchTo(task.workspaceId);
+      // switchTo detaches synchronously; later new-task actions must supersede this intent.
+      const draftEpoch = useConversationStore.getState().newConversationEpoch;
+      if (transition) await transition;
+      const actual = useWorkspaceStore.getState().current;
+      if (
+        useUiStore.getState().navigationEpoch !== epoch ||
+        useConversationStore.getState().newConversationEpoch !== draftEpoch
+      )
+        return;
+      if (
+        (actual?.id ?? GLOBAL_WORKSPACE_ID) !== task.workspaceId ||
+        (actual?.product_data_generation ?? GLOBAL_WORKSPACE_ID) !== task.workspaceGeneration ||
+        useConversationStore.getState().workspaceId !== task.workspaceId
+      )
+        return;
+      await loadConversation(task.conversation.conversation_id);
+      if (useUiStore.getState().navigationEpoch === epoch)
+        useWorkspaceViewStore.getState().openChat();
+    } catch (error) {
+      if (useUiStore.getState().navigationEpoch === epoch)
+        useToastStore
+          .getState()
+          .addToast('error', error instanceof Error ? error.message : '打开任务失败');
+    }
+  };
 
   // Debounced search across all conversation content
   useEffect(() => {
@@ -79,6 +227,10 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       setSearchResults([]);
       return;
     }
+    const requestScope = JSON.stringify([
+      current?.id ?? GLOBAL_WORKSPACE_ID,
+      current?.product_data_generation ?? GLOBAL_WORKSPACE_ID,
+    ]);
     const controller = new AbortController();
     const timer = setTimeout(async () => {
       if (controller.signal.aborted) return;
@@ -89,6 +241,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
           searchQuery.trim()
         );
         if (!controller.signal.aborted) {
+          setSearchResultScope(requestScope);
           setSearchResults(results);
         }
       } catch (e) {
@@ -106,7 +259,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [current?.id, searchQuery]);
+  }, [current?.id, current?.product_data_generation, searchQuery]);
 
   useEffect(() => {
     setShowAllConvs(false);
@@ -134,7 +287,10 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
     ? workspaces.filter((w) => w.name.toLowerCase().includes(searchQuery.toLowerCase()))
     : workspaces;
   const isSearchingContent = searchQuery.trim().length > 0;
-  const visibleSearchResults = searchResults.filter((conversation) => !conversation.archived);
+  const visibleSearchResults =
+    searchResultScope === currentSearchScope
+      ? searchResults.filter((conversation) => !conversation.archived)
+      : [];
 
   const handleSwitch = async (ws: Workspace) => {
     if (current?.id === ws.id) {
@@ -142,17 +298,29 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       setExpandedId(expandedId === ws.id ? null : ws.id);
       return;
     }
+    const epoch = useUiStore.getState().beginNavigation();
     try {
       await switchTo(ws.id);
+      const actual = useWorkspaceStore.getState().current;
+      if (
+        useUiStore.getState().navigationEpoch !== epoch ||
+        actual?.id !== ws.id ||
+        actual.product_data_generation !== ws.product_data_generation
+      )
+        return;
       setExpandedId(ws.id);
-    } catch (e) {
-      console.error('Switch workspace failed:', e);
+      useWorkspaceViewStore.getState().openChat();
+    } catch (error) {
+      if (useUiStore.getState().navigationEpoch === epoch)
+        useToastStore
+          .getState()
+          .addToast('error', error instanceof Error ? error.message : '切换工作空间失败');
     }
   };
 
   const handleDelete = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!confirm('确定删除此任务？所有数据将被清除。')) return;
+    if (!confirm('确定移除此工作空间及其本机会话数据？项目代码文件不会被删除。')) return;
     try {
       await deleteWorkspace(id);
       if (expandedId === id) setExpandedId(null);
@@ -164,7 +332,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const handleOpenFolder = async (e: React.MouseEvent, ws: Workspace) => {
     e.stopPropagation();
     try {
-      await fileSystem.openPath(ws.root);
+      await fileSystem.openPath(workspaceLocationLabel(ws));
     } catch (err) {
       console.error('Open folder failed:', err);
     }
@@ -173,12 +341,18 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const handleNewConversation = async (e: React.MouseEvent, ws: Workspace) => {
     e.stopPropagation();
     try {
-      if (current?.id === ws.id) {
-        await startNewConversation();
-      } else {
-        await startNewConversation();
-        await switchTo(ws.id);
-      }
+      const epoch = useUiStore.getState().beginNavigation();
+      if (current?.id !== ws.id) await switchTo(ws.id);
+      const actual = useWorkspaceStore.getState().current;
+      if (
+        useUiStore.getState().navigationEpoch !== epoch ||
+        actual?.id !== ws.id ||
+        actual.product_data_generation !== ws.product_data_generation
+      )
+        return;
+      await startNewConversation();
+      if (useUiStore.getState().navigationEpoch !== epoch) return;
+      useWorkspaceViewStore.getState().openChat();
       setExpandedId(ws.id);
       setShowAllConvs(false);
     } catch (err) {
@@ -188,7 +362,23 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
 
   const handleSelectConv = async (convId: string) => {
     if (convId === activeConvId) return;
+    const epoch = useUiStore.getState().beginNavigation();
     await loadConversation(convId);
+    if (useUiStore.getState().navigationEpoch === epoch)
+      useWorkspaceViewStore.getState().openChat();
+  };
+
+  const handleSearchResult = async (id: string, scope: string) => {
+    const live = useWorkspaceStore.getState().current;
+    if (
+      scope !==
+      JSON.stringify([
+        live?.id ?? GLOBAL_WORKSPACE_ID,
+        live?.product_data_generation ?? GLOBAL_WORKSPACE_ID,
+      ])
+    )
+      return;
+    await handleSelectConv(id);
   };
 
   const handleArchiveConversation = async (id: string, e: React.MouseEvent) => {
@@ -248,12 +438,6 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
     }
   };
 
-  const getKindIcon = (kind: { type: string }) => {
-    const k = getWorkspaceKind(kind.type);
-    const Icon = k.icon;
-    return <Icon size={14} style={{ color: k.color }} />;
-  };
-
   // Conversations are loaded from the active workspace-scoped store after switchWorkspace.
   const sideConversationIds = new Set(
     sideConversations.map((conversation) => conversation.conversation_id)
@@ -294,7 +478,9 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
         <button
           type="button"
           onClick={() => onNewTask()}
-          className="btn btn-primary flex h-10 w-full items-center justify-start gap-2 px-3 text-sm"
+          disabled={isWorkspaceLoading}
+          title={isWorkspaceLoading ? '工作空间正在切换，请稍候' : '在当前工作空间新建任务'}
+          className="disabled:cursor-wait disabled:opacity-60 flex h-10 w-full items-center justify-start gap-2.5 rounded-xl bg-[var(--bg-sidebar-active)] px-3 text-sm font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-sidebar-hover)]"
         >
           <Plus size={16} />
           新建任务
@@ -307,7 +493,8 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
               ref={searchInputRef}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="搜索任务..."
+              placeholder="搜索任务或工作空间"
+              aria-label="搜索任务或工作空间"
               className="flex-1 bg-transparent text-xs text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
             />
             {searchQuery && (
@@ -326,6 +513,25 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
           </div>
         )}
       </div>
+
+      <nav aria-label="后台服务" className="space-y-0.5 px-3 pb-3">
+        <button
+          type="button"
+          onClick={() => setActiveSettingsTab('channels')}
+          className="flex h-8 w-full items-center gap-2.5 rounded-lg px-3 text-[13px] hover:bg-[var(--bg-sidebar-hover)]"
+        >
+          <MessagesSquare size={15} />
+          IM 渠道
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveSettingsTab('scheduler')}
+          className="flex h-8 w-full items-center gap-2.5 rounded-lg px-3 text-[13px] hover:bg-[var(--bg-sidebar-hover)]"
+        >
+          <CalendarClock size={15} />
+          定时任务
+        </button>
+      </nav>
 
       {/* Search Results — conversation content matches */}
       {isSearchingContent && (
@@ -352,11 +558,11 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                 role="button"
                 tabIndex={0}
                 className="cursor-pointer rounded-md px-2 py-2 text-[13px] transition-colors hover:bg-[var(--bg-hover)]"
-                onClick={() => handleSelectConv(conv.conversation_id)}
+                onClick={() => void handleSearchResult(conv.conversation_id, searchResultScope)}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' || event.key === ' ') {
                     event.preventDefault();
-                    handleSelectConv(conv.conversation_id);
+                    void handleSearchResult(conv.conversation_id, searchResultScope);
                   }
                 }}
               >
@@ -376,11 +582,73 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       )}
 
       {/* Task (Workspace) List — expandable with conversations */}
-      <div className="flex-1 overflow-y-auto px-1.5 pb-2">
+      <div className="flex-1 overflow-y-auto px-2 pb-2">
+        {!isSearchingContent && (
+          <section aria-label="最近任务" className="mb-3">
+            <div className="flex items-center justify-between px-3 pb-2 text-[11px] font-medium text-[var(--text-tertiary)]">
+              <h2>最近任务</h2>
+              {recentLoading && (
+                <Loader2 size={12} className="animate-spin" aria-label="读取最近任务" />
+              )}
+            </div>
+            {recentTasks.slice(0, recentVisibleCount).map((task) => (
+              <button
+                type="button"
+                key={`${task.workspaceId}:${task.workspaceGeneration}:${task.conversation.conversation_id}`}
+                onClick={() => void openRecentTask(task)}
+                aria-label={`打开任务 ${task.conversation.title || '新任务'}，${task.workspaceName}`}
+                title={`${task.conversation.title || '新任务'} · ${task.workspaceName}`}
+                className={`group flex min-h-8 w-full items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-[13px] transition-colors hover:bg-[var(--bg-sidebar-hover)] ${activeConvId === task.conversation.conversation_id && (current?.id ?? GLOBAL_WORKSPACE_ID) === task.workspaceId ? 'bg-[var(--bg-sidebar-active)] text-[var(--text-primary)]' : ''}`}
+              >
+                <MessageSquare size={13} className="shrink-0 text-[var(--text-tertiary)]" />
+                <span className="min-w-0 flex-1 truncate">
+                  {task.conversation.title || '新任务'}
+                </span>
+                <span className="max-w-[56px] shrink-0 truncate text-[10px] text-[var(--text-tertiary)]">
+                  {task.workspaceName}
+                </span>
+              </button>
+            ))}
+            {!recentLoading && recentTasks.length === 0 && (
+              <p className="px-3 py-2 text-xs text-[var(--text-tertiary)]">从一个新任务开始</p>
+            )}
+            {recentError && (
+              <p role="status" className="px-3 py-2 text-xs text-[var(--color-warning-text)]">
+                {recentError}
+              </p>
+            )}
+            {(recentTasks.length > recentVisibleCount ||
+              recentWorkspaceCount < recentScopes.length) && (
+              <button
+                type="button"
+                disabled={recentLoading}
+                onClick={() => {
+                  setRecentVisibleCount((count) => count + 8);
+                  setRecentWorkspaceCount((count) => count + WORKSPACE_BATCH);
+                }}
+                className="px-3 py-2 text-xs text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
+              >
+                查看更多任务
+              </button>
+            )}
+          </section>
+        )}
+        <div className="flex items-center justify-between px-3 pb-2 text-[11px] font-medium text-[var(--text-tertiary)]">
+          <h2>工作空间</h2>
+          <button
+            type="button"
+            onClick={() => openWorkspaceDialog()}
+            aria-label="添加工作空间"
+            title="添加工作空间"
+            className="rounded-md p-1 hover:bg-[var(--bg-sidebar-hover)]"
+          >
+            <Plus size={13} />
+          </button>
+        </div>
         {filtered.length === 0 && !searchQuery && (
           <div className="px-3 py-8 text-center">
             <FolderOpen size={24} className="mx-auto mb-2 text-[var(--text-tertiary)]" />
-            <p className="text-xs text-[var(--text-tertiary)]">暂无任务，点击上方创建</p>
+            <p className="text-xs text-[var(--text-tertiary)]">还没有工作空间</p>
           </div>
         )}
 
@@ -402,7 +670,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
               <div
                 role="button"
                 tabIndex={0}
-                aria-label={`打开工作区 ${ws.name}`}
+                aria-label={`打开工作空间 ${ws.name}`}
                 className={`group relative cursor-pointer rounded-md transition-colors
                   ${
                     isActive
@@ -426,13 +694,15 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                     ) : (
                       <ChevronRight size={13} className="shrink-0 text-[var(--text-tertiary)]" />
                     )
+                  ) : workspaceIsRemote(ws) ? (
+                    <Server size={14} className="shrink-0" />
                   ) : (
-                    getKindIcon(ws.kind)
+                    <FolderOpen size={14} className="shrink-0" />
                   )}
 
                   <div
                     className={`min-w-0 flex-1 truncate text-sm ${isActive ? 'font-medium' : ''}`}
-                    title={ws.root}
+                    title={workspaceLocationLabel(ws)}
                   >
                     {ws.name}
                   </div>
@@ -445,13 +715,15 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                     >
                       <Plus size={12} />
                     </button>
-                    <button
-                      onClick={(e) => handleOpenFolder(e, ws)}
-                      className="rounded-md p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
-                      title="打开文件夹"
-                    >
-                      <FolderOpen size={12} />
-                    </button>
+                    {!workspaceIsRemote(ws) && (
+                      <button
+                        onClick={(e) => handleOpenFolder(e, ws)}
+                        className="rounded-md p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
+                        title="打开文件夹"
+                      >
+                        <FolderOpen size={12} />
+                      </button>
+                    )}
                     <button
                       onClick={(e) => handleDelete(ws.id, e)}
                       className="rounded-md p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--color-error)]"

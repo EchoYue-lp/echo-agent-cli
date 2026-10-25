@@ -1909,13 +1909,40 @@ where
     Settle: Fn(TurnOutcome) -> SettleFuture + Send + Sync + 'static,
     SettleFuture: std::future::Future<Output = Result<(), String>> + Send + 'static,
 {
+    drive_foreground_chat_with_bound_ingress(
+        lease,
+        agent,
+        turn,
+        resources,
+        None,
+        input_observer,
+        durable_terminal,
+    )
+    .await
+}
+
+/// The same foreground/ingress owner with an explicit initial TaskRun selection.
+/// The unbound wrapper above keeps every existing surface's default behavior.
+pub async fn drive_foreground_chat_with_bound_ingress<Settle, SettleFuture>(
+    lease: ForegroundTurnLease,
+    agent: &AgentHandle,
+    turn: &PreparedUserTurn,
+    resources: Arc<ChatResources>,
+    binding: Option<crate::tasks::task_runtime::types::RunTurnBinding>,
+    input_observer: crate::chat_driver::InputReceiptObserver,
+    durable_terminal: Settle,
+) -> Result<TurnOutcome, ChatTurnError>
+where
+    Settle: Fn(TurnOutcome) -> SettleFuture + Send + Sync + 'static,
+    SettleFuture: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
     let (result, settlement_outcome) =
         run_foreground_chat_with(&lease, resources, |controlled_resources| async move {
             crate::chat_driver::drive_chat_turn_with_input_observer(
                 agent,
                 turn,
                 controlled_resources,
-                None,
+                binding,
                 Some(input_observer),
             )
             .await

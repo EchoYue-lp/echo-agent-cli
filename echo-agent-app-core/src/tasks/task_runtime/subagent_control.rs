@@ -2129,6 +2129,8 @@ mod tests {
             .collect();
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: format!("plan-{run_id}"),
                 run_id: run_id.to_string(),
                 revision: 1,

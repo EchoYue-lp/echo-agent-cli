@@ -1437,6 +1437,8 @@ export interface TerminalCreateOptions {
   rows?: number;
   cols?: number;
   target?: TerminalTarget;
+  projectWorkspaceId?: string;
+  projectWorkspaceGeneration?: string;
 }
 
 export interface TerminalCloseResult {
@@ -1453,8 +1455,9 @@ export const terminalApi = {
   create: (options?: TerminalCreateOptions | string) => {
     const request: TerminalCreateOptions =
       typeof options === 'string' ? { cwd: options } : (options ?? {});
-    const target = request.target ?? { kind: 'local' as const };
-    if (!isTauri() && target.kind === 'ssh') {
+    const target =
+      request.target ?? (request.projectWorkspaceId ? undefined : { kind: 'local' as const });
+    if (!isTauri() && (target?.kind === 'ssh' || request.projectWorkspaceId)) {
       return Promise.reject<TerminalSession>(
         new Error('SSH terminals require the EKO desktop application')
       );
@@ -1892,6 +1895,22 @@ export const systematicReviewsApi = {
 
 // ── Workspace API ──
 
+export type ProjectLocation =
+  | { kind: 'local'; path: string }
+  | { kind: 'ssh'; host: string; user: string | null; port: number | null; path: string };
+
+export type ProjectSource =
+  | { kind: 'existing_local'; path: string }
+  | { kind: 'new_local'; parent: string; directory_name: string }
+  | {
+      kind: 'ssh';
+      host: string;
+      user: string | null;
+      port: number | null;
+      path: string;
+      connection_id: string;
+    };
+
 export interface Workspace {
   id: string;
   name: string;
@@ -1902,6 +1921,8 @@ export interface Workspace {
     description?: string;
     tags: string[];
     project_root_revision?: number;
+    project_location?: ProjectLocation;
+    project_execution_location?: ProjectLocation;
   };
   product_data_generation: string;
   created_at: string;
@@ -1939,11 +1960,16 @@ export type WorkspaceCreateAndSwitchResponse =
     };
 
 export const workspaceApi = {
+  connectSsh: (connectionId: string, target: TerminalTarget, rows: number, cols: number) =>
+    apiInvoke<TerminalSession>('connect_project_ssh', { connectionId, target, rows, cols }),
+  verifySsh: (connectionId: string, target: TerminalTarget, path: string) =>
+    apiInvoke<{ path: string }>('verify_project_ssh', { connectionId, target, path }),
+  closeSsh: (connectionId: string) => apiInvoke<void>('close_project_ssh', { connectionId }),
   list: () =>
     isTauri()
       ? apiInvoke<WorkspaceListResponse>('list_workspaces')
       : get<WorkspaceListResponse>('/workspaces'),
-  create: (name: string, kind?: string, root?: string) =>
+  create: (name: string, kind?: string, root?: string, source?: ProjectSource) =>
     isTauri()
       ? apiInvoke<{ success: boolean; created?: boolean; workspace: Workspace }>(
           'create_workspace',
@@ -1951,21 +1977,24 @@ export const workspaceApi = {
             name,
             kind,
             root,
+            source,
           }
         )
       : post<{ success: boolean; created?: boolean; workspace: Workspace }>('/workspaces', {
           name,
           kind,
           root,
+          source,
         }),
-  createAndSwitch: (name: string, kind?: string, root?: string) =>
+  createAndSwitch: (name: string, kind?: string, root?: string, source?: ProjectSource) =>
     isTauri()
       ? apiInvoke<WorkspaceCreateAndSwitchResponse>('create_and_switch_workspace', {
           name,
           kind,
           root,
+          source,
         })
-      : workspaceApi.create(name, kind, root).then(async ({ workspace, created }) => {
+      : workspaceApi.create(name, kind, root, source).then(async ({ workspace, created }) => {
           const switched = await workspaceApi.switch(workspace.id);
           return {
             ...switched,
@@ -1982,13 +2011,13 @@ export const workspaceApi = {
     isTauri()
       ? apiInvoke<{ workspace: Workspace }>('get_workspace', { id }).then((r) => r.workspace)
       : get<Workspace>(`/workspaces/${id}`),
-  switch: (id: string) =>
+  switch: (id: string, connectionId?: string) =>
     isTauri()
       ? apiInvoke<{
           success: boolean;
           workspace: Workspace;
           transition: WorkspaceTransitionReceipt;
-        }>('switch_workspace', { id })
+        }>('switch_workspace', { id, connectionId })
       : post<{
           success: boolean;
           workspace: Workspace;
@@ -3097,28 +3126,28 @@ export interface UnattendedWorktreeMergeResult {
 }
 
 export const worktreeApi = {
-  list: (workspaceId: string) => apiInvoke<WorktreeInfo[]>('list_worktrees', { workspaceId }),
-  create: (workspaceId: string, req: { branch: string; base?: string; path?: string }) =>
+  list: (scope: ProductDataScope) => apiInvoke<WorktreeInfo[]>('list_worktrees', { ...scope }),
+  create: (scope: ProductDataScope, req: { branch: string; base?: string; path?: string }) =>
     apiInvoke<WorktreeInfo>('create_worktree', {
-      workspaceId,
+      ...scope,
       branch: req.branch,
       base: req.base,
       path: req.path,
     }),
-  remove: (workspaceId: string, path: string) =>
-    apiInvoke<{ success: boolean }>('remove_worktree', { workspaceId, path }),
-  listUnattended: (workspaceId: string) =>
-    apiInvoke<UnattendedWorktreeInfo[]>('list_unattended_worktrees', { workspaceId }),
-  mergeUnattended: (workspaceId: string, runId: string) =>
+  remove: (scope: ProductDataScope, path: string) =>
+    apiInvoke<{ success: boolean }>('remove_worktree', { ...scope, path }),
+  listUnattended: (scope: ProductDataScope) =>
+    apiInvoke<UnattendedWorktreeInfo[]>('list_unattended_worktrees', { ...scope }),
+  mergeUnattended: (scope: ProductDataScope, runId: string) =>
     apiInvoke<UnattendedWorktreeMergeResult>('merge_unattended_worktree', {
-      workspaceId,
+      ...scope,
       runId,
     }),
-  discardUnattended: (workspaceId: string, runId: string) =>
+  discardUnattended: (scope: ProductDataScope, runId: string) =>
     apiInvoke<{ success: boolean; discarded: string }>('discard_unattended_worktree', {
-      workspaceId,
+      ...scope,
       runId,
     }),
-  cleanupUnattended: (workspaceId: string) =>
-    apiInvoke<UnattendedWorktreeCleanupResult>('cleanup_unattended_worktrees', { workspaceId }),
+  cleanupUnattended: (scope: ProductDataScope) =>
+    apiInvoke<UnattendedWorktreeCleanupResult>('cleanup_unattended_worktrees', { ...scope }),
 };

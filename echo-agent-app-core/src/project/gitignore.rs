@@ -23,6 +23,24 @@ struct IgnorePattern {
 }
 
 impl GitIgnore {
+    pub fn load_with_file_system(
+        project_root: &Path,
+        files: &dyn echo_agent::tools::filesystem::FileSystem,
+    ) -> echo_agent::error::Result<Self> {
+        let bytes = match files.read(&project_root.join(".gitignore")) {
+            Ok(bytes) => bytes,
+            Err(echo_agent::error::ReactError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(Self::parse(""));
+            }
+            Err(error) => return Err(error),
+        };
+        let content = String::from_utf8(bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        Ok(Self::parse(&content))
+    }
+
     /// Load gitignore rules from the given directory.
     ///
     /// Reads `.gitignore` at the project root. Returns an empty rule set if
@@ -54,7 +72,7 @@ impl GitIgnore {
 
             if raw.starts_with('!') {
                 negated = true;
-                raw = raw[1..].to_string();
+                raw = raw.strip_prefix('!').unwrap_or(&raw).to_string();
             }
             // Remove leading slash for root-relative patterns
             if raw.starts_with('/') {

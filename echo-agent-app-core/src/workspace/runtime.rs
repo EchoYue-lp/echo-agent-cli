@@ -45,6 +45,9 @@ pub(crate) struct WorkspaceRuntimeResources {
 /// refreshed after registry operations such as linking a project without
 /// replacing the host or reopening its stores.
 pub(crate) struct WorkspaceRuntimeHost {
+    execution_root: PathBuf,
+    project_file_system: Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+    project_executor: Arc<dyn echo_agent::sandbox::SandboxExecutor>,
     subagent_depth_defaults: Arc<crate::subagent_policy::SubagentDepthDefaults>,
     workspace: RwLock<Workspace>,
     resources: WorkspaceRuntimeResources,
@@ -174,6 +177,7 @@ impl WorkspaceRuntimeActivity {
 /// resident until application shutdown; eviction requires an explicit idle
 /// proof and is intentionally deferred.
 pub(crate) struct WorkspaceRuntimeRegistry {
+    terminal: Option<Arc<crate::terminal::TerminalService>>,
     subagent_depth_defaults: Arc<crate::subagent_policy::SubagentDepthDefaults>,
     lifecycle_retention: WorkspaceLifecycleBinding,
     hosts: Mutex<HashMap<WorkspaceId, Arc<WorkspaceRuntimeHost>>>,
@@ -306,10 +310,73 @@ impl WorkspaceRuntimeHost {
         product_data_io: crate::product_data_io::ProductDataIoService,
         lifecycle_retention: WorkspaceLifecycleBinding,
         subagent_depth_defaults: Arc<crate::subagent_policy::SubagentDepthDefaults>,
+        terminal: Option<&Arc<crate::terminal::TerminalService>>,
     ) -> anyhow::Result<Arc<Self>> {
+        let (execution_root, project_file_system, project_executor): (
+            PathBuf,
+            Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+            Arc<dyn echo_agent::sandbox::SandboxExecutor>,
+        ) = match workspace.project_location() {
+            super::ProjectLocation::Local { path } => {
+                let path = tokio::task::spawn_blocking(move || {
+                    let path = path.canonicalize()?;
+                    if !path.is_dir() {
+                        anyhow::bail!("Project location is not a directory");
+                    }
+                    Ok::<_, anyhow::Error>(path)
+                })
+                .await??;
+                (
+                    path,
+                    Arc::new(echo_agent::tools::files::LocalFileSystem),
+                    Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox()),
+                )
+            }
+            super::ProjectLocation::Ssh {
+                host,
+                user,
+                port,
+                path,
+            } => {
+                let terminal = terminal.ok_or_else(|| anyhow::anyhow!("SSH 项目连接服务不可用"))?;
+                let connection = terminal
+                    .project_ssh(workspace.id.as_str())
+                    .map_err(anyhow::Error::msg)?;
+                let actual = connection
+                    .verify_target_directory(
+                        crate::terminal::TerminalTarget::Ssh { host, user, port },
+                        path.clone(),
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                let crate::terminal::TerminalTarget::Ssh { host, user, port } =
+                    connection.effective_target().map_err(anyhow::Error::msg)?
+                else {
+                    anyhow::bail!("SSH effective target is unavailable");
+                };
+                let actual_location = super::ProjectLocation::Ssh {
+                    host: host.clone(),
+                    user: user.clone(),
+                    port: *port,
+                    path: actual.clone(),
+                };
+                if workspace.metadata.project_execution_location.as_ref() != Some(&actual_location)
+                {
+                    anyhow::bail!("远程主机或目录身份已变化，请重新关联项目");
+                }
+                (
+                    PathBuf::from(&actual),
+                    connection.file_system(actual).map_err(anyhow::Error::msg)?,
+                    connection.sandbox(),
+                )
+            }
+        };
         let resources = WorkspaceRuntimeResources::prepare(workspace, product_data_io).await?;
         let workspace = resources.workspace().clone();
         Ok(Arc::new(Self {
+            execution_root,
+            project_file_system,
+            project_executor,
             subagent_depth_defaults,
             workspace: RwLock::new(workspace),
             resources,
@@ -345,7 +412,15 @@ impl WorkspaceRuntimeHost {
     }
 
     pub(crate) fn execution_scope(&self) -> WorkspaceExecutionScope {
-        WorkspaceExecutionScope::workspace(self.id(), self.root())
+        WorkspaceExecutionScope::workspace(self.id(), &self.execution_root)
+    }
+
+    pub(crate) fn project_file_system(&self) -> Arc<dyn echo_agent::tools::filesystem::FileSystem> {
+        self.project_file_system.clone()
+    }
+
+    pub(crate) fn project_executor(&self) -> Arc<dyn echo_agent::sandbox::SandboxExecutor> {
+        self.project_executor.clone()
     }
 
     pub(crate) fn workspace_io_identity(&self) -> super::WorkspaceIoIdentity {
@@ -462,6 +537,24 @@ impl WorkspaceRuntimeHost {
                     )?
                     .with_subagent_depth_defaults(self.subagent_depth_defaults.clone()),
                 );
+                let workspace = self.workspace().await;
+                // Product data retains the original local Workspace identity;
+                // the tool invocation cwd may instead be a remote project or
+                // an isolated checkout and cannot identify this authority.
+                store.bind_workspace_io_identity(self.workspace_io_identity())?;
+                let execution_location = match workspace.execution_location() {
+                    super::ProjectLocation::Local { .. } => super::ProjectLocation::Local {
+                        path: self.execution_root.clone(),
+                    },
+                    location => location,
+                };
+                store.bind_project_environment(
+                    workspace.id.as_str(),
+                    execution_location,
+                    workspace.metadata.project_root_revision,
+                    self.project_file_system.clone(),
+                    self.project_executor.clone(),
+                )?;
                 if let Some(root) = self
                     .lifecycle_retention
                     .read()
@@ -514,7 +607,7 @@ impl WorkspaceRuntimeHost {
             .get_or_try_init(|| async {
                 let task_runtime = self.task_runtime().await?;
                 let workspace = self.workspace().await;
-                let project_root = workspace.project_root.clone();
+                let project_root = Some(self.execution_root.clone());
                 let inherited_review = seed_pool
                     .shared_review_integration()
                     .map(|owner| {
@@ -539,7 +632,7 @@ impl WorkspaceRuntimeHost {
                             workspace.id.to_string(),
                             workspace.opaque_product_data_generation(),
                             project_root.clone(),
-                        ));
+                        ).with_project_file_system(self.project_file_system.clone()));
                         let generation = owner
                             .lease_generation()
                             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -568,6 +661,9 @@ impl WorkspaceRuntimeHost {
                 let (pool, plugin_runtime, _mcp_ownership) = seed_pool
                     .fork_for_workspace(WorkspaceAgentPoolResources {
                         root: self.root().to_path_buf(),
+                        execution_root: self.execution_root.clone(),
+                        file_system: self.project_file_system.clone(),
+                        executor: self.project_executor.clone(),
                         project_root: project_root.clone(),
                         kind: workspace.kind.clone(),
                         conversation_store: self.resources.conversation_store(),
@@ -655,6 +751,16 @@ impl WorkspaceRuntimeHost {
             );
         }
         workspace.root = root;
+        let current = self.workspace.read().await;
+        if workspace.project_location() != current.project_location()
+            || workspace.execution_location() != current.execution_location()
+            || workspace.metadata.project_root_revision != current.metadata.project_root_revision
+        {
+            anyhow::bail!(
+                "Workspace project location changed; retire the original host before rebuilding"
+            );
+        }
+        drop(current);
         *self.workspace.write().await = workspace;
         Ok(())
     }
@@ -949,6 +1055,7 @@ impl WorkspaceRuntimeRegistry {
         product_data_io: crate::product_data_io::ProductDataIoService,
     ) -> Self {
         Self {
+            terminal: None,
             subagent_depth_defaults: Arc::new(
                 crate::subagent_policy::SubagentDepthDefaults::default(),
             ),
@@ -969,6 +1076,14 @@ impl WorkspaceRuntimeRegistry {
         defaults: Arc<crate::subagent_policy::SubagentDepthDefaults>,
     ) -> Self {
         self.subagent_depth_defaults = defaults;
+        self
+    }
+
+    pub(crate) fn with_terminal_service(
+        mut self,
+        terminal: Arc<crate::terminal::TerminalService>,
+    ) -> Self {
+        self.terminal = Some(terminal);
         self
     }
 
@@ -996,6 +1111,7 @@ impl WorkspaceRuntimeRegistry {
             self.product_data_io(),
             self.lifecycle_retention.clone(),
             self.subagent_depth_defaults.clone(),
+            self.terminal.as_ref(),
         )
         .await?;
         hosts.insert(workspace_id, Arc::clone(&host));
@@ -1032,6 +1148,7 @@ impl WorkspaceRuntimeRegistry {
                     self.product_data_io(),
                     self.lifecycle_retention.clone(),
                     self.subagent_depth_defaults.clone(),
+                    self.terminal.as_ref(),
                 )
                 .await?;
                 hosts.insert(workspace_id, Arc::clone(&host));
@@ -2280,8 +2397,8 @@ mod tests {
             .get_or_open(workspace("alpha", root.clone()))
             .await
             .map_err(|error| error.to_string())?;
-        let mut updated = workspace("alpha", root);
-        updated.project_root = Some(temp.path().join("project"));
+        let mut updated = workspace("alpha", root.clone());
+        updated.metadata.description = Some("updated display metadata".to_string());
         let second = registry
             .get_or_open(updated.clone())
             .await
@@ -2289,7 +2406,16 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(registry.host_count().await, 1);
-        assert_eq!(second.workspace().await.project_root, updated.project_root);
+        assert_eq!(
+            second.workspace().await.metadata.description,
+            updated.metadata.description
+        );
+        updated.project_root = Some(temp.path().join("project"));
+        assert!(registry.get_or_open(updated).await.is_err());
+        assert_eq!(
+            second.execution_root,
+            root.canonicalize().map_err(|error| error.to_string())?
+        );
         Ok(())
     }
 

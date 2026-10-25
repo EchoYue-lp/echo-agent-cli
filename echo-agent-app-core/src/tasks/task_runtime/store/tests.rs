@@ -319,6 +319,8 @@ mod tests {
                 AttendedMode::Attended,
             )?;
             store.attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: "crashed-plan".to_string(),
                 run_id: "crashed-owner".to_string(),
                 revision: 1,
@@ -1344,15 +1346,18 @@ mod tests {
         let mut parameters = ToolParameters::new();
         parameters.insert("run_id".to_string(), serde_json::json!("r1"));
         let tool = crate::tasks::task_runtime::task_tools::CancelRunTool;
-        let response = crate::chat_resources::with_chat_resources(
-            resources,
-            tool.execute(parameters),
-        )
-        .await?;
-        assert!(response.success, "cancel request tool failed: {:?}", response.error);
+        let response =
+            crate::chat_resources::with_chat_resources(resources, tool.execute(parameters)).await?;
+        assert!(
+            response.success,
+            "cancel request tool failed: {:?}",
+            response.error
+        );
         let reply: serde_json::Value = serde_json::from_str(&response.output)?;
         assert_eq!(
-            reply.get("cancellation_requested").and_then(serde_json::Value::as_bool),
+            reply
+                .get("cancellation_requested")
+                .and_then(serde_json::Value::as_bool),
             Some(true)
         );
         assert!(reply.get("cancelled").is_none());
@@ -2273,6 +2278,8 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: format!("plan-{event_count}"),
             run_id: run_id.clone(),
             revision: 1,
@@ -2392,6 +2399,8 @@ mod tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: format!("plan-{run_id}"),
                 run_id: run_id.to_string(),
                 revision: 1,
@@ -2717,6 +2726,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: format!("{run_id}-plan"),
             run_id: run_id.to_string(),
             revision: 1,
@@ -3485,6 +3496,8 @@ mod tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: "parked-prepare-plan".to_string(),
                 run_id: "parked-prepare".to_string(),
                 revision: 1,
@@ -4339,6 +4352,8 @@ mod tests {
         assert_eq!(created.goal_sha256, task_goal_sha256("original goal"));
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: "goal-plan".to_string(),
                 run_id: "goal-run".to_string(),
                 revision: 1,
@@ -4588,10 +4603,10 @@ mod tests {
                 reason: "align the task graph with goal revision 2".to_string(),
                 operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
-                    patch: TaskPatch {
+                    patch: Box::new(TaskPatch {
                         title: Some("Review revised runtime scope".to_string()),
                         ..Default::default()
-                    },
+                    }),
                 }],
             },
         )?;
@@ -4657,6 +4672,8 @@ mod tests {
         )?;
         // attach_plan no longer changes the run status; caller decides.
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".into(),
             run_id: "r1".into(),
             revision: 1,
@@ -4808,6 +4825,8 @@ mod tests {
         let timed_out = sample_task_body("timed-out");
         let skipped = sample_task_body("skipped");
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "task-todo-characterization-plan".to_string(),
             run_id: run_id.to_string(),
             revision: 1,
@@ -4870,7 +4889,7 @@ mod tests {
                 reason: "exercise dynamic graph insertion".to_string(),
                 operations: vec![TaskUpdateOperation::Insert {
                     after_task_id: Some("upstream".to_string()),
-                    task: patched.spec(),
+                    task: Box::new(patched.spec()),
                 }],
             },
         )?;
@@ -5062,6 +5081,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "restart-recovery-characterization-plan".to_string(),
             run_id: recovery_id.to_string(),
             revision: 1,
@@ -5264,6 +5285,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".into(),
             run_id: "r1".into(),
             revision: 1,
@@ -6138,6 +6161,8 @@ mod tests {
             attended_mode,
         )?;
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: format!("{run_id}-plan"),
             run_id: run_id.to_string(),
             revision: 1,
@@ -6219,6 +6244,8 @@ mod tests {
             AttendedMode::Unattended,
         )?;
         mismatched.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "mismatch-plan".to_string(),
             run_id: "mismatch".to_string(),
             revision: 1,
@@ -6790,6 +6817,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "retry-plan".to_string(),
             run_id: "retry-run".to_string(),
             revision: 1,
@@ -7761,10 +7790,10 @@ mod tests {
                 reason: "exercise mutating recovery".to_string(),
                 operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
-                    patch: TaskPatch {
+                    patch: Box::new(TaskPatch {
                         kind: Some(PlanTaskKind::Implementation),
                         ..Default::default()
-                    },
+                    }),
                 }],
             },
         )?;
@@ -7821,10 +7850,10 @@ mod tests {
                 reason: "exercise canonical recovery skip".to_string(),
                 operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
-                    patch: TaskPatch {
+                    patch: Box::new(TaskPatch {
                         kind: Some(PlanTaskKind::Implementation),
                         ..Default::default()
-                    },
+                    }),
                 }],
             },
         )?;
@@ -7971,7 +8000,7 @@ mod tests {
                 reason: "new implementation dependency".to_string(),
                 operations: vec![TaskUpdateOperation::Insert {
                     after_task_id: Some("t1".to_string()),
-                    task: t2.spec(),
+                    task: Box::new(t2.spec()),
                 }],
             },
         )?;
@@ -8004,6 +8033,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "reorder-plan".to_string(),
             run_id: "reorder-run".to_string(),
             revision: 1,
@@ -8759,10 +8790,10 @@ mod tests {
                 reason: "change blocked task contract".to_string(),
                 operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
-                    patch: TaskPatch {
+                    patch: Box::new(TaskPatch {
                         description: Some("review the revised runtime contract".to_string()),
                         ..Default::default()
-                    },
+                    }),
                 }],
             },
         )?;
@@ -8849,10 +8880,10 @@ mod tests {
                 reason: "clarify the blocked task".to_string(),
                 operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
-                    patch: TaskPatch {
+                    patch: Box::new(TaskPatch {
                         description: Some("Review the clarified runtime boundary".to_string()),
                         ..Default::default()
-                    },
+                    }),
                 }],
             },
         )?;
@@ -8909,7 +8940,7 @@ mod tests {
                 reason: "new evidence requires verification".to_string(),
                 operations: vec![TaskUpdateOperation::Insert {
                     after_task_id: Some("t1".to_string()),
-                    task: follow_up.spec(),
+                    task: Box::new(follow_up.spec()),
                 }],
             },
         )?;
@@ -8950,10 +8981,10 @@ mod tests {
                 reason: "change active ownership".to_string(),
                 operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
-                    patch: TaskPatch {
+                    patch: Box::new(TaskPatch {
                         files: Some(vec!["src/new-owner.rs".to_string()]),
                         ..Default::default()
-                    },
+                    }),
                 }],
             },
         );
@@ -9013,6 +9044,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         s.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
             revision: 1,
@@ -9045,10 +9078,10 @@ mod tests {
                     reason: "introduce invalid cycle".to_string(),
                     operations: vec![TaskUpdateOperation::Update {
                         task_id: "t1".to_string(),
-                        patch: TaskPatch {
+                        patch: Box::new(TaskPatch {
                             depends_on: Some(vec!["t2".into()]),
                             ..Default::default()
-                        },
+                        }),
                     }],
                 },
             )
@@ -9861,7 +9894,7 @@ mod tests {
                 .get("state")
                 .and_then(|state| state.get("query_projection_schema"))
                 .and_then(serde_json::Value::as_u64),
-            Some(3)
+            Some(4)
         );
         drop(reopened);
         let restarted = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
@@ -10146,6 +10179,8 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
         let mut plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "reset-plan".to_string(),
             run_id: "reset-run".to_string(),
             revision: 1,
@@ -10852,6 +10887,8 @@ mod tests {
         store.fail_next_runtime_mutation_projection_for_test();
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: "plan-id".to_string(),
                 run_id: "plan-run".to_string(),
                 revision: 1,
@@ -10956,6 +10993,8 @@ mod tests {
         ));
         let task_id = "direct-answer";
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: format!("plan:{run_id}"),
             run_id: run_id.to_string(),
             revision: 0,
@@ -11022,6 +11061,9 @@ mod tests {
     /// for the cycle test above (avoids repeating the full struct literal).
     fn sample_task_body(id: &str) -> PlanTask {
         PlanTask {
+            domain_binding: None,
+            domain_role: None,
+
             id: id.to_string(),
             title: format!("task {id}"),
             description: format!("do {id}"),
@@ -11496,6 +11538,269 @@ mod tests {
             .ok_or("canonical execution missing after replay")?;
         assert_eq!(replayed, expected_execution);
         assert!(reopened.get_summary("r1", "t1")?.is_none());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod domain_binding_tests {
+    use super::*;
+
+    fn bound_graph(
+        run: &TaskRun,
+        binding: &crate::domain_plugin::DomainBinding,
+    ) -> Result<echo_agent::tasks::TaskGraphCommit, Box<dyn std::error::Error>> {
+        let task = PlanTask {
+            id: "evidence".to_string(),
+            kind: PlanTaskKind::Verification,
+            agent_role: "primary".to_string(),
+            domain_binding: Some(binding.reference()),
+            domain_role: Some(binding.role_for_kind(PlanTaskKind::Verification)?.clone()),
+            required_artifacts: binding.snapshot.required_artifacts.clone(),
+            execution_checks: binding.snapshot.execution_checks.clone(),
+            acceptance_criteria: binding.review_criteria(),
+            ..Default::default()
+        };
+        Ok(echo_agent::tasks::TaskGraphCommit {
+            expected_revision: None,
+            expected_executions: None,
+            reason: "domain initial graph".to_string(),
+            effects: Default::default(),
+            next: echo_agent::tasks::RevisionedTaskGraph {
+                snapshot: echo_agent::tasks::RuntimePlanSnapshot {
+                    revision: 1,
+                    tasks: vec![(&task).try_into()?],
+                },
+                context: echo_agent::tasks::TaskGraphContext {
+                    goal: run.goal.clone(),
+                    assumptions: Vec::new(),
+                    risks: Vec::new(),
+                    execution_mode: echo_agent::tasks::TaskGraphExecutionMode::Sequential,
+                    metadata: serde_json::to_value(EkoPlanMetadata {
+                        plan_id: "domain-plan".to_string(),
+                        domain_profile: DomainProfile::General,
+                        domain_binding: Some(binding.reference()),
+                        goal_revision: run.goal_revision,
+                        goal_sha256: run.goal_sha256.clone(),
+                    })?,
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn domain_binding_roundtrips_both_run_created_producers_and_rejects_rebinding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = super::super::project_environment_tests::EnvironmentFixture::new()?;
+        let store = project.open("domain-target.invalid", 7)?;
+        let project_binding = store
+            .project_execution_binding()
+            .ok_or("project binding missing")?;
+        let binding = crate::domain_plugin::test_binding(true)?;
+        let profile = TaskRunExecutionProfile::orchestrated(RunPlanPolicy::RequirePlan);
+        let run = store.create_run_for_active_workspace_with_domain(
+            "domain-run",
+            "conversation",
+            "root",
+            DomainProfile::General,
+            "goal",
+            "task",
+            AttendedMode::Attended,
+            profile,
+            Some(&binding),
+        )?;
+        let state = store
+            .get_run_state("domain-run")?
+            .ok_or("domain state missing")?;
+        assert_eq!(run.domain_binding, Some(binding.reference()));
+        assert_eq!(state.domain_binding, Some(binding.clone()));
+        assert_eq!(state.project_binding, Some(project_binding.clone()));
+        let replay = super::super::event_rebuild::fold_fixture_for_test(
+            &store.list_events("domain-run", 0)?,
+        )?;
+        assert_eq!(replay.domain_binding, Some(binding.clone()));
+        assert_eq!(replay.run.domain_binding, Some(binding.reference()));
+        assert_eq!(replay.project_binding, Some(project_binding.clone()));
+        // An old idempotent reader may omit a new selection but cannot fill or
+        // replace the immutable original binding from current configuration.
+        store.create_run_for_active_workspace_with_profile(
+            "domain-run",
+            "conversation",
+            "root",
+            DomainProfile::General,
+            "goal",
+            "task",
+            AttendedMode::Attended,
+            profile,
+        )?;
+        let mut changed = binding.snapshot.clone();
+        changed.plugin.version = Some("new".to_string());
+        changed.dependency_closure = vec![changed.plugin.clone()];
+        let changed = crate::domain_plugin::DomainBinding::new(changed)?;
+        assert!(
+            store
+                .create_run_for_active_workspace_with_domain(
+                    "domain-run",
+                    "conversation",
+                    "root",
+                    DomainProfile::General,
+                    "goal",
+                    "task",
+                    AttendedMode::Attended,
+                    profile,
+                    Some(&changed)
+                )
+                .is_err()
+        );
+        let mut initial = store.prepare_run_for_active_workspace(
+            "initial",
+            "conversation",
+            "initial-root",
+            DomainProfile::General,
+            "initial goal",
+            "task",
+            AttendedMode::Attended,
+        )?;
+        initial.domain_binding = Some(binding.reference());
+        let trigger = InitialRunTriggerMetadata {
+            source: "fixture".to_string(),
+            kind: "domain".to_string(),
+            prompt: initial.goal.clone(),
+            priority: 5,
+        };
+        store.compare_and_publish_initial_revisioned_task_graph_with_domain(
+            &initial,
+            &trigger,
+            None,
+            Some(&binding),
+            profile,
+            bound_graph(&initial, &binding)?,
+        )?;
+        let state = store
+            .get_run_state("initial")?
+            .ok_or("initial state missing")?;
+        assert_eq!(state.domain_binding, Some(binding.clone()));
+        assert_eq!(state.project_binding, Some(project_binding.clone()));
+        let initial_replay =
+            super::super::event_rebuild::fold_fixture_for_test(&store.list_events("initial", 0)?)?;
+        assert_eq!(initial_replay.domain_binding, Some(binding.clone()));
+        assert_eq!(
+            initial_replay.project_binding,
+            Some(project_binding.clone())
+        );
+        assert_eq!(
+            store
+                .get_plan("initial")?
+                .ok_or("initial plan missing")?
+                .domain_binding,
+            Some(binding.reference())
+        );
+        drop(store);
+        let reopened = project.open("domain-target.invalid", 7)?;
+        let reopened_state = reopened
+            .get_run_state("domain-run")?
+            .ok_or("reopened state missing")?;
+        assert_eq!(reopened_state.domain_binding, Some(binding));
+        assert_eq!(reopened_state.project_binding, Some(project_binding));
+        drop(reopened);
+        let wrong_host = project.open("another-domain-target.invalid", 7)?;
+        assert!(
+            wrong_host
+                .validate_run_project_binding("domain-run")
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_present_binding_does_not_recover_as_general()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TaskRuntimeStore::new_in_memory()?;
+        let binding = crate::domain_plugin::test_binding(false)?;
+        store.create_run_for_active_workspace_with_domain(
+            "bad",
+            "conversation",
+            "root",
+            DomainProfile::General,
+            "goal",
+            "task",
+            AttendedMode::Attended,
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            Some(&binding),
+        )?;
+        let mut events = store.list_events("bad", 0)?;
+        let event = events
+            .iter_mut()
+            .find(|event| event.event_type == RuntimeEventKind::RunCreated)
+            .ok_or("RunCreated missing")?;
+        event
+            .payload
+            .as_object_mut()
+            .ok_or("RunCreated payload is not an object")?
+            .insert(
+                "domain_binding".to_string(),
+                serde_json::json!({"binding_sha256":"invalid"}),
+            );
+        assert!(super::super::event_rebuild::fold_fixture_for_test(&events).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn domain_graph_cannot_drop_obligations_or_change_binding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TaskRuntimeStore::new_in_memory()?;
+        let binding = crate::domain_plugin::test_binding(true)?;
+        let run = store.create_run_for_active_workspace_with_domain(
+            "rules",
+            "conversation",
+            "root",
+            DomainProfile::General,
+            "goal",
+            "task",
+            AttendedMode::Attended,
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::RequirePlan),
+            Some(&binding),
+        )?;
+        let original = bound_graph(&run, &binding)?;
+        let mut missing = original.clone();
+        let task = missing
+            .next
+            .snapshot
+            .tasks
+            .first_mut()
+            .ok_or("task missing")?;
+        let mut extension: EkoTaskExtension = task.spec.extension_as()?;
+        extension.execution_checks.clear();
+        task.spec = task.spec.clone().with_extension(extension)?;
+        assert!(
+            store
+                .compare_and_commit_revisioned_task_graph("rules", missing)
+                .is_err()
+        );
+        let mut changed = original.clone();
+        changed
+            .next
+            .context
+            .metadata
+            .as_object_mut()
+            .ok_or("metadata is not an object")?
+            .insert("domain_binding".to_string(), serde_json::Value::Null);
+        assert!(
+            store
+                .compare_and_commit_revisioned_task_graph("rules", changed)
+                .is_err()
+        );
+        store.compare_and_commit_revisioned_task_graph("rules", original)?;
+        assert_eq!(
+            store
+                .get_plan("rules")?
+                .ok_or("plan missing")?
+                .tasks
+                .first()
+                .ok_or("task missing")?
+                .execution_checks,
+            binding.snapshot.execution_checks
+        );
         Ok(())
     }
 }

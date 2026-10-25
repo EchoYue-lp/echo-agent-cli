@@ -20,6 +20,7 @@ fn facade_exposes_each_app_authority_without_duplicate_types() {
     assert_eq!(address.conversation_id, "r4-conversation");
 
     let plan = TaskPlan {
+        domain_binding: None,
         plan_id: "plan:r4".to_string(),
         run_id: "run:r4".to_string(),
         revision: 1,

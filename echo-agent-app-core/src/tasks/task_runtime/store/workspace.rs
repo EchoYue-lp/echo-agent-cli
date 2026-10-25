@@ -2,6 +2,11 @@
 /// behind `Arc`. The event stream is authoritative; plan and execution files
 /// are deterministic read projections.
 pub struct TaskRuntimeStore {
+    /// Resources of this immutable Workspace host, not a process-wide current
+    /// project. The original store retains them through run settlement.
+    project_environment: std::sync::OnceLock<ProjectExecutionEnvironment>,
+    /// Host identity only; never a permanent I/O lease or a Host backedge.
+    workspace_io_identity: std::sync::OnceLock<crate::workspace::WorkspaceIoIdentity>,
     /// Only the new-run default is shared with config; existing run bindings
     /// are immutable values in the original RunCreated journal.
     subagent_depth_defaults: std::sync::Arc<crate::subagent_policy::SubagentDepthDefaults>,
@@ -83,6 +88,256 @@ pub struct TaskRuntimeStore {
     /// Different runs keep independent locks.
     plan_locks: dashmap::DashMap<String, std::sync::Arc<std::sync::Mutex<()>>>,
     operation_supervisor: std::sync::Arc<super::executor::TaskRuntimeOperationSupervisor>,
+}
+
+#[derive(Clone)]
+/// Immutable references to an already owned Workspace host environment.
+/// This carries no scheduler, connection lifecycle, or independent state.
+pub struct ProjectExecutionEnvironment {
+    pub(crate) binding: super::types::ProjectExecutionBinding,
+    pub(crate) location: crate::workspace::ProjectLocation,
+    pub(crate) state_dir: std::path::PathBuf,
+    pub(crate) files: std::sync::Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+    pub(crate) executor: std::sync::Arc<dyn echo_agent::sandbox::SandboxExecutor>,
+    pub(crate) runtime: Option<tokio::runtime::Handle>,
+}
+
+impl std::fmt::Debug for ProjectExecutionEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectExecutionEnvironment")
+            .field("binding", &self.binding)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TaskRuntimeStore {
+    pub(crate) fn bind_workspace_io_identity(
+        &self,
+        expected: crate::workspace::WorkspaceIoIdentity,
+    ) -> Result<(), StoreError> {
+        if expected.workspace_id() != self.active_workspace_id() {
+            return Err(StoreError::InvalidPlan(
+                "product-data identity does not belong to this TaskRuntime host".to_string(),
+            ));
+        }
+        if let Err(candidate) = self.workspace_io_identity.set(expected)
+            && self.workspace_io_identity.get() != Some(&candidate)
+        {
+            return Err(StoreError::InvalidPlan(
+                "product-data identity is immutable for this host".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn workspace_io_from_tool_context(
+        &self,
+        context: &echo_agent::tools::ToolContext,
+    ) -> Result<Option<crate::state::WorkspaceIoInvocation>, StoreError> {
+        match self.workspace_io_identity.get() {
+            Some(expected) => {
+                let scope =
+                    crate::state::WorkspaceIoInvocation::scoped_to_identity(context, expected);
+                let reason =
+                    "tool invocation has no unique receipt for this host's product-data identity";
+                scope
+                    .map(Some)
+                    .ok_or_else(|| StoreError::InvalidPlan(reason.to_string()))
+            }
+            None if self.project_environment.get().is_some() => Err(StoreError::InvalidPlan(
+                "project host product-data identity has not been installed".to_string(),
+            )),
+            // Minimal legacy embeddings have no project host. They may use
+            // an explicitly supplied outer scope, never infer it from cwd.
+            None => Ok(None),
+        }
+    }
+
+    /// Called once while constructing the original Workspace host. A relink
+    /// must retire/rebuild that host; it cannot retarget accepted operations.
+    pub fn bind_project_environment(
+        &self,
+        workspace_id: &str,
+        location: crate::workspace::ProjectLocation,
+        revision: u64,
+        files: std::sync::Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+        executor: std::sync::Arc<dyn echo_agent::sandbox::SandboxExecutor>,
+    ) -> Result<(), StoreError> {
+        if workspace_id != self.active_workspace_id() {
+            return Err(StoreError::InvalidPlan(
+                "project environment does not belong to this Workspace host".to_string(),
+            ));
+        }
+        let environment = ProjectExecutionEnvironment {
+            binding: super::types::ProjectExecutionBinding {
+                workspace_id: workspace_id.to_string(),
+                location_sha256: {
+                    use sha2::{Digest, Sha256};
+                    let bytes = serde_json::to_vec(&location)
+                        .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+                    hex::encode(Sha256::digest(bytes))
+                },
+                revision,
+            },
+            location,
+            state_dir: self
+                .shadow
+                .root()
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .ok_or_else(|| {
+                    StoreError::InvalidPlan(
+                        "project task data root has no state directory".to_string(),
+                    )
+                })?,
+            files,
+            executor,
+            runtime: tokio::runtime::Handle::try_current().ok(),
+        };
+        if let Err(candidate) = self.project_environment.set(environment)
+            && self.project_environment.get().map(|bound| &bound.binding)
+                != Some(&candidate.binding)
+        {
+            return Err(StoreError::InvalidPlan(
+                "project environment is immutable; retire the original host before relinking"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn project_environment(&self) -> Option<ProjectExecutionEnvironment> {
+        self.project_environment.get().cloned()
+    }
+
+    pub fn project_execution_binding(&self) -> Option<super::types::ProjectExecutionBinding> {
+        self.project_environment
+            .get()
+            .map(|environment| environment.binding.clone())
+    }
+
+    pub(crate) fn project_working_dir(&self) -> Option<std::path::PathBuf> {
+        self.project_environment
+            .get()
+            .map(|environment| match &environment.location {
+                crate::workspace::ProjectLocation::Local { path } => path.clone(),
+                crate::workspace::ProjectLocation::Ssh { path, .. } => {
+                    std::path::PathBuf::from(path)
+                }
+            })
+    }
+
+    pub fn project_isolation_provider(
+        &self,
+        repo_root: Option<std::path::PathBuf>,
+    ) -> super::worktree::EkoIsolationProvider {
+        super::worktree::EkoIsolationProvider::for_environment(
+            repo_root,
+            self.project_environment().map(std::sync::Arc::new),
+        )
+    }
+
+    /// Project-aware primitives for the existing GUI worktree commands. They
+    /// share the same algorithms and merge locks as actual writer dispatch.
+    pub fn project_git_repo_root(
+        &self,
+        start: &std::path::Path,
+    ) -> Result<std::path::PathBuf, super::worktree::WorktreeError> {
+        super::worktree::git_repo_root_in_environment(start, self.project_environment.get())
+    }
+
+    pub fn project_run_git(
+        &self,
+        root: &std::path::Path,
+        args: &[&str],
+    ) -> Result<String, super::worktree::WorktreeError> {
+        super::worktree::run_git_in_environment(root, args, self.project_environment.get())
+    }
+
+    pub fn project_worktree_lock(
+        &self,
+        root: &std::path::Path,
+    ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        super::worktree::repo_merge_lock_in_environment(root, self.project_environment.get())
+    }
+
+    pub fn project_file_system(
+        &self,
+    ) -> Option<std::sync::Arc<dyn echo_agent::tools::filesystem::FileSystem>> {
+        self.project_environment
+            .get()
+            .map(|environment| environment.files.clone())
+    }
+
+    pub(crate) fn task_project_environment(
+        &self,
+        task: &super::types::PlanTask,
+    ) -> Result<Option<ProjectExecutionEnvironment>, StoreError> {
+        let Some(target) = task.execution_target.as_ref() else {
+            return Ok(self.project_environment());
+        };
+        let Some(resolver) = self.execution_target_resolver() else {
+            if target.project_binding.is_none() && self.project_environment.get().is_none() {
+                return Ok(None);
+            }
+            return Err(StoreError::InvalidPlan(
+                "target project resolver is unavailable for artifact verification".to_string(),
+            ));
+        };
+        let runtime = self
+            .project_environment
+            .get()
+            .and_then(|environment| environment.runtime.clone())
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
+            .ok_or_else(|| {
+                StoreError::InvalidPlan(
+                    "target artifact verification requires the original application runtime"
+                        .to_string(),
+                )
+            })?;
+        let environment = std::thread::scope(|scope| {
+            scope
+                .spawn(|| runtime.block_on(resolver.project_environment(target)))
+                .join()
+        })
+        .map_err(|_| {
+            StoreError::InvalidPlan("target artifact verification bridge failed".to_string())
+        })?
+        .map_err(StoreError::InvalidPlan)?;
+        if environment.as_ref().map(|environment| &environment.binding)
+            != target.project_binding.as_ref()
+        {
+            return Err(StoreError::InvalidPlan(
+                "artifact target location differs from the accepted PlanTask revision".to_string(),
+            ));
+        }
+        Ok(environment)
+    }
+
+    /// No field from today's sidebar or manifest may fill a historical run.
+    /// The same check is used by resume and fresh driver/cell admission.
+    pub(crate) fn validate_project_binding(
+        &self,
+        recorded: Option<&super::types::ProjectExecutionBinding>,
+    ) -> Result<(), StoreError> {
+        let current = self
+            .project_environment
+            .get()
+            .map(|environment| &environment.binding);
+        if recorded != current {
+            return Err(StoreError::InvalidPlan(
+                "TaskRun project location or revision differs from this host; reopen its original project environment before resuming".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_run_project_binding(&self, run_id: &str) -> Result<(), StoreError> {
+        let snapshot = self
+            .get_run_state(run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        self.validate_project_binding(snapshot.project_binding.as_ref())
+    }
 }
 
 struct ShadowGeneration {

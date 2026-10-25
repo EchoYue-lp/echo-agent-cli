@@ -160,7 +160,16 @@ impl EkoPromptPayload {
         dependency_summaries: &[(String, String)],
         can_delegate: bool,
     ) -> Self {
-        let profile = ProfileTemplate::for_profile(task.domain_profile);
+        Self::planned_task_with_domain(task, dependency_summaries, can_delegate, None)
+    }
+
+    pub(crate) fn planned_task_with_domain(
+        task: &PlanTask,
+        dependency_summaries: &[(String, String)],
+        can_delegate: bool,
+        binding: Option<&crate::domain_plugin::DomainBinding>,
+    ) -> Self {
+        let profile = ProfileTemplate::general();
         let task_boundary = if task.kind.is_read_only() {
             TaskBoundaryPrompt::ReadOnly
         } else {
@@ -175,9 +184,18 @@ impl EkoPromptPayload {
 
         Self::PlannedTask {
             task: PlannedTaskPrompt {
-                domain_key: profile.key.to_string(),
-                domain_label: profile.label.to_string(),
-                execution_guidance: profile.execution_guidance.to_string(),
+                domain_key: binding.map_or_else(
+                    || profile.key.to_string(),
+                    |binding| binding.snapshot.plugin.plugin_id.clone(),
+                ),
+                domain_label: binding.map_or_else(
+                    || profile.label.to_string(),
+                    |binding| binding.snapshot.plugin.plugin_id.clone(),
+                ),
+                execution_guidance: binding.map_or_else(
+                    || profile.execution_guidance.to_string(),
+                    crate::domain_plugin::DomainBinding::prompt_instructions,
+                ),
                 dependency_summaries: dependency_summaries
                     .iter()
                     .map(|(title, summary)| DependencyPrompt {

@@ -1,8 +1,34 @@
 # EKO Runtime Architecture
 
+## Project Workspaces and actual locations
+
+A Workspace is a project or engineering workspace; tasks and conversations belong to it, and TaskRun/PlanTask lists contain execution records. Workspace creation selects an existing local folder, creates one new local folder, or opens an SSH project. Creating a task does not create a folder. Code location is separate from local `Workspace.root` product data. Legacy manifests still resolve `project_root`, then `root`, without moving directories. The original manifest and `project_root_revision` own configured location and verified execution identity; see [ADR 0055](../adr/0055-project-workspaces.md).
+
+The project tree, editor, changes/diff, Git/worktrees and Agent file/command tools use the same host target. GUI calls capture Workspace ID and generation; late responses cannot replace another location generation. The directory picker stays local. Remote paths are verified through the project connection, never local canonicalization. Metadata without a modification-time guarantee returns `null`. Saving retains the original lock/preimage semantics and the target's real comparison/replacement boundary. Unsupported operations are explicit; uncertain writes retain diagnostics and are not replayed.
+
+The six non-native GUI file entries observe the original ProductDataIo operation for at most 30 seconds. Unconfirmed ends that wait while retaining physical work and its host receipt. Only real completion clears the same operation id, and late errors remain in its failure receipt. Local/global paths retain their previous waiting behavior. Retargeting and host close use the original idle gates; ordinary focus changes keep background work on its captured target. This observation does not replace the SSH backend's evidence of remote terminal or unknown outcomes.
+
+The completed result envelope carries the same original operation until consumption or unobserved drop. A successful send into the result buffer does not acknowledge delivery: dropping that buffer preserves an unread error in the original failure receipt, while a consumed business error stays a normal caller result.
+
+User rules, memory, conversations and journals remain local. Project AGENTS, Skills and Subagent sources use the selected project. Required read errors return at the original fallible model entry. After isolation establishes its actual cwd, a fresh Subagent prepares immutable instructions and project facts. The existing pre-model projection interface publishes those same read values after cold Execute/reset or restore and replaces old checkpoint projections by their original markers. The role root retains its original authority. This projection performs no file I/O and makes no failure admission decision.
+
+Primary turns carry prepared project values in the existing turn registration, including the store-less, run-less embedding path when it supplies an explicit environment. The original EKO projector keeps Domain/TaskRuntime, turn policy, hot memory and command watches alongside those values. Concurrent primary verifications key this registration with their existing execution ID; the root message remains the original trigger. Fresh default and Plugin Subagents use one composition of the original Domain-only renderer and their own prepared checkout facts. Local product-data receipts remain identified guards, never command working directories.
+
+Inline application configuration and user hooks/Skills retain local files and the original local executor. Project hooks/Skills capture project files and its executor; later host executor replacement cannot move registered origins. Hooks preserve inline, user-file and project-file order and replace the same UserConfig source as one unit. Project read errors block initial loading, while a failed explicit reload preserves the last valid set. Native configuration watching covers local configuration and local projects. SSH projects have no remote notify/poller; the existing explicit reload reads the same remote target.
+
+A project terminal captures its project identity; explicit local and standalone SSH tabs keep their targets. It requires no Agent execution slot, LLM or full-auto mode. The original child/reader retains the host I/O receipt through physical settlement. Quit closes interactive PTYs before their dependencies and retains authentication masters until Agent/file users settle. Source and frontend tests do not replace real remote writes, native GUI or platform-specific acceptance.
+
 This page records runtime ownership, lifecycle, workspace execution, and task
 coordination. It is the current behavior reference; historical alternatives
 remain in ADRs.
+
+## GUI input acceptance and draft ownership
+
+Queued additions acknowledge receipt from the original durable `queue_chat_input` result, without waiting for the model, physical tool or mailbox drain. Frontier refresh and tracked-steer observation stay with the original input service and attempt owner. Receipt, drain, context inclusion and terminal outcome are separate facts; receipt does not mean an active tool stopped or the correction executed. Before attachment preparation, one draft captures its external ID, Workspace/generation, Conversation/new-draft epoch and Domain choice. Retry retains that identity and encoded payload. The Hook's original turn/view fence and the GUI's draft, attachment and mount checks protect delayed callbacks: durable facts remain, while a newer draft or another task cannot be cleared. An explicit queued Domain choice cannot silently replace the current TaskRun binding.
+
+Ordinary initial sending continues with the real conversation address returned by the original save owner. A delayed create cannot overwrite a newer selection or route input by rereading focus after saving. Direct Started acceptance and local slash-command success are distinct from a durable input receipt; the GUI clears only the still-owned original submission.
+
+First-input projection ownership is captured before canonical conversation creation waits. The original save owner notifies the still-owned admission before selecting its canonical ID; only this proven null-to-ID transition may migrate that owner. Stop, unmount, navigation and newer drafts cannot revive an old projection. A successful save remains a fact even when list refresh or its view observer fails. A delayed `/clear` reset still settles its original conversation, while clearing the active projection requires the original Workspace, selection, load generation and new-draft epoch. Reset failure keeps the existing clear behavior only while that original view owns the action. These callbacks extend the original conversation lifecycle; they introduce no second store or execution owner.
 
 ## AgentRouter Migration Handoff
 
@@ -345,3 +371,28 @@ EKO configuration supplies new-run defaults only. The original RunCreated execut
 ### GUI IM/cron control and true desktop quit
 
 The existing IM owner lives in app-core `channel_runtime`; bin entry points are thin forwards. ApplicationServices and Tauri share the same Arc. ConfigState publishes its UUID revision only after owned persistence; transport epoch and applied revision retain their distinct meanings. The lifecycle's original channel slot retains manager/coordinator/pump handles until real physical settlement, and blocks dependent close on unknown ownership. Desktop X hides; explicit Quit awaits the original receipt's final publication while keeping Tokio alive. Bounded observations elsewhere are unchanged. Completed failures can be final errors; unknown observations cannot grant finality. Cron views consume original edit/manual/history receipts and exact existing run facts. See [ADR0053](../adr/0053-im-cron-gui-control.md) for data flow, recovery boundaries, implementation references and unverified native/Rust acceptance.
+
+## Task-bound domain plugins
+
+Professional methods now enter the original plugin prepare/publication path as
+EKO `domain.yaml` data, rather than four compiled profile templates. The complete
+immutable binding is written in the original RunCreated event. TaskRun, graph
+metadata and task extensions carry the same bounded identity reference; the
+original journal/checkpoint fold reconstructs the full rules. Dynamic graph edits
+retain the binding, tool ceiling and minimum artifact/check/semantic obligations.
+
+Primary, planned Subagent, Verification and review paths use the stored rules.
+The original admitted pool lease carries its published generation and the actual
+Agent catalog handles, including cross-workspace targets. Restoring work checks
+that identity; a current package cannot silently redefine an old task. General
+chat retains its original no-plan completion. A lightweight domain uses the
+original fixed Summary transaction and real event evidence, while formal domain
+obligations require a real graph and the existing CompletionGate.
+
+This is source implementation in progress. Adhoc `agent_tool` uses original
+physical lease projections and same-registration admission; its existing model
+projector reads the stored method even without a structured prompt payload. GUI
+preparation reuses the original foreground token. These paths have new regression
+definitions, but Rust type/tests, generated TypeScript, full integration and
+native/main acceptance are pending. See [ADR0054](../adr/0054-task-bound-domain-plugins.md) and
+[the package example](../../../examples/domain-plugin/README.md).

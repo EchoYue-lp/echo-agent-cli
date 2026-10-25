@@ -390,6 +390,9 @@ impl PluginRuntimeService {
             .await
             .map_err(anyhow::Error::msg)?;
         publication.commit().await.map_err(anyhow::Error::msg)?;
+        pool_owner
+            .install_domain_registration_admission(&self.agent_handle)
+            .await;
         *self.agent_pool.write().await = Some(pool);
         Ok(())
     }
@@ -406,6 +409,10 @@ impl PluginRuntimeService {
             .await;
         let output_style = active_output_style_instructions_for(active_output_style, prepared);
         AgentPluginGeneration::new(revision, descriptors, prepared.agents.clone(), output_style)
+            .with_domain_components(
+                prepared.domains.clone(),
+                active_output_style.map(str::to_string),
+            )
     }
 
     /// Atomically load one EKO-owned skill into the primary and pool catalog.
@@ -483,6 +490,10 @@ impl PluginRuntimeService {
             primary.skill_descriptors(),
             state.prepared.agents.clone(),
             active_output_style_instructions(&state),
+        )
+        .with_domain_components(
+            state.prepared.domains.clone(),
+            state.active_output_style.clone(),
         )
         .with_framework_generation(state.framework_generation.clone());
         if let Some(publication) = pool_publication.as_mut()
@@ -586,6 +597,10 @@ impl PluginRuntimeService {
             state.prepared.agents.clone(),
             active_output_style_instructions(&state),
         )
+        .with_domain_components(
+            state.prepared.domains.clone(),
+            state.active_output_style.clone(),
+        )
         .with_framework_generation(state.framework_generation.clone());
         if let Some(publication) = pool_publication.as_mut()
             && let Err(error) = publication
@@ -673,8 +688,9 @@ impl PluginRuntimeService {
         self.scan_registry(&mut candidate)?;
         let framework_generation =
             require_applicable_generation(self.integrator.prepare(&mut candidate).await)?;
-        let prepared = prepare_application_components(&framework_generation, &self.target_scope)
-            .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
+        let prepared =
+            prepare_application_components(&framework_generation, &self.target_scope, &candidate)
+                .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
         let declarations = plugin_mcp_declarations(&framework_generation)?;
         let state = self.state.lock().await;
         if state.shut_down {
@@ -903,6 +919,9 @@ impl PluginRuntimeService {
         unload_application_components(&mut primary, &previous_prepared).await;
         primary
             .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, None)
+            .await;
+        primary
+            .replace_system_context_projection(DOMAIN_CATALOG_PROJECTION, None)
             .await;
         crate::runtime::configure_intent_router(&mut primary);
         release_plugin_mcp_name_claims(&mut ownership_guard, &owned_claims);
@@ -1861,6 +1880,7 @@ impl PluginRuntimeService {
             state.prepared.agents.clone(),
             instructions,
         )
+        .with_domain_components(state.prepared.domains.clone(), selected.clone())
         .with_framework_generation(state.framework_generation.clone());
         if let Some(publication) = pool_publication.as_mut()
             && let Err(error) = publication.prepare(generation).await
@@ -2027,8 +2047,9 @@ impl PluginRuntimeService {
             .into_iter()
             .map(|entry| entry.manifest.name.clone())
             .collect::<Vec<_>>();
-        let prepared = prepare_application_components(&framework_generation, &self.target_scope)
-            .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
+        let prepared =
+            prepare_application_components(&framework_generation, &self.target_scope, &candidate)
+                .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
         let candidate_mcp_declarations = plugin_mcp_declarations(&framework_generation)?;
         self.validate_agent_collisions(state, &prepared).await?;
 
@@ -2187,6 +2208,10 @@ impl PluginRuntimeService {
                 state.active_output_style.as_deref(),
                 &applied.prepared,
             ),
+        )
+        .with_domain_components(
+            applied.prepared.domains.clone(),
+            state.active_output_style.clone(),
         )
         .with_framework_generation(applied.framework_generation.clone());
         if let Some(publication) = pool_publication.as_mut()
@@ -2451,6 +2476,12 @@ impl PluginRuntimeService {
         state.mcp_ownership = applied.mcp_ownership;
         state.prepared = applied.prepared;
         state.generation = candidate_revision;
+        primary
+            .replace_system_context_projection(
+                DOMAIN_CATALOG_PROJECTION,
+                state.prepared.domains.catalog_prompt(),
+            )
+            .await;
         if let Some(style) = active_style {
             if state
                 .prepared
@@ -2582,6 +2613,11 @@ impl PluginRuntimeService {
         candidate_mcp_declarations: PluginMcpDeclarations,
         candidate_prepared: PreparedApplicationComponents,
     ) -> Result<AppliedAgentComponents, FailedAgentComponents> {
+        // This service root is EKO's local workspace data, not the project's
+        // remote code cwd. Project I/O comes from the parent Agent resources.
+        let local_state_dir = Some(crate::workspace::layout::WorkspaceLayout::state_dir(
+            &self.project_root.read().await,
+        ));
         let candidate_monitors = candidate_prepared.monitors.clone();
         let previous_mcp_declarations = match previous_framework_generation
             .as_deref()
@@ -2703,10 +2739,13 @@ impl PluginRuntimeService {
                         }
                         None => None,
                     };
-                    let restore_agent_error =
-                        register_plugin_agents(agent, &previous_prepared.agents)
-                            .await
-                            .err();
+                    let restore_agent_error = register_plugin_agents(
+                        agent,
+                        &previous_prepared.agents,
+                        local_state_dir.clone(),
+                    )
+                    .await
+                    .err();
                     crate::runtime::configure_intent_router(agent);
                     let mut errors = vec![error];
                     if let Some(error) = restore_agent_error {
@@ -2743,7 +2782,13 @@ impl PluginRuntimeService {
         // receipt's clients stay connected until a retry withdraws them. Keep the
         // typed error until the receipt and the candidate tokens are in hand.
         let candidate_outcome: Result<AppliedCandidate, RejectedCandidate> = match wiring {
-            Ok(wiring) => match register_plugin_agents(agent, &candidate_prepared.agents).await {
+            Ok(wiring) => match register_plugin_agents(
+                agent,
+                &candidate_prepared.agents,
+                local_state_dir.clone(),
+            )
+            .await
+            {
                 Ok(_) => {
                     crate::runtime::configure_intent_router(agent);
                     Ok((candidate, wiring))
@@ -2864,9 +2909,13 @@ impl PluginRuntimeService {
                         ));
                     }
                 };
-                let restore_agent_error = register_plugin_agents(agent, &previous_prepared.agents)
-                    .await
-                    .err();
+                let restore_agent_error = register_plugin_agents(
+                    agent,
+                    &previous_prepared.agents,
+                    local_state_dir.clone(),
+                )
+                .await
+                .err();
                 crate::runtime::configure_intent_router(agent);
                 let registry = previous_registry;
                 let mut errors = vec![error];

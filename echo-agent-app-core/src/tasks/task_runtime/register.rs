@@ -27,7 +27,11 @@ pub async fn task_revision_service_for_agent(
     subagent_catalog: Arc<SubagentCatalogSnapshot>,
 ) -> Arc<echo_agent::tasks::TaskRevisionService> {
     let tool_names = agent_handle.read(|agent| agent.tool_names()).await;
-    let capabilities = Arc::new(TaskCapabilityCatalog::new(subagent_catalog, tool_names));
+    let registry = agent_handle
+        .read(|agent| agent.subagent_registry().clone())
+        .await;
+    let capabilities =
+        Arc::new(TaskCapabilityCatalog::new(subagent_catalog, tool_names).with_registry(registry));
     super::revisioned_runtime::build_task_revision_service(store, capabilities)
 }
 
@@ -47,10 +51,12 @@ pub async fn register_task_tools_on_agent(
         })
         .await;
     let tool_names = agent_handle.read(|agent| agent.tool_names()).await;
-    let capabilities = Arc::new(TaskCapabilityCatalog::new(
-        subagent_catalog.clone(),
-        tool_names,
-    ));
+    let registry = agent_handle
+        .read(|agent| agent.subagent_registry().clone())
+        .await;
+    let capabilities = Arc::new(
+        TaskCapabilityCatalog::new(subagent_catalog.clone(), tool_names).with_registry(registry),
+    );
     let revision_service =
         super::revisioned_runtime::build_task_revision_service(store.clone(), capabilities);
     let added = agent_handle
