@@ -39,7 +39,8 @@ use sha2::{Digest, Sha256};
 enum ChannelRenderEvent {
     Token(String),
     Driver(crate::chat_driver::ChatDriverEvent),
-    Journaled(crate::chat_event_log::ChatEventEnvelope),
+    // Keep the full owned journal envelope without inflating every bounded queue slot.
+    Journaled(Box<crate::chat_event_log::ChatEventEnvelope>),
     ToolProjection(crate::tool_execution_projection::ToolExecutionProjectionUpdate),
     Prompt(String),
     Terminal(crate::chat_driver::TurnOutcome),

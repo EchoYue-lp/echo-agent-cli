@@ -289,13 +289,12 @@ pub fn build_tauri_app(
             terminal::list_terminal_sessions,
         ])
         .on_window_event(|window,event| {
-            if let tauri::WindowEvent::CloseRequested {api,..} = event {
-                if let Err(error) = desktop::hide_requested_window(||api.prevent_close(),||window.hide()) {
+            if let tauri::WindowEvent::CloseRequested {api,..} = event
+                && let Err(error) = desktop::hide_requested_window(||api.prevent_close(),||window.hide()) {
                     use tauri_plugin_dialog::DialogExt;
                     tracing::error!(%error,"Unable to hide EKO window");
                     if let Err(show_error) = window.show() {tracing::error!(%show_error,"Unable to restore visible EKO window");}
                     window.dialog().message("无法隐藏窗口，应用保持运行。请重试或使用托盘退出。").title("EKO").show(|_|{});
-                }
             }
         })
         .setup(move |app| {

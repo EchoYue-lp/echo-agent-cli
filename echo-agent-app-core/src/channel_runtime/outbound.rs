@@ -92,7 +92,10 @@ impl ChannelSurfaceSink {
         if !self.flush_pending_token(&mut budget) {
             return false;
         }
-        self.try_send(&mut budget, ChannelRenderEvent::Journaled(envelope))
+        self.try_send(
+            &mut budget,
+            ChannelRenderEvent::Journaled(Box::new(envelope)),
+        )
     }
 
     fn append_token(&self, budget: &mut ChannelSinkBudget, token: &str) -> bool {
