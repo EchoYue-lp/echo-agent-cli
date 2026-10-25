@@ -513,6 +513,22 @@
       "sourceLanguage": "zh",
       "translationStatus": "reviewed",
       "legacyRemoved": true
+    },
+    {
+      "legacyPath": "guides/gui-hitl-dialog.md",
+      "targetPath": "guides/gui-hitl-dialog.md",
+      "kind": "guide",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "guides/gui-task-runtime-panel.md",
+      "targetPath": "guides/gui-task-runtime-panel.md",
+      "kind": "guide",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
     }
   ]
 }

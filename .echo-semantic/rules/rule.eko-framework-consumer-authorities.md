@@ -30,6 +30,8 @@ code_refs:
 - web-frontend/src/hooks/chatEventHandler.ts
 - web-frontend/src/stores/chatStore.ts
 - web-frontend/src/components/chat/ChatPanel.tsx
+- web-frontend/src/components/chat/HitlDialog.tsx
+- web-frontend/src/components/task/TaskRuntimeList.tsx
 - echo-agent-app-core/src/infra/factory.rs
 - echo-agent-app-core/src/agent_pool/tests.rs
 - echo-agent-app-core/src/state/reliability_contracts.rs

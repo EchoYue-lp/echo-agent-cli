@@ -1,7 +1,7 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useChatStore } from '../../stores/chatStore';
 import { MessageBubble } from './MessageBubble';
-import { ApprovalCard } from './ApprovalCard';
+import { HitlDialog } from './HitlDialog';
 import { ChatInput } from './ChatInput';
 import { WelcomeScreen } from './WelcomeScreen';
 import { useTauriChat } from '../../hooks/useTauriChat';
@@ -46,7 +46,8 @@ function useChatTransport() {
 
 export function ChatPanel() {
   const messages = useChatStore((s) => s.messages);
-  const pendingHitlRequest = useChatStore((s) => s.pendingHitlRequests.at(0) ?? null);
+  const pendingHitlRequests = useChatStore((s) => s.pendingHitlRequests);
+  const pendingHitlRequest = pendingHitlRequests.at(0) ?? null;
   const isStreaming = useChatStore((s) => s.isStreaming);
   const isCancelled = useChatStore((s) => s.isCancelled);
   const runStatus = useChatStore((s) => s.runStatus);
@@ -67,6 +68,12 @@ export function ChatPanel() {
     (state) => state.noteSideConversationTurnStarted
   );
   const activeConversation = conversations.find((item) => item.id === activeConversationId);
+  // The delivered request keeps its own conversation when the selected page changes.
+  const pendingConversationId = pendingHitlRequest?.identity.scope.conversation_id;
+  const pendingConversationLabel =
+    conversations.find((item) => item.id === pendingConversationId)?.title ??
+    pendingConversationId ??
+    undefined;
   const activeSide = sideConversations.find(
     (item) => item.conversation_id === activeConversationId
   );
@@ -408,22 +415,19 @@ export function ChatPanel() {
         }
         footer={
           <div className="border-t border-[var(--border-secondary)] pt-2">
-            {pendingHitlRequest?.kind === 'approval' && (
-              <div className="mx-auto w-full max-w-[980px] px-4 pb-2 sm:px-6 lg:px-8">
-                <ApprovalCard
-                  key={JSON.stringify(pendingHitlRequest.identity)}
-                  request={pendingHitlRequest}
-                  onApprove={() => sendApproval(pendingHitlRequest.identity, true)}
-                  onReject={(reason) => sendApproval(pendingHitlRequest.identity, false, reason)}
-                  onModify={(feedback) =>
-                    sendApproval(pendingHitlRequest.identity, false, `修改意见: ${feedback}`)
-                  }
-                  onApproveAll={() =>
-                    sendApproval(pendingHitlRequest.identity, true, undefined, 'session_tool')
-                  }
-                />
-              </div>
-            )}
+            <div className="mx-auto w-full max-w-[980px] px-4 sm:px-6 lg:px-8">
+              <HitlDialog
+                requests={pendingHitlRequests}
+                conversationLabel={pendingConversationLabel}
+                onApproval={(request, approved, reason, scope) =>
+                  sendApproval(request.identity, approved, reason, scope)
+                }
+                onInput={(request, answer) => sendInput(request.identity, answer)}
+                onSelection={(request, selection, instructions) =>
+                  sendSelection(request.identity, selection, instructions)
+                }
+              />
+            </div>
             {isStreaming && messages.length > 0 && (
               <div className="flex justify-center pb-2">
                 <button
@@ -517,32 +521,6 @@ export function ChatPanel() {
                   <div className="h-px flex-1 bg-[var(--border-secondary)]" />
                   <span className="text-xs italic text-[var(--text-tertiary)]">已停止响应</span>
                   <div className="h-px flex-1 bg-[var(--border-secondary)]" />
-                </div>
-              )}
-
-              {pendingHitlRequest?.kind === 'input' && (
-                <div className="py-2">
-                  <InputCard
-                    key={JSON.stringify(pendingHitlRequest.identity)}
-                    prompt={pendingHitlRequest.prompt}
-                    onSubmit={(text) => sendInput(pendingHitlRequest.identity, text)}
-                  />
-                </div>
-              )}
-
-              {pendingHitlRequest?.kind === 'selection' && (
-                <div className="py-2">
-                  <SelectionCard
-                    key={JSON.stringify(pendingHitlRequest.identity)}
-                    prompt={pendingHitlRequest.prompt}
-                    options={pendingHitlRequest.options}
-                    taskId={pendingHitlRequest.taskId}
-                    phase={pendingHitlRequest.phase}
-                    context={pendingHitlRequest.context}
-                    onSelect={(selection, instructions) =>
-                      sendSelection(pendingHitlRequest.identity, selection, instructions)
-                    }
-                  />
                 </div>
               )}
 
@@ -701,109 +679,4 @@ function runStatusLabel(status: string, isStreaming: boolean) {
     default:
       return isStreaming ? '执行中' : '就绪';
   }
-}
-
-function InputCard({
-  prompt,
-  onSubmit,
-}: {
-  prompt?: string;
-  onSubmit: (text: string) => Promise<boolean>;
-}) {
-  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    const formElement = e.currentTarget;
-    const form = new FormData(formElement);
-    const text = form.get('input') as string;
-    if (text.trim() && (await onSubmit(text))) {
-      formElement.reset();
-    }
-  };
-
-  return (
-    <div className="animate-pulse-border rounded-xl border-2 bg-[var(--bg-primary)] p-4 shadow-[var(--shadow-sm)]">
-      {prompt && <p className="mb-2 text-sm font-medium text-[var(--text-primary)]">{prompt}</p>}
-      <form onSubmit={handleSubmit} className="flex gap-2">
-        <input name="input" className="input flex-1" placeholder="输入你的回答..." autoFocus />
-        <button type="submit" className="btn btn-primary">
-          提交
-        </button>
-      </form>
-    </div>
-  );
-}
-
-function SelectionCard({
-  prompt,
-  options,
-  taskId,
-  phase,
-  context,
-  onSelect,
-}: {
-  prompt: string;
-  options: string[];
-  taskId?: string;
-  phase?: string;
-  context?: unknown;
-  onSelect: (selection: string, instructions?: string) => void;
-}) {
-  const instructionsRef = useRef<HTMLTextAreaElement>(null);
-
-  const submitSelection = (selection: string) => {
-    const instructions = instructionsRef.current?.value.trim() || undefined;
-    onSelect(selection, instructions);
-  };
-
-  return (
-    <div className="rounded-xl border-2 border-[var(--accent)]/40 bg-[var(--bg-primary)] p-4 shadow-[var(--shadow-sm)]">
-      <div className="space-y-3">
-        <div>
-          <p className="text-sm font-semibold text-[var(--text-primary)]">需要选择</p>
-          <p className="mt-1 text-sm text-[var(--text-secondary)]">{prompt}</p>
-          {(taskId || phase) && (
-            <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-[var(--text-tertiary)]">
-              {taskId && <span>任务: {taskId}</span>}
-              {phase && <span>阶段: {phase}</span>}
-            </div>
-          )}
-        </div>
-
-        {context !== undefined && (
-          <pre className="max-h-36 overflow-auto rounded-lg bg-[var(--bg-code)] p-3 text-xs text-[var(--color-code-text)]">
-            {JSON.stringify(context, null, 2)}
-          </pre>
-        )}
-
-        <textarea
-          ref={instructionsRef}
-          className="min-h-16 w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--border-focus)]"
-          placeholder="补充说明（可选）"
-        />
-
-        <div className="flex flex-wrap gap-2">
-          {options.length > 0 ? (
-            options.map((option) => (
-              <button
-                key={option}
-                type="button"
-                onClick={() => submitSelection(option)}
-                className="rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90"
-              >
-                {option}
-              </button>
-            ))
-          ) : (
-            <button
-              type="button"
-              onClick={() => submitSelection('approve')}
-              className="rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90"
-            >
-              继续
-            </button>
-          )}
-        </div>
-      </div>
-    </div>
-  );
 }
