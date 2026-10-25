@@ -5204,20 +5204,18 @@ async fn handle_slash_command(
         }
         Some(SlashCommand::AutoMemory) => {
             use echo_agent_app_core::api::auto_memory::{
-                AutoMemoryConfig, extract_observations, format_observations_for_memory,
-                queue_observations,
+                AUTO_MEMORY_ENABLED, AutoMemoryConfig, extract_observations,
+                format_observations_for_memory, queue_observations,
             };
 
             let sub = args.split_whitespace().next().unwrap_or("status");
             let content = match sub {
                 "on" => {
-                    crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    AUTO_MEMORY_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                     "Auto-memory enabled.".to_string()
                 }
                 "off" => {
-                    crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    AUTO_MEMORY_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
                     "Auto-memory disabled.".to_string()
                 }
                 "extract" | "show" => {
@@ -5286,8 +5284,7 @@ async fn handle_slash_command(
                     }
                 }
                 "config" | "status" => {
-                    let enabled = crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let enabled = AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
                     let config = AutoMemoryConfig::default();
                     format!(
                         "Auto-memory: {}\nMinimum confidence: {:.0}%\nMaximum per session: {}",

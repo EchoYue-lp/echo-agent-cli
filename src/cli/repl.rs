@@ -1808,13 +1808,11 @@ pub(crate) async fn run_auto_memory_on_exit(
     review_integration: &Option<Arc<echo_agent_app_core::api::evolution::ReviewIntegration>>,
 ) {
     use echo_agent_app_core::api::auto_memory::{
-        AutoMemoryConfig, extract_observations, queue_observations,
+        AUTO_MEMORY_ENABLED, AutoMemoryConfig, extract_observations, queue_observations,
     };
 
-    // Check if auto-memory is enabled (shared with /auto-memory command)
-    // Use the global flag from the cmd_impls module
-    let enabled =
-        crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    // Every adapter observes the same app-core process-global policy.
+    let enabled = AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
     if !enabled {
         return;
     }

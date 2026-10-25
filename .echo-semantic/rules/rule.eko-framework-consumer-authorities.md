@@ -87,6 +87,8 @@ code_refs:
 - echo-agent-app-core/src/tasks/task_runtime/executor/review.rs
 - echo-agent-app-core/src/tasks/task_runtime/executor/unattended.rs
 - echo-agent-app-core/src/tasks/task_runtime/task_tools.rs
+- echo-agent-app-core/src/auto_memory/mod.rs
+- src/tauri/commands/panels.rs
 - echo-agent-app-core/src/tasks/task_runtime/types.rs
 - echo-agent-app-core/src/types/request.rs
 - echo-agent-app-core/src/types/response.rs

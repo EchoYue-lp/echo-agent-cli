@@ -1,0 +1,39 @@
+---
+schema_version: 1
+id: evidence.eko-console-tool-receipts
+kind: evidence
+observed_at: source:ee89a2c31b9259f9d06b9c3bc5dc3f1accc14637b6022e8ca2b6a36c3233a12a
+source_refs: [echo-agent-app-core/src/auto_memory/mod.rs, src/cli/cmd_impls/all.rs, src/cli/repl.rs, src/tauri/commands/panels.rs, src/tauri/desktop.rs, src/tui/events.rs, echo-agent-app-core/src/tasks/task_runtime/task_tools.rs, echo-agent-app-core/src/tasks/task_runtime/store/runtime.rs, echo-agent-app-core/src/tasks/task_runtime/store/tests.rs, echo-agent-app-core/src/tasks/task_runtime/register.rs, echo-agent-app-core/src/runtime.rs, docs/en/architecture/runtime.md, docs/zh/architecture/runtime.md]
+supports: [rule.eko-framework-consumer-authorities]
+limitations: [Focused Rust tests only, Historical source-only review remains a separate epoch, Same-six risk scan qualification recorded separately, No full matrix or native performance or main acceptance]
+---
+
+# Console boundaries and truthful cancellation request receipts
+
+## 来源与范围
+
+This is one Root-authorized application source batch after APP UI checkpoint97502b9eb02fb75024b56570cf500f70472262ae. Desktop argument ownership, the existing auto-memory switch, the application cancel Tool response and four stale source comments belong to EKO. Framework cancellation, Task graph/claim settlement, stores, tools API and concurrency primitives are unchanged. There is no new JSON helper, queue, executor, state machine, permission gate or compatibility mirror.
+
+R1/R2 use the exact reviewed APP overlay544029b6136e1e6cc9c70843d2a103167140d501f8bdf2cd3330210608545086, independently reviewed under b7ebb7bb4e5f58f2a28a54c139ee44901dd8e89bf17599b747f18f98f22a4858. The actual desktop file changes from15d5aa1fcb6653fe5cc0f65549a8df6d4882b61bd476f748af55ad19080084ac toe2444004daa47e9d630a9514cfd8625c80aeae7d44417b6bf0132633d84d0e94; Result/map_err/wait_final and original startup/physical lifecycle remain. The one process-global, initially true AtomicBool moves into the existing app-core auto_memory module; its original callers retain their Relaxed operations and validation order.
+
+## 支持的结论
+
+The cancel_run Tool retains its name, run_id parameter and exact original Store.request_cancel delegation. The same returned boolean is named cancellation_requested, without a cancelled completion alias. Description and bilingual runtime docs state that this acknowledges request acceptance. An active Run can remain Running with its original claim and physical owner pending until the original cancellation/settlement authority publishes its final facts. The Store runtime file differs only by removal of an unrelated misplaced pause comment, not any control logic.
+
+The existing cancellation_intent_keeps_claim_and_running_until_same_owner_settles test is extended, rather than replaced by a JSON mirror test or new harness. It enters original with_chat_resources with the same real Store, calls actual CancelRunTool while the original claim, physical intent and registered cancellation token are retained, checks the truthful reply and unchanged foreground token, and retains the original Running/claim/durable interruption/no-terminal-event assertions and original claim settlement path. This was a source definition in the initial review epoch. The later bounded actual window executes this same test successfully, as recorded below.
+
+The four comment locations describe shared ApplicationServices/post-bootstrap installation, existing per-run router ownership, the original active execution control identity and the actual GUI/IM/cron direction. They change no registration, routing, caller or primitive. Existing console entrypoints are not claimed deleted.
+
+Actual source checks reverse only the exact Tool description/field rename back to the archived original bytes, prove the Store file contains only the targeted comment deletion, verify the reviewed desktop successor hash, preserve all UI16 checkpoint bytes, and pass git diff --check plus docs parity66pairs/54ADRs. The normal Rule only adds direct references for the retained memory/desktop adapters; no constraint or accepted risk is weakened. Detailed originals, inputs and checks remain under .echo-semantic/local/gui-runtime-rust-facing-integration/ on this machine.
+
+## 已知缺口
+
+The initial source-only review ran no Rust command while the native release owner held the compiler slot. After its formal return, cargo fmt --all and its check both exit0. Only desktop parser signature wrapping, an optional trailing comma and a blank line change; Root confirms the original source/exposure review7944fabd5735abe828f5b0bd606b69f4975558170794c22e87526e505b4ab053 remains applicable.
+
+The later Root-authorized original runner actually executes three all-features/locked/offline commands on frozen sourceee89a2c31b9259f9d06b9c3bc5dc3f1accc14637b6022e8ca2b6a36c3233a12a,1002-input SHA256c5f51f0d624c7fa72442d702cfab601e5cca7b6813c74c34921e79fe8f3482e2, lockcd05fc1c3ffa425b972d48a687486446ea70f24dea30282d096b4f2856fac335 and framework0a18157140b1212c06db38ae5edbe4326381c891. Filters cancellation_intent_keeps_claim_and_running_until_same_owner_settles, tauri::desktop::tests:: and invalid_auto_memory_scope pass1+10+2=13 distinct tests, with no failed, ignored or compiler warnings. Each original Cargo and wrapper naturally exits0. The first test directly proves the actual Tool/ChatResources/Store path with retained claim/physical owner; the other groups cover desktop argument precedence/rejection/lifecycle and memory-scope validation order.
+
+Original receipts/raws, source guards, three-second resource samples and current executable identities are saved outside target under the local task rust-validation directory. They show observation gaps0, sampled RSS maximum3547447296B and sampled target4814446592B, not continuous peaks. Original independent clean guard0, exact own-target cargo clean0 (7161files/4.3GiB), and post-clean guard0 confirm target absent/no active Rust or target processes. Formal returnfe4695efea1bb35c2e78efb660441e233a76d89ddc55e6b62e39eabd605bda81 returns the compiler slot at1343.387s, within the original2400+300s work/finalization allowance; actual work completes at1191.595s. No old result, clock or PGID becomes a new execution.
+
+The one same-six consumer reassessment changes only the policy consumer binding from08f993b8d72c2f446c7181f3fbc910939e5a0abc114e77a93d14633c9bbcb8b9 tod47a0c2be53fa5dc6e053477c837a864d4e532526f9344ae5c59f66efa7df59f after formal return. All306 Rust/build inputs remain identical to the tested cut. Full accepted identities, lock, scanner and original human decisions stay unchanged. The finite7944 delta review preserves earlier2ca2 source exposure findings, including real GTK/menu/tray/AppIndicator/session-bus activation and unrepaired glib/maintenance risks. The original six Python methods pass0. Two new actual-lock/canonical-origin fresh online scans each preserve scanner1, exactly the unchanged six warnings, zero vulnerabilities and separate gate/caller0 with noFetch=false. Complete own-DB blob/mode/physical-file checks pass before, between and after scans, and FETCH_HEAD advances independently. These actual results and per-process transport scope are recorded in the append-only dependency-risk decision and local risk-rebind-v1 receipts; the six risks remain accepted, not repaired. Both scanner owners and DB readers are settled before handoff.
+
+Historical A42, E7 B16, sourcef5e1 and the metadata7a/GUI23cc checkpoints retain their exact scopes and raw failures. They are not renamed as current Rust-batch acceptance, a new native/performance run, full Plan07 or main/CI completion. Public API examples and website descriptions do not consume this Tool reply field or these internal argument/memory placement details; bilingual runtime documentation records the changed application contract. No website release claim or example execution is added.

@@ -1687,12 +1687,11 @@ impl AgentRuntime {
             tracing::warn!(%error, "Failed to load project-local skills");
         }
 
-        // ── NOTE: ExecuteTaskTool + the task-management tools are NOT registered
-        // here. The TaskRuntimeStore doesn't exist yet at primary-agent build
-        // time (GUI: AppState creates it later; TUI: built in main.rs after
-        // bootstrap), so BOTH entry points call `register_task_tools_on_agent`
-        // (in app-core `tasks/task_runtime/register.rs`) post-hoc once the store
-        // is ready. TUI/GUI functional parity (AGENTS.md).
+        // Shared ApplicationServices composition registers task tools once
+        // AppState exposes the canonical TaskRuntimeStore. Pool initialization
+        // receives the same store. This early primary-agent build has no store
+        // yet; remaining legacy callers retain their existing post-hoc hook
+        // while GUI, IM and cron converge on shared application composition.
         // Chat 可用 agent_tool 做单个临时子任务;Auto/Task 的委派统一进入正式 TaskRuntime。
         // ── 4. HITL dispatcher ──
         let hitl_dispatcher = {

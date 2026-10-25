@@ -3,7 +3,7 @@
 //! Shared by the dedicated `echo-agent-tauri` binary and by the package-name
 //! binary when Tauri CLI builds the app with `--no-default-features --features gui`.
 
-use crate::{cli, infra};
+use crate::infra;
 use clap::Parser;
 use echo_agent_app_core::api::config;
 use std::ffi::OsString;
@@ -155,8 +155,8 @@ async fn run_desktop() -> anyhow::Result<()> {
     // Load project-local .env file (standard dotenvy behavior)
     dotenvy::dotenv().ok();
 
-    // The desktop binary accepts the same model/project/config overrides as
-    // TUI/CLI, including the canonical `--mcp-config` source.
+    // Desktop configuration overrides belong to this entry, independently of
+    // the console interaction modes and their arguments.
     let args = parse_desktop_args(std::env::args_os())?;
     let mut app_config = config::load_config(args.config.as_deref()).map_err(anyhow::Error::msg)?;
     // On macOS, GUI apps launched from Dock/Finder don't inherit shell env
@@ -337,13 +337,37 @@ where
     receipt.into_result().map_err(anyhow::Error::new)
 }
 
-fn parse_desktop_args(args: impl IntoIterator<Item = OsString>) -> Result<cli::Args, clap::Error> {
+/// Configuration inputs consumed by the existing desktop bootstrap. Console
+/// interaction flags are deliberately absent rather than silently ignored.
+#[derive(Parser, Debug)]
+#[command(name = "echo-agent-tauri", version, about = "EKO desktop assistant")]
+struct DesktopArgs {
+    /// Configured model ID or unique model name; otherwise use the default.
+    #[arg(long, short = 'm', env = "MODEL_NAME")]
+    model: Option<String>,
+
+    /// Project directory whose instructions the desktop Agent loads.
+    #[arg(long)]
+    project: Option<String>,
+
+    /// MCP configuration file override.
+    #[arg(long)]
+    mcp_config: Option<String>,
+
+    /// EKO configuration file (eko.yaml).
+    #[arg(long)]
+    config: Option<String>,
+}
+
+fn parse_desktop_args(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<DesktopArgs, clap::Error> {
     let args = args
         .into_iter()
         // Finder may add a process-serial-number argument when launching a
         // macOS application bundle. It is platform metadata, not an EKO flag.
         .filter(|arg| !arg.to_string_lossy().starts_with("-psn_"));
-    cli::Args::try_parse_from(args)
+    DesktopArgs::try_parse_from(args)
 }
 
 #[cfg(test)]
@@ -400,6 +424,52 @@ mod tests {
         )?;
         assert_eq!(args.mcp_config.as_deref(), Some("/tmp/eko-mcp.json"));
         Ok(())
+    }
+
+    #[test]
+    fn desktop_args_preserve_all_configuration_overrides() -> anyhow::Result<()> {
+        let args = parse_desktop_args(
+            [
+                "echo-agent-tauri",
+                "-m",
+                "configured-model",
+                "--project",
+                "/tmp/项目",
+                "--mcp-config",
+                "/tmp/工具.json",
+                "--config",
+                "/tmp/eko.yaml",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )?;
+        assert_eq!(args.model.as_deref(), Some("configured-model"));
+        assert_eq!(args.project.as_deref(), Some("/tmp/项目"));
+        assert_eq!(args.mcp_config.as_deref(), Some("/tmp/工具.json"));
+        assert_eq!(args.config.as_deref(), Some("/tmp/eko.yaml"));
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_args_reject_console_interaction_flags() {
+        for flag in [
+            "--tui",
+            "--cli",
+            "--jsonl",
+            "--web",
+            "--channels",
+            "--continue",
+            "--resume",
+            "--port",
+            "--verbose",
+        ] {
+            let result =
+                parse_desktop_args(["echo-agent-tauri", flag].into_iter().map(OsString::from));
+            assert!(matches!(
+                result,
+                Err(error) if error.kind() == clap::error::ErrorKind::UnknownArgument
+            ));
+        }
     }
 
     #[tokio::test]

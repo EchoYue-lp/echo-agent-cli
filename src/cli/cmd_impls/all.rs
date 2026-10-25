@@ -1,6 +1,7 @@
 //! All remaining slash commands — help, exit, clear, remember, forget, memory.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
+use echo_agent_app_core::api::auto_memory::AUTO_MEMORY_ENABLED;
 use std::sync::Arc;
 
 async fn current_memory_control(
@@ -448,10 +449,6 @@ cmd!(
 );
 
 // ── AutoMemoryCommand ─────────────────────────────────────────────────
-
-/// Global auto-memory toggle (persists within the session).
-pub static AUTO_MEMORY_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
 
 async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     use echo_agent_app_core::api::auto_memory::{

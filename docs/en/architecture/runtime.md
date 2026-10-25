@@ -188,6 +188,14 @@ See [ADR 0005](../adr/0005-foreground-continuation-owner.md),
 [ADR 0009](../adr/0009-taskruntime-async-io-and-ipc-boundary.md), and
 [ADR 0015](../adr/0015-task-graph-status-authority.md).
 
+The background `cancel_run` Tool returns `cancellation_requested` for the original
+Store request-acceptance boolean. Its active-run path durably records interruption
+and signals the original cancellation tokens while the Run may remain Running
+and its execution claim stays owned. Observe the original TaskRuntime state and
+physical-settlement receipts for final cancellation; the Tool reply does not
+publish a `cancelled` completion mirror. Tool name, `run_id` input, Store API and
+cancellation/settlement logic are unchanged.
+
 ## Failed publication and settlement evidence
 
 Plugin cleanup keeps the original Agent, framework receipt, name registry and
@@ -231,9 +239,9 @@ records the product decision. Paths below are repository-relative.
 | Current source and reachable use | Future disposition and prerequisite |
 | --- | --- |
 | `Cargo.toml` defaults to `tui`; `src/main.rs` dispatches TUI/REPL/JSONL/channel paths, including a JSONL escape from a GUI build; `src/lib.rs` exposes CLI/TUI modules | Retire independent TUI/REPL/CLI/JSONL dispatch, console-only dependencies and help/configuration claims after retained paths are proven. A hidden flag or disabled default alone is insufficient. Keep a working desktop process entry. |
-| `src/cli/args.rs::Args` is also parsed by `src/tauri/desktop.rs::parse_desktop_args` | Move desktop argument ownership before removing console Args. Retain actual desktop consumers: model/project/config/MCP overrides and Finder `-psn_` filtering. Console resume/JSONL/permission/rendering flags do not become desktop requirements merely because Args contains them. |
+| `src/tauri/desktop.rs::DesktopArgs` is parsed by the existing `parse_desktop_args`, independently of console `Args` | Desktop accepts only model (including `-m`/`MODEL_NAME`), project, config and MCP overrides. Preserve Finder `-psn_` filtering and MCP argument → YAML → environment priority. Console resume/JSONL/permission/rendering flags are explicitly rejected by this entry. |
 | `src/cli/modes.rs::run_channels_mode` constructs QQ/Feishu adapters, `ChannelManager`, session factories and shutdown/join; `src/cli/channels.rs::AppChannelMessageHandler` and `ChannelSessionCoordinator`, plus `channels/{input_pump,outbound,tool_render}.rs`, handle IM identity, replies and settlement | Retain IM behavior and move its application lifecycle into shared app-core ownership before deleting the launch mode. Preserve `(channel, conversation, sender)`, session incarnations, input-pump shutdown/join, outbound/tool rendering and channel HITL. GUI bootstrap does not currently start this manager; configuration fields are not evidence of GUI IM management. |
-| `src/tauri/commands/panels.rs` reads/writes `crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED` | Move this shared memory switch and its consumers before deleting command modules. Retain GUI memory controls; do not delete the entire panels module. |
+| `echo-agent-app-core/src/auto_memory/mod.rs::AUTO_MEMORY_ENABLED` is exported through the existing `api::auto_memory`; panels and remaining CLI/TUI callers all consume it | App-core owns the one process-global, initially true, non-persistent switch with the same Relaxed atomic reads/writes. GUI validates the workspace/generation before changing it. No per-workspace state or new store is introduced; later console deletion retains GUI memory controls and the original evidence lease. |
 | `echo-agent-app-core/src/runtime.rs::ApplicationServices::compose`, `ApplicationLifecycleOwner`; `state/app_state.rs::start_scheduler_and_task_service`; `scheduler/{mod,runner}.rs` | Retain shared bootstrap, TaskRun boot recovery, SchedulerRunner, file-backed cron definitions and delivery ledger. `src/tauri/commands/scheduler.rs` and `web-frontend/src/components/scheduler/SchedulerPanel.tsx` remain adapters over them. No alternate GUI scheduler or automatic replay policy. |
 | `echo-agent-app-core/src/terminal.rs::TerminalService`, `src/tauri/terminal.rs`, `web-frontend/src/components/terminal/` | Retain GUI PTY/xterm terminal create/write/resize/close and cleanup. Console product retirement does not retire an interactive terminal or Agent shell tool. The source now accepts explicit local/system-OpenSSH targets through this same owner; Plan06 native/remote qualification remains pending (ADR 0051). |
 | `echo-agent-app-core/src/hitl/{dispatcher,channel_provider}.rs`; `src/tauri/commands/chat.rs::TauriHumanLoopHandler`; shared chat/pool/TaskRuntime owners | Retain generic HumanLoop request identity, GUI/IM response ownership, Task/Subagent and recovery. Audit `hitl/{tui_provider,repl_provider}.rs`, `src/cli/{jsonl,repl,editor,completion,keybindings,commands,command,extension_surface}.rs`, `cmd_impls/`, `src/tui/` and console render/config/tests/examples for console-only consumers before deletion; keep shared behavior through retained owners. |

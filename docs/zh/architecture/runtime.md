@@ -229,6 +229,8 @@ GUI、TUI、CLI 把框架惰性 handle 交给 app-core 的 generation-bound owne
 或 worktree policy。`echo-website` 是静态展示站，不依赖 agent runtime。因此本决策不修改
 framework examples 或 website。
 
+后台 `cancel_run` 工具使用 `cancellation_requested` 返回原 Store 的取消请求接受布尔值。活跃运行路径只持久化 interruption 并通知原取消 token，Run 仍可保持 Running，执行 claim 继续由原 owner 持有。最终取消状态和物理结算须观察原 TaskRuntime 与结算收据；工具答复不发布 `cancelled` 完成镜像。工具名、`run_id` 参数、Store API 与取消/结算逻辑均未改变。
+
 ## 发布失败与结算证据
 
 插件 bootstrap 失败后，清理义务仍持有原 Agent、框架 wiring receipt、名称 registry 和
@@ -265,9 +267,9 @@ EKO 注册的 revision store 通过同一个 run 文件锁和原子 journal 批�
 | 当前源码与真实消费 | 后续处置与前置条件 |
 | --- | --- |
 | `Cargo.toml` 默认启用 `tui`；`src/main.rs` 分派 TUI/REPL/JSONL/channel，GUI build 仍可转入 JSONL；`src/lib.rs` 暴露 CLI/TUI 模块 | 保留路径验收后退役独立 TUI/REPL/CLI/JSONL 分派、终端专属依赖及帮助/配置说明。仅隐藏参数或禁用默认 feature 不算退出。保留可用的桌面进程入口。 |
-| `src/cli/args.rs::Args` 仍由 `src/tauri/desktop.rs::parse_desktop_args` 解析 | 删除 console Args 前迁移桌面参数归属。保留真实桌面消费者：model/project/config/MCP override 与 Finder `-psn_` 过滤。Args 中的 console resume/JSONL/permission/rendering 参数不因此成为桌面需求。 |
+| `src/tauri/desktop.rs::DesktopArgs` 由同模块的 `parse_desktop_args` 解析，已不依赖 console `Args` | 桌面仅接受 model（含 `-m`/`MODEL_NAME`）、project、config 和 MCP override；保留 Finder `-psn_` 过滤与 MCP 参数 → YAML → 环境变量优先级。console resume/JSONL/permission/rendering 参数不属于桌面入口，解析时明确拒绝。 |
 | `src/cli/modes.rs::run_channels_mode` 构造 QQ/飞书 adapter、`ChannelManager`、session factory 和 shutdown/join；`src/cli/channels.rs::AppChannelMessageHandler`、`ChannelSessionCoordinator` 及 `channels/{input_pump,outbound,tool_render}.rs` 处理 IM identity、回复和结算 | 保留 IM 行为，先把应用生命周期迁入共享 app-core owner，再删启动模式。保留 `(channel, conversation, sender)`、session incarnation、input-pump 关闭/join、outbound/tool 呈现与 channel HITL。当前 GUI bootstrap 未启动此 manager，配置字段不代表 GUI IM 管理已交付。 |
-| `src/tauri/commands/panels.rs` 读写 `crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED` | 删除 command 模块前迁移共享记忆开关及调用点。保留 GUI 记忆控制，不整包删 panels。 |
+| `echo-agent-app-core/src/auto_memory/mod.rs::AUTO_MEMORY_ENABLED` 经既有 `api::auto_memory` 导出；panels、尚存 CLI/TUI 调用点均消费它 | 唯一开关已归 app-core，默认 true、进程全局、不持久化，仍使用 Relaxed 原子读写。GUI 先校验 workspace/generation 再写开关；归位不新增每工作区状态或 store。后续删除 console adapter 时保留 GUI 记忆控制与原 evidence lease。 |
 | `echo-agent-app-core/src/runtime.rs::ApplicationServices::compose`、`ApplicationLifecycleOwner`；`state/app_state.rs::start_scheduler_and_task_service`；`scheduler/{mod,runner}.rs` | 保留共享启动、TaskRun boot 恢复、SchedulerRunner、文件 cron 定义与投递账本。`src/tauri/commands/scheduler.rs` 和 `web-frontend/src/components/scheduler/SchedulerPanel.tsx` 仍是其适配层。不另建 GUI scheduler，不新增自动重放策略。 |
 | `echo-agent-app-core/src/terminal.rs::TerminalService`、`src/tauri/terminal.rs`、`web-frontend/src/components/terminal/` | 保留 GUI PTY/xterm 的创建、输入、resize、关闭和清理。终端产品入口退役不删除交互式终端或 Agent shell。源码现已沿同一 owner 接受明确的本地/系统 OpenSSH 目标；Plan06 原生/远端验收仍未完成（ADR 0051）。 |
 | `echo-agent-app-core/src/hitl/{dispatcher,channel_provider}.rs`；`src/tauri/commands/chat.rs::TauriHumanLoopHandler`；共享 chat/pool/TaskRuntime owner | 保留通用 HumanLoop 请求身份、GUI/IM 回答 owner、Task/Subagent 与恢复。删前核对 `hitl/{tui_provider,repl_provider}.rs`、`src/cli/{jsonl,repl,editor,completion,keybindings,commands,command,extension_surface}.rs`、`cmd_impls/`、`src/tui/` 以及 console 呈现/配置/测试/示例的专属消费者；共享行为由保留 owner 承接。 |

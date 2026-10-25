@@ -3568,9 +3568,6 @@ impl TaskRuntimeStore {
         }
     }
 
-    /// Pause an actively driven run. The status changes first, then the same
-    /// run-scoped token used for cancellation stops in-flight Subagents. The
-    /// executor observes the durable Paused status and leaves the run resumable.
     /// Resolve the durable control identity of the currently active
     /// execution under `execution_id`, if any. Used by the Subagent uplink to
     /// address sibling attempts without knowing their task/attempt fields.

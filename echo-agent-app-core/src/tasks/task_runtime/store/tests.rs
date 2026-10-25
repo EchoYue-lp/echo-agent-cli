@@ -1295,9 +1295,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn cancellation_intent_keeps_claim_and_running_until_same_owner_settles()
+    #[tokio::test]
+    async fn cancellation_intent_keeps_claim_and_running_until_same_owner_settles()
     -> Result<(), Box<dyn std::error::Error>> {
+        use echo_agent::tools::{Tool, ToolParameters};
+
         let store = std::sync::Arc::new(fresh()?);
         seed_plan(&store)?;
         let snapshot = store.load_runtime_plan_snapshot("r1")?;
@@ -1318,7 +1320,43 @@ mod tests {
         let token = echo_agent::agent::CancellationToken::new();
         let registration = store.register_run_cancellation("r1", token.clone())?;
         let before = store.list_events("r1", 0)?.len();
-        assert!(store.request_cancel("r1")?);
+        let directory = tempfile::tempdir()?;
+        let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let foreground_cancel = echo_agent::agent::CancellationToken::new();
+        let resources = std::sync::Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: crate::workspace::WorkspaceExecutionScope::workspace(
+                &crate::workspace::WorkspaceId::from_name("ws"),
+                directory.path(),
+            ),
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink: std::sync::Arc::new(crate::chat_driver::ChannelChatSink::new(events)),
+            webhook_emitter: None,
+            conv_id: Some("c1".to_string()),
+            root_message_id: "m1".to_string(),
+            attachments: Vec::new(),
+            cancel: foreground_cancel.clone(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let mut parameters = ToolParameters::new();
+        parameters.insert("run_id".to_string(), serde_json::json!("r1"));
+        let tool = crate::tasks::task_runtime::task_tools::CancelRunTool;
+        let response = crate::chat_resources::with_chat_resources(
+            resources,
+            tool.execute(parameters),
+        )
+        .await?;
+        assert!(response.success, "cancel request tool failed: {:?}", response.error);
+        let reply: serde_json::Value = serde_json::from_str(&response.output)?;
+        assert_eq!(
+            reply.get("cancellation_requested").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(reply.get("cancelled").is_none());
+        assert!(!foreground_cancel.is_cancelled());
         assert!(token.is_cancelled());
         assert_eq!(
             store.get_run("r1")?.ok_or("run missing")?.status,

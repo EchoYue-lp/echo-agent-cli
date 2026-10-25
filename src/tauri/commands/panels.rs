@@ -8,6 +8,7 @@ use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::sandbox::{IsolationLevel, SandboxCommand, SandboxExecutor};
 use echo_agent::tools::permission::{PermissionRule, RuleBehavior, RuleMatcher, RuleSource};
+use echo_agent_app_core::api::auto_memory::AUTO_MEMORY_ENABLED;
 use echo_agent_app_core::api::state::AuditDecision;
 use echo_agent_app_core::api::structured_extraction::{
     StructuredExtractionError, StructuredExtractionExample, StructuredExtractionOutcome,
@@ -328,8 +329,7 @@ async fn auto_memory_config_status(
     IpcError,
 > {
     let config = echo_agent_app_core::api::auto_memory::AutoMemoryConfig {
-        enabled: crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-            .load(std::sync::atomic::Ordering::Relaxed),
+        enabled: AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
     };
     let messages = scoped_agent_messages(control).await;
@@ -344,8 +344,7 @@ fn commit_auto_memory_toggle_after_validation<T>(
     enabled: bool,
 ) -> Result<T, IpcError> {
     let validated = validation?;
-    crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-        .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    AUTO_MEMORY_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
     Ok(validated)
 }
 
@@ -400,8 +399,7 @@ pub async fn extract_auto_memory(
     workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let config = echo_agent_app_core::api::auto_memory::AutoMemoryConfig {
-        enabled: crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-            .load(std::sync::atomic::Ordering::Relaxed),
+        enabled: AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
     };
     let control = auto_memory_extract_control_after_validation(
@@ -452,8 +450,7 @@ pub async fn get_auto_memory_observations(
     workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let config = echo_agent_app_core::api::auto_memory::AutoMemoryConfig {
-        enabled: crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-            .load(std::sync::atomic::Ordering::Relaxed),
+        enabled: AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
     };
     let control = auto_memory_control_for_workspace(&state, &workspace_id).await?;
@@ -2046,16 +2043,14 @@ mod scoped_control_tests {
 
     #[test]
     fn invalid_auto_memory_scope_does_not_commit_global_toggle() {
-        let previous = crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let previous = AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
         let result = commit_auto_memory_toggle_after_validation::<()>(
             Err(IpcError::Validation("workspace was deleted".to_string())),
             !previous,
         );
         assert!(result.is_err());
         assert_eq!(
-            crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-                .load(std::sync::atomic::Ordering::Relaxed),
+            AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
             previous
         );
     }

@@ -1307,7 +1307,7 @@ impl CheckRunStatusTool {
     }
 }
 
-/// Cancel a background Run by run_id.
+/// Request cancellation of a background Run; final settlement remains store-owned.
 pub struct CancelRunTool;
 
 impl Tool for CancelRunTool {
@@ -1315,7 +1315,7 @@ impl Tool for CancelRunTool {
         "cancel_run"
     }
     fn description(&self) -> &str {
-        "Cancel a background Run by run_id. Use when a task is no longer needed or going wrong."
+        "Request cancellation of a background Run by run_id. cancellation_requested only reports request acceptance; observe the original TaskRuntime status and physical-settlement receipts for completion."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
@@ -1360,8 +1360,8 @@ impl CancelRunTool {
             })
             .await
         {
-            Ok(cancelled) => Ok(ToolResult::success(
-                serde_json::json!({"run_id": run_id, "cancelled": cancelled}).to_string(),
+            Ok(cancellation_requested) => Ok(ToolResult::success(
+                serde_json::json!({"run_id": run_id, "cancellation_requested": cancellation_requested}).to_string(),
             )),
             Err(error) => Ok(ToolResult::error(format!(
                 "Failed to cancel run {run_id}: {error}"
