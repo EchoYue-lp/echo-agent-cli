@@ -1,5 +1,15 @@
 # EKO 配置指南
 
+## 最大子智能体层数
+
+在 GUI 配置页或 EKO 独有的顶层 YAML 字段中设置。只接受整数 1、2、3，默认 1；主智能体为第 0 层。仅对新运行/turn 生效，已运行任务及同 Run 新任务、重试和恢复保持原绑定。非法配置文件明确失败，不静默加载默认配置。
+
+```yaml
+max_subagent_depth: 1
+```
+
+这不是并发数，不改变框架默认，也不要求轻量 agent_tool 创建 TaskRun。历史缺少可信绑定的运行不能从当前设置获得新委派许可。见 [ADR 0052](adr/0052-gui-subagent-depth-policy.md)。
+
 ## 配置位置与优先级
 
 EKO 在 app-core 中拥有 `EkoConfig` 与 `~/.eko` 数据根。runtime bootstrap 只选择
@@ -317,3 +327,9 @@ scope 的全部 incarnation checkpoint/transcript 和稳定 transcript。
 Provider API Key 使用各 Provider 的 `api_key_env`，无需维护固定厂商变量白名单。
 
 旧 `.lsp.yaml` 不再被解析或热重载；发现时只报告 LSP 已退役，保留文件原件。
+
+## IM 人工请求的回复身份
+
+EKO 渠道中的每个活动审批、输入或选择提示都会给出 response target。使用 `/reply <response-target> <answer>` 回复，使用 `/reply <response-target> /cancel` 拒绝。审批继续支持 `y`、`a`、`n [reason]`、`m [feedback]`；选择沿原选项数字或名称；自由输入保留 answer 后缀的中文、emoji 与换行。有 pending 时裸文本不回答请求。缺失、旧、非 front 或其它会话的 target 明确拒绝且不进入普通聊天；无 pending 的普通文本仍可聊天。
+
+submitted 不等于原 provider/dispatcher 已选定的 effective answer。GUI 回复携带原投递 scope/target，不因切页重绑，缺 target 的历史事件不重新激活。合同与待完成的 Rust/native、实际双端组合及 IM/cron 验收边界见 [ADR0053](adr/0053-im-cron-gui-control.md)。身份源码 checkpoint 不表示完整渠道管理页或原生平台投递已验证。

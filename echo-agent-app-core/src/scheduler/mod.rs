@@ -5,6 +5,7 @@
 //! `runner` provides the CLI-specific [`runner::build_occurrence_fire_fn`]
 //! adapter。
 
+pub mod management;
 pub mod runner;
 
 pub use echo_agent::scheduler::{CronTask, CronTaskStatus, CronTaskStore};

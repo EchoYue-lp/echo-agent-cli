@@ -6,7 +6,7 @@ title: Existing EKO interactive terminal owner and view adapters
 asset_type: state_authority
 status: active
 risk: high
-observed_at: source:230d0c7af649f29cef2002109e67167479b0894c28537c90eefe2d0746336829
+observed_at: source:4726a37cc1350e66b30b281fd02e16cdd087cd7f44b58b28a0ba6ab09bfa0d46
 boundary_refs: [boundary.eko-framework-consumer-settlement]
 behavior_refs: []
 rule_refs: [rule.eko-framework-consumer-authorities]
@@ -26,7 +26,7 @@ code_refs:
 consumer_refs:
 - echo-agent-app-core/src/developer_commands.rs
 - src/cli/channels.rs
-- src/cli/channels/outbound.rs
+- echo-agent-app-core/src/channel_runtime/outbound.rs
 - src/cli/cmd_impls/developer.rs
 - src/tui/events.rs
 - web-frontend/src/api/endpoints.terminal.test.ts
@@ -75,3 +75,9 @@ active 表示该原 owner 在生产入口可达，不表示完整产品已验收
 前一私有别名修复来源观察source:9f547aecb5c081047bcf82867a21515d83d490d701aed53a9a2a1b312f026cbf与原d7/710/101历史保持。后继另获一条focused租约后，原两package/lib/all-feature Clippy完整自然0，两个lib的rmeta已保存哈希，未运行tests/bins/examples/Node/native/远端。此处只更新当前来源观察和已执行资格，不改变原TerminalService唯一owner、前端观察角色或既有风险接受。
 
 observer的du临时文件竞争exit1、采样gap和同原Cargo组恢复另存，不把observer退出当compiler退出，也不声称连续RSS峰值。原命令完整raw/真实0/源guard/rmeta保存后，无targetreader才立即exactclean0移除5939files/1.2GiB，targetabsent并归还槽；资格不以留target等待review。完整矩阵、真实native/SSH、其它平台、main/CI和Plan06仍未资格。
+
+## 2026-10-25 应用源码归位观察
+
+当前可读 channel helper 路径随原实现归位 app-core/channel_runtime；原 bin 入口只转发。此路径修正不续期本文件任何历史 Rust、Node、风险接受或 native 资格；历史观察和具名旧快照结论保持原范围。当前合流尚未 Cargo 编译。
+
+旧来源观察 `source:230d0c7af649f29cef2002109e67167479b0894c28537c90eefe2d0746336829` 保留为历史。当前 observed_at 只绑定归位后的可读来源，不表示旧验证在新合流上续期。

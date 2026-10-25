@@ -1,5 +1,7 @@
 # ADR 0039:统一 Agent 会话分栏与上下文工作台
 
+> 委派政策更新：ADR [0052](0052-gui-subagent-depth-policy.md) 仅替代下文无条件嵌套/默认三层和固定单层的冲突政策；通信、生命周期与 GUI 决定仍有效。
+
 - Status: Accepted
 - Date: 2026-09-04
 - Owners: `echo-agent::subagent`、`web-frontend`、`src/tauri`

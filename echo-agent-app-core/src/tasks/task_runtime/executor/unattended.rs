@@ -1185,7 +1185,7 @@ async fn run_readonly_subagent(
                         &task_input,
                         &run_id,
                         cancel,
-                        0,
+                        u32::from(delegation_policy.delegate_depth),
                         runtime_context,
                         Some(allowed_tools),
                         Some(prompt_payload),
@@ -1326,7 +1326,7 @@ async fn run_writer_subagent(
                             msg,
                             &run_id,
                             cancel,
-                            0,
+                            u32::from(delegation_policy.delegate_depth),
                             runtime_context,
                             Some(allowed_tools.clone()),
                             Some(prompt_payload.clone()),
@@ -1341,7 +1341,7 @@ async fn run_writer_subagent(
                             &task_input,
                             &run_id,
                             cancel,
-                            0,
+                            u32::from(delegation_policy.delegate_depth),
                             runtime_context,
                             Some(allowed_tools),
                             Some(prompt_payload),
@@ -1472,6 +1472,18 @@ async fn run_main_agent_task(
             ExecutionFailure::failed(format!("failed to load TaskRun identity: {error}"))
         })?;
     let root_message_id = Some(run_record.root_message_id.clone());
+    let policy_run_id = run_id.clone();
+    let binding = blocking
+        .run("load primary verification depth binding", move |store| {
+            Ok(store
+                .get_run_state(&policy_run_id)?
+                .ok_or(StoreError::RunNotFound(policy_run_id))?
+                .execution_profile
+                .subagent_depth_limit)
+        })
+        .await
+        .map_err(|error| ExecutionFailure::failed(error.to_string()))?;
+    let delegation_policy = crate::subagent_policy::primary_policy_for_binding(binding);
     let run_message = if run_record.attachments.is_empty() {
         None
     } else {
@@ -1508,6 +1520,8 @@ async fn run_main_agent_task(
                     })
                     .cloned();
                 let invocation = echo_agent::agent::AgentInvocationContext {
+                    allowed_tools: (!task.allowed_tools.is_empty())
+                        .then(|| task.allowed_tools.iter().cloned().collect()),
                     history: None,
                     runtime_state_id,
                     transcript_generation_id,
@@ -1521,7 +1535,7 @@ async fn run_main_agent_task(
                         message_id: root_message_id,
                         cancel: Some(Arc::new(cancel.clone())),
                         trace_sink: exec_trace_sink_to_core(trace_sink.clone()),
-                        delegation_policy: None,
+                        delegation_policy: Some(delegation_policy),
                         resource_guards: Vec::new(),
                         subagent_lineage: None,
                         uplink: None,

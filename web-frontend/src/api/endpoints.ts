@@ -2846,10 +2846,85 @@ export const hooksApi = {
       : post<HookTestResult>('/hooks/test', { event, matcher }),
 };
 
+// Existing QQ/Feishu management projects the original application owners.
+export type ManagedChannelId = 'qqbot' | 'feishu';
+export type ChannelSecretUpdate =
+  | { action: 'preserve' }
+  | { action: 'clear' }
+  | { action: 'set'; value: string };
+export interface ManagedChannelsConfiguration {
+  revision: string;
+  qq: { enabled: boolean; app_id: string; has_secret: boolean };
+  feishu: {
+    enabled: boolean;
+    app_id: string;
+    has_secret: boolean;
+    mode: string;
+    webhook_bind: string;
+    webhook_path: string;
+    has_verification_token: boolean;
+  };
+  session: { timeout_minutes: number };
+}
+export interface ManagedChannelStatus {
+  id: ManagedChannelId;
+  registered: boolean;
+  configuration_revision: string;
+  completed_cleanup_failures: string[];
+  applied_configuration_revision: string | null;
+  mutation_epoch: string | null;
+  handler_attached: boolean;
+  active_invocations: number;
+  shutdown_settled: boolean;
+  pump_shutdown_settled: boolean;
+  transport: {
+    phase: 'stopped' | 'connecting' | 'ready' | 'disconnected' | 'failed' | 'unknown';
+    evidence: string | null;
+    error: string | null;
+    observed_at: string | null;
+  };
+}
+export interface ManagedChannelStatusResponse {
+  configuration_revision: string;
+  channels: ManagedChannelStatus[];
+}
+export interface ManagedChannelPatch {
+  channel: ManagedChannelId;
+  expected_revision: string;
+  enabled: boolean;
+  app_id: string;
+  secret: ChannelSecretUpdate;
+  mode?: string;
+  webhook_bind?: string;
+  webhook_path?: string;
+  verification_token?: ChannelSecretUpdate;
+}
+export const channelApi = {
+  configuration: () => apiInvoke<ManagedChannelsConfiguration>('get_channel_configuration'),
+  save: (patch: ManagedChannelPatch) =>
+    apiInvoke<ManagedChannelsConfiguration>('save_channel_configuration', { patch }),
+  status: () => apiInvoke<ManagedChannelStatusResponse>('list_channel_status'),
+  control: (
+    channel: ManagedChannelId,
+    revision: string,
+    instance: ManagedChannelStatus,
+    action: 'start' | 'stop' | 'reconnect'
+  ) =>
+    apiInvoke<ManagedChannelStatusResponse>('control_channel', {
+      channel,
+      expected_revision: revision,
+      expected_mutation_epoch: instance.mutation_epoch,
+      expected_applied_revision: instance.applied_configuration_revision,
+      action,
+    }),
+};
+
 // ── Scheduler API (定时任务) ──────────────────────────────────────
 
 export interface SchedulerTask {
   id: string;
+  definition_id: string;
+  control_revision: number;
   name: string;
   cron_expr: string;
   prompt: string;
@@ -2859,6 +2934,82 @@ export interface SchedulerTask {
   created_at: string;
   next_run: string | null;
 }
+
+export interface SchedulerRunReference {
+  run_id: string;
+  workspace_id: string;
+  conversation_id: string;
+  status: string;
+}
+export interface SchedulerRunLookup {
+  run: SchedulerRunReference | null;
+  lookup: string;
+  error?: string;
+}
+export interface SchedulerOccurrence {
+  task_id: string;
+  definition_id: string;
+  occurrence_id: string;
+  scheduled_at: string;
+  trigger: 'manual' | 'scheduled';
+}
+export interface SchedulerManualResponse {
+  success: boolean;
+  cause?: string | null;
+  outcome_unknown: boolean;
+  occurrence?: SchedulerOccurrence | null;
+  attempt_id?: string | null;
+  attempt?: number | null;
+  result?: string | null;
+  error?: string | null;
+  run_lookup?: SchedulerRunLookup | null;
+  terminal_receipt?: Record<string, unknown> | null;
+  journal_failure?: Record<string, unknown> | null;
+}
+export interface SchedulerEditResponse {
+  success: boolean;
+  task?: SchedulerTask | null;
+  cause?: string;
+  error?: string;
+  outcome_unknown?: boolean;
+}
+/** Opaque serialization of the original typed journal cursor, preserving u64 coordinates. */
+export type SchedulerHistoryCursor = string;
+export interface SchedulerHistoryRecord {
+  batch_id: string;
+  sequence: string;
+  event: {
+    kind: string;
+    message_id?: string;
+    attempt_id?: string;
+    outcome?: string;
+    reason?: string;
+    envelope?: {
+      message_id: string;
+      payload: { task: SchedulerTask; scheduled_at: string; trigger: 'manual' | 'scheduled' };
+    };
+    [key: string]: unknown;
+  };
+}
+export type SchedulerHistoryResponse =
+  | {
+      success: true;
+      page: {
+        journal_identity: string;
+        retained_floor: string;
+        snapshot_end_sequence: string;
+        events: SchedulerHistoryRecord[];
+        next_cursor: SchedulerHistoryCursor | null;
+      };
+      runs: Record<string, SchedulerRunLookup>;
+    }
+  | {
+      success: false;
+      cause: string;
+      error?: string;
+      retained_floor?: string;
+      current_journal_identity?: string;
+    };
 
 export const schedulerApi = {
   list: () =>
@@ -2884,10 +3035,18 @@ export const schedulerApi = {
         }),
   run: (id: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; result?: string; error?: string }>('run_scheduler_task', {
+      ? apiInvoke<SchedulerManualResponse>('run_scheduler_task', {
           id,
         })
-      : post<{ success: boolean; result?: string; error?: string }>(`/scheduler/tasks/${id}/run`),
+      : post<SchedulerManualResponse>(`/scheduler/tasks/${id}/run`),
+  edit: (expected: SchedulerTask, edit: { name: string; cron_expr: string; prompt: string }) =>
+    isTauri()
+      ? apiInvoke<SchedulerEditResponse>('edit_scheduler_task', { expected, edit })
+      : put<SchedulerEditResponse>(`/scheduler/tasks/${expected.id}`, { expected, edit }),
+  history: (cursor: SchedulerHistoryCursor | null = null, limit = 128) =>
+    isTauri()
+      ? apiInvoke<SchedulerHistoryResponse>('read_scheduler_history', { cursor, limit })
+      : post<SchedulerHistoryResponse>('/scheduler/history', { cursor, limit }),
   delete: (id: string) =>
     isTauri()
       ? apiInvoke<{ success: boolean }>('remove_scheduler_task', { id })

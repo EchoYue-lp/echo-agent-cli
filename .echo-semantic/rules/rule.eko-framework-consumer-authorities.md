@@ -11,13 +11,25 @@ focus:
 - time_lifecycle
 - failure_concurrency
 - contract_evidence
-observed_at: source:a316119d3d822166fd260b6806ad05b2bf2762f349d47185e64a2bea4f964241
+observed_at: source:4726a37cc1350e66b30b281fd02e16cdd087cd7f44b58b28a0ba6ab09bfa0d46
 behavior_refs:
 - behavior.background-review-caller-owned-settlement
 - behavior.shared-turn-observation-retains-owner
 - behavior.task-unknown-owner-admission-fence
 - behavior.analysis-original-owner-settlement-retry
 code_refs:
+- echo-agent-app-core/src/foreground_turn.rs
+- echo-agent-app-core/src/hitl/pairing.rs
+- echo-agent-app-core/src/hitl/dispatcher.rs
+- echo-agent-app-core/src/hitl/channel_provider.rs
+- echo-agent-app-core/src/hitl/mod.rs
+- src/tauri/commands/chat.rs
+- src/cli/jsonl.rs
+- web-frontend/src/types/api.ts
+- web-frontend/src/hooks/useTauriChat.ts
+- web-frontend/src/hooks/chatEventHandler.ts
+- web-frontend/src/stores/chatStore.ts
+- web-frontend/src/components/chat/ChatPanel.tsx
 - echo-agent-app-core/src/infra/factory.rs
 - echo-agent-app-core/src/agent_pool/tests.rs
 - echo-agent-app-core/src/state/reliability_contracts.rs
@@ -30,7 +42,7 @@ code_refs:
 - echo-agent-app-core/src/tasks/task_runtime/executor/tests.rs
 - src/cli/repl.rs
 - src/cli/channels.rs
-- src/cli/channels/input_pump.rs
+- echo-agent-app-core/src/channel_runtime/input_pump.rs
 - src/tauri/commands/task_runtime.rs
 - src/tui/events.rs
 - echo-agent-app-core/src/agent_router/tests.rs
@@ -48,6 +60,8 @@ code_refs:
 - echo-agent-app-core/src/agent_pool/pool.rs
 - echo-agent-app-core/src/analysis.rs
 - echo-agent-app-core/src/chat_driver.rs
+- echo-agent-app-core/src/chat_resources.rs
+- echo-agent-app-core/src/subagent_policy.rs
 - echo-agent-app-core/src/conversation_input.rs
 - echo-agent-app-core/src/foreground_turn.rs
 - echo-agent-app-core/src/product_data_io.rs
@@ -59,10 +73,64 @@ code_refs:
 - echo-agent-app-core/src/tasks/task_runtime/store/workspace.rs
 - echo-agent-app-core/src/plugin_runtime/tests.rs
 - echo-agent-app-core/src/tasks/task_runtime/subagent_control.rs
+- echo-agent-app-core/src/api/mod.rs
+- echo-agent-app-core/src/chat_event_log/projection.rs
+- echo-agent-app-core/src/chat_event_log/tests.rs
+- echo-agent-app-core/src/config.rs
+- echo-agent-app-core/src/config_watcher.rs
+- echo-agent-app-core/src/infra/diagnostics.rs
+- echo-agent-app-core/src/lib.rs
+- echo-agent-app-core/src/scheduler/mod.rs
+- echo-agent-app-core/src/tasks/task_runtime/executor/events.rs
+- echo-agent-app-core/src/tasks/task_runtime/executor/review.rs
+- echo-agent-app-core/src/tasks/task_runtime/executor/unattended.rs
+- echo-agent-app-core/src/tasks/task_runtime/task_tools.rs
+- echo-agent-app-core/src/tasks/task_runtime/types.rs
+- echo-agent-app-core/src/types/request.rs
+- echo-agent-app-core/src/types/response.rs
+- examples/lh6_product_soak.rs
+- src/cli/cmd_impls/agent_router.rs
+- src/cli/cmd_impls/analysis.rs
+- src/cli/cmd_impls/research.rs
+- src/cli/modes.rs
+- src/main.rs
+- src/task_run_control.rs
+- src/tauri/commands/config.rs
+- src/tauri/commands/mod.rs
+- src/tauri/commands/scheduler.rs
+- src/tauri/desktop.rs
+- src/tauri/mod.rs
+- src/tauri/state.rs
+- web-frontend/src/api/endpoints.ts
+- web-frontend/src/components/config/ConfigPanel.tsx
+- web-frontend/src/components/layout/SettingsDialog.tsx
+- web-frontend/src/components/scheduler/SchedulerPanel.tsx
+- web-frontend/src/hooks/chatEventHandler.contract.test.ts
+- web-frontend/src/hooks/chatEventHandler.test.ts
+- web-frontend/src/hooks/useTauriChat.test.tsx
+- web-frontend/src/stores/uiStore.ts
+- echo-agent-app-core/src/channel_runtime.rs
+- echo-agent-app-core/src/channel_runtime/management.rs
+- echo-agent-app-core/src/channel_runtime/outbound.rs
+- echo-agent-app-core/src/channel_runtime/tool_render.rs
+- echo-agent-app-core/src/hitl/channel_entry.rs
+- echo-agent-app-core/src/scheduler/management.rs
+- echo-agent-app-core/src/text_commands.rs
+- echo-agent-app-core/src/text_commands/agent_router.rs
+- echo-agent-app-core/src/text_commands/analysis.rs
+- echo-agent-app-core/src/text_commands/research.rs
+- echo-agent-app-core/src/text_commands/task_run_control.rs
+- src/tauri/commands/channels.rs
+- web-frontend/src/components/channels/ChannelsPanel.test.tsx
+- web-frontend/src/components/channels/ChannelsPanel.tsx
+- web-frontend/src/components/config/ConfigPanel.test.tsx
+- web-frontend/src/components/scheduler/SchedulerHistory.test.tsx
+- web-frontend/src/components/scheduler/SchedulerHistory.tsx
+- web-frontend/src/components/scheduler/SchedulerPanel.test.tsx
 evidence_refs:
 - evidence.latest-framework-consumer-integration
 - evidence.cancellation-observation-consumer
-finding_refs: [finding.cli-upstream-dependency-risks]
+finding_refs: [finding.cli-upstream-dependency-risks, finding.eko-channel-helper-relocation]
 ---
 
 # EKO framework consumer authorities
@@ -82,6 +150,22 @@ EKO 使用同一 generation-bound Review owner；Skill 使用框架 preview/appr
 ## 期望行为
 
 任何适配器不能私自拥有第二套 Memory/Skill/Plugin 状态机。失败结算必须报告 unknown、冲突或清理债务，不能把未确认效果包装成成功；重试只用稳定身份，不把新 generation 误认为旧操作。
+
+### Plan07 HITL identity source checkpoint
+
+ADR0053 owns EKO's per-delivery response_target/scope/kind. The original provider future, dispatcher, GUI pending reservation and channel FIFO remain their respective owners; no framework field, third queue, store or terminal authority is added. Providers read the original ForegroundTurnControl and ChannelActiveTurn through Weak observers at the actual request, preserving current continuation turn across framework spawn without a new store or Arc cycle. Missing original owners reject before pending insertion. Original pump leases retain the original active-map removal receipt. Input/Selection/Approval payload constraints are checked under the original pending-map lock before removal, and bare /cancel only returns the target-qualified hint. Direct GUI/resume/browser providers pair inside request; the paired dispatcher entry pairs before cloning. Generic-only legacy registration remains unpaired. The channel target is consumed before ordinary ingress, and a reused request_id cannot consume a successor's waiting item. The journal event's absent optional identity remains absent on serialization; historical requests are never reactivated from it. Frontend state is a projection and replies use the delivered identity rather than current page refs.
+
+This is a narrow source checkpoint on EKO d7/F634a, not completion of Plan07 or renewal of the historical qualifications below. Node before/after and Rust test definitions are separate evidence: Rust tests/export, native controls, live GUI+IM composition, shared ChannelManager/Cron GUI/lifecycle, fresh exact risk gate and main CI remain pending. Rule status stays needs_review; old dependency-risk fingerprints and global closure are not extended.
+
+### EKO Subagent depth policy source slice
+
+ADR0052 (`docs/zh/adr/0052-gui-subagent-depth-policy.md` / `docs/en/adr/0052-gui-subagent-depth-policy.md`) owns EKO's default1/selectable1..3 product policy. `subagent_policy.rs` validates that product value; the shared committed-config projection only supplies new admissions through `chat_resources.rs` or the original TaskRuntime store. The original `TaskRunExecutionProfile` in RunCreated, fold, checkpoint and resume identity remains the sole durable binding. Same-run task insertion, retries and recovery retain it; historical absence is not filled from current settings. Framework child-policy and invocation hard-W remain the generic enforcement authority, including primary Verification's original nonempty PlanTask tool bound. No new store, executor, task CRUD or runtime state machine is introduced.
+
+This is a source-stage observation, not an extension of the historical verified cuts below. Node tests, lint/build and bilingual document parity have actual local results; Rust tests, Rust type export, native GUI and composed-framework qualification remain pending. The original frozen depth source paired e4e and used immutable e713 only as its hard-W field reference; its framework-fix qualification remained pending at that historical cut. Rule status stays needs_review; no old dependency-risk consumer fingerprint, native acceptance or global closure is renewed here.
+
+### Independent application composition source
+
+The new gui-runtime-app-integration source composes these two immutable slices by three-way hunks on SSH28bb and consumes stable F0a181571. Its original v3/depth/SSH receipts remain bound to their original cuts. This application composition has not run Rust, actual exports, native GUI, live dual GUI/IM or fresh risk qualification. The original ConfigState/ChannelManager/SchedulerRunner/TaskRuntime and foreground leases remain the only authorities.
 
 ## 证据
 
@@ -118,3 +202,9 @@ EKO 的 ConfiguredModel/ModelProviderConfig 与既有 resolver 仍拥有产品�
 
 
 2026-10-21 的显式新三项决定使当前应用policy只接受绑定d2e7/e46的精六项；原三项保持版本/字段/事件期限。原officialscanner1与独立精风险gate0必须分列，不可传播为framework/SDK例外，未知类别、身份/输入漂移和任意漏洞/yanked仍拒。现有Decision/Finding/Evidence各自保存人的范围、risk_accepted状态和真实扫描/工程限制；Rule仍needs_review，宽义务不因窄checkpoint关闭。
+
+## 2026-10-25 应用源码归位观察
+
+当前可读 channel helper 路径随原实现归位 app-core/channel_runtime；原 bin 入口只转发。此路径修正不续期本文件任何历史 Rust、Node、风险接受或 native 资格；历史观察和具名旧快照结论保持原范围。当前合流尚未 Cargo 编译。
+
+旧来源观察 `source:d764d62ffe779ae5fe2b6e6627158291821c4258e700cb6301fb29ade46bc7aa` 保留为历史。当前 observed_at 只绑定归位后的可读来源，不表示旧验证在新合流上续期。

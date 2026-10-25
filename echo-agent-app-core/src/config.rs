@@ -29,6 +29,8 @@ pub struct EkoConfig {
         serialize_with = "serialize_eko_agent_settings"
     )]
     pub agent: AgentSettings,
+    /// Captured by each new run/turn; changing config never rewrites active work.
+    pub max_subagent_depth: crate::subagent_policy::SubagentDepthLimit,
     pub mcp: McpYamlConfig,
     pub channels: ChannelsConfig,
     pub webhooks: WebhooksConfig,
@@ -45,6 +47,7 @@ impl Default for EkoConfig {
             model_providers: BTreeMap::new(),
             configured_models: Vec::new(),
             agent: default_eko_agent_settings(),
+            max_subagent_depth: crate::subagent_policy::SubagentDepthLimit::default(),
             mcp: McpYamlConfig::default(),
             channels: ChannelsConfig::default(),
             webhooks: WebhooksConfig::default(),
@@ -230,7 +233,7 @@ pub struct ChannelsConfig {
     pub session: SessionYamlConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct QqChannelConfig {
     pub enabled: bool,
@@ -238,7 +241,7 @@ pub struct QqChannelConfig {
     pub client_secret: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct FeishuChannelConfig {
     pub enabled: bool,
@@ -248,6 +251,35 @@ pub struct FeishuChannelConfig {
     pub webhook_bind: String,
     pub webhook_path: String,
     pub webhook_verification_token: Option<String>,
+}
+
+impl std::fmt::Debug for QqChannelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QqChannelConfig")
+            .field("enabled", &self.enabled)
+            .field("app_id", &self.app_id)
+            .field("client_secret", &"[redacted]")
+            .finish()
+    }
+}
+impl std::fmt::Debug for FeishuChannelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FeishuChannelConfig")
+            .field("enabled", &self.enabled)
+            .field("app_id", &self.app_id)
+            .field("app_secret", &"[redacted]")
+            .field("mode", &self.mode)
+            .field("webhook_bind", &self.webhook_bind)
+            .field("webhook_path", &self.webhook_path)
+            .field(
+                "webhook_verification_token",
+                &self
+                    .webhook_verification_token
+                    .as_ref()
+                    .map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 impl Default for FeishuChannelConfig {
@@ -394,24 +426,29 @@ pub fn save_config(config: &EkoConfig) -> Result<(), String> {
     save_config_file(target, config)
 }
 
-pub fn load_config(explicit_path: Option<&str>) -> EkoConfig {
-    if let Some(path) = explicit_path.map(PathBuf::from) {
-        return load_config_file(&path).unwrap_or_else(|error| {
-            tracing::error!(path = %path.display(), %error, "failed to load EKO config");
-            EkoConfig::default()
-        });
+pub fn load_config(explicit_path: Option<&str>) -> Result<EkoConfig, String> {
+    let selected = explicit_path.map(PathBuf::from).or_else(|| {
+        std::env::var("EKO_CONFIG")
+            .ok()
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from)
+    });
+    if let Some(path) = selected {
+        return load_config_file(&path);
     }
     for path in config_search_paths() {
-        if path.exists() {
-            match load_config_file(&path) {
-                Ok(config) => return config,
-                Err(error) => {
-                    tracing::warn!(path = %path.display(), %error, "invalid EKO config");
-                }
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return load_config_file(&path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to inspect config file {}: {error}",
+                    path.display()
+                ));
             }
         }
     }
-    EkoConfig::default()
+    Ok(EkoConfig::default())
 }
 
 pub fn apply_env_overrides(config: &mut EkoConfig) {
@@ -437,6 +474,22 @@ pub fn apply_env_overrides(config: &mut EkoConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_config_depth_errors_are_not_replaced_by_a_default()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("eko.yaml");
+        let selected = path.to_str().ok_or("fixture config path is not UTF-8")?;
+        assert!(load_config(Some(selected)).is_err());
+        std::fs::write(&path, "max_subagent_depth: 4\n")?;
+        assert!(load_config(Some(selected)).is_err());
+        std::fs::write(&path, "max_subagent_depth: 3\n")?;
+        assert_eq!(load_config(Some(selected))?.max_subagent_depth.get(), 3);
+        std::fs::write(&path, "{}\n")?;
+        assert_eq!(load_config(Some(selected))?.max_subagent_depth.get(), 1);
+        Ok(())
+    }
 
     #[test]
     fn eko_defaults_are_owned_by_the_application() {

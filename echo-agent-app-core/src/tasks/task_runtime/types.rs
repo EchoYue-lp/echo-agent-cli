@@ -882,6 +882,10 @@ pub enum RunPlanPolicy {
 pub struct TaskRunExecutionProfile {
     pub provenance: TaskRunProvenance,
     pub plan_policy: RunPlanPolicy,
+    /// None means a legacy run without trustworthy delegation authorization.
+    /// Only a genuinely new RunCreated admission captures the config default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_depth_limit: Option<crate::subagent_policy::SubagentDepthLimit>,
 }
 
 impl TaskRunExecutionProfile {
@@ -889,6 +893,7 @@ impl TaskRunExecutionProfile {
         Self {
             provenance: TaskRunProvenance::ConversationTurn,
             plan_policy: RunPlanPolicy::AllowDirect,
+            subagent_depth_limit: None,
         }
     }
 
@@ -896,11 +901,28 @@ impl TaskRunExecutionProfile {
         Self {
             provenance: TaskRunProvenance::Orchestrated,
             plan_policy,
+            subagent_depth_limit: None,
         }
     }
 
     pub const fn is_conversation_turn(self) -> bool {
         matches!(self.provenance, TaskRunProvenance::ConversationTurn)
+    }
+
+    pub const fn with_subagent_depth_limit(
+        mut self,
+        limit: crate::subagent_policy::SubagentDepthLimit,
+    ) -> Self {
+        self.subagent_depth_limit = Some(limit);
+        self
+    }
+
+    pub fn require_subagent_depth_limit(
+        self,
+    ) -> Result<crate::subagent_policy::SubagentDepthLimit, String> {
+        self.subagent_depth_limit.ok_or_else(|| {
+            "This historical run has no bound Subagent depth policy; new delegation requires explicit confirmation".to_string()
+        })
     }
 }
 
@@ -946,6 +968,7 @@ impl TaskRunResumeIdentity {
     }
 
     pub fn validate_resumable(&self, snapshot: &RunStateSnapshot) -> Result<(), String> {
+        self.execution_profile.require_subagent_depth_limit()?;
         let run = &snapshot.run;
         let mut changed = Vec::new();
         if run.run_id != self.run_id {
@@ -3258,12 +3281,21 @@ mod tests {
             continuation: None,
             background_cells: Vec::new(),
             recent_constraints: Vec::new(),
-            execution_profile: TaskRunExecutionProfile::default(),
+            execution_profile: TaskRunExecutionProfile::default()
+                .with_subagent_depth_limit(crate::subagent_policy::SubagentDepthLimit::default()),
             journal_sequence: 7,
             event_index: RunStateEventIndex::default(),
         };
         let identity = TaskRunResumeIdentity::capture(&snapshot);
         assert!(identity.validate_resumable(&snapshot).is_ok());
+
+        let mut legacy = snapshot.clone();
+        legacy.execution_profile.subagent_depth_limit = None;
+        assert!(
+            TaskRunResumeIdentity::capture(&legacy)
+                .validate_resumable(&legacy)
+                .is_err_and(|error| error.contains("no bound Subagent depth policy"))
+        );
 
         snapshot.run.created_at = now + chrono::Duration::milliseconds(1);
         assert!(

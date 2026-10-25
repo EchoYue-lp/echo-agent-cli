@@ -448,6 +448,21 @@ pub struct ForegroundTurnControl {
     inner: Arc<ForegroundTurnControlInner>,
 }
 
+/// Weak observation of the same control. It owns no admission, settlement or
+/// mutable scope, and cannot keep an Agent/provider/control reference cycle alive.
+#[derive(Clone)]
+pub struct WeakForegroundTurnControl {
+    inner: std::sync::Weak<ForegroundTurnControlInner>,
+}
+
+impl WeakForegroundTurnControl {
+    pub(crate) fn upgrade(&self) -> Option<ForegroundTurnControl> {
+        self.inner
+            .upgrade()
+            .map(|inner| ForegroundTurnControl { inner })
+    }
+}
+
 /// Ordered generation receipts for one foreground execution. TaskRuntime is
 /// retained first; memory evolution is appended by the Memory integration;
 /// the pool receipt is held separately and released before this stack.
@@ -547,6 +562,12 @@ impl Drop for ForegroundConversationSuspension {
 }
 
 impl ForegroundTurnControl {
+    pub fn downgrade(&self) -> WeakForegroundTurnControl {
+        WeakForegroundTurnControl {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
     pub(crate) fn bind_lifecycle_retention(
         &self,
         root: &Arc<crate::runtime::ApplicationLifecycleRetention>,
@@ -3029,6 +3050,154 @@ mod tests {
                 Ok::<(), ForegroundTurnError>(())
             })
             .await
+    }
+
+    #[tokio::test]
+    async fn real_react_hitl_stream_reads_original_owner_across_spawn_and_continuation()
+    -> anyhow::Result<()> {
+        use crate::hitl::{ChannelHumanLoopProvider, ChannelHumanLoopResolution, HitlRequestScope};
+        use echo_agent::agent::{Agent, ReactAgentBuilder};
+        use futures::StreamExt;
+
+        for surface in [ForegroundTurnSurface::Gui, ForegroundTurnSurface::Channel] {
+            let control = ForegroundTurnControl::default();
+            let lease =
+                control.begin_scoped("original-workspace", surface, "conversation", "root-turn")?;
+            let observer = control.downgrade();
+            let base = HitlRequestScope {
+                workspace_id: Some("original-workspace".to_string()),
+                host_generation: Some("original-host".to_string()),
+                conversation_id: Some("conversation".to_string()),
+                root_turn_id: Some("root-turn".to_string()),
+                turn_id: Some("root-turn".to_string()),
+                ..Default::default()
+            };
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let missing = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let recorded = observed.clone();
+            let missing_owner = missing.clone();
+            let provider = Arc::new(
+                ChannelHumanLoopProvider::new()
+                    .with_scope(base.clone())
+                    .with_scope_resolver(Arc::new(move || {
+                        // This callback runs inside the real framework stream task,
+                        // which intentionally does not carry EKO's task-locals.
+                        assert!(current_foreground_progress().is_none());
+                        assert!(crate::chat_resources::current_chat_resources().is_none());
+                        match base.for_foreground_observer(&observer, surface) {
+                            Ok(scope) => {
+                                recorded
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .push(scope.clone());
+                                Ok(scope)
+                            }
+                            Err(error) => {
+                                missing_owner.fetch_add(1, Ordering::SeqCst);
+                                Err(error)
+                            }
+                        }
+                    })),
+            );
+            let mut prompts = provider.subscribe_prompts();
+            let llm = Arc::new(
+                echo_agent::testing::MockLlmClient::new()
+                    .then_tool_call(
+                        "hitl-root",
+                        "human_in_loop",
+                        r#"{"reasoning":"root question","approval_type":"LLM"}"#,
+                    )
+                    .with_response("root answered")
+                    .then_tool_call(
+                        "hitl-next",
+                        "human_in_loop",
+                        r#"{"reasoning":"continuation question","approval_type":"LLM"}"#,
+                    )
+                    .with_response("continuation answered")
+                    .then_tool_call(
+                        "hitl-owner-missing",
+                        "human_in_loop",
+                        r#"{"reasoning":"expired owner","approval_type":"LLM"}"#,
+                    )
+                    .with_response("expired owner handled"),
+            );
+            let mut agent = ReactAgentBuilder::new()
+                .model("test-model")
+                .llm_client(llm)
+                .enable_human_in_loop()
+                .build()?;
+            agent.set_human_loop_provider_preserving_approvals(provider.clone());
+            CURRENT_FOREGROUND_TURN
+                .scope(lease.entry.clone(), async {
+                    for expected_turn in ["root-turn", "continuation-turn"] {
+                        let progress = current_foreground_progress()
+                            .ok_or_else(|| anyhow::anyhow!("foreground progress missing"))?;
+                        progress.bind_run_turn("original-run", expected_turn);
+                        let drain = async {
+                            let mut stream = agent.chat_stream("ask a question").await?;
+                            while let Some(event) = stream.next().await {
+                                event?;
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        };
+                        let answer = async {
+                            let prompt = prompts.recv().await?;
+                            let scope = observed
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .last()
+                                .cloned()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("HITL did not resolve its original owner")
+                                })?;
+                            assert_eq!(scope.turn_id.as_deref(), Some(expected_turn));
+                            assert_eq!(scope.root_turn_id.as_deref(), Some("root-turn"));
+                            assert_eq!(scope.host_generation.as_deref(), Some("original-host"));
+                            assert_eq!(scope.run_id.as_deref(), Some("original-run"));
+                            assert!(matches!(
+                                provider.try_resolve_message("/cancel"),
+                                ChannelHumanLoopResolution::Rejected(_)
+                            ));
+                            let target = prompt
+                                .split("Use /reply ")
+                                .nth(1)
+                                .and_then(|suffix| suffix.split_whitespace().next())
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("target-qualified prompt missing")
+                                })?;
+                            assert!(matches!(
+                                provider.try_resolve_message(&format!("/reply {target} 中文\n🙂")),
+                                ChannelHumanLoopResolution::Resolved(_)
+                            ));
+                            Ok::<(), anyhow::Error>(())
+                        };
+                        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                            tokio::try_join!(drain, answer).map(|_| ())
+                        })
+                        .await??;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await?;
+            lease.settle(TurnOutcome::Completed);
+            // Same real tool/provider after settlement must fail its original
+            // owner lookup, without a new request carrying empty coordinates.
+            let mut stream = agent.chat_stream("ask after owner ended").await?;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while let Some(event) = stream.next().await {
+                    event?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await??;
+            assert!(missing.load(Ordering::SeqCst) > 0);
+            assert!(matches!(
+                prompts.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+            drop(control);
+        }
+        Ok(())
     }
 
     #[tokio::test]

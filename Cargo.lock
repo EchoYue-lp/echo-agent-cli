@@ -1601,6 +1601,7 @@ name = "echo-agent-app-core"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "base64 0.22.1",
@@ -1623,6 +1624,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "shell-words",
  "similar",
  "tempfile",
  "thiserror 2.0.20",
@@ -1641,7 +1643,6 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "arboard",
- "async-stream",
  "async-trait",
  "base64 0.22.1",
  "chrono",
@@ -1798,6 +1799,7 @@ dependencies = [
  "echo_core",
  "futures",
  "hmac",
+ "matchit",
  "prost",
  "rand 0.9.5",
  "reqwest 0.12.28",

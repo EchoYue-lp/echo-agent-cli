@@ -1,4 +1,6 @@
 import { create } from 'zustand';
+import { isHitlRequestIdentity, sameHitlIdentity } from '../types/api';
+import type { HitlRequestIdentity } from '../types/api';
 import type { ChatMessage, ApprovalRequest, ExecutionRound, ChatRunStatus } from '../types/api';
 import { useConversationStore } from './conversationStore';
 
@@ -28,7 +30,7 @@ export interface ContextUsageAccumulator {
   totalCached: number;
 }
 
-export type PendingHitlRequest =
+export type PendingHitlRequest = { identity: HitlRequestIdentity } & (
   | ({ kind: 'approval' } & ApprovalRequest)
   | { kind: 'input'; requestId: string; prompt?: string }
   | {
@@ -39,7 +41,8 @@ export type PendingHitlRequest =
       taskId?: string;
       context?: unknown;
       phase?: string;
-    };
+    }
+);
 
 function waitingStatus(request: PendingHitlRequest): ChatRunStatus {
   return request.kind === 'approval' ? 'waiting_approval' : 'waiting_input';
@@ -91,7 +94,7 @@ interface ChatState {
   setRunStatus: (status: ChatRunStatus) => void;
   clearInactiveTurnProjection: () => void;
   enqueueHitlRequest: (request: PendingHitlRequest) => void;
-  removeHitlRequest: (requestId: string) => void;
+  removeHitlRequest: (identity: HitlRequestIdentity) => void;
   clearHitlRequests: () => void;
   addChartMessage: (spec: unknown) => void;
   clearMessages: () => void;
@@ -446,7 +449,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   enqueueHitlRequest: (request) =>
     set((state) => {
-      if (state.pendingHitlRequests.some((pending) => pending.requestId === request.requestId)) {
+      if (
+        !isHitlRequestIdentity(request.identity) ||
+        request.identity.request_id !== request.requestId ||
+        request.identity.kind !== request.kind
+      )
+        return state;
+      if (
+        state.pendingHitlRequests.some((pending) =>
+          sameHitlIdentity(pending.identity, request.identity)
+        )
+      ) {
         return state;
       }
       const pendingHitlRequests = [...state.pendingHitlRequests, request];
@@ -456,10 +469,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         runStatus: front ? waitingStatus(front) : state.runStatus,
       };
     }),
-  removeHitlRequest: (requestId) =>
+  removeHitlRequest: (identity) =>
     set((state) => {
+      if (!isHitlRequestIdentity(identity)) return state;
       const pendingHitlRequests = state.pendingHitlRequests.filter(
-        (request) => request.requestId !== requestId
+        (request) => !sameHitlIdentity(request.identity, identity)
       );
       if (pendingHitlRequests.length === state.pendingHitlRequests.length) {
         return state;

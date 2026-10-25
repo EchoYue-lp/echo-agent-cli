@@ -19,6 +19,7 @@ export type SettingsTabId =
   | 'evolution'
   | 'plugins'
   | 'hooks'
+  | 'channels'
   | 'scheduler'
   | 'worktree';
 

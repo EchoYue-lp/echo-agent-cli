@@ -120,6 +120,18 @@ async fn drive_owned_agent_turn(
     let prompt = prompt.to_string();
     let core_trace_sink = exec_trace_sink_to_core(trace_sink.clone());
     let trace_sink_for_scope = trace_sink.clone();
+    let policy_run_id = run_id.clone();
+    let binding = blocking
+        .run("read bound primary run delegation policy", move |store| {
+            Ok(store
+                .get_run_state(&policy_run_id)?
+                .ok_or(StoreError::RunNotFound(policy_run_id))?
+                .execution_profile
+                .subagent_depth_limit)
+        })
+        .await
+        .map_err(|error| ExecError::Other(error.to_string()))?;
+    let delegation_policy = crate::subagent_policy::primary_policy_for_binding(binding);
     let working_dir = workspace_io
         .as_ref()
         .map(|scope| scope.data_root().to_path_buf());
@@ -152,6 +164,7 @@ async fn drive_owned_agent_turn(
                 .filter(|runtime_state_id| Some(*runtime_state_id) != Some(&conversation_id))
                 .cloned();
             let invocation = echo_agent::agent::AgentInvocationContext {
+                allowed_tools: None,
                 history: None,
                 runtime_state_id,
                 transcript_generation_id,
@@ -165,7 +178,7 @@ async fn drive_owned_agent_turn(
                     message_id,
                     cancel: Some(Arc::new(cancel.clone())),
                     trace_sink: core_trace_sink,
-                    delegation_policy: None,
+                    delegation_policy: Some(delegation_policy),
                     resource_guards: Vec::new(),
                     subagent_lineage: None,
                     uplink: None,

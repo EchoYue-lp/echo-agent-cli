@@ -29,6 +29,9 @@ import { Modal } from '../common/Modal';
 import { ErrorBoundary } from '../common/ErrorBoundary';
 
 // Keep panel identities at module scope; closed settings should not eagerly load every screen.
+const ChannelsPanel = lazy(() =>
+  import('../channels/ChannelsPanel').then((module) => ({ default: module.ChannelsPanel }))
+);
 const ConfigPanel = lazy(() =>
   import('../config/ConfigPanel').then((module) => ({ default: module.ConfigPanel }))
 );
@@ -232,6 +235,13 @@ const settingsGroups: SettingsGroup[] = [
         description: '并行开发工作区',
       },
       {
+        id: 'channels',
+        label: 'IM 渠道',
+        icon: Globe,
+        maturity: 'advanced',
+        description: '已有 QQ Bot 与飞书连接',
+      },
+      {
         id: 'scheduler',
         label: '定时任务',
         icon: Timer,
@@ -268,6 +278,7 @@ const panels: Record<SettingsTabId, React.FC> = {
   plugins: PluginPanel,
   hooks: HooksPanel,
   scheduler: SchedulerPanel,
+  channels: ChannelsPanel,
   worktree: WorktreePanel,
 };
 

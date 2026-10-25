@@ -65,7 +65,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     let args = cli::Args::parse();
 
     // 加载 YAML 配置文件
-    let mut app_config = config::load_config(args.config.as_deref());
+    let mut app_config = config::load_config(args.config.as_deref()).map_err(anyhow::Error::msg)?;
     let configured_mcp_path = app_config.mcp.config_path.clone();
     // Resolve MCP before the generic environment overlay copies
     // MCP_CONFIG_PATH into EkoConfig. This preserves CLI > YAML > env.
@@ -374,14 +374,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             );
             let channels_cancel = echo_agent::agent::CancellationToken::new();
             let channels_handle = tokio::spawn(cli::run_channels_mode(cli::ChannelsModeArgs {
-                app_state: application_services.app_state.clone(),
-                app_config: app_config.clone(),
-                webhook_emitter: webhook_emitter.clone(),
-                foreground_turns: application_services
-                    .app_state
-                    .session
-                    .foreground_turns
-                    .clone(),
+                runtime: application_services.channel_runtime.clone(),
                 shutdown: channels_cancel.clone(),
             }));
             let channel_observer =

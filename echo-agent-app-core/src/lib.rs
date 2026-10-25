@@ -59,6 +59,7 @@ pub(crate) mod state;
 pub(crate) mod structured_extraction;
 pub(crate) mod subagent_event_projection;
 pub(crate) mod subagent_loader;
+pub(crate) mod subagent_policy;
 pub(crate) mod subagent_prompt;
 pub(crate) mod tasks;
 pub(crate) mod terminal;
@@ -83,3 +84,7 @@ pub(crate) mod runtime;
 /// compatibility views over the single app-core implementations; they do not
 /// own state, persistence, scheduling, or publication logic.
 pub mod api;
+
+#[cfg(feature = "channels")]
+pub(crate) mod channel_runtime;
+pub(crate) mod text_commands;

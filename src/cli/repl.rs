@@ -802,6 +802,7 @@ impl echo_agent_app_core::api::chat_driver::ChatSink for ReplChatSink {
                     conversation_input_fact_phase(fact.as_ref())
                 ))
             }
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::HitlRequestReleased { .. } => true,
             echo_agent_app_core::api::chat_driver::ChatDriverEvent::ApprovalRequest {
                 request_id,
                 tool_name,
@@ -810,10 +811,7 @@ impl echo_agent_app_core::api::chat_driver::ChatSink for ReplChatSink {
             } => self.output.emit(format!(
                 "Approval requested [{request_id}] for {tool_name}: {prompt}"
             )),
-            echo_agent_app_core::api::chat_driver::ChatDriverEvent::InputRequest {
-                request_id,
-                prompt,
-            } => self
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::InputRequest { request_id, prompt, .. } => self
                 .output
                 .emit(format!("Input requested [{request_id}]: {prompt}")),
             echo_agent_app_core::api::chat_driver::ChatDriverEvent::SelectionRequest {

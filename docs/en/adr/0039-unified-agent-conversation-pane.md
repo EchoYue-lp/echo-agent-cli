@@ -1,5 +1,7 @@
 # ADR 0039: Unified Agent Conversation Pane and Contextual Workspaces
 
+> Delegation policy update: ADR [0052](0052-gui-subagent-depth-policy.md) supersedes only the unconditional nesting/default-three and fixed-single-layer clauses below. Communication, lifecycle and GUI decisions remain in force.
+
 - Status: Accepted
 - Date: 2026-09-04
 - Owners: `echo-agent::subagent`, `web-frontend`, `src/tauri`

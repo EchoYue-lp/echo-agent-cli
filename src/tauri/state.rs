@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 /// Shared state accessible from all Tauri IPC commands.
 pub struct TauriState {
     pub app_state: Arc<AppState>,
+    pub channel_runtime: Arc<echo_agent_app_core::api::channel_runtime::ChannelRuntime>,
     pub browser_runtime: Arc<BrowserRuntime>,
     pub subagent_projection:
         Arc<echo_agent_app_core::api::subagent_event_projection::SubagentEnvelopeProjectionService>,
@@ -17,6 +18,7 @@ pub struct TauriState {
 impl TauriState {
     pub fn new(
         app_state: Arc<AppState>,
+        channel_runtime: Arc<echo_agent_app_core::api::channel_runtime::ChannelRuntime>,
         browser_runtime: Arc<BrowserRuntime>,
         subagent_projection: Arc<
             echo_agent_app_core::api::subagent_event_projection::SubagentEnvelopeProjectionService,
@@ -25,6 +27,7 @@ impl TauriState {
     ) -> Self {
         Self {
             app_state,
+            channel_runtime,
             browser_runtime,
             subagent_projection,
             bridge_supervisor,

@@ -1140,6 +1140,12 @@ impl AgentPool {
         *self.app_config.write().await = app_config;
     }
 
+    pub(crate) async fn configured_subagent_depth(
+        &self,
+    ) -> crate::subagent_policy::SubagentDepthLimit {
+        self.app_config.read().await.max_subagent_depth
+    }
+
     /// Project one durable Side Conversation model selector into this pool.
     ///
     /// Changing the selector retires the cached child Agent before publishing

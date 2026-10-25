@@ -385,7 +385,7 @@ async fn main() -> Result<()> {
     );
 
     let config_path = args.config.to_string_lossy().to_string();
-    let mut app_config = config::load_config(Some(&config_path));
+    let mut app_config = config::load_config(Some(&config_path)).map_err(anyhow::Error::msg)?;
     config::apply_env_overrides(&mut app_config);
     let runtime_model =
         echo_agent_app_core::api::model_config::resolve_runtime_model(&app_config, None)

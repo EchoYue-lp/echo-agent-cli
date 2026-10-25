@@ -328,3 +328,12 @@ effects stopped. See [ADR 0051](../adr/0051-ssh-terminal-sessions.md).
 Qualification boundary: this change is source and Node evidence only. Rust tests,
 new Tauri binaries, native window/theme acceptance and authenticated remote
 interaction are not yet qualified; no platform or release support is claimed.
+
+
+## Bound Subagent policy
+
+EKO configuration supplies new-run defaults only. The original RunCreated execution profile owns a run’s captured depth limit; journal replay, checkpoint and resume identity preserve it. Primary is depth 0 and a real child is depth 1. The original TaskRuntime and framework dispatch own execution; no second task graph or policy store exists. See [ADR 0052](../adr/0052-gui-subagent-depth-policy.md). Source qualification does not replace native or exact-main validation.
+
+### GUI IM/cron control and true desktop quit
+
+The existing IM owner lives in app-core `channel_runtime`; bin entry points are thin forwards. ApplicationServices and Tauri share the same Arc. ConfigState publishes its UUID revision only after owned persistence; transport epoch and applied revision retain their distinct meanings. The lifecycle's original channel slot retains manager/coordinator/pump handles until real physical settlement, and blocks dependent close on unknown ownership. Desktop X hides; explicit Quit awaits the original receipt's final publication while keeping Tokio alive. Bounded observations elsewhere are unchanged. Completed failures can be final errors; unknown observations cannot grant finality. Cron views consume original edit/manual/history receipts and exact existing run facts. See [ADR0053](../adr/0053-im-cron-gui-control.md) for data flow, recovery boundaries, implementation references and unverified native/Rust acceptance.

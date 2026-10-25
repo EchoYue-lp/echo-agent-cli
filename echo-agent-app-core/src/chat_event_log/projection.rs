@@ -99,7 +99,9 @@ impl RetentionPins {
     fn apply(&mut self, sequence: u64, event: &PersistedChatEvent) {
         self.cursor = sequence;
         if let Some(fact_key) = command_cell_watch_fact_key(&event.payload) {
-            self.command_cell_watch_facts.entry(fact_key).or_insert(sequence);
+            self.command_cell_watch_facts
+                .entry(fact_key)
+                .or_insert(sequence);
         }
         match &event.payload {
             ChatDriverEvent::CommandCellStarted { cell } => {
@@ -183,7 +185,11 @@ impl RetentionPins {
         self.earliest = self
             .pending_command_cell_watches
             .values()
-            .chain(self.started_command_cell_watches.values().map(|(sequence, _)| sequence))
+            .chain(
+                self.started_command_cell_watches
+                    .values()
+                    .map(|(sequence, _)| sequence),
+            )
             .chain(self.active_cells.values())
             .chain(conversation_input_earliest.iter())
             .copied()
@@ -785,6 +791,7 @@ fn append_durability(event: &ChatDriverEvent) -> FileDurability {
         | ChatDriverEvent::ApprovalRequest { .. }
         | ChatDriverEvent::InputRequest { .. }
         | ChatDriverEvent::SelectionRequest { .. }
+        | ChatDriverEvent::HitlRequestReleased { .. }
         | ChatDriverEvent::ContextCompressed { .. } => FileDurability::SyncData,
         ChatDriverEvent::TurnStatus { .. } => FileDurability::Flush,
     }
@@ -846,6 +853,26 @@ fn stream_id(
 
 fn event_identity(event: &ChatDriverEvent, root_turn_id: &str) -> (String, String) {
     match event {
+        ChatDriverEvent::ApprovalRequest {
+            identity: Some(identity),
+            ..
+        }
+        | ChatDriverEvent::InputRequest {
+            identity: Some(identity),
+            ..
+        }
+        | ChatDriverEvent::SelectionRequest {
+            identity: Some(identity),
+            ..
+        }
+        | ChatDriverEvent::HitlRequestReleased { identity } => (
+            identity
+                .scope
+                .turn_id
+                .clone()
+                .unwrap_or_else(|| root_turn_id.to_string()),
+            root_turn_id.to_string(),
+        ),
         ChatDriverEvent::Agent(envelope) => (
             envelope.turn_id.as_str().to_string(),
             envelope
@@ -894,15 +921,18 @@ fn command_cell_watch_fact_key(event: &ChatDriverEvent) -> Option<String> {
         ChatDriverEvent::CommandCellSettled { cell } => {
             Some(format!("cell_settled:{}", cell.cell_id))
         }
-        ChatDriverEvent::CommandCellWatchReady { result } => {
-            Some(format!("ready:{}", command_cell_watch_receipt_key(&result.receipt)))
-        }
-        ChatDriverEvent::CommandCellWatchDeliveryStarted { acknowledgement } => {
-            Some(format!("started:{}", command_cell_watch_ack_key(acknowledgement)))
-        }
-        ChatDriverEvent::CommandCellWatchAcknowledged { acknowledgement } => {
-            Some(format!("ack:{}", command_cell_watch_ack_key(acknowledgement)))
-        }
+        ChatDriverEvent::CommandCellWatchReady { result } => Some(format!(
+            "ready:{}",
+            command_cell_watch_receipt_key(&result.receipt)
+        )),
+        ChatDriverEvent::CommandCellWatchDeliveryStarted { acknowledgement } => Some(format!(
+            "started:{}",
+            command_cell_watch_ack_key(acknowledgement)
+        )),
+        ChatDriverEvent::CommandCellWatchAcknowledged { acknowledgement } => Some(format!(
+            "ack:{}",
+            command_cell_watch_ack_key(acknowledgement)
+        )),
         _ => None,
     }
 }
@@ -914,6 +944,52 @@ fn validate_event_stream_identity(
     event: &ChatDriverEvent,
 ) -> Result<(), ChatEventLogError> {
     match event {
+        ChatDriverEvent::ApprovalRequest {
+            identity: Some(identity),
+            ..
+        }
+        | ChatDriverEvent::InputRequest {
+            identity: Some(identity),
+            ..
+        }
+        | ChatDriverEvent::SelectionRequest {
+            identity: Some(identity),
+            ..
+        }
+        | ChatDriverEvent::HitlRequestReleased { identity } => {
+            let request_matches = match event {
+                ChatDriverEvent::ApprovalRequest { request_id, .. } => {
+                    request_id == &identity.request_id
+                        && identity.kind == crate::hitl::HitlRequestKind::Approval
+                }
+                ChatDriverEvent::InputRequest { request_id, .. } => {
+                    request_id == &identity.request_id
+                        && identity.kind == crate::hitl::HitlRequestKind::Input
+                }
+                ChatDriverEvent::SelectionRequest { request_id, .. } => {
+                    request_id == &identity.request_id
+                        && identity.kind == crate::hitl::HitlRequestKind::Selection
+                }
+                ChatDriverEvent::HitlRequestReleased { .. } => true,
+                _ => false,
+            };
+            if !request_matches
+                || identity.request_id.trim().is_empty()
+                || identity.scope.workspace_id.as_deref() != Some(workspace_id)
+                || identity.scope.conversation_id.as_deref() != conversation_id
+                || identity.scope.root_turn_id.as_deref() != Some(root_turn_id)
+                || identity
+                    .scope
+                    .turn_id
+                    .as_deref()
+                    .is_none_or(|turn| turn.trim().is_empty())
+                || identity.response_target.trim().is_empty()
+            {
+                return Err(ChatEventLogError::InvalidIdentity(
+                    "HITL identity does not match the original journal owner".to_string(),
+                ));
+            }
+        }
         ChatDriverEvent::Agent(envelope) => {
             let event_conversation_id = envelope
                 .conversation_id
@@ -934,9 +1010,11 @@ fn validate_event_stream_identity(
                 ));
             }
             if let Some(metadata) = execution.framework_event.as_ref()
-                && (metadata.message_id.as_deref().is_some_and(|id| id != root_turn_id)
-                    || execution.subagent_run_id.as_deref()
-                        != Some(metadata.execution_id.as_str())
+                && (metadata
+                    .message_id
+                    .as_deref()
+                    .is_some_and(|id| id != root_turn_id)
+                    || execution.subagent_run_id.as_deref() != Some(metadata.execution_id.as_str())
                     || execution.task_id.as_deref() != metadata.task_id.as_deref()
                     || execution.agent.as_deref() != Some(metadata.agent_name.as_str()))
             {

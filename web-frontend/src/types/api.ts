@@ -190,6 +190,67 @@ export interface ToolExecutionDetailPage {
  * ChatEventLike + 调用方 `as any` 强转, 失去编译期类型安全。提取为公共类型,
  * 让 handleChatEvent 直接接收 ChatEvent, 每种 type 的 payload 字段精确可查。
  */
+// EKO-local reply identity. Rust-generated IPC qualification remains a
+// separate export gate; these are the existing handwritten event adapters.
+export interface HitlRequestScope {
+  workspace_id?: string | null;
+  host_generation?: string | null;
+  conversation_id?: string | null;
+  root_turn_id?: string | null;
+  turn_id?: string | null;
+  run_id?: string | null;
+  task_id?: string | null;
+  channel_id?: string | null;
+  channel_conversation_id?: string | null;
+  sender_id?: string | null;
+  sender_incarnation?: string | null;
+}
+export interface HitlRequestIdentity {
+  request_id: string;
+  response_target: string;
+  kind: 'approval' | 'input' | 'selection';
+  scope: HitlRequestScope;
+}
+export function isHitlRequestIdentity(value: unknown): value is HitlRequestIdentity {
+  if (typeof value !== 'object' || value === null) return false;
+  const identity = value as Record<string, unknown>;
+  if (
+    typeof identity.request_id !== 'string' ||
+    !identity.request_id.trim() ||
+    typeof identity.response_target !== 'string' ||
+    !identity.response_target.trim() ||
+    !['approval', 'input', 'selection'].includes(String(identity.kind)) ||
+    typeof identity.scope !== 'object' ||
+    identity.scope === null
+  )
+    return false;
+  const scope = identity.scope as Record<string, unknown>;
+  return ['workspace_id', 'host_generation', 'conversation_id', 'root_turn_id', 'turn_id'].every(
+    (field) => typeof scope[field] === 'string' && String(scope[field]).trim().length > 0
+  );
+}
+export function sameHitlIdentity(a: HitlRequestIdentity, b: HitlRequestIdentity): boolean {
+  const fields: (keyof HitlRequestScope)[] = [
+    'workspace_id',
+    'host_generation',
+    'conversation_id',
+    'root_turn_id',
+    'turn_id',
+    'run_id',
+    'task_id',
+    'channel_id',
+    'channel_conversation_id',
+    'sender_id',
+    'sender_incarnation',
+  ];
+  return (
+    a.request_id === b.request_id &&
+    a.response_target === b.response_target &&
+    a.kind === b.kind &&
+    fields.every((field) => (a.scope[field] ?? null) === (b.scope[field] ?? null))
+  );
+}
+
 export type ChatEvent = {
   message_key?: string;
   conversation_id?: string | null;
@@ -223,14 +284,16 @@ export type ChatEvent = {
   | { type: 'execution_path'; observed_path: string }
   | {
       type: 'approval_request';
+      identity?: HitlRequestIdentity;
       request_id: string;
       tool_name: string;
       args: unknown;
       prompt: string;
     }
-  | { type: 'input_request'; request_id: string; prompt: string }
+  | { type: 'input_request'; identity?: HitlRequestIdentity; request_id: string; prompt: string }
   | {
       type: 'selection_request';
+      identity?: HitlRequestIdentity;
       request_id: string;
       prompt: string;
       options: string[];
@@ -238,6 +301,7 @@ export type ChatEvent = {
       context?: unknown;
       phase?: string | null;
     }
+  | { type: 'hitl_request_released'; identity: HitlRequestIdentity }
   | { type: 'tool_batch_start'; tool_count: number }
   | { type: 'tool_batch_end' }
   | { type: 'interrupt_prompt'; run_id: string; goal: string; new_message: string }
@@ -341,19 +405,33 @@ export type ChatDriverEvent =
   | { source: 'input_lifecycle'; event: ConversationInputFact }
   | {
       source: 'approval_request';
-      event: { request_id: string; tool_name: string; args: unknown; prompt: string };
+      event: {
+        request_id: string;
+        identity?: HitlRequestIdentity;
+        tool_name: string;
+        args: unknown;
+        prompt: string;
+      };
     }
-  | { source: 'input_request'; event: { request_id: string; prompt: string } }
+  | {
+      source: 'input_request';
+      event: { request_id: string; identity?: HitlRequestIdentity; prompt: string };
+    }
   | {
       source: 'selection_request';
       event: {
         request_id: string;
+        identity?: HitlRequestIdentity;
         prompt: string;
         options: string[];
         task_id: string | null;
         context: unknown;
         phase: string | null;
       };
+    }
+  | {
+      source: 'hitl_request_released';
+      event: { identity: HitlRequestIdentity };
     }
   | {
       source: 'context_compressed';
@@ -732,6 +810,7 @@ export interface SandboxExecuteResult {
 // partial-edit 草稿类型（可选字段准确对应后端 Option 字段的缺省语义）。
 
 export interface FullConfigUpdateRequest {
+  max_subagent_depth?: 1 | 2 | 3;
   model?: {
     max_tokens?: number;
     temperature?: number;

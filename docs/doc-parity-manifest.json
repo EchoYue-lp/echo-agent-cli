@@ -497,6 +497,22 @@
       "sourceLanguage": "zh-mixed",
       "translationStatus": "reviewed",
       "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0053-im-cron-gui-control.md",
+      "targetPath": "adr/0053-im-cron-gui-control.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0052-gui-subagent-depth-policy.md",
+      "targetPath": "adr/0052-gui-subagent-depth-policy.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
     }
   ]
 }

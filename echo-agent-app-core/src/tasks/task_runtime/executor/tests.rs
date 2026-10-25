@@ -14,6 +14,8 @@ mod tests {
         name: String,
         permission: echo_agent::prelude::ToolPermission,
         calls: Arc<AtomicUsize>,
+        policies:
+            Option<Arc<std::sync::Mutex<Vec<Option<echo_agent::tasks::NestedDelegationPolicy>>>>>,
     }
 
     impl PermissionCountingTool {
@@ -26,7 +28,16 @@ mod tests {
                 name: name.to_string(),
                 permission,
                 calls,
+                policies: None,
             }
+        }
+
+        fn with_policy_observer(
+            mut self,
+            policies: Arc<std::sync::Mutex<Vec<Option<echo_agent::tasks::NestedDelegationPolicy>>>>,
+        ) -> Self {
+            self.policies = Some(policies);
+            self
         }
     }
 
@@ -62,6 +73,22 @@ mod tests {
 
         fn permissions(&self) -> Vec<echo_agent::prelude::ToolPermission> {
             vec![self.permission]
+        }
+
+        fn execute_with_context<'a>(
+            &'a self,
+            parameters: echo_agent::tools::ToolParameters,
+            context: &'a echo_agent::tools::ToolContext,
+        ) -> BoxFuture<'a, echo_agent::error::Result<echo_agent::tools::ToolResult>> {
+            Box::pin(async move {
+                if let Some(policies) = self.policies.as_ref() {
+                    policies
+                        .lock()
+                        .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?
+                        .push(context.delegation_policy);
+                }
+                self.execute(parameters).await
+            })
         }
     }
 
@@ -3383,6 +3410,101 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
+    async fn primary_verification_keeps_original_depth_and_hard_tool_bound() -> Result<(), String> {
+        use crate::subagent_policy::{SubagentDepthDefaults, SubagentDepthLimit};
+        use echo_agent::testing::MockLlmClient;
+        for original in [1, 3] {
+            for allow_probe in [false, true] {
+                let defaults = Arc::new(SubagentDepthDefaults::new(SubagentDepthLimit::new(
+                    original,
+                )?));
+                let store = Arc::new(
+                    TaskRuntimeStore::new_in_memory()
+                        .map_err(|error| error.to_string())?
+                        .with_subagent_depth_defaults(defaults.clone()),
+                );
+                let task = PlanTask {
+                    id: "verify-policy".to_string(),
+                    title: "Verify bounded invocation".to_string(),
+                    description: "Run the permitted probe".to_string(),
+                    kind: PlanTaskKind::Verification,
+                    agent_role: "primary".to_string(),
+                    allowed_tools: vec![
+                        if allow_probe { "run_code" } else { "read_file" }.to_string(),
+                    ],
+                    ..Default::default()
+                };
+                let run_id = seed_run(&store, vec![task.clone()])?;
+                defaults.publish(SubagentDepthLimit::new(if original == 1 { 3 } else { 1 })?);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let policies = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let llm = Arc::new(
+                    MockLlmClient::new()
+                        .then_tool_call("probe", "run_code", r#"{"path":"Cargo.toml"}"#)
+                        .with_response("Probe finished."),
+                );
+                let agent = echo_agent::agent::ReactAgentBuilder::new()
+                    .llm_client(llm.clone())
+                    .tool(Box::new(
+                        PermissionCountingTool::new(
+                            "run_code",
+                            echo_agent::prelude::ToolPermission::Read,
+                            calls.clone(),
+                        )
+                        .with_policy_observer(policies.clone()),
+                    ))
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                let execution_id = format!("{run_id}:verify-policy:1:1");
+                store
+                    .record_subagent_assigned(
+                        &run_id,
+                        &task.id,
+                        &execution_id,
+                        &task.agent_role,
+                        &task.title,
+                        1,
+                        1,
+                        false,
+                        false,
+                    )
+                    .map_err(|error| error.to_string())?;
+                let outcome = run_main_agent_task(
+                    &crate::agent_handle::AgentHandle::new(agent),
+                    TaskRuntimeOperation::new(store),
+                    &run_id,
+                    &task,
+                    &execution_id,
+                    "Run the probe only when allowed",
+                    CancellationToken::new(),
+                    None,
+                    None,
+                )
+                .await;
+                assert!(llm.call_count() > 0, "must reach the real Agent/LLM path");
+                if allow_probe {
+                    outcome.map_err(|error| error.to_string())?;
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    let observed = policies.lock().map_err(|error| error.to_string())?;
+                    let policy = observed
+                        .first()
+                        .and_then(|policy| *policy)
+                        .ok_or_else(|| "primary ToolContext lost its bound policy".to_string())?;
+                    assert_eq!(policy.delegate_depth, 0);
+                    assert_eq!(policy.max_delegate_depth, original);
+                } else {
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        0,
+                        "a hallucinated registered tool must not bypass nonempty W"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn main_agent_task_streams_tool_events_to_subagent_trace() -> Result<(), String> {
         use crate::agent_handle::AgentHandle;
         use echo_agent::agent::ReactAgentBuilder;
@@ -4182,37 +4304,45 @@ Read the runtime path and found one missing branch.
                 );
                 let persisted = store.load_runtime_plan_snapshot(&run_id)?;
                 assert_eq!(
-                    persisted.tasks.first().and_then(|task| task.execution.interruption_requested.as_ref()),
+                    persisted
+                        .tasks
+                        .first()
+                        .and_then(|task| task.execution.interruption_requested.as_ref()),
                     Some(&disposition),
                     "the exact-claim stop must be durable before abandonment"
                 );
             }
 
             let failure = "original abandonment failure";
-            let (expected_status, expected_summary, expected_label, expected_detail, expected_event) =
-                match interruption {
-                    "pause" => (
-                        TaskStatus::Paused("durable pause wins".to_string()),
-                        "durable pause wins",
-                        "paused",
-                        Some("durable pause wins"),
-                        RuntimeEventKind::TaskBlocked,
-                    ),
-                    "cancel" => (
-                        TaskStatus::Cancelled,
-                        "dispatch cancelled before resolution",
-                        "cancelled",
-                        None,
-                        RuntimeEventKind::TaskCancelled,
-                    ),
-                    _ => (
-                        TaskStatus::Failed(failure.to_string()),
-                        failure,
-                        "failed",
-                        Some(failure),
-                        RuntimeEventKind::TaskFailed,
-                    ),
-                };
+            let (
+                expected_status,
+                expected_summary,
+                expected_label,
+                expected_detail,
+                expected_event,
+            ) = match interruption {
+                "pause" => (
+                    TaskStatus::Paused("durable pause wins".to_string()),
+                    "durable pause wins",
+                    "paused",
+                    Some("durable pause wins"),
+                    RuntimeEventKind::TaskBlocked,
+                ),
+                "cancel" => (
+                    TaskStatus::Cancelled,
+                    "dispatch cancelled before resolution",
+                    "cancelled",
+                    None,
+                    RuntimeEventKind::TaskCancelled,
+                ),
+                _ => (
+                    TaskStatus::Failed(failure.to_string()),
+                    failure,
+                    "failed",
+                    Some(failure),
+                    RuntimeEventKind::TaskFailed,
+                ),
+            };
             let outcome = controller
                 .abandon_claim(
                     &run_id,
@@ -4230,7 +4360,9 @@ Read the runtime path and found one missing branch.
                 }
             );
             assert_eq!(
-                store.runtime_task_execution(&run_id, "abandoned")?.map(|execution| execution.status),
+                store
+                    .runtime_task_execution(&run_id, "abandoned")?
+                    .map(|execution| execution.status),
                 Some(expected_status)
             );
             let journal = store.list_events(&run_id, 0)?;
@@ -4239,26 +4371,44 @@ Read the runtime path and found one missing branch.
                 .rev()
                 .find(|event| {
                     event.task_id.as_deref() == Some("abandoned")
-                        && event.payload.get("status").and_then(serde_json::Value::as_str)
+                        && event
+                            .payload
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
                             == Some(expected_label)
                 })
                 .ok_or("committed task event missing")?;
             assert_eq!(
-                terminal.payload.get("summary").and_then(serde_json::Value::as_str),
+                terminal
+                    .payload
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str),
                 Some(expected_summary),
                 "{interruption}: the task journal must describe the committed winner"
             );
             assert_eq!(
-                terminal.payload.get("status_detail").and_then(serde_json::Value::as_str),
+                terminal
+                    .payload
+                    .get("status_detail")
+                    .and_then(serde_json::Value::as_str),
                 expected_detail
             );
             if interruption != "none" {
-                assert!(journal.iter().any(|event| {
-                    event.payload.get("kind").and_then(serde_json::Value::as_str)
-                        == Some("abandoned_attempt_diagnostic")
-                        && event.payload.get("message").and_then(serde_json::Value::as_str)
-                            == Some(failure)
-                }), "{interruption}: retain the failure separately from the final summary");
+                assert!(
+                    journal.iter().any(|event| {
+                        event
+                            .payload
+                            .get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("abandoned_attempt_diagnostic")
+                            && event
+                                .payload
+                                .get("message")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(failure)
+                    }),
+                    "{interruption}: retain the failure separately from the final summary"
+                );
             }
             {
                 let observed = events.lock().map_err(|_| "event mutex poisoned")?;
@@ -4266,19 +4416,30 @@ Read the runtime path and found one missing branch.
                 let event = observed.first().ok_or("terminal live event missing")?;
                 assert_eq!(event.event, expected_event);
                 assert_eq!(
-                    event.payload.get("summary").and_then(serde_json::Value::as_str),
+                    event
+                        .payload
+                        .get("summary")
+                        .and_then(serde_json::Value::as_str),
                     Some(expected_summary)
                 );
                 assert_eq!(
-                    event.payload.get("terminal_status").and_then(serde_json::Value::as_str),
+                    event
+                        .payload
+                        .get("terminal_status")
+                        .and_then(serde_json::Value::as_str),
                     Some(expected_label)
                 );
                 assert_eq!(
-                    event.payload.get("status_detail").and_then(serde_json::Value::as_str),
+                    event
+                        .payload
+                        .get("status_detail")
+                        .and_then(serde_json::Value::as_str),
                     expected_detail
                 );
             }
-            let sequence = store.get_run_state(&run_id)?.map(|state| state.journal_sequence);
+            let sequence = store
+                .get_run_state(&run_id)?
+                .map(|state| state.journal_sequence);
             assert_eq!(
                 controller
                     .abandon_claim(
@@ -4294,7 +4455,9 @@ Read the runtime path and found one missing branch.
             );
             assert_eq!(events.lock().map_err(|_| "event mutex poisoned")?.len(), 1);
             assert_eq!(
-                store.get_run_state(&run_id)?.map(|state| state.journal_sequence),
+                store
+                    .get_run_state(&run_id)?
+                    .map(|state| state.journal_sequence),
                 sequence,
                 "{interruption}: superseded abandonment must append no journal facts"
             );

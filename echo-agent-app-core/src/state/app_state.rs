@@ -94,6 +94,9 @@ impl AppState {
         mcp_config_runtime: Arc<crate::mcp_config_runtime::McpConfigRuntime>,
         product_data_io: crate::product_data_io::ProductDataIoService,
     ) -> anyhow::Result<Self> {
+        let subagent_depth_defaults = Arc::new(crate::subagent_policy::SubagentDepthDefaults::new(
+            app_config.max_subagent_depth,
+        ));
         let config = agent
             .try_write(|guard| WebConfig {
                 model: guard.model_name().to_string(),
@@ -146,7 +149,9 @@ impl AppState {
                 conversation_binding: conversation_binding.clone(),
             },
             config: ConfigState {
+                subagent_depth_defaults: subagent_depth_defaults.clone(),
                 app_config: RwLock::new(app_config),
+                app_config_revision: std::sync::Mutex::new(uuid::Uuid::new_v4().to_string()),
                 active_model_id: RwLock::new(active_model_id),
                 config_path: crate::config_watcher::resolve_config_save_path(None),
                 web_config: RwLock::new(config),
@@ -220,7 +225,8 @@ impl AppState {
                 service: None,
                 cancel_token: CancellationToken::new(),
                 runtime: Some(Arc::new(
-                    crate::tasks::task_runtime::TaskRuntimeStore::new()?,
+                    crate::tasks::task_runtime::TaskRuntimeStore::new()?
+                        .with_subagent_depth_defaults(subagent_depth_defaults.clone()),
                 )),
             },
             webhook: WebhookState {
@@ -234,7 +240,8 @@ impl AppState {
                 runtimes: Arc::new(
                     crate::workspace::runtime::WorkspaceRuntimeRegistry::new_with_product_data_io(
                         product_data_io,
-                    ),
+                    )
+                    .with_subagent_depth_defaults(subagent_depth_defaults),
                 ),
                 global_conversation,
                 transition: Arc::new(RwLock::new(())),
@@ -368,6 +375,30 @@ impl AppState {
         })
         .await
         .map(|receipt| receipt.config)
+    }
+
+    /// Compare channel edits inside the existing config mutation owner, after
+    /// earlier accepted publications; a preflight read alone would race.
+    #[cfg(feature = "channels")]
+    pub async fn update_channels_config_owned<Update>(
+        self: &Arc<Self>,
+        expected_revision: String,
+        update: Update,
+    ) -> Result<ModelMutationReceipt, ModelMutationError>
+    where
+        Update: FnOnce(&mut crate::config::ChannelsConfig) -> Result<(), String> + Send + 'static,
+    {
+        let state = Arc::clone(self);
+        self.run_owned_model_mutation(ModelMutationRequest::UpdateConfig {
+            reapply_active_model: false,
+            update: Box::new(move |config| {
+                if state.config.configuration_revision() != expected_revision {
+                    return Err("Channel configuration changed; reload before saving".to_string());
+                }
+                update(&mut config.channels)
+            }),
+        })
+        .await
     }
 
     async fn run_owned_model_mutation(
@@ -569,7 +600,21 @@ impl AppState {
 
         self.save_app_config(&mutation.config)
             .map_err(ModelMutationError::Persistence)?;
-        *self.config.app_config.write().await = mutation.config.clone();
+        // Publish only the default for future admissions. Never walk active
+        // agents/runs and rewrite their captured delegation policy.
+        let configuration_revision = uuid::Uuid::new_v4().to_string();
+        {
+            let mut config = self.config.app_config.write().await;
+            *config = mutation.config.clone();
+            *self
+                .config
+                .app_config_revision
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = configuration_revision.clone();
+            self.config
+                .subagent_depth_defaults
+                .publish(mutation.config.max_subagent_depth);
+        }
 
         if let Some(publication) = primary_publication {
             publication.commit().await;
@@ -602,6 +647,7 @@ impl AppState {
             tracing::info!("active model removed; agent requires model configuration");
         }
         Ok(ModelMutationReceipt {
+            configuration_revision,
             config: mutation.config,
             model_id: mutation.model_id,
             runtime: mutation.runtime,
@@ -4377,7 +4423,10 @@ impl AppState {
                 .await?;
             return Ok(true);
         }
-        execution.lock().unwrap_or_else(|error| error.into_inner()).take();
+        execution
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         self.settle_internal_delivery_visibility(
             &runtime,
             target,

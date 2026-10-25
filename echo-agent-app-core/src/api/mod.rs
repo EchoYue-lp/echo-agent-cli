@@ -196,6 +196,9 @@ pub mod subagent_loader {
 pub mod subagent_prompt {
     pub use crate::subagent_prompt::*;
 }
+pub mod subagent_policy {
+    pub use crate::subagent_policy::*;
+}
 pub mod tasks {
     pub use crate::tasks::*;
 }
@@ -237,3 +240,11 @@ pub mod workspace_routing {
 }
 
 pub use crate::state::AppState;
+
+pub mod text_commands {
+    pub use crate::text_commands::*;
+}
+#[cfg(feature = "channels")]
+pub mod channel_runtime {
+    pub use crate::channel_runtime::*;
+}

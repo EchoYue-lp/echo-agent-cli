@@ -70,6 +70,12 @@ impl ChatSink for JsonlChatSink {
     }
 
     fn on_journaled_event(&self, envelope: ChatEventEnvelope) -> bool {
+        if matches!(
+            &envelope.payload,
+            ChatDriverEvent::HitlRequestReleased { .. }
+        ) {
+            return true;
+        }
         self.write_json_line(&envelope)
     }
 }
@@ -109,16 +115,19 @@ impl echo_agent::human_loop::HumanLoopProvider for JsonlHumanLoopProvider {
         let event = match &request.kind {
             HumanLoopKind::Approval => ChatDriverEvent::ApprovalRequest {
                 request_id,
+                identity: None,
                 tool_name: request.tool_name.unwrap_or_else(|| "unknown".to_string()),
                 args: request.args.unwrap_or(serde_json::Value::Null),
                 prompt: request.prompt,
             },
             HumanLoopKind::Input => ChatDriverEvent::InputRequest {
                 request_id,
+                identity: None,
                 prompt: request.prompt,
             },
             HumanLoopKind::Selection => ChatDriverEvent::SelectionRequest {
                 request_id,
+                identity: None,
                 prompt: request.prompt,
                 options: request.options.unwrap_or_default(),
                 task_id: request.task_id,

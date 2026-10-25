@@ -145,6 +145,7 @@ pub struct AgentConfigResponse {
 #[derive(Debug, Serialize, TS)]
 #[ts(export, rename = "FullConfigResponse")]
 pub struct FullConfigResponse {
+    pub max_subagent_depth: u8,
     pub model: ModelConfigResponse,
     pub agent: AgentConfigResponse,
     pub mcp: McpConfigResponse,

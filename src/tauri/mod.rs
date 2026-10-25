@@ -19,11 +19,13 @@ use tauri::Emitter;
 
 pub fn build_tauri_app(
     app_state: Arc<AppState>,
+    channel_runtime: Arc<echo_agent_app_core::api::channel_runtime::ChannelRuntime>,
     browser_runtime: Arc<BrowserRuntime>,
     subagent_projection: Arc<
         echo_agent_app_core::api::subagent_event_projection::SubagentEnvelopeProjectionService,
     >,
     bridge_supervisor: Arc<TauriBridgeSupervisor>,
+    desktop_lifecycle: std::sync::Weak<std::sync::Mutex<desktop::DesktopLifecycleState>>,
 ) -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -33,6 +35,7 @@ pub fn build_tauri_app(
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(TauriState::new(
             app_state,
+            channel_runtime,
             browser_runtime,
             subagent_projection,
             bridge_supervisor,
@@ -55,6 +58,11 @@ pub fn build_tauri_app(
             commands::analysis::run_analysis,
             commands::analysis::cancel_analysis,
             commands::analysis::delete_analysis,
+            // Existing QQ/Feishu runtime controls; save and connect remain separate.
+            commands::channels::get_channel_configuration,
+            commands::channels::save_channel_configuration,
+            commands::channels::list_channel_status,
+            commands::channels::control_channel,
             // Config
             commands::config::get_config,
             commands::config::update_config,
@@ -179,6 +187,8 @@ pub fn build_tauri_app(
             commands::scheduler::remove_scheduler_task,
             commands::scheduler::set_scheduler_task_status,
             commands::scheduler::run_scheduler_task,
+            commands::scheduler::edit_scheduler_task,
+            commands::scheduler::read_scheduler_history,
             // Conversations
             commands::conversations::list_conversations,
             commands::conversations::create_conversation,
@@ -278,10 +288,47 @@ pub fn build_tauri_app(
             terminal::close_terminal,
             terminal::list_terminal_sessions,
         ])
-        .setup(|app| {
+        .on_window_event(|window,event| {
+            if let tauri::WindowEvent::CloseRequested {api,..} = event {
+                if let Err(error) = desktop::hide_requested_window(||api.prevent_close(),||window.hide()) {
+                    use tauri_plugin_dialog::DialogExt;
+                    tracing::error!(%error,"Unable to hide EKO window");
+                    if let Err(show_error) = window.show() {tracing::error!(%show_error,"Unable to restore visible EKO window");}
+                    window.dialog().message("无法隐藏窗口，应用保持运行。请重试或使用托盘退出。").title("EKO").show(|_|{});
+                }
+            }
+        })
+        .setup(move |app| {
             // Register global shortcut: CmdOrCtrl+Shift+E toggles window visibility
             use tauri::Manager;
             use tauri_plugin_global_shortcut::GlobalShortcutExt;
+            let show = tauri::menu::MenuItem::with_id(app,"eko-show","显示",true,None::<&str>)?;
+            let quit = tauri::menu::MenuItem::with_id(app,"eko-quit","退出",true,None::<&str>)?;
+            let menu = tauri::menu::Menu::with_items(app,&[&show,&quit])?;
+            let mut tray = tauri::tray::TrayIconBuilder::with_id("eko-background")
+                .menu(&menu).show_menu_on_left_click(true)
+                .on_menu_event(move |app,event| match event.id.as_ref() {
+                    "eko-show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            if let Err(error) = window.show() {tracing::error!(%error,"Unable to show EKO window");}
+                            if let Err(error) = window.unminimize() {tracing::error!(%error,"Unable to restore EKO window");}
+                            if let Err(error) = window.set_focus() {tracing::error!(%error,"Unable to focus EKO window");}
+                        }
+                    }
+                    "eko-quit" => {
+                        if let Some(owner) = desktop_lifecycle.upgrade() {
+                            let result = owner.lock().unwrap_or_else(|error|error.into_inner()).begin_shutdown();
+                            match result {
+                                Ok(()) => app.exit(0),
+                                Err(error) => tracing::error!(%error,"Unable to begin original desktop shutdown"),
+                            }
+                        }
+                    }
+                    _ => {}
+                });
+            if let Some(icon) = app.default_window_icon() { tray = tray.icon(icon.clone()); }
+            let _tray = tray.build(app)?;
+
 
             // Keep normal `cargo gui-dev` usable. The inspector opens only for
             // an explicitly requested `devtools` build.

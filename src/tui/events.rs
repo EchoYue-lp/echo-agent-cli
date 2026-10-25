@@ -3070,6 +3070,7 @@ impl echo_agent_app_core::api::chat_driver::ChatSink for TuiChatSink {
                 .is_ok();
         }
         let mapped = match event {
+            ChatDriverEvent::HitlRequestReleased { .. } => return true,
             ChatDriverEvent::Execution(event) => AgentEvent::Execution(event),
             ChatDriverEvent::TurnStatus { status } => AgentEvent::TurnStatus(status),
             ChatDriverEvent::InputLifecycle(fact) => {
@@ -3104,9 +3105,9 @@ impl echo_agent_app_core::api::chat_driver::ChatSink for TuiChatSink {
             } => AgentEvent::Notice(format!(
                 "Approval requested [{request_id}] for {tool_name}: {prompt}"
             )),
-            ChatDriverEvent::InputRequest { request_id, prompt } => {
-                AgentEvent::Notice(format!("Input requested [{request_id}]: {prompt}"))
-            }
+            ChatDriverEvent::InputRequest {
+                request_id, prompt, ..
+            } => AgentEvent::Notice(format!("Input requested [{request_id}]: {prompt}")),
             ChatDriverEvent::SelectionRequest {
                 request_id,
                 prompt,

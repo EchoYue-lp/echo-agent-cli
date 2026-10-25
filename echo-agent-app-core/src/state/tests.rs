@@ -849,6 +849,65 @@ mod model_mutation_tests {
     }
 
     #[tokio::test]
+    async fn depth_default_publishes_only_after_owned_config_persistence() -> Result<(), String> {
+        let next = crate::subagent_policy::SubagentDepthLimit::new(3)?;
+        for persistence_fails in [false, true] {
+            let fixture = fixture(valid_config()?, persistence_fails).await?;
+            let original_revision = fixture.state.config.configuration_snapshot().await.1;
+            let original = fixture
+                .state
+                .config
+                .app_config
+                .read()
+                .await
+                .max_subagent_depth;
+            let store = fixture
+                .state
+                .tasks
+                .runtime
+                .as_ref()
+                .ok_or_else(|| "TaskRuntime fixture missing".to_string())?;
+            assert_eq!(store.new_execution_subagent_depth(), original);
+            let result = fixture
+                .state
+                .update_app_config_owned(false, move |config| {
+                    config.max_subagent_depth = next;
+                    Ok(())
+                })
+                .await;
+            let expected = if persistence_fails {
+                assert!(matches!(result, Err(ModelMutationError::Persistence(_))));
+                original
+            } else {
+                result.map_err(|error| error.to_string())?;
+                assert_eq!(
+                    crate::config::load_config_file(&fixture.config_path)?.max_subagent_depth,
+                    next
+                );
+                next
+            };
+            assert_eq!(
+                fixture
+                    .state
+                    .config
+                    .app_config
+                    .read()
+                    .await
+                    .max_subagent_depth,
+                expected
+            );
+            assert_eq!(store.new_execution_subagent_depth(), expected);
+            let published_revision = fixture.state.config.configuration_snapshot().await.1;
+            if persistence_fails {
+                assert_eq!(published_revision, original_revision);
+            } else {
+                assert_ne!(published_revision, original_revision);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn persistence_failure_rolls_back_snapshot_primary_and_pool() -> Result<(), String> {
         let fixture = fixture(valid_config()?, true).await?;
 
@@ -2431,20 +2490,34 @@ mod workspace_transition_tests {
     }
 
     #[tokio::test]
-    async fn cold_delivery_original_cell_marks_only_its_exact_unknown_lease() -> anyhow::Result<()> {
+    async fn cold_delivery_original_cell_marks_only_its_exact_unknown_lease() -> anyhow::Result<()>
+    {
         let client = Arc::new(MockLlmClient::new().with_model_name("test-model"));
-        let agent = AgentHandle::new(ReactAgentBuilder::new().model("test-model").llm_client(client.clone()).build()?);
-        let pool = Arc::new(crate::agent_pool::AgentPool::new_for_test(agent, None, None, 2, false).await);
+        let agent = AgentHandle::new(
+            ReactAgentBuilder::new()
+                .model("test-model")
+                .llm_client(client.clone())
+                .build()?,
+        );
+        let pool =
+            Arc::new(crate::agent_pool::AgentPool::new_for_test(agent, None, None, 2, false).await);
         pool.set_llm_client_override_for_test(client).await;
         let original = pool.acquire("same-cold-target").await?;
         let ordinary = pool.acquire("same-cold-target").await?;
         let control = crate::foreground_turn::ForegroundTurnControl::default();
-        let lease = control.begin(crate::foreground_turn::ForegroundTurnSurface::Channel, "same-cold-target", "cold-original-turn")?;
+        let lease = control.begin(
+            crate::foreground_turn::ForegroundTurnSurface::Channel,
+            "same-cold-target",
+            "cold-original-turn",
+        )?;
         // Invoke the exact private binding used by deliver_agent_message_cold.
         let cell = AppState::retain_cold_delivery_execution(&lease, original);
         let (release, held) = tokio::sync::oneshot::channel();
         let backend = tokio::spawn(held);
-        lease.retain_observation(crate::chat_driver::ChatTurnError::Observation { run_id: "cold-original-run".into(), execution_id: Some("cold-original-execution".into()) });
+        lease.retain_observation(crate::chat_driver::ChatTurnError::Observation {
+            run_id: "cold-original-run".into(),
+            execution_id: Some("cold-original-execution".into()),
+        });
         drop(lease);
         {
             let normal_drain = pool.join_known_executions();
@@ -2453,14 +2526,31 @@ mod workspace_transition_tests {
         }
         assert_eq!(pool.active_execution_count(), 2);
         drop(ordinary);
-        let unknown = tokio::time::timeout(std::time::Duration::from_secs(2), pool.join_known_executions()).await?;
-        assert!(unknown.as_ref().err().is_some_and(|error| error.contains("cold-original-run")));
+        let unknown = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            pool.join_known_executions(),
+        )
+        .await?;
+        assert!(
+            unknown
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.contains("cold-original-run"))
+        );
         assert_eq!(pool.active_execution_count(), 1);
-        assert!(cell.lock().unwrap_or_else(|error| error.into_inner()).is_some());
+        assert!(
+            cell.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+        );
         assert!(!backend.is_finished());
-        release.send(()).map_err(|_| anyhow::anyhow!("original cold backend vanished"))?;
+        release
+            .send(())
+            .map_err(|_| anyhow::anyhow!("original cold backend vanished"))?;
         backend.await??;
-        cell.lock().unwrap_or_else(|error| error.into_inner()).take();
+        cell.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         assert_eq!(pool.active_execution_count(), 0);
         pool.shutdown().await.map_err(anyhow::Error::msg)?;
         Ok(())
@@ -6361,11 +6451,16 @@ mod service_bootstrap_tests {
             .await
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string());
-        assert!(observed.is_err(), "the driver must report the unsettled owner");
+        assert!(
+            observed.is_err(),
+            "the driver must report the unsettled owner"
+        );
         assert!(store.has_unsettled_driver_resources());
         // R1: the fence leaves the run Running and recovery settles nothing.
         assert_eq!(
-            store.recover_incomplete().map_err(|error| error.to_string())?,
+            store
+                .recover_incomplete()
+                .map_err(|error| error.to_string())?,
             0
         );
         assert_eq!(

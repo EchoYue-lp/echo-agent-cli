@@ -13,7 +13,7 @@ pub enum DoctorConnectivity {
 /// Send a minimal chat request to verify the model is reachable and responding.
 async fn probe_model_connectivity(model: &str) -> echo_agent::error::Result<()> {
     use echo_agent::error::ReactError;
-    let mut app_config = crate::config::load_config(None);
+    let mut app_config = crate::config::load_config(None).map_err(ReactError::Other)?;
     crate::config::apply_env_overrides(&mut app_config);
     let runtime = model_config::resolve_runtime_model(&app_config, Some(model))
         .map_err(|error| ReactError::Other(error.to_string()))?;
@@ -43,7 +43,15 @@ async fn probe_model_connectivity(model: &str) -> echo_agent::error::Result<()> 
 
 /// 执行基础环境诊断（API Key、配置文件、数据目录等）
 pub fn run_base_doctor() -> DoctorResult {
-    let mut config = crate::config::load_config(None);
+    let mut config = match crate::config::load_config(None) {
+        Ok(config) => config,
+        Err(error) => {
+            return DoctorResult {
+                issues: vec![error],
+                checks: Vec::new(),
+            };
+        }
+    };
     crate::config::apply_env_overrides(&mut config);
     let model = model_config::resolve_runtime_model(&config, None)
         .map(|runtime| runtime.model)

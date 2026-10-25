@@ -77,21 +77,32 @@ pub enum ChatDriverEvent {
     InputLifecycle(Box<crate::conversation_input::ConversationInputFact>),
     ApprovalRequest {
         request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<crate::hitl::HitlRequestIdentity>,
         tool_name: String,
         args: serde_json::Value,
         prompt: String,
     },
     InputRequest {
         request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<crate::hitl::HitlRequestIdentity>,
         prompt: String,
     },
     SelectionRequest {
         request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<crate::hitl::HitlRequestIdentity>,
         prompt: String,
         options: Vec<String>,
         task_id: Option<String>,
         context: Option<serde_json::Value>,
         phase: Option<String>,
+    },
+    /// Projection removal derived from the original provider reservation Drop.
+    /// This is neither an approval decision nor another terminal authority.
+    HitlRequestReleased {
+        identity: crate::hitl::HitlRequestIdentity,
     },
     ContextCompressed {
         before_count: usize,
@@ -1635,6 +1646,21 @@ async fn drive_chat_inner(
     let webhook_emitter = res.webhook_emitter.clone();
     let runtime_store = res.store.clone();
     let active_run_id = bound_run_id;
+    let subagent_depth_binding = if let Some(run_id) = active_run_id.as_deref() {
+        let store = runtime_store.as_ref().ok_or_else(|| {
+            "A bound TaskRun requires its original runtime policy owner".to_string()
+        })?;
+        store
+            .get_run_state(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("TaskRun '{run_id}' policy snapshot is missing"))?
+            .execution_profile
+            .subagent_depth_limit
+    } else {
+        Some(res.new_execution_subagent_depth().await)
+    };
+    let delegation_policy =
+        crate::subagent_policy::primary_policy_for_binding(subagent_depth_binding);
     // Scope the chat resources into a task_local so tools the agent calls
     // mid-ReAct (create_complex_task / check_run_status / cancel_run, Phase B3)
     // can reach pool/store/sink via `current_chat_resources()`.
@@ -1645,7 +1671,11 @@ async fn drive_chat_inner(
         let guard = inner.read().await;
         let webhook_observer =
             WebhookTurnObserver::new(webhook_emitter, guard.model_name().to_string());
-        let disabled_tools = Some(crate::tool_exposure::disabled_tools());
+        let mut disabled = crate::tool_exposure::disabled_tools();
+        if !delegation_policy.can_delegate() {
+            disabled.insert("agent_tool".to_string());
+        }
+        let disabled_tools = Some(disabled);
         let registered_tools = guard.tool_names();
         let visible_tools = if active_run_id.is_some() {
             crate::tool_exposure::initial_visible_tools_for_task_run(&registered_tools)
@@ -1686,6 +1716,7 @@ async fn drive_chat_inner(
         )
         .map_err(|error| error.to_string())?;
         let invocation = echo_agent::agent::AgentInvocationContext {
+            allowed_tools: None,
             history: None,
             runtime_state_id,
             transcript_generation_id,
@@ -1702,7 +1733,7 @@ async fn drive_chat_inner(
                 message_id: Some(turn_id.clone()),
                 cancel: Some(std::sync::Arc::new(cancel.clone())),
                 trace_sink: Some(framework_trace_sink_for(&sink)),
-                delegation_policy: None,
+                delegation_policy: Some(delegation_policy),
                 resource_guards: Vec::new(),
                 subagent_lineage: None,
                 uplink: None,
@@ -2626,6 +2657,7 @@ mod tests {
                 | ChatDriverEvent::ApprovalRequest { .. }
                 | ChatDriverEvent::InputRequest { .. }
                 | ChatDriverEvent::SelectionRequest { .. }
+                | ChatDriverEvent::HitlRequestReleased { .. }
                 | ChatDriverEvent::ExtensionReceipt(_)
                 | ChatDriverEvent::CommandCellStarted { .. }
                 | ChatDriverEvent::CommandCellSettled { .. }

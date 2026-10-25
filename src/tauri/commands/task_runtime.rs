@@ -755,6 +755,26 @@ async fn resume_continuation_run(
             "Resume the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative runtime projection and continue the next useful work."
         ),
     );
+    let hitl_scope = echo_agent_app_core::api::hitl::HitlRequestScope {
+        workspace_id: Some(runtime.execution_scope().workspace_id().to_string()),
+        host_generation: Some(runtime.workspace_io_receipt().host_generation().to_string()),
+        conversation_id: Some(conversation_id.clone()),
+        root_turn_id: Some(turn_id.clone()),
+        turn_id: Some(turn_id.clone()),
+        run_id: Some(run_id.clone()),
+        ..Default::default()
+    };
+    let hitl_provider: Arc<dyn echo_agent::human_loop::HumanLoopProvider> = Arc::new(
+        crate::tauri::commands::chat::TauriHumanLoopHandler::new(
+            sink.clone(),
+            turn_id.clone(),
+            hitl_scope.clone(),
+        )
+        .with_scope_resolver(crate::tauri::commands::chat::gui_hitl_scope_resolver(
+            &state.app_state,
+            hitl_scope,
+        )),
+    );
     let resources = Arc::new(echo_agent_app_core::api::chat_resources::ChatResources {
         execution_scope: runtime.execution_scope().clone(),
         workspace_io_receipt: Some(runtime.workspace_io_receipt()),
@@ -768,9 +788,7 @@ async fn resume_continuation_run(
         cancel: lease.cancellation_token(),
         review_integration: runtime.review_integration(),
         memory_generation: None,
-        human_loop_provider: Some(Arc::new(
-            crate::tauri::commands::chat::TauriHumanLoopHandler::new(sink.clone(), turn_id.clone()),
-        )),
+        human_loop_provider: Some(hitl_provider),
     });
     let binding = RunTurnBinding::resume_expected_with_visibility(
         expected_resume,
@@ -1032,7 +1050,13 @@ pub async fn cancel_task_run(
     })
     .await?;
     if cancelled {
-        super::chat::cancel_pending_hitl(message_key.as_deref(), "task run cancelled").await;
+        super::chat::cancel_pending_hitl(
+            &workspace_id,
+            &run.conversation_id,
+            message_key.as_deref(),
+            "task run cancelled",
+        )
+        .await;
         store.wait_for_run_driver_idle(&run_id).await;
     }
     Ok(TaskRunControlReceipt {
@@ -1057,7 +1081,13 @@ pub async fn pause_task_run(
     })
     .await?;
     if paused {
-        super::chat::cancel_pending_hitl(message_key.as_deref(), "task run paused").await;
+        super::chat::cancel_pending_hitl(
+            &workspace_id,
+            &run.conversation_id,
+            message_key.as_deref(),
+            "task run paused",
+        )
+        .await;
     }
     Ok(TaskRunControlReceipt {
         success: paused,

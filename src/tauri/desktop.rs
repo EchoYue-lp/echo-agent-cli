@@ -64,6 +64,36 @@ fn install_panic_hook() {
     }));
 }
 
+/// Mutable holder of the ORIGINAL application owner and its phase-one receipt.
+/// Window/menu callbacks retain Weak references only; no second shutdown owner.
+pub struct DesktopLifecycleState {
+    services: Option<echo_agent_app_core::api::runtime::ApplicationServices>,
+    receipt: Option<echo_agent_app_core::api::runtime::ApplicationLifecycleReceipt>,
+}
+impl DesktopLifecycleState {
+    pub(crate) fn begin_shutdown(&mut self) -> anyhow::Result<()> {
+        if self.receipt.is_none() {
+            let services = self
+                .services
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("original desktop service owner unavailable"))?;
+            self.receipt = Some(services.begin_shutdown(
+                echo_agent_app_core::api::runtime::ApplicationLifecycleReason::Shutdown,
+                None,
+            )?);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn hide_requested_window<E>(
+    prevent: impl FnOnce(),
+    hide: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    prevent();
+    hide()
+}
+
 /// Run the Tauri desktop app and report lifecycle failures to a crash log.
 pub async fn run_desktop_entry() -> anyhow::Result<()> {
     // Must run before crash_log_path(), logging, or any Store resolves a path.
@@ -128,7 +158,7 @@ async fn run_desktop() -> anyhow::Result<()> {
     // The desktop binary accepts the same model/project/config overrides as
     // TUI/CLI, including the canonical `--mcp-config` source.
     let args = parse_desktop_args(std::env::args_os())?;
-    let mut app_config = config::load_config(args.config.as_deref());
+    let mut app_config = config::load_config(args.config.as_deref()).map_err(anyhow::Error::msg)?;
     // On macOS, GUI apps launched from Dock/Finder don't inherit shell env
     // vars. Import only names explicitly declared by configured providers.
     infra::load_shell_env(&app_config);
@@ -200,25 +230,80 @@ async fn run_desktop() -> anyhow::Result<()> {
         },
         async move { bridge_join.join().await },
     )?;
+    let channel_runtime = services.channel_runtime.clone();
+    let subagent_projection = services.subagent_projection.clone();
+    let lifecycle = Arc::new(std::sync::Mutex::new(DesktopLifecycleState {
+        services: Some(services),
+        receipt: None,
+    }));
     let builder = crate::tauri::build_tauri_app(
         state,
+        channel_runtime,
         runtime.browser_runtime.clone(),
-        services.subagent_projection.clone(),
+        subagent_projection,
         bridge_supervisor,
+        Arc::downgrade(&lifecycle),
     );
+    let on_exit = Arc::downgrade(&lifecycle);
     run_desktop_with_settlement(
         move || {
+            use tauri::Manager;
             let app = builder.build(tauri_context)?;
-            // App::run exits the process, bypassing our application owner.
-            // Returning the loop keeps Tokio alive until every accepted service
-            // settles. Repeated exit requests still produce only one return.
-            Ok(app.run_return(|_, _| {}))
+            let gui_host = Arc::new(app.handle().clone());
+            let gui_state = app.state::<crate::tauri::state::TauriState>();
+            gui_state.channel_runtime.install_gui_hitl_factory(
+                crate::tauri::commands::chat::channel_gui_hitl_factory(
+                    Arc::downgrade(&gui_host),
+                    Arc::downgrade(&gui_state.app_state),
+                ),
+            );
+            let channels = gui_state.channel_runtime.clone();
+            let channel_start = gui_state.bridge_supervisor.reserve()?;
+            channel_start.track(tokio::spawn(async move {
+                for error in channels.start_configured().await {
+                    tracing::warn!(%error,"Configured IM channel did not start");
+                }
+            }));
+            // Every explicit exit intent closes original admission once. The
+            // returning loop keeps Tokio alive for phase-two physical joins.
+            Ok(app.run_return(move |_, event| {
+                // The loop owns this host. Channel factories retain only Weak.
+                let _original_gui_host = &gui_host;
+                if matches!(event, tauri::RunEvent::ExitRequested { .. })
+                    && let Some(owner) = on_exit.upgrade()
+                    && let Err(error) = owner
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .begin_shutdown()
+                {
+                    tracing::error!(%error,"Unable to begin original desktop shutdown");
+                }
+            }))
         },
-        move |primary_error| {
-            services.settle(
-                echo_agent_app_core::api::runtime::ApplicationLifecycleReason::Shutdown,
-                primary_error,
-            )
+        move |primary_error| async move {
+            let (services, mut receipt) = {
+                let mut original = lifecycle.lock().unwrap_or_else(|error| error.into_inner());
+                (
+                    original.services.take().ok_or_else(|| {
+                        anyhow::anyhow!("original desktop service owner unavailable")
+                    })?,
+                    original.receipt.take(),
+                )
+            };
+            let settled = if let Some(mut receipt) = receipt.take() {
+                if let Some(error) = primary_error {
+                    receipt.primary_error = Some(error.to_string());
+                }
+                services.join(receipt).await
+            } else {
+                services
+                    .settle(
+                        echo_agent_app_core::api::runtime::ApplicationLifecycleReason::Shutdown,
+                        primary_error,
+                    )
+                    .await
+            };
+            Ok(settled)
         },
     )
     .await
@@ -231,7 +316,9 @@ async fn run_desktop_with_settlement<Run, Settle, Settlement>(
 where
     Run: FnOnce() -> anyhow::Result<i32>,
     Settle: FnOnce(Option<anyhow::Error>) -> Settlement,
-    Settlement: std::future::Future<Output = echo_agent_app_core::api::runtime::ApplicationLifecycleReceipt>,
+    Settlement: std::future::Future<
+            Output = anyhow::Result<echo_agent_app_core::api::runtime::ApplicationLifecycleReceipt>,
+        >,
 {
     let primary_error = match run() {
         Ok(0) => None,
@@ -244,7 +331,9 @@ where
     };
     // The same boundary handles builder failures and normal loop completion;
     // neither path may return before the existing service owner joins.
-    let receipt = settle(primary_error).await;
+    // A bounded retained observation is useful to interactive callers, but
+    // returning it here would drop Tokio while original channel owners remain.
+    let receipt = settle(primary_error).await?.wait_final().await;
     receipt.into_result().map_err(anyhow::Error::new)
 }
 
@@ -270,6 +359,21 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn window_close_is_prevented_before_hide_even_when_hide_fails() -> anyhow::Result<()> {
+        let order = std::cell::RefCell::new(Vec::new());
+        let result = hide_requested_window(
+            || order.borrow_mut().push("prevent"),
+            || {
+                order.borrow_mut().push("hide");
+                Err::<(), _>("native hide failed")
+            },
+        );
+        assert_eq!(result, Err("native hide failed"));
+        assert_eq!(*order.borrow(), vec!["prevent", "hide"]);
+        Ok(())
+    }
 
     #[test]
     fn desktop_args_preserve_explicit_mcp_override() -> anyhow::Result<()> {
@@ -330,7 +434,11 @@ mod tests {
                 }
                 Ok(0)
             },
-            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+            |error| async move {
+                Ok(owner
+                    .settle(ApplicationLifecycleReason::Shutdown, error)
+                    .await)
+            },
         )
         .await?;
 
@@ -368,7 +476,11 @@ mod tests {
         );
         let exit = tokio::spawn(run_desktop_with_settlement(
             || Ok(0),
-            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+            |error| async move {
+                Ok(owner
+                    .settle(ApplicationLifecycleReason::Shutdown, error)
+                    .await)
+            },
         ));
 
         timeout(TEST_TIMEOUT, cancel_seen_rx).await??;
@@ -396,7 +508,11 @@ mod tests {
 
         let error = run_desktop_with_settlement(
             || Err(anyhow::anyhow!("desktop builder failed")),
-            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+            |error| async move {
+                Ok(owner
+                    .settle(ApplicationLifecycleReason::Shutdown, error)
+                    .await)
+            },
         )
         .await
         .err()
@@ -435,7 +551,11 @@ mod tests {
 
         let error = run_desktop_with_settlement(
             || Ok(0),
-            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+            |error| async move {
+                Ok(owner
+                    .settle(ApplicationLifecycleReason::Shutdown, error)
+                    .await)
+            },
         )
         .await
         .err()
@@ -459,7 +579,11 @@ mod tests {
         let owner = ApplicationLifecycleOwner::new(cancel.clone());
         let error = run_desktop_with_settlement(
             || Ok(17),
-            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+            |error| async move {
+                Ok(owner
+                    .settle(ApplicationLifecycleReason::Shutdown, error)
+                    .await)
+            },
         )
         .await
         .err()

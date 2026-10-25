@@ -411,14 +411,15 @@ export function ChatPanel() {
             {pendingHitlRequest?.kind === 'approval' && (
               <div className="mx-auto w-full max-w-[980px] px-4 pb-2 sm:px-6 lg:px-8">
                 <ApprovalCard
+                  key={JSON.stringify(pendingHitlRequest.identity)}
                   request={pendingHitlRequest}
-                  onApprove={() => sendApproval(pendingHitlRequest.requestId, true)}
-                  onReject={(reason) => sendApproval(pendingHitlRequest.requestId, false, reason)}
+                  onApprove={() => sendApproval(pendingHitlRequest.identity, true)}
+                  onReject={(reason) => sendApproval(pendingHitlRequest.identity, false, reason)}
                   onModify={(feedback) =>
-                    sendApproval(pendingHitlRequest.requestId, false, `修改意见: ${feedback}`)
+                    sendApproval(pendingHitlRequest.identity, false, `修改意见: ${feedback}`)
                   }
                   onApproveAll={() =>
-                    sendApproval(pendingHitlRequest.requestId, true, undefined, 'session_tool')
+                    sendApproval(pendingHitlRequest.identity, true, undefined, 'session_tool')
                   }
                 />
               </div>
@@ -522,8 +523,9 @@ export function ChatPanel() {
               {pendingHitlRequest?.kind === 'input' && (
                 <div className="py-2">
                   <InputCard
+                    key={JSON.stringify(pendingHitlRequest.identity)}
                     prompt={pendingHitlRequest.prompt}
-                    onSubmit={(text) => sendInput(pendingHitlRequest.requestId, text)}
+                    onSubmit={(text) => sendInput(pendingHitlRequest.identity, text)}
                   />
                 </div>
               )}
@@ -531,13 +533,14 @@ export function ChatPanel() {
               {pendingHitlRequest?.kind === 'selection' && (
                 <div className="py-2">
                   <SelectionCard
+                    key={JSON.stringify(pendingHitlRequest.identity)}
                     prompt={pendingHitlRequest.prompt}
                     options={pendingHitlRequest.options}
                     taskId={pendingHitlRequest.taskId}
                     phase={pendingHitlRequest.phase}
                     context={pendingHitlRequest.context}
                     onSelect={(selection, instructions) =>
-                      sendSelection(pendingHitlRequest.requestId, selection, instructions)
+                      sendSelection(pendingHitlRequest.identity, selection, instructions)
                     }
                   />
                 </div>
@@ -700,14 +703,20 @@ function runStatusLabel(status: string, isStreaming: boolean) {
   }
 }
 
-function InputCard({ prompt, onSubmit }: { prompt?: string; onSubmit: (text: string) => void }) {
-  const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+function InputCard({
+  prompt,
+  onSubmit,
+}: {
+  prompt?: string;
+  onSubmit: (text: string) => Promise<boolean>;
+}) {
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    const form = new FormData(e.currentTarget);
+    const formElement = e.currentTarget;
+    const form = new FormData(formElement);
     const text = form.get('input') as string;
-    if (text.trim()) {
-      onSubmit(text);
-      e.currentTarget.reset();
+    if (text.trim() && (await onSubmit(text))) {
+      formElement.reset();
     }
   };
 

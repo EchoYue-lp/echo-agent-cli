@@ -1,5 +1,15 @@
 # EKO Configuration Guide
 
+## Maximum Subagent depth
+
+Use the GUI configuration panel or the EKO-owned top-level YAML value below. Only integers 1, 2 and 3 are accepted; the default is 1. Primary is layer 0. Changes apply to new runs/turns; existing runs, new tasks within them, retries and recovery keep their original binding. Invalid configuration files fail explicitly instead of silently loading defaults.
+
+```yaml
+max_subagent_depth: 1
+```
+
+This does not change concurrency or Framework defaults and does not require a TaskRun for a lightweight agent_tool call. Historical runs without a trustworthy binding cannot obtain new delegation permission from this setting. See [ADR 0052](adr/0052-gui-subagent-depth-policy.md).
+
 EKO owns `EkoConfig` and the `~/.eko` data root in app-core. Runtime bootstrap
 selects the provider-neutral fields used by the framework's `FrameworkConfig`,
 typed `PermissionMode`, and explicit paths; the framework does not discover EKO
@@ -149,3 +159,9 @@ driver, TaskRuntime, HITL, and memory authority as GUI and TUI.
 | `HTTP_PROXY` / `HTTPS_PROXY` | HTTP proxy |
 
 Legacy `.lsp.yaml` is no longer parsed or hot-reloaded. Discovery only reports that LSP has retired; the original file is preserved.
+
+## IM replies to human-loop requests
+
+Each active EKO channel approval, input or selection prompt supplies a response target. Reply with `/reply <response-target> <answer>`; use `/reply <response-target> /cancel` to decline. Approval answers retain `y`, `a`, `n [reason]` and `m [feedback]`; selection accepts its original option number or name. Free-text input preserves its answer suffix, including Unicode and newlines. A pending request is not answered by bare text. Missing, old, non-front or foreign-session targets are rejected and do not become normal chat; ordinary text without a pending request remains chat.
+
+Submission is distinct from the original provider/dispatcher's effective answer. GUI replies carry the original delivered scope and target across page changes; historical events without a target are not activated. See [ADR0053](adr/0053-im-cron-gui-control.md) for the contract and the pending Rust/native, live composition and IM/cron qualification boundaries. The identity source checkpoint does not claim that the complete channel management page or native platform delivery has been verified.

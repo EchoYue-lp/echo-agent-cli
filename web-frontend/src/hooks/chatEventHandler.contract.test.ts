@@ -23,6 +23,137 @@ describe('canonical chat event v4 contract', () => {
     resetChatEventCursorsForTest();
   });
 
+  it('retains the original target and owner scope for a live HITL request', () => {
+    const base = fixture.at(0);
+    if (!base) throw new Error('contract fixture is incomplete');
+    const identity = {
+      request_id: 'reusable',
+      response_target: 'target-current',
+      kind: 'input',
+      scope: {
+        workspace_id: 'workspace-original',
+        host_generation: 'generation-original',
+        conversation_id: 'conversation-original',
+        root_turn_id: 'root-original',
+        turn_id: 'turn-original',
+      },
+    };
+    const envelope = {
+      ...base,
+      workspace_id: 'workspace-original',
+      conversation_id: 'conversation-original',
+      root_turn_id: 'root-original',
+      turn_id: 'turn-original',
+      payload: {
+        source: 'input_request',
+        event: {
+          request_id: 'reusable',
+          identity,
+          prompt: '中文\n🙂',
+        },
+      },
+    } as unknown as ChatEventEnvelope;
+    handleChatEventEnvelope(envelope, context());
+    expect(useChatStore.getState().pendingHitlRequests.at(0)).toMatchObject({ identity });
+  });
+
+  it('keeps a historical HITL event without a target out of the active reply queue', () => {
+    const base = fixture.at(0);
+    if (!base) throw new Error('contract fixture is incomplete');
+    const envelope = {
+      ...base,
+      payload: {
+        source: 'input_request',
+        event: {
+          request_id: 'old-request',
+          prompt: 'expired historical input',
+        },
+      },
+    } as unknown as ChatEventEnvelope;
+    handleChatEventEnvelope(envelope, context());
+    expect(useChatStore.getState().pendingHitlRequests).toEqual([]);
+  });
+
+  it('releases only the exact target and scope when a request id is reused', () => {
+    const scope = {
+      workspace_id: 'w',
+      host_generation: 'host-a',
+      conversation_id: 'c',
+      root_turn_id: 'root',
+      turn_id: 'turn',
+    };
+    const a = {
+      request_id: 'reusable',
+      response_target: 'target-a',
+      kind: 'input' as const,
+      scope,
+    };
+    const b = { ...a, response_target: 'target-b' };
+    const base = fixture.at(0);
+    if (!base) throw new Error('contract fixture is incomplete');
+    for (const identity of [a, b]) {
+      useChatStore
+        .getState()
+        .enqueueHitlRequest({ kind: 'input', requestId: 'reusable', identity, prompt: 'input' });
+    }
+    handleChatEventEnvelope(
+      {
+        ...base,
+        payload: {
+          source: 'hitl_request_released',
+          event: {
+            identity: { ...b, scope: { ...scope, host_generation: 'other-host' } },
+          },
+        },
+      },
+      context()
+    );
+    expect(useChatStore.getState().pendingHitlRequests).toHaveLength(2);
+    handleChatEventEnvelope(
+      { ...base, payload: { source: 'hitl_request_released', event: { identity: a } } },
+      context()
+    );
+    expect(useChatStore.getState().pendingHitlRequests).toEqual([
+      expect.objectContaining({ identity: b }),
+    ]);
+  });
+
+  it('does not activate malformed, empty or conflicting request identities', () => {
+    const base = fixture.at(0);
+    if (!base) throw new Error('contract fixture is incomplete');
+    const scope = {
+      workspace_id: base.workspace_id,
+      host_generation: 'host',
+      conversation_id: base.conversation_id,
+      root_turn_id: base.root_turn_id,
+      turn_id: base.turn_id,
+    };
+    const identity = { request_id: 'id', response_target: 'target', kind: 'input', scope };
+    for (const invalid of [
+      { ...identity, response_target: '' },
+      { ...identity, response_target: null },
+      { ...identity, request_id: 'another' },
+      { ...identity, kind: 'approval' },
+      { ...identity, scope: { ...scope, conversation_id: 'another' } },
+    ]) {
+      handleChatEventEnvelope(
+        {
+          ...base,
+          payload: {
+            source: 'input_request',
+            event: {
+              request_id: 'id',
+              prompt: 'input',
+              identity: invalid,
+            },
+          },
+        } as unknown as ChatEventEnvelope,
+        context()
+      );
+    }
+    expect(useChatStore.getState().pendingHitlRequests).toEqual([]);
+  });
+
   it('treats InputLifecycle as a Frontier refresh signal only', () => {
     const base = fixture[0];
     if (!base) throw new Error('contract fixture is incomplete');

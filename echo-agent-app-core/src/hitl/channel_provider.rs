@@ -3,6 +3,10 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use super::{
+    HitlRequestIdentity, HitlRequestScope, PairedHumanLoopProvider, PairedHumanLoopRequest,
+    pair_request,
+};
 use echo_agent::human_loop::{
     ApprovalScope, HumanLoopKind, HumanLoopProvider, HumanLoopRequest, HumanLoopResponse,
 };
@@ -12,7 +16,8 @@ use tokio::sync::{broadcast, oneshot};
 struct PendingChannelRequest {
     request_id: String,
     request: HumanLoopRequest,
-    response_tx: oneshot::Sender<HumanLoopResponse>,
+    identity: HitlRequestIdentity,
+    response_tx: oneshot::Sender<Result<HumanLoopResponse, echo_agent::error::ReactError>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +78,8 @@ impl Drop for ChannelRequestReservation {
 pub struct ChannelHumanLoopProvider {
     state: Arc<Mutex<ChannelHumanLoopState>>,
     prompt_tx: broadcast::Sender<String>,
+    scope: HitlRequestScope,
+    scope_resolver: Option<super::HitlScopeResolver>,
 }
 
 impl ChannelHumanLoopProvider {
@@ -86,6 +93,25 @@ impl ChannelHumanLoopProvider {
                 reserved_ids: HashSet::new(),
             })),
             prompt_tx,
+            scope: HitlRequestScope::default(),
+            scope_resolver: None,
+        }
+    }
+
+    pub fn with_scope(mut self, scope: HitlRequestScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    pub fn with_scope_resolver(mut self, resolver: super::HitlScopeResolver) -> Self {
+        self.scope_resolver = Some(resolver);
+        self
+    }
+
+    fn request_scope(&self) -> Result<HitlRequestScope, echo_agent::error::ReactError> {
+        match self.scope_resolver.as_ref() {
+            Some(resolve) => resolve(),
+            None => Ok(self.scope.clone().with_current_runtime()),
         }
     }
 
@@ -105,9 +131,9 @@ impl ChannelHumanLoopProvider {
         let request_id = request.request_id;
         let delivered = request
             .response_tx
-            .send(HumanLoopResponse::Rejected {
+            .send(Ok(HumanLoopResponse::Rejected {
                 reason: Some(reason.into()),
-            })
+            }))
             .is_ok();
         self.publish_front(&state.pending);
         if delivered {
@@ -130,9 +156,7 @@ impl ChannelHumanLoopProvider {
         while let Some(request) = state.pending.pop_front() {
             if request
                 .response_tx
-                .send(HumanLoopResponse::Rejected {
-                    reason: Some(reason.clone()),
-                })
+                .send(Err(echo_agent::error::ReactError::Other(reason.clone())))
                 .is_ok()
             {
                 rejected = rejected.saturating_add(1);
@@ -157,9 +181,7 @@ impl ChannelHumanLoopProvider {
         while let Some(request) = state.pending.pop_front() {
             if request
                 .response_tx
-                .send(HumanLoopResponse::Rejected {
-                    reason: Some(reason.clone()),
-                })
+                .send(Err(echo_agent::error::ReactError::Other(reason.clone())))
                 .is_ok()
             {
                 rejected = rejected.saturating_add(1);
@@ -177,15 +199,35 @@ impl ChannelHumanLoopProvider {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::prune_closed(&mut state.pending);
+        let reply = parse_targeted_reply(message);
         let Some(request) = state.pending.front() else {
+            if reply.is_some() {
+                return ChannelHumanLoopResolution::Rejected(
+                    "This reply target is expired or unavailable.".to_string(),
+                );
+            }
             return ChannelHumanLoopResolution::NoPending;
         };
-        let response = match parse_response(&request.request, message) {
+        let Some(Ok((target, answer))) = reply else {
+            return ChannelHumanLoopResolution::Rejected(format!(
+                "Reply using /reply {} <answer>; bare text does not answer a pending request.",
+                request.identity.response_target
+            ));
+        };
+        if target != request.identity.response_target
+            || request.identity.request_id != request.request_id
+            || request.identity.kind != super::HitlRequestKind::from(&request.request.kind)
+        {
+            return ChannelHumanLoopResolution::Rejected(
+                "Reply does not match the current request target and kind.".to_string(),
+            );
+        }
+        let response = match parse_response(&request.request, answer) {
             Ok(response) => response,
             Err(reason) => {
                 return ChannelHumanLoopResolution::Rejected(format!(
                     "{reason}\n\n{}",
-                    format_prompt(&request.request_id, &request.request)
+                    format_prompt(&request.identity.response_target, &request.request)
                 ));
             }
         };
@@ -193,14 +235,16 @@ impl ChannelHumanLoopProvider {
             return ChannelHumanLoopResolution::NoPending;
         };
         let request_id = request.request_id;
-        let delivered = request.response_tx.send(response).is_ok();
+        let delivered = request.response_tx.send(Ok(response)).is_ok();
         self.publish_front(&state.pending);
         if !delivered {
             return ChannelHumanLoopResolution::Rejected(
                 "The pending request already expired; advanced to the next request.".to_string(),
             );
         }
-        ChannelHumanLoopResolution::Resolved(format!("Resolved request {request_id}."))
+        ChannelHumanLoopResolution::Resolved(format!(
+            "Submitted response for request {request_id}."
+        ))
     }
 
     fn prune_closed(pending: &mut VecDeque<PendingChannelRequest>) -> bool {
@@ -219,7 +263,10 @@ impl ChannelHumanLoopProvider {
         pending: &VecDeque<PendingChannelRequest>,
     ) {
         if let Some(request) = pending.front() {
-            let _ = prompt_tx.send(format_prompt(&request.request_id, &request.request));
+            let _ = prompt_tx.send(format_prompt(
+                &request.identity.response_target,
+                &request.request,
+            ));
         }
     }
 }
@@ -236,21 +283,36 @@ impl HumanLoopProvider for ChannelHumanLoopProvider {
         request: HumanLoopRequest,
     ) -> BoxFuture<'_, Result<HumanLoopResponse, echo_agent::error::ReactError>> {
         Box::pin(async move {
+            let paired = pair_request(request, self.request_scope()?)?;
+            self.request_paired(paired).await
+        })
+    }
+}
+
+impl PairedHumanLoopProvider for ChannelHumanLoopProvider {
+    fn request_paired(
+        &self,
+        paired: PairedHumanLoopRequest,
+    ) -> BoxFuture<'_, Result<HumanLoopResponse, echo_agent::error::ReactError>> {
+        Box::pin(async move {
+            paired.validate()?;
+            if !self.request_scope()?.accepts(&paired.identity.scope) {
+                return Err(echo_agent::error::ReactError::Other(
+                    "Channel HITL owner scope mismatch".to_string(),
+                ));
+            }
+            let identity = paired.identity;
+            let request = paired.request;
             if request.kind == HumanLoopKind::Selection
                 && request.options.as_ref().is_none_or(Vec::is_empty)
             {
-                return Ok(HumanLoopResponse::Rejected {
-                    reason: Some("Selection request has no options".to_string()),
-                });
+                return Err(echo_agent::error::ReactError::Other(
+                    "Selection request has no options".to_string(),
+                ));
             }
 
             let (response_tx, response_rx) = oneshot::channel();
-            let request_id = request
-                .request_id
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let request_id = identity.request_id.clone();
             {
                 let mut state = self
                     .state
@@ -277,6 +339,7 @@ impl HumanLoopProvider for ChannelHumanLoopProvider {
                 state.pending.push_back(PendingChannelRequest {
                     request_id: request_id.clone(),
                     request: request.clone(),
+                    identity,
                     response_tx,
                 });
                 if publish {
@@ -292,18 +355,37 @@ impl HumanLoopProvider for ChannelHumanLoopProvider {
 
             let timeout = request
                 .timeout
-                .unwrap_or(std::time::Duration::from_secs(300));
+                .unwrap_or(std::time::Duration::from_secs(300))
+                .min(std::time::Duration::from_secs(300));
             let response = match tokio::time::timeout(timeout, response_rx).await {
                 Ok(Ok(response)) => response,
-                Ok(Err(_)) => HumanLoopResponse::Rejected {
-                    reason: Some("Channel response was dropped".to_string()),
-                },
-                Err(_) => HumanLoopResponse::Timeout,
+                Ok(Err(_)) => Err(echo_agent::error::ReactError::Other(
+                    "Channel response was dropped".to_string(),
+                )),
+                Err(_) => Ok(HumanLoopResponse::Timeout),
             };
             reservation.release();
-            Ok(response)
+            response
         })
     }
+}
+
+/// Keep the answer suffix intact, including UTF-8 and subsequent newlines.
+fn parse_targeted_reply(message: &str) -> Option<Result<(&str, &str), &'static str>> {
+    let message = message.trim_start();
+    let (command, rest) = message
+        .split_once(char::is_whitespace)
+        .unwrap_or((message, ""));
+    if command != "/reply" {
+        return None;
+    }
+    let Some((target, answer)) = rest.split_once(char::is_whitespace) else {
+        return Some(Err("Reply requires a target and answer"));
+    };
+    if target.is_empty() || answer.trim().is_empty() {
+        return Some(Err("Reply requires a target and answer"));
+    }
+    Some(Ok((target, answer)))
 }
 
 fn parse_response(request: &HumanLoopRequest, message: &str) -> Result<HumanLoopResponse, String> {
@@ -318,7 +400,7 @@ fn parse_response(request: &HumanLoopRequest, message: &str) -> Result<HumanLoop
             if value.is_empty() {
                 Err("Input cannot be empty.".to_string())
             } else {
-                Ok(HumanLoopResponse::Text(value.to_string()))
+                Ok(HumanLoopResponse::Text(message.to_string()))
             }
         }
         HumanLoopKind::Approval => parse_approval(value),
@@ -369,14 +451,15 @@ fn parse_selection(request: &HumanLoopRequest, value: &str) -> Result<HumanLoopR
     }
 }
 
-fn format_prompt(request_id: &str, request: &HumanLoopRequest) -> String {
+fn format_prompt(response_target: &str, request: &HumanLoopRequest) -> String {
+    let request_id = request.request_id.as_deref().unwrap_or(response_target);
     match request.kind {
         HumanLoopKind::Approval => format!(
-            "[approval:{request_id}] {}\nReply y, a (all), n [reason], m [feedback], or /cancel.",
+            "[approval:{request_id}] {}\nUse /reply {response_target} <answer>: y, a (all), n [reason], m [feedback], or /reply {response_target} /cancel.",
             request.prompt
         ),
         HumanLoopKind::Input => format!(
-            "[input:{request_id}] {}\nReply with text, or /cancel.",
+            "[input:{request_id}] {}\nUse /reply {response_target} <text>, or /reply {response_target} /cancel.",
             request.prompt
         ),
         HumanLoopKind::Selection => {
@@ -390,7 +473,7 @@ fn format_prompt(request_id: &str, request: &HumanLoopRequest) -> String {
                 .collect::<Vec<_>>()
                 .join("\n");
             format!(
-                "[selection:{request_id}] {}\n{options}\nReply with an option number/name, or /cancel.",
+                "[selection:{request_id}] {}\n{options}\nUse /reply {response_target} <option number/name>, or /reply {response_target} /cancel.",
                 request.prompt
             )
         }
@@ -400,6 +483,116 @@ fn format_prompt(request_id: &str, request: &HumanLoopRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_id_reuse_never_accepts_an_old_target_bare_text_or_foreign_scope()
+    -> Result<(), String> {
+        for kind in [
+            HumanLoopKind::Approval,
+            HumanLoopKind::Input,
+            HumanLoopKind::Selection,
+        ] {
+            let scope = HitlRequestScope {
+                workspace_id: Some("w".to_string()),
+                host_generation: Some("generation-a".to_string()),
+                sender_incarnation: Some("sender-a".to_string()),
+                ..Default::default()
+            };
+            let provider = Arc::new(ChannelHumanLoopProvider::new().with_scope(scope.clone()));
+            let mut prompts = provider.subscribe_prompts();
+            let mut request = match kind {
+                HumanLoopKind::Approval => {
+                    HumanLoopRequest::approval("read_file", serde_json::json!({"path":"x"}))
+                }
+                HumanLoopKind::Input => HumanLoopRequest::input("中文输入"),
+                HumanLoopKind::Selection => {
+                    HumanLoopRequest::selection("task", "Choose", vec!["Continue".to_string()])
+                }
+            };
+            request.request_id = Some("reusable".to_string());
+            let a =
+                pair_request(request.clone(), scope.clone()).map_err(|error| error.to_string())?;
+            let old_target = a.identity.response_target.clone();
+            let actor = provider.clone();
+            let old = tokio::spawn(async move { actor.request_paired(a).await });
+            tokio::time::timeout(std::time::Duration::from_secs(1), prompts.recv())
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            old.abort();
+            let _ = old.await;
+            let b = pair_request(request, scope.clone()).map_err(|error| error.to_string())?;
+            let target = b.identity.response_target.clone();
+            assert_ne!(old_target, target);
+            let mut foreign = b.clone();
+            foreign.identity.scope.host_generation = Some("generation-b".to_string());
+            assert!(provider.request_paired(foreign).await.is_err());
+            let actor = provider.clone();
+            let current = tokio::spawn(async move { actor.request_paired(b).await });
+            tokio::time::timeout(std::time::Duration::from_secs(1), prompts.recv())
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            for invalid in [
+                format!("/reply {old_target} y"),
+                "/reply".to_string(),
+                "y".to_string(),
+                "/reply  y".to_string(),
+            ] {
+                assert!(matches!(
+                    provider.try_resolve_message(&invalid),
+                    ChannelHumanLoopResolution::Rejected(_)
+                ));
+            }
+            let answer = match kind {
+                HumanLoopKind::Approval => "y",
+                HumanLoopKind::Input => "  中文\n🙂",
+                HumanLoopKind::Selection => "1",
+            };
+            assert!(matches!(
+                provider.try_resolve_message(&format!("/reply {target} {answer}")),
+                ChannelHumanLoopResolution::Resolved(_)
+            ));
+            let response = current
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            match kind {
+                HumanLoopKind::Approval => assert!(matches!(response, HumanLoopResponse::Approved)),
+                HumanLoopKind::Input => {
+                    assert!(matches!(response, HumanLoopResponse::Text(text) if text == answer))
+                }
+                HumanLoopKind::Selection => assert!(
+                    matches!(response, HumanLoopResponse::Selection { selection, .. } if selection == "Continue")
+                ),
+            }
+            assert!(matches!(
+                provider.try_resolve_message(&format!("/reply {target} y")),
+                ChannelHumanLoopResolution::Rejected(_)
+            ));
+            assert!(matches!(
+                provider.try_resolve_message("ordinary new chat"),
+                ChannelHumanLoopResolution::NoPending
+            ));
+        }
+        Ok(())
+    }
+    fn front_target(provider: &ChannelHumanLoopProvider) -> String {
+        provider
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending
+            .front()
+            .map(|request| request.identity.response_target.clone())
+            .unwrap_or_default()
+    }
+    fn reply_front(
+        provider: &ChannelHumanLoopProvider,
+        answer: &str,
+    ) -> ChannelHumanLoopResolution {
+        provider.try_resolve_message(&format!("/reply {} {answer}", front_target(provider)))
+    }
 
     #[tokio::test]
     async fn resolves_input_from_next_message() -> Result<(), String> {
@@ -417,7 +610,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert!(prompt.contains("[input:"));
         assert!(matches!(
-            provider.try_resolve_message("Use file storage"),
+            reply_front(&provider, "Use file storage"),
             ChannelHumanLoopResolution::Resolved(_)
         ));
         let response = task
@@ -449,11 +642,11 @@ mod tests {
             .map_err(|_| "prompt timeout".to_string())?
             .map_err(|error| error.to_string())?;
         assert!(matches!(
-            provider.try_resolve_message("9"),
+            reply_front(&provider, "9"),
             ChannelHumanLoopResolution::Rejected(_)
         ));
         assert!(matches!(
-            provider.try_resolve_message("2"),
+            reply_front(&provider, "2"),
             ChannelHumanLoopResolution::Resolved(_)
         ));
         let response = task
@@ -510,7 +703,7 @@ mod tests {
         );
 
         assert!(matches!(
-            provider.try_resolve_message("first answer"),
+            reply_front(&provider, "first answer"),
             ChannelHumanLoopResolution::Resolved(message)
                 if message.contains("framework-first")
         ));
@@ -520,7 +713,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert!(second_prompt.contains("[input:framework-second]"));
         assert!(matches!(
-            provider.try_resolve_message("second answer"),
+            reply_front(&provider, "second answer"),
             ChannelHumanLoopResolution::Resolved(message)
                 if message.contains("framework-second")
         ));
@@ -623,7 +816,7 @@ mod tests {
             .ok_or_else(|| "duplicate request id was accepted".to_string())?;
         assert!(error.to_string().contains("same-framework-id"));
         assert!(matches!(
-            provider.try_resolve_message("first answer"),
+            reply_front(&provider, "first answer"),
             ChannelHumanLoopResolution::Resolved(_)
         ));
         let first_response = first
@@ -651,7 +844,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
 
         assert!(matches!(
-            provider.try_resolve_message("original answer"),
+            reply_front(&provider, "original answer"),
             ChannelHumanLoopResolution::Resolved(_)
         ));
         let mut duplicate = HumanLoopRequest::input("Duplicate input");
@@ -701,7 +894,7 @@ mod tests {
                 .map_err(|error| error.to_string())?;
         assert!(replacement_prompt.contains("[input:reusable-after-abort]"));
         assert!(matches!(
-            provider.try_resolve_message("replacement answer"),
+            reply_front(&provider, "replacement answer"),
             ChannelHumanLoopResolution::Resolved(_)
         ));
         let response = replacement_task
@@ -729,15 +922,12 @@ mod tests {
             .map_err(|error| error.to_string())?;
 
         assert_eq!(provider.close_now("channel session stopped"), 1);
-        let response = task
+        let error = task
             .await
             .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string())?;
-        assert!(matches!(
-            response,
-            HumanLoopResponse::Rejected { reason: Some(reason) }
-                if reason == "channel session stopped"
-        ));
+            .err()
+            .ok_or_else(|| "closed provider returned a human answer".to_string())?;
+        assert!(error.to_string().contains("channel session stopped"));
 
         let error = provider
             .request(HumanLoopRequest::input("Late input"))
@@ -795,7 +985,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert!(next_prompt.contains("[input:persistent-second]"));
         assert!(matches!(
-            provider.try_resolve_message("second answer"),
+            reply_front(&provider, "second answer"),
             ChannelHumanLoopResolution::Resolved(message)
                 if message.contains("persistent-second")
         ));
@@ -811,8 +1001,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_messages_linearize_one_resolution_and_one_no_pending() -> Result<(), String>
-    {
+    async fn concurrent_targeted_messages_linearize_one_submission_and_one_rejection()
+    -> Result<(), String> {
         let provider = Arc::new(ChannelHumanLoopProvider::new());
         let mut prompts = provider.subscribe_prompts();
         let request_provider = Arc::clone(&provider);
@@ -833,7 +1023,7 @@ mod tests {
             let start = Arc::clone(&start);
             threads.push(std::thread::spawn(move || {
                 start.wait();
-                provider.try_resolve_message(message)
+                reply_front(&provider, message)
             }));
         }
         start.wait();
@@ -858,7 +1048,7 @@ mod tests {
             resolutions
                 .iter()
                 .filter(|resolution| {
-                    matches!(resolution, ChannelHumanLoopResolution::NoPending)
+                    matches!(resolution, ChannelHumanLoopResolution::Rejected(_))
                 })
                 .count(),
             1

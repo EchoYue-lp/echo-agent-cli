@@ -23,6 +23,7 @@ fn full_config_response(cfg: &echo_agent_app_core::api::config::EkoConfig) -> Fu
     let token_limit = echo_agent_app_core::api::infra::effective_token_limit(cfg, runtime.as_ref());
     let available_models = configured_model_names(cfg);
     FullConfigResponse {
+        max_subagent_depth: cfg.max_subagent_depth.get(),
         model: ModelConfigResponse {
             provider: runtime
                 .as_ref()
@@ -179,9 +180,20 @@ pub async fn update_full_config(
     req: UpdateFullConfigRequest,
 ) -> Result<FullConfigResponse, IpcError> {
     let reapply_active_model = req.model.is_some();
+    let update_prompt = req
+        .agent
+        .as_ref()
+        .is_some_and(|agent| agent.system_prompt.is_some());
+    let update_iterations = req
+        .agent
+        .as_ref()
+        .is_some_and(|agent| agent.max_iterations.is_some());
     let config = state
         .app_state
         .update_app_config_owned(reapply_active_model, move |cfg| {
+            if let Some(limit) = req.max_subagent_depth {
+                cfg.max_subagent_depth = limit;
+            }
             if let Some(m) = req.model {
                 let active_model_id = model_config::resolve_runtime_model(cfg, None)
                     .ok()
@@ -285,18 +297,22 @@ pub async fn update_full_config(
 
     // Model runtime settings were settled by the owned config mutation. The
     // system prompt is independent of model generation publication.
-    let system_prompt = config.agent.system_prompt.clone();
-    state
-        .app_state
-        .apply_system_prompt_to_agents(system_prompt)
-        .await;
+    if update_prompt {
+        let system_prompt = config.agent.system_prompt.clone();
+        state
+            .app_state
+            .apply_system_prompt_to_agents(system_prompt)
+            .await;
+    }
     // `max_iterations` rides the same authoritative transaction: persist to
     // YAML above, then publish the resolved ceiling to the running agents so
     // the saved value is actually enforced without a restart.
-    state
-        .app_state
-        .apply_max_iterations_to_agents(config.agent.max_iterations)
-        .await;
+    if update_iterations {
+        state
+            .app_state
+            .apply_max_iterations_to_agents(config.agent.max_iterations)
+            .await;
+    }
     tracing::info!("配置已同步到 Agent");
 
     Ok(full_config_response(&config))

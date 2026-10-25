@@ -24,7 +24,7 @@ use crate::subagent_loader::SubagentCatalogSnapshot;
 
 use super::executor::{ExecEvent, RunOutcome};
 use super::profiles::ProfileTemplate;
-use super::types::{DomainProfile, EkoTaskExtension, RunPlanPolicy};
+use super::types::{DomainProfile, EkoTaskExtension, PlanTaskKind, RunPlanPolicy};
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskCapabilityCatalog {
@@ -63,7 +63,11 @@ impl TaskCapabilityCatalog {
         let extension: EkoTaskExtension = task
             .extension_as()
             .map_err(|error| format!("task '{}' has invalid EKO extension: {error}", task.id))?;
-        if !self.subagents.contains(&extension.agent_role) {
+        // Verification is an existing primary execution route, not a fake
+        // registry role. Other kinds cannot claim primary to reset depth.
+        let is_primary_verification =
+            extension.kind == PlanTaskKind::Verification && extension.agent_role == "primary";
+        if !is_primary_verification && !self.subagents.contains(&extension.agent_role) {
             let mut available = self
                 .subagents
                 .names()
@@ -525,6 +529,63 @@ mod task_create_tests {
         assert_eq!(
             plan.tasks.first().map(|task| task.agent_role.as_str()),
             Some("explorer")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verification_default_primary_and_same_run_insert_keep_the_binding()
+    -> std::result::Result<(), String> {
+        use crate::subagent_policy::{SubagentDepthDefaults, SubagentDepthLimit};
+        let defaults = Arc::new(SubagentDepthDefaults::default());
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?
+                .with_subagent_depth_defaults(defaults.clone()),
+        );
+        let tool = FrameworkTaskCreateTool::new(task_service(store.clone()));
+        let run_id = "default-verification-policy";
+        let result = with_run_id(run_id.to_string(), tool.execute(one_task_params(
+            serde_json::json!({"id":"verify", "title":"Verify", "description":"Verify changes", "kind":"verification"})
+        ))).await.map_err(|error| error.to_string())?;
+        assert!(result.success);
+        let plan = store
+            .get_plan(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "plan missing".to_string())?;
+        assert_eq!(
+            plan.tasks.first().map(|task| task.agent_role.as_str()),
+            Some("primary")
+        );
+        defaults.publish(SubagentDepthLimit::new(3)?);
+        let mut next = one_task_params(serde_json::json!({
+            "id":"inspect", "title":"Inspect", "description":"Inspect changes",
+            "kind":"investigation", "subagent":"explorer"
+        }));
+        next.insert("base_revision".to_string(), serde_json::json!(1));
+        let result = with_run_id(run_id.to_string(), tool.execute(next))
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(result.success);
+        let snapshot = store
+            .get_run_state(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "run missing".to_string())?;
+        assert_eq!(
+            snapshot
+                .execution_profile
+                .require_subagent_depth_limit()?
+                .get(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_plan(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "plan missing".to_string())?
+                .tasks
+                .len(),
+            2
         );
         Ok(())
     }

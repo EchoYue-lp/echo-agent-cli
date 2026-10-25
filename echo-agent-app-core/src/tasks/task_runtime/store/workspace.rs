@@ -2,6 +2,9 @@
 /// behind `Arc`. The event stream is authoritative; plan and execution files
 /// are deterministic read projections.
 pub struct TaskRuntimeStore {
+    /// Only the new-run default is shared with config; existing run bindings
+    /// are immutable values in the original RunCreated journal.
+    subagent_depth_defaults: std::sync::Arc<crate::subagent_policy::SubagentDepthDefaults>,
     /// Per-task cancellation tokens (in-memory runtime state, not persisted).
     /// Key = `"{run_id}::{task_id}"`. `execute_task` registers a token when a
     /// task starts and removes it on completion; runtime control actions use

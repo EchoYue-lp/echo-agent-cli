@@ -3,6 +3,137 @@
 mod tests {
     use super::*;
 
+    #[test]
+    fn depth_binding_survives_config_changes_journal_and_checkpoint_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::subagent_policy::{SubagentDepthDefaults, SubagentDepthLimit};
+        for original in [1, 3] {
+            for keep_checkpoint in [false, true] {
+                let directory = tempfile::tempdir()?;
+                let original_limit = SubagentDepthLimit::new(original)?;
+                let next_limit = SubagentDepthLimit::new(if original == 1 { 3 } else { 1 })?;
+                let defaults = std::sync::Arc::new(SubagentDepthDefaults::new(original_limit));
+                let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?
+                    .with_subagent_depth_defaults(defaults.clone());
+                store.create_run(
+                    "bound",
+                    "global",
+                    "conversation",
+                    "root",
+                    DomainProfile::General,
+                    "goal",
+                    "task",
+                    AttendedMode::Attended,
+                )?;
+                let first = store.get_run_state("bound")?.ok_or("run missing")?;
+                assert_eq!(
+                    first.execution_profile.subagent_depth_limit,
+                    Some(original_limit)
+                );
+                let checkpoint_path = directory.path().join("bound/checkpoint.json");
+                let identity = TaskRunResumeIdentity::capture(&first);
+                let mut changed_binding = first.clone();
+                changed_binding.execution_profile = changed_binding
+                    .execution_profile
+                    .with_subagent_depth_limit(next_limit);
+                assert!(
+                    identity
+                        .validate_resumable(&changed_binding)
+                        .is_err_and(|error| error.contains("execution_profile"))
+                );
+                let checkpoint = std::fs::read(&checkpoint_path)?;
+                defaults.publish(next_limit);
+                store.create_run(
+                    "bound",
+                    "global",
+                    "conversation",
+                    "root",
+                    DomainProfile::General,
+                    "goal",
+                    "task",
+                    AttendedMode::Attended,
+                )?;
+                assert_eq!(
+                    store
+                        .get_run_state("bound")?
+                        .ok_or("run missing")?
+                        .execution_profile
+                        .subagent_depth_limit,
+                    Some(original_limit)
+                );
+                assert!(
+                    store
+                        .create_run_with_profile(
+                            "bound",
+                            "global",
+                            "conversation",
+                            "root",
+                            DomainProfile::General,
+                            "goal",
+                            "task",
+                            AttendedMode::Attended,
+                            TaskRunExecutionProfile::default()
+                                .with_subagent_depth_limit(next_limit)
+                        )
+                        .is_err()
+                );
+                store.create_run(
+                    "new",
+                    "global",
+                    "conversation",
+                    "new-root",
+                    DomainProfile::General,
+                    "new goal",
+                    "task",
+                    AttendedMode::Attended,
+                )?;
+                assert_eq!(
+                    store
+                        .get_run_state("new")?
+                        .ok_or("new run missing")?
+                        .execution_profile
+                        .subagent_depth_limit,
+                    Some(next_limit)
+                );
+                store.transition_run("bound", TaskRunStatus::Running)?;
+                drop(store);
+                if keep_checkpoint {
+                    // Restore the valid prefix checkpoint so Running is a real
+                    // suffix replay, rather than testing only a warm snapshot.
+                    std::fs::write(&checkpoint_path, checkpoint)?;
+                } else {
+                    std::fs::remove_file(&checkpoint_path)?;
+                }
+                let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+                let recovered = reopened
+                    .get_run_state("bound")?
+                    .ok_or("recovered run missing")?;
+                assert_eq!(
+                    recovered.execution_profile.subagent_depth_limit,
+                    Some(original_limit)
+                );
+                assert_eq!(recovered.run.status, TaskRunStatus::Running);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_historical_profile_binding_is_never_a_new_default()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let legacy: TaskRunExecutionProfile = serde_json::from_value(serde_json::json!({
+            "provenance": "orchestrated", "plan_policy": "require_plan"
+        }))?;
+        assert!(legacy.subagent_depth_limit.is_none());
+        assert!(legacy.require_subagent_depth_limit().is_err());
+        assert!(
+            serde_json::to_value(legacy)?
+                .get("subagent_depth_limit")
+                .is_none()
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn aggregate_shutdown_drains_normal_io_then_reports_original_unknown_pool_owner()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -171,12 +302,11 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         const ROOT_ENV: &str = "EKO_TASK_OWNER_CRASH_ROOT";
         const READY_ENV: &str = "EKO_TASK_OWNER_CRASH_READY";
-        if let (Some(root), Some(ready)) =
-            (std::env::var_os(ROOT_ENV), std::env::var_os(READY_ENV))
+        if let (Some(root), Some(ready)) = (std::env::var_os(ROOT_ENV), std::env::var_os(READY_ENV))
         {
-            let store = std::sync::Arc::new(
-                TaskRuntimeStore::new_in_memory_with_shadow_root(PathBuf::from(root))?,
-            );
+            let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+                PathBuf::from(root),
+            )?);
             let _resource_scope = store.test_resource_scope();
             store.create_run(
                 "crashed-owner",
@@ -253,11 +383,16 @@ mod tests {
                 break;
             }
             if let Some(status) = child.0.as_mut().ok_or("crash child missing")?.try_wait()? {
-                return Err(format!("crash fixture exited before owner admission: {status}").into());
+                return Err(
+                    format!("crash fixture exited before owner admission: {status}").into(),
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(ready.exists(), "crash fixture never entered its real driver");
+        assert!(
+            ready.exists(),
+            "crash fixture never entered its real driver"
+        );
         assert!(
             TaskRuntimeStore::new_in_memory_with_shadow_root(&root).is_err(),
             "a live competing process must retain its exclusive root lease"
@@ -265,42 +400,70 @@ mod tests {
         let mut original = child.0.take().ok_or("crash child missing")?;
         original.kill()?;
         let status = original.wait()?;
-        assert!(!status.success(), "fixture must end without graceful shutdown");
-
-        let store = std::sync::Arc::new(
-            TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?,
+        assert!(
+            !status.success(),
+            "fixture must end without graceful shutdown"
         );
+
+        let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?);
         let pending = store.unresolved_physical_owner_intents("crashed-owner")?;
         assert_eq!(pending.len(), 1);
-        assert!(pending.iter().all(|intent| !intent.physical_terminal_observed));
+        assert!(
+            pending
+                .iter()
+                .all(|intent| !intent.physical_terminal_observed)
+        );
         let reconciler = crate::tasks::task_runtime::TaskRunBootReconciler::for_store(&store);
         assert_eq!(
             reconciler.recover_once().await?,
             1,
             "the dead process intent must not leave its run permanently Running"
         );
-        let state = store.get_run_state("crashed-owner")?.ok_or("recovered run missing")?;
+        let state = store
+            .get_run_state("crashed-owner")?
+            .ok_or("recovered run missing")?;
         assert_eq!(state.run.status, TaskRunStatus::Paused);
         assert_eq!(
-            state.continuation.and_then(|continuation| continuation.pause).map(|pause| pause.reason),
+            state
+                .continuation
+                .and_then(|continuation| continuation.pause)
+                .map(|pause| pause.reason),
             Some(RunPauseReason::BootRecovery)
         );
-        assert!(store.unresolved_physical_owner_intents("crashed-owner")?.is_empty());
+        assert!(
+            store
+                .unresolved_physical_owner_intents("crashed-owner")?
+                .is_empty()
+        );
         assert_eq!(store.recover_incomplete()?, 0);
         let events = store.list_events("crashed-owner", 0)?;
         assert_eq!(
-            events.iter().filter(|event| event.event_type == RuntimeEventKind::RecoveryResolved).count(),
+            events
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::RecoveryResolved)
+                .count(),
             1
         );
-        assert!(events.iter().all(|event| {
-            event.payload.get("physical_owner_intent")
-                .and_then(|intent| intent.get("physical_terminal_observed"))
-                .and_then(serde_json::Value::as_bool) != Some(true)
-        }), "process interruption must not fabricate physical completion");
-        assert!(events.iter().all(|event| !matches!(
-            event.event_type,
-            RuntimeEventKind::ToolStarted | RuntimeEventKind::ToolCompleted | RuntimeEventKind::ToolFailed
-        )), "boot reconciliation must not replay model or tool work");
+        assert!(
+            events.iter().all(|event| {
+                event
+                    .payload
+                    .get("physical_owner_intent")
+                    .and_then(|intent| intent.get("physical_terminal_observed"))
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+            }),
+            "process interruption must not fabricate physical completion"
+        );
+        assert!(
+            events.iter().all(|event| !matches!(
+                event.event_type,
+                RuntimeEventKind::ToolStarted
+                    | RuntimeEventKind::ToolCompleted
+                    | RuntimeEventKind::ToolFailed
+            )),
+            "boot reconciliation must not replay model or tool work"
+        );
         Ok(())
     }
 
@@ -310,27 +473,63 @@ mod tests {
         let store = std::sync::Arc::new(fresh()?);
         seed_history_plan(&store, "atomic-owner")?;
         store.transition_run("atomic-owner", TaskRunStatus::Running)?;
-        store.set_task_status("atomic-owner", "target-task", echo_agent::tasks::TaskStatus::Running, None, None)?;
-        store.record_tool_started("atomic-owner", "target-task", "execution", "unsafe-call", "write_file", false)?;
+        store.set_task_status(
+            "atomic-owner",
+            "target-task",
+            echo_agent::tasks::TaskStatus::Running,
+            None,
+            None,
+        )?;
+        store.record_tool_started(
+            "atomic-owner",
+            "target-task",
+            "execution",
+            "unsafe-call",
+            "write_file",
+            false,
+        )?;
         let intent = PhysicalOwnerIntent {
-            run_id: "atomic-owner".to_string(), owner_id: "dead-owner".to_string(),
-            execution_id: None, workspace_id: "test".to_string(),
-            process_epoch: Some(uuid::Uuid::new_v4().to_string()), physical_terminal_observed: false,
+            run_id: "atomic-owner".to_string(),
+            owner_id: "dead-owner".to_string(),
+            execution_id: None,
+            workspace_id: "test".to_string(),
+            process_epoch: Some(uuid::Uuid::new_v4().to_string()),
+            physical_terminal_observed: false,
         };
         store.commit_runtime_event(RuntimeJournalEvent::for_append(
-            "atomic-owner", None, None, RuntimeEventKind::RecoveryBlocked,
+            "atomic-owner",
+            None,
+            None,
+            RuntimeEventKind::RecoveryBlocked,
             serde_json::json!({"physical_owner_intent": intent}),
         ))?;
         let before = serde_json::to_value(store.list_events("atomic-owner", 0)?)?;
         store.fail_next_recovery_commit_for_test();
         assert!(store.recover_incomplete().is_err());
-        assert_eq!(store.unresolved_physical_owner_intents("atomic-owner")?, vec![intent],
-            "failed recovery must retain the original admission fence");
-        assert_eq!(serde_json::to_value(store.list_events("atomic-owner", 0)?)?, before,
-            "owner retirement must not commit before unsafe effects are classified");
-        assert!(store.reserve_run_driver_admission("atomic-owner".to_string(), echo_agent::agent::CancellationToken::new()).is_err());
+        assert_eq!(
+            store.unresolved_physical_owner_intents("atomic-owner")?,
+            vec![intent],
+            "failed recovery must retain the original admission fence"
+        );
+        assert_eq!(
+            serde_json::to_value(store.list_events("atomic-owner", 0)?)?,
+            before,
+            "owner retirement must not commit before unsafe effects are classified"
+        );
+        assert!(
+            store
+                .reserve_run_driver_admission(
+                    "atomic-owner".to_string(),
+                    echo_agent::agent::CancellationToken::new()
+                )
+                .is_err()
+        );
         assert_eq!(store.recover_incomplete()?, 1);
-        assert!(store.unresolved_physical_owner_intents("atomic-owner")?.is_empty());
+        assert!(
+            store
+                .unresolved_physical_owner_intents("atomic-owner")?
+                .is_empty()
+        );
         assert!(!store.list_recovery_blockers("atomic-owner")?.is_empty());
         assert!(store.resume_task_run("atomic-owner").is_err());
         Ok(())
@@ -344,25 +543,61 @@ mod tests {
             if with_plan {
                 seed_history_plan(&store, "orphan-unsafe")?;
             } else {
-                store.create_run("orphan-unsafe", "global", "conversation", "message", DomainProfile::General, "goal", "task", AttendedMode::Attended)?;
+                store.create_run(
+                    "orphan-unsafe",
+                    "global",
+                    "conversation",
+                    "message",
+                    DomainProfile::General,
+                    "goal",
+                    "task",
+                    AttendedMode::Attended,
+                )?;
             }
             store.transition_run("orphan-unsafe", TaskRunStatus::Running)?;
-            store.record_tool_started("orphan-unsafe", "absent-task", "original-execution", "unsafe-call", "write_file", false)?;
+            store.record_tool_started(
+                "orphan-unsafe",
+                "absent-task",
+                "original-execution",
+                "unsafe-call",
+                "write_file",
+                false,
+            )?;
             let intent = PhysicalOwnerIntent {
-                run_id: "orphan-unsafe".to_string(), owner_id: "dead-owner".to_string(),
-                execution_id: None, workspace_id: store.active_workspace_id(),
-                process_epoch: Some(uuid::Uuid::new_v4().to_string()), physical_terminal_observed: false,
+                run_id: "orphan-unsafe".to_string(),
+                owner_id: "dead-owner".to_string(),
+                execution_id: None,
+                workspace_id: store.active_workspace_id(),
+                process_epoch: Some(uuid::Uuid::new_v4().to_string()),
+                physical_terminal_observed: false,
             };
             store.commit_runtime_event(RuntimeJournalEvent::for_append(
-                "orphan-unsafe", None, None, RuntimeEventKind::RecoveryBlocked,
+                "orphan-unsafe",
+                None,
+                None,
+                RuntimeEventKind::RecoveryBlocked,
                 serde_json::json!({"physical_owner_intent":intent}),
             ))?;
             let before = serde_json::to_value(store.list_events("orphan-unsafe", 0)?)?;
             for _ in 0..2 {
-                assert!(matches!(store.recover_incomplete(), Err(StoreError::RecoveryBlocked { .. })));
-                assert_eq!(serde_json::to_value(store.list_events("orphan-unsafe", 0)?)?, before);
-                assert_eq!(store.unresolved_physical_owner_intents("orphan-unsafe")?, vec![intent.clone()]);
-                assert_eq!(store.get_run_state("orphan-unsafe")?.map(|state| state.run.status), Some(TaskRunStatus::Running));
+                assert!(matches!(
+                    store.recover_incomplete(),
+                    Err(StoreError::RecoveryBlocked { .. })
+                ));
+                assert_eq!(
+                    serde_json::to_value(store.list_events("orphan-unsafe", 0)?)?,
+                    before
+                );
+                assert_eq!(
+                    store.unresolved_physical_owner_intents("orphan-unsafe")?,
+                    vec![intent.clone()]
+                );
+                assert_eq!(
+                    store
+                        .get_run_state("orphan-unsafe")?
+                        .map(|state| state.run.status),
+                    Some(TaskRunStatus::Running)
+                );
             }
         }
         Ok(())
@@ -374,22 +609,50 @@ mod tests {
         let store = fresh()?;
         seed_history_plan(&store, "paused-unsafe-owner")?;
         store.transition_run("paused-unsafe-owner", TaskRunStatus::Running)?;
-        store.set_task_status("paused-unsafe-owner", "target-task", echo_agent::tasks::TaskStatus::Running, None, None)?;
-        store.record_tool_started("paused-unsafe-owner", "target-task", "execution", "unsafe-call", "write_file", false)?;
+        store.set_task_status(
+            "paused-unsafe-owner",
+            "target-task",
+            echo_agent::tasks::TaskStatus::Running,
+            None,
+            None,
+        )?;
+        store.record_tool_started(
+            "paused-unsafe-owner",
+            "target-task",
+            "execution",
+            "unsafe-call",
+            "write_file",
+            false,
+        )?;
         store.transition_run("paused-unsafe-owner", TaskRunStatus::Paused)?;
         let intent = PhysicalOwnerIntent {
-            run_id: "paused-unsafe-owner".to_string(), owner_id: "dead-owner".to_string(),
-            execution_id: None, workspace_id: "test".to_string(),
-            process_epoch: Some(uuid::Uuid::new_v4().to_string()), physical_terminal_observed: false,
+            run_id: "paused-unsafe-owner".to_string(),
+            owner_id: "dead-owner".to_string(),
+            execution_id: None,
+            workspace_id: "test".to_string(),
+            process_epoch: Some(uuid::Uuid::new_v4().to_string()),
+            physical_terminal_observed: false,
         };
         store.commit_runtime_event(RuntimeJournalEvent::for_append(
-            "paused-unsafe-owner", None, None, RuntimeEventKind::RecoveryBlocked,
+            "paused-unsafe-owner",
+            None,
+            None,
+            RuntimeEventKind::RecoveryBlocked,
             serde_json::json!({"physical_owner_intent":intent}),
         ))?;
         store.recover_incomplete()?;
-        assert!(store.unresolved_physical_owner_intents("paused-unsafe-owner")?.is_empty());
-        assert!(store.list_recovery_blockers("paused-unsafe-owner")?.iter().any(|blocker| blocker.call_id.as_deref() == Some("unsafe-call")),
-            "paused recovery must classify unsafe effects before retiring their dead owner");
+        assert!(
+            store
+                .unresolved_physical_owner_intents("paused-unsafe-owner")?
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_recovery_blockers("paused-unsafe-owner")?
+                .iter()
+                .any(|blocker| blocker.call_id.as_deref() == Some("unsafe-call")),
+            "paused recovery must classify unsafe effects before retiring their dead owner"
+        );
         assert!(store.resume_task_run("paused-unsafe-owner").is_err());
         assert_eq!(store.recover_incomplete()?, 0);
         Ok(())
@@ -400,35 +663,73 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         const ROOT_ENV: &str = "EKO_TASK_CANCELLED_OWNER_CRASH_ROOT";
         const READY_ENV: &str = "EKO_TASK_CANCELLED_OWNER_CRASH_READY";
-        if let (Some(root), Some(ready)) = (std::env::var_os(ROOT_ENV), std::env::var_os(READY_ENV)) {
-            let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(PathBuf::from(root))?);
+        if let (Some(root), Some(ready)) = (std::env::var_os(ROOT_ENV), std::env::var_os(READY_ENV))
+        {
+            let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+                PathBuf::from(root),
+            )?);
             let _scope = store.test_resource_scope();
             seed_history_plan(&store, "cancelled-crash")?;
             store.transition_run("cancelled-crash", TaskRunStatus::Running)?;
-            let admission = store.reserve_run_driver_admission("cancelled-crash".to_string(), echo_agent::agent::CancellationToken::new())?;
-            let registration = store.register_observed_run_driver::<()>(admission, store.lease_active_workspace_generation()?)?;
+            let admission = store.reserve_run_driver_admission(
+                "cancelled-crash".to_string(),
+                echo_agent::agent::CancellationToken::new(),
+            )?;
+            let registration = store.register_observed_run_driver::<()>(
+                admission,
+                store.lease_active_workspace_generation()?,
+            )?;
             let driver_store = store.clone();
-            let _result = registration.start(move |_owner| async move {
-                let snapshot = driver_store.load_runtime_plan_snapshot("cancelled-crash").map_err(|error| RunDriverFailure::from(error.to_string()))?;
-                let task = snapshot.tasks.iter().find(|task| task.spec.id == "target-task").ok_or_else(|| RunDriverFailure::from("task missing".to_string()))?;
-                let claim = match driver_store.claim_runtime_task("cancelled-crash", task, snapshot.revision).map_err(|error| RunDriverFailure::from(error.to_string()))? {
-                    echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
-                    _ => return Err(RunDriverFailure::from("claim not acquired".to_string())),
-                };
-                driver_store.request_cancel("cancelled-crash").map_err(|error| RunDriverFailure::from(error.to_string()))?;
-                let execution = driver_store.runtime_task_execution("cancelled-crash", "target-task").map_err(|error| RunDriverFailure::from(error.to_string()))?.ok_or_else(|| RunDriverFailure::from("execution missing".to_string()))?;
-                if execution.interruption_requested != Some(echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled) || execution.claim.as_ref() != Some(&claim) {
-                    return Err(RunDriverFailure::from("accepted interruption not persisted on original claim".to_string()));
-                }
-                std::fs::write(ready, serde_json::to_vec(&claim).map_err(|error| RunDriverFailure::from(error.to_string()))?).map_err(|error| RunDriverFailure::from(error.to_string()))?;
-                std::future::pending::<Result<(), RunDriverFailure>>().await
-            }).await?;
+            let _result = registration
+                .start(move |_owner| async move {
+                    let snapshot = driver_store
+                        .load_runtime_plan_snapshot("cancelled-crash")
+                        .map_err(|error| RunDriverFailure::from(error.to_string()))?;
+                    let task = snapshot
+                        .tasks
+                        .iter()
+                        .find(|task| task.spec.id == "target-task")
+                        .ok_or_else(|| RunDriverFailure::from("task missing".to_string()))?;
+                    let claim = match driver_store
+                        .claim_runtime_task("cancelled-crash", task, snapshot.revision)
+                        .map_err(|error| RunDriverFailure::from(error.to_string()))?
+                    {
+                        echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+                        _ => return Err(RunDriverFailure::from("claim not acquired".to_string())),
+                    };
+                    driver_store
+                        .request_cancel("cancelled-crash")
+                        .map_err(|error| RunDriverFailure::from(error.to_string()))?;
+                    let execution = driver_store
+                        .runtime_task_execution("cancelled-crash", "target-task")
+                        .map_err(|error| RunDriverFailure::from(error.to_string()))?
+                        .ok_or_else(|| RunDriverFailure::from("execution missing".to_string()))?;
+                    if execution.interruption_requested
+                        != Some(echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled)
+                        || execution.claim.as_ref() != Some(&claim)
+                    {
+                        return Err(RunDriverFailure::from(
+                            "accepted interruption not persisted on original claim".to_string(),
+                        ));
+                    }
+                    std::fs::write(
+                        ready,
+                        serde_json::to_vec(&claim)
+                            .map_err(|error| RunDriverFailure::from(error.to_string()))?,
+                    )
+                    .map_err(|error| RunDriverFailure::from(error.to_string()))?;
+                    std::future::pending::<Result<(), RunDriverFailure>>().await
+                })
+                .await?;
             return Err("cancelled crash fixture unexpectedly returned".into());
         }
         struct CrashChild(Option<std::process::Child>);
         impl Drop for CrashChild {
             fn drop(&mut self) {
-                if let Some(child) = self.0.as_mut() { let _ = child.kill(); let _ = child.wait(); }
+                if let Some(child) = self.0.as_mut() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
             }
         }
         let directory = tempfile::tempdir()?;
@@ -438,27 +739,48 @@ mod tests {
             .arg("tasks::task_runtime::store::tests::crashed_registered_owner_preserves_accepted_claim_cancellation").arg("--exact").arg("--nocapture")
             .env(ROOT_ENV, &root).env(READY_ENV, &ready).spawn()?));
         for _ in 0..1_000 {
-            if ready.exists() { break; }
-            if let Some(status) = child.0.as_mut().ok_or("child missing")?.try_wait()? { return Err(format!("cancel fixture exited before ready: {status}").into()); }
+            if ready.exists() {
+                break;
+            }
+            if let Some(status) = child.0.as_mut().ok_or("child missing")?.try_wait()? {
+                return Err(format!("cancel fixture exited before ready: {status}").into());
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(ready.exists(), "driver never persisted exact claim cancellation");
+        assert!(
+            ready.exists(),
+            "driver never persisted exact claim cancellation"
+        );
         let claim: echo_agent::tasks::TaskClaim = serde_json::from_slice(&std::fs::read(&ready)?)?;
         let mut original = child.0.take().ok_or("child missing")?;
         original.kill()?;
         assert!(!original.wait()?.success());
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(root)?;
-        let before = store.runtime_task_execution("cancelled-crash", "target-task")?.ok_or("task missing")?;
+        let before = store
+            .runtime_task_execution("cancelled-crash", "target-task")?
+            .ok_or("task missing")?;
         assert_eq!(before.claim.as_ref(), Some(&claim));
-        assert_eq!(before.interruption_requested, Some(echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled));
+        assert_eq!(
+            before.interruption_requested,
+            Some(echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled)
+        );
         assert_eq!(store.recover_incomplete()?, 1);
         let snapshot = store.load_runtime_plan_snapshot("cancelled-crash")?;
-        let execution = &snapshot.tasks.iter().find(|task| task.spec.id == "target-task").ok_or("recovered task missing")?.execution;
+        let execution = &snapshot
+            .tasks
+            .iter()
+            .find(|task| task.spec.id == "target-task")
+            .ok_or("recovered task missing")?
+            .execution;
         assert_eq!(execution.status, echo_agent::tasks::TaskStatus::Cancelled);
         assert!(execution.claim.is_none());
         assert!(execution.interruption_requested.is_none());
         assert_eq!(execution.retry_count, before.retry_count);
-        assert!(store.unresolved_physical_owner_intents("cancelled-crash")?.is_empty());
+        assert!(
+            store
+                .unresolved_physical_owner_intents("cancelled-crash")?
+                .is_empty()
+        );
         assert_eq!(store.recover_incomplete()?, 0);
         Ok(())
     }
@@ -494,13 +816,20 @@ mod tests {
             reopened.get_run("legacy-owner")?.map(|run| run.status),
             Some(TaskRunStatus::Paused)
         );
-        assert!(reopened.unresolved_physical_owner_intents("legacy-owner")?.is_empty());
+        assert!(
+            reopened
+                .unresolved_physical_owner_intents("legacy-owner")?
+                .is_empty()
+        );
         assert_eq!(reopened.recover_incomplete()?, 0);
         let events = reopened.list_events("legacy-owner", 0)?;
         assert!(events.iter().all(|event| {
-            event.payload.get("physical_owner_intent")
+            event
+                .payload
+                .get("physical_owner_intent")
                 .and_then(|intent| intent.get("physical_terminal_observed"))
-                .and_then(serde_json::Value::as_bool) != Some(true)
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
         }));
         Ok(())
     }
@@ -549,7 +878,12 @@ mod tests {
                 physical_terminal_observed: false,
             };
             store.begin_physical_owner_intent(&mut intent)?;
-            assert!(intent.process_epoch.as_ref().is_some_and(|epoch| !epoch.is_empty()));
+            assert!(
+                intent
+                    .process_epoch
+                    .as_ref()
+                    .is_some_and(|epoch| !epoch.is_empty())
+            );
             store.record_background_cell_started(
                 "owner-run",
                 "protected-cell",
@@ -699,17 +1033,29 @@ mod tests {
             physical_terminal_observed: false,
         };
         store.begin_physical_owner_intent(&mut intent)?;
-        assert_ne!(intent.process_epoch.as_deref(), Some(foreign_epoch.as_str()));
-        assert_eq!(intent.process_epoch.as_deref(), Some(store.shadow.owner_process_epoch()?));
+        assert_ne!(
+            intent.process_epoch.as_deref(),
+            Some(foreign_epoch.as_str())
+        );
+        assert_eq!(
+            intent.process_epoch.as_deref(),
+            Some(store.shadow.owner_process_epoch()?)
+        );
         assert_eq!(store.recover_incomplete()?, 0);
-        assert_eq!(store.unresolved_physical_owner_intents("stamped-owner")?, vec![intent]);
+        assert_eq!(
+            store.unresolved_physical_owner_intents("stamped-owner")?,
+            vec![intent]
+        );
 
         for epoch in ["", " ", "not-a-valid-epoch"] {
             let invalid_store = fresh()?;
             seed_history_plan(&invalid_store, "malformed-epoch")?;
             invalid_store.transition_run("malformed-epoch", TaskRunStatus::Running)?;
             invalid_store.commit_runtime_event(RuntimeJournalEvent::for_append(
-                "malformed-epoch", None, None, RuntimeEventKind::RecoveryBlocked,
+                "malformed-epoch",
+                None,
+                None,
+                RuntimeEventKind::RecoveryBlocked,
                 serde_json::json!({ "physical_owner_intent": {
                     "run_id": "malformed-epoch", "owner_id": "owner", "execution_id": null,
                     "workspace_id": "test", "process_epoch": epoch,
@@ -717,8 +1063,14 @@ mod tests {
                 }}),
             ))?;
             let before = invalid_store.list_events("malformed-epoch", 0)?;
-            assert!(matches!(invalid_store.recover_incomplete(), Err(StoreError::RecoveryBlocked { .. })));
-            assert_eq!(serde_json::to_value(invalid_store.list_events("malformed-epoch", 0)?)?, serde_json::to_value(before)?);
+            assert!(matches!(
+                invalid_store.recover_incomplete(),
+                Err(StoreError::RecoveryBlocked { .. })
+            ));
+            assert_eq!(
+                serde_json::to_value(invalid_store.list_events("malformed-epoch", 0)?)?,
+                serde_json::to_value(before)?
+            );
         }
         Ok(())
     }
@@ -726,7 +1078,12 @@ mod tests {
     #[test]
     fn terminal_process_owner_debts_retire_without_rewriting_committed_run_status()
     -> Result<(), Box<dyn std::error::Error>> {
-        for status in [TaskRunStatus::Pending, TaskRunStatus::Completed, TaskRunStatus::Failed, TaskRunStatus::Cancelled] {
+        for status in [
+            TaskRunStatus::Pending,
+            TaskRunStatus::Completed,
+            TaskRunStatus::Failed,
+            TaskRunStatus::Cancelled,
+        ] {
             for epoch in [None, Some(uuid::Uuid::new_v4().to_string())] {
                 let store = fresh()?;
                 seed_history_plan(&store, "terminal-debt")?;
@@ -735,17 +1092,30 @@ mod tests {
                     store.transition_run("terminal-debt", status)?;
                 }
                 let intent = PhysicalOwnerIntent {
-                    run_id: "terminal-debt".to_string(), owner_id: "old-owner".to_string(),
-                    execution_id: None, workspace_id: "test".to_string(),
-                    process_epoch: epoch, physical_terminal_observed: false,
+                    run_id: "terminal-debt".to_string(),
+                    owner_id: "old-owner".to_string(),
+                    execution_id: None,
+                    workspace_id: "test".to_string(),
+                    process_epoch: epoch,
+                    physical_terminal_observed: false,
                 };
                 store.commit_runtime_event(RuntimeJournalEvent::for_append(
-                    "terminal-debt", None, None, RuntimeEventKind::RecoveryBlocked,
+                    "terminal-debt",
+                    None,
+                    None,
+                    RuntimeEventKind::RecoveryBlocked,
                     serde_json::json!({"physical_owner_intent":intent}),
                 ))?;
                 assert_eq!(store.recover_incomplete()?, 0);
-                assert_eq!(store.get_run("terminal-debt")?.map(|run|run.status), Some(status));
-                assert!(store.unresolved_physical_owner_intents("terminal-debt")?.is_empty());
+                assert_eq!(
+                    store.get_run("terminal-debt")?.map(|run| run.status),
+                    Some(status)
+                );
+                assert!(
+                    store
+                        .unresolved_physical_owner_intents("terminal-debt")?
+                        .is_empty()
+                );
                 assert_eq!(store.recover_incomplete()?, 0);
             }
         }
@@ -753,14 +1123,20 @@ mod tests {
         seed_history_plan(&store, "current-terminal")?;
         store.transition_run("current-terminal", TaskRunStatus::Running)?;
         let mut intent = PhysicalOwnerIntent {
-            run_id: "current-terminal".to_string(), owner_id: "live-owner".to_string(),
-            execution_id: None, workspace_id: "test".to_string(),
-            process_epoch: None, physical_terminal_observed: false,
+            run_id: "current-terminal".to_string(),
+            owner_id: "live-owner".to_string(),
+            execution_id: None,
+            workspace_id: "test".to_string(),
+            process_epoch: None,
+            physical_terminal_observed: false,
         };
         store.begin_physical_owner_intent(&mut intent)?;
         store.transition_run("current-terminal", TaskRunStatus::Completed)?;
         assert_eq!(store.recover_incomplete()?, 0);
-        assert_eq!(store.unresolved_physical_owner_intents("current-terminal")?, vec![intent]);
+        assert_eq!(
+            store.unresolved_physical_owner_intents("current-terminal")?,
+            vec![intent]
+        );
         Ok(())
     }
 
@@ -770,38 +1146,93 @@ mod tests {
         let store = fresh()?;
         seed_history_plan(&store, "unsafe-owner")?;
         store.transition_run("unsafe-owner", TaskRunStatus::Running)?;
-        store.set_task_status("unsafe-owner", "target-task", echo_agent::tasks::TaskStatus::Running, None, None)?;
-        store.record_tool_started("unsafe-owner", "target-task", "old-execution", "unsafe-call", "write_file", false)?;
+        store.set_task_status(
+            "unsafe-owner",
+            "target-task",
+            echo_agent::tasks::TaskStatus::Running,
+            None,
+            None,
+        )?;
+        store.record_tool_started(
+            "unsafe-owner",
+            "target-task",
+            "old-execution",
+            "unsafe-call",
+            "write_file",
+            false,
+        )?;
         let intent = PhysicalOwnerIntent {
-            run_id: "unsafe-owner".to_string(), owner_id: "dead-owner".to_string(),
-            execution_id: None, workspace_id: "test".to_string(),
-            process_epoch: Some(uuid::Uuid::new_v4().to_string()), physical_terminal_observed: false,
+            run_id: "unsafe-owner".to_string(),
+            owner_id: "dead-owner".to_string(),
+            execution_id: None,
+            workspace_id: "test".to_string(),
+            process_epoch: Some(uuid::Uuid::new_v4().to_string()),
+            physical_terminal_observed: false,
         };
         store.commit_runtime_event(RuntimeJournalEvent::for_append(
-            "unsafe-owner", None, None, RuntimeEventKind::RecoveryBlocked,
+            "unsafe-owner",
+            None,
+            None,
+            RuntimeEventKind::RecoveryBlocked,
             serde_json::json!({"physical_owner_intent": intent}),
         ))?;
         assert_eq!(store.recover_incomplete()?, 1);
-        assert_eq!(store.get_run("unsafe-owner")?.map(|run| run.status), Some(TaskRunStatus::Paused));
-        assert!(store.unresolved_physical_owner_intents("unsafe-owner")?.is_empty());
-        assert!(store.list_recovery_blockers("unsafe-owner")?.iter().any(|blocker| blocker.call_id.as_deref() == Some("unsafe-call")));
-        assert!(store.resume_task_run("unsafe-owner").is_err(), "releasing a dead process fence cannot authorize replaying an unsafe effect");
+        assert_eq!(
+            store.get_run("unsafe-owner")?.map(|run| run.status),
+            Some(TaskRunStatus::Paused)
+        );
+        assert!(
+            store
+                .unresolved_physical_owner_intents("unsafe-owner")?
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_recovery_blockers("unsafe-owner")?
+                .iter()
+                .any(|blocker| blocker.call_id.as_deref() == Some("unsafe-call"))
+        );
+        assert!(
+            store.resume_task_run("unsafe-owner").is_err(),
+            "releasing a dead process fence cannot authorize replaying an unsafe effect"
+        );
 
         seed_history_plan(&store, "paused-cell-owner")?;
         store.transition_run("paused-cell-owner", TaskRunStatus::Running)?;
         store.transition_run("paused-cell-owner", TaskRunStatus::Paused)?;
-        store.record_background_cell_started("paused-cell-owner", "old-cell", "old command", "command-hash", None, None, None)?;
+        store.record_background_cell_started(
+            "paused-cell-owner",
+            "old-cell",
+            "old command",
+            "command-hash",
+            None,
+            None,
+            None,
+        )?;
         let intent = PhysicalOwnerIntent {
-            run_id: "paused-cell-owner".to_string(), owner_id: "dead-cell-owner".to_string(),
-            process_epoch: Some(uuid::Uuid::new_v4().to_string()), ..intent
+            run_id: "paused-cell-owner".to_string(),
+            owner_id: "dead-cell-owner".to_string(),
+            process_epoch: Some(uuid::Uuid::new_v4().to_string()),
+            ..intent
         };
         store.commit_runtime_event(RuntimeJournalEvent::for_append(
-            "paused-cell-owner", None, None, RuntimeEventKind::RecoveryBlocked,
+            "paused-cell-owner",
+            None,
+            None,
+            RuntimeEventKind::RecoveryBlocked,
             serde_json::json!({"physical_owner_intent": intent}),
         ))?;
         assert_eq!(store.recover_incomplete()?, 1);
-        assert_eq!(store.get_run("paused-cell-owner")?.map(|run| run.status), Some(TaskRunStatus::Paused));
-        assert!(store.list_background_cells("paused-cell-owner")?.iter().all(|cell| !cell.is_active()));
+        assert_eq!(
+            store.get_run("paused-cell-owner")?.map(|run| run.status),
+            Some(TaskRunStatus::Paused)
+        );
+        assert!(
+            store
+                .list_background_cells("paused-cell-owner")?
+                .iter()
+                .all(|cell| !cell.is_active())
+        );
         assert_eq!(store.recover_incomplete()?, 0);
         Ok(())
     }

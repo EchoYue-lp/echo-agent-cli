@@ -70,6 +70,12 @@ pub struct UpdateConfigRequest {
 #[derive(Debug, Deserialize, Default, TS)]
 #[ts(export, rename = "UpdateFullConfigRequest")]
 pub struct UpdateFullConfigRequest {
+    #[serde(
+        default,
+        deserialize_with = "crate::subagent_policy::deserialize_optional_depth"
+    )]
+    #[ts(optional, type = "number")]
+    pub max_subagent_depth: Option<crate::subagent_policy::SubagentDepthLimit>,
     pub model: Option<ModelUpdate>,
     pub agent: Option<AgentUpdate>,
     pub mcp: Option<McpUpdate>,

@@ -13,6 +13,7 @@ import { reorderById } from './queuedChat';
 import type { ForegroundTurnSnapshot } from '../generated';
 import type {
   Attachment,
+  HitlRequestIdentity,
   ChatEventEnvelope,
   ChatEventReplay,
   ConversationInputFrontier,
@@ -718,20 +719,28 @@ export function useTauriChat() {
   );
 
   const sendApproval = useCallback(
-    async (requestId: string, approved: boolean, reason?: string, scope?: string) => {
+    async (identity: HitlRequestIdentity, approved: boolean, reason?: string, scope?: string) => {
       try {
-        await apiInvoke('send_approval_response', {
-          workspaceId: currentWorkspaceIdRef.current,
-          conversationId:
-            currentConversationIdRef.current ?? useConversationStore.getState().activeId,
-          expectedRootTurnId: currentMessageKeyRef.current,
-          expectedActiveTurnId: activeTurnIdRef.current,
-          requestId,
-          approved,
-          reason,
-          scope,
-        });
-        useChatStore.getState().removeHitlRequest(requestId);
+        const receipt = await apiInvoke<{ submitted: boolean; response_target: string }>(
+          'send_approval_response',
+          {
+            workspaceId: identity.scope.workspace_id,
+            conversationId: identity.scope.conversation_id,
+            expectedRootTurnId: identity.scope.root_turn_id,
+            expectedActiveTurnId: identity.scope.turn_id,
+            requestId: identity.request_id,
+            responseTarget: identity.response_target,
+            requestScope: identity.scope,
+            requestKind: identity.kind,
+            approved,
+            reason,
+            scope,
+          }
+        );
+        if (receipt?.submitted !== true || receipt.response_target !== identity.response_target) {
+          throw new Error('HITL response submission was not acknowledged');
+        }
+        useChatStore.getState().removeHitlRequest(identity);
       } catch (e) {
         console.error('[TauriChat] Failed to send approval:', e);
         throw e;
@@ -740,39 +749,61 @@ export function useTauriChat() {
     []
   );
 
-  const sendInput = useCallback(async (requestId: string, text: string) => {
+  const sendInput = useCallback(async (identity: HitlRequestIdentity, text: string) => {
     try {
-      await apiInvoke('send_input_response', {
-        workspaceId: currentWorkspaceIdRef.current,
-        conversationId:
-          currentConversationIdRef.current ?? useConversationStore.getState().activeId,
-        expectedRootTurnId: currentMessageKeyRef.current,
-        expectedActiveTurnId: activeTurnIdRef.current,
-        requestId,
-        text,
-      });
-      useChatStore.getState().removeHitlRequest(requestId);
+      const receipt = await apiInvoke<{ submitted: boolean; response_target: string }>(
+        'send_input_response',
+        {
+          workspaceId: identity.scope.workspace_id,
+          conversationId: identity.scope.conversation_id,
+          expectedRootTurnId: identity.scope.root_turn_id,
+          expectedActiveTurnId: identity.scope.turn_id,
+          requestId: identity.request_id,
+          responseTarget: identity.response_target,
+          requestScope: identity.scope,
+          requestKind: identity.kind,
+          text,
+        }
+      );
+      if (receipt?.submitted !== true || receipt.response_target !== identity.response_target) {
+        throw new Error('HITL response submission was not acknowledged');
+      }
+      useChatStore.getState().removeHitlRequest(identity);
+      return true;
     } catch (e) {
       console.error('[TauriChat] Failed to send input:', e);
+      useToastStore.getState().addToast('error', `回复提交失败：${errorMessage(e)}`);
+      return false;
     }
   }, []);
 
   const sendSelection = useCallback(
-    async (requestId: string, selection: string, instructions?: string) => {
+    async (identity: HitlRequestIdentity, selection: string, instructions?: string) => {
       try {
-        await apiInvoke('send_selection_response', {
-          workspaceId: currentWorkspaceIdRef.current,
-          conversationId:
-            currentConversationIdRef.current ?? useConversationStore.getState().activeId,
-          expectedRootTurnId: currentMessageKeyRef.current,
-          expectedActiveTurnId: activeTurnIdRef.current,
-          requestId,
-          selection,
-          instructions,
-        });
-        useChatStore.getState().removeHitlRequest(requestId);
+        const receipt = await apiInvoke<{ submitted: boolean; response_target: string }>(
+          'send_selection_response',
+          {
+            workspaceId: identity.scope.workspace_id,
+            conversationId: identity.scope.conversation_id,
+            expectedRootTurnId: identity.scope.root_turn_id,
+            expectedActiveTurnId: identity.scope.turn_id,
+            requestId: identity.request_id,
+            responseTarget: identity.response_target,
+            requestScope: identity.scope,
+            requestKind: identity.kind,
+            selection,
+            instructions,
+          }
+        );
+        if (receipt?.submitted !== true || receipt.response_target !== identity.response_target) {
+          throw new Error('HITL response submission was not acknowledged');
+        }
+        useChatStore.getState().removeHitlRequest(identity);
+        return true;
       } catch (e) {
         console.error('[TauriChat] Failed to send selection:', e);
+        useToastStore.getState().addToast('error', `回复提交失败：${errorMessage(e)}`);
+        return false;
       }
     },
     []

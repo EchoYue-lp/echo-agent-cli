@@ -1,8 +1,108 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_hitl_without_identity_keeps_payload_hash_through_real_journal_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let payloads = [
+            serde_json::json!({"source":"approval_request","event":{"request_id":"reusable","tool_name":"read_file","args":{"path":"中文"},"prompt":"approve"}}),
+            serde_json::json!({"source":"input_request","event":{"request_id":"reusable","prompt":"中文\n🙂"}}),
+            serde_json::json!({"source":"selection_request","event":{"request_id":"reusable","prompt":"Choose","options":["继续"],"task_id":null,"context":null,"phase":null}}),
+        ];
+        let mut hashes = Vec::new();
+        {
+            let log = ChatEventLog::open(directory.path(), ChatEventRetention::default())?;
+            for raw in &payloads {
+                let event: ChatDriverEvent = serde_json::from_value(raw.clone())?;
+                assert_eq!(serde_json::to_value(&event)?, *raw);
+                hashes.push(log.append("w", Some("c"), "root", event)?.content_hash);
+            }
+        }
+        let reopened = ChatEventLog::open(directory.path(), ChatEventRetention::default())?;
+        let replay = reopened.replay("w", Some("c"), "root", 0)?;
+        assert_eq!(replay.events.len(), payloads.len());
+        for ((event, raw), hash) in replay.events.iter().zip(&payloads).zip(hashes) {
+            assert_eq!(serde_json::to_value(&event.payload)?, *raw);
+            assert_eq!(event.content_hash, hash);
+        }
+        Ok(())
+    }
+    #[test]
+    fn paired_hitl_uses_current_continuation_turn_in_original_journal() -> anyhow::Result<()> {
+        use crate::hitl::{HitlRequestIdentity, HitlRequestKind, HitlRequestScope};
+        let directory = tempfile::tempdir()?;
+        let identity = HitlRequestIdentity {
+            request_id: "request".to_string(),
+            response_target: "target".to_string(),
+            kind: HitlRequestKind::Input,
+            scope: HitlRequestScope {
+                workspace_id: Some("w".to_string()),
+                host_generation: Some("host".to_string()),
+                conversation_id: Some("c".to_string()),
+                root_turn_id: Some("root".to_string()),
+                turn_id: Some("continuation".to_string()),
+                ..Default::default()
+            },
+        };
+        let hashes = {
+            let log = ChatEventLog::open(directory.path(), ChatEventRetention::default())?;
+            let request = ChatDriverEvent::InputRequest {
+                request_id: "request".to_string(),
+                identity: Some(identity.clone()),
+                prompt: "中文\n🙂".to_string(),
+            };
+            let mut malformed = request.clone();
+            if let ChatDriverEvent::InputRequest {
+                identity: Some(identity),
+                ..
+            } = &mut malformed
+            {
+                identity.kind = HitlRequestKind::Approval;
+            }
+            assert!(log.append("w", Some("c"), "root", malformed).is_err());
+            let mut malformed = request.clone();
+            if let ChatDriverEvent::InputRequest { request_id, .. } = &mut malformed {
+                *request_id = "foreign-id".to_string();
+            }
+            assert!(log.append("w", Some("c"), "root", malformed).is_err());
+            assert!(
+                log.append("foreign-workspace", Some("c"), "root", request.clone())
+                    .is_err()
+            );
+            assert!(
+                log.append("w", Some("foreign-conversation"), "root", request.clone())
+                    .is_err()
+            );
+            assert!(
+                log.append("w", Some("c"), "foreign-root", request.clone())
+                    .is_err()
+            );
+            [
+                log.append("w", Some("c"), "root", request)?.content_hash,
+                log.append(
+                    "w",
+                    Some("c"),
+                    "root",
+                    ChatDriverEvent::HitlRequestReleased { identity },
+                )?
+                .content_hash,
+            ]
+        };
+        let log = ChatEventLog::open(directory.path(), ChatEventRetention::default())?;
+        let replay = log.replay("w", Some("c"), "root", 0)?;
+        assert_eq!(replay.events.len(), 2);
+        for (event, hash) in replay.events.iter().zip(hashes) {
+            assert_eq!(event.turn_id, "continuation");
+            assert_eq!(event.message_id, "root");
+            assert_eq!(event.content_hash, hash);
+        }
+        Ok(())
+    }
+
     use crate::tasks::task_runtime::command_cells::{
-        CommandCellWatchResult, CommandCellWatchAcknowledgement, CommandCellWatchReceipt,
+        CommandCellWatchAcknowledgement, CommandCellWatchReceipt, CommandCellWatchResult,
         CommandCellWatchState,
     };
     use crate::tasks::task_runtime::types::{
@@ -193,8 +293,8 @@ mod tests {
     }
 
     #[test]
-    fn command_cell_watch_ready_requires_exact_stream_and_settled_generation()
-    -> Result<(), String> {
+    fn command_cell_watch_ready_requires_exact_stream_and_settled_generation() -> Result<(), String>
+    {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
@@ -463,7 +563,8 @@ mod tests {
     }
 
     #[test]
-    fn unacknowledged_command_cell_watch_pins_then_acknowledgement_converges() -> Result<(), String> {
+    fn unacknowledged_command_cell_watch_pins_then_acknowledgement_converges() -> Result<(), String>
+    {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let log = ChatEventLog::open(
             temp.path(),
@@ -1479,13 +1580,8 @@ mod tests {
                 acknowledgement: acknowledgement.clone(),
             },
         ] {
-            log.append(
-                "workspace-1",
-                Some("conversation-1"),
-                "turn-1",
-                event,
-            )
-            .map_err(|error| error.to_string())?;
+            log.append("workspace-1", Some("conversation-1"), "turn-1", event)
+                .map_err(|error| error.to_string())?;
         }
         let corrupt = root.join("sha256_unrelated_corrupt_stream");
         fs::create_dir_all(&corrupt).map_err(|error| error.to_string())?;
@@ -1502,12 +1598,7 @@ mod tests {
             1
         );
         let replay = log
-            .replay(
-                "workspace-1",
-                Some("conversation-1"),
-                "turn-1",
-                0,
-            )
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
             .map_err(|error| error.to_string())?;
         assert!(replay.events.iter().any(|event| matches!(
             &event.payload,
@@ -1542,11 +1633,8 @@ mod tests {
         .map_err(|error| error.to_string())?;
 
         assert_eq!(
-            log.pending_command_cell_watches_for_conversation(
-                "workspace-1",
-                "conversation-1"
-            )
-            .map_err(|error| error.to_string())?,
+            log.pending_command_cell_watches_for_conversation("workspace-1", "conversation-1")
+                .map_err(|error| error.to_string())?,
             vec![expected]
         );
         Ok(())

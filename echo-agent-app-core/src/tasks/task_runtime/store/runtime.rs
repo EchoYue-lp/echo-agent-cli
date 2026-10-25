@@ -62,6 +62,9 @@ impl TaskRuntimeStore {
         workspace_id: impl Into<String>,
     ) -> Self {
         Self {
+            subagent_depth_defaults: std::sync::Arc::new(
+                crate::subagent_policy::SubagentDepthDefaults::default(),
+            ),
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_subagent_controls: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -112,6 +115,18 @@ impl TaskRuntimeStore {
         &self,
     ) -> std::sync::Arc<super::executor::TaskRuntimeOperationSupervisor> {
         std::sync::Arc::clone(&self.operation_supervisor)
+    }
+
+    pub(crate) fn with_subagent_depth_defaults(
+        mut self,
+        defaults: std::sync::Arc<crate::subagent_policy::SubagentDepthDefaults>,
+    ) -> Self {
+        self.subagent_depth_defaults = defaults;
+        self
+    }
+
+    pub fn new_execution_subagent_depth(&self) -> crate::subagent_policy::SubagentDepthLimit {
+        self.subagent_depth_defaults.snapshot()
     }
 
     pub fn active_operation_count(&self) -> usize {
@@ -2222,13 +2237,20 @@ impl TaskRuntimeStore {
                     .get_run_state(run_id)?
                     .map(|snapshot| snapshot.execution_profile)
                     .unwrap_or_default();
+                // An idempotent caller that did not supply a binding reads the
+                // original one, including legacy None. Never fill an old run
+                // from today's config. An explicit different binding conflicts.
+                let mut requested_profile = execution_profile;
+                if requested_profile.subagent_depth_limit.is_none() {
+                    requested_profile.subagent_depth_limit = existing_profile.subagent_depth_limit;
+                }
                 if existing.workspace_id != workspace_id
                     || existing.conversation_id != conversation_id
                     || existing.root_message_id != root_message_id
                     || existing.domain_profile != domain_profile
                     || existing.route != route
                     || existing.attended_mode != attended_mode
-                    || existing_profile != execution_profile
+                    || existing_profile != requested_profile
                 {
                     return Err(StoreError::InvalidPlan(format!(
                         "TaskRun '{run_id}' already exists with a different immutable identity"
@@ -2236,6 +2258,12 @@ impl TaskRuntimeStore {
                 }
                 return Ok((existing, false));
             }
+
+            let execution_profile = if execution_profile.subagent_depth_limit.is_some() {
+                execution_profile
+            } else {
+                execution_profile.with_subagent_depth_limit(self.new_execution_subagent_depth())
+            };
 
             let run = new_pending_run(
                 run_id,
@@ -3282,7 +3310,9 @@ impl TaskRuntimeStore {
         {
             blockers.push(BootAutoResumeBlocker::ActiveCommandCell);
         }
-        if !self.list_recovery_blockers(run_id)?.is_empty() {
+        if execution_profile.subagent_depth_limit.is_none()
+            || !self.list_recovery_blockers(run_id)?.is_empty()
+        {
             blockers.push(BootAutoResumeBlocker::RecoveryBlocker);
         }
         if !blockers.is_empty() {
@@ -4021,7 +4051,8 @@ impl TaskRuntimeStore {
                         "attended_mode": run.attended_mode.as_str(),
                         "attachments": run.attachments,
                         "created_at": echo_agent::utils::time::to_local(run.created_at).to_rfc3339(),
-                        "execution_profile": TaskRunExecutionProfile::default(),
+                        "execution_profile": TaskRunExecutionProfile::default()
+                            .with_subagent_depth_limit(self.new_execution_subagent_depth()),
                     }),
                     timestamp,
                 ),
@@ -4677,7 +4708,13 @@ impl TaskRuntimeStore {
         claim: &echo_agent::tasks::TaskClaim,
         status: echo_agent::tasks::TaskStatus,
         summary: Option<String>,
-    ) -> Result<(echo_agent::tasks::RuntimeTaskSettlementOutcome, Option<String>), StoreError> {
+    ) -> Result<
+        (
+            echo_agent::tasks::RuntimeTaskSettlementOutcome,
+            Option<String>,
+        ),
+        StoreError,
+    > {
         self.with_run_lock(run_id, || {
             let mut graph = self
                 .load_revisioned_task_graph(run_id)?
@@ -4692,12 +4729,12 @@ impl TaskRuntimeStore {
             let mut diagnostic_events = Vec::new();
             let committed_summary = match &outcome {
                 echo_agent::tasks::RuntimeTaskSettlementOutcome::Superseded => None,
-                echo_agent::tasks::RuntimeTaskSettlementOutcome::Settled {
-                    status: committed,
-                } if committed == &status => summary.clone(),
-                echo_agent::tasks::RuntimeTaskSettlementOutcome::Settled {
-                    status: committed,
-                } => {
+                echo_agent::tasks::RuntimeTaskSettlementOutcome::Settled { status: committed }
+                    if committed == &status =>
+                {
+                    summary.clone()
+                }
+                echo_agent::tasks::RuntimeTaskSettlementOutcome::Settled { status: committed } => {
                     // The fallback error remains inspectable, but it must not
                     // become the summary of the interruption that won the CAS.
                     if let Some(message) = summary.as_ref() {
@@ -5356,7 +5393,10 @@ impl TaskRuntimeStore {
         })
     }
 
-    fn begin_physical_owner_intent(&self, intent: &mut PhysicalOwnerIntent) -> Result<(), StoreError> {
+    fn begin_physical_owner_intent(
+        &self,
+        intent: &mut PhysicalOwnerIntent,
+    ) -> Result<(), StoreError> {
         if intent.run_id.trim().is_empty()
             || intent.owner_id.trim().is_empty()
             || intent.workspace_id.trim().is_empty()
@@ -5504,7 +5544,8 @@ impl TaskRuntimeStore {
                 TaskRunStatus::Paused => self.recover_interrupted_run(run)?,
                 _ => {
                     self.with_run_lock(&run.run_id, || {
-                        if let Some(events) = self.interrupted_process_owner_events_locked(&run.run_id)?
+                        if let Some(events) =
+                            self.interrupted_process_owner_events_locked(&run.run_id)?
                             && !events.is_empty()
                         {
                             self.commit_runtime_events(&run.run_id, events)?;
@@ -5525,36 +5566,49 @@ impl TaskRuntimeStore {
     /// Retire only the admission fence of a previous process. This is not a
     /// physical completion receipt: boot recovery below must still classify
     /// interrupted tools, Subagents and command cells without replaying them.
-    fn interrupted_process_owner_events_locked(&self, run_id: &str) -> Result<Option<Vec<RuntimeJournalEvent>>, StoreError> {
+    fn interrupted_process_owner_events_locked(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<Vec<RuntimeJournalEvent>>, StoreError> {
         let current_epoch = self.shadow.owner_process_epoch()?;
         let intents = self.unresolved_physical_owner_intents(run_id)?;
         if intents.iter().any(|intent| {
-            intent.process_epoch.as_ref().is_some_and(|epoch| uuid::Uuid::parse_str(epoch).is_err())
+            intent
+                .process_epoch
+                .as_ref()
+                .is_some_and(|epoch| uuid::Uuid::parse_str(epoch).is_err())
         }) {
             return Err(StoreError::RecoveryBlocked {
                 run_id: run_id.to_string(),
                 details: "physical owner intent contains an invalid process epoch".to_string(),
             });
         }
-        if intents.iter().any(|intent| intent.process_epoch.as_deref() == Some(current_epoch)) {
+        if intents
+            .iter()
+            .any(|intent| intent.process_epoch.as_deref() == Some(current_epoch))
+        {
             return Ok(None);
         }
         // The current process is the only producer while holding this OS
         // lease and always stamps Some(current_epoch). None is therefore an
         // old-version journal, never a currently admitted in-process owner.
-        let events = intents.into_iter().filter(|intent| {
-            intent.process_epoch.as_deref() != Some(current_epoch)
-        }).map(|intent| RuntimeJournalEvent::for_append(
-            run_id,
-            None,
-            intent.execution_id.as_deref(),
-            RuntimeEventKind::RecoveryResolved,
-            serde_json::json!({
-                "physical_owner_intent": intent,
-                "reason": "owner_process_interrupted",
-                "recovery_process_epoch": current_epoch,
-            }),
-        )).collect::<Vec<_>>();
+        let events = intents
+            .into_iter()
+            .filter(|intent| intent.process_epoch.as_deref() != Some(current_epoch))
+            .map(|intent| {
+                RuntimeJournalEvent::for_append(
+                    run_id,
+                    None,
+                    intent.execution_id.as_deref(),
+                    RuntimeEventKind::RecoveryResolved,
+                    serde_json::json!({
+                        "physical_owner_intent": intent,
+                        "reason": "owner_process_interrupted",
+                        "recovery_process_epoch": current_epoch,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
         Ok(Some(events))
     }
 

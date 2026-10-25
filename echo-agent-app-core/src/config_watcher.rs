@@ -696,6 +696,12 @@ async fn handle_config_change(
         warn!(path = %changed_path.display(), "LSP has been retired from EKO; configuration is unsupported and remains unchanged");
         return;
     }
+    if config_path.is_some_and(|path| path == changed_path)
+        && let Err(error) = crate::config::load_config_file(changed_path)
+    {
+        warn!(%error, "App config reload rejected before publishing any component");
+        return;
+    }
 
     for target in registered {
         let Some(agent) = target.agent() else {
@@ -735,7 +741,12 @@ async fn handle_config_change(
             .and_then(Path::to_str)
             .map(|path| crate::config::load_config(Some(path)))
             .unwrap_or_else(|| crate::config::load_config(None));
-        emitter.reload_from_config(&new_config).await;
+        match new_config {
+            Ok(config) => emitter.reload_from_config(&config).await,
+            Err(error) => {
+                warn!(%error, "Config reload rejected; keeping last known-good webhook config")
+            }
+        }
     }
 }
 

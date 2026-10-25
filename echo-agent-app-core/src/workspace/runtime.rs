@@ -45,6 +45,7 @@ pub(crate) struct WorkspaceRuntimeResources {
 /// refreshed after registry operations such as linking a project without
 /// replacing the host or reopening its stores.
 pub(crate) struct WorkspaceRuntimeHost {
+    subagent_depth_defaults: Arc<crate::subagent_policy::SubagentDepthDefaults>,
     workspace: RwLock<Workspace>,
     resources: WorkspaceRuntimeResources,
     task_runtime: OnceCell<Arc<TaskRuntimeStore>>,
@@ -173,6 +174,7 @@ impl WorkspaceRuntimeActivity {
 /// resident until application shutdown; eviction requires an explicit idle
 /// proof and is intentionally deferred.
 pub(crate) struct WorkspaceRuntimeRegistry {
+    subagent_depth_defaults: Arc<crate::subagent_policy::SubagentDepthDefaults>,
     lifecycle_retention: WorkspaceLifecycleBinding,
     hosts: Mutex<HashMap<WorkspaceId, Arc<WorkspaceRuntimeHost>>>,
     product_data_io: crate::product_data_io::ProductDataIoService,
@@ -303,10 +305,12 @@ impl WorkspaceRuntimeHost {
         operation_admission_open: Arc<std::sync::atomic::AtomicBool>,
         product_data_io: crate::product_data_io::ProductDataIoService,
         lifecycle_retention: WorkspaceLifecycleBinding,
+        subagent_depth_defaults: Arc<crate::subagent_policy::SubagentDepthDefaults>,
     ) -> anyhow::Result<Arc<Self>> {
         let resources = WorkspaceRuntimeResources::prepare(workspace, product_data_io).await?;
         let workspace = resources.workspace().clone();
         Ok(Arc::new(Self {
+            subagent_depth_defaults,
             workspace: RwLock::new(workspace),
             resources,
             task_runtime: OnceCell::new(),
@@ -451,10 +455,13 @@ impl WorkspaceRuntimeHost {
                 {
                     anyhow::bail!("workspace TaskRuntime operation admission is closed");
                 }
-                let store = Arc::new(TaskRuntimeStore::open_for_workspace(
-                    self.resources.tasks_dir(),
-                    self.id().to_string(),
-                )?);
+                let store = Arc::new(
+                    TaskRuntimeStore::open_for_workspace(
+                        self.resources.tasks_dir(),
+                        self.id().to_string(),
+                    )?
+                    .with_subagent_depth_defaults(self.subagent_depth_defaults.clone()),
+                );
                 if let Some(root) = self
                     .lifecycle_retention
                     .read()
@@ -942,6 +949,9 @@ impl WorkspaceRuntimeRegistry {
         product_data_io: crate::product_data_io::ProductDataIoService,
     ) -> Self {
         Self {
+            subagent_depth_defaults: Arc::new(
+                crate::subagent_policy::SubagentDepthDefaults::default(),
+            ),
             lifecycle_retention: Arc::new(std::sync::RwLock::new(std::sync::Weak::new())),
             hosts: Mutex::new(HashMap::new()),
             product_data_io,
@@ -952,6 +962,14 @@ impl WorkspaceRuntimeRegistry {
             #[cfg(test)]
             close_barrier: std::sync::Mutex::new(None),
         }
+    }
+
+    pub(crate) fn with_subagent_depth_defaults(
+        mut self,
+        defaults: Arc<crate::subagent_policy::SubagentDepthDefaults>,
+    ) -> Self {
+        self.subagent_depth_defaults = defaults;
+        self
     }
 
     fn product_data_io(&self) -> crate::product_data_io::ProductDataIoService {
@@ -977,6 +995,7 @@ impl WorkspaceRuntimeRegistry {
             Arc::clone(&self.operation_admission_open),
             self.product_data_io(),
             self.lifecycle_retention.clone(),
+            self.subagent_depth_defaults.clone(),
         )
         .await?;
         hosts.insert(workspace_id, Arc::clone(&host));
@@ -1012,6 +1031,7 @@ impl WorkspaceRuntimeRegistry {
                     Arc::clone(&self.operation_admission_open),
                     self.product_data_io(),
                     self.lifecycle_retention.clone(),
+                    self.subagent_depth_defaults.clone(),
                 )
                 .await?;
                 hosts.insert(workspace_id, Arc::clone(&host));

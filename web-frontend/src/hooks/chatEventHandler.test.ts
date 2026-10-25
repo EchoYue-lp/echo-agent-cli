@@ -1,8 +1,25 @@
+import type { HitlRequestIdentity } from '../types/api';
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { TaskRun } from '../generated';
 import { useChatStore } from '../stores/chatStore';
 import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 import { handleChatEvent } from './chatEventHandler';
+
+const hitlIdentity = (
+  request_id: string,
+  kind: HitlRequestIdentity['kind']
+): HitlRequestIdentity => ({
+  request_id,
+  response_target: `target-${request_id}`,
+  kind,
+  scope: {
+    workspace_id: 'global',
+    host_generation: 'global',
+    conversation_id: 'conversation',
+    root_turn_id: 'turn',
+    turn_id: 'turn',
+  },
+});
 
 describe('chat and TaskRuntime lifecycle separation', () => {
   beforeEach(() => {
@@ -141,6 +158,7 @@ describe('chat and TaskRuntime lifecycle separation', () => {
       {
         type: 'approval_request',
         request_id: 'approval-1',
+        identity: hitlIdentity('approval-1', 'approval'),
         tool_name: 'write_file',
         args: { path: 'first.txt' },
         prompt: 'Approve the first write',
@@ -151,6 +169,7 @@ describe('chat and TaskRuntime lifecycle separation', () => {
       {
         type: 'input_request',
         request_id: 'input-2',
+        identity: hitlIdentity('input-2', 'input'),
         prompt: 'Describe the second change',
       },
       context
@@ -159,6 +178,7 @@ describe('chat and TaskRuntime lifecycle separation', () => {
       {
         type: 'approval_request',
         request_id: 'approval-1',
+        identity: hitlIdentity('approval-1', 'approval'),
         tool_name: 'write_file',
         args: { path: 'duplicate.txt' },
         prompt: 'Duplicate delivery',
@@ -172,13 +192,13 @@ describe('chat and TaskRuntime lifecycle separation', () => {
     ]);
     expect(useChatStore.getState().runStatus).toBe('waiting_approval');
 
-    useChatStore.getState().removeHitlRequest('input-2');
+    useChatStore.getState().removeHitlRequest(hitlIdentity('input-2', 'input'));
     expect(useChatStore.getState().pendingHitlRequests).toEqual([
       expect.objectContaining({ kind: 'approval', requestId: 'approval-1' }),
     ]);
     expect(useChatStore.getState().runStatus).toBe('waiting_approval');
 
-    useChatStore.getState().removeHitlRequest('approval-1');
+    useChatStore.getState().removeHitlRequest(hitlIdentity('approval-1', 'approval'));
     expect(useChatStore.getState().pendingHitlRequests).toEqual([]);
     expect(useChatStore.getState().runStatus).toBe('running');
   });
@@ -187,6 +207,7 @@ describe('chat and TaskRuntime lifecycle separation', () => {
     useChatStore.getState().enqueueHitlRequest({
       kind: 'input',
       requestId: 'input-terminal',
+      identity: hitlIdentity('input-terminal', 'input'),
       prompt: 'Still pending',
     });
     const context = {

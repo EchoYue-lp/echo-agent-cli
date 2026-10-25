@@ -8,6 +8,7 @@
 
 pub mod analysis;
 pub mod browser;
+pub mod channels;
 pub mod chat;
 pub mod config;
 pub mod conversations;

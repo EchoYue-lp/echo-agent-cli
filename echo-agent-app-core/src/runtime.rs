@@ -66,6 +66,9 @@ pub struct ApplicationLifecycleReceipt {
     pub failures: Vec<ApplicationLifecycleFailure>,
     // Rust ownership only; public diagnostic fields and wire shapes are unchanged.
     continuation: Option<Arc<ApplicationLifecycleRetention>>,
+    // Set only by the original owner's final publication. Absence of a
+    // continuation alone cannot prove that physical settlement happened.
+    physically_final: bool,
 }
 
 impl std::fmt::Debug for ApplicationLifecycleReceipt {
@@ -93,6 +96,7 @@ impl ApplicationLifecycleReceipt {
             primary_error: primary_error.map(|error| error.to_string()),
             failures: Vec::new(),
             continuation: None,
+            physically_final: false,
         }
     }
 
@@ -105,6 +109,56 @@ impl ApplicationLifecycleReceipt {
 
     pub fn is_clean(&self) -> bool {
         self.continuation.is_none() && self.primary_error.is_none() && self.failures.is_empty()
+    }
+
+    /// Keep the EKO host runtime alive until the same original owner publishes
+    /// physical finality. This does not retry cleanup or manufacture progress;
+    /// bounded `ApplicationLifecycleSettlement::wait` remains unchanged.
+    pub async fn wait_final(mut self) -> Self {
+        if self.physically_final {
+            return self;
+        }
+        let Some(retention) = self.continuation.as_ref() else {
+            self.record_retained(
+                "application lifecycle",
+                "physical final receipt unavailable; original continuation is missing",
+            );
+            return self;
+        };
+        let publications = retention.publications.subscribe();
+        self.wait_final_publications(publications).await
+    }
+
+    async fn wait_final_publications(
+        mut self,
+        mut publications: tokio::sync::watch::Receiver<Option<LifecyclePublication>>,
+    ) -> Self {
+        loop {
+            let publication = publications.borrow().clone();
+            if let Some(publication) = publication
+                && publication.final_receipt
+            {
+                let mut final_receipt = publication.receipt;
+                // The desktop can attach its launch/exit error to an earlier
+                // observation. A later physical receipt must not erase it.
+                if self.primary_error.is_some() {
+                    final_receipt.primary_error = self.primary_error.take();
+                }
+                for failure in self.failures {
+                    final_receipt.record_retained(failure.owner, failure.error);
+                }
+                final_receipt.continuation = None;
+                final_receipt.physically_final = true;
+                return final_receipt;
+            }
+            if publications.changed().await.is_err() {
+                self.record_retained(
+                    "application lifecycle",
+                    "final observation closed without physical settlement evidence",
+                );
+                return self;
+            }
+        }
     }
 
     fn record_retained(&mut self, owner: impl Into<String>, error: impl std::fmt::Display) {
@@ -336,6 +390,7 @@ impl ApplicationLifecycleRetention {
                 };
             receipt.continuation = None;
             let final_receipt = !retained;
+            receipt.physically_final = final_receipt;
             {
                 let mut state = root.state.lock().unwrap_or_else(|error| error.into_inner());
                 if retained {
@@ -432,6 +487,8 @@ pub struct ApplicationLifecycleOwner {
         Option<Arc<crate::subagent_event_projection::SubagentEnvelopeProjectionService>>,
     background_tasks: Vec<ApplicationBackgroundTask>,
     external_owners: Vec<ApplicationExternalOwner>,
+    #[cfg(feature = "channels")]
+    channel_runtime: Option<Arc<crate::channel_runtime::ChannelRuntime>>,
     #[cfg(test)]
     specialist_teardown_started: Option<tokio::sync::oneshot::Sender<()>>,
     shutdown_begun: bool,
@@ -473,6 +530,8 @@ impl ApplicationLifecycleOwner {
             subagent_projection: None,
             background_tasks: Vec::new(),
             external_owners: Vec::new(),
+            #[cfg(feature = "channels")]
+            channel_runtime: None,
             #[cfg(test)]
             specialist_teardown_started: None,
             shutdown_begun: false,
@@ -494,6 +553,22 @@ impl ApplicationLifecycleOwner {
     pub fn bind_app_state(&mut self, state: Arc<AppState>) {
         self.bind_app_state_components(&state);
         self.app_state = Some(state);
+    }
+
+    #[cfg(feature = "channels")]
+    pub fn bind_channel_runtime(&mut self, channels: Arc<crate::channel_runtime::ChannelRuntime>) {
+        if let Some(root) = self.retention.upgrade() {
+            channels.bind_lifecycle_retention(&root);
+        }
+        let admission = channels.clone();
+        // Phase one only. Physical settlement stays in the original explicit
+        // slot below; generic external Err must not discard this channel owner.
+        self.track_external_owner(
+            "IM channel admission",
+            move || admission.begin_shutdown(),
+            async { Ok(()) },
+        );
+        self.channel_runtime = Some(channels);
     }
 
     pub fn bind_primary_agent(&mut self, agent: AgentHandle) {
@@ -803,6 +878,25 @@ impl ApplicationLifecycleOwner {
         } else {
             false
         };
+        #[cfg(feature = "channels")]
+        let channels_uncertain = if let Some(channels) = self.channel_runtime.as_ref() {
+            match channels.observe_shutdown().await {
+                Ok(failures) => {
+                    for error in failures {
+                        receipt.record_retained("IM channel completed failure", error);
+                    }
+                    false
+                }
+                Err(error) => {
+                    receipt.record_retained("IM channel original owners", error);
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        #[cfg(not(feature = "channels"))]
+        let channels_uncertain = false;
         if !self.normal_drained {
             if let Some(store) = self.task_runtime_store.as_ref() {
                 if let Err(error) = store.shutdown_run_drivers().await {
@@ -856,8 +950,9 @@ impl ApplicationLifecycleOwner {
         {
             receipt.record_retained("config watcher", error);
         }
-        let mut uncertain =
-            scheduler_uncertain || self.external_owners.iter().any(|owner| owner.join_panicked);
+        let mut uncertain = scheduler_uncertain
+            || channels_uncertain
+            || self.external_owners.iter().any(|owner| owner.join_panicked);
         if let Some(state) = self.app_state.as_ref() {
             if let Err(error) = state.workspace.runtimes.join_known_shutdown().await {
                 receipt.record_retained("workspace execution owners", error);
@@ -1041,6 +1136,8 @@ pub struct AgentRuntime {
 /// accidentally bypass the shared shutdown order.
 pub struct ApplicationServices {
     pub app_state: Arc<AppState>,
+    #[cfg(feature = "channels")]
+    pub channel_runtime: Arc<crate::channel_runtime::ChannelRuntime>,
     pub pool: Arc<crate::agent_pool::AgentPool>,
     pub subagent_projection:
         Arc<crate::subagent_event_projection::SubagentEnvelopeProjectionService>,
@@ -1291,8 +1388,16 @@ impl ApplicationServices {
             lifecycle.track_background_task("Dreaming", dreaming_task);
         }
 
+        #[cfg(feature = "channels")]
+        let channel_runtime = {
+            let channels = Arc::new(crate::channel_runtime::ChannelRuntime::new(&app_state));
+            lifecycle.bind_channel_runtime(channels.clone());
+            channels
+        };
         Ok(Self {
             app_state,
+            #[cfg(feature = "channels")]
+            channel_runtime,
             pool,
             subagent_projection,
             lifecycle: Some(lifecycle),
@@ -3503,6 +3608,288 @@ mod tests {
         assert!(weak_state.upgrade().is_none());
         assert!(weak_analysis.upgrade().is_none());
         assert!(weak_agent.upgrade().is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn channel_postcommit_finalizes_original_root_without_an_external_wait_kick()
+    -> anyhow::Result<()> {
+        use crate::channel_runtime::test_support;
+        use std::sync::atomic::Ordering;
+        let (plugin, mut probe) = test_support::channel(true, false, false);
+        let channels = crate::channel_runtime::ChannelRuntime::with_original_test_plugin(
+            std::sync::Weak::new(),
+            plugin,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let weak_channels = Arc::downgrade(&channels);
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.bind_channel_runtime(channels.clone());
+        let (dependency_closed, dependency_observer) = tokio::sync::oneshot::channel();
+        owner.specialist_teardown_started = Some(dependency_closed);
+        let root = owner
+            .retention
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("root absent"))?;
+        let mut publications = root.publications.subscribe();
+        let initial = owner.begin_shutdown(
+            ApplicationLifecycleReason::Shutdown,
+            Some(anyhow::anyhow!("original desktop exit error")),
+        );
+        let settlement = owner.start_join(initial);
+        let first =
+            tokio::time::timeout(std::time::Duration::from_secs(2), settlement.wait()).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), probe.started.notified()).await?;
+        assert!(first.continuation.is_some());
+        assert!(!first.physically_final);
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 1);
+        let waiter = tokio::spawn(first.clone().wait_final());
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        waiter.abort();
+        assert!(waiter.await.is_err());
+        drop(channels);
+        assert!(weak_channels.upgrade().is_some());
+        assert!(
+            !root
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .owner
+                .as_ref()
+                .is_some_and(|(owner, _)| owner.primary_closed)
+        );
+        probe
+            .release
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("release absent"))?
+            .send(())
+            .map_err(|_| anyhow::anyhow!("original stop owner vanished"))?;
+        // Observe publication directly: no Settlement.wait/note_progress/kick
+        // is allowed to make this post-commit completion happen.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if publications
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|p| p.final_receipt)
+                {
+                    break;
+                }
+                publications
+                    .changed()
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        dependency_observer.await?;
+        let final_receipt =
+            tokio::time::timeout(std::time::Duration::from_secs(2), first.wait_final()).await?;
+        assert!(final_receipt.physically_final);
+        assert!(final_receipt.continuation.is_none());
+        assert_eq!(
+            final_receipt.primary_error.as_deref(),
+            Some("original desktop exit error")
+        );
+        assert!(final_receipt.into_result().is_err());
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 1);
+        assert!(weak_channels.upgrade().is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn channel_stop_error_keeps_original_dependencies_and_repeated_wait_does_not_retry()
+    -> anyhow::Result<()> {
+        use crate::channel_runtime::test_support;
+        use std::sync::atomic::Ordering;
+        let (plugin, probe) = test_support::channel(false, true, false);
+        let channels = crate::channel_runtime::ChannelRuntime::with_original_test_plugin(
+            std::sync::Weak::new(),
+            plugin,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.bind_channel_runtime(channels.clone());
+        let root = owner
+            .retention
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("root absent"))?;
+        let mut publications = root.publications.subscribe();
+        let initial = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        let settlement = owner.start_join(initial);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let failed = publications.borrow().as_ref().is_some_and(|p| {
+                    p.receipt
+                        .failures
+                        .iter()
+                        .any(|failure| failure.error.contains("mock_stop_error"))
+                });
+                if failed {
+                    break;
+                }
+                publications
+                    .changed()
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        for _ in 0..3 {
+            let observed = settlement.clone().wait().await;
+            assert!(observed.continuation.is_some());
+            assert!(!observed.physically_final);
+        }
+        // Cached wait can move the original owner into its single-flight poll.
+        // Wait only for that poll, then inspect the parked owner under one lock.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                {
+                    let state = root.state.lock().unwrap_or_else(|error| error.into_inner());
+                    if !state.polling {
+                        assert!(state.owner.as_ref().is_some_and(|(owner, _)| {
+                            !owner.primary_closed && owner.channel_runtime.is_some()
+                        }));
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 1);
+        // A changed test flag is not physical evidence. Only a successful
+        // explicit stop of the original handle can wake legal final cleanup.
+        probe.fail.store(false, Ordering::SeqCst);
+        channels
+            .retry_original_stop_for_test()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if publications
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|p| p.final_receipt)
+                {
+                    break;
+                }
+                publications
+                    .changed()
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn channel_cleanup_unwind_retains_original_slot_without_repolling_the_producer()
+    -> anyhow::Result<()> {
+        use crate::channel_runtime::test_support;
+        use std::sync::atomic::Ordering;
+        let (plugin, probe) = test_support::channel(false, false, true);
+        let channels = crate::channel_runtime::ChannelRuntime::with_original_test_plugin(
+            std::sync::Weak::new(),
+            plugin,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.bind_channel_runtime(channels.clone());
+        let root = owner
+            .retention
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("root absent"))?;
+        let mut publications = root.publications.subscribe();
+        let initial = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        let settlement = owner.start_join(initial);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if publications.borrow().as_ref().is_some_and(|p| {
+                    p.receipt.failures.iter().any(|failure| {
+                        failure
+                            .error
+                            .contains("Original cleanup producer unavailable")
+                    })
+                }) {
+                    break;
+                }
+                publications
+                    .changed()
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        for _ in 0..3 {
+            let observed = settlement.clone().wait().await;
+            assert!(observed.continuation.is_some());
+            assert!(!observed.physically_final);
+        }
+        // The cached wait may have started the same original owner's poll.
+        // Quiescence is the observation boundary, not the assertion's outcome.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                {
+                    let state = root.state.lock().unwrap_or_else(|error| error.into_inner());
+                    if !state.polling {
+                        assert!(state.owner.as_ref().is_some_and(|(owner, _)| {
+                            !owner.primary_closed
+                                && owner
+                                    .channel_runtime
+                                    .as_ref()
+                                    .is_some_and(|original| Arc::ptr_eq(original, &channels))
+                        }));
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn final_wait_requires_original_final_evidence_and_preserves_diagnostics()
+    -> anyhow::Result<()> {
+        let missing = ApplicationLifecycleReceipt::new(ApplicationLifecycleReason::Shutdown, None)
+            .wait_final()
+            .await;
+        assert!(!missing.physically_final);
+        assert!(missing.into_result().is_err());
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        drop(sender);
+        let closed = ApplicationLifecycleReceipt::new(ApplicationLifecycleReason::Shutdown, None)
+            .wait_final_publications(receiver)
+            .await;
+        assert!(!closed.physically_final);
+        assert!(closed.into_result().is_err());
+        let owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        let mut final_receipt = owner
+            .settle(ApplicationLifecycleReason::Shutdown, None)
+            .await;
+        assert!(final_receipt.physically_final);
+        final_receipt.record("original completed cleanup", "completed error");
+        let final_receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            final_receipt.wait_final(),
+        )
+        .await?;
+        assert!(final_receipt.physically_final);
+        assert_eq!(final_receipt.failures.len(), 1);
+        assert!(final_receipt.into_result().is_err());
         Ok(())
     }
 

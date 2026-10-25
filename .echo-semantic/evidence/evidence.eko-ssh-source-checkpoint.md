@@ -2,14 +2,14 @@
 schema_version: 1
 id: evidence.eko-ssh-source-checkpoint
 kind: evidence
-observed_at: source:230d0c7af649f29cef2002109e67167479b0894c28537c90eefe2d0746336829
+observed_at: source:4726a37cc1350e66b30b281fd02e16cdd087cd7f44b58b28a0ba6ab09bfa0d46
 source_refs:
 - echo-agent-app-core/src/terminal.rs
 - echo-agent-app-core/src/runtime.rs
 - echo-agent-app-core/src/developer_commands.rs
 - src/tauri/terminal.rs
 - src/cli/channels.rs
-- src/cli/channels/outbound.rs
+- echo-agent-app-core/src/channel_runtime/outbound.rs
 - src/cli/cmd_impls/developer.rs
 - src/tui/events.rs
 - web-frontend/src/api/endpoints.ts
@@ -74,3 +74,9 @@ source_refs 都指向当前可读取的正式源码、测试、ADR或精六项�
 任务observer因du读取临时归档并发消失exit1，原完整toolresponse在 .echo-semantic/local/eko-ssh-clippy-retry-9568/observer-original-tool-response.json，原script/样本及恢复记录同目录。原有效样本到16:30:09Z，恢复观察从16:34:48Z开始；该gap不隐去，所报RSS仅采样观察，不冒全程peak/无压力证明。恢复者attach同原runnerPGID8699/Cargo8730，没有重启Cargo或改argv/源码，时间预算仍从原开始计算；compiler的0只取原run-command receipt。
 
 该批Rust294/consumer9568、编译前完整963593edaca快照、5owned路径、pairedFe4e/lock/风险身份无漂移。保存完整raw/exit/argv/env/sourceguard/2rmeta哈希后，lsof准确target为1且stdout/stderr空；16:35:45Z exactcargo clean0移除5939files/1.2GiB，targetabsent/slotreturned，之后才做metadata收口。原Clippy101、old710、旧25case与Node425边界均保留；不重跑Node/25/full，也不推main/发布。后继当前observed_at包含本次真实资格附录，前一9f547aec来源与原失败段落仍是历史事实，不重标为当时已通过。
+
+## 2026-10-25 应用源码归位观察
+
+当前可读 channel helper 路径随原实现归位 app-core/channel_runtime；原 bin 入口只转发。此路径修正不续期本文件任何历史 Rust、Node、风险接受或 native 资格；历史观察和具名旧快照结论保持原范围。当前合流尚未 Cargo 编译。
+
+旧来源观察 `source:230d0c7af649f29cef2002109e67167479b0894c28537c90eefe2d0746336829` 保留为历史。当前 observed_at 只绑定归位后的可读来源，不表示旧验证在新合流上续期。

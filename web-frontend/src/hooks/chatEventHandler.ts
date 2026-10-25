@@ -8,6 +8,7 @@
  */
 
 import { useChatStore } from '../stores/chatStore';
+import { isHitlRequestIdentity } from '../types/api';
 import {
   ingestSubagentExecEvent,
   subagentRunStoreKey,
@@ -29,6 +30,21 @@ interface EventContext {
 
 export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventContext): void {
   const payload = envelope.payload;
+  if (
+    payload.source === 'approval_request' ||
+    payload.source === 'input_request' ||
+    payload.source === 'selection_request'
+  ) {
+    const identity = payload.event.identity;
+    if (
+      !isHitlRequestIdentity(identity) ||
+      identity.scope.workspace_id !== envelope.workspace_id ||
+      identity.scope.conversation_id !== envelope.conversation_id ||
+      identity.scope.root_turn_id !== envelope.root_turn_id ||
+      identity.scope.turn_id !== envelope.turn_id
+    )
+      return;
+  }
   switch (payload.source) {
     case 'agent': {
       handleAgentEvent(payload.event.payload, ctx);
@@ -57,6 +73,9 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
       break;
     case 'selection_request':
       handleChatEvent({ type: 'selection_request', ...payload.event }, ctx);
+      break;
+    case 'hitl_request_released':
+      useChatStore.getState().removeHitlRequest(payload.event.identity);
       break;
     case 'context_compressed':
       handleChatEvent({ type: 'context_compressed', ...payload.event }, ctx);
@@ -295,11 +314,21 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
       }
       break;
     }
+    case 'hitl_request_released':
+      store.removeHitlRequest(event.identity);
+      break;
     case 'approval_request': {
       if (ctx.isCancelledRef.current) break;
+      if (
+        !isHitlRequestIdentity(event.identity) ||
+        event.identity.request_id !== event.request_id ||
+        event.identity.kind !== 'approval'
+      )
+        break;
       // P2-5: 用精确 union 后无需强转, 字段名直接可查。
       store.enqueueHitlRequest({
         kind: 'approval',
+        identity: event.identity,
         requestId: event.request_id,
         toolName: event.tool_name,
         args: event.args,
@@ -309,8 +338,15 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     }
     case 'input_request': {
       if (ctx.isCancelledRef.current) break;
+      if (
+        !isHitlRequestIdentity(event.identity) ||
+        event.identity.request_id !== event.request_id ||
+        event.identity.kind !== 'input'
+      )
+        break;
       store.enqueueHitlRequest({
         kind: 'input',
+        identity: event.identity,
         requestId: event.request_id,
         prompt: event.prompt,
       });
@@ -318,8 +354,15 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     }
     case 'selection_request': {
       if (ctx.isCancelledRef.current) break;
+      if (
+        !isHitlRequestIdentity(event.identity) ||
+        event.identity.request_id !== event.request_id ||
+        event.identity.kind !== 'selection'
+      )
+        break;
       store.enqueueHitlRequest({
         kind: 'selection',
+        identity: event.identity,
         requestId: event.request_id,
         prompt: event.prompt,
         options: event.options,

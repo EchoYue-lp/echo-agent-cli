@@ -35,6 +35,19 @@ async fn execute_runtime_plan_with_admission<W: TaskDispatcher + 'static>(
     shared_admission: Arc<ExecutionAdmission>,
 ) -> Result<RunOutcome, ExecError> {
     let blocking = TaskRuntimeOperation::new(store.clone());
+    let policy_run_id = run_id.to_string();
+    let depth_limit = blocking
+        .run("load immutable run delegation binding", move |store| {
+            store
+                .get_run_state(&policy_run_id)?
+                .ok_or(StoreError::RunNotFound(policy_run_id))?
+                .execution_profile
+                .require_subagent_depth_limit()
+                .map_err(StoreError::InvalidPlan)
+        })
+        .await
+        .map_err(|error| ExecError::Other(error.to_string()))?;
+    let delegation_policy = depth_limit.first_child_policy().map_err(ExecError::Other)?;
     let controller = Arc::new(EkoRuntimeDagController {
         store,
         blocking: blocking.clone(),
@@ -52,6 +65,7 @@ async fn execute_runtime_plan_with_admission<W: TaskDispatcher + 'static>(
     let runtime_tasks = echo_agent::tasks::RuntimeTaskService::new(
         controller,
         echo_agent::tasks::RuntimeTaskServiceConfig {
+            delegation_policy,
             max_concurrent_subagents: limits.max_concurrent_subagents,
             shared_admission: Some(shared_admission),
             ..Default::default()

@@ -1,3 +1,4 @@
+import type { HitlRequestIdentity } from '../types/api';
 // @vitest-environment jsdom
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -203,6 +204,19 @@ vi.mock('../lib/tauri-bridge', () => ({
 vi.mock('@tauri-apps/api/event', () => ({
   listen: mocks.listen,
 }));
+
+const hitlIdentity = (request_id: string): HitlRequestIdentity => ({
+  request_id,
+  response_target: `target-${request_id}`,
+  kind: 'approval',
+  scope: {
+    workspace_id: 'original-workspace',
+    host_generation: 'original-generation',
+    conversation_id: 'original-conversation',
+    root_turn_id: 'original-root',
+    turn_id: 'original-turn',
+  },
+});
 
 describe('useTauriChat foreground turn recovery', () => {
   const activeSnapshot = {
@@ -1358,31 +1372,161 @@ describe('useTauriChat foreground turn recovery', () => {
     hook.unmount();
   });
 
+  it.each(['input', 'selection'] as const)(
+    'passes original scope and kind through the real %s reply call',
+    async (kind) => {
+      const identity = { ...hitlIdentity(`request-${kind}`), kind };
+      const previous = mocks.apiInvoke.getMockImplementation();
+      mocks.apiInvoke.mockImplementation(async (command, args) =>
+        command === `send_${kind}_response`
+          ? { submitted: true, response_target: args.responseTarget }
+          : previous?.(command, args)
+      );
+      if (kind === 'input')
+        useChatStore
+          .getState()
+          .enqueueHitlRequest({ kind, requestId: identity.request_id, identity, prompt: 'input' });
+      else
+        useChatStore.getState().enqueueHitlRequest({
+          kind,
+          requestId: identity.request_id,
+          identity,
+          prompt: 'choose',
+          options: ['Continue'],
+        });
+      const hook = renderHook(() => useTauriChat());
+      await act(async () => {
+        if (kind === 'input') await hook.result.current.sendInput(identity, '中文\n🙂');
+        else await hook.result.current.sendSelection(identity, 'Continue');
+      });
+      expect(mocks.apiInvoke).toHaveBeenCalledWith(
+        `send_${kind}_response`,
+        expect.objectContaining({
+          workspaceId: 'original-workspace',
+          conversationId: 'original-conversation',
+          expectedRootTurnId: 'original-root',
+          expectedActiveTurnId: 'original-turn',
+          responseTarget: identity.response_target,
+          requestScope: identity.scope,
+          requestKind: kind,
+        })
+      );
+      expect(useChatStore.getState().pendingHitlRequests).toEqual([]);
+      hook.unmount();
+    }
+  );
+
+  it('does not let an earlier submission acknowledgement remove a reused-id successor', async () => {
+    const original = {
+      ...hitlIdentity('reusable'),
+      kind: 'input' as const,
+      response_target: 'old-target',
+    };
+    const successor = { ...original, response_target: 'new-target' };
+    let finish: ((receipt: { submitted: boolean; response_target: string }) => void) | undefined;
+    const previous = mocks.apiInvoke.getMockImplementation();
+    mocks.apiInvoke.mockImplementation((command, args) =>
+      command === 'send_input_response'
+        ? new Promise((resolve) => {
+            finish = resolve;
+          })
+        : previous?.(command, args)
+    );
+    useChatStore
+      .getState()
+      .enqueueHitlRequest({ kind: 'input', requestId: 'reusable', identity: original });
+    const hook = renderHook(() => useTauriChat());
+    let pending: Promise<boolean> | undefined;
+    await act(async () => {
+      pending = hook.result.current.sendInput(original, 'answer');
+    });
+    expect(finish).toBeTypeOf('function');
+    act(() => {
+      useChatStore.getState().removeHitlRequest(original);
+      useChatStore
+        .getState()
+        .enqueueHitlRequest({ kind: 'input', requestId: 'reusable', identity: successor });
+    });
+    await act(async () => {
+      finish?.({ submitted: true, response_target: 'old-target' });
+      await pending;
+    });
+    expect(useChatStore.getState().pendingHitlRequests).toEqual([
+      expect.objectContaining({ identity: successor }),
+    ]);
+    hook.unmount();
+  });
+
+  it.each(['input', 'selection'] as const)(
+    'keeps %s waiting when transport success is not a submission receipt',
+    async (kind) => {
+      const identity = { ...hitlIdentity('not-submitted'), kind };
+      const previous = mocks.apiInvoke.getMockImplementation();
+      mocks.apiInvoke.mockImplementation(async (command, args) =>
+        command === `send_${kind}_response` ? { success: true } : previous?.(command, args)
+      );
+      if (kind === 'input')
+        useChatStore
+          .getState()
+          .enqueueHitlRequest({ kind, requestId: identity.request_id, identity });
+      else
+        useChatStore.getState().enqueueHitlRequest({
+          kind,
+          requestId: identity.request_id,
+          identity,
+          prompt: 'choose',
+          options: ['Continue'],
+        });
+      const hook = renderHook(() => useTauriChat());
+      await act(async () => {
+        const submitted =
+          kind === 'input'
+            ? await hook.result.current.sendInput(identity, 'answer')
+            : await hook.result.current.sendSelection(identity, 'Continue');
+        expect(submitted).toBe(false);
+      });
+      expect(useChatStore.getState().pendingHitlRequests).toEqual([
+        expect.objectContaining({ identity }),
+      ]);
+      hook.unmount();
+    }
+  );
+
   it('removes only the acknowledged HITL request and keeps the next one waiting', async () => {
+    mocks.apiInvoke.mockImplementation(async (command, args) =>
+      command === 'send_approval_response'
+        ? { submitted: true, response_target: args.responseTarget }
+        : undefined
+    );
     useChatStore.getState().enqueueHitlRequest({
       kind: 'approval',
       requestId: 'approval-first',
+      identity: hitlIdentity('approval-first'),
       toolName: 'write_file',
       args: { path: 'first.txt' },
     });
     useChatStore.getState().enqueueHitlRequest({
       kind: 'approval',
       requestId: 'approval-second',
+      identity: hitlIdentity('approval-second'),
       toolName: 'write_file',
       args: { path: 'second.txt' },
     });
     const hook = renderHook(() => useTauriChat());
 
     await act(async () => {
-      await hook.result.current.sendApproval('approval-first', true);
+      await hook.result.current.sendApproval(hitlIdentity('approval-first'), true);
     });
 
     expect(mocks.apiInvoke).toHaveBeenCalledWith('send_approval_response', {
-      workspaceId: 'global',
-      conversationId: null,
-      expectedRootTurnId: null,
-      expectedActiveTurnId: null,
+      workspaceId: 'original-workspace',
+      conversationId: 'original-conversation',
+      expectedRootTurnId: 'original-root',
+      expectedActiveTurnId: 'original-turn',
       requestId: 'approval-first',
+      responseTarget: 'target-approval-first',
+      requestScope: hitlIdentity('approval-first').scope,
+      requestKind: 'approval',
       approved: true,
       reason: undefined,
       scope: undefined,
@@ -1393,7 +1537,7 @@ describe('useTauriChat foreground turn recovery', () => {
     expect(useChatStore.getState().runStatus).toBe('waiting_approval');
 
     await act(async () => {
-      await hook.result.current.sendApproval('approval-second', false, 'not now');
+      await hook.result.current.sendApproval(hitlIdentity('approval-second'), false, 'not now');
     });
     expect(useChatStore.getState().pendingHitlRequests).toEqual([]);
     expect(useChatStore.getState().runStatus).toBe('running');

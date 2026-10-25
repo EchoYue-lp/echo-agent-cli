@@ -1,0 +1,58 @@
+# ADR 0053: GUI control of existing IM and cron owners
+
+The product decision is accepted. The source integrates the existing IM/cron owners, HITL delivery identity and desktop lifecycle. Source integration does not qualify the complete outcome, Rust compilation or native desktop behavior.
+
+## Status
+
+Accepted
+
+## Context
+
+GUI, retained channel entry points and scheduled work must share the original EKO owners. ChannelManager owns transport and handler settlement; SchedulerRunner/CronTaskStore and the occurrence journal own scheduling facts; ConfigState's owned save owns configuration publication. Their APIs and receipts must not be replaced by GUI stores or a second executor. The accepted cross-repository convergence design and Plan07 define the product scope; ADR0050 defines the framework/application boundary.
+
+The original HITL request ID is released after its provider future ends and can then be reused. An ID alone cannot distinguish a late answer from a new request. The framework request and response types remain unchanged, including Selection context and browser session identity.
+
+## Alternatives
+
+1. Keep ID-only replies: late answers could resolve a later request with the same ID.
+2. Add framework fields or a central approval store: this would move EKO presentation policy into the framework or duplicate existing future/pending ownership.
+3. Pair each actual delivery in EKO and retain the original provider future: selected.
+
+## Decision
+
+EKO's `pair_request` preserves an existing request ID, generates a missing ID once, and creates a fresh nonempty `response_target` per actual delivery. `HitlRequestIdentity` contains the original ID, target, kind and `HitlRequestScope`. Scope carries available workspace/host generation, conversation/root turn/turn, run/task and channel/sender incarnation coordinates. Standalone absent coordinates remain absent; real GUI/channel owners supply their original coordinates. Selection context and framework session IDs are not repurposed. Providers resolve coordinates at the actual request using Weak read views of the original ForegroundTurnControl and ChannelActiveTurn record. They do not depend on EKO task-locals surviving a framework stream spawn, retain an application-owner cycle or rebind to the selected workspace. The same original owner supplies a continuation’s current turn; missing or settled owners reject before insertion. Pump admissions publish to the existing channel map and retain its existing removal receipt on the original foreground lease.
+
+Ordinary GUI, resumed TaskRun and registered browser Approval use the same Tauri provider's direct request future. EKO's paired provider entry validates and consumes a pair without generating another target. A scoped GUI+IM dispatcher pairs before cloning, shares the pair across its original provider futures and accepts one effective human answer. Timeout, Deferred and unavailable providers cannot beat another human answer. Its single deadline is the shorter of the request timeout and 300 seconds. Legacy generic provider registration remains available.
+
+The original GUI pending map is indexed by target. Before removal, all three reply IPCs check `request_id`, `response_target`, `request_scope`, `request_kind`, the route's expected kind and original active turn coordinates. While holding that same pending-map lock, Input must contain nonblank text, Selection must match an original option, and Approval permits only the original known scope values. Invalid input leaves the waiting item intact. Sender failure reports expired; a successful send reports `submitted`, not an effective winner. Cancellation retains workspace/conversation scope. Reservation release emits only removal of the same identity's projection; it is not a new approval terminal state or store.
+
+Request events carry optional EKO `identity`. New paired request/release envelopes use the current turn within the original root journal and reject inconsistent stream coordinates, ID or kind. Absence is omitted during serialization to preserve historical payload/hash identity; replay never invents a target or activates a historical request without one. The handwritten event adapters retain the original identity through the journal envelope, handler, pending projection, ChatPanel and the three production useTauriChat calls. Replies use the clicked request's scope, not the currently selected page.
+
+IM consumes `/reply <response-target> <answer>` before chat, steering and management admission. Only the current front's matching target and kind can resolve it. Missing, expired, non-front or foreign-session targets are rejected; bare text with a pending request prompts for its target. Ordinary text without pending work remains chat. Input preserves the answer suffix's UTF-8/newlines. Approval and Selection retain their original answer parsing; cancellation is `/reply <target> /cancel`. Existing reserved IDs remain reserved until the original future settles.
+
+The existing channel implementation now lives in app-core `channel_runtime`; retained bin entry points forward to it. Only the original text command adapters move with it. `ApplicationServices`, Tauri and standalone channels consume one `ChannelRuntime`, original `ChannelManager` and original coordinator/session/pump owners. GUI+IM uses a desktop factory with Weak host/state references and the original scoped dispatcher, GUI pending map and IM FIFO. Without a desktop factory, the direct IM provider remains in use. The original pump driver forwards prompt broadcasts through its existing render channel; losing that observer only withdraws the IM provider, leaving an eligible GUI response available.
+
+ConfigState publishes an opaque UUID revision with the committed config under the same write guard, only after the original owned save succeeds. Every provider/model/full-config/channel save shares that owner. This revision is independent of the transport mutation epoch and the revision used to construct the existing adapter. Save never starts a channel. Start/reconnect checks the desired revision and original instance identity; stop checks the delivered instance epoch/applied revision so a newer model save cannot strand an old connection. A late stop cannot affect its successor. GUI sees credential presence only; omitted credentials preserve, explicit clear removes, and debug output redacts them. Unknown/closed observations remain unknown; local webhook listener readiness does not prove platform reachability.
+
+The original pump JoinSet remains in its original coordinator registry while one owned producer drains it. Dropping a waiter cannot abort the tasks. A task error is retained while all remaining tasks are joined; a completed error receipt differs from unknown physical ownership. Explicit reconnect reuses the original coordinator and incarnation/retirement gates only after its physical receipt and foreground map confirm settlement. No automatic replay or replacement owner is introduced.
+
+ApplicationLifecycleOwner has an application-specific channel retention slot outside `normal_drained`. Phase one closes the original admission; phase two observes the same original handles. Stop errors, unknown observations or cleanup panic retain those handles and block dependent Agent/ToolManager/pool close. Completed cleanup errors remain diagnostics while allowing physical release. Real producer post-commit receipts and original transport changes Weak-wake the original single-flight continuation. Repeated waits or notifications do not themselves prove progress or retry a failed stop: retries require changed original manager/session facts. Generic external-owner semantics remain unchanged.
+
+Window X prevents close and hides; failure restores the window and reports it. Tray show restores/focuses, while explicit Quit follows the original two-phase owner. The desktop's final settlement boundary subscribes to that original receipt until an actual final publication, keeping Tokio alive even after the event loop returns. Bounded `wait()` elsewhere keeps its original observation semantics. Missing continuation or closed observation cannot manufacture finality; completed final errors still return errors. Unknown without real progress may keep true Quit pending indefinitely rather than falsely report physical completion.
+
+Cron edit uses the original captured definition/revision; manual execution projects the original occurrence/attempt, typed cause, physical settlement, terminal apply receipt and journal outcome. Callback result text stays opaque. History reads the original bounded journal page with an opaque lossless cursor; JS sequence/floor values use strings. Retention/generation errors preserve the displayed page until explicit refresh. An associated run link resolves existing facts from the occurrence's canonical conversation and opens only its exact existing workspace/conversation/run, never the selected page or a parsed callback string.
+
+No new platform, daemon, SQLite, crash replay policy, Agent permission gate, task graph, store or executor is selected. Depth ADR0052 and SSH ADR0051 retain their own source/qualification boundaries.
+
+
+The retained standalone channel entry returns after original cleanup when every actual start fails; GUI empty state remains valid and one failed channel does not stop another successful channel. A paired GUI delivery failure withdraws only that observer; only the exclusive direct GUI path preserves its original failed-turn projection. Pump prompt backpressure awaits capacity in the original bounded queue while continuing to poll the same driver. Closed or lagged prompt observation withdraws current IM requests without permanently closing the session. The same drive continues observing later prompts and immediately withdraws IM when that renderer remains unavailable, so a later request cannot wait unobserved until its deadline. Eligible GUI futures and a later independent IM renderer remain usable.
+
+## Consequences
+
+The application gains a delivery identity independent of a reusable framework ID without another queue, task graph, store or executor. Retained CLI/TUI callers only maintain existing literals/exhaustive matches; absent identity keeps the old bytes and GUI release projections add no JSONL record or command.
+
+Focused Node before/after tests and source regression definitions cover the integrated adapters. This combined source has not been compiled by Cargo. Rust/GUI gates, genuine Rust IPC export, native GUI/browser/IM behavior, live two-surface composition, fresh exact dependency-risk qualification and exact main CI remain separate pending evidence. Immutable earlier identity validation and its warning are recorded separately and are not relabelled as combined-source evidence. Website synchronization belongs to the coordinated website owner. No real platform delivery or complete product acceptance is claimed by this ADR.
+
+## Implementation references
+
+[Tokio graceful shutdown](https://tokio.rs/tokio/topics/shutdown) distinguishes signalling shutdown from waiting for accepted work to finish. [Tokio JoinHandle](https://docs.rs/tokio/latest/tokio/task/struct.JoinHandle.html) documents that dropping a handle detaches its task. EKO therefore retains its original handles and observes real completion at its existing application owner. The alternative of broadening every generic external-owner contract was rejected because this channel-specific product composition belongs in EKO. This local protection prevents framework/application cleanup bugs and accidental loss of accepted work; it adds no user-interaction permission gate.

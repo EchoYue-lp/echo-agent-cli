@@ -36,10 +36,7 @@ pub(super) struct ChannelInputReplyRoute {
     pub(super) render_tx: tokio::sync::mpsc::Sender<ChannelRenderEvent>,
     pub(super) lifecycle_cursor: Arc<Mutex<u64>>,
     pub(super) terminal_tx: tokio::sync::oneshot::Sender<
-        Result<
-            echo_agent_app_core::api::chat_driver::TurnOutcome,
-            echo_agent_app_core::api::chat_driver::ChatTurnError,
-        >,
+        Result<crate::chat_driver::TurnOutcome, crate::chat_driver::ChatTurnError>,
     >,
 }
 
@@ -54,10 +51,7 @@ pub(super) struct ChannelInputReplyReceiver {
     pub(super) correlation: ChannelReplyCorrelation,
     pub(super) render_rx: tokio::sync::mpsc::Receiver<ChannelRenderEvent>,
     pub(super) terminal_rx: tokio::sync::oneshot::Receiver<
-        Result<
-            echo_agent_app_core::api::chat_driver::TurnOutcome,
-            echo_agent_app_core::api::chat_driver::ChatTurnError,
-        >,
+        Result<crate::chat_driver::TurnOutcome, crate::chat_driver::ChatTurnError>,
     >,
 }
 
@@ -546,13 +540,11 @@ pub(super) trait ChannelInputPumpAdapter: Send + Sync + 'static {
 pub(super) struct ChannelInputExecutionError {
     reason: String,
     reply: Option<ChannelInputReplyRoute>,
-    observation: Option<echo_agent_app_core::api::chat_driver::ChatTurnError>,
+    observation: Option<crate::chat_driver::ChatTurnError>,
 }
 
 impl ChannelInputExecutionError {
-    pub(super) fn from_driver_error(
-        error: echo_agent_app_core::api::chat_driver::ChatTurnError,
-    ) -> Self {
+    pub(super) fn from_driver_error(error: crate::chat_driver::ChatTurnError) -> Self {
         let observation = error.is_observation().then(|| error.clone());
         Self {
             reason: error.to_string(),
@@ -1121,7 +1113,7 @@ mod tests {
                 let closed = reply
                     .render_tx
                     .try_send(ChannelRenderEvent::Terminal(
-                        echo_agent_app_core::api::chat_driver::TurnOutcome::Cancelled,
+                        crate::chat_driver::TurnOutcome::Cancelled,
                     ))
                     .is_err();
                 if closed {
@@ -1207,15 +1199,15 @@ mod tests {
     }
 
     struct DurableRestartAdapter {
-        service: echo_agent_app_core::api::conversation_input::ConversationInputService,
-        address: echo_agent_app_core::api::conversation_input::ConversationInputAddress,
+        service: crate::conversation_input::ConversationInputService,
+        address: crate::conversation_input::ConversationInputAddress,
         claims: AtomicUsize,
         executions: AtomicUsize,
     }
 
     impl ChannelInputPumpAdapter for DurableRestartAdapter {
-        type Identity = echo_agent_app_core::api::conversation_input::ConversationInputIdentity;
-        type Item = echo_agent_app_core::api::conversation_input::ConversationInputProjection;
+        type Identity = crate::conversation_input::ConversationInputIdentity;
+        type Item = crate::conversation_input::ConversationInputProjection;
 
         fn peek_next_identity(&self) -> BoxFuture<'_, Result<Option<Self::Identity>, String>> {
             Box::pin(async move {
@@ -1309,7 +1301,7 @@ mod tests {
                 self.service
                     .turn_settled(
                         attempt,
-                        echo_agent_app_core::api::conversation_input::ConversationInputOutcome::Completed,
+                        crate::conversation_input::ConversationInputOutcome::Completed,
                         true,
                     )
                     .await
@@ -1317,9 +1309,9 @@ mod tests {
                         ChannelInputExecutionError::from_driver_error(error.to_string().into())
                     })?;
                 self.executions.fetch_add(1, Ordering::SeqCst);
-                let _ = reply.terminal_tx.send(Ok(
-                    echo_agent_app_core::api::chat_driver::TurnOutcome::Completed,
-                ));
+                let _ = reply
+                    .terminal_tx
+                    .send(Ok(crate::chat_driver::TurnOutcome::Completed));
                 Ok(())
             })
         }
@@ -1338,15 +1330,14 @@ mod tests {
     -> Result<(), String> {
         let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
         let log = Arc::new(
-            echo_agent_app_core::api::chat_event_log::ChatEventLog::open(
+            crate::chat_event_log::ChatEventLog::open(
                 temporary.path().join("channel-restart-log"),
-                echo_agent_app_core::api::chat_event_log::ChatEventRetention::default(),
+                crate::chat_event_log::ChatEventRetention::default(),
             )
             .map_err(|error| error.to_string())?,
         );
-        let service =
-            echo_agent_app_core::api::conversation_input::ConversationInputService::new(log);
-        let address = echo_agent_app_core::api::conversation_input::ConversationInputAddress {
+        let service = crate::conversation_input::ConversationInputService::new(log);
+        let address = crate::conversation_input::ConversationInputAddress {
             workspace_id: "workspace-restart".to_string(),
             conversation_id: "conversation-restart".to_string(),
         };
@@ -1396,7 +1387,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert!(matches!(
             outcome,
-            Ok(echo_agent_app_core::api::chat_driver::TurnOutcome::Completed)
+            Ok(crate::chat_driver::TurnOutcome::Completed)
         ));
         assert_eq!(adapter.claims.load(Ordering::SeqCst), 1);
         assert_eq!(adapter.executions.load(Ordering::SeqCst), 1);
@@ -1419,7 +1410,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert_eq!(
             old_terminal.phase,
-            echo_agent_app_core::api::conversation_input::ConversationInputPhase::Cancelled
+            crate::conversation_input::ConversationInputPhase::Cancelled
         );
         assert!(old_terminal.attempt.is_none());
         assert!(!old_terminal.drained);
@@ -1582,9 +1573,9 @@ mod tests {
                     ));
                 }
                 self.available.store(0, Ordering::SeqCst);
-                let _ = reply.terminal_tx.send(Ok(
-                    echo_agent_app_core::api::chat_driver::TurnOutcome::Completed,
-                ));
+                let _ = reply
+                    .terminal_tx
+                    .send(Ok(crate::chat_driver::TurnOutcome::Completed));
                 Ok(())
             })
         }
@@ -1635,7 +1626,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert!(matches!(
             outcome,
-            Ok(echo_agent_app_core::api::chat_driver::TurnOutcome::Completed)
+            Ok(crate::chat_driver::TurnOutcome::Completed)
         ));
         assert_eq!(adapter.executions.load(Ordering::SeqCst), 2);
         assert_eq!(adapter.recoveries.load(Ordering::SeqCst), 1);

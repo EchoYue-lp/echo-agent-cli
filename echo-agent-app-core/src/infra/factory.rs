@@ -1549,6 +1549,9 @@ fn build_writer_subagent_agent(
     }
 
     if can_delegate {
+        // Role capability is static. The original invocation's bound policy
+        // controls current depth/visibility; consulting today's GUI default
+        // here would break simultaneous old/new runs with different limits.
         builder = builder
             .enable_subagent()
             .subagent_registry(subagent_registry)
@@ -1681,6 +1684,8 @@ fn build_readonly_subagent_agent(
     }
 
     if can_delegate {
+        // Keep the role menu reusable across bound limits 1/2/3. Runtime
+        // invocation scope, not a global factory flag, authorizes descendants.
         builder = builder
             .enable_subagent()
             .subagent_registry(subagent_registry)

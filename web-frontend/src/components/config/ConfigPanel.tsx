@@ -3,6 +3,16 @@ import { configApi } from '../../api/endpoints';
 import type { AgentConfigResponse, FullConfigResponse } from '../../generated';
 import type { FullConfigUpdateRequest } from '../../types/api';
 
+// Validate the wire value without hand-editing Rust-generated contracts. The
+// generated response gains this field only when the authorized Rust export runs.
+function readMaxSubagentDepth(config: unknown): 1 | 2 | 3 {
+  if (typeof config === 'object' && config !== null && 'max_subagent_depth' in config) {
+    const value = config.max_subagent_depth;
+    if (value === 1 || value === 2 || value === 3) return value;
+  }
+  throw new Error('配置缺少有效的最大子智能体层数（1、2 或 3）');
+}
+
 export function ConfigPanel() {
   const [agentConfig, setAgentConfig] = useState<AgentConfigResponse | null>(null);
   const [fullConfig, setFullConfig] = useState<FullConfigResponse | null>(null);
@@ -17,6 +27,7 @@ export function ConfigPanel() {
     setLoadError(null);
     try {
       const [agent, full] = await Promise.all([configApi.get(), configApi.getFull()]);
+      readMaxSubagentDepth(full);
       setAgentConfig(agent);
       setFullConfig(full);
     } catch (e) {
@@ -46,6 +57,10 @@ export function ConfigPanel() {
       // syncs system_prompt and max_iterations to the running agents (primary
       // + pools), so no second update_config round-trip is needed here.
       const updatedFull = await configApi.updateFull(edit, controller.signal);
+      const savedDepth = readMaxSubagentDepth(updatedFull);
+      if (edit.max_subagent_depth !== undefined && savedDepth !== edit.max_subagent_depth) {
+        throw new Error('层数配置未按请求保存');
+      }
       setFullConfig(updatedFull);
       setEdit({});
       setDirty(false);
@@ -109,8 +124,32 @@ export function ConfigPanel() {
         </div>
       </div>
 
-      {/* Agent — reads from running agent (configApi.get), not YAML */}
+      {/* Prompt reads the live Agent; depth reads committed product config. */}
       <Section title="智能体">
+        <div className="space-y-1">
+          <label htmlFor="max-subagent-depth" className="text-xs text-[var(--text-secondary)]">
+            最大子智能体层数
+          </label>
+          <select
+            id="max-subagent-depth"
+            disabled={saving}
+            value={edit.max_subagent_depth ?? readMaxSubagentDepth(fullConfig)}
+            onChange={(event) => {
+              const value = Number(event.target.value);
+              if (value === 1 || value === 2 || value === 3) {
+                markDirty({ max_subagent_depth: value });
+              }
+            }}
+            className="w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-3 py-2 text-sm text-[var(--text-primary)]"
+          >
+            <option value="1">1 层：仅主智能体可以分工（默认）</option>
+            <option value="2">2 层：允许子智能体继续分工</option>
+            <option value="3">3 层：最多三层</option>
+          </select>
+          <p className="text-[11px] leading-relaxed text-[var(--text-tertiary)]">
+            主智能体为第 0 层。对新任务生效，已运行任务及其重试、恢复保持原上限。
+          </p>
+        </div>
         <Field
           label="系统提示词"
           value={edit.agent?.system_prompt ?? agentConfig.system_prompt}
