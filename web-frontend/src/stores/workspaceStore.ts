@@ -13,6 +13,11 @@ import { productDataScope } from '../lib/productDataScope';
 
 let workspaceGeneration = 0;
 
+function includeWorkspace(workspaces: Workspace[], workspace: Workspace): Workspace[] {
+  // 创建/打开回执已来自原 registry；同步侧栏列表并替换同 ID 的旧 generation。
+  return [workspace, ...workspaces.filter((item) => item.id !== workspace.id)];
+}
+
 function detachVisibleWorkspace(workspaceId: string): void {
   useChatStore.getState().clearMessages();
   useTaskRuntimeStore.getState().reset();
@@ -168,15 +173,21 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
     if (!res.success) {
       if (generation === workspaceGeneration) {
+        // 创建已落盘但进入失败时，保留列表事实，不把它投影成当前工作空间。
+        set((state) => ({ workspaces: includeWorkspace(state.workspaces, res.workspace) }));
         await useConversationStore.getState().init(previousWorkspaceId);
-        set({ isLoading: false });
+        if (generation === workspaceGeneration) set({ isLoading: false });
       }
       const prefix = res.created ? '工作区已创建，但进入失败' : '无法创建并进入工作区';
       throw new Error(`${prefix}：${res.error}`);
     }
     if (generation !== workspaceGeneration) return res.workspace;
     const ws = res.workspace;
-    set({ current: ws, isLoading: false });
+    set((state) => ({
+      current: ws,
+      workspaces: includeWorkspace(state.workspaces, ws),
+      isLoading: false,
+    }));
     showTransitionWarning(res.transition);
     const fileStore = useFileStore.getState();
     fileStore.bindScope(productDataScope(ws));
