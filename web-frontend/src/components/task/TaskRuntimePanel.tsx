@@ -662,18 +662,22 @@ export function TaskRuntimePanel() {
         : '',
   };
   const usageSummary = cacheUsageForRuns(visibleTraceRuns);
-  const completedCount = todos.filter((todo) => todo.status === ('completed' as TodoStatus)).length;
-  const executionCompletedCount = todos.filter((todo) => {
-    const trace = traceRunForTodo(todo, activeTaskTraceRuns);
-    return trace?.status === 'completed' || todo.status === ('completed' as TodoStatus);
-  }).length;
+  const planGoalCurrent =
+    plan?.goal_revision === activeRun.goal_revision && plan?.goal_sha256 === activeRun.goal_sha256;
+  const completedCount = planGoalCurrent
+    ? todos.filter((todo) => todo.status === ('completed' as TodoStatus)).length
+    : 0;
+  const executionCompletedCount = planGoalCurrent
+    ? todos.filter((todo) => {
+        const trace = traceRunForTodo(todo, activeTaskTraceRuns);
+        return trace?.status === 'completed' || todo.status === ('completed' as TodoStatus);
+      }).length
+    : 0;
   const currentTurn = continuation?.active_turn ?? continuation?.last_turn;
   const activeCellCount = backgroundCells.filter((cell) =>
     ['prepared', 'queued', 'running'].includes(cell.phase)
   ).length;
   const budgetLabels = continuation?.enabled ? continuationBudgetLabels(continuation) : null;
-  const planGoalCurrent =
-    plan?.goal_revision === activeRun.goal_revision && plan?.goal_sha256 === activeRun.goal_sha256;
   const visibleActionReceipt =
     actionReceipt?.runId === runId &&
     actionReceipt.workspaceId === controlTarget.workspace_id &&
@@ -826,22 +830,32 @@ export function TaskRuntimePanel() {
           <span>{activeRun.attended_mode === 'unattended' ? '后台触发' : '交互任务'}</span>
           <span>更新于 {taskTimestamp(activeRun.updated_at)}</span>
         </div>
-        <div className="eko-task-progress-heading">
-          <span>
-            已提交完成 <strong>{completedCount}</strong>
-            <span> / {todos.length} 项</span>
-          </span>
-          <span>
-            {hasMoreEvents ? '执行记录尚未读完' : `执行完成 ${executionCompletedCount} 项`}
-          </span>
-        </div>
-        {todos.length > 0 ? (
-          <div
-            className="eko-task-progress-track"
-            aria-label={`已提交完成 ${completedCount} / ${todos.length} 项任务`}
-          >
-            <span style={{ width: `${(completedCount / todos.length) * 100}%` }} />
-          </div>
+        {planGoalCurrent ? (
+          <>
+            <div className="eko-task-progress-heading">
+              <span>
+                已提交完成 <strong>{completedCount}</strong>
+                <span> / {todos.length} 项</span>
+              </span>
+              <span>
+                {hasMoreEvents ? '执行记录尚未读完' : `执行完成 ${executionCompletedCount} 项`}
+              </span>
+            </div>
+            {todos.length > 0 ? (
+              <div
+                className="eko-task-progress-track"
+                aria-label={`已提交完成 ${completedCount} / ${todos.length} 项任务`}
+              >
+                <span style={{ width: `${(completedCount / todos.length) * 100}%` }} />
+              </div>
+            ) : (
+              <p className="eko-task-progress-unknown">任务尚未展开 · 进度待记录</p>
+            )}
+          </>
+        ) : plan ? (
+          <p role="status" className="eko-task-progress-unknown">
+            旧计划未绑定当前 Goal r{activeRun.goal_revision}，保留为历史记录，不计当前目标完成进度。
+          </p>
         ) : (
           <p className="eko-task-progress-unknown">任务尚未展开 · 进度待记录</p>
         )}
@@ -926,14 +940,22 @@ export function TaskRuntimePanel() {
         pendingAction={pendingAction}
         actionReceipt={visibleActionReceipt}
         onAction={performAction}
-        describeTodo={(todo) => todoStatusDescription(todo, activeTaskTraceRuns)}
-        renderStatus={(todo) => (
-          <TodoIcon
-            status={todo.status}
-            executionStatus={traceRunForTodo(todo, activeTaskTraceRuns)?.status}
-            taskRunStatus={activeRun.status}
-          />
-        )}
+        describeTodo={(todo) =>
+          planGoalCurrent
+            ? todoStatusDescription(todo, activeTaskTraceRuns)
+            : `历史计划 · ${TODO_LABEL[todo.status] ?? todo.status}（不计当前目标）`
+        }
+        renderStatus={(todo) =>
+          planGoalCurrent ? (
+            <TodoIcon
+              status={todo.status}
+              executionStatus={traceRunForTodo(todo, activeTaskTraceRuns)?.status}
+              taskRunStatus={activeRun.status}
+            />
+          ) : (
+            <Clock3 size={14} aria-label="历史计划状态" style={{ color: 'var(--text-tertiary)' }} />
+          )
+        }
       />
       <details className="eko-task-runtime-settings">
         <summary>

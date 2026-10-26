@@ -59,10 +59,12 @@ function run(status: TaskRun['status']): TaskRun {
 
 function deferred<T>() {
   let resolve: (value: T) => void = () => undefined;
-  const promise = new Promise<T>((next) => {
+  let reject: (reason: Error) => void = () => undefined;
+  const promise = new Promise<T>((next, fail) => {
     resolve = next;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function eventPage(events: RuntimeTaskEvent[] = [], after = '0', hasMore = false): TaskEventPage {
@@ -484,6 +486,356 @@ describe('taskRuntimeStore conversation loading', () => {
     workspaceGeneration: 'generation-1',
   };
 
+  it.each(['conversation', 'history'] as const)(
+    'keeps the canonical Goal refresh after an older initial %s snapshot resolves',
+    async (view) => {
+      const original = { ...run('paused'), domain_profile: 'general' as const };
+      const live = { ...original, run_id: 'run-live' };
+      const plan: PlanRevision = {
+        plan_id: 'plan-1',
+        run_id: original.run_id,
+        revision: 1,
+        domain_profile: 'general',
+        domain_binding: null,
+        goal_revision: 1,
+        goal_sha256: original.goal_sha256,
+        assumptions: [],
+        risks: [],
+        execution_mode: 'parallel',
+        tasks: [],
+      };
+      const oldGate = {
+        run_id: original.run_id,
+        goal_revision: 1,
+        plan_revision: 1,
+        ready: true,
+        requirements: [],
+        blockers: [],
+      };
+      mocks.getPlan.mockImplementation((_workspace: string, runId: string) =>
+        Promise.resolve({ ...plan, run_id: runId })
+      );
+      mocks.getCompletionGate.mockImplementation((_workspace: string, runId: string) =>
+        Promise.resolve({ ...oldGate, run_id: runId })
+      );
+      mocks.latestRunForConversation.mockResolvedValue(view === 'history' ? live : original);
+      useTaskRuntimeStore.getState().bindScope(scope);
+      await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
+      if (view === 'history') {
+        mocks.getRun.mockResolvedValue(original);
+        await useTaskRuntimeStore.getState().loadByRun(scope, original.run_id);
+      }
+
+      const oldPlan = deferred<PlanRevision>();
+      const readsBefore = mocks.getPlan.mock.calls.length;
+      mocks.getPlan.mockReturnValueOnce(oldPlan.promise);
+      const oldLoad =
+        view === 'history'
+          ? useTaskRuntimeStore.getState().loadByRun(scope, original.run_id)
+          : useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
+      await vi.waitFor(() => expect(mocks.getPlan).toHaveBeenCalledTimes(readsBefore + 1));
+      // 除 plan 外的旧快照已返回；后面只释放这一个旧请求，不手写更新后的store状态。
+      expect(mocks.getCompletionGate).toHaveBeenLastCalledWith(
+        'workspace-1',
+        original.run_id,
+        'generation-1'
+      );
+      const revised = {
+        ...original,
+        goal: '修订后的目标',
+        goal_revision: 2,
+        goal_sha256: 'revised-goal-sha256',
+      };
+      const currentGate = {
+        ...oldGate,
+        goal_revision: 2,
+        ready: false,
+        blockers: [
+          { code: 'plan_goal_mismatch', task_id: null, requirement_id: null, detail: '旧计划' },
+        ],
+      };
+      mocks.updateGoal.mockResolvedValue(revised);
+      mocks.getRun.mockResolvedValue(revised);
+      mocks.getCompletionGate.mockResolvedValue(currentGate);
+      mocks.listEvents.mockResolvedValue(eventPage([note('1')], '0'));
+
+      await expect(
+        useTaskRuntimeStore.getState().updateGoal(original.run_id, 1, revised.goal, '用户修订目标')
+      ).resolves.toBe(true);
+      expect(mocks.updateGoal).toHaveBeenLastCalledWith(
+        'workspace-1',
+        original.run_id,
+        1,
+        revised.goal,
+        '用户修订目标',
+        'generation-1'
+      );
+      expect(taskRuntimePresentation(useTaskRuntimeStore.getState()).activeRun).toEqual(revised);
+      oldPlan.resolve(plan);
+      await oldLoad;
+
+      const current = taskRuntimePresentation(useTaskRuntimeStore.getState());
+      expect(current.activeRun).toEqual(revised);
+      expect(current.completionGate).toEqual(currentGate);
+      expect(current.lastSeq).toBe('1');
+      expect(current.events.map((event) => event.seq)).toEqual(['1']);
+      expect(current.error).toBeNull();
+      expect(useTaskRuntimeStore.getState().loadingRun).toBe(false);
+      expect(useTaskRuntimeStore.getState().pollingInterval).not.toBeNull();
+      expect(useTaskRuntimeStore.getState().activeRun?.run_id).toBe(
+        view === 'history' ? live.run_id : original.run_id
+      );
+    }
+  );
+
+  it.each(['conversation', 'history'] as const)(
+    'settles a still-current initial %s snapshot after a failed refresh',
+    async (view) => {
+      const original = run('paused');
+      mocks.latestRunForConversation.mockResolvedValue(original);
+      mocks.getRun.mockResolvedValue(original);
+      useTaskRuntimeStore.getState().bindScope(scope);
+      await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
+      if (view === 'history') {
+        useTaskRuntimeStore.setState({ activeRun: { ...original, run_id: 'live-other' } });
+        await useTaskRuntimeStore.getState().loadByRun(scope, original.run_id);
+      }
+      const pendingPlan = deferred<PlanRevision | null>();
+      const readsBefore = mocks.getPlan.mock.calls.length;
+      mocks.getPlan.mockReturnValueOnce(pendingPlan.promise);
+      const initial =
+        view === 'history'
+          ? useTaskRuntimeStore.getState().loadByRun(scope, original.run_id)
+          : useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
+      await vi.waitFor(() => expect(mocks.getPlan).toHaveBeenCalledTimes(readsBefore + 1));
+      mocks.getRun.mockRejectedValueOnce(new Error('受控刷新失败'));
+      await useTaskRuntimeStore.getState().refresh('workspace-1', original.run_id);
+      expect(taskRuntimePresentation(useTaskRuntimeStore.getState()).error).toBe('受控刷新失败');
+
+      pendingPlan.resolve(null);
+      await initial;
+      expect(taskRuntimePresentation(useTaskRuntimeStore.getState()).activeRun).toEqual(original);
+      expect(taskRuntimePresentation(useTaskRuntimeStore.getState()).error).toBeNull();
+      expect(useTaskRuntimeStore.getState().loadingRun).toBe(false);
+      expect(useTaskRuntimeStore.getState().pollingInterval).not.toBeNull();
+    }
+  );
+
+  it.each(['conversation', 'history'] as const)(
+    'reports an initial %s snapshot failure without leaving a loading owner',
+    async (view) => {
+      mocks.latestRunForConversation.mockResolvedValue(run('paused'));
+      mocks.getRun.mockResolvedValue(run('paused'));
+      mocks.getPlan.mockRejectedValueOnce(new Error('受控初始载入失败'));
+      useTaskRuntimeStore.getState().bindScope(scope);
+      if (view === 'history') {
+        await useTaskRuntimeStore.getState().loadByRun(scope, 'run-1');
+        expect(useTaskRuntimeStore.getState().historyError).toBe('受控初始载入失败');
+      } else {
+        await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
+        expect(useTaskRuntimeStore.getState().error).toBe('受控初始载入失败');
+      }
+      expect(useTaskRuntimeStore.getState().loadingRun).toBe(false);
+      expect(useTaskRuntimeStore.getState().pollingInterval).toBeNull();
+    }
+  );
+
+  it.each(['conversation', 'history', 'shared', 'shared-unloaded'] as const)(
+    'retires r1 initial data after an accepted Goal CAS even when refresh fails (%s)',
+    async (view) => {
+      const original = run('paused');
+      const revised = {
+        ...original,
+        goal: '已持久提交的 Goal 2',
+        goal_revision: 2,
+        goal_sha256: 'goal-2',
+      };
+      const plan: PlanRevision = {
+        plan_id: 'plan-1',
+        run_id: original.run_id,
+        revision: 1,
+        domain_profile: 'general',
+        domain_binding: null,
+        goal_revision: 1,
+        goal_sha256: original.goal_sha256,
+        assumptions: [],
+        risks: [],
+        execution_mode: 'parallel',
+        tasks: [],
+      };
+      mocks.getPlan.mockResolvedValue(plan);
+      mocks.getRun.mockResolvedValue(original);
+      mocks.latestRunForConversation.mockResolvedValue(
+        view === 'history' ? { ...original, run_id: 'run-live' } : original
+      );
+      useTaskRuntimeStore.getState().bindScope(scope);
+      await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
+      if (view === 'history' || view === 'shared')
+        await useTaskRuntimeStore.getState().loadByRun(scope, original.run_id);
+      const oldPlan = deferred<PlanRevision>();
+      const readsBefore = mocks.getPlan.mock.calls.length;
+      mocks.getPlan.mockReturnValueOnce(oldPlan.promise);
+      const pending =
+        view === 'conversation'
+          ? useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1')
+          : useTaskRuntimeStore.getState().loadByRun(scope, original.run_id);
+      await vi.waitFor(() => expect(mocks.getPlan).toHaveBeenCalledTimes(readsBefore + 1));
+
+      mocks.updateGoal.mockResolvedValue(revised);
+      mocks.getRun.mockRejectedValueOnce(new Error('受控 CAS 后刷新失败'));
+      await useTaskRuntimeStore.getState().updateGoal(original.run_id, 1, revised.goal, '明确修订');
+      const accepted = taskRuntimePresentation(useTaskRuntimeStore.getState());
+      const loadingAfterAccepted = useTaskRuntimeStore.getState().loadingRun;
+      oldPlan.resolve(plan);
+      await pending;
+
+      expect(accepted.activeRun).toEqual(revised);
+      expect(accepted.error).toBe('受控 CAS 后刷新失败');
+      expect(loadingAfterAccepted).toBe(false);
+      const current = taskRuntimePresentation(useTaskRuntimeStore.getState());
+      expect(current.activeRun).toEqual(revised);
+      expect(current.error).toBe('受控 CAS 后刷新失败');
+      expect(current.plan?.goal_revision).toBe(1);
+      expect(current.completionGate?.ready).toBe(false);
+      expect(useTaskRuntimeStore.getState().pollingInterval).not.toBeNull();
+      mocks.getRun.mockResolvedValue(revised);
+      mocks.getCompletionGate.mockResolvedValue({
+        run_id: original.run_id,
+        goal_revision: 2,
+        plan_revision: 1,
+        ready: false,
+        requirements: [],
+        blockers: [],
+      });
+      if (view === 'history' || view === 'shared')
+        await useTaskRuntimeStore.getState().refreshHistory();
+      else await useTaskRuntimeStore.getState().refresh('workspace-1', original.run_id);
+      expect(taskRuntimePresentation(useTaskRuntimeStore.getState()).error).toBeNull();
+      if (view === 'shared' || view === 'shared-unloaded') {
+        expect(useTaskRuntimeStore.getState().error).toBeNull();
+        expect(useTaskRuntimeStore.getState().historySnapshot?.error).toBeNull();
+      }
+      if (view === 'shared' || view === 'shared-unloaded') {
+        mocks.latestRunForConversation.mockResolvedValue({ ...original, run_id: 'run-next' });
+        await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
+        expect(taskRuntimePresentation(useTaskRuntimeStore.getState()).activeRun).toEqual(revised);
+      }
+    }
+  );
+
+  it('keeps a selected chat run canonical while retaining its independent history cursor', async () => {
+    const original = run('paused');
+    const revised = { ...original, goal: '修订 Goal 2', goal_revision: 2, goal_sha256: 'goal-2' };
+    mocks.latestRunForConversation.mockResolvedValue(original);
+    mocks.getRun.mockResolvedValue(original);
+    useTaskRuntimeStore.getState().bindScope(scope);
+    mocks.listEvents.mockResolvedValueOnce(eventPage([note('1'), note('2'), note('3')]));
+    await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
+    mocks.listEvents.mockResolvedValueOnce(eventPage([note('1')], '0', true));
+    await useTaskRuntimeStore.getState().loadByRun(scope, original.run_id);
+    const oldPlan = deferred<PlanRevision | null>();
+    mocks.getPlan.mockReturnValueOnce(oldPlan.promise);
+    mocks.listEvents.mockResolvedValueOnce(eventPage([note('1')], '0', true));
+    const readsBefore = mocks.getPlan.mock.calls.length;
+    const pending = useTaskRuntimeStore.getState().loadByRun(scope, original.run_id);
+    await vi.waitFor(() => expect(mocks.getPlan).toHaveBeenCalledTimes(readsBefore + 1));
+    mocks.updateGoal.mockResolvedValue(revised);
+    mocks.getRun.mockResolvedValue(revised);
+    const gate = {
+      run_id: original.run_id,
+      goal_revision: 2,
+      plan_revision: 0,
+      ready: false,
+      requirements: [],
+      blockers: [],
+    };
+    mocks.getCompletionGate.mockResolvedValue(gate);
+    mocks.listEvents.mockResolvedValueOnce(eventPage([note('4')], '3'));
+    await useTaskRuntimeStore
+      .getState()
+      .updateGoal(original.run_id, 1, revised.goal, '保持同一目标');
+    const loadingAfterAccepted = useTaskRuntimeStore.getState().loadingRun;
+    oldPlan.resolve(null);
+    await pending;
+
+    expect(useTaskRuntimeStore.getState().historySnapshot?.activeRun).toEqual(revised);
+    expect(useTaskRuntimeStore.getState().historySnapshot?.completionGate).toEqual(gate);
+    expect(useTaskRuntimeStore.getState().historySnapshot?.lastSeq).toBe('1');
+    expect(useTaskRuntimeStore.getState().historySnapshot?.hasMoreEvents).toBe(true);
+    expect(useTaskRuntimeStore.getState().lastSeq).toBe('4');
+    expect(loadingAfterAccepted).toBe(false);
+    mocks.latestRunForConversation.mockResolvedValue({ ...original, run_id: 'run-next' });
+    await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
+    expect(taskRuntimePresentation(useTaskRuntimeStore.getState()).activeRun).toEqual(revised);
+    expect(taskRuntimePresentation(useTaskRuntimeStore.getState()).completionGate).toEqual(gate);
+  });
+
+  it.each(['conversation', 'history'] as const)(
+    'does not downgrade a newer canonical %s projection when an older Goal receipt arrives',
+    async (view) => {
+      const original = run('paused');
+      const receipt = deferred<TaskRun>();
+      const revised = { ...original, goal_revision: 2, goal_sha256: 'goal-2', goal: 'Goal 2' };
+      const newer = { ...original, goal_revision: 3, goal_sha256: 'goal-3', goal: 'Goal 3' };
+      const plan: PlanRevision = {
+        plan_id: 'plan-1',
+        run_id: original.run_id,
+        revision: 8,
+        domain_profile: 'general',
+        domain_binding: null,
+        goal_revision: 3,
+        goal_sha256: newer.goal_sha256,
+        assumptions: [],
+        risks: [],
+        execution_mode: 'parallel',
+        tasks: [],
+      };
+      mocks.latestRunForConversation.mockResolvedValue(original);
+      mocks.getRun.mockResolvedValue(original);
+      useTaskRuntimeStore.getState().bindScope(scope);
+      await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
+      await useTaskRuntimeStore.getState().loadByRun(scope, original.run_id);
+      mocks.updateGoal.mockReturnValueOnce(receipt.promise);
+      const action = useTaskRuntimeStore
+        .getState()
+        .updateGoal(original.run_id, 1, revised.goal, '较早提交');
+      mocks.getRun.mockResolvedValue(newer);
+      mocks.getPlan.mockResolvedValue(plan);
+      mocks.getCompletionGate.mockResolvedValue({
+        run_id: original.run_id,
+        goal_revision: 3,
+        plan_revision: 8,
+        ready: false,
+        requirements: [],
+        blockers: [],
+      });
+      if (view === 'history') await useTaskRuntimeStore.getState().refreshHistory();
+      else await useTaskRuntimeStore.getState().refresh('workspace-1', original.run_id);
+      const observed: Array<{ goal: number; plan: number }> = [];
+      const unsubscribe = useTaskRuntimeStore.subscribe((state) => {
+        const current = view === 'history' ? state.historySnapshot : state;
+        observed.push({
+          goal: current?.activeRun?.goal_revision ?? 0,
+          plan: current?.plan?.revision ?? 0,
+        });
+      });
+      try {
+        receipt.resolve(revised);
+        await action;
+      } finally {
+        unsubscribe();
+      }
+      expect(observed.length).toBeGreaterThan(0);
+      expect(observed.every((item) => item.goal >= 3 && item.plan >= 8)).toBe(true);
+      const current =
+        view === 'history'
+          ? useTaskRuntimeStore.getState().historySnapshot
+          : useTaskRuntimeStore.getState();
+      expect(current?.activeRun).toEqual(newer);
+      expect(current?.plan).toEqual(plan);
+    }
+  );
+
   it('loads an exact historical run without asking for the newer run in its conversation', async () => {
     mocks.getRun.mockResolvedValue(run('completed'));
     mocks.latestRunForConversation.mockResolvedValue({ ...run('running'), run_id: 'newer-run' });
@@ -643,19 +995,71 @@ describe('taskRuntimeStore conversation loading', () => {
     expect(useTaskRuntimeStore.getState().activeRun?.run_id).toBe('run-live');
     expect(useTaskRuntimeStore.getState().interruptPrompt).toBe(prompt);
   });
-  it('pins a selected current run when the same conversation advances to another chat run', async () => {
-    const first = { ...run('paused'), run_id: 'run-live' };
-    mocks.latestRunForConversation.mockResolvedValueOnce(first);
-    await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
-    mocks.getRun.mockResolvedValueOnce(first);
-    await useTaskRuntimeStore.getState().loadByRun(scope, first.run_id);
-    mocks.latestRunForConversation.mockResolvedValueOnce({ ...first, run_id: 'run-successor' });
-    await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
-    expect(useTaskRuntimeStore.getState().activeRun?.run_id).toBe('run-successor');
-    expect(taskRuntimePresentation(useTaskRuntimeStore.getState()).activeRun?.run_id).toBe(
-      'run-live'
-    );
-  });
+  it.each([
+    ['conversation', 'refresh'],
+    ['conversation', 'goal-receipt'],
+    ['history', 'refresh'],
+    ['history', 'goal-receipt'],
+  ] as const)(
+    'pins a selected run while a new %s run loads across the old run %s',
+    async (view, update) => {
+      const first = { ...run('paused'), run_id: 'run-live' };
+      const successor = { ...first, run_id: 'run-successor' };
+      mocks.latestRunForConversation.mockResolvedValueOnce(first);
+      useTaskRuntimeStore.getState().bindScope(scope);
+      await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
+      mocks.getRun.mockResolvedValue(first);
+      await useTaskRuntimeStore.getState().loadByRun(scope, first.run_id);
+      const accepted = deferred<TaskRun>();
+      mocks.updateGoal.mockReturnValueOnce(accepted.promise);
+      const action =
+        update === 'goal-receipt'
+          ? useTaskRuntimeStore.getState().updateGoal(first.run_id, 1, 'revised A', '用户修改')
+          : null;
+      const nextPlan = deferred<PlanRevision | null>();
+      mocks.getPlan.mockImplementation((_workspace: string, runId: string) =>
+        runId === successor.run_id ? nextPlan.promise : Promise.resolve(null)
+      );
+      mocks.latestRunForConversation.mockResolvedValueOnce(successor);
+      mocks.getRun.mockImplementation((_workspace: string, runId: string) =>
+        Promise.resolve(runId === successor.run_id ? successor : first)
+      );
+      const nextRead =
+        view === 'conversation'
+          ? useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1')
+          : useTaskRuntimeStore.getState().loadByRun(scope, successor.run_id);
+      await vi.waitFor(() =>
+        expect(mocks.getPlan).toHaveBeenCalledWith('workspace-1', successor.run_id, 'generation-1')
+      );
+      if (action) {
+        const revised = { ...first, goal: 'revised A', goal_revision: 2 };
+        mocks.getRun.mockImplementation((_workspace: string, runId: string) =>
+          Promise.resolve(runId === successor.run_id ? successor : revised)
+        );
+        accepted.resolve(revised);
+        await action;
+        expect(useTaskRuntimeStore.getState().activeRun?.goal_revision).toBe(2);
+      } else {
+        await useTaskRuntimeStore.getState().refresh('workspace-1', first.run_id);
+      }
+      nextPlan.resolve(null);
+      await nextRead;
+      const state = useTaskRuntimeStore.getState();
+      expect(state.activeRun?.run_id).toBe(
+        view === 'conversation' ? successor.run_id : first.run_id
+      );
+      expect(state.historySnapshot?.activeRun?.run_id).toBe(
+        view === 'conversation' ? first.run_id : successor.run_id
+      );
+      expect(taskRuntimePresentation(state).activeRun?.run_id).toBe(
+        view === 'conversation' ? first.run_id : successor.run_id
+      );
+      expect(state.loadingRun).toBe(false);
+      expect(state.error).toBeNull();
+      expect(state.historyError).toBeNull();
+      expect(state.pollingInterval).not.toBeNull();
+    }
+  );
 
   it('settles only the new detail busy owner after following chat supersedes a pending detail', async () => {
     const old = deferred<TaskRun | null>();

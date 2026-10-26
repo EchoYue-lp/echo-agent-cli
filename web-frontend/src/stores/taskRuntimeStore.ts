@@ -180,6 +180,17 @@ function viewForRun(state: TaskRuntimeState, runId?: string): TaskRuntimeView | 
   return state.historySnapshot?.activeRun?.run_id === runId ? state.historySnapshot : null;
 }
 
+/** 同一作用域/run的两份现有投影以後端版本拒绝回退，不用时间戳推断新旧。 */
+function hasNewerRunProjection(state: TaskRuntimeState, run: TaskRun, plan: PlanRevision | null) {
+  return [state, state.historySnapshot].some(
+    (view) =>
+      view?.activeRun?.run_id === run.run_id &&
+      view.activeRun.workspace_id === run.workspace_id &&
+      (view.activeRun.goal_revision > run.goal_revision ||
+        (view.plan?.run_id === run.run_id && view.plan.revision > (plan?.revision ?? 0)))
+  );
+}
+
 /** Select/refresh a presentation after the original API settles; this owns no execution. */
 async function runAction<T>(
   get: () => TaskRuntimeState,
@@ -187,7 +198,7 @@ async function runAction<T>(
   target: string | RunAddress | undefined,
   operation: (address: RunAddress, view: TaskRuntimeView | null) => Promise<T>,
   refreshOnError = false,
-  apply?: (result: T) => Partial<TaskRuntimeView>,
+  apply?: (result: T, current: TaskRuntimeView) => Partial<TaskRuntimeView>,
   throwOnError = false
 ): Promise<T | undefined> {
   const before = get();
@@ -209,6 +220,7 @@ async function runAction<T>(
   const address: RunAddress = { ...run, workspace_generation: capturedScope.workspaceGeneration };
   const chatVersion = loadGeneration;
   const historyVersion = historyRequestGeneration;
+  let appliedGoalReceipt = false;
   const stillOwned = () => {
     const state = get();
     return (
@@ -229,7 +241,15 @@ async function runAction<T>(
       state.activeRun?.run_id === address.run_id &&
       state.activeRun.workspace_id === address.workspace_id
     )
-      set({ error });
+      set({
+        error,
+        ...(appliedGoalReceipt &&
+        error &&
+        state.historySnapshot?.activeRun?.run_id === address.run_id &&
+        state.historySnapshot.activeRun.workspace_id === address.workspace_id
+          ? { historySnapshot: { ...state.historySnapshot, error } }
+          : {}),
+      });
     else if (state.historySnapshot) set({ historySnapshot: { ...state.historySnapshot, error } });
   };
   errorForTarget(null);
@@ -245,16 +265,51 @@ async function runAction<T>(
     }
     if (stillOwned()) {
       if (apply) {
-        const patch = apply(result);
-        if (
-          get().activeRun?.run_id === address.run_id &&
-          get().activeRun?.workspace_id === address.workspace_id
-        )
-          set(patch);
-        else if (get().historySnapshot)
-          set({ historySnapshot: { ...(get().historySnapshot as TaskRuntimeView), ...patch } });
+        const state = get();
+        const isChat =
+          state.activeRun?.run_id === address.run_id &&
+          state.activeRun.workspace_id === address.workspace_id;
+        const current = isChat ? state : state.historySnapshot;
+        if (!current) return result;
+        const patch = apply(result, current);
+        appliedGoalReceipt = !!patch.activeRun;
+        if (appliedGoalReceipt) {
+          const history =
+            state.historySnapshot?.activeRun?.run_id === address.run_id &&
+            state.historySnapshot.activeRun.workspace_id === address.workspace_id
+              ? state.historySnapshot
+              : isChat && state.selectedRunId === address.run_id
+                ? {
+                    activeRun: state.activeRun,
+                    plan: state.plan,
+                    todos: state.todos,
+                    events: state.events,
+                    artifacts: state.artifacts,
+                    recoveryBlockers: state.recoveryBlockers,
+                    continuation: state.continuation,
+                    backgroundCells: state.backgroundCells,
+                    completionGate: state.completionGate,
+                    lastSeq: state.lastSeq,
+                    hasMoreEvents: state.hasMoreEvents,
+                    error: state.error,
+                  }
+                : null;
+          // Goal CAS 的真实回执不因后续读取失败而失效；两份匹配视图仍保留各自事件游标。
+          set({
+            ...(isChat ? patch : {}),
+            ...(history ? { historySnapshot: { ...history, ...apply(result, history) } } : {}),
+            ...(state.selectedRunId === address.run_id ? { loadingRun: false } : {}),
+          });
+          const committed = viewForRun(get(), address.run_id)?.activeRun;
+          if (committed && ['pending', 'running', 'paused'].includes(committed.status))
+            get().startPolling(committed.workspace_id, committed.run_id);
+        } else if (isChat) set(patch);
+        else if (state.historySnapshot)
+          set({ historySnapshot: { ...state.historySnapshot, ...patch } });
       }
       await get().refresh(address.workspace_id, address.run_id);
+      const refreshed = viewForRun(get(), address.run_id);
+      if (appliedGoalReceipt && refreshed?.error) errorForTarget(refreshed.error);
     }
     return result;
   } catch (error) {
@@ -500,12 +555,28 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     const generation = ++historyRequestGeneration;
     eventRequestGeneration += 1;
     const previousSelection = get().selectedRunId;
+    const previousView = get().historySnapshot;
+    // 只有待载入同run的规范提交会退役旧快照；其它run刷新不吞掉本次选中的目标。
+    const ownsInitialData = () => {
+      const state = get();
+      const current = state.historySnapshot;
+      return (
+        generation === historyRequestGeneration &&
+        !!state.taskScope &&
+        sameProductDataScope(state.taskScope, scope) &&
+        (current?.activeRun?.run_id !== runId ||
+          (current?.activeRun === previousView?.activeRun &&
+            current?.plan === previousView?.plan &&
+            current?.completionGate === previousView?.completionGate &&
+            current?.events === previousView?.events))
+      );
+    };
     set({ selectedRunId: runId, loadingRun: true, loadingEvents: false, historyError: null });
     try {
       // Explicit history keeps its single snapshot even when this is also the live chat run.
       // A subsequent chat turn may select another run without changing this inspector's target.
       const run = await taskRuntimeApi.getRun(scope.workspaceId, runId, scope.workspaceGeneration);
-      if (generation !== historyRequestGeneration) return;
+      if (!ownsInitialData()) return;
       if (!run || run.run_id !== runId || run.workspace_id !== scope.workspaceId)
         throw new Error('所选运行已不可用或不属于此工作空间');
       const { snapshot, page } = await initialRunData(
@@ -514,7 +585,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         scope.workspaceGeneration,
         false
       );
-      if (generation !== historyRequestGeneration) return;
+      if (!ownsInitialData() || hasNewerRunProjection(get(), run, snapshot.plan)) return;
       ingestTaskRuntimeSubagentEvents(run, snapshot.plan, page.events);
       ingestTaskRuntimeToolExecutions(run, page.events);
       set({
@@ -531,7 +602,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       if (['pending', 'running', 'paused'].includes(run.status))
         get().startPolling(scope.workspaceId, runId);
     } catch (error) {
-      if (generation === historyRequestGeneration)
+      if (ownsInitialData())
         set({
           selectedRunId: previousSelection,
           historyError: error instanceof Error ? error.message : String(error),
@@ -547,6 +618,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     const scope = get().taskScope;
     if (!view || !run || !scope || get().selectedRunId !== run.run_id) return;
     const generation = historyRequestGeneration;
+    const chatGeneration = loadGeneration;
     const requestGeneration = ++historyRefreshRequestGeneration;
     const after = view.lastSeq;
     refreshInFlight = true;
@@ -573,6 +645,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         get().historySnapshot?.lastSeq !== after
       )
         return;
+      if (hasNewerRunProjection(get(), updated, snapshot.plan)) return;
       ingestTaskRuntimeSubagentEvents(updated, snapshot.plan, page.events);
       ingestTaskRuntimeToolExecutions(updated, page.events);
       set({
@@ -584,7 +657,15 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           hasMoreEvents: page.has_more,
           error: null,
         },
+        loadingRun: false,
+        ...(chatGeneration === loadGeneration &&
+        get().activeRun?.run_id === updated.run_id &&
+        get().activeRun?.workspace_id === updated.workspace_id
+          ? { ...snapshot, activeRun: updated, error: null }
+          : {}),
       });
+      if (['pending', 'running', 'paused'].includes(updated.status))
+        get().startPolling(updated.workspace_id, updated.run_id);
     } catch (error) {
       if (
         generation === historyRequestGeneration &&
@@ -623,6 +704,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       return;
     }
     const generation = loadGeneration;
+    const historyGeneration = historyRequestGeneration;
     const requestGeneration = ++refreshRequestGeneration;
     const scope = get().taskScope;
     if (scope && scope.workspaceId !== workspaceId) return;
@@ -644,16 +726,33 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         get().lastSeq !== after
       )
         return;
+      if (hasNewerRunProjection(get(), run, snapshot.plan)) return;
       ingestTaskRuntimeSubagentEvents(run, snapshot.plan, page.events);
       ingestTaskRuntimeToolExecutions(run, page.events);
-      set({
+      const current: TaskRuntimeView = {
         ...snapshot,
         activeRun: run,
         events: [...get().events, ...page.events].slice(-MAX_EVENTS),
         lastSeq: page.next_after_sequence,
         hasMoreEvents: page.has_more,
         error: null,
+      };
+      const history = get().historySnapshot;
+      set({
+        ...current,
+        ...(historyGeneration === historyRequestGeneration && get().selectedRunId === runId
+          ? {
+              historySnapshot:
+                history?.activeRun?.run_id === runId &&
+                history.activeRun.workspace_id === workspaceId
+                  ? { ...history, ...snapshot, activeRun: run, error: null }
+                  : current,
+              loadingRun: false,
+            }
+          : {}),
       });
+      if (['pending', 'running', 'paused'].includes(run.status))
+        get().startPolling(workspaceId, runId);
     } catch (error) {
       if (generation === loadGeneration && requestGeneration === refreshRequestGeneration)
         set({ error: error instanceof Error ? error.message : String(error) });
@@ -684,17 +783,35 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     refreshRequestGeneration += 1;
     refreshInFlight = false;
     get().stopPolling();
-    const scope = get().taskScope;
+    const previousView = get();
+    const scope = previousView.taskScope;
+    let targetRunId: string | undefined;
+    // 确认目标后只受同run规范提交退役；旧run刷新不能吞掉同会话的新run载入。
+    const ownsInitialData = () => {
+      const current = get();
+      return (
+        generation === loadGeneration &&
+        (scope
+          ? !!current.taskScope && sameProductDataScope(current.taskScope, scope)
+          : !current.taskScope) &&
+        ((targetRunId !== undefined && current.activeRun?.run_id !== targetRunId) ||
+          (current.activeRun === previousView.activeRun &&
+            current.plan === previousView.plan &&
+            current.completionGate === previousView.completionGate &&
+            current.events === previousView.events))
+      );
+    };
     const token = scope?.workspaceId === workspaceId ? scope.workspaceGeneration : undefined;
     set({ focusedAddress: viewAddress(workspaceId, conversationId) });
     try {
       const run = await taskRuntimeApi.latestRunForConversation(workspaceId, conversationId, token);
-      if (generation !== loadGeneration) return;
+      targetRunId = run?.run_id;
+      if (!ownsInitialData()) return;
       if (run) {
         if (run.workspace_id !== workspaceId || run.conversation_id !== conversationId)
           throw new Error('TaskRuntime 返回了不属于当前会话的运行');
         const { snapshot, page, persistedTools } = await initialRunData(workspaceId, run, token);
-        if (generation !== loadGeneration) return;
+        if (!ownsInitialData() || hasNewerRunProjection(get(), run, snapshot.plan)) return;
         ingestTaskRuntimeSubagentEvents(run, snapshot.plan, page.events);
         useToolExecutionStore
           .getState()
@@ -733,12 +850,16 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         });
       }
     } catch (error) {
-      if (generation === loadGeneration)
-        set({ error: error instanceof Error ? error.message : String(error) });
+      if (ownsInitialData()) set({ error: error instanceof Error ? error.message : String(error) });
     } finally {
-      const history = get().historySnapshot?.activeRun;
-      if (history && ['pending', 'running', 'paused'].includes(history.status))
-        get().startPolling(history.workspace_id, history.run_id);
+      if (generation === loadGeneration) {
+        const current = get().activeRun;
+        const history = get().historySnapshot?.activeRun;
+        const pending = [current, history].find(
+          (run) => run && ['pending', 'running', 'paused'].includes(run.status)
+        );
+        if (pending) get().startPolling(pending.workspace_id, pending.run_id);
+      }
     }
   },
 
@@ -778,7 +899,25 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           address.workspace_generation
         ),
       true,
-      undefined,
+      (updated, current) => {
+        const previous = current.activeRun;
+        if (
+          !previous ||
+          updated.run_id !== previous.run_id ||
+          updated.workspace_id !== previous.workspace_id
+        )
+          throw new Error('目标更新回执不属于原工作空间或运行');
+        const candidates = [get().activeRun, get().historySnapshot?.activeRun, updated].filter(
+          (run): run is TaskRun =>
+            !!run && run.run_id === updated.run_id && run.workspace_id === updated.workspace_id
+        );
+        const canonical = candidates.reduce((latest, run) =>
+          run.goal_revision > latest.goal_revision ? run : latest
+        );
+        return {
+          activeRun: canonical.goal_revision > previous.goal_revision ? canonical : previous,
+        };
+      },
       true
     );
     return result !== undefined;

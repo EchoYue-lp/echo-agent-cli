@@ -179,6 +179,132 @@ describe('task runtime list and details', () => {
     expect(screen.queryByText(/\d+%/)).toBeNull();
   });
 
+  it.each(['revision', 'hash'] as const)(
+    'marks a completed old plan as historical until the current Goal binding matches (%s)',
+    (mismatch) => {
+      seed(1);
+      const prior = useTaskRuntimeStore.getState();
+      const revised = { ...run, goal: '修订后的交付目标', goal_revision: 2, goal_sha256: 'goal-2' };
+      useTaskRuntimeStore.setState({
+        activeRun: revised,
+        plan: prior.plan ? { ...prior.plan, goal_revision: mismatch === 'hash' ? 2 : 1 } : null,
+        todos: prior.todos.map((todo) => ({ ...todo, status: 'completed' })),
+        completionGate: {
+          run_id: run.run_id,
+          goal_revision: 2,
+          plan_revision: prior.plan?.revision ?? 0,
+          ready: false,
+          requirements: [
+            {
+              requirement: {
+                requirement_id: 'req:task-1',
+                goal_revision: 2,
+                plan_revision: prior.plan?.revision ?? 0,
+                task_id: 'task-1',
+                title: '当前目标的验收要求',
+                description: '保留原任务身份与真实状态',
+                requirement_sha256: 'requirement-sha',
+                required_artifacts: [],
+                execution_checks: [],
+                acceptance_criteria: ['保留原任务身份与真实状态'],
+              },
+              status: 'stale',
+              evidence: [],
+            },
+          ],
+          blockers: [
+            {
+              code: 'plan_goal_mismatch',
+              task_id: null,
+              requirement_id: null,
+              detail: '旧计划不能作为修订 Goal 的验收',
+            },
+            {
+              code: 'stale_evidence',
+              task_id: 'task-1',
+              requirement_id: null,
+              detail: '旧证据尚未重绑定',
+            },
+          ],
+        },
+      });
+      const { container } = render(<TaskRuntimePanel />);
+      const summary = container.querySelector<HTMLElement>('.eko-task-run-summary');
+      if (!summary) throw new Error('真实任务主区域未渲染');
+      expect(summary.textContent).toContain('旧计划未绑定当前 Goal r2');
+      expect(within(summary).queryByLabelText('已提交完成 1 / 1 项任务')).toBeNull();
+      expect(within(summary).queryByText('执行完成 1 项')).toBeNull();
+      expect(screen.getByText('历史计划 · 已完成（不计当前目标）')).toBeTruthy();
+      expect(screen.getByText('2 项阻塞')).toBeTruthy();
+      expect(
+        useTaskRuntimeStore.getState().completionGate?.blockers.map((item) => item.code)
+      ).toEqual(['plan_goal_mismatch', 'stale_evidence']);
+      expect(useTaskRuntimeStore.getState().todos.at(0)?.status).toBe('completed');
+
+      act(() => {
+        useTaskRuntimeStore.setState((state) => ({
+          plan: state.plan
+            ? {
+                ...state.plan,
+                revision: state.plan.revision + 1,
+                goal_revision: 2,
+                goal_sha256: revised.goal_sha256,
+              }
+            : null,
+          completionGate: state.completionGate
+            ? {
+                ...state.completionGate,
+                plan_revision: (state.plan?.revision ?? 0) + 1,
+                ready: true,
+                blockers: [],
+                requirements: state.completionGate.requirements.map((assessment) => ({
+                  ...assessment,
+                  requirement: {
+                    ...assessment.requirement,
+                    plan_revision: (state.plan?.revision ?? 0) + 1,
+                  },
+                  status: 'accepted' as const,
+                })),
+              }
+            : null,
+        }));
+      });
+      expect(within(summary).getByLabelText('已提交完成 1 / 1 项任务')).toBeTruthy();
+      expect(within(summary).getByText('执行完成 1 项')).toBeTruthy();
+      expect(screen.queryByText('历史计划 · 已完成（不计当前目标）')).toBeNull();
+    }
+  );
+
+  it('keeps a late completed Subagent on the old plan out of the current Goal progress', () => {
+    seed(1);
+    useTaskRuntimeStore.setState({
+      activeRun: { ...run, goal_revision: 2, goal_sha256: 'goal-2' },
+    });
+    const { container } = render(<TaskRuntimePanel />);
+    act(() => {
+      useSubagentRunStore.getState().ingest({
+        kind: 'subagent',
+        event: 'completed',
+        workspace_id: run.workspace_id,
+        conversation_id: run.conversation_id,
+        run_id: run.run_id,
+        task_id: 'task-1',
+        subagent_run_id: 'run-1:task-1:2:1',
+        agent: 'general-purpose',
+        plan_revision: 2,
+        attempt: 1,
+        summary: '旧计划的物理执行已完成',
+      });
+    });
+    const summary = container.querySelector<HTMLElement>('.eko-task-run-summary');
+    if (!summary) throw new Error('真实任务主区域未渲染');
+    expect(Object.values(useSubagentRunStore.getState().runs).at(0)?.status).toBe('completed');
+    expect(summary.textContent).toContain('旧计划未绑定当前 Goal r2');
+    expect(within(summary).queryByText('执行完成 1 项')).toBeNull();
+    expect(screen.getByText('历史计划 · 待处理（不计当前目标）')).toBeTruthy();
+    expect(useTaskRuntimeStore.getState().todos.at(0)?.status).toBe('pending');
+  });
+
   it('opens complete task details and returns keyboard focus without changing the task', () => {
     render(<TaskRuntimePanel />);
     const trigger = screen.getByRole('button', { name: '查看任务：任务 2 中文 🧭' });
