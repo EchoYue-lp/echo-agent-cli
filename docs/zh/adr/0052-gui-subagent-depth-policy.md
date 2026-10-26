@@ -37,6 +37,20 @@ GUI 值或 Framework fallback 伪造旧许可。
 fresh child 和排队期间动态注册均不能放宽。通用 inheritance 修复归框架 owner，
 不新增 executor、validator、store、终态或用户手动协作控制台。
 
+## 程序化 Fork 桥的继承合同
+
+原 readonly 与 writer 消费者已把本次 TaskRun 的完整目标 policy 放进 runtime
+context。Framework 的 text/message helper（含 exact-attempt）必须保留三字段，
+不能仅取当前 depth 再重建 legacy 最大值 3。显式 depth 与该目标 policy 不一致时
+在派发前拒绝；不会重新读取 GUI 默认值或多推进一次层数。writer 附件沿原持久
+引用重建 message，策略与普通文本路径相同。primary Verification 仍为第 0 层，
+继续原路径，不增加假 primary Subagent。
+
+该修复不改变用户政策：默认最大层数 1 允许主智能体派发首层，首层不能再派发；
+配置 2/3 允许同一绑定内对应层数，任何模式均不准进入第 4 层。Framework 通用
+复用方仍可选择独立上限，EKO 不向 Framework 注入产品常量。真实工作树隔离、
+GUI 配置操作、原生进程和 main CI 仍各自需要对应资格，不能由 Fork 测试替代。
+
 ## 候选方案
 
 永久禁用子角色 flag 会破坏 2/3 设置和旧绑定 3 的任务；改全框架默认会影响独立

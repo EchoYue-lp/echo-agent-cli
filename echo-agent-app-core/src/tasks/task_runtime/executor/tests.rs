@@ -3701,6 +3701,279 @@ Read the runtime path and found one missing branch.
         Ok(())
     }
 
+    struct DelegationMessageProbe {
+        inner: Arc<echo_agent::testing::MockLlmClient>,
+        saw_attachment: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl echo_agent::llm::LlmClient for DelegationMessageProbe {
+        fn chat(
+            &self,
+            request: echo_agent::llm::ChatRequest,
+        ) -> BoxFuture<'_, echo_agent::error::Result<echo_agent::llm::ChatResponse>> {
+            if request.messages.iter().any(|message| {
+                matches!(&message.content, echo_agent::llm::types::MessageContent::Parts(parts)
+                    if parts.iter().any(|part| matches!(part, echo_agent::llm::types::ContentPart::File { .. })))
+            }) {
+                self.saw_attachment.store(true, Ordering::SeqCst);
+            }
+            echo_agent::llm::LlmClient::chat(self.inner.as_ref(), request)
+        }
+        fn chat_stream(
+            &self,
+            request: echo_agent::llm::ChatRequest,
+        ) -> BoxFuture<
+            '_,
+            echo_agent::error::Result<
+                BoxStream<'static, echo_agent::error::Result<echo_agent::llm::ChatChunk>>,
+            >,
+        > {
+            if request.messages.iter().any(|message| {
+                matches!(&message.content, echo_agent::llm::types::MessageContent::Parts(parts)
+                    if parts.iter().any(|part| matches!(part, echo_agent::llm::types::ContentPart::File { .. })))
+            }) {
+                self.saw_attachment.store(true, Ordering::SeqCst);
+            }
+            echo_agent::llm::LlmClient::chat_stream(self.inner.as_ref(), request)
+        }
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+    }
+
+    async fn actual_subagent_consumer_keeps_run_depth(
+        writer: bool,
+        attachment: bool,
+    ) -> Result<(), String> {
+        use crate::subagent_policy::{SubagentDepthDefaults, SubagentDepthLimit};
+        use echo_agent::agent::ReactAgentBuilder;
+        use echo_agent::subagent::{SubagentBuilder, SubagentEvent, SubagentRegistry};
+        use echo_agent::testing::MockLlmClient;
+
+        for maximum in [1, 2, 3] {
+            let defaults = Arc::new(SubagentDepthDefaults::new(SubagentDepthLimit::new(
+                maximum,
+            )?));
+            let store = Arc::new(
+                TaskRuntimeStore::new_in_memory()
+                    .map_err(|error| error.to_string())?
+                    .with_subagent_depth_defaults(defaults.clone()),
+            );
+            let _resource_scope = store.test_resource_scope();
+            let task = PlanTask {
+                id: "bound-child".into(),
+                title: "验证实际消费者的层数绑定".into(),
+                description: "沿真实 Fork 与 agent_tool 执行".into(),
+                kind: if writer {
+                    PlanTaskKind::Implementation
+                } else {
+                    PlanTaskKind::ReadOnlyReview
+                },
+                agent_role: "bound-child-1".into(),
+                ..Default::default()
+            };
+            let run_id = seed_run(&store, vec![task.clone()])?;
+            let bound = store
+                .get_run_state(&run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "原 TaskRun 不存在".to_string())?
+                .execution_profile
+                .require_subagent_depth_limit()?;
+            defaults.publish(SubagentDepthLimit::new(if maximum == 1 { 3 } else { 1 })?);
+            let policy = bound.first_child_policy()?;
+            assert_eq!(policy.delegate_depth, 1);
+            assert_eq!(policy.max_delegate_depth, maximum);
+            let uploads = tempfile::tempdir().map_err(|error| error.to_string())?;
+            if attachment {
+                let path = uploads.path().join("中文验证附件.txt");
+                std::fs::write(&path, "只读附件，不执行代码").map_err(|error| error.to_string())?;
+                store
+                    .set_run_attachments(
+                        &run_id,
+                        &[crate::attachments::AttachmentRef {
+                            path,
+                            name: "中文验证附件.txt".into(),
+                            mime_type: "text/plain".into(),
+                            source: crate::types::AttachmentSource::default(),
+                        }],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            let registry = Arc::new(SubagentRegistry::new());
+            let mut events = registry.event_bus().subscribe();
+            let saw_attachment = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut actors = Vec::new();
+            for depth in 1_u8..=4 {
+                let name = format!("bound-child-{depth}");
+                let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let calls = Arc::new(AtomicUsize::new(0));
+                let llm = Arc::new(
+                    MockLlmClient::new()
+                        .then_tool_call("probe", "depth_probe", r#"{"path":"Cargo.toml"}"#)
+                        .then_tool_call("search", "tool_search", r#"{"query":"agent_tool"}"#)
+                        .then_tool_call(
+                            "delegate",
+                            "agent_tool",
+                            serde_json::json!({
+                                "agent_name":format!("bound-child-{}", depth.saturating_add(1)),
+                                "task":"继续真实下一层", "mode":"fork"
+                            })
+                            .to_string(),
+                        )
+                        .with_response("## Summary\n层数探针完成"),
+                );
+                let child = ReactAgentBuilder::new()
+                    .name(&name)
+                    .model("mock-model")
+                    .enable_tools()
+                    .enable_subagent()
+                    .register_agent_dispatch_tool()
+                    .subagent_registry(registry.clone())
+                    .llm_client(Arc::new(DelegationMessageProbe {
+                        inner: llm.clone(),
+                        saw_attachment: saw_attachment.clone(),
+                    }))
+                    .tool(Box::new(
+                        PermissionCountingTool::new(
+                            "depth_probe",
+                            echo_agent::prelude::ToolPermission::Read,
+                            calls.clone(),
+                        )
+                        .with_policy_observer(observations.clone()),
+                    ))
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                let definition = SubagentBuilder::new(&name).fork_mode().can_delegate();
+                let definition = if writer {
+                    definition.write_access()
+                } else {
+                    definition.read_only()
+                };
+                registry.register(definition.build(), Box::new(child)).await;
+                actors.push((depth, calls, observations, llm));
+            }
+            let primary = crate::agent_handle::AgentHandle::new(
+                ReactAgentBuilder::new()
+                    .name("primary")
+                    .model("mock-model")
+                    .enable_tools()
+                    .enable_subagent()
+                    .subagent_registry(registry)
+                    .build()
+                    .map_err(|error| error.to_string())?,
+            );
+            let execution_id = format!("{run_id}:bound-child:1:1");
+            let identity = echo_agent::subagent::SubagentAttemptIdentity::for_run(
+                &run_id,
+                &task.id,
+                &execution_id,
+                1,
+            )
+            .map_err(|error| error.to_string())?;
+            let uplink: echo_agent::tools::SubagentUplinkFn = Arc::new(|_| {
+                Box::pin(async {
+                    echo_agent::tools::SubagentUplinkReceipt {
+                        accepted: true,
+                        status: "test_no_message".into(),
+                        detail: String::new(),
+                    }
+                })
+            });
+            let result = if writer {
+                run_writer_subagent(
+                    &primary,
+                    TaskRuntimeOperation::new(store.clone()),
+                    &run_id,
+                    &execution_id,
+                    "bound-isolation",
+                    &task.agent_role,
+                    &task.description,
+                    serde_json::json!({}),
+                    SubagentTaskContext::default(),
+                    Vec::new(),
+                    CancellationToken::new(),
+                    policy,
+                    None,
+                    identity,
+                    None,
+                    uplink,
+                    1,
+                    Vec::new(),
+                )
+                .await
+            } else {
+                run_readonly_subagent(
+                    &primary,
+                    &run_id,
+                    &execution_id,
+                    None,
+                    &task.agent_role,
+                    &task.description,
+                    serde_json::json!({}),
+                    SubagentTaskContext::default(),
+                    Vec::new(),
+                    CancellationToken::new(),
+                    policy,
+                    None,
+                    identity,
+                    None,
+                    uplink,
+                    1,
+                    Vec::new(),
+                )
+                .await
+            };
+            result.map_err(|error| error.to_string())?;
+            // 必须先经过真实消费者、Fork、模型与工具执行，再核完整 policy 与越界无派发。
+            for (depth, calls, observations, llm) in actors {
+                assert_eq!(
+                    llm.call_count() > 0,
+                    depth <= maximum,
+                    "writer={writer}, max={maximum}, depth={depth}"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), usize::from(depth <= maximum));
+                let observed = observations.lock().map_err(|error| error.to_string())?;
+                if depth <= maximum {
+                    assert_eq!(
+                        *observed,
+                        vec![Some(echo_agent::tasks::NestedDelegationPolicy {
+                            can_spawn_subagents: true,
+                            delegate_depth: depth,
+                            max_delegate_depth: maximum,
+                        })]
+                    );
+                } else {
+                    assert!(observed.is_empty());
+                }
+            }
+            let mut started = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let SubagentEvent::DispatchStarted { agent, mode, .. } = event.as_ref() {
+                    assert_eq!(*mode, echo_agent::subagent::ExecutionMode::Fork);
+                    started.push(agent.clone());
+                }
+            }
+            assert_eq!(started.len(), usize::from(maximum));
+            assert_eq!(saw_attachment.load(Ordering::SeqCst), attachment);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readonly_fork_consumer_preserves_bound_subagent_depth() -> Result<(), String> {
+        actual_subagent_consumer_keeps_run_depth(false, false).await
+    }
+
+    #[tokio::test]
+    async fn writer_text_fork_consumer_preserves_bound_subagent_depth() -> Result<(), String> {
+        actual_subagent_consumer_keeps_run_depth(true, false).await
+    }
+
+    #[tokio::test]
+    async fn writer_message_fork_consumer_preserves_bound_subagent_depth() -> Result<(), String> {
+        actual_subagent_consumer_keeps_run_depth(true, true).await
+    }
+
     #[tokio::test]
     async fn primary_verification_keeps_original_depth_and_hard_tool_bound() -> Result<(), String> {
         use crate::subagent_policy::{SubagentDepthDefaults, SubagentDepthLimit};
