@@ -11,13 +11,18 @@ focus:
 - time_lifecycle
 - failure_concurrency
 - contract_evidence
-observed_at: source:4726a37cc1350e66b30b281fd02e16cdd087cd7f44b58b28a0ba6ab09bfa0d46
+observed_at: 9bcc1fc052326acc13b4223e64a51fcc867f1ccf
 behavior_refs:
 - behavior.background-review-caller-owned-settlement
 - behavior.shared-turn-observation-retains-owner
 - behavior.task-unknown-owner-admission-fence
 - behavior.analysis-original-owner-settlement-retry
 code_refs:
+- web-frontend/src/stores/taskRuntimeStore.test.ts
+- web-frontend/src/components/task/TaskRuntimePanel.css
+- web-frontend/src/components/layout/ContextPane.tsx
+- echo-agent-app-core/src/tasks/task_runtime/file_shadow.rs
+- echo-agent-app-core/src/tasks/task_runtime/file_store.rs
 - echo-agent-app-core/src/foreground_turn.rs
 - echo-agent-app-core/src/hitl/pairing.rs
 - echo-agent-app-core/src/hitl/dispatcher.rs
@@ -132,6 +137,7 @@ code_refs:
 - web-frontend/src/components/scheduler/SchedulerHistory.tsx
 - web-frontend/src/components/scheduler/SchedulerPanel.test.tsx
 evidence_refs:
+- evidence.gui-dialog-presentation
 - evidence.latest-framework-consumer-integration
 - evidence.cancellation-observation-consumer
 finding_refs: [finding.cli-upstream-dependency-risks, finding.eko-channel-helper-relocation]
@@ -212,3 +218,15 @@ EKO 的 ConfiguredModel/ModelProviderConfig 与既有 resolver 仍拥有产品�
 当前可读 channel helper 路径随原实现归位 app-core/channel_runtime；原 bin 入口只转发。此路径修正不续期本文件任何历史 Rust、Node、风险接受或 native 资格；历史观察和具名旧快照结论保持原范围。当前合流尚未 Cargo 编译。
 
 旧来源观察 `source:d764d62ffe779ae5fe2b6e6627158291821c4258e700cb6301fb29ade46bc7aa` 保留为历史。当前 observed_at 只绑定归位后的可读来源，不表示旧验证在新合流上续期。
+
+## Finite task-history read adaptation
+
+Original EKO TaskRuntime journals, scope captures and typed controls remain authoritative. The GUI inventory and finite event IPC reuse their read path and the original formal-task visibility predicate; page continuation and selection are read projections, not a state authority. Candidate damage must be explicit, and a finite page or accepted control is not complete collection/physical settlement proof. Task-list source and current evidence are scoped separately from older channel, cancellation and mainline qualifications.
+
+## 2026-10-27 主目录 focused 后继结算
+
+本次源码观察绑定可恢复的 CLI 提交 `9bcc1fc052326acc13b4223e64a51fcc867f1ccf`，Framework 为 `69296a4dea1047be7fb91b7ab06a839ee57dda7e`。原 observed_at `source:4726a37cc1350e66b30b281fd02e16cdd087cd7f44b58b28a0ba6ab09bfa0d46` 保留为历史来源标识；更新观察只修复当前引用的可恢复性，不重标上述历史源码、风险接受或执行资格。Rule 仍为高风险 `needs_review`，原 Finding、状态权威与失败语义不变。
+
+epoch15 在原 TaskRuntime、输入 journal、tracked mailbox 与执行 owner 上完成定向验证：含 channels 配置实际68项、无 channels 配置37项均零失败、零忽略、零编译 warning；GUI caller 和无 channels 生产检查最终自然退出0且零 warning。直接支持 GUI 分页/控制的 Rust 范围仅 `task_history_` 五项与 `task_control_generation_` 三项，不把其余渠道测试合称 GUI 验收。原两项 GUI/IM 投递前持久确认的行为 RED、编译/fixture 错误、19 warning、后继残余 import warning 与早先零 warning 误报撤销都保留，后继绿色不改写原结果。
+
+Root 在同一前端来源取得75文件/580测试、TypeScript 与 Tauri 模式 Vite build、全 ESLint 和格式检查自然0；回执绑定465个输入，不借本次语义文档更新重跑或续期其它产品验收。Rust 制品和日志已在 target 外保全，准确清理自然0，原 target 不存在。上述有限结算见共用 Evidence 的本日补充，不提升宽 Rule 或全项目 closure。
