@@ -350,7 +350,7 @@ channels:
 
 **压力验证待执行：**上述原 pump 数据 route 针对旧路径的“32 个普通响应槽等输出→严格 cursor frontier 卡住→后续 `/reply` 不可达”结构性反例。显式 Steer 保留原 tracked live 注入；原持久接收及 supervised observer 已拥有该输入后立即返回“已持久接收，等待原任务处理”，不等待 drain 或追加同轮输出 waiter。后续实际 drain/recovery 仍由原 owner 记录，不把接收 ACK 当已应用。超过 32 条及后续 `/reply` 的压力回归、编译和原生检查仍未运行，不能把源码接线当作已验证闭合或完整微信/HITL Outcome 已通过。
 本候选尚无编译或原生验收；本地 fixtures、前端测试、真实 GUI 扫码/手机收发与 main CI 分别结算。真实登录与发消息只由用户在最终 GUI 操作。
-协议参考腾讯第一方 [openclaw-weixin 874637a0，2.4.10，MIT](https://github.com/Tencent/openclaw-weixin/tree/874637a0dbc24050f72d1385add4fc6170a2d726)。详见 [ADR 0054](adr/0056-personal-weixin-channel.md)。
+协议参考腾讯第一方 [openclaw-weixin 874637a0，2.4.10，MIT](https://github.com/Tencent/openclaw-weixin/tree/874637a0dbc24050f72d1385add4fc6170a2d726)。详见 [ADR 0056](adr/0056-personal-weixin-channel.md)。
 
 ## 常用环境变量
 

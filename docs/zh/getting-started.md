@@ -1,5 +1,9 @@
 # EKO 快速入门
 
+EKO 推荐从 GUI 开始，继续保留 IM 收发和 cron 后台触发。独立 TUI、REPL、CLI/JSONL
+入口目前仍在源码中，已进入退役范围；本页保留其现有命令供迁移期间使用，不再承诺长期
+入口能力对等。GUI 内置终端、Agent shell 和桌面构建命令继续保留。
+
 ## 前置条件
 
 - Rust 1.95 或更高版本
@@ -17,7 +21,7 @@ cd web-frontend
 npm install
 ```
 
-只使用 TUI 或 JSONL 时可以跳过前端依赖。
+迁移期间只使用现存 TUI 或 JSONL 入口时可以跳过前端依赖。
 
 ## 配置模型
 
@@ -28,7 +32,7 @@ GUI 用户在“设置 -> 模型 Provider”中：
 3. 为每个模型明确选择 `chat_completions`、`responses` 或 `anthropic`。
 4. 选择输入能力并设为默认模型。
 
-TUI/CLI 用户可以准备 `./eko.yaml` 或 `~/.eko/config.yaml`。最小示例：
+迁移期间仍使用 TUI/CLI 的用户可以准备 `./eko.yaml` 或 `~/.eko/config.yaml`。最小示例：
 
 ```yaml
 model:
@@ -58,26 +62,9 @@ export MY_PROVIDER_API_KEY="..."
 
 完整字段见 [配置指南](./configuration.md)。
 
-## 启动 TUI
-
-```bash
-cargo run --bin echo-agent-cli
-```
-
-常用参数：
-
-```bash
-cargo run --bin echo-agent-cli -- --project /path/to/project
-cargo run --bin echo-agent-cli -- --model my-provider:my-model
-cargo run --bin echo-agent-cli -- --continue
-cargo run --bin echo-agent-cli -- --resume <conversation-id>
-```
-
-TUI 是完整 Agent surface，支持 TaskRun、Subagent、HITL、MCP、Browser、Plugin、Skill、
-Memory 和附件，不是 GUI 的精简版。输入 `/help` 查看当前代码注册的命令，避免依赖
-静态命令清单。
-
 ## 启动 GUI
+
+这是当前推荐的产品入口：
 
 ```bash
 cargo gui-dev
@@ -105,7 +92,30 @@ GUI 中的工作空间就是项目。“新建任务”在所选工作空间打�
 和附件，不必等待模型或工具；它不表示输入已经执行或任务已经完成。准备或准入失败
 会保留原稿，切换任务或编辑后的迟到结果不会清掉新稿。停止仍使用独立的停止操作。
 
+## 启动 TUI
+
+以下命令对应仍存在、待退役的独立终端入口：
+
+```bash
+cargo run --bin echo-agent-cli
+```
+
+常用参数：
+
+```bash
+cargo run --bin echo-agent-cli -- --project /path/to/project
+cargo run --bin echo-agent-cli -- --model my-provider:my-model
+cargo run --bin echo-agent-cli -- --continue
+cargo run --bin echo-agent-cli -- --resume <conversation-id>
+```
+
+现存 TUI 仍复用 TaskRun、Subagent、HITL、MCP、Browser、Plugin、Skill、Memory 和附件
+权威；这些共享能力继续保留，独立终端入口的长期扩张与对等目标已由
+[GUI 产品收敛边界](./adr/0050-gui-product-convergence.md)替代。输入 `/help` 可查看现有注册命令。
+
 ## 非交互 JSONL
+
+该独立产品入口同样待退役，尚未从实现中删除：
 
 ```bash
 cargo run --bin echo-agent-cli -- --jsonl "检查当前项目并给出结论"

@@ -4,13 +4,18 @@
 已接入应用入口，并且可从至少一个真实 surface 调用；仅有类型、测试夹具或未注册模块
 不计入。
 
+GUI 是推荐的产品主入口，IM 收发和 cron 后台触发继续保留。表中 TUI、REPL、CLI/JSONL
+描述的是尚未删除的迁移期实现，不再代表长期入口能力对等或新增能力目标；GUI 内置终端、
+Agent shell、MCP 与共享 Task/Subagent 能力不随独立终端入口退役。见
+[产品收敛边界](./adr/0050-gui-product-convergence.md)。
+
 ## Agent 与会话
 
 | 能力           | 当前实现                                                                      | 主要依据                                        |
 | -------------- | ----------------------------------------------------------------------------- | ----------------------------------------------- |
 | 流式对话       | TUI、GUI、CLI/JSONL、channel 共享 `drive_chat` 与 typed `TurnOutcome`         | `echo-agent-app-core/src/chat_driver.rs`        |
 | 多会话 Agent   | `AgentPool` 按 conversation 维护 Agent，忙会话不会被驱逐                      | `echo-agent-app-core/src/agent_pool/pool.rs`         |
-| Channel 会话   | sender-scoped 产品 ID + incarnation Agent/checkpoint/cache ID，reset 保留历史 | `src/cli/channels.rs`                           |
+| Channel 会话   | app-core 原 owner 管理 sender-scoped 产品 ID 与 incarnation Agent/checkpoint/cache ID，reset 保留历史 | `echo-agent-app-core/src/channel_runtime.rs`、`channel_runtime/input_pump.rs` |
 | 前台 turn 控制 | admission、steer、cancel、settlement 由 app-core 统一拥有                     | `echo-agent-app-core/src/foreground_turn.rs`    |
 | 会话追加输入   | 四个交互 surface 共用 durable frontier、tracked drain 与 exact terminal       | `echo-agent-app-core/src/conversation_input.rs` |
 | 会话历史       | framework `FileConversationStore` 为权威，EKO 只做 workspace 绑定和 UI 投影   | `echo-agent-app-core/src/workspace/runtime.rs`  |
@@ -95,6 +100,11 @@ store。
 | Sandbox      | GUI 已挂载配置、可用性检查和真实本地 sandbox execution                     | `src/tauri/commands/panels.rs`                           |
 | 定时任务     | file-backed cron scheduler、GUI/TUI/CLI 控制与原样 prompt                  | `echo-agent-app-core/src/scheduler/`                     |
 | 记忆与自进化 | generation-bound layered memory、safe-point hot projection、`/reflect`、Review Inbox、Curator、rule/Skill promotion、dashboard | `echo-agent-app-core/src/evolution/`、`echo-agent-app-core/src/reflection.rs` |
+
+GUI 设置已挂载渠道与定时任务页面，配置、控制及历史继续使用原 ChannelRuntime、scheduler
+和 TaskRuntime 权威。IM handler 已由 app-core 接管，旧 channel bin 只转发；这不表示真实平台
+收发、GUI/IM 人工请求组合、隐藏/退出/重启及完整产品验收均已通过。边界见
+[IM/cron owner 决策](./adr/0053-im-cron-gui-control.md)。
 
 ## 配置与可观测性
 

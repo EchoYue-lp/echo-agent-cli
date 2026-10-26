@@ -8,15 +8,18 @@
 EKO 是运行在用户机器上的本地个人助理。已批准目标只有 GUI 产品主入口，继续保留 IM 消息与
 cron 后台触发。GUI 内置终端、Agent shell、桌面启动参数和独立 SDK Host stdio 均继续保留。
 
-当前基线仍包含 TUI、REPL、CLI/JSONL 和 channel 适配。迁移期间共享服务继续拥有权威；
-旧的终端入口持续扩张与对等目标已被替代。实际删除终端入口必须等 GUI 接管 IM 生命周期、
-cron 与共享恢复并验收后进行。本次文档改动不删除运行入口或协议。
+当前基线仍包含 TUI、REPL、CLI/JSONL 和 channel 适配。IM handler、session coordinator
+与 input pump 已归 app-core `channel_runtime`，GUI 与保留的 channel bin 入口复用同一
+`ApplicationServices`、ChannelRuntime 和生命周期 owner；`src/cli/channels.rs` 仅转发。
+旧的终端入口持续扩张与对等目标已被替代。实际删除终端入口仍须保留路径的完整结果与
+生命周期验收，包括 IM/cron、隐藏窗口、真正退出和共享恢复；源码接管不等于原生验收。
+本次文档改动不删除运行入口或协议。
 
 | 层                           | 职责                                                                                                            |
 | ---------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `echo-agent`                 | ReAct、模型协议、tools、DAG、Subagent、memory/store trait、MCP/LSP、workflow 通用机制                           |
 | `echo-agent-app-core`        | EKO runtime、workspace、conversation、TaskRuntime 文件投影、AgentPool、HITL、Plugin、Browser、分析/研究产品策略 |
-| `src/cli` / `src/tui`        | 当前待退役的终端适配；先迁移 IM handler 与桌面共享依赖                                                                                   |
+| `src/cli` / `src/tui`        | 当前待退役的终端适配；IM 转发到 app-core 原 owner，桌面共享依赖继续保留                                                                 |
 | `src/tauri` / `web-frontend` | typed Tauri IPC、GUI 状态投影和交互                                                                             |
 | `src-tauri`                  | 桌面进程入口、窗口和平台能力                                                                                    |
 
