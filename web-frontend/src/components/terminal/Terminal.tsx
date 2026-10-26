@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import {
   terminalApi,
   type TerminalCreateOptions,
@@ -229,7 +230,6 @@ export function Terminal({
         });
       };
       if (desktop) {
-        const { listen } = await import('@tauri-apps/api/event');
         if (disposed || closeWanted) return;
         const subscribe = async <T,>(name: string, receive: (payload: T) => void) => {
           const release = await listen<T>(name, (event) => {

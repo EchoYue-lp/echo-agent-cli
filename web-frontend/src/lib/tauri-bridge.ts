@@ -5,6 +5,8 @@
  * In Web environment, everything goes through HTTP.
  */
 
+import { invoke as tauriInvoke } from '@tauri-apps/api/core';
+
 declare global {
   interface Window {
     __TAURI__?: unknown;
@@ -32,12 +34,12 @@ const IS_TAURI: boolean = (() => {
 // 保留 isTauri() 函数形式以兼容现有调用点 (大量 `isTauri() ?` 内联)。
 const isTauri = (): boolean => IS_TAURI;
 
-// Dynamic import for Tauri invoke
+// core 的模块加载不访问原生桥；调用仍由环境检查保护。统一静态导入，
+// 避免与事件和系统插件对同一模块的静态引用形成无效拆包提示。
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   if (!isTauri()) {
     throw new Error('Not in Tauri environment');
   }
-  const { invoke: tauriInvoke } = await import('@tauri-apps/api/core');
   return tauriInvoke<T>(cmd, args);
 }
 

@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { isTauri } from '../lib/tauri-bridge';
 import { type BrowserEvent, useBrowserStore } from '../stores/browserStore';
 
@@ -7,12 +8,9 @@ export function useBrowserEvents() {
     if (!isTauri()) return;
     let disposed = false;
     let unlisten: (() => void) | null = null;
-    import('@tauri-apps/api/event')
-      .then(({ listen }) =>
-        listen<BrowserEvent>('browser://event', ({ payload }) => {
-          if (!disposed) useBrowserStore.getState().ingest(payload);
-        })
-      )
+    listen<BrowserEvent>('browser://event', ({ payload }) => {
+      if (!disposed) useBrowserStore.getState().ingest(payload);
+    })
       .then((cleanup) => {
         if (disposed) cleanup();
         else unlisten = cleanup;

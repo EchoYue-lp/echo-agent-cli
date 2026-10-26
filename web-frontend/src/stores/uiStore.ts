@@ -3,7 +3,6 @@ import { extensionRequestScope, pluginApi, type PluginThemeDefinition } from '..
 import { useWorkspaceStore } from './workspaceStore';
 
 export type SettingsTabId =
-  | 'overview'
   | 'tools'
   | 'mcp'
   | 'skills'
@@ -109,7 +108,7 @@ export function applyPluginTheme(pluginTheme: PluginThemeDefinition | null) {
 export const useUiStore = create<UiState>((set, get) => ({
   leftSidebarOpen: typeof window !== 'undefined' && window.innerWidth >= 768,
   settingsOpen: false,
-  activeSettingsTab: 'overview',
+  activeSettingsTab: 'providers',
   theme: getInitialTheme(),
   activePluginTheme: null,
   terminalOpen: false,
@@ -130,7 +129,7 @@ export const useUiStore = create<UiState>((set, get) => ({
   closeWorkspaceDialog: () => set({ workspaceDialogOpen: false }),
 
   toggleLeftSidebar: () => set((s) => ({ leftSidebarOpen: !s.leftSidebarOpen })),
-  openSettings: () => set({ settingsOpen: true, activeSettingsTab: 'overview' }),
+  openSettings: () => set({ settingsOpen: true, activeSettingsTab: 'providers' }),
   closeSettings: () => set({ settingsOpen: false }),
   setActiveSettingsTab: (tab) => set({ activeSettingsTab: tab, settingsOpen: true }),
   toggleTheme: async () => {

@@ -13,11 +13,11 @@ describe('settings navigation', () => {
     useUiStore.setState({ settingsOpen: false, activeSettingsTab: 'providers' });
   });
 
-  it('opens the general settings entry on the overview tab', () => {
+  it('打开设置直接进入模型页', () => {
     useUiStore.getState().openSettings();
 
     expect(useUiStore.getState().settingsOpen).toBe(true);
-    expect(useUiStore.getState().activeSettingsTab).toBe('overview');
+    expect(useUiStore.getState().activeSettingsTab).toBe('providers');
   });
 
   it('keeps direct model settings navigation explicit', () => {

@@ -1,4 +1,5 @@
 import { useRef, useCallback, useEffect, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { useChatStore } from '../stores/chatStore';
 import { useConversationStore } from '../stores/conversationStore';
 import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
@@ -425,7 +426,7 @@ export function useTauriChat() {
   // Set up event listener on mount.
   //
   // P0-4 修复: 此前 cleanup 只在 setupListener 跑完 (unlistenRef.current 赋值后)
-  // 才生效。若组件在 `await import()` / `await listen()` 之间卸载, cleanup 执行时
+  // 才生效。若组件在两次 `await listen()` 之间卸载, cleanup 执行时
   // unlistenRef.current 仍是 null → 空操作; 但 setupListener 稍后 resolve 并注册了
   // 监听器, 该 unlisten 句柄永远没人调用 → 监听器泄漏 (内存 + 幽灵事件)。
   //
@@ -440,8 +441,7 @@ export function useTauriChat() {
 
     const setupListener = async () => {
       const setupIdentityGeneration = identityGenerationRef.current;
-      const { listen } = await import('@tauri-apps/api/event');
-      if (aborted) return; // 卸载发生在 import 期间, 不再注册
+      if (aborted) return;
       const unlisten = await listen<ChatEventEnvelope>('chat://event', (event) => {
         if (aborted || !isCurrentStreamEvent(event.payload)) return;
         const envelope = event.payload;

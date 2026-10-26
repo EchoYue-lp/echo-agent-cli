@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { useEffect } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ErrorBoundary } from '../common/ErrorBoundary';
@@ -29,16 +29,36 @@ const { SettingsDialog } = await import('./SettingsDialog');
 
 afterEach(() => {
   cleanup();
-  useUiStore.setState({ settingsOpen: false, activeSettingsTab: 'overview' });
+  useUiStore.setState({ settingsOpen: false, activeSettingsTab: 'providers' });
   vi.restoreAllMocks();
 });
 
 describe('optional settings screens', () => {
-  it('retires LSP navigation and safely falls back from an obsolete settings key', () => {
-    useUiStore.setState({ settingsOpen: true, activeSettingsTab: 'lsp' as never });
+  it('按用途组织入口并保留高级设置的展开访问', () => {
+    useUiStore.getState().openSettings();
+    render(<SettingsDialog />);
+    const conversations = within(screen.getByRole('group', { name: '会话与记忆' }));
+    for (const name of ['会话', '归档', '记忆', '压缩']) {
+      expect(conversations.getByRole('button', { name })).toBeTruthy();
+    }
+    const automation = within(screen.getByRole('group', { name: '连接与自动化' }));
+    for (const name of ['IM 渠道', '定时任务', 'Hooks']) {
+      expect(automation.getByRole('button', { name })).toBeTruthy();
+    }
+    expect(screen.queryByRole('button', { name: 'Worktree' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '高级' }));
+    expect(screen.getByRole('button', { name: '高级' }).getAttribute('aria-expanded')).toBe('true');
+    for (const name of ['配置', 'Worktree', /^自进化/]) {
+      expect(screen.getByRole('button', { name })).toBeTruthy();
+    }
+  });
+
+  it.each(['lsp', 'overview'])('旧设置选择 %s 回到模型页且没有总览入口', (key) => {
+    useUiStore.setState({ settingsOpen: true, activeSettingsTab: key as never });
     render(<SettingsDialog />);
     expect(screen.queryByRole('button', { name: /^LSP/ })).toBeNull();
-    expect(screen.getByText('运行与记录')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '总览' })).toBeNull();
+    expect(screen.getByRole('button', { name: '模型' }).getAttribute('aria-current')).toBe('page');
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
@@ -68,9 +88,8 @@ describe('optional settings screens', () => {
     );
 
     expect(screen.getByRole('status').textContent).toContain('正在加载');
-    fireEvent.click(screen.getByRole('button', { name: '总览' }));
-    expect(screen.queryByRole('status')).toBeNull();
-    expect(screen.getByText('运行与记录')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '模型' }));
+    expect(screen.getByRole('button', { name: '模型' }).getAttribute('aria-current')).toBe('page');
 
     act(() => useUiStore.getState().setActiveSettingsTab('tools'));
     expect(screen.getByRole('status')).toBeTruthy();
@@ -94,9 +113,9 @@ describe('optional settings screens', () => {
     expect(mounts).toBe(1);
     expect(unmounts).toBe(0);
 
-    fireEvent.click(screen.getByRole('button', { name: '返回总览' }));
+    fireEvent.click(screen.getByRole('button', { name: '工具' }));
     expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.getByText('运行与记录')).toBeTruthy();
+    expect(screen.getByText('Loaded tools screen')).toBeTruthy();
     fireEvent.keyDown(document, { key: 'Escape' });
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     expect(document.activeElement).toBe(opener);
