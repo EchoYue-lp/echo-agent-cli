@@ -39,6 +39,27 @@ const lifecycleEnvelope = (sequence: number, phase: 'persisted' | 'attempt_start
 describe('ChatEventSequencer', () => {
   beforeEach(resetChatEventCursorsForTest);
 
+  it('保留处理失败的原事件，后续输入可以重试并继续处理真实终态', () => {
+    const sequencer = new ChatEventSequencer();
+    const applied: number[] = [];
+    let fail = true;
+    const apply = (event: ChatEventEnvelope) => {
+      if (event.sequence === 2 && fail) throw new Error('投影暂时不可用');
+      applied.push(event.sequence);
+    };
+    sequencer.ingest(envelope(1), apply);
+    expect(() => sequencer.ingest(envelope(2), apply)).toThrow('投影暂时不可用');
+    expect(sequencer.cursor('conversation:one')).toBe(1);
+
+    fail = false;
+    sequencer.ingest(
+      { ...envelope(3), payload: { source: 'turn_status', event: { status: 'completed' } } },
+      apply
+    );
+    expect(applied).toEqual([1, 2, 3]);
+    expect(sequencer.cursor('conversation:one')).toBe(3);
+  });
+
   it('orders a live event that races ahead of replay and deduplicates it', () => {
     const sequencer = new ChatEventSequencer();
     const applied: number[] = [];

@@ -75,7 +75,7 @@ describe('chat and TaskRuntime lifecycle separation', () => {
     expect(useChatStore.getState().messages.at(-1)?.content).toContain('workspace_scope');
   });
 
-  it('surfaces the observed execution path', () => {
+  it('内部执行路径保留在诊断记录中，不写入普通聊天消息', () => {
     const context = {
       assistantIdRef: { current: null as string | null },
       currentMessageKeyRef: { current: null as string | null },
@@ -83,8 +83,10 @@ describe('chat and TaskRuntime lifecycle separation', () => {
       isCancelledRef: { current: false },
       currentThinkingIdRef: { current: null as string | null },
     };
+    useChatStore.getState().setRunStatus('running');
     handleChatEvent({ type: 'execution_path', observed_path: 'formal_plan' }, context);
-    expect(useChatStore.getState().messages.at(-1)?.content).toContain('formal_plan');
+    expect(useChatStore.getState().messages).toEqual([]);
+    expect(useChatStore.getState().runStatus).toBe('running');
   });
 
   it('projects reported LLM usage into the context indicator state', () => {

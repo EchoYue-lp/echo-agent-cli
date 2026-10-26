@@ -47,7 +47,6 @@ export class ChatEventSequencer {
     let next = this.cursor(streamId) + 1;
     while (pending.has(next)) {
       const envelope = pending.get(next);
-      pending.delete(next);
       if (envelope) {
         const terminalTurnStatus =
           envelope.payload.source === 'turn_status' &&
@@ -60,6 +59,9 @@ export class ChatEventSequencer {
         ) {
           apply(envelope);
         }
+        // 投影成功后才消费。异常时保留原事件与游标，后续重放可以重试，
+        // 避免提前删除导致真实终态永久堵在一个已丢失的序号之后。
+        pending.delete(next);
         appliedCursorByStream.set(streamId, next);
       }
       next += 1;

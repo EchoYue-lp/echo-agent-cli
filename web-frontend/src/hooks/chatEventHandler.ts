@@ -173,6 +173,22 @@ function handleAgentEvent(event: AgentEvent, ctx: EventContext): void {
     case 'context_compressed':
       handleChatEvent({ type: 'context_compressed', ...event.data }, ctx);
       break;
+    case 'transcript_projection_settlement':
+      // 保存检查点不改变运行状态；真正的终态仍由 turn_status 结算。
+      if (event.data.status !== 'settled') {
+        handleChatEvent(
+          {
+            type: 'notice',
+            level: 'warning',
+            code: event.type,
+            message: `会话保存尚未确认（${event.data.status}）：${
+              event.data.error_class ?? '未提供错误分类'
+            }${event.data.detail ? `；${event.data.detail}` : ''}`,
+          },
+          ctx
+        );
+      }
+      break;
     case 'tool_call':
       handleChatEvent({ type: 'run_status', status: 'using_tool' }, ctx);
       break;
@@ -414,7 +430,7 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
       break;
     }
     case 'execution_path': {
-      store.appendLocalAssistantNote(`[Info] Execution path: ${event.observed_path}`);
+      // 原执行路径已保存在后端 journal，作为内部诊断，不生成用户聊天气泡。
       break;
     }
     case 'interrupt_prompt': {

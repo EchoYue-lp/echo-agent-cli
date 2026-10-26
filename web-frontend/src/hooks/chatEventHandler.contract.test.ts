@@ -23,6 +23,49 @@ describe('canonical chat event v4 contract', () => {
     resetChatEventCursorsForTest();
   });
 
+  it.each(['settled', 'deferred', 'blocked', 'conflict'] as const)(
+    '处理 schema5 会话投影结算 %s，同时保留真正的运行终态',
+    (status) => {
+      const base = fixture.at(0);
+      if (!base) throw new Error('contract fixture is incomplete');
+      useChatStore.getState().setRunStatus('running');
+      const settlement = {
+        ...base,
+        payload: {
+          source: 'agent',
+          event: {
+            schema_version: 5,
+            payload: {
+              type: 'transcript_projection_settlement',
+              data: {
+                status,
+                operation_id: 'transcript-projection-v1:original',
+                conversation_id: base.conversation_id,
+                generation_id: base.conversation_id,
+                attempt: 1,
+                error_class: status === 'settled' ? null : 'outcome_unknown',
+                detail: status === 'settled' ? null : '原保存结果尚未确认',
+              },
+            },
+          },
+        },
+      } as unknown as ChatEventEnvelope;
+      expect(() => handleChatEventEnvelope(settlement, context())).not.toThrow();
+      expect(useChatStore.getState().runStatus).toBe('running');
+      expect(useChatStore.getState().isStreaming).toBe(true);
+      if (status !== 'settled') {
+        expect(useChatStore.getState().messages.at(-1)?.content).toContain('outcome_unknown');
+        expect(useChatStore.getState().messages.at(-1)?.content).toContain('原保存结果尚未确认');
+      }
+      handleChatEventEnvelope(
+        { ...base, payload: { source: 'turn_status', event: { status: 'completed' } } },
+        context()
+      );
+      expect(useChatStore.getState().runStatus).toBe('completed');
+      expect(useChatStore.getState().isStreaming).toBe(false);
+    }
+  );
+
   it('retains the original target and owner scope for a live HITL request', () => {
     const base = fixture.at(0);
     if (!base) throw new Error('contract fixture is incomplete');

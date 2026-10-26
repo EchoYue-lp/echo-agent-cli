@@ -199,6 +199,8 @@ registry 接收已提交事件；GUI、TUI 和 REPL 后台事件由 committed pr
 late-subscriber/lag replay 投递；请求级 channel 在下一次响应中从 durable conversation cursor
 重放 execution event。因此 live 与 replay 使用同一个 `ChatDriverEvent::Execution` payload。
 
+`execution_path` 只作为原 journal 中的内部诊断保留，不生成普通聊天气泡；不通过删除用户文本清理诊断。
+
 Tauri 和 TUI 不再订阅 raw Subagent event；Tauri 只发布已提交的 chat envelope 与 tool
 summary。详见 [ADR 0040](../adr/0040-app-core-subagent-event-projection.md)。
 
@@ -394,3 +396,9 @@ primary、计划 Subagent、Verification 与 review 消费持久规则。原 poo
 原 foreground 令牌。这些路径已新增回归定义，Rust 类型/测试、TypeScript 原生成、
 完整集成及 native/main 验收待做。见 [ADR0054](../adr/0054-task-bound-domain-plugins.md) 和
 [包示例](../../../examples/domain-plugin/README.md)。
+
+## 会话事件投影与终态
+
+前端接纳框架 AgentEvent schema5 的 `transcript_projection_settlement`，完整保留保存结果分类、操作与会话/世代身份、尝试次数及错误信息。它是会话保存检查点，不是 TaskRun 或聊天回合完成；成功保存不改变运行状态，未确认、阻塞与冲突显示明确提示，真正的回合结束仍以原 `turn_status` 为准。
+
+事件排序器只有在对应投影处理成功后才消费该序号。投影异常保留原事件和游标供后续重试，不能提前删除事件后把终态永久挡在缺失序号之后。

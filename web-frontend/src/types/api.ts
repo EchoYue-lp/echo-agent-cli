@@ -337,6 +337,26 @@ export type ToolStreamEvent =
   | { event_type: 'output'; channel: 'stdout' | 'stderr' | 'log'; chunk: string }
   | ({ event_type: 'complete' } & ToolResult);
 
+// 对应框架 schema5 的会话投影保存回执；它是检查点，不是回合完成事件。
+export interface TranscriptProjectionSettlement {
+  status: 'settled' | 'deferred' | 'blocked' | 'conflict';
+  operation_id: string | null;
+  conversation_id: string | null;
+  generation_id: string | null;
+  attempt: number;
+  error_class:
+    | 'outcome_unknown'
+    | 'transient_no_commit'
+    | 'revision_conflict'
+    | 'deadline_exceeded'
+    | 'unsupported'
+    | 'invalid_configuration'
+    | 'corrupt_state'
+    | 'semantic_conflict'
+    | null;
+  detail: string | null;
+}
+
 export type AgentEvent =
   | { type: 'token'; data: string }
   | { type: 'think_start' }
@@ -374,6 +394,7 @@ export type AgentEvent =
       };
     }
   | { type: 'chart'; data: { spec: unknown } }
+  | { type: 'transcript_projection_settlement'; data: TranscriptProjectionSettlement }
   | { type: 'error'; data: { source: string; message: string; failure: AgentFailure } }
   | { type: 'safety_notice'; data: Record<string, unknown> }
   | { type: 'parameter_error'; data: Record<string, unknown> }
