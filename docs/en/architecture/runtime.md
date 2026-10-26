@@ -396,3 +396,13 @@ preparation reuses the original foreground token. These paths have new regressio
 definitions, but Rust type/tests, generated TypeScript, full integration and
 native/main acceptance are pending. See [ADR0054](../adr/0054-task-bound-domain-plugins.md) and
 [the package example](../../../examples/domain-plugin/README.md).
+
+## GUI formal-task history reads
+
+The task context pane discovers original formal TaskRuns in the selected Workspace. Its inventory and exact run selection extend the existing taskRuntimeStore; ordinary recent/new task conversations retain ConversationStore. `list_task_runs` binds product-data generation and status filters to finite live pages, with creation-time/run-ID order and explicit continuation. Read/repair failures preserve displayed content and report errors. The original latest-task provenance predicate also controls inventory visibility, so opening history never creates a plan or upgrades an ordinary turn.
+
+Choosing an older run uses its exact run ID for details, polling and controls, rather than the conversation's latest run. Run/event pages do not create another task or event store. Event reads return a finite slice, a lossless next sequence and an unread-tail flag; partial Subagent history remains labelled incomplete. Original control receipts distinguish no-op, accepted request and scheduled/recovery retry from physical or semantic completion. Same-workspace generation changes and late requests are fenced by the original scope and GUI selection generation.
+
+The bounded transport is not an index or a constant-time scan claim. Legal graph/query measurements and native light/dark, normal/minimum-window behavior remain required. Framework/SDK examples are unchanged; the coordinated website mirror waits for the qualified EKO source. See [the task panel guide](../guides/gui-task-runtime-panel.md) and [ADR 0008](../adr/0008-taskruntime-bounded-query-projections.md).
+
+Historical inspection uses at most one additional presentation snapshot in the same Zustand store. It does not replace the current chat’s active run, Todo count, failure notice or message association. Task-panel actions carry their rendered run ID; conflict Continue uses the original admitted workspace/run and typed receipt, never a selected historical status. Late results cannot clear a successor prompt or update another presentation.

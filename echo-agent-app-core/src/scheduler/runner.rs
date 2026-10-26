@@ -32,6 +32,7 @@ use crate::tasks::task_runtime::executor::{
     ExecError, create_unattended_run, drive_existing_cron_run,
 };
 use crate::tasks::task_runtime::store::RunDriverFailure;
+use crate::tasks::task_runtime::weixin_delivery::WeixinCronDelivery;
 use crate::tasks::task_runtime::{
     AttendedMode, DomainProfile, OccurrenceIdentity, OccurrenceRunRequest, RunPlanPolicy, TaskRun,
     TaskRunExecutionProfile, TaskRunStatus, TaskRuntimeStore,
@@ -64,6 +65,26 @@ pub fn build_occurrence_fire_fn(
     webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
     review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
 ) -> OccurrenceFireFn {
+    build_occurrence_fire_fn_with_weixin(
+        agent,
+        task_runtime_store,
+        pool,
+        webhook_emitter,
+        review_integration,
+        None,
+    )
+}
+
+/// Optional EKO notification binding; the ordinary scheduler API remains
+/// unchanged and unconfigured tasks acquire no external delivery behavior.
+pub fn build_occurrence_fire_fn_with_weixin(
+    agent: AgentHandle,
+    task_runtime_store: Option<Arc<TaskRuntimeStore>>,
+    pool: Option<Arc<AgentPool>>,
+    webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
+    review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    notifications: Option<Arc<dyn WeixinCronDelivery>>,
+) -> OccurrenceFireFn {
     build_occurrence_fire_fn_with_cancel(
         agent,
         task_runtime_store,
@@ -71,6 +92,7 @@ pub fn build_occurrence_fire_fn(
         webhook_emitter,
         review_integration,
         CancellationToken::new(),
+        notifications,
     )
 }
 
@@ -81,6 +103,7 @@ fn build_occurrence_fire_fn_with_cancel(
     webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
     review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
     scheduler_cancel: CancellationToken,
+    notifications: Option<Arc<dyn WeixinCronDelivery>>,
 ) -> OccurrenceFireFn {
     Arc::new(move |invocation: SchedulerInvocation| {
         let fallback_agent = agent.clone();
@@ -89,6 +112,7 @@ fn build_occurrence_fire_fn_with_cancel(
         let webhook_emitter = webhook_emitter.clone();
         let review_integration = review_integration.clone();
         let scheduler_cancel = scheduler_cancel.clone();
+        let notifications = notifications.clone();
         Box::pin(async move {
             let store = runtime_store.ok_or_else(|| {
                 echo_agent::error::ReactError::Other(
@@ -136,6 +160,37 @@ fn build_occurrence_fire_fn_with_cancel(
                     "task runtime generation admission failed: {error}"
                 ))
             })?;
+            if store.active_workspace_id() != identity.workspace_id {
+                return Err(echo_agent::error::ReactError::Other(
+                    "cron workspace changed before generation admission".to_string(),
+                ));
+            }
+            // Existing admissions own their original snapshot, including None.
+            // In the create race, only the first RunCreated frame wins.
+            let notification = if store
+                .find_occurrence_run(&identity)
+                .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?
+                .is_none()
+            {
+                match notifications.as_ref() {
+                    Some(sender) => sender
+                        .freeze_target(&invocation, &identity.workspace_id)
+                        .await
+                        .map_err(echo_agent::error::ReactError::Other)?,
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if notification
+                .as_ref()
+                .is_some_and(|target| target.definition_id != task.definition_id)
+            {
+                return Err(echo_agent::error::ReactError::Other(
+                    "Weixin notification definition does not match the frozen scheduler occurrence"
+                        .to_string(),
+                ));
+            }
             let mut registration = store
                 .register_observed_run_driver::<String>(admission, generation_lease)
                 .map_err(|error| {
@@ -147,7 +202,7 @@ fn build_occurrence_fire_fn_with_cancel(
             // only place a cron run comes into existence. A re-delivery reads the
             // existing run and must not touch it, so it rejects the driver slot
             // instead of starting a driver; `Reject` performs no settlement.
-            match store.get_or_create_occurrence_run(&request) {
+            match store.get_or_create_occurrence_run_with_weixin(&request, notification.as_ref()) {
                 Ok((_run, true)) => {
                     // This delivery owns the new run: bind continuation and
                     // Pending → Running through the shared unattended launcher
@@ -175,6 +230,18 @@ fn build_occurrence_fire_fn_with_cancel(
                     // reservation releases it without settlement, so the run's
                     // status, journal, and events stay exactly as the first
                     // delivery left them.
+                    // A completion-to-intent crash can leave a finished run
+                    // without notification facts. Recover only that obligation;
+                    // never drive the prompt or read current route config.
+                    #[cfg(feature = "channels")]
+                    if run.status == TaskRunStatus::Completed {
+                        deliver_weixin_without_changing_run(
+                            &store,
+                            &identity,
+                            notifications.as_deref(),
+                        )
+                        .await;
+                    }
                     registration.reject(format!(
                         "cron occurrence {} is already admitted as run {}",
                         identity.occurrence_id, run.run_id
@@ -200,6 +267,8 @@ fn build_occurrence_fire_fn_with_cancel(
             let owned_fire_id = fire_id.clone();
             let owned_prompt = prompt.clone();
             let owned_cancel = cancel.clone();
+            #[cfg(feature = "channels")]
+            let owned_identity = identity.clone();
             let waiter = registration.start(move |mut receipt_owner| async move {
                 // The exact driver owns memory settlement before pool
                 // admission. A configured integration never falls back
@@ -253,6 +322,13 @@ fn build_occurrence_fire_fn_with_cancel(
                 .await
                 .map_err(cron_execution_error);
                 let settled_run_id = result?;
+                #[cfg(feature = "channels")]
+                deliver_weixin_without_changing_run(
+                    &owned_store,
+                    &owned_identity,
+                    notifications.as_deref(),
+                )
+                .await;
                 if let Some(emitter) = webhook_emitter.as_ref() {
                     emitter.emit(crate::webhook::WebhookEvent::CronTaskCompleted {
                         task_id: owned_task.id.clone(),
@@ -422,11 +498,51 @@ pub async fn new_scheduler_runner(
         webhook_emitter,
         review_integration,
         cancel.clone(),
+        None,
     );
     // Occurrence-aware constructor: the callback receives the durable
     // occurrence identity (not just the mutable task), which is what makes the
     // TaskRun admission idempotent across retries.
     SchedulerRunner::new_with_occurrence_context(store, cancel, fire_fn).await
+}
+
+/// GUI background composition uses the same scheduler cancellation owner.
+#[allow(clippy::too_many_arguments)]
+pub async fn new_scheduler_runner_with_weixin(
+    store: CronTaskStore,
+    cancel: CancellationToken,
+    agent: AgentHandle,
+    task_runtime_store: Option<Arc<TaskRuntimeStore>>,
+    pool: Option<Arc<AgentPool>>,
+    webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
+    review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    notifications: Option<Arc<dyn WeixinCronDelivery>>,
+) -> echo_agent::error::Result<SchedulerRunner> {
+    let fire_fn = build_occurrence_fire_fn_with_cancel(
+        agent,
+        task_runtime_store,
+        pool,
+        webhook_emitter,
+        review_integration,
+        cancel.clone(),
+        notifications,
+    );
+    SchedulerRunner::new_with_occurrence_context(store, cancel, fire_fn).await
+}
+
+#[cfg(feature = "channels")]
+async fn deliver_weixin_without_changing_run(
+    store: &TaskRuntimeStore,
+    identity: &OccurrenceIdentity,
+    sender: Option<&dyn WeixinCronDelivery>,
+) {
+    if let Some(sender) = sender
+        && let Err(error) = store.deliver_weixin_completion(identity, sender).await
+    {
+        // The TaskRun is already terminal. Delivery owns its independent
+        // journal outcome; neither scheduler retry nor failure changes it.
+        tracing::warn!(run_id = %identity.run_id(), %error, "cron Weixin notification remains independently unsettled");
+    }
 }
 
 #[cfg(test)]
@@ -578,6 +694,7 @@ mod tests {
             None,
             None,
             scheduler_cancel,
+            None,
         );
 
         let result = fire_fn(invocation(
@@ -594,6 +711,7 @@ mod tests {
         Ok(())
     }
 
+    // `worker_threads` is a fixed Tokio attribute, not an EKO execution role.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn scheduler_reservation_is_boot_resumable_during_runtime_shutdown() -> Result<(), String>
     {
@@ -1313,6 +1431,514 @@ mod tests {
             // exercise recovery/replay; that remains the framework's own proof.
             // This composition proves the existing claim and callback count
             // survive real shutdown/re-observation without false settlement.
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    struct RecordingWeixin {
+        freeze_calls: std::sync::atomic::AtomicUsize,
+        sends: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[cfg(feature = "channels")]
+    impl WeixinCronDelivery for RecordingWeixin {
+        fn freeze_target<'a>(
+            &'a self,
+            invocation: &'a SchedulerInvocation,
+            workspace_id: &'a str,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<
+                Option<crate::tasks::task_runtime::weixin_delivery::WeixinDeliveryTarget>,
+                String,
+            >,
+        > {
+            Box::pin(async move {
+                self.freeze_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(
+                    crate::tasks::task_runtime::weixin_delivery::WeixinDeliveryTarget {
+                        account_id: "frozen-account".to_string(),
+                        credential_generation: "original-generation".to_string(),
+                        peer_id: "frozen-peer".to_string(),
+                        context_ref: "original-context-reference".to_string(),
+                        workspace_id: workspace_id.to_string(),
+                        channel_conversation: "original-direct-conversation".to_string(),
+                        definition_id: invocation.task.definition_id.clone(),
+                    },
+                ))
+            })
+        }
+
+        fn send<'a>(
+            &'a self,
+            target: &'a crate::tasks::task_runtime::weixin_delivery::WeixinDeliveryTarget,
+            message_id: &'a str,
+            text: &'a str,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<echo_agent::channels::weixin::WeixinSendOutcome, String>,
+        > {
+            Box::pin(async move {
+                if target.account_id != "frozen-account"
+                    || target.credential_generation != "original-generation"
+                {
+                    return Err("target drift".to_string());
+                }
+                self.sends
+                    .lock()
+                    .map_err(|_| "test send observer poisoned".to_string())?
+                    .push((message_id.to_string(), text.to_string()));
+                Ok(echo_agent::channels::weixin::WeixinSendOutcome::Accepted {
+                    client_id: message_id.to_string(),
+                    message_id: Some("fixture-server-message".to_string()),
+                })
+            })
+        }
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn cron_completion_delivers_full_original_answer_once_across_duplicate_occurrence()
+    -> Result<(), String> {
+        let full_answer = format!("{}FULL-ANSWER-END", "中文🌱".repeat(600));
+        let agent = ReactAgentBuilder::new()
+            .llm_client(Arc::new(
+                MockLlmClient::new().with_response(full_answer.clone()),
+            ))
+            .system_prompt("test")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
+        let sender = Arc::new(RecordingWeixin {
+            freeze_calls: std::sync::atomic::AtomicUsize::new(0),
+            sends: std::sync::Mutex::new(Vec::new()),
+        });
+        let fire = build_occurrence_fire_fn_with_weixin(
+            AgentHandle::new(agent),
+            Some(store.clone()),
+            None,
+            None,
+            None,
+            Some(sender.clone()),
+        );
+        let invocation = invocation(
+            "cron-scheduled:weixin-one",
+            CronTask::new("notify", "*/5 * * * *", "answer fully"),
+        );
+        let identity =
+            OccurrenceIdentity::from_scheduler_invocation(store.active_workspace_id(), &invocation);
+        fire(invocation.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        fire(invocation).await.map_err(|error| error.to_string())?;
+        assert_eq!(
+            sender
+                .freeze_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let sends = sender
+            .sends
+            .lock()
+            .map_err(|_| "test send observer poisoned".to_string())?;
+        assert_eq!(
+            sends.len(),
+            1,
+            "duplicate occurrence must not send or execute again"
+        );
+        let (_, text) = sends.first().ok_or("original send missing")?;
+        assert!(
+            text.contains(&full_answer),
+            "bounded summary/finished label cannot replace original direct answer"
+        );
+        let receipt = store
+            .weixin_notification_status(&identity.run_id())
+            .map_err(|error| error.to_string())?
+            .ok_or("notification receipt missing")?;
+        assert_eq!(
+            receipt.outcome,
+            Some(echo_agent::delivery::DeliveryOutcome::Completed)
+        );
+        assert_eq!(
+            receipt.reply_message_id.as_deref(),
+            Some("fixture-server-message")
+        );
+        assert_eq!(
+            store
+                .get_run(&identity.run_id())
+                .map_err(|error| error.to_string())?
+                .ok_or("original run missing")?
+                .status,
+            TaskRunStatus::Completed
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    struct RestartNotificationSender {
+        unknown: bool,
+        freeze_calls: std::sync::atomic::AtomicUsize,
+        send_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "channels")]
+    impl WeixinCronDelivery for RestartNotificationSender {
+        fn freeze_target<'a>(
+            &'a self,
+            invocation: &'a SchedulerInvocation,
+            workspace_id: &'a str,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<
+                Option<crate::tasks::task_runtime::weixin_delivery::WeixinDeliveryTarget>,
+                String,
+            >,
+        > {
+            Box::pin(async move {
+                self.freeze_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(
+                    crate::tasks::task_runtime::weixin_delivery::WeixinDeliveryTarget {
+                        account_id: "original-account".to_string(),
+                        credential_generation: "original-generation".to_string(),
+                        peer_id: "original-peer".to_string(),
+                        context_ref: "opaque-original-context".to_string(),
+                        workspace_id: workspace_id.to_string(),
+                        channel_conversation: "original-direct-conversation".to_string(),
+                        definition_id: invocation.task.definition_id.clone(),
+                    },
+                ))
+            })
+        }
+        fn send<'a>(
+            &'a self,
+            target: &'a crate::tasks::task_runtime::weixin_delivery::WeixinDeliveryTarget,
+            message_id: &'a str,
+            text: &'a str,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<echo_agent::channels::weixin::WeixinSendOutcome, String>,
+        > {
+            Box::pin(async move {
+                if target.account_id != "original-account"
+                    || target.credential_generation != "original-generation"
+                    || target.peer_id != "original-peer"
+                    || !text.contains("original completed answer")
+                {
+                    return Err("fixture observed frozen target/result drift".to_string());
+                }
+                self.send_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.unknown {
+                    Ok(echo_agent::channels::weixin::WeixinSendOutcome::Unknown {
+                        client_id: message_id.to_string(),
+                        reason: "original admitted effect has no response".to_string(),
+                    })
+                } else {
+                    Ok(echo_agent::channels::weixin::WeixinSendOutcome::Accepted {
+                        client_id: message_id.to_string(),
+                        message_id: Some("original-server-accepted".to_string()),
+                    })
+                }
+            })
+        }
+    }
+
+    /// This starts with the REAL Framework run_once owner. Its callback and
+    /// occurrence both complete despite a failed notification journal append.
+    /// New stores and the SAME public after-channel-start recovery entry must
+    /// recover that obligation without invoking an Agent or scheduler fire.
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn completed_framework_occurrence_recovers_original_notification_debt_after_restart()
+    -> anyhow::Result<()> {
+        use echo_agent::delivery::{DeliveryEvent, DeliveryOutcome, DeliveryPhase};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cases = [
+            (Some(DeliveryPhase::Persisted), false),
+            (Some(DeliveryPhase::Claimed), false),
+            (Some(DeliveryPhase::EffectStarted), false),
+            (Some(DeliveryPhase::TurnSettled), false),
+            (None, false),
+            (None, true),
+        ];
+        for (index, (fault, unknown)) in cases.into_iter().enumerate() {
+            let root = tempfile::tempdir()?;
+            let registry_root = root.path().join("registry");
+            let registry = Arc::new(
+                crate::workspace::registry::WorkspaceRegistry::with_base_dir(
+                    registry_root.clone(),
+                )?,
+            );
+            // Alternate global and cold stored workspace scopes. Recovery
+            // cannot depend on the GUI's currently selected workspace.
+            let workspace_scope = index % 2 == 1;
+            let (tasks_root, workspace_id) = if workspace_scope {
+                let path = root.path().join("original-workspace");
+                let workspace = registry.create_at(
+                    "original",
+                    crate::workspace::WorkspaceKind::General,
+                    path.clone(),
+                )?;
+                (
+                    crate::workspace::layout::WorkspaceLayout::tasks(&path),
+                    workspace.id.to_string(),
+                )
+            } else {
+                (root.path().join("global-tasks"), "global".to_string())
+            };
+            let llm =
+                Arc::new(MockLlmClient::new().with_response("original completed answer 中文🌱"));
+            let sender = Arc::new(RestartNotificationSender {
+                unknown,
+                freeze_calls: AtomicUsize::new(0),
+                send_calls: AtomicUsize::new(0),
+            });
+            let definition = root.path().join("tasks.json");
+            let (run_id, occurrence_id, original_identity) = {
+                let store = Arc::new(TaskRuntimeStore::open_for_workspace(
+                    &tasks_root,
+                    &workspace_id,
+                )?);
+                let resource_root = store.test_resource_scope();
+                let agent = AgentHandle::new(
+                    ReactAgentBuilder::new()
+                        .llm_client(llm.clone())
+                        .system_prompt("original prompt")
+                        .build()?,
+                );
+                let original = build_occurrence_fire_fn_with_weixin(
+                    agent,
+                    Some(store.clone()),
+                    None,
+                    None,
+                    None,
+                    Some(sender.clone()),
+                );
+                let fault_store = store.clone();
+                let fire: OccurrenceFireFn = Arc::new(move |invocation| {
+                    if let Some(phase) = fault {
+                        let identity = OccurrenceIdentity::from_scheduler_invocation(
+                            fault_store.active_workspace_id(),
+                            &invocation,
+                        );
+                        TaskRuntimeStore::fail_weixin_phase_before_append_for_test(
+                            &identity.run_id(),
+                            phase,
+                        );
+                    }
+                    original(invocation)
+                });
+                let runner = FrameworkSchedulerRunner::new_with_occurrence_context(
+                    CronTaskStore::new().with_path(definition.clone()),
+                    CancellationToken::new(),
+                    fire,
+                )
+                .await?;
+                let task = CronTask::new(
+                    "restart debt",
+                    "0 0 1 1 *",
+                    "produce original completed answer",
+                );
+                let task_id = task.id.clone();
+                runner.add_task(task).await?;
+                let manual = runner.run_once_with_receipt(&task_id).await?;
+                assert_eq!(llm.call_count(), 1);
+                let runs = store.list_runs_in(&[TaskRunStatus::Completed])?;
+                let run = runs
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("original completed run missing"))?;
+                assert_eq!(runs.len(), 1);
+                let identity = store
+                    .frozen_weixin_occurrence(&run.run_id)?
+                    .ok_or_else(|| anyhow::anyhow!("original frozen occurrence missing"))?;
+                assert_eq!(identity.occurrence_id, manual.occurrence.occurrence_id);
+                let history = runner.read_occurrence_history(None, Some(512))?;
+                assert!(history.events.iter().any(|record| matches!(&record.event,
+                    DeliveryEvent::TurnSettled { message_id, outcome: DeliveryOutcome::Completed, .. }
+                    if message_id == &manual.occurrence.occurrence_id)));
+                if matches!(
+                    fault,
+                    Some(
+                        DeliveryPhase::Persisted
+                            | DeliveryPhase::Claimed
+                            | DeliveryPhase::EffectStarted
+                    )
+                ) {
+                    assert_eq!(sender.send_calls.load(Ordering::SeqCst), 0);
+                    assert!(
+                        !store
+                            .weixin_notification_status(&run.run_id)?
+                            .is_some_and(|record| record.terminal)
+                    );
+                }
+                let result = (
+                    run.run_id.clone(),
+                    manual.occurrence.occurrence_id.clone(),
+                    identity,
+                );
+                store.shutdown_run_drivers().await?;
+                drop(runner);
+                drop(store);
+                drop(resource_root);
+                result
+            };
+            // Original stores have closed. Neither the new Agent nor current
+            // config has the old notification binding; only RunCreated does.
+            let reopened = Arc::new(TaskRuntimeStore::open_for_workspace(
+                &tasks_root,
+                &workspace_id,
+            )?);
+            let resources = reopened.test_resource_scope();
+            let agent = AgentHandle::new(
+                ReactAgentBuilder::new()
+                    .llm_client(llm.clone())
+                    .system_prompt("must not execute after restart")
+                    .build()?,
+            );
+            let mut state = crate::state::AppState::from_shared(
+                agent.clone(),
+                None,
+                Arc::new(crate::hitl::HitlDispatcher::new()),
+                None,
+                None,
+                Default::default(),
+                Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
+                    root.path().join("mcp.json"),
+                    Default::default(),
+                )),
+                crate::product_data_io::ProductDataIoService::new(),
+            )?;
+            state.workspace.registry = Arc::new(
+                crate::workspace::registry::WorkspaceRegistry::with_base_dir(registry_root)?,
+            );
+            state
+                .workspace
+                .runtimes
+                .bind_lifecycle_retention(&resources);
+            state.tasks.runtime = if workspace_scope {
+                let global = Arc::new(TaskRuntimeStore::open_for_workspace(
+                    root.path().join("new-global-tasks"),
+                    "global",
+                )?);
+                global.bind_lifecycle_retention(&resources);
+                Some(global)
+            } else {
+                Some(reopened.clone())
+            };
+            let reopened_runner = Arc::new(
+                FrameworkSchedulerRunner::new_with_occurrence_context(
+                    CronTaskStore::new().with_path(definition),
+                    CancellationToken::new(),
+                    build_occurrence_fire_fn_with_weixin(
+                        agent,
+                        Some(reopened.clone()),
+                        None,
+                        None,
+                        None,
+                        Some(sender.clone()),
+                    ),
+                )
+                .await?,
+            );
+            let history = reopened_runner.read_occurrence_history(None, Some(512))?;
+            assert!(history.events.iter().any(|record| matches!(&record.event,
+                DeliveryEvent::TurnSettled { message_id, outcome: DeliveryOutcome::Completed, .. }
+                if message_id == &occurrence_id)));
+            state.scheduler.runner = Some(reopened_runner);
+            if index == 0 {
+                // A second refusal during actual startup must be visible as
+                // durable debt, not a successful recovery or failed prompt.
+                TaskRuntimeStore::fail_weixin_phase_before_append_for_test(
+                    &run_id,
+                    DeliveryPhase::Persisted,
+                );
+                let pending = state
+                    .recover_weixin_notifications_after_channel_start(
+                        sender.clone(),
+                        &CancellationToken::new(),
+                    )
+                    .await;
+                assert!(!pending.pending.is_empty());
+                assert_eq!(pending.recovered, 0);
+                assert_eq!(sender.send_calls.load(Ordering::SeqCst), 0);
+                assert!(reopened.weixin_notification_status(&run_id)?.is_none());
+                assert_eq!(
+                    reopened.frozen_weixin_occurrence(&run_id)?,
+                    Some(original_identity.clone())
+                );
+                assert_eq!(
+                    reopened
+                        .get_run(&run_id)?
+                        .ok_or_else(|| anyhow::anyhow!("pending debt lost its original run"))?
+                        .status,
+                    TaskRunStatus::Completed
+                );
+            }
+            let report = state
+                .recover_weixin_notifications_after_channel_start(
+                    sender.clone(),
+                    &CancellationToken::new(),
+                )
+                .await;
+            assert!(
+                report.pending.is_empty(),
+                "startup notification debt remains: {:?}",
+                report.pending
+            );
+            assert_eq!(report.scanned, 1);
+            assert_eq!(
+                llm.call_count(),
+                1,
+                "notification recovery must never re-execute a completed prompt"
+            );
+            assert_eq!(
+                sender.freeze_calls.load(Ordering::SeqCst),
+                1,
+                "restart cannot reinterpret current config"
+            );
+            assert_eq!(
+                sender.send_calls.load(Ordering::SeqCst),
+                1,
+                "only an unstarted notification may send"
+            );
+            let status = reopened
+                .weixin_notification_status(&run_id)?
+                .ok_or_else(|| anyhow::anyhow!("recovery receipt missing"))?;
+            let expected = if unknown || fault == Some(DeliveryPhase::TurnSettled) {
+                DeliveryOutcome::OutcomeUnknown
+            } else {
+                DeliveryOutcome::Completed
+            };
+            assert_eq!(status.outcome, Some(expected));
+            assert_eq!(
+                reopened
+                    .get_run(&run_id)?
+                    .ok_or_else(|| anyhow::anyhow!("original run missing"))?
+                    .status,
+                TaskRunStatus::Completed
+            );
+            assert_eq!(
+                reopened.frozen_weixin_occurrence(&run_id)?,
+                Some(original_identity)
+            );
+            let again = state
+                .recover_weixin_notifications_after_channel_start(
+                    sender.clone(),
+                    &CancellationToken::new(),
+                )
+                .await;
+            assert!(again.pending.is_empty());
+            assert_eq!(sender.send_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(llm.call_count(), 1);
+            state.shutdown_workspace_runtimes().await?;
+            reopened.shutdown_run_drivers().await?;
+            if let Some(global) = state.tasks.runtime.as_ref() {
+                global.shutdown_run_drivers().await?;
+            }
         }
         Ok(())
     }

@@ -3420,6 +3420,287 @@ Read the runtime path and found one missing branch.
         Ok(())
     }
 
+    #[derive(Clone, Debug)]
+    struct PrimaryVerificationToolRequest {
+        names: Vec<String>,
+        has_tools: bool,
+        schema_bytes: usize,
+        estimated_tokens: usize,
+    }
+
+    #[derive(Default)]
+    struct PrimaryVerificationMetadataClient {
+        requests: std::sync::Mutex<Vec<PrimaryVerificationToolRequest>>,
+    }
+
+    impl PrimaryVerificationMetadataClient {
+        fn observe(&self, request: &echo_agent::llm::ChatRequest) -> echo_agent::error::Result<()> {
+            let definitions = request.tools.as_deref().unwrap_or_default();
+            let stats =
+                echo_agent::tools::ToolManager::schema_stats_for(definitions).map_err(|_| {
+                    echo_agent::error::ReactError::Other(
+                        "无法统计验证请求的工具 schema".to_string(),
+                    )
+                })?;
+            let mut names = definitions
+                .iter()
+                .map(|definition| definition.function.name.clone())
+                .collect::<Vec<_>>();
+            names.sort_unstable();
+            // 只在实际模型边界保留无内容元数据；不保存 prompt、参数 schema 或整个请求。
+            self.requests
+                .lock()
+                .map_err(|_| {
+                    echo_agent::error::ReactError::Other("验证请求元数据锁不可用".to_string())
+                })?
+                .push(PrimaryVerificationToolRequest {
+                    names,
+                    has_tools: request.tools.is_some(),
+                    schema_bytes: stats.schema_bytes,
+                    estimated_tokens: stats.estimated_tokens,
+                });
+            Ok(())
+        }
+    }
+
+    impl echo_agent::llm::LlmClient for PrimaryVerificationMetadataClient {
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+
+        fn chat(
+            &self,
+            request: echo_agent::llm::ChatRequest,
+        ) -> BoxFuture<'_, echo_agent::error::Result<echo_agent::llm::ChatResponse>> {
+            let observed = self.observe(&request);
+            drop(request);
+            Box::pin(async move {
+                observed?;
+                Ok(echo_agent::llm::ChatResponse {
+                    message: echo_agent::llm::types::Message::assistant("验证完成。".to_owned()),
+                    finish_reason: Some("stop".to_string()),
+                    usage: None,
+                    raw: Default::default(),
+                })
+            })
+        }
+
+        fn chat_stream(
+            &self,
+            request: echo_agent::llm::ChatRequest,
+        ) -> BoxFuture<
+            '_,
+            echo_agent::error::Result<
+                BoxStream<'static, echo_agent::error::Result<echo_agent::llm::ChatChunk>>,
+            >,
+        > {
+            let observed = self.observe(&request);
+            drop(request);
+            Box::pin(async move {
+                observed?;
+                let chunks: BoxStream<
+                    'static,
+                    echo_agent::error::Result<echo_agent::llm::ChatChunk>,
+                > = Box::pin(stream::iter(vec![
+                    Ok(echo_agent::llm::ChatChunk {
+                        delta: echo_agent::llm::types::DeltaMessage {
+                            content: Some("验证完成。".to_string()),
+                            ..Default::default()
+                        },
+                        finish_reason: None,
+                        usage: None,
+                    }),
+                    Ok(echo_agent::llm::ChatChunk {
+                        delta: Default::default(),
+                        finish_reason: Some("stop".to_string()),
+                        usage: None,
+                    }),
+                ]));
+                Ok(chunks)
+            })
+        }
+    }
+
+    async fn primary_verification_actual_request(
+        allowed_tools: &[&str],
+    ) -> Result<(HashSet<String>, PrimaryVerificationToolRequest), String> {
+        let fixture = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resource_scope = store.test_resource_scope();
+        let run_id = seed_run(
+            &store,
+            vec![PlanTask {
+                id: "verify-model-tools".to_string(),
+                title: "核对 primary verification 的实际工具曝光".to_string(),
+                description: "无需执行工具，正常回答验证完成。".to_string(),
+                kind: PlanTaskKind::Verification,
+                agent_role: "primary".to_string(),
+                allowed_tools: allowed_tools
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+                ..Default::default()
+            }],
+        )?;
+        let product_data_io = crate::product_data_io::ProductDataIoService::new();
+        let command_cells = super::super::command_cells::CommandCellRuntimeService::new(
+            Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox()),
+            Arc::new(
+                crate::chat_event_log::ChatEventLog::open(
+                    fixture.path().join("chat-events"),
+                    Default::default(),
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+            product_data_io.clone(),
+        )?;
+        // 使用原 EKO factory、真实内置注册和 TaskRuntime 工具；只替换受控模型传输。
+        let created = crate::infra::create_agent_with_diagnostics(
+            &crate::infra::AgentCreateParams {
+                system_prompt: Some("按要求正常回答，不调用工具。".to_string()),
+                working_dir: Some(fixture.path().to_path_buf()),
+                workspace_data_root: Some(fixture.path().join("product-data")),
+                task_runtime_store: Some(store.clone()),
+                command_cell_runtime: Some(command_cells.clone()),
+                product_data_io: Some(product_data_io.clone()),
+                ..Default::default()
+            },
+            &crate::config::EkoConfig::default(),
+        )
+        .await?;
+        let client = Arc::new(PrimaryVerificationMetadataClient::default());
+        let mut agent = created.agent;
+        let registered = agent.tool_names().into_iter().collect::<HashSet<_>>();
+        agent.set_llm_client(client.clone());
+        let agent = crate::agent_handle::AgentHandle::new(agent);
+        let execution = execute_run(
+            store.clone(),
+            Some(agent.clone()),
+            None,
+            None,
+            None,
+            None,
+            &run_id,
+            CancellationToken::new(),
+            super::super::memory_bridge::MemoryPolicy::None,
+            None,
+        )
+        .await;
+        // 原 owner 先结算，再检查断言，避免失败时遗留 command-cell 观察任务。
+        let command_shutdown = command_cells.shutdown().await;
+        drop(agent);
+        drop(created.model_consumers);
+        drop(created.command_cell_runtime);
+        drop(command_cells);
+        let io_shutdown = product_data_io.join_shutdown().await;
+        command_shutdown?;
+        io_shutdown?;
+        assert!(matches!(
+            execution.map_err(|error| error.to_string())?,
+            RunOutcome::Completed
+        ));
+        let run = store
+            .get_run(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "验证 TaskRun 缺失".to_string())?;
+        assert_eq!(run.status, TaskRunStatus::Completed);
+        let subagent_runs = store
+            .list_subagent_runs(&run_id)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(subagent_runs.len(), 1);
+        let subagent_run = subagent_runs
+            .first()
+            .ok_or_else(|| "原 primary verification 执行记录缺失".to_string())?;
+        assert_eq!(subagent_run.task_id, "verify-model-tools");
+        assert_eq!(subagent_run.subagent_name, "primary");
+        assert_eq!(subagent_run.status, SubagentStatus::Completed);
+        let outcome = subagent_run
+            .outcome
+            .as_ref()
+            .ok_or_else(|| "原 primary verification 未保存正常回答".to_string())?;
+        assert!(outcome.summary.contains("验证完成。"));
+        let mut requests = client
+            .requests
+            .lock()
+            .map_err(|_| "验证元数据锁不可用".to_string())?;
+        assert_eq!(
+            requests.len(),
+            1,
+            "必须真正命中一次模型 API，不能以零请求通过"
+        );
+        let request = requests
+            .pop()
+            .ok_or_else(|| "最终模型请求缺失".to_string())?;
+        assert!(request.names.iter().all(|name| registered.contains(name)));
+        assert!(
+            request.schema_bytes <= 16_000,
+            "实际请求 schema 超出 16,000 bytes：{}",
+            request.schema_bytes
+        );
+        assert!(
+            request.estimated_tokens <= 4_000,
+            "实际请求 schema 超出 4,000 估算 token：{}",
+            request.estimated_tokens
+        );
+        eprintln!(
+            "primary verification tools={:?} schema_bytes={} estimated_tokens={}",
+            request.names, request.schema_bytes, request.estimated_tokens
+        );
+        Ok((registered, request))
+    }
+
+    #[tokio::test]
+    async fn primary_verification_model_tools_default_scope() -> Result<(), String> {
+        let (registered, request) = primary_verification_actual_request(&[]).await?;
+        for required in [
+            "read_file",
+            "tool_search",
+            "task_create",
+            "task_update",
+            "task_list",
+        ] {
+            assert!(
+                registered.contains(required),
+                "原 factory 必须注册 {required}"
+            );
+            assert!(
+                request.names.iter().any(|name| name == required),
+                "缺省请求必须曝光 {required}"
+            );
+        }
+        assert!(request.has_tools);
+        // 复用原产品策略作为预期；不在夹具中另建 registry 或实现可见性算法。
+        let registered = registered.into_iter().collect::<Vec<_>>();
+        let expected = crate::tool_exposure::initial_visible_tools_for_task_run(&registered);
+        assert_eq!(request.names.into_iter().collect::<HashSet<_>>(), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn primary_verification_model_tools_read_file_bound() -> Result<(), String> {
+        let (registered, request) = primary_verification_actual_request(&["read_file"]).await?;
+        assert!(registered.contains("read_file"));
+        assert!(request.has_tools);
+        assert_eq!(request.names, vec!["read_file".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn primary_verification_model_tools_disjoint_bound() -> Result<(), String> {
+        let missing = "unregistered_primary_verification_probe";
+        let (registered, request) = primary_verification_actual_request(&[missing]).await?;
+        assert!(
+            !registered.contains(missing),
+            "反控必须与真实注册目录无交集"
+        );
+        assert!(request.names.is_empty());
+        assert!(
+            !request.has_tools,
+            "空交集应成为实际 ChatRequest.tools=None，不能回退全量"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn primary_verification_keeps_original_depth_and_hard_tool_bound() -> Result<(), String> {
         use crate::subagent_policy::{SubagentDepthDefaults, SubagentDepthLimit};

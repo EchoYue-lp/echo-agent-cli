@@ -8,8 +8,10 @@
  */
 export type RuntimeEventKind =
   | 'run_created'
+  | 'weixin_delivery_recorded'
   | 'run_goal_updated'
   | 'run_steer_recorded'
+  | 'run_input_accepted'
   | 'requirement_evidence_invalidated'
   | 'requirement_evidence_revalidated'
   | 'requirement_skipped'

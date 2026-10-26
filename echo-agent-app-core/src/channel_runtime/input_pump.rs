@@ -31,8 +31,30 @@ impl ChannelReplyCorrelation {
     }
 }
 
+/// Queued response data, retained by the original pump route. No delivery
+/// permit, SessionStreamReceipt, task or future exists while this input waits.
+pub(super) struct WeixinReplyScope {
+    // True only when reconstructing a lost route from persisted DATA. Live
+    // original routes retain their existing typed Deferred/retry semantics.
+    pub(super) recovered: bool,
+    pub(super) state: Arc<crate::state::AppState>,
+    pub(super) address: crate::conversation_input::ConversationInputAddress,
+    pub(super) binding: crate::conversation_input::ChannelInputBinding,
+    pub(super) service_cancel: tokio_util::sync::CancellationToken,
+}
+
+pub(super) struct DeferredWeixinReply {
+    pub(super) scope: WeixinReplyScope,
+    pub(super) receiver: ChannelInputReplyReceiver,
+    pub(super) delivery: echo_agent::channels::weixin::WeixinDeliveryHandle,
+    pub(super) context: Option<echo_agent::channels::weixin::WeixinContextRef>,
+    pub(super) template: echo_agent::channels::OutboundMessage,
+    pub(super) client_id_prefix: String,
+}
+
 /// Sender half retained until the exact durable input is claimed.
 pub(super) struct ChannelInputReplyRoute {
+    pub(super) deferred_weixin: Option<DeferredWeixinReply>,
     pub(super) render_tx: tokio::sync::mpsc::Sender<ChannelRenderEvent>,
     pub(super) lifecycle_cursor: Arc<Mutex<u64>>,
     pub(super) terminal_tx: tokio::sync::oneshot::Sender<
@@ -64,6 +86,7 @@ pub(super) fn channel_input_reply_route(
     let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
     (
         ChannelInputReplyRoute {
+            deferred_weixin: None,
             render_tx,
             lifecycle_cursor: Arc::new(Mutex::new(0)),
             terminal_tx,
@@ -100,6 +123,7 @@ pub(super) enum ChannelInputPumpError {
     ShuttingDown,
     ReplyAlreadyRegistered,
     ReplyRecoveryInProgress,
+    AdmissionCounterExhausted,
     DurableDebt(String),
 }
 
@@ -120,6 +144,9 @@ impl std::fmt::Display for ChannelInputPumpError {
             Self::ReplyRecoveryInProgress => {
                 formatter.write_str("channel input route-less recovery is already in progress")
             }
+            Self::AdmissionCounterExhausted => {
+                formatter.write_str("channel reply admission counter exhausted")
+            }
             Self::DurableDebt(reason) => write!(formatter, "channel input durable debt: {reason}"),
         }
     }
@@ -137,6 +164,7 @@ where
     active_owner_id: Option<u64>,
     shutting_down: bool,
     reply_routes: HashMap<Identity, ChannelInputReplyRoute>,
+    pending_reply_admissions: usize,
     unroutable_recovery: Option<Identity>,
 }
 
@@ -152,6 +180,7 @@ where
             active_owner_id: None,
             shutting_down: false,
             reply_routes: HashMap::new(),
+            pending_reply_admissions: 0,
             unroutable_recovery: None,
         }
     }
@@ -183,6 +212,51 @@ impl<Identity> ChannelInputPumpSlot<Identity>
 where
     Identity: Clone + Eq + Hash,
 {
+    /// Keep the existing owner from treating a committed input as route-less
+    /// between durable submit and publication into this same reply map.
+    pub(super) fn begin_reply_admission(
+        self: &Arc<Self>,
+    ) -> Result<ChannelReplyAdmission<Identity>, ChannelInputPumpError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ChannelInputPumpError::StateUnavailable)?;
+        if state.shutting_down {
+            return Err(ChannelInputPumpError::ShuttingDown);
+        }
+        state.pending_reply_admissions = state
+            .pending_reply_admissions
+            .checked_add(1)
+            .ok_or(ChannelInputPumpError::AdmissionCounterExhausted)?;
+        Ok(ChannelReplyAdmission {
+            slot: Arc::clone(self),
+        })
+    }
+
+    /// Only the already selected original route-recovery owner can republish
+    /// DATA for its exact durable identity. No second queue or claimant exists.
+    pub(super) fn restore_reply(
+        &self,
+        identity: Identity,
+        route: ChannelInputReplyRoute,
+    ) -> Result<(), ChannelInputPumpError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ChannelInputPumpError::StateUnavailable)?;
+        if state.shutting_down {
+            return Err(ChannelInputPumpError::ShuttingDown);
+        }
+        if state.unroutable_recovery.as_ref() != Some(&identity) {
+            return Err(ChannelInputPumpError::OwnerMismatch);
+        }
+        if state.reply_routes.contains_key(&identity) {
+            return Err(ChannelInputPumpError::ReplyAlreadyRegistered);
+        }
+        state.reply_routes.insert(identity, route);
+        Ok(())
+    }
+
     pub(super) fn register_reply(
         &self,
         identity: Identity,
@@ -206,6 +280,45 @@ where
             return Err(ChannelInputPumpError::ReplyAlreadyRegistered);
         }
         state.reply_routes.insert(identity, route);
+        Ok(())
+    }
+
+    /// Keep framework session eviction from retiring the original fence while
+    /// its queued response data or single pump owner still exists. A poisoned
+    /// owner cannot safely claim that all work has settled.
+    pub(super) fn has_pending_work(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| {
+                !state.reply_routes.is_empty()
+                    || state.pending_reply_admissions != 0
+                    || state.active_owner_id.is_some()
+                    || state.unroutable_recovery.is_some()
+            })
+            .unwrap_or(true)
+    }
+
+    pub(super) fn requires_channel_recovery_proof(
+        &self,
+        identity: &Identity,
+    ) -> Result<bool, ChannelInputPumpError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ChannelInputPumpError::StateUnavailable)?;
+        Ok(state
+            .reply_routes
+            .get(identity)
+            .and_then(|route| route.deferred_weixin.as_ref())
+            .is_none_or(|reply| reply.scope.recovered))
+    }
+
+    pub(super) fn forget_reply(&self, identity: &Identity) -> Result<(), ChannelInputPumpError> {
+        self.state
+            .lock()
+            .map_err(|_| ChannelInputPumpError::StateUnavailable)?
+            .reply_routes
+            .remove(identity);
         Ok(())
     }
 
@@ -252,7 +365,7 @@ where
         Ok(())
     }
 
-    fn has_reply(&self, identity: &Identity) -> Result<bool, ChannelInputPumpError> {
+    pub(super) fn has_reply(&self, identity: &Identity) -> Result<bool, ChannelInputPumpError> {
         let state = self
             .state
             .lock()
@@ -290,6 +403,21 @@ where
             owner_id,
             active: true,
         }))
+    }
+}
+
+pub(super) struct ChannelReplyAdmission<Identity: Clone + Eq + Hash> {
+    slot: Arc<ChannelInputPumpSlot<Identity>>,
+}
+
+impl<Identity: Clone + Eq + Hash> Drop for ChannelReplyAdmission<Identity> {
+    fn drop(&mut self) {
+        let mut state = self
+            .slot
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.pending_reply_admissions = state.pending_reply_admissions.saturating_sub(1);
     }
 }
 
@@ -354,17 +482,32 @@ where
         Ok(state.shutting_down)
     }
 
-    pub(super) fn take_reply(
+    pub(super) async fn take_reply(
         &self,
         identity: &Identity,
     ) -> Result<Option<ChannelInputReplyRoute>, ChannelInputPumpError> {
-        let mut state = self
-            .slot
-            .state
-            .lock()
-            .map_err(|_| ChannelInputPumpError::StateUnavailable)?;
-        self.ensure_owner(&state)?;
-        Ok(state.reply_routes.remove(identity))
+        loop {
+            {
+                let mut state = self
+                    .slot
+                    .state
+                    .lock()
+                    .map_err(|_| ChannelInputPumpError::StateUnavailable)?;
+                self.ensure_owner(&state)?;
+                if state.shutting_down {
+                    return Err(ChannelInputPumpError::ShuttingDown);
+                }
+                // Keep the original route visible until every admission that
+                // could have observed the pre-claim fact has finished publishing.
+                // Otherwise a duplicate recovery could install a second route
+                // after this owner removed the first one. New admissions after
+                // this point observe the already committed claim/live owner.
+                if state.pending_reply_admissions == 0 {
+                    return Ok(state.reply_routes.remove(identity));
+                }
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     fn restore_reply(
@@ -408,6 +551,9 @@ where
         self.ensure_owner(&state)?;
         if state.shutting_down {
             return Err(ChannelInputPumpError::ShuttingDown);
+        }
+        if state.pending_reply_admissions != 0 {
+            return Ok(false);
         }
         if state
             .reply_routes
@@ -598,7 +744,11 @@ where
         let Some(next_identity) = next_identity else {
             match owner.finish_if_quiescent(observed_wake_epoch)? {
                 ChannelInputPumpOwnerDecision::Continue { .. } => continue,
-                ChannelInputPumpOwnerDecision::Quiescent => return Ok(()),
+                ChannelInputPumpOwnerDecision::Quiescent => {
+                    #[cfg(test)]
+                    super::trace_channel_boundary("pump.quiescent");
+                    return Ok(());
+                }
                 ChannelInputPumpOwnerDecision::ShuttingDown => {
                     return Err(ChannelInputPumpError::ShuttingDown);
                 }
@@ -606,6 +756,7 @@ where
         };
         if !owner.has_reply(&next_identity)? {
             if !owner.begin_unroutable_recovery(&next_identity)? {
+                tokio::task::yield_now().await;
                 continue;
             }
             let mut attempts = 0_usize;
@@ -671,16 +822,19 @@ where
             .await?;
             continue;
         }
-        if owner.is_shutting_down()? {
-            recover_claimed_until_durable(
-                adapter.as_ref(),
-                &item,
-                "channel session shut down after the durable input was claimed",
-            )
-            .await?;
-            return Err(ChannelInputPumpError::ShuttingDown);
-        }
-        let Some(reply) = owner.take_reply(adapter.identity(&item))? else {
+        let reply = match owner.take_reply(adapter.identity(&item)).await {
+            Err(ChannelInputPumpError::ShuttingDown) => {
+                recover_claimed_until_durable(
+                    adapter.as_ref(),
+                    &item,
+                    "channel session shut down after the durable input was claimed",
+                )
+                .await?;
+                return Err(ChannelInputPumpError::ShuttingDown);
+            }
+            other => other?,
+        };
+        let Some(reply) = reply else {
             recover_claimed_until_durable(
                 adapter.as_ref(),
                 &item,
@@ -757,6 +911,81 @@ mod tests {
             "queued",
             message_id,
         )
+    }
+
+    #[test]
+    fn reply_publication_is_not_cancelled_as_unroutable() -> Result<(), String> {
+        let slot = Arc::new(ChannelInputPumpSlot::<TestIdentity>::default());
+        let owner = match slot.kick().map_err(|error| error.to_string())? {
+            ChannelInputPumpKick::Started(owner) => owner,
+            ChannelInputPumpKick::Notified => return Err("fixture did not own pump".to_string()),
+        };
+        let admission = slot
+            .begin_reply_admission()
+            .map_err(|error| error.to_string())?;
+        assert!(
+            !owner
+                .begin_unroutable_recovery(&TestIdentity("publishing"))
+                .map_err(|error| error.to_string())?
+        );
+        let (route, _receiver) = channel_input_reply_route(&test_message("publishing"));
+        slot.register_reply(TestIdentity("publishing"), route)
+            .map_err(|error| error.to_string())?;
+        drop(admission);
+        assert!(
+            owner
+                .has_reply(&TestIdentity("publishing"))
+                .map_err(|error| error.to_string())?
+        );
+        assert!(
+            !owner
+                .begin_unroutable_recovery(&TestIdentity("publishing"))
+                .map_err(|error| error.to_string())?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn original_route_remains_visible_until_duplicate_publication_settles()
+    -> Result<(), String> {
+        let slot = Arc::new(ChannelInputPumpSlot::<TestIdentity>::default());
+        let identity = TestIdentity("same-recovered-input");
+        let owner = match slot.kick().map_err(|error| error.to_string())? {
+            ChannelInputPumpKick::Started(owner) => owner,
+            ChannelInputPumpKick::Notified => return Err("fixture did not own pump".to_string()),
+        };
+        let admission = slot
+            .begin_reply_admission()
+            .map_err(|error| error.to_string())?;
+        let (route, _receiver) = channel_input_reply_route(&test_message(identity.0));
+        slot.register_reply(identity.clone(), route)
+            .map_err(|error| error.to_string())?;
+        let taking = owner.take_reply(&identity);
+        tokio::pin!(taking);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), taking.as_mut())
+                .await
+                .is_err()
+        );
+        let (duplicate, _duplicate_receiver) = channel_input_reply_route(&test_message(identity.0));
+        assert!(matches!(
+            slot.register_reply(identity.clone(), duplicate),
+            Err(ChannelInputPumpError::ReplyAlreadyRegistered)
+        ));
+        drop(admission);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), taking.as_mut())
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?
+                .is_some()
+        );
+        assert!(
+            !slot
+                .has_reply(&identity)
+                .map_err(|error| error.to_string())?
+        );
+        Ok(())
     }
 
     #[test]

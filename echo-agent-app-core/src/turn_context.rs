@@ -223,6 +223,20 @@ impl EkoContextProjector {
 }
 
 impl PreModelContextProjector for EkoContextProjector {
+    fn validate_model_request<'a>(
+        &'a self,
+        context: &'a ProjectionContext,
+        request: &'a echo_agent::llm::ChatRequest,
+        artifacts: Option<&'a echo_agent::tools::artifact::ToolOutputArtifactConfig>,
+    ) -> BoxFuture<'a, AgentResult<()>> {
+        self.task_runtime
+            .validate_model_request(context, request, artifacts)
+    }
+
+    fn is_required(&self) -> bool {
+        self.task_runtime.is_required()
+    }
+
     fn project<'a>(
         &'a self,
         context: &'a ProjectionContext,

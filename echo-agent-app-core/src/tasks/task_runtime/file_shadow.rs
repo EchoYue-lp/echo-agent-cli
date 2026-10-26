@@ -572,6 +572,18 @@ impl FileTaskShadow {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_source_post_commit_validation_for_test(
+        &self,
+        run_id: &str,
+    ) -> Result<(), ShadowError> {
+        let authority = self
+            .authority(run_id, false)?
+            .ok_or_else(|| ShadowError::Io(format!("TaskRuntime run not found: {run_id}")))?;
+        authority.fail_next_post_commit_validation_for_test();
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn fail_next_append_durability_for_test(
         &self,
         run_id: &str,
@@ -861,6 +873,16 @@ impl FileTaskShadow {
     }
 
     pub(crate) fn list_run_ids(&self) -> Result<Vec<String>, ShadowError> {
+        self.list_run_ids_with_integrity(false)
+    }
+
+    /// Task inventory must not hide a damaged candidate as an empty final page.
+    /// Staged creation/deletion directories retain the original exclusion.
+    pub(crate) fn list_task_query_run_ids(&self) -> Result<Vec<String>, ShadowError> {
+        self.list_run_ids_with_integrity(true)
+    }
+
+    fn list_run_ids_with_integrity(&self, strict: bool) -> Result<Vec<String>, ShadowError> {
         self.with_root_read(|root| {
             let entries = match std::fs::read_dir(root) {
                 Ok(entries) => entries,
@@ -874,14 +896,52 @@ impl FileTaskShadow {
                 let hidden = entry.file_name().to_str().is_some_and(|name| {
                     name.starts_with(".preparing-") || name.starts_with(".deleting-")
                 });
-                if hidden || !path.is_dir() {
+                if hidden {
                     continue;
                 }
-                if !path.join("events.jsonl").is_file() {
+                let is_directory = if strict {
+                    std::fs::metadata(&path)
+                        .map_err(|error| {
+                            ShadowError::Io(format!(
+                                "task inventory candidate {}: {error}",
+                                path.display()
+                            ))
+                        })?
+                        .is_dir()
+                } else {
+                    path.is_dir()
+                };
+                if !is_directory {
+                    continue;
+                }
+                if strict {
+                    let journal = path.join("events.jsonl");
+                    let metadata = match std::fs::metadata(&journal) {
+                        Ok(metadata) => metadata,
+                        // Existing authority semantics: projections alone do not create a TaskRun.
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            return Err(ShadowError::Io(format!(
+                                "task inventory journal {}: {error}",
+                                journal.display()
+                            )));
+                        }
+                    };
+                    if !metadata.is_file() {
+                        return Err(ShadowError::Io(format!(
+                            "task inventory journal is not a file: {}",
+                            journal.display()
+                        )));
+                    }
+                } else if !path.join("events.jsonl").is_file() {
                     continue;
                 }
                 if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
                     ids.push(name.to_string());
+                } else if strict {
+                    return Err(ShadowError::Io(
+                        "task inventory candidate has a non-UTF-8 identity".into(),
+                    ));
                 }
             }
             Ok(ids)

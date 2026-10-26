@@ -167,7 +167,8 @@ fn decide_after_persisted_run_turn_sync(
             return Ok(RunTurnDecision::Stop);
         }
         TurnOutcome::Failed(failure) => {
-            if failure.retryable {
+            if failure.retryable || super::compact_context::is_required_context_unavailable(failure)
+            {
                 let _paused = store
                     .request_pause_with_reason(
                         run_id,

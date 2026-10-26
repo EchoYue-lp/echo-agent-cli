@@ -204,8 +204,14 @@ Workspace, project and engineering project name the same existing Workspace. The
 
 The main composer places workspace selection and permissions at the lower left, and the real configured model selector at the lower right. Its workspace menu searches registered workspaces and opens the existing source form for an existing local directory, a new directory or an SSH device and remote directory. Remote entries display the verified execution location, never the local product-data folder. IM channels, scheduled tasks, terminal, settings, HITL and execution-task details remain reachable through their existing owners. The large primary composer is an explicit variant; Subagent inputs keep their compact layout.
 
-You can add input while the conversation is running. The “已收到” (Received) notice means that input has been saved; the unchanged submitted text and attachments clear without waiting for the model or tools to finish. It does not mean execution or task completion. Attachment preparation or admission failure preserves the draft, and retrying an unchanged draft reuses the same submission. Repeated send events during admission do not create another submission. Late results do not clear a newer draft after navigation, reopening a conversation or editing. Stop remains a separate action.
+You can add input while the conversation is running. The `已收到` (Received) notice means that input has been saved; the unchanged submitted text and attachments clear without waiting for the model or tools to finish. It does not mean execution or task completion. Attachment preparation or admission failure preserves the draft, and retrying an unchanged draft reuses the same submission. Repeated send events during admission do not create another submission. Late results do not clear a newer draft after navigation, reopening a conversation or editing. Stop remains a separate action.
 
 Workspace/Conversation stores and backend lifecycle remain authoritative. Navigation uses transient UI intent and existing workspace generation checks to discard superseded selections; no second task store, recent-task database, permission model or SSH owner is introduced.
+
+### Formal TaskRun history
+
+“Task runs” opens the existing context pane's formal execution history for the current Workspace. This differs from the sidebar's ordinary recent/new task conversations. A history row selects that exact persisted run, including an older run in the same conversation. The current-conversation action explicitly returns to following that conversation. Status-filtered finite pages, visible read errors, original task details and typed control receipts share the same TaskRuntime facts. A next page or unread event tail is never presented as a complete inventory.
+
+Selecting history leaves the current chat’s progress, failures and message association unchanged; controls act on the displayed run, while a pending chat Continue stays bound to its original run.
 
 The default desktop page uses the existing native system-font fallback stack and makes no default remote font request. User-configured theme fonts remain user-owned.

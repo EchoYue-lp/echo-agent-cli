@@ -12,8 +12,8 @@ use echo_agent_app_core::api::workspace::WorkspaceKind;
 use echo_agent_app_core::api::workspace::registry::WorkspaceRegistry;
 use std::sync::Arc;
 
-/// Authentication stays in the existing PTY owner; no password enters IPC,
-/// workspace metadata, a model prompt, or a persistent frontend store.
+/// 认证保留原 PTY owner。密码只通过原终端写入 IPC 暂时传输，
+/// 不进入命令参数、环境、Workspace、模型、日志或持久前端状态。
 #[tauri::command]
 pub async fn connect_project_ssh(
     state: tauri::State<'_, TauriState>,
@@ -34,6 +34,24 @@ pub async fn connect_project_ssh(
         .create_project_ssh_auth(connection_id, target, rows, cols)
         .await
         .map_err(IpcError::Validation)
+}
+
+#[tauri::command]
+pub async fn test_project_ssh(
+    state: tauri::State<'_, TauriState>,
+    connection_id: String,
+    target: echo_agent_app_core::api::terminal::TerminalTarget,
+) -> Result<serde_json::Value, IpcError> {
+    let connection = state
+        .app_state
+        .terminal
+        .project_ssh(&connection_id)
+        .map_err(IpcError::Validation)?;
+    let authenticated = connection
+        .test_target_authenticated(target)
+        .await
+        .map_err(IpcError::Validation)?;
+    Ok(serde_json::json!({ "authenticated": authenticated }))
 }
 
 #[tauri::command]

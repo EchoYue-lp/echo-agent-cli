@@ -1,14 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { FolderOpen } from 'lucide-react';
+import { listen } from '@tauri-apps/api/event';
 import {
+  terminalApi,
   workspaceApi,
   type ProjectSource,
-  type TerminalCreateOptions,
   type TerminalSession,
   type TerminalTarget,
 } from '../../api/endpoints';
 import { isTauri } from '../../lib/tauri-bridge';
-import { Terminal } from '../terminal/Terminal';
+import { decodeTerminalBytes, encodeTerminalBytes, observeTerminal } from '../terminal/terminal-io';
+import { useToastStore } from '../../stores/toastStore';
 
 export interface ProjectSourceDraft {
   kind: 'existing_local' | 'new_local' | 'ssh';
@@ -64,8 +66,12 @@ export function ProjectSourceFields({
 }: Props) {
   const [connectionId, setConnectionId] = useState<string>();
   const [issue, setIssue] = useState('');
+  const [password, setPassword] = useState('');
+  const [testing, setTesting] = useState(false);
+  const [credentialLocked, setCredentialLocked] = useState(false);
   const update = (patch: Partial<ProjectSourceDraft>) => {
-    if (connectionId) return;
+    if (connectionId && Object.keys(patch).some((key) => key !== 'remotePath')) return;
+    if ('host' in patch || 'user' in patch || 'port' in patch || 'kind' in patch) setPassword('');
     onRemoteSource(undefined);
     onChange({ ...draft, ...patch });
   };
@@ -93,7 +99,7 @@ export function ProjectSourceFields({
   };
   return (
     <div className="space-y-3">
-      <fieldset disabled={busy || fixedLocation || !!connectionId} className="space-y-3">
+      <fieldset disabled={busy || fixedLocation} className="space-y-3">
         <legend className="mb-2 text-xs font-medium text-[var(--text-secondary)]">
           工作空间位置
         </legend>
@@ -107,6 +113,7 @@ export function ProjectSourceFields({
           ).map(([kind, label]) => (
             <button
               type="button"
+              disabled={!!connectionId}
               key={kind}
               aria-pressed={draft.kind === kind}
               onClick={() => update({ kind })}
@@ -159,6 +166,7 @@ export function ProjectSourceFields({
               <label className="space-y-1 text-xs text-[var(--text-secondary)]">
                 <span>主机或 SSH 别名</span>
                 <input
+                  disabled={!!connectionId}
                   value={draft.host}
                   onChange={(event) => update({ host: event.target.value })}
                   className={inputClass}
@@ -168,6 +176,7 @@ export function ProjectSourceFields({
               <label className="space-y-1 text-xs text-[var(--text-secondary)]">
                 <span>用户名（可选）</span>
                 <input
+                  disabled={!!connectionId}
                   value={draft.user}
                   onChange={(event) => update({ user: event.target.value })}
                   className={inputClass}
@@ -178,6 +187,7 @@ export function ProjectSourceFields({
             <label className="block space-y-1 text-xs text-[var(--text-secondary)]">
               <span>端口（默认使用 SSH 配置）</span>
               <input
+                disabled={!!connectionId}
                 value={draft.port}
                 onChange={(event) => update({ port: event.target.value })}
                 className={inputClass}
@@ -190,12 +200,33 @@ export function ProjectSourceFields({
                 value={draft.remotePath}
                 onChange={(event) => update({ remotePath: event.target.value })}
                 className={inputClass}
-                placeholder="远程绝对路径或 ~ 下的路径"
+                placeholder="如 ssh-test、~/ssh-test 或 /home/ubuntu/ssh-test"
               />
             </label>
           </>
         )}
       </fieldset>
+      {draft.kind === 'ssh' && (
+        <label className="block space-y-1 text-xs text-[var(--text-secondary)]">
+          <span>SSH 密码</span>
+          <input
+            type="password"
+            aria-label="SSH 密码"
+            value={password}
+            disabled={busy || testing || credentialLocked}
+            onChange={(event) => setPassword(event.target.value)}
+            autoComplete="off"
+            spellCheck={false}
+            className={inputClass}
+            placeholder="仅用于本次连接；密钥认证可留空"
+          />
+          <span className="block text-[11px] text-[var(--text-tertiary)]">
+            {credentialLocked
+              ? '已登录；如需更换密码，请先断开并重新测试连接。'
+              : '密码以掩码显示，不保存。测试只验证登录；创建时再校验目录，相对目录从远程 home 解析。'}
+          </span>
+        </label>
+      )}
       {draft.kind === 'ssh' &&
         (connectionId ? (
           <ProjectAuthentication
@@ -205,6 +236,13 @@ export function ProjectSourceFields({
             path={draft.remotePath}
             onSource={onRemoteSource}
             onIssue={setIssue}
+            password={password}
+            onPasswordConsumed={(submitted) =>
+              setPassword((value) => (value === submitted ? '' : value))
+            }
+            onTestingChange={setTesting}
+            onAuthenticatedChange={setCredentialLocked}
+            busy={busy}
           />
         ) : (
           <button
@@ -213,7 +251,7 @@ export function ProjectSourceFields({
             onClick={connect}
             className="rounded-lg border border-[var(--accent)] px-3 py-2 text-xs text-[var(--accent)] disabled:opacity-60"
           >
-            连接并验证远程目录
+            测试连接
           </button>
         ))}
       {connectionId && (
@@ -222,6 +260,10 @@ export function ProjectSourceFields({
           disabled={busy}
           onClick={() => {
             setConnectionId(undefined);
+            setPassword('');
+            setTesting(false);
+            setCredentialLocked(false);
+            setIssue('');
             onRemoteSource(undefined);
           }}
           className="text-xs text-[var(--text-secondary)]"
@@ -250,37 +292,196 @@ function ProjectAuthentication({
   path,
   onSource,
   onIssue,
+  password,
+  onPasswordConsumed,
+  onTestingChange,
+  onAuthenticatedChange,
+  busy,
 }: {
   connectionId: string;
   target: TerminalTarget;
   path: string;
   onSource: (source: ProjectSource | undefined) => void;
   onIssue: (issue: string) => void;
+  password: string;
+  onPasswordConsumed: (submitted: string) => void;
+  onTestingChange: (testing: boolean) => void;
+  onAuthenticatedChange: (authenticated: boolean) => void;
+  busy: boolean;
 }) {
+  const latest = useRef({
+    password,
+    path,
+    onSource,
+    onIssue,
+    onPasswordConsumed,
+    onTestingChange,
+    onAuthenticatedChange,
+  });
+  latest.current = {
+    password,
+    path,
+    onSource,
+    onIssue,
+    onPasswordConsumed,
+    onTestingChange,
+    onAuthenticatedChange,
+  };
+  const active = useRef(false);
   const creation = useRef<Promise<TerminalSession> | undefined>(undefined);
-  const active = useRef(true);
-  const [verifying, setVerifying] = useState(false);
-  const [verified, setVerified] = useState(false);
-  const start = useCallback(
-    (options: TerminalCreateOptions) => {
-      if (!active.current) return Promise.reject(new Error('连接视图已关闭'));
-      const pending = workspaceApi.connectSsh(
-        connectionId,
-        target,
-        options.rows ?? 24,
-        options.cols ?? 80
-      );
-      creation.current = pending;
-      return pending;
-    },
-    [connectionId, target]
-  );
+  const operation = useRef<symbol | null>(null);
+  const retry = useRef<(() => Promise<void>) | undefined>(undefined);
+  const trust = useRef<(() => Promise<void>) | undefined>(undefined);
+  const [testing, setTesting] = useState(true);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [status, setStatus] = useState('正在连接 SSH…');
+  const [hostPrompt, setHostPrompt] = useState('');
+
   useEffect(() => {
     active.current = true;
+    let live = true;
+    let exited = false;
+    let passwordPrompt = 0;
+    let hostKey = '';
+    let tail = '';
+    const decoder = new TextDecoder();
+    const releases: Array<() => void> = [];
+    const current = (token: symbol) => live && operation.current === token;
+    const write = async (value: string) => {
+      const result = await observeTerminal(
+        terminalApi.write(connectionId, encodeTerminalBytes(new TextEncoder().encode(value)))
+      );
+      if (!result.success) throw new Error('SSH 输入未确认，请断开后重新测试；不会自动重发密码');
+    };
+    const test = async () => {
+      if (!live || operation.current) return;
+      const token = Symbol('ssh-login-test');
+      operation.current = token;
+      setTesting(true);
+      latest.current.onTestingChange(true);
+      latest.current.onIssue('');
+      latest.current.onSource(undefined);
+      setAuthenticated(false);
+      latest.current.onAuthenticatedChange(false);
+      setStatus('正在测试 SSH 登录…');
+      const deadline = performance.now() + 30_000;
+      let sentPrompt = 0;
+      try {
+        const original = creation.current;
+        if (!original) throw new Error('SSH 连接尚未开始');
+        await observeTerminal(original);
+        while (current(token)) {
+          if (exited) throw new Error('SSH 连接已退出，请断开后重新测试连接');
+          const result = await observeTerminal(workspaceApi.testSsh(connectionId, target));
+          if (!current(token)) return;
+          if (result.authenticated) {
+            latest.current.onPasswordConsumed(latest.current.password);
+            latest.current.onAuthenticatedChange(true);
+            setAuthenticated(true);
+            setStatus('SSH 登录已验证；创建时再验证远程目录。');
+            return;
+          }
+          if (hostKey) {
+            setStatus('请核对主机指纹后确认连接');
+            return;
+          }
+          if (passwordPrompt > sentPrompt) {
+            if (sentPrompt) throw new Error('SSH 未接受本次密码，请重新输入后测试连接');
+            const secret = latest.current.password;
+            if (!secret) {
+              setStatus('SSH 正在等待密码，请填写上方密码后再次测试连接');
+              return;
+            }
+            if (
+              Array.from(secret).some(
+                (char) => char === '\r' || char === '\n' || char.charCodeAt(0) === 0
+              )
+            )
+              throw new Error('SSH 密码不能包含换行或空字符');
+            sentPrompt = passwordPrompt;
+            // 只在原 OpenSSH 已请求密码后写入；其原 PTY 负责关闭回显。
+            // 发送前清除本次密码，不因迟到失败重放，也不写入配置/日志/模型。
+            latest.current.onPasswordConsumed(secret);
+            await write(secret + '\r');
+            if (!current(token)) return;
+            setStatus('密码已提交，正在确认原 SSH 连接…');
+          }
+          if (performance.now() >= deadline)
+            throw new Error('SSH 登录测试超时，请检查主机、用户名和认证方式；可断开后重新测试');
+          await new Promise<void>((resolve) => setTimeout(resolve, 250));
+        }
+      } catch (error) {
+        if (current(token)) {
+          setStatus('SSH 登录尚未通过');
+          latest.current.onIssue(error instanceof Error ? error.message : 'SSH 登录测试失败');
+        }
+      } finally {
+        if (current(token)) {
+          operation.current = null;
+          setTesting(false);
+          latest.current.onTestingChange(false);
+        }
+      }
+    };
+    retry.current = test;
+    trust.current = async () => {
+      if (!live || operation.current || !hostKey) return;
+      try {
+        await write('yes\r');
+        if (!live) return;
+        hostKey = '';
+        tail = '';
+        setHostPrompt('');
+        await test();
+      } catch {
+        if (live) latest.current.onIssue('主机指纹确认未送达，请断开后重试');
+      }
+    };
+    creation.current = (async () => {
+      const observe = async <T,>(name: string, receive: (payload: T) => void) => {
+        const release = await listen<T>(name, ({ payload }) => {
+          if (live) receive(payload);
+        });
+        if (live) releases.push(release);
+        else release();
+      };
+      await Promise.all([
+        observe<{ id: string; data: string }>('terminal-output', (payload) => {
+          if (payload.id !== connectionId) return;
+          tail = (tail + decoder.decode(decodeTerminalBytes(payload.data), { stream: true })).slice(
+            -4096
+          );
+          if (/Are you sure you want to continue connecting[^?]*\?\s*$/is.test(tail)) {
+            hostKey = tail;
+            setHostPrompt(tail);
+            tail = '';
+          } else if (/(?:password|passphrase)[^:\r\n]*:\s*$/i.test(tail)) {
+            passwordPrompt += 1;
+            tail = '';
+          }
+        }),
+        observe<{ id: string }>('terminal-exit', (payload) => {
+          if (payload.id !== connectionId) return;
+          exited = true;
+          setAuthenticated(false);
+          latest.current.onAuthenticatedChange(false);
+          latest.current.onSource(undefined);
+          setStatus('SSH 连接已退出，请断开后重新测试');
+        }),
+        observe<{ id: string; message: string }>('terminal-issue', (payload) => {
+          if (payload.id === connectionId)
+            latest.current.onIssue('SSH 连接异常：' + payload.message);
+        }),
+      ]);
+      if (!live) throw new Error('SSH 连接视图已关闭');
+      return workspaceApi.connectSsh(connectionId, target, 24, 80);
+    })();
+    void test();
     return () => {
+      live = false;
       active.current = false;
-      // Observe the original create before closing. After successful owned
-      // handoff this draft key is absent, so closing it cannot close the host.
+      operation.current = null;
+      releases.forEach((release) => release());
       const pending = creation.current;
       if (pending)
         void pending
@@ -288,57 +489,57 @@ function ProjectAuthentication({
           .then(() => {
             if (!active.current) return workspaceApi.closeSsh(connectionId);
           })
-          .catch((error) => {
-            onIssue(`连接清理仍未确认：${error instanceof Error ? error.message : String(error)}`);
+          .catch(() => {
+            useToastStore
+              .getState()
+              .addToast(
+                'warning',
+                '原 SSH 认证连接清理尚未确认；资源仍由应用持有，可通过退出应用重试结算。'
+              );
           });
     };
-  }, [connectionId, onIssue]);
-  const verify = async () => {
-    setVerifying(true);
-    setVerified(false);
-    onIssue('');
-    onSource(undefined);
-    try {
-      await creation.current;
-      const result = await workspaceApi.verifySsh(connectionId, target, path);
-      if (!active.current) return;
-      if (target.kind !== 'ssh') throw new Error('SSH 目标无效');
+  }, [connectionId, target]);
+
+  useEffect(() => {
+    if (authenticated && target.kind === 'ssh')
       onSource({
         kind: 'ssh',
         host: target.host,
         user: target.user ?? null,
         port: target.port ?? null,
-        path: result.path,
+        path: path.trim(),
         connection_id: connectionId,
       });
-      setVerified(true);
-    } catch (error) {
-      if (active.current) onIssue(error instanceof Error ? error.message : '验证失败');
-    } finally {
-      if (active.current) setVerifying(false);
-    }
-  };
+  }, [authenticated, target, path, connectionId, onSource]);
+
   return (
-    <div className="space-y-2">
-      <p className="text-xs text-[var(--text-secondary)]">
-        在终端中完成系统 SSH 认证，然后验证文件夹。连接启动不代表认证成功。
+    <div className="space-y-2" aria-busy={testing}>
+      <p role="status" className="text-xs text-[var(--text-secondary)]">
+        {status}
       </p>
-      <div className="h-52">
-        <Terminal sessionId={connectionId} target={target} createSession={start} retainOnUnmount />
-      </div>
+      {hostPrompt && (
+        <div className="space-y-2 rounded border border-[var(--border-primary)] p-3">
+          <p className="whitespace-pre-wrap break-words text-xs text-[var(--text-secondary)]">
+            {hostPrompt}
+          </p>
+          <button
+            type="button"
+            disabled={busy || testing}
+            onClick={() => void trust.current?.()}
+            className="text-xs text-[var(--accent)]"
+          >
+            核对指纹并信任此主机
+          </button>
+        </div>
+      )}
       <button
         type="button"
-        disabled={verifying}
-        onClick={verify}
+        disabled={busy || testing}
+        onClick={() => void retry.current?.()}
         className="rounded-lg border border-[var(--accent)] px-3 py-2 text-xs text-[var(--accent)]"
       >
-        {verifying ? '验证中…' : '验证认证与目录'}
+        {testing ? '正在测试连接…' : '测试连接'}
       </button>
-      {verified && (
-        <p role="status" className="text-xs text-[var(--accent)]">
-          远程目录已验证；创建后仍由后端确认并绑定项目。
-        </p>
-      )}
     </div>
   );
 }

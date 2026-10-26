@@ -12,7 +12,15 @@ const api = vi.hoisted(() => ({
   delete: vi.fn(),
   history: vi.fn(),
 }));
-vi.mock('../../api/endpoints', () => ({ schedulerApi: api }));
+const notifications = vi.hoisted(() => ({
+  configuration: vi.fn(),
+  configure: vi.fn(),
+  result: vi.fn(),
+}));
+vi.mock('../../api/endpoints', () => ({
+  schedulerApi: api,
+  weixinNotificationApi: notifications,
+}));
 const task = {
   id: 'task-a',
   definition_id: 'definition-old',
@@ -31,6 +39,11 @@ afterEach(cleanup);
 beforeEach(() => {
   vi.clearAllMocks();
   api.list.mockResolvedValue([task]);
+  notifications.configuration.mockResolvedValue({ enabled: false, revision: 'notification-1' });
+  notifications.result.mockImplementation(async (runId: string) => ({
+    configured: false,
+    run_id: runId,
+  }));
 });
 
 describe('original scheduler management receipts', () => {
@@ -75,6 +88,35 @@ describe('original scheduler management receipts', () => {
     expect(screen.queryByText('运行完成')).toBeNull();
     expect(screen.getByText(/manual-a/)).toBeTruthy();
     expect(screen.getByText('callback finished')).toBeTruthy();
+    expect(api.run).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads the exact manual run receipt separately from successful task completion', async () => {
+    api.run.mockResolvedValue({
+      success: true,
+      result: '真实任务结果',
+      run_lookup: {
+        lookup: 'found',
+        run: {
+          run_id: 'manual-run-original',
+          workspace_id: 'workspace-original',
+          conversation_id: 'conversation-original',
+          status: 'completed',
+        },
+      },
+    });
+    notifications.result.mockResolvedValue({
+      configured: true,
+      run_id: 'manual-run-original',
+      phase: 'effect_started',
+      outcome: 'outcome_unknown',
+    });
+    render(<SchedulerPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: '手动运行' }));
+    expect(await screen.findByText('运行完成')).toBeTruthy();
+    expect(await screen.findByText('微信发送结果未知，请勿直接重发')).toBeTruthy();
+    expect(notifications.result).toHaveBeenCalledWith('manual-run-original');
+    expect(api.history).not.toHaveBeenCalled();
     expect(api.run).toHaveBeenCalledTimes(1);
   });
 });

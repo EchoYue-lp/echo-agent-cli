@@ -82,6 +82,13 @@ impl AppState {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    #[cfg(all(test, feature = "channels"))]
+    pub(crate) fn set_workspace_transition_for_test(&self, in_progress: bool) {
+        self.workspace
+            .transitioning
+            .store(in_progress, std::sync::atomic::Ordering::Release);
+    }
+
     /// 从共享的 Agent 和 HITL Dispatcher 创建状态（用于双模式）
     #[allow(clippy::too_many_arguments)]
     pub fn from_shared(
@@ -140,6 +147,11 @@ impl AppState {
         };
         let conversation_binding = Arc::new(RwLock::new(global_conversation.clone()));
         let terminal = crate::terminal::TerminalService::new();
+        let scheduler_cancel_token = CancellationToken::new();
+        #[cfg(feature = "channels")]
+        let weixin_notifications = Arc::new(crate::weixin_cron::WeixinCronBinding::new(
+            scheduler_cancel_token.clone(),
+        ));
 
         Ok(Self {
             connection: ConnectionState {
@@ -219,7 +231,9 @@ impl AppState {
             },
             scheduler: SchedulerState {
                 runner: None,
-                cancel_token: echo_agent::agent::CancellationToken::new(),
+                cancel_token: scheduler_cancel_token,
+                #[cfg(feature = "channels")]
+                weixin_notifications,
                 handle: Mutex::new(None),
             },
             tasks: TaskState {
@@ -1813,6 +1827,19 @@ impl AppState {
         // latent override bug where overlapping cron runs clobbered the shared
         // agent's working_dir). Falls back to the shared primary agent when no
         // pool is configured.
+        #[cfg(feature = "channels")]
+        let runner = crate::scheduler::runner::new_scheduler_runner_with_weixin(
+            store,
+            self.scheduler.cancel_token.clone(),
+            self.connection.agent.clone(),
+            self.tasks.runtime.clone(),
+            self.connection.pool.clone(),
+            Some(self.webhook.emitter.clone()),
+            self.review_integration.clone(),
+            Some(self.scheduler.weixin_notifications.clone()),
+        )
+        .await?;
+        #[cfg(not(feature = "channels"))]
         let runner = crate::scheduler::new_scheduler_runner(
             store,
             self.scheduler.cancel_token.clone(),
@@ -1887,6 +1914,92 @@ impl AppState {
             pool.spawn_cleanup_monitor().await;
         }
         Ok(())
+    }
+
+    /// Reconcile notification debt only after the original channel-start
+    /// owner has installed its GUI/HITL factory and attempted configured
+    /// transport startup. The caller retains that startup/lifecycle receipt.
+    /// Every candidate comes from the original completed TaskRun admission;
+    /// current GUI workspace and mutable notification config are not consulted.
+    #[cfg(feature = "channels")]
+    pub async fn recover_weixin_notifications_after_channel_start(
+        &self,
+        sender: Arc<dyn crate::tasks::task_runtime::weixin_delivery::WeixinCronDelivery>,
+        cancel: &CancellationToken,
+    ) -> crate::tasks::task_runtime::weixin_delivery::WeixinNotificationRecoveryReport {
+        use crate::tasks::task_runtime::weixin_delivery::WeixinNotificationRecoveryReport;
+        let mut report = WeixinNotificationRecoveryReport::default();
+        if let Some(store) = self.tasks.runtime.clone() {
+            report.merge(
+                store
+                    .recover_weixin_notifications(sender.clone(), cancel)
+                    .await,
+            );
+        }
+        let registry = Arc::clone(&self.workspace.registry);
+        let workspaces = match self
+            .session
+            .product_data_io
+            .run(
+                "list original workspaces for Weixin notification recovery",
+                move || registry.list(),
+            )
+            .await
+        {
+            Ok(Ok(workspaces)) => workspaces,
+            Ok(Err(error)) => {
+                report.pending.push(format!("workspace registry: {error}"));
+                return report;
+            }
+            Err(error) => {
+                report
+                    .pending
+                    .push(format!("workspace registry owner: {error}"));
+                return report;
+            }
+        };
+        for workspace in workspaces {
+            if cancel.is_cancelled() {
+                report.pending.push(
+                    "original channel-start recovery cancelled; frozen admissions remain pending"
+                        .to_string(),
+                );
+                break;
+            }
+            let workspace_id = workspace.id.to_string();
+            let (host, control_lease) =
+                match self.workspace.runtimes.get_or_open_control(workspace).await {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        report
+                            .pending
+                            .push(format!("workspace {workspace_id}: {error}"));
+                        continue;
+                    }
+                };
+            let store = match host.task_runtime().await {
+                Ok(store) => store,
+                Err(error) => {
+                    report
+                        .pending
+                        .push(format!("workspace {workspace_id}: {error}"));
+                    continue;
+                }
+            };
+            // Hold the same original scoped control lease through physical
+            // send settlement; workspace deletion cannot overtake recovery.
+            report.merge(
+                store
+                    .recover_weixin_notifications_with_workspace(
+                        sender.clone(),
+                        cancel,
+                        Some(control_lease.io_lifetime()),
+                    )
+                    .await,
+            );
+            drop(control_lease);
+        }
+        report
     }
 
     async fn reconcile_task_runs_at_boot(&self) -> TaskRunBootReport {
@@ -3356,6 +3469,50 @@ impl AppState {
         )))
     }
 
+    /// Channel effects validate the current registry manifest under the same
+    /// publication lease that excludes unlink/recreate until admission ends.
+    #[cfg(feature = "channels")]
+    pub(crate) async fn channel_control_for_generation(
+        &self,
+        workspace_id: &str,
+        expected: &str,
+    ) -> anyhow::Result<(
+        tokio::sync::OwnedRwLockReadGuard<()>,
+        ScopedWorkspaceControl,
+    )> {
+        let publication = self.workspace.transition.clone().read_owned().await;
+        let control = if workspace_id == "global" {
+            ScopedWorkspaceControl {
+                runtime: self.global_chat_runtime(),
+                workspace: None,
+            }
+        } else {
+            let registry = Arc::clone(&self.workspace.registry);
+            let id = crate::workspace::WorkspaceId::from_raw(workspace_id.to_string());
+            let workspace = self
+                .session
+                .product_data_io
+                .run("validate channel workspace generation", move || {
+                    registry.inspect(&id).map_err(anyhow::Error::msg)
+                })
+                .await
+                .map_err(anyhow::Error::msg)??;
+            validate_workspace_product_data_generation(Some(&workspace), expected)
+                .map_err(anyhow::Error::msg)?;
+            let runtime = self
+                .chat_runtime_for_workspace_locked(workspace.clone())
+                .await?;
+            ScopedWorkspaceControl {
+                runtime,
+                workspace: Some(workspace),
+            }
+        };
+        control
+            .validate_generation(expected)
+            .map_err(anyhow::Error::msg)?;
+        Ok((publication, control))
+    }
+
     pub async fn workspace_control_for_scope(
         &self,
         workspace_id: &str,
@@ -3384,6 +3541,21 @@ impl AppState {
             runtime,
             workspace: Some(workspace),
         })
+    }
+
+    /// Validate a captured product-data token against the very host/control lease returned.
+    /// Callers keep this receipt through their operation; resolving by id again would lose
+    /// the checked generation and could mutate a replacement workspace incarnation.
+    pub async fn workspace_control_for_generation(
+        &self,
+        workspace_id: &str,
+        expected_generation: &str,
+    ) -> anyhow::Result<ScopedWorkspaceControl> {
+        let control = self.workspace_control_for_scope(workspace_id).await?;
+        control
+            .validate_generation(expected_generation)
+            .map_err(anyhow::Error::new)?;
+        Ok(control)
     }
 
     /// Resolve one exact product-data authority without running synchronous
@@ -4149,6 +4321,178 @@ impl AppState {
                 Ok(true)
             }
         }
+    }
+
+    /// 沿原输入日志固定唯一任务去向；此成功不代表TaskRuntime、mailbox或Applied。
+    pub(crate) async fn bind_user_input_target(
+        &self,
+        source: crate::conversation_input::ConversationInputSource,
+        projection: &crate::conversation_input::ConversationInputProjection,
+        run_id: &str,
+        turn_id: &str,
+    ) -> Result<crate::conversation_input::BoundRunInput, String> {
+        use crate::conversation_input::ConversationInputPhase;
+        let receipt = &projection.receipt;
+        let attempt = projection
+            .active_attempt
+            .as_ref()
+            .ok_or_else(|| "原输入投递 attempt 不可用".to_string())?;
+        if receipt.phase != ConversationInputPhase::AttemptStarted
+            || receipt.identity != attempt.identity
+            || receipt.attempt != Some(attempt.attempt)
+            || receipt.attempt_id.as_deref() != Some(attempt.attempt_id.as_str())
+            || receipt.turn_id.as_deref() != Some(attempt.turn_id.as_str())
+            || turn_id != attempt.turn_id
+            || run_id.trim().is_empty()
+        {
+            return Err("原输入 attempt 与准确任务准入不匹配，未投递".to_string());
+        }
+        if projection.claimed_before_current && projection.task_target.is_none() {
+            return Err(
+                "旧输入已有claim而任务去向未知，保留RecoveryRequired，禁止改绑新任务".to_string(),
+            );
+        }
+        let input = crate::tasks::task_runtime::RunInputSnapshot {
+            source,
+            identity: receipt.identity.clone(),
+            payload: projection.payload.clone(),
+        };
+        input.validate()?;
+        self.conversation_inputs()
+            .bind_task_target(attempt.clone(), run_id.to_string())
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(crate::conversation_input::BoundRunInput {
+            target: crate::conversation_input::ConversationInputTaskTarget {
+                run_id: run_id.to_string(),
+                turn_id: turn_id.to_string(),
+                identity: receipt.identity.clone(),
+            },
+            snapshot: input,
+        })
+    }
+
+    /// 首轮沿既有RunTurnBinding传递原文；不把PreparedUserTurn引用预览当作完整Goal。
+    pub async fn bind_initial_user_input(
+        &self,
+        source: crate::conversation_input::ConversationInputSource,
+        projection: &crate::conversation_input::ConversationInputProjection,
+        binding: Option<crate::tasks::task_runtime::RunTurnBinding>,
+    ) -> Result<
+        (
+            crate::tasks::task_runtime::RunTurnBinding,
+            crate::conversation_input::BoundRunInput,
+        ),
+        String,
+    > {
+        use crate::tasks::task_runtime::{RunTurnBinding, RunTurnOrigin, TurnVisibility};
+        let attempt = projection
+            .active_attempt
+            .as_ref()
+            .ok_or_else(|| "原输入attempt不存在".to_string())?;
+        let mut binding = binding.unwrap_or_else(|| RunTurnBinding {
+            domain_plugin: projection.payload.domain_plugin.clone(),
+            run_id: None,
+            turn_id: attempt.turn_id.clone(),
+            root_message_id: attempt.turn_id.clone(),
+            origin: RunTurnOrigin::User,
+            transcript_visibility: TurnVisibility::Visible,
+            expected_resume: None,
+        });
+        let run_id = binding.run_id.clone().unwrap_or_else(|| {
+            crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&binding.turn_id)
+        });
+        binding.run_id = Some(run_id.clone());
+        let input = self
+            .bind_user_input_target(source, projection, &run_id, &binding.turn_id)
+            .await?;
+        Ok((binding, input))
+    }
+
+    /// 原输入 attempt 和精确前台 TaskRun 共同授权投递；持久接受失败不触碰mailbox。
+    pub async fn accept_user_input_for_active_turn(
+        &self,
+        foreground: &crate::foreground_turn::ForegroundTurnControl,
+        source: crate::conversation_input::ConversationInputSource,
+        projection: &crate::conversation_input::ConversationInputProjection,
+    ) -> Result<crate::tasks::task_runtime::RunInputAcceptance, String> {
+        let attempt = projection
+            .active_attempt
+            .as_ref()
+            .ok_or_else(|| "原输入attempt不存在".to_string())?;
+        let address = &projection.receipt.identity.address;
+        let snapshots = foreground
+            .snapshots_for_conversation_scoped(&address.workspace_id, &address.conversation_id)
+            .map_err(|error| error.to_string())?;
+        let snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.active_turn_id == attempt.turn_id)
+            .ok_or_else(|| "原输入目标turn已变化，未投递".to_string())?;
+        let run_id = snapshot
+            .run_id
+            .clone()
+            .ok_or_else(|| "原turn的TaskRun身份尚未发布，输入继续保留".to_string())?;
+        let runtime = self
+            .chat_runtime_for_scope(&address.workspace_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let store = runtime
+            .task_runtime()
+            .ok_or_else(|| "原输入的TaskRuntime不可用，未投递".to_string())?;
+        let input = self
+            .bind_user_input_target(source, projection, &run_id, &attempt.turn_id)
+            .await?;
+        let turn_id = attempt.turn_id.clone();
+        crate::tasks::task_runtime::TaskRuntimeOperation::new(store)
+            .run_store("投递前持久接受原用户输入", move |store| {
+                store.accept_run_steer_input(
+                    &run_id,
+                    &turn_id,
+                    input.snapshot.source,
+                    &input.snapshot.identity,
+                    &input.snapshot.payload,
+                )
+            })
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// GUI/IM共用原消费顺序：outer错误只代表持久接受/准确目标未准许，inner保原mailbox结果。
+    /// 用户输入不受agent自动权限门控；本检查只防应用自身丢输入或投到错误运行。
+    pub async fn steer_user_input_for_active_turn(
+        &self,
+        foreground: &crate::foreground_turn::ForegroundTurnControl,
+        source: crate::conversation_input::ConversationInputSource,
+        projection: &crate::conversation_input::ConversationInputProjection,
+        agent: &crate::agent_handle::AgentHandle,
+        message: echo_agent::prelude::Message,
+    ) -> Result<
+        Result<echo_agent::agent::AgentSteerReceipt, echo_agent::agent::TurnSteerError>,
+        String,
+    > {
+        let accepted = self
+            .accept_user_input_for_active_turn(foreground, source, projection)
+            .await?;
+        let current = foreground
+            .snapshots_for_conversation_scoped(
+                &accepted.identity.address.workspace_id,
+                &accepted.identity.address.conversation_id,
+            )
+            .map_err(|error| error.to_string())?;
+        if !current.iter().any(|turn| {
+            turn.active_turn_id == accepted.turn_id
+                && turn.run_id.as_deref() == Some(accepted.run_id.as_str())
+                && !turn.cancellation_requested
+        }) {
+            return Err("持久接受后的原目标已结束、取消或切换，输入保留且未投递".to_string());
+        }
+        #[cfg(test)]
+        if let Some(attempt) = projection.active_attempt.as_ref() {
+            attempt.observation.mark_mailbox_invocation();
+        }
+        Ok(agent
+            .steer_input_tracked(Some(&accepted.turn_id), message)
+            .await)
     }
 
     /// Record one accepted user-authored steer against the exact foreground

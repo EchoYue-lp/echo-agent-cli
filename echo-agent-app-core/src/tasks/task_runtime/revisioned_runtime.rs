@@ -351,7 +351,7 @@ impl TaskToolPolicy for EkoTaskPolicy {
                 serde_json::json!({
                     "type": "object",
                     "additionalProperties": false,
-                    "description": "Exact group, role, and address from the Agent group service.",
+                    "description": "Exact values from Agent group service.",
                     "properties": {
                         "group_id": { "type": "string" },
                         "subagent_role": { "type": "string" },

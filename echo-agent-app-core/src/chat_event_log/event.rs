@@ -134,6 +134,8 @@ struct RetentionPins {
     queue_order: Vec<String>,
     queue_revision: u64,
     command_cell_watch_facts: HashMap<String, u64>,
+    // A control stream is tiny, but its full lifecycle must survive provider replay.
+    weixin_control_first: Option<u64>,
     earliest: Option<u64>,
     #[cfg(test)]
     recovered_records: usize,
@@ -145,6 +147,8 @@ struct FoldedConversationInput {
     first_sequence: u64,
     last_sequence: u64,
     terminal_fact_self_contained: bool,
+    // Monotonic fold of ALL retained history, never inferred from current phase.
+    ever_claimed: bool,
 }
 
 #[derive(Debug)]
@@ -154,6 +158,8 @@ struct StreamAuthority {
     journal: StreamJournal,
     pins: RetentionPins,
     barrier_pending: bool,
+    #[cfg(any(test, feature = "channels"))]
+    weixin_control_active: bool,
 }
 
 type StreamAuthorityCell = Mutex<Option<StreamAuthority>>;

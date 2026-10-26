@@ -44,7 +44,7 @@ existing examples/lh6_product_soak.rs 不调用终端/SSH，无源码迁移；�
 
 用户已明确侧栏任务相当于项目，创建来源是现有本地目录、新建本地目录或远程项目。本扩展以项目工作环境设计和 Plan `plan:986e9191-1a18-454b-a8b8-59ae18ad3bc7` 为准，不再把独立终端验收当作远程项目验收。Workspace 仍拥有项目及位置，TaskRun 仍拥有执行事实；本 ADR 只负责原终端/SSH 资源适配。
 
-系统 OpenSSH 在原 PTY 中以前台认证 master 运行。GUI 先确定 session id 并订阅，再启动进程，避免丢失首个密码或 host-key 提示。密码只进入该终端，不进入项目元数据、模型上下文或日志。真实 `ssh -O check` 状态用于检查认证连接，远端目录由 SFTP canonicalize/metadata 验证，不解析 prompt，也不检查本机同名 PathBuf。
+系统 OpenSSH 在原 PTY 中以前台认证 master 运行。GUI 先确定 session id 并订阅，再启动进程，避免丢失首个密码或 host-key 提示。项目认证用密码掩码表单呈现，不再展示黑色终端；密码只在原进程已请求时通过既有写入 IPC 送入原 PTY 并清空，不进入 argv、env、项目元数据、模型上下文或日志。提示只用于决定何时请求输入或展示指纹，不能证明登录成功。真实 `ssh -O check` 状态用于独立测试登录；创建时相对目录按远程 HOME 解析，再用原连接的 SFTP canonicalize/metadata 和命令 cwd 交叉验证，不检查本机同名 PathBuf。
 
 每个连接使用应用本次拥有的私有 control socket，明确 `ControlPersist=no`。普通项目终端、结构化执行和 SFTP 共用该 socket；slave 设置 `ProxyCommand=false` 和 `BatchMode=yes`，在检查与实际使用之间 master 消失时也不得偷偷新建连接。host key 校验不关闭。创建成功在原服务边界内把同一连接映射从 draft owner 移交 Workspace 身份；取消/关闭与移交串行，旧 draft 不能误关已发布项目。
 

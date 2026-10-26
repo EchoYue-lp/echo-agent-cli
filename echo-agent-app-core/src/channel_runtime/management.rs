@@ -3,6 +3,8 @@
 //! are projections; neither a closed watch nor a discarded waiter settles work.
 
 use super::ChannelSessionCoordinator;
+#[path = "management/weixin_auth.rs"]
+mod weixin_auth;
 use crate::state::AppState;
 use echo_agent::channels::{
     ChannelHandle, ChannelManager, ChannelPlugin, ChannelTransportEvidence, ChannelTransportPhase,
@@ -15,18 +17,21 @@ use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicBool, Ordering},
 };
+pub use weixin_auth::WeixinQrStatus;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedChannel {
     Qqbot,
     Feishu,
+    Weixin,
 }
 impl ManagedChannel {
     pub fn id(self) -> &'static str {
         match self {
             Self::Qqbot => "qqbot",
             Self::Feishu => "feishu",
+            Self::Weixin => "weixin",
         }
     }
 }
@@ -138,6 +143,15 @@ pub struct ChannelRuntime {
     completed_cleanup_failures: Mutex<HashMap<String, Vec<String>>>,
     transport_observers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     observer_cancel: tokio_util::sync::CancellationToken,
+    weixin_auth: Arc<weixin_auth::AuthOwner>,
+    weixin_auth_action: tokio::sync::Mutex<()>,
+    weixin_workspace: Arc<Mutex<Option<String>>>,
+    weixin_delivery: Mutex<
+        Option<(
+            crate::config::WeixinAccountConfig,
+            echo_agent::channels::weixin::WeixinDeliveryHandle,
+        )>,
+    >,
 }
 impl ChannelRuntime {
     pub fn new(state: &Arc<AppState>) -> Self {
@@ -157,6 +171,10 @@ impl ChannelRuntime {
             completed_cleanup_failures: Mutex::default(),
             transport_observers: Arc::default(),
             observer_cancel: tokio_util::sync::CancellationToken::new(),
+            weixin_auth: Arc::default(),
+            weixin_auth_action: tokio::sync::Mutex::new(()),
+            weixin_workspace: Arc::default(),
+            weixin_delivery: Mutex::default(),
         }
     }
     #[cfg(test)]
@@ -259,6 +277,10 @@ impl ChannelRuntime {
                         config.qq.app_id = app_id;
                         secret.apply(&mut config.qq.client_secret)?;
                     }
+                    ManagedChannel::Weixin => {
+                        // Credentials only enter through the backend QR commit.
+                        config.weixin.enabled = enabled;
+                    }
                     ManagedChannel::Feishu => {
                         config.feishu.enabled = enabled;
                         config.feishu.app_id = app_id;
@@ -289,7 +311,19 @@ impl ChannelRuntime {
                     }
                 }
                 if enabled {
-                    let _validated = plugin_from_config(channel, config)?;
+                    if matches!(channel, ManagedChannel::Weixin) {
+                        weixin_auth::credentials(
+                            config
+                                .weixin
+                                .account
+                                .as_ref()
+                                .ok_or_else(|| "Scan Weixin before enabling".to_string())?,
+                        )
+                        .validate()
+                        .map_err(|_| "Invalid Weixin credentials".to_string())?;
+                    } else {
+                        let _validated = plugin_from_config(channel, config)?;
+                    }
                 }
                 Ok(())
             })
@@ -306,7 +340,11 @@ impl ChannelRuntime {
         let state = self.state()?;
         let (_, revision) = state.config.configuration_snapshot().await;
         let mut channels = Vec::new();
-        for channel in [ManagedChannel::Qqbot, ManagedChannel::Feishu] {
+        for channel in [
+            ManagedChannel::Qqbot,
+            ManagedChannel::Feishu,
+            ManagedChannel::Weixin,
+        ] {
             let id = channel.id();
             let handle = self.handle(id)?;
             let configured = self
@@ -349,14 +387,7 @@ impl ChannelRuntime {
                     ChannelTransportPhase::Failed => "failed",
                     ChannelTransportPhase::Unknown => "unknown",
                 };
-                let evidence = snapshot.transport.evidence.map(|evidence| match evidence {
-                    ChannelTransportEvidence::QqSessionReady => "qq_session_ready",
-                    ChannelTransportEvidence::QqSessionResumed => "qq_session_resumed",
-                    ChannelTransportEvidence::FeishuWebSocketHandshake => {
-                        "feishu_websocket_handshake"
-                    }
-                    ChannelTransportEvidence::LocalWebhookListener => "local_webhook_listener",
-                });
+                let evidence = snapshot.transport.evidence.map(transport_evidence_name);
                 let observed =
                     chrono::DateTime::<chrono::Utc>::from(snapshot.transport.observed_at)
                         .to_rfc3339();
@@ -372,12 +403,12 @@ impl ChannelRuntime {
         }
         Ok(json!({"configuration_revision":revision,"channels":channels}))
     }
-    fn handler(
+    async fn handler(
         &self,
         state: Arc<AppState>,
         id: &str,
         timeout: u64,
-    ) -> Result<Arc<dyn MessageHandler>, String> {
+    ) -> Result<(Arc<dyn MessageHandler>, Option<String>), String> {
         let existing = self
             .coordinators
             .lock()
@@ -399,30 +430,85 @@ impl ChannelRuntime {
                 .push(coordinator.clone());
             coordinator
         };
+        let weixin_account = if id == "weixin" {
+            Some(self.weixin_configured_account()?)
+        } else {
+            None
+        };
+        let weixin_delivery = weixin_account
+            .as_ref()
+            .map(|account| self.weixin_delivery_handle(&account.account_id, &account.generation))
+            .transpose()?;
+        // Bind the original workspace/runtime once per transport instance.
+        // GUI project selection must not retarget later messages or HITL.
+        let bound_product_data = if id == "weixin" {
+            Some(
+                state
+                    .current_product_data()
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
+        let bound_runtime = bound_product_data
+            .as_ref()
+            .map(|scope| scope.runtime().clone());
+        let bound_workspace_generation =
+            bound_product_data.as_ref().map(|scope| scope.generation());
+        let bound_workspace = bound_runtime
+            .as_ref()
+            .map(|runtime| runtime.execution_scope().workspace_id().to_string());
+        let weixin_identity = weixin_account
+            .as_ref()
+            .map(|account| (account.account_id.clone(), account.generation.clone()));
+        let recovery_coordinator = coordinator.clone();
         let end = coordinator.clone();
         let admission = self.accepting.clone();
         let gui_hitl = self.gui_hitl_factory.clone();
         let foreground = state.session.foreground_turns.clone();
         let webhook = state.webhook.emitter.clone();
-        Ok(Arc::new(
-            SessionHandler::new(
-                super::channel_session_config(timeout),
-                move |instance: &echo_agent::channels::ChannelSessionInstance| {
-                    Box::new(
-                        super::AppChannelMessageHandler::new(
-                            state.clone(),
-                            webhook.clone(),
-                            foreground.clone(),
-                            instance.clone(),
-                            coordinator.clone(),
-                        )
-                        .with_admission_gate(admission.clone())
-                        .with_gui_hitl_factory(gui_hitl.clone()),
-                    ) as Box<dyn MessageHandler>
-                },
-            )
-            .with_on_session_end(move |info| end.record_session_end(info)),
-        ))
+        let handler = SessionHandler::new(
+            super::channel_session_config(timeout),
+            move |instance: &echo_agent::channels::ChannelSessionInstance| {
+                let mut handler = super::AppChannelMessageHandler::new(
+                    state.clone(),
+                    webhook.clone(),
+                    foreground.clone(),
+                    instance.clone(),
+                    coordinator.clone(),
+                )
+                .with_admission_gate(admission.clone())
+                .with_gui_hitl_factory(gui_hitl.clone());
+                if let Some(runtime) = bound_runtime.as_ref() {
+                    handler = handler.with_bound_control_runtime(runtime.clone());
+                    handler.bound_workspace_generation = bound_workspace_generation.clone();
+                }
+                if let Some(delivery) = weixin_delivery.as_ref() {
+                    handler = handler.with_weixin_delivery(delivery.clone());
+                    if let Some((account, generation)) = weixin_identity.as_ref() {
+                        handler = handler.with_weixin_credential_identity(account, generation);
+                    }
+                }
+                Box::new(handler) as Box<dyn MessageHandler>
+            },
+        )
+        .with_on_session_end(move |info| end.record_session_end(info));
+        let handler: Arc<dyn MessageHandler> = if weixin_account.is_some() {
+            Arc::new(handler.with_durable_ingress())
+        } else {
+            Arc::new(handler)
+        };
+        if let Some(account) = weixin_account {
+            return Ok((
+                Arc::new(
+                    weixin_auth::ScannerHandler::new(handler, account)
+                        .with_coordinator(recovery_coordinator),
+                ),
+                bound_workspace,
+            ));
+        }
+        Ok((handler, bound_workspace))
     }
     async fn stop_selected(&self, handle: &ChannelHandle) -> Result<Vec<String>, String> {
         let coordinators = self
@@ -464,6 +550,12 @@ impl ChannelRuntime {
             unknown.push("Original channel cleanup remains unconfirmed".to_string());
         }
         if unknown.is_empty() {
+            if handle.id() == "weixin" {
+                self.weixin_workspace
+                    .lock()
+                    .map_err(|_| "Weixin original workspace binding unavailable".to_string())?
+                    .take();
+            }
             self.notify_progress();
             Ok(completed_failures)
         } else {
@@ -515,6 +607,10 @@ impl ChannelRuntime {
         if !matches!(action, ChannelControlAction::Stop) && revision != expected_revision {
             return Err("Channel configuration changed; reload before applying".to_string());
         }
+        if matches!(channel, ManagedChannel::Weixin) {
+            self.weixin_auth.cancel();
+            self.weixin_auth.wait().await?;
+        }
         if matches!(action, ChannelControlAction::Stop) {
             if let Some(handle) = current {
                 self.stop_selected(&handle).await?;
@@ -524,13 +620,18 @@ impl ChannelRuntime {
         let enabled = match channel {
             ManagedChannel::Qqbot => config.channels.qq.enabled,
             ManagedChannel::Feishu => config.channels.feishu.enabled,
+            ManagedChannel::Weixin => config.channels.weixin.enabled,
         };
         if !enabled {
             return Err("Enable and save this channel before connecting".to_string());
         }
         if let Some(handle) = current.as_ref() {
             let snapshot = handle.management_snapshot().await;
-            if matches!(action, ChannelControlAction::Start) && snapshot.handler_attached {
+            if matches!(action, ChannelControlAction::Start)
+                && snapshot.handler_attached
+                && (!matches!(channel, ManagedChannel::Weixin)
+                    || actual_applied.as_deref() == Some(expected_revision.as_str()))
+            {
                 return self.status().await;
             }
             self.stop_selected(handle).await?;
@@ -539,16 +640,32 @@ impl ChannelRuntime {
                     "Configuration changed during cleanup; reload before connecting".to_string(),
                 );
             }
+            let (plugin, delivery) = self.construct_plugin(channel, &config.channels)?;
             handle
-                .replace_stopped_plugin(plugin_from_config(channel, &config.channels)?)
+                .replace_stopped_plugin(plugin)
                 .await
                 .map_err(|error| error.to_string())?;
+            if let Some(delivery) = delivery {
+                *self
+                    .weixin_delivery
+                    .lock()
+                    .map_err(|_| "Weixin original sender slot unavailable".to_string())? =
+                    Some(delivery);
+            }
         } else {
+            let (plugin, delivery) = self.construct_plugin(channel, &config.channels)?;
             self.manager
                 .lock()
                 .map_err(|_| "Original channel manager unavailable".to_string())?
-                .register(plugin_from_config(channel, &config.channels)?)
+                .register(plugin)
                 .map_err(|error| error.to_string())?;
+            if let Some(delivery) = delivery {
+                *self
+                    .weixin_delivery
+                    .lock()
+                    .map_err(|_| "Weixin original sender slot unavailable".to_string())? =
+                    Some(delivery);
+            }
         }
         self.configured_revisions
             .lock()
@@ -557,10 +674,37 @@ impl ChannelRuntime {
         let handle = self
             .handle(id)?
             .ok_or_else(|| "Original channel registration missing".to_string())?;
-        let handler = self.handler(state, id, config.channels.session.timeout_minutes)?;
-        let started = handle.start(handler).await;
+        let (handler, bound_workspace) = self
+            .handler(state.clone(), id, config.channels.session.timeout_minutes)
+            .await?;
+        let started = handle.start(handler.clone()).await;
+        if matches!(channel, ManagedChannel::Weixin) && started.is_ok() {
+            *self
+                .weixin_workspace
+                .lock()
+                .map_err(|_| "Weixin original workspace binding unavailable".to_string())? =
+                bound_workspace;
+        }
         self.watch_original_transport(&handle).await?;
         started.map_err(|error| error.to_string())?;
+        if id == "weixin" {
+            let account = self.weixin_configured_account()?;
+            let coordinator = self
+                .coordinators
+                .lock()
+                .map_err(|_| "original channel coordinator unavailable".to_string())?
+                .get(id)
+                .and_then(|owners| owners.last())
+                .cloned()
+                .ok_or_else(|| "original channel coordinator missing".to_string())?;
+            coordinator.start_channel_recovery_initialization(
+                state,
+                handler,
+                handle.clone(),
+                account.account_id,
+                account.generation,
+            )?;
+        }
         self.status().await
     }
     pub async fn start_configured(&self) -> Vec<String> {
@@ -575,11 +719,16 @@ impl ChannelRuntime {
         };
         let mut failures = Vec::new();
         let mut started = 0usize;
-        for channel in [ManagedChannel::Qqbot, ManagedChannel::Feishu] {
+        for channel in [
+            ManagedChannel::Qqbot,
+            ManagedChannel::Feishu,
+            ManagedChannel::Weixin,
+        ] {
             let (config, revision) = state.config.configuration_snapshot().await;
             let enabled = match channel {
                 ManagedChannel::Qqbot => config.channels.qq.enabled,
                 ManagedChannel::Feishu => config.channels.feishu.enabled,
+                ManagedChannel::Weixin => config.channels.weixin.enabled,
             };
             let epoch = match self.handle(channel.id()) {
                 Ok(Some(handle)) => Some(
@@ -617,6 +766,20 @@ impl ChannelRuntime {
                 }
             }
         }
+        // This is the original configured-channel startup owner. Recovery is
+        // deliberately AFTER start and outside the instance operation lock;
+        // GUI factory installation/readiness order remains unchanged.
+        let sender: Arc<dyn crate::tasks::task_runtime::weixin_delivery::WeixinCronDelivery> =
+            state.scheduler.weixin_notifications.clone();
+        let recovery = state
+            .recover_weixin_notifications_after_channel_start(sender, &state.scheduler.cancel_token)
+            .await;
+        failures.extend(
+            recovery
+                .pending
+                .into_iter()
+                .map(|reason| format!("Weixin completion recovery remains pending: {reason}")),
+        );
         (started, failures)
     }
     async fn watch_original_transport(&self, handle: &ChannelHandle) -> Result<(), String> {
@@ -645,6 +808,7 @@ impl ChannelRuntime {
 
     fn close_admission(&self) -> Result<(), String> {
         self.accepting.store(false, Ordering::Release);
+        self.weixin_auth.cancel();
         let coordinators = self
             .coordinators
             .lock()
@@ -666,11 +830,12 @@ impl ChannelRuntime {
         }
     }
     fn no_registered_owners(&self) -> Result<bool, String> {
-        Ok(self
-            .manager
-            .lock()
-            .map_err(|_| "Original manager unavailable".to_string())?
-            .is_empty()
+        Ok(!self.weixin_auth.has_operation()
+            && self
+                .manager
+                .lock()
+                .map_err(|_| "Original manager unavailable".to_string())?
+                .is_empty()
             && self
                 .coordinators
                 .lock()
@@ -760,11 +925,19 @@ impl ChannelRuntime {
         let observers = self.transport_observers.clone();
         let observer_cancel = self.observer_cancel.clone();
         let root = self.root();
+        let authentication = self.weixin_auth.clone();
+        let weixin_workspace = self.weixin_workspace.clone();
         let (sender, receiver) = tokio::sync::watch::channel(None);
         let producer = runtime.spawn(async move {
             let _operation = operation.lock().await;
             let mut failures = Vec::new();
             let mut physically_settled = true;
+            if let Err(error) = authentication.wait().await {
+                physically_settled = false;
+                failures.push(error);
+            } else if let Some(error) = authentication.completed_failure() {
+                failures.push(error);
+            }
             let mut retry_cleanup = true;
             let stop = manager
                 .lock()
@@ -806,6 +979,10 @@ impl ChannelRuntime {
                 Some(original_shutdown_facts(&manager, &coordinators).await?)
             };
             if physically_settled {
+                weixin_workspace
+                    .lock()
+                    .map_err(|_| "Weixin original workspace binding unavailable".to_string())?
+                    .take();
                 observer_cancel.cancel();
                 let owned = std::mem::take(
                     &mut *observers
@@ -886,7 +1063,7 @@ async fn original_shutdown_facts(
         let manager = manager
             .lock()
             .map_err(|_| "Original manager unavailable".to_string())?;
-        ["qqbot", "feishu"]
+        ["qqbot", "feishu", "weixin"]
             .into_iter()
             .filter_map(|id| manager.get_owned(id))
             .collect::<Vec<_>>()
@@ -961,13 +1138,28 @@ fn configuration_view(config: &crate::config::ChannelsConfig, revision: &str) ->
     json!({"revision":revision,"qq":{"enabled":config.qq.enabled,"app_id":config.qq.app_id,"has_secret":!config.qq.client_secret.is_empty()},
         "feishu":{"enabled":config.feishu.enabled,"app_id":config.feishu.app_id,"has_secret":!config.feishu.app_secret.is_empty(),"mode":config.feishu.mode,
             "webhook_bind":config.feishu.webhook_bind,"webhook_path":config.feishu.webhook_path,"has_verification_token":config.feishu.webhook_verification_token.as_ref().is_some_and(|token|!token.is_empty())},
+        "weixin":{"enabled":config.weixin.enabled,"has_credential":config.weixin.account.is_some(),"account_id":config.weixin.account.as_ref().map(|account|&account.account_id)},
         "session":{"timeout_minutes":config.session.timeout_minutes}})
 }
+
+fn transport_evidence_name(evidence: ChannelTransportEvidence) -> &'static str {
+    match evidence {
+        ChannelTransportEvidence::QqSessionReady => "qq_session_ready",
+        ChannelTransportEvidence::QqSessionResumed => "qq_session_resumed",
+        ChannelTransportEvidence::FeishuWebSocketHandshake => "feishu_websocket_handshake",
+        ChannelTransportEvidence::LocalWebhookListener => "local_webhook_listener",
+        ChannelTransportEvidence::WeixinAuthenticatedPoll => "weixin_authenticated_poll",
+    }
+}
+
 fn plugin_from_config(
     channel: ManagedChannel,
     config: &crate::config::ChannelsConfig,
 ) -> Result<Box<dyn ChannelPlugin>, String> {
     match channel {
+        ManagedChannel::Weixin => {
+            Err("Weixin requires the original runtime credential owner".to_string())
+        }
         ManagedChannel::Qqbot => QqChannel::new(QqConfig {
             app_id: config.qq.app_id.clone(),
             client_secret: config.qq.client_secret.clone(),
@@ -1160,6 +1352,22 @@ mod tests {
             .with_config_path(temp.join("eko.yaml")),
         ))
     }
+
+    #[test]
+    fn management_snapshot_serializes_weixin_authenticated_poll_evidence() {
+        let evidence = serde_json::json!({
+            "transport": {
+                "evidence": transport_evidence_name(
+                    ChannelTransportEvidence::WeixinAuthenticatedPoll,
+                )
+            }
+        });
+        assert_eq!(
+            evidence["transport"]["evidence"],
+            "weixin_authenticated_poll"
+        );
+    }
+
     #[tokio::test]
     async fn standalone_all_start_failures_return_without_waiting_for_shutdown()
     -> anyhow::Result<()> {

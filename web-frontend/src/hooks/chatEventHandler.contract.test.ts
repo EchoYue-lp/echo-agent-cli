@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import fixtureText from '../fixtures/chat-event-envelope-v4.json?raw';
 import { useChatStore } from '../stores/chatStore';
 import { subagentRunStoreKey, useSubagentRunStore } from '../stores/subagentRunStore';
-import type { ChatEventEnvelope } from '../types/api';
+import type { ChatEventEnvelope, ConversationInputFact } from '../types/api';
 import { handleChatEventEnvelope } from './chatEventHandler';
 import { resetChatEventCursorsForTest } from './chatEventSequencer';
 
@@ -213,6 +213,46 @@ describe('canonical chat event v4 contract', () => {
 
     handleChatEventEnvelope(envelope, { ...context(), onInputLifecycle: refresh });
 
+    expect(refresh).toHaveBeenCalledWith('workspace-input', 'conversation-input');
+    expect(useChatStore.getState().messages).toEqual([]);
+  });
+
+  it('准确任务绑定事实只刷新原输入Frontier，不制造气泡或投递成功', () => {
+    const base = fixture.at(0);
+    if (!base) throw new Error('contract fixture is incomplete');
+    const event: ConversationInputFact = {
+      phase: 'task_run_target_bound',
+      attempt: {
+        identity: {
+          address: {
+            workspace_id: 'workspace-input',
+            conversation_id: 'conversation-input',
+          },
+          input_id: 'durable-input',
+          revision: 1,
+          payload_sha256: 'a'.repeat(64),
+        },
+        attempt: 1,
+        attempt_id: 'durable-attempt',
+        turn_id: 'durable-turn',
+      },
+      run_id: 'original-task-run',
+      bound_at_ms: 1,
+    };
+    const envelope: ChatEventEnvelope = {
+      ...base,
+      workspace_id: 'workspace-input',
+      conversation_id: 'conversation-input',
+      root_turn_id: 'durable-root',
+      turn_id: 'durable-turn',
+      message_id: 'durable-turn',
+      payload: { source: 'input_lifecycle', event },
+    };
+    const refresh = vi.fn();
+
+    handleChatEventEnvelope(envelope, { ...context(), onInputLifecycle: refresh });
+
+    expect(refresh).toHaveBeenCalledTimes(1);
     expect(refresh).toHaveBeenCalledWith('workspace-input', 'conversation-input');
     expect(useChatStore.getState().messages).toEqual([]);
   });

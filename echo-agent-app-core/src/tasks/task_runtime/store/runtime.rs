@@ -2244,6 +2244,9 @@ impl TaskRuntimeStore {
             attended_mode,
             execution_profile,
             None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -2272,8 +2275,79 @@ impl TaskRuntimeStore {
             attended_mode,
             execution_profile,
             domain_binding,
+            None,
+            None,
+            None,
         )
         .map(|(run, _)| run)
+    }
+
+    /// GUI/IM首轮在同一个RunCreated事实中保存完整源版本；旧入口不猜来源。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_run_for_active_workspace_with_source(
+        &self,
+        run_id: &str,
+        conversation_id: &str,
+        root_message_id: &str,
+        domain_profile: DomainProfile,
+        goal: &str,
+        route: &str,
+        attended_mode: AttendedMode,
+        execution_profile: TaskRunExecutionProfile,
+        domain_binding: Option<&crate::domain_plugin::DomainBinding>,
+        input: &RunInputSnapshot,
+    ) -> Result<TaskRun, StoreError> {
+        let _operation = self.shadow_operation()?;
+        self.create_run_with_domain_result(
+            run_id,
+            &self.active_workspace_id(),
+            conversation_id,
+            root_message_id,
+            domain_profile,
+            goal,
+            route,
+            attended_mode,
+            execution_profile,
+            domain_binding,
+            None,
+            None,
+            Some(input),
+        )
+        .map(|(run, _)| run)
+    }
+
+    /// Freeze notification and occurrence in the original Domain/Project
+    /// RunCreated authority. This adapter does not reconstruct either binding.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_run_with_profile_and_notification_result(
+        &self,
+        run_id: &str,
+        workspace_id: &str,
+        conversation_id: &str,
+        root_message_id: &str,
+        domain_profile: DomainProfile,
+        goal: &str,
+        route: &str,
+        attended_mode: AttendedMode,
+        execution_profile: TaskRunExecutionProfile,
+        notification: Option<&super::weixin_delivery::WeixinDeliveryTarget>,
+        occurrence: Option<&super::occurrence::OccurrenceIdentity>,
+    ) -> Result<(TaskRun, bool), StoreError> {
+        self.create_run_with_domain_result(
+            run_id,
+            workspace_id,
+            conversation_id,
+            root_message_id,
+            domain_profile,
+            goal,
+            route,
+            attended_mode,
+            execution_profile,
+            None,
+            notification,
+            occurrence,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2289,7 +2363,21 @@ impl TaskRuntimeStore {
         attended_mode: AttendedMode,
         execution_profile: TaskRunExecutionProfile,
         domain_binding: Option<&crate::domain_plugin::DomainBinding>,
+        notification: Option<&super::weixin_delivery::WeixinDeliveryTarget>,
+        occurrence: Option<&super::occurrence::OccurrenceIdentity>,
+        input_source: Option<&RunInputSnapshot>,
     ) -> Result<(TaskRun, bool), StoreError> {
+        if let Some(input) = input_source {
+            input.validate().map_err(StoreError::InvalidPlan)?;
+            if input.identity.address.workspace_id != workspace_id
+                || input.identity.address.conversation_id != conversation_id
+                || input.payload.text != goal
+            {
+                return Err(StoreError::InvalidPlan(
+                    "首轮原输入、完整Goal和任务地址不匹配".to_string(),
+                ));
+            }
+        }
         if let Some(binding) = domain_binding {
             binding.validate().map_err(StoreError::InvalidPlan)?;
             if domain_profile != DomainProfile::General {
@@ -2332,9 +2420,38 @@ impl TaskRuntimeStore {
                         "TaskRun '{run_id}' already exists with a different immutable identity"
                     )));
                 }
+                if let Some(input) = input_source {
+                    let state = self.get_run_state(run_id)?.ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+                    let original = state.event_index.accepted_user_inputs.get(&input.key()?);
+                    if original.is_none_or(|accepted| accepted.role != RunInputRole::InitialGoal || accepted.source != input.source
+                        || accepted.identity != input.identity || accepted.turn_id != root_message_id)
+                        || matches!(existing.status, TaskRunStatus::Completed | TaskRunStatus::Cancelled | TaskRunStatus::Failed)
+                    {
+                        return Err(StoreError::InvalidPlan("首轮输入原任务归属或执行状态不匹配，保留待恢复".to_string()));
+                    }
+                    let (journal, _) = self.shadow.settle_event_state(run_id)?;
+                    if !matches!(journal, JournalDurabilityStatus::Confirmed) {
+                        return Err(StoreError::InvalidPlan("首轮原输入接受尚未确认持久化，未执行".to_string()));
+                    }
+                }
                 return Ok((existing, false));
             }
 
+            if notification.is_some() {
+                let identity = occurrence.ok_or_else(|| {
+                    StoreError::InvalidPlan(
+                        "Weixin notification admission requires its original occurrence identity"
+                            .to_string(),
+                    )
+                })?;
+                identity.validate()?;
+                if identity.run_id() != run_id || identity.workspace_id != workspace_id {
+                    return Err(StoreError::InvalidPlan(
+                        "Weixin notification occurrence does not match original TaskRun admission"
+                            .to_string(),
+                    ));
+                }
+            }
             let execution_profile = if execution_profile.subagent_depth_limit.is_some() {
                 execution_profile
             } else {
@@ -2357,7 +2474,7 @@ impl TaskRuntimeStore {
             // U1c phase-0/0bc step-2: file is the write authority. Append the
             // RunCreated event to events.jsonl and rebuild plan.json — no SQL
             // write.
-            self.commit_runtime_event(RuntimeJournalEvent::for_append(
+            let created_event = RuntimeJournalEvent::for_append(
                 run.run_id.as_str(),
                 None,
                 None,
@@ -2376,8 +2493,26 @@ impl TaskRuntimeStore {
                     "execution_profile": execution_profile,
                     "project_binding": self.project_execution_binding(),
                     "domain_binding": domain_binding,
+                    "weixin_notification": notification,
+                    "weixin_occurrence": if notification.is_some() { occurrence } else { None },
                 }),
-            ))?;
+            );
+            if input_source.is_some() {
+                let input = input_source.ok_or_else(|| StoreError::InvalidPlan("首轮来源载体丢失".to_string()))?;
+                let accepted_event = RuntimeJournalEvent::for_append(run_id, None, Some(root_message_id),
+                    RuntimeEventKind::RunInputAccepted,
+                    serde_json::json!({"turn_id":root_message_id, "role":RunInputRole::InitialGoal, "input_snapshot":input}));
+                let receipt = self.shadow.append_event_batch(run_id, vec![created_event, accepted_event])?;
+                if !matches!(receipt.apply.journal, JournalDurabilityStatus::Confirmed) {
+                    return Err(StoreError::InvalidPlan("首轮原输入接受尚未确认持久化，未执行".to_string()));
+                }
+                let sequence = i64::try_from(receipt.apply.last_sequence)
+                    .map_err(|_| StoreError::InvalidPlan("首轮来源sequence超出游标范围".to_string()))?;
+                let projection = self.refresh_committed_projection(run_id, sequence);
+                self.observe_projection_receipt(run_id, &projection);
+            } else {
+                self.commit_runtime_event(created_event)?;
+            }
             self.spill_objective_artifact_if_bounded(
                 run_id,
                 run.goal_revision,
@@ -2416,9 +2551,170 @@ impl TaskRuntimeStore {
             .objective_artifact_path(run_id, run.goal_revision, &run.goal_sha256)
     }
 
-    /// Anchor an incremental user constraint (steer) in the run journal so it
-    /// survives context compression alongside the Goal. Best-effort by design:
-    /// callers skip unknown runs instead of failing the steer delivery.
+    #[cfg(all(test, feature = "channels"))]
+    pub(crate) fn fail_next_input_acceptance_durability_for_test(
+        &self,
+        run_id: &str,
+    ) -> Result<(), StoreError> {
+        self.shadow.fail_next_append_durability_for_test(run_id)?;
+        Ok(())
+    }
+
+    /// 在原输入 attempt 准许 mailbox 之前，持久接受准确 TaskRun 的源版本。
+    /// 相同 ID/修订重试复用原 journal 事实；投递幂等仍由原 ConversationInput attempt 控制。
+    pub fn accept_run_steer_input(
+        &self,
+        run_id: &str,
+        turn_id: &str,
+        source: crate::conversation_input::ConversationInputSource,
+        identity: &crate::conversation_input::ConversationInputIdentity,
+        payload: &crate::conversation_input::ConversationInputPayload,
+    ) -> Result<RunInputAcceptance, StoreError> {
+        let _operation = self.shadow_operation()?;
+        let input = RunInputSnapshot {
+            source,
+            identity: identity.clone(),
+            payload: payload.clone(),
+        };
+        self.with_run_lock(run_id, || {
+            let event = self.prepare_input_acceptance_locked(run_id, turn_id, &input)?;
+            if let Some(event) = event {
+                let receipt = self.shadow.append_event_batch(run_id, vec![event])?;
+                if !matches!(receipt.apply.journal, JournalDurabilityStatus::Confirmed) {
+                    return Err(StoreError::InvalidPlan(
+                        "原任务输入接受尚未确认持久化，未投递".to_string(),
+                    ));
+                }
+                let sequence = i64::try_from(receipt.apply.last_sequence).map_err(|_| {
+                    StoreError::InvalidPlan("任务输入journal sequence超出游标范围".to_string())
+                })?;
+                let projection = self.refresh_committed_projection(run_id, sequence);
+                self.observe_projection_receipt(run_id, &projection);
+                Ok(RunInputAcceptance {
+                    role: RunInputRole::Steer,
+                    run_id: run_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    source,
+                    identity: identity.clone(),
+                    journal_sequence: sequence,
+                    duplicate: false,
+                })
+            } else {
+                let state = self
+                    .get_run_state(run_id)?
+                    .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+                let mut receipt = state
+                    .event_index
+                    .accepted_user_inputs
+                    .get(&input.key()?)
+                    .cloned()
+                    .ok_or_else(|| {
+                        StoreError::InvalidPlan("原输入接受事实无法恢复，未投递".to_string())
+                    })?;
+                receipt.duplicate = true;
+                Ok(receipt)
+            }
+        })
+    }
+
+    /// 只准备同一原journal的接受事实；调用者必须持有原run锁，且resume先核原expected CAS。
+    fn prepare_input_acceptance_locked(
+        &self,
+        run_id: &str,
+        turn_id: &str,
+        input: &RunInputSnapshot,
+    ) -> Result<Option<RuntimeJournalEvent>, StoreError> {
+        input.validate().map_err(StoreError::InvalidPlan)?;
+        let state = self
+            .get_run_state(run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        if turn_id.trim().is_empty()
+            || state.run.workspace_id != input.identity.address.workspace_id
+            || state.run.conversation_id != input.identity.address.conversation_id
+            || matches!(
+                state.run.status,
+                TaskRunStatus::Completed | TaskRunStatus::Cancelled | TaskRunStatus::Failed
+            )
+        {
+            return Err(StoreError::InvalidPlan(
+                "任务输入不属于准确运行或目标已结束，未投递".to_string(),
+            ));
+        }
+        if let Some(previous) = state.event_index.accepted_user_inputs.get(&input.key()?) {
+            if previous.role != RunInputRole::Steer
+                || previous.identity != input.identity
+                || previous.source != input.source
+                || previous.turn_id != turn_id
+            {
+                return Err(StoreError::InvalidPlan(
+                    "同一任务输入修订发生身份或目标冲突，未投递".to_string(),
+                ));
+            }
+            let (journal, _) = self.shadow.settle_event_state(run_id)?;
+            if !matches!(journal, JournalDurabilityStatus::Confirmed) {
+                return Err(StoreError::InvalidPlan(
+                    "原任务输入接受尚未确认持久化，未投递".to_string(),
+                ));
+            }
+            return Ok(None);
+        }
+        if state
+            .event_index
+            .accepted_user_inputs
+            .values()
+            .any(|previous| {
+                previous.identity.address == input.identity.address
+                    && previous.identity.input_id == input.identity.input_id
+                    && previous.identity.revision > input.identity.revision
+            })
+        {
+            return Err(StoreError::InvalidPlan(
+                "原输入已有更新修订，旧修订未接受或投递".to_string(),
+            ));
+        }
+        Ok(Some(RuntimeJournalEvent::for_append(
+            run_id,
+            None,
+            Some(turn_id),
+            RuntimeEventKind::RunInputAccepted,
+            serde_json::json!({"turn_id":turn_id,"role":RunInputRole::Steer,"input_snapshot":input}),
+        )))
+    }
+
+    /// 接受与恢复事件只在同一任务日志batch提交；不是与ChatEventLog的跨日志事务。
+    fn commit_input_resume_events_locked(
+        &self,
+        run_id: &str,
+        events: Vec<RuntimeJournalEvent>,
+    ) -> Result<(), StoreError> {
+        let receipt = self.shadow.append_event_batch(run_id, events).map_err(|error| {
+            match error {
+                super::file_shadow::ShadowError::BatchOutcomeUnknown {batch_id,payload_digest,detail} => {
+                    StoreError::ResumeOutcomeUnknown {run_id:run_id.to_string(),
+                        details:format!("来源接受/恢复batch结果未知：batch={batch_id}, digest={payload_digest}; {detail}")}
+                }
+                other=>StoreError::Shadow(other),
+            }
+        })?;
+        if !matches!(receipt.apply.journal, JournalDurabilityStatus::Confirmed) {
+            return Err(StoreError::ResumeOutcomeUnknown {
+                run_id: run_id.to_string(),
+                details: "来源接受/恢复batch耐久未确认，原输入保留且未准许启动".to_string(),
+            });
+        }
+        let sequence = i64::try_from(receipt.apply.last_sequence).map_err(|_| {
+            StoreError::ResumeOutcomeUnknown {
+                run_id: run_id.to_string(),
+                details: "恢复batch游标超限，未准许启动".to_string(),
+            }
+        })?;
+        let projection = self.refresh_committed_projection(run_id, sequence);
+        self.observe_projection_receipt(run_id, &projection);
+        Ok(())
+    }
+
+    /// 保留追加输入完整原文，避免在事实写入前丢失长消息尾部约束。
+    /// 展示预览可独立截取；这里沿用原 Run journal 及 Result 错误边界。
     pub fn record_run_steer(
         &self,
         run_id: &str,
@@ -2429,16 +2725,64 @@ impl TaskRuntimeStore {
         self.with_run_lock(run_id, || {
             self.get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
-            let bounded: String = text.chars().take(2_000).collect();
             self.commit_runtime_event(RuntimeJournalEvent::for_append(
                 run_id,
                 None,
                 Some(turn_id),
                 RuntimeEventKind::RunSteerRecorded,
-                serde_json::json!({ "turn_id": turn_id, "text": bounded }),
+                serde_json::json!({ "turn_id": turn_id, "text": text }),
             ))?;
             Ok(())
         })
+    }
+
+    /// 为原 journal 中的一条用户约束导出可校验的有界读取引用。
+    /// 路径取原本机产品数据根，不借 invocation cwd（它可能是远程项目）。
+    pub(crate) fn recorded_user_steer_artifact(
+        &self,
+        run_id: &str,
+        steer: &super::types::RecordedUserSteer,
+    ) -> Result<crate::prepared_turn::InputResourceRef, StoreError> {
+        let _operation = self.shadow_operation()?;
+        let run = self
+            .get_run(run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        // 与现有 ProjectExecutionEnvironment::state_dir 和全局 .eko/tasks 布局相同。
+        let task_root = self.shadow.root();
+        let state_dir = task_root.parent().ok_or_else(|| {
+            StoreError::InvalidPlan("原 TaskRuntime 产品数据根缺少父目录".to_string())
+        })?;
+        let spill_dir = state_dir.join("artifacts").join("user-input");
+        let artifact = crate::prepared_turn::materialize_recorded_user_text(
+            &steer.text,
+            &spill_dir,
+            &run.conversation_id,
+            &steer.turn_id,
+        )
+        .map_err(|error| StoreError::InvalidPlan(format!("用户约束原文引用不可用：{error}")))?;
+        let config = echo_agent::tools::artifact::ToolOutputArtifactConfig::new(
+            state_dir.join("artifacts"),
+            "conversation_or_30d",
+        );
+        let reference = echo_agent::tools::artifact::ToolOutputArtifactRef {
+            path: artifact.path.clone(),
+            artifact_bytes: artifact.bytes,
+            payload_bytes: artifact.bytes,
+            sha256: artifact
+                .sha256
+                .clone()
+                .ok_or_else(|| StoreError::InvalidPlan("原文摘要缺失".to_string()))?,
+            retention: config.retention.clone(),
+        };
+        // 复用与真实工具完全相同的本机 root/SHA/UTF-8 检查，不新建校验器。
+        echo_agent::tools::files::artifact::read_artifact_page(
+            &config,
+            &reference,
+            None,
+            echo_agent::tools::files::artifact::ArtifactPageLimit::Bytes(1),
+        )
+        .map_err(|error| StoreError::InvalidPlan(format!("用户约束原文校验失败：{error}")))?;
+        Ok(artifact)
     }
 
     /// Replace the sole authoritative Goal after an explicit local-user action.
@@ -3024,9 +3368,33 @@ impl TaskRuntimeStore {
         &self,
         expected: &TaskRunResumeIdentity,
     ) -> Result<TaskRun, StoreError> {
+        self.resume_task_run_expected_input(expected, None)
+    }
+
+    pub(crate) fn resume_task_run_expected_with_input(
+        &self,
+        expected: &TaskRunResumeIdentity,
+        turn_id: &str,
+        input: &RunInputSnapshot,
+    ) -> Result<TaskRun, StoreError> {
+        self.resume_task_run_expected_input(expected, Some((turn_id, input)))
+    }
+
+    fn resume_task_run_expected_input(
+        &self,
+        expected: &TaskRunResumeIdentity,
+        input: Option<(&str, &RunInputSnapshot)>,
+    ) -> Result<TaskRun, StoreError> {
         let run_id = expected.run_id.as_str();
         self.with_run_lock(run_id, || {
             let mut run = self.validate_resume_locked(run_id, Some(expected))?;
+            if let Some((turn_id,input))=input {
+                let mut events=self.prepare_resume_events(run_id,&run,true)?;
+                if let Some(accepted)=self.prepare_input_acceptance_locked(run_id,turn_id,input)? {events.insert(0,accepted);}
+                self.commit_input_resume_events_locked(run_id,events)?;
+                run.status=TaskRunStatus::Running;run.updated_at=Utc::now();
+                return Ok(run);
+            }
             if let Err(error) = self.append_resume_events(run_id, &run, true) {
                 let reconciled = self.get_run_state(run_id).map_err(|reconcile_error| {
                     StoreError::ResumeOutcomeUnknown {
@@ -4753,6 +5121,7 @@ impl TaskRuntimeStore {
                                 // fact to a later retry of the same task.
                                 "attempt": claim.attempt,
                                 "claim_id": claim.claim_id,
+                                "plan_revision": claim.revision,
                             }),
                         ));
                     }
@@ -5243,11 +5612,17 @@ impl TaskRuntimeStore {
             .into_iter()
             .filter(|run| run.conversation_id == conversation_id)
         {
-            let profile = self
-                .get_run_state(&run.run_id)?
-                .map(|snapshot| snapshot.execution_profile)
-                .unwrap_or_default();
-            if !profile.is_conversation_turn() || self.get_plan(&run.run_id)?.is_some() {
+            let store = self.file_store()?;
+            let Some(snapshot) = store
+                .get_run_state(&run.run_id)
+                .map_err(|error| StoreError::InvalidPlan(error.to_string()))?
+            else {
+                continue;
+            };
+            if store
+                .task_ui_visible(&snapshot)
+                .map_err(|error| StoreError::InvalidPlan(error.to_string()))?
+            {
                 return Ok(Some(run));
             }
         }
@@ -5271,6 +5646,78 @@ impl TaskRuntimeStore {
         self.file_store()?
             .list_runs_in(statuses)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
+    }
+
+    /// Finite formal-task inventory; cursor identity is verified on every read.
+    pub fn query_task_runs_page(
+        &self,
+        workspace_generation: &str,
+        statuses: &[TaskRunStatus],
+        limit: usize,
+        continuation: Option<&str>,
+    ) -> Result<TaskRunPage, StoreError> {
+        self.file_store()?
+            .task_run_page(
+                &self.active_workspace_id(),
+                workspace_generation,
+                statuses,
+                limit,
+                continuation,
+            )
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))
+    }
+
+    /// A single bounded journal request. A look-ahead record proves whether a
+    /// further page exists without fetching the complete tail or losing i64 precision.
+    pub fn query_task_event_page(
+        &self,
+        run_id: &str,
+        after_sequence: i64,
+        limit: usize,
+    ) -> Result<TaskEventPage, StoreError> {
+        if after_sequence < 0 || !(1..=256).contains(&limit) {
+            return Err(StoreError::InvalidPlan(
+                "event page requires a nonnegative sequence and limit 1..256".into(),
+            ));
+        }
+        let snapshot = self
+            .get_run_state(run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        let after = u64::try_from(after_sequence)
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+        if after > snapshot.journal_sequence {
+            return Err(StoreError::InvalidPlan(
+                "event cursor is ahead of this journal; refresh required".into(),
+            ));
+        }
+        let mut events = self.query_events_bounded(
+            run_id,
+            RuntimeEventQuery::new(after_sequence, limit.saturating_add(1)),
+        )?;
+        if events.is_empty() && after < snapshot.journal_sequence {
+            return Err(StoreError::InvalidPlan(
+                "event history is unavailable before its current head; refresh required".into(),
+            ));
+        }
+        let mut expected = after_sequence;
+        for event in &events {
+            expected = expected
+                .checked_add(1)
+                .ok_or_else(|| StoreError::InvalidPlan("event sequence overflow".into()))?;
+            if event.seq != expected || event.run_id != run_id {
+                return Err(StoreError::InvalidPlan(
+                    "event history has a gap or belongs to another run; refresh required".into(),
+                ));
+            }
+        }
+        let has_more = events.len() > limit;
+        events.truncate(limit);
+        let next_after_sequence = events.last().map_or(after_sequence, |event| event.seq);
+        Ok(TaskEventPage {
+            events,
+            next_after_sequence,
+            has_more,
+        })
     }
 
     /// Rebuild all Subagent execution instances for a run from lifecycle and
@@ -6527,6 +6974,40 @@ impl TaskRuntimeStore {
         origin: RunTurnOrigin,
         transcript_visibility: TurnVisibility,
     ) -> Result<RunTurnClaimOutcome, StoreError> {
+        self.resume_and_claim_run_turn_expected_input(
+            expected,
+            turn_id,
+            origin,
+            transcript_visibility,
+            None,
+        )
+    }
+
+    pub(crate) fn resume_and_claim_run_turn_expected_with_input(
+        &self,
+        expected: &TaskRunResumeIdentity,
+        turn_id: &str,
+        origin: RunTurnOrigin,
+        transcript_visibility: TurnVisibility,
+        input: &RunInputSnapshot,
+    ) -> Result<RunTurnClaimOutcome, StoreError> {
+        self.resume_and_claim_run_turn_expected_input(
+            expected,
+            turn_id,
+            origin,
+            transcript_visibility,
+            Some(input),
+        )
+    }
+
+    fn resume_and_claim_run_turn_expected_input(
+        &self,
+        expected: &TaskRunResumeIdentity,
+        turn_id: &str,
+        origin: RunTurnOrigin,
+        transcript_visibility: TurnVisibility,
+        input: Option<&RunInputSnapshot>,
+    ) -> Result<RunTurnClaimOutcome, StoreError> {
         let run_id = expected.run_id.as_str();
         self.with_run_lock(run_id, || {
             if origin != RunTurnOrigin::Resume {
@@ -6558,7 +7039,16 @@ impl TaskRuntimeStore {
             };
             let mut events = self.prepare_resume_events(run_id, &run, true)?;
             events.push(start);
-            self.commit_runtime_events(run_id, events)?;
+            if let Some(input) = input {
+                if let Some(accepted) =
+                    self.prepare_input_acceptance_locked(run_id, turn_id, input)?
+                {
+                    events.insert(0, accepted);
+                }
+                self.commit_input_resume_events_locked(run_id, events)?;
+            } else {
+                self.commit_runtime_events(run_id, events)?;
+            }
             self.read_claimed_run_turn(run_id, turn_id)
         })
     }
@@ -7900,5 +8390,31 @@ impl TaskRuntimeStore {
             self.commit_runtime_events(run_id, events)?;
             Ok(())
         })
+    }
+}
+
+impl TaskRuntimeStore {
+    pub(crate) fn with_weixin_delivery_lock<R>(
+        &self,
+        run_id: &str,
+        operation: impl FnOnce() -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        self.with_run_lock(run_id, operation)
+    }
+
+    /// Reuse the registry-owned original authority at this pinned task root.
+    /// No adapter opens a second journal or creates a missing TaskRun.
+    pub(crate) fn weixin_delivery_authority(
+        &self,
+        run_id: &str,
+    ) -> Result<std::sync::Arc<super::run_authority::RunAuthority>, StoreError> {
+        self.get_run(run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        let directory = self.shadow.root().join(run_id);
+        Ok(super::run_authority::RunAuthority::open(
+            &directory.join("events.jsonl"),
+            &directory.join("checkpoint.json"),
+            run_id,
+        )?)
     }
 }

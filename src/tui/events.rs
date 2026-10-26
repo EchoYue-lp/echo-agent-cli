@@ -2475,11 +2475,19 @@ fn format_conversation_input_fact(fact: &ConversationInputFact) -> String {
     let phase = match fact {
         ConversationInputFact::Persisted { .. } => ConversationInputPhase::Persisted,
         ConversationInputFact::AttemptStarted { .. } => ConversationInputPhase::AttemptStarted,
+        ConversationInputFact::TaskRunTargetBound { .. } => {
+            return "原输入任务去向已固定，尚未进入上下文".to_string();
+        }
         ConversationInputFact::MailboxAccepted { .. } => ConversationInputPhase::MailboxAccepted,
-        ConversationInputFact::Drained { .. } => ConversationInputPhase::Drained,
+        ConversationInputFact::Drained { .. } | ConversationInputFact::DriverAccepted { .. } => {
+            ConversationInputPhase::Drained
+        }
         ConversationInputFact::TurnSettled { .. } => ConversationInputPhase::TurnSettled,
         ConversationInputFact::Deferred { .. } => ConversationInputPhase::Deferred,
-        ConversationInputFact::RecoveryRequired { .. } => ConversationInputPhase::RecoveryRequired,
+        ConversationInputFact::RecoveryRequired { .. }
+        | ConversationInputFact::RecoveryUncertain { .. } => {
+            ConversationInputPhase::RecoveryRequired
+        }
         ConversationInputFact::Reordered { .. } => ConversationInputPhase::Persisted,
         ConversationInputFact::Cancelled { .. } => ConversationInputPhase::Cancelled,
     };
@@ -3070,7 +3078,8 @@ impl echo_agent_app_core::api::chat_driver::ChatSink for TuiChatSink {
                 .is_ok();
         }
         let mapped = match event {
-            ChatDriverEvent::HitlRequestReleased { .. } => return true,
+            ChatDriverEvent::HitlRequestReleased { .. }
+            | ChatDriverEvent::WeixinControlDelivery(_) => return true,
             ChatDriverEvent::Execution(event) => AgentEvent::Execution(event),
             ChatDriverEvent::TurnStatus { status } => AgentEvent::TurnStatus(status),
             ChatDriverEvent::InputLifecycle(fact) => {
@@ -8106,11 +8115,15 @@ mod tests {
                         },
                     payload:
                         echo_agent_app_core::api::conversation_input::ConversationInputPayload {
+                            channel_binding: None,
+                            domain_plugin: None,
                             text: "durable next input".to_string(),
                             attachments: Vec::new(),
                             submitted_at_ms: 1,
                             payload_sha256: identity.payload_sha256,
                         },
+                    task_target: None,
+                    claimed_before_current: false,
                     active_attempt: None,
                 }],
             },

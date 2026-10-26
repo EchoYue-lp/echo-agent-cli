@@ -34,9 +34,10 @@ import {
   type TaskActionReceipt,
 } from './TaskRuntimeList';
 import './TaskRuntimePanel.css';
-import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
+import { useTaskRuntimeStore, taskRuntimePresentation } from '../../stores/taskRuntimeStore';
 import {
   useSubagentRunStore,
+  latestSubagentRunsByTask,
   type ExecutionEvent,
   type SubagentRunState,
 } from '../../stores/subagentRunStore';
@@ -518,9 +519,7 @@ function MetricCell({
 }
 
 function traceRunForTodo(todo: { task_id: string }, runs: SubagentRunState[]) {
-  return runs
-    .filter((run) => run.taskId === todo.task_id)
-    .sort((a, b) => b.startedAt - a.startedAt)[0];
+  return latestSubagentRunsByTask(runs).find((run) => run.taskId === todo.task_id);
 }
 
 export function traceRunsForTaskRun(
@@ -563,6 +562,7 @@ export function todoStatusDescription(
 
 export function TaskRuntimePanel() {
   const traceRuns = useSubagentRunStore((s) => s.runs);
+  const state = useTaskRuntimeStore();
   const {
     activeRun,
     plan,
@@ -573,6 +573,12 @@ export function TaskRuntimePanel() {
     backgroundCells,
     completionGate,
     error,
+    hasMoreEvents,
+  } = useTaskRuntimeStore(taskRuntimePresentation);
+  const {
+    selectedRunId,
+    loadingEvents,
+    loadMoreEvents,
     refresh,
     cancel,
     pause,
@@ -582,18 +588,24 @@ export function TaskRuntimePanel() {
     retryBlockedTask,
     resolveRecoveryTask,
     skipGoalRequirement,
-  } = useTaskRuntimeStore();
+  } = state;
   const [tokenBudgetInput, setTokenBudgetInput] = useState('');
   const [timeBudgetInput, setTimeBudgetInput] = useState('');
   const [budgetError, setBudgetError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
-  const actionInFlight = useRef(false);
+  const actionInFlight = useRef<symbol | null>(null);
   const [actionReceipt, setActionReceipt] = useState<TaskActionReceipt | null>(null);
   const [goalInput, setGoalInput] = useState('');
   const [goalReasonInput, setGoalReasonInput] = useState('');
   const [goalError, setGoalError] = useState<string | null>(null);
   const [requirementSkipId, setRequirementSkipId] = useState<string | null>(null);
   const [requirementSkipReason, setRequirementSkipReason] = useState('');
+
+  useEffect(() => {
+    actionInFlight.current = null;
+    setPendingAction(null);
+    setActionReceipt(null);
+  }, [activeRun?.run_id, state.taskScope?.workspaceId, state.taskScope?.workspaceGeneration]);
 
   useEffect(() => {
     setTokenBudgetInput(continuation?.token_budget?.toString() ?? '');
@@ -620,15 +632,19 @@ export function TaskRuntimePanel() {
             // conversationId.
             .filter(
               (run) =>
-                run.runId === activeRun.run_id || run.conversationId === activeRun.conversation_id
+                run.runId === activeRun.run_id ||
+                (!selectedRunId && run.conversationId === activeRun.conversation_id)
             )
             .sort((a, b) => a.startedAt - b.startedAt)
         : [],
-    [activeRun, traceRuns]
+    [activeRun, traceRuns, selectedRunId]
   );
   const activeTaskTraceRuns = useMemo(
-    () => traceRunsForTaskRun(activeRun?.run_id ?? null, Object.values(traceRuns)),
-    [activeRun, traceRuns]
+    // A partial prefix can contain an old completed attempt followed by an unread retry.
+    // Keep canonical Todo facts visible without presenting that prefix as the latest execution.
+    () =>
+      hasMoreEvents ? [] : traceRunsForTaskRun(activeRun?.run_id ?? null, Object.values(traceRuns)),
+    [activeRun, traceRuns, hasMoreEvents]
   );
 
   if (!activeRun) return null;
@@ -636,6 +652,15 @@ export function TaskRuntimePanel() {
   // Detailed execution timeline is now in ConversationTimeline (main panel).
   // Keep the plan summary and task details on the original runtime projection.
   const runId = activeRun.run_id;
+  // The rendered target owns this token; a delayed click must not borrow a replacement host.
+  const controlTarget = {
+    workspace_id: activeRun.workspace_id,
+    run_id: runId,
+    workspace_generation:
+      state.taskScope?.workspaceId === activeRun.workspace_id
+        ? state.taskScope.workspaceGeneration
+        : '',
+  };
   const usageSummary = cacheUsageForRuns(visibleTraceRuns);
   const completedCount = todos.filter((todo) => todo.status === ('completed' as TodoStatus)).length;
   const executionCompletedCount = todos.filter((todo) => {
@@ -649,18 +674,40 @@ export function TaskRuntimePanel() {
   const budgetLabels = continuation?.enabled ? continuationBudgetLabels(continuation) : null;
   const planGoalCurrent =
     plan?.goal_revision === activeRun.goal_revision && plan?.goal_sha256 === activeRun.goal_sha256;
+  const visibleActionReceipt =
+    actionReceipt?.runId === runId &&
+    actionReceipt.workspaceId === controlTarget.workspace_id &&
+    actionReceipt.workspaceGeneration === controlTarget.workspace_generation
+      ? actionReceipt
+      : null;
   const performAction: TaskAction = async (label, operation, taskId) => {
-    if (actionInFlight.current || useTaskRuntimeStore.getState().activeRun?.run_id !== runId)
-      return false;
-    actionInFlight.current = true;
+    const ownsTarget = () => {
+      const current = useTaskRuntimeStore.getState();
+      const run = taskRuntimePresentation(current).activeRun;
+      return (
+        !!controlTarget.workspace_generation &&
+        current.taskScope?.workspaceId === controlTarget.workspace_id &&
+        current.taskScope.workspaceGeneration === controlTarget.workspace_generation &&
+        run?.run_id === runId &&
+        run.workspace_id === controlTarget.workspace_id
+      );
+    };
+    if (actionInFlight.current || !ownsTarget()) return false;
+    const operationToken = Symbol(label);
+    actionInFlight.current = operationToken;
     // Capture the original target before awaiting; the selected detail may change meanwhile.
-    const receiptIdentity = { runId, taskId };
+    const receiptIdentity = {
+      runId,
+      taskId,
+      workspaceId: controlTarget.workspace_id,
+      workspaceGeneration: controlTarget.workspace_generation,
+    };
     setPendingAction(label);
     setActionReceipt(null);
     try {
-      await operation();
-      const snapshot = useTaskRuntimeStore.getState();
-      if (snapshot.activeRun?.run_id !== runId) return false;
+      const receipt = await operation();
+      const snapshot = taskRuntimePresentation(useTaskRuntimeStore.getState());
+      if (!ownsTarget() || !snapshot.activeRun) return false;
       if (snapshot.error) {
         setActionReceipt({
           ...receiptIdentity,
@@ -669,13 +716,35 @@ export function TaskRuntimePanel() {
         });
         return false;
       }
+      let outcome = '请求已返回';
+      if (receipt && typeof receipt === 'object') {
+        if ('run_id' in receipt && receipt.run_id !== runId)
+          throw new Error('后端回执不属于原运行');
+        if ('success' in receipt && receipt.success === false)
+          outcome = '无需重复执行（后端未改变运行）';
+        else if ('success' in receipt && receipt.success === true)
+          outcome = '后端已接受请求，结算以运行记录为准';
+        else if ('kind' in receipt) {
+          outcome =
+            receipt.kind === 'retry_scheduled'
+              ? '重试已排期'
+              : receipt.kind === 'recovery_retry_recorded'
+                ? '恢复重试已记录'
+                : receipt.kind === 'continuation_resumed'
+                  ? '继续请求已接受'
+                  : receipt.kind === 'resumed'
+                    ? '恢复请求已接受'
+                    : '后端回执已返回';
+        }
+      }
       setActionReceipt({
         ...receiptIdentity,
-        text: `${label}请求已返回 · 当前运行${STATUS_LABEL[snapshot.activeRun.status] ?? snapshot.activeRun.status}`,
+        text: `${label}${outcome} · 当前运行${STATUS_LABEL[snapshot.activeRun.status] ?? snapshot.activeRun.status}`,
         failed: false,
       });
       return true;
     } catch (actionError) {
+      if (!ownsTarget()) return false;
       setActionReceipt({
         ...receiptIdentity,
         text: `${label}失败：${actionError instanceof Error ? actionError.message : String(actionError)}`,
@@ -683,8 +752,10 @@ export function TaskRuntimePanel() {
       });
       return false;
     } finally {
-      actionInFlight.current = false;
-      setPendingAction(null);
+      if (actionInFlight.current === operationToken) {
+        actionInFlight.current = null;
+        setPendingAction(null);
+      }
     }
   };
 
@@ -694,7 +765,7 @@ export function TaskRuntimePanel() {
       const timeBudget = parseContinuationBudgetInput(timeBudgetInput, '时间预算');
       setBudgetError(null);
       await performAction('更新预算', () =>
-        updateContinuationBudgets(runId, tokenBudget, timeBudget)
+        updateContinuationBudgets(controlTarget, tokenBudget, timeBudget)
       );
     } catch (budgetInputError) {
       setBudgetError(
@@ -710,14 +781,16 @@ export function TaskRuntimePanel() {
       return;
     }
     setGoalError(null);
-    await performAction('更新目标', () => updateGoal(runId, activeRun.goal_revision, goal, reason));
+    await performAction('更新目标', () =>
+      updateGoal(controlTarget, activeRun.goal_revision, goal, reason)
+    );
   };
   const confirmRequirementSkip = async () => {
     const reason = requirementSkipReason.trim();
     const requirementId = requirementSkipId;
     if (!requirementId || !reason) return;
     const succeeded = await performAction('确认跳过验收项', () =>
-      skipGoalRequirement(requirementId, reason)
+      skipGoalRequirement(requirementId, reason, controlTarget)
     );
     if (!succeeded) return;
     setRequirementSkipId(null);
@@ -726,6 +799,19 @@ export function TaskRuntimePanel() {
 
   return (
     <section className="eko-task-runtime">
+      {hasMoreEvents && (
+        <div className="eko-task-history-notice" role="status">
+          <span>执行记录尚有后续页，当前执行明细可能不完整。</span>
+          <button
+            type="button"
+            className="eko-task-button"
+            disabled={loadingEvents}
+            onClick={() => void loadMoreEvents()}
+          >
+            {loadingEvents ? '正在读取…' : '继续读取执行记录'}
+          </button>
+        </div>
+      )}
       <div className="eko-task-run-summary">
         <div className="eko-task-run-eyebrow">
           <span>
@@ -745,7 +831,9 @@ export function TaskRuntimePanel() {
             已提交完成 <strong>{completedCount}</strong>
             <span> / {todos.length} 项</span>
           </span>
-          <span>执行完成 {executionCompletedCount} 项</span>
+          <span>
+            {hasMoreEvents ? '执行记录尚未读完' : `执行完成 ${executionCompletedCount} 项`}
+          </span>
         </div>
         {todos.length > 0 ? (
           <div
@@ -767,17 +855,17 @@ export function TaskRuntimePanel() {
           </div>
         )}
       </div>
-      {error && !(actionReceipt?.runId === runId && actionReceipt.failed) && (
+      {error && !visibleActionReceipt?.failed && (
         <div role="alert" className="eko-task-action-receipt is-error">
           {error}
         </div>
       )}
-      {actionReceipt?.runId === runId && (
+      {visibleActionReceipt && (
         <div
-          role={actionReceipt.failed ? 'alert' : 'status'}
-          className={`eko-task-action-receipt ${actionReceipt.failed ? 'is-error' : ''}`}
+          role={visibleActionReceipt.failed ? 'alert' : 'status'}
+          className={`eko-task-action-receipt ${visibleActionReceipt.failed ? 'is-error' : ''}`}
         >
-          {actionReceipt.text}
+          {visibleActionReceipt.text}
         </div>
       )}
       {pendingAction && (
@@ -789,7 +877,7 @@ export function TaskRuntimePanel() {
       {activeRun.status === 'running' && (
         <div className="mb-2 grid grid-cols-2 gap-1.5">
           <button
-            onClick={() => void performAction('暂停', () => pause(runId))}
+            onClick={() => void performAction('暂停', () => pause(controlTarget))}
             disabled={!!pendingAction}
             className="flex items-center justify-center gap-1 rounded-md px-2 py-1.5 text-[11px] font-medium"
             style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)' }}
@@ -798,7 +886,7 @@ export function TaskRuntimePanel() {
             <Pause size={12} /> 暂停
           </button>
           <button
-            onClick={() => void performAction('取消', () => cancel(runId))}
+            onClick={() => void performAction('取消', () => cancel(controlTarget))}
             disabled={!!pendingAction}
             className="flex items-center justify-center gap-1 rounded-md px-2 py-1.5 text-[11px] font-medium"
             style={{ background: 'var(--bg-hover)', color: 'var(--color-error)' }}
@@ -812,7 +900,7 @@ export function TaskRuntimePanel() {
       {activeRun.status === 'paused' && recoveryBlockers.length === 0 && (
         <div className="mb-2">
           <button
-            onClick={() => void performAction('继续执行', resumeTaskRun)}
+            onClick={() => void performAction('继续执行', () => resumeTaskRun(controlTarget))}
             disabled={!planGoalCurrent || !!pendingAction}
             className="flex w-full items-center justify-center gap-1 rounded-md px-3 py-1.5 text-[11px] font-medium"
             style={{
@@ -827,6 +915,7 @@ export function TaskRuntimePanel() {
       )}
 
       <TaskRuntimeList
+        controlTarget={controlTarget}
         key={runId}
         run={activeRun}
         plan={plan}
@@ -835,7 +924,7 @@ export function TaskRuntimePanel() {
         artifacts={artifacts}
         recoveryBlockers={recoveryBlockers}
         pendingAction={pendingAction}
-        actionReceipt={actionReceipt?.runId === runId ? actionReceipt : null}
+        actionReceipt={visibleActionReceipt}
         onAction={performAction}
         describeTodo={(todo) => todoStatusDescription(todo, activeTaskTraceRuns)}
         renderStatus={(todo) => (
@@ -1012,7 +1101,7 @@ export function TaskRuntimePanel() {
                       <button
                         onClick={() =>
                           void performAction('重试恢复任务', () =>
-                            retryBlockedTask(blocker.task_id)
+                            retryBlockedTask(blocker.task_id, controlTarget)
                           )
                         }
                         disabled={!!pendingAction}
@@ -1025,7 +1114,7 @@ export function TaskRuntimePanel() {
                       <button
                         onClick={() =>
                           void performAction('跳过恢复任务', () =>
-                            resolveRecoveryTask(blocker.task_id, 'skip')
+                            resolveRecoveryTask(blocker.task_id, 'skip', controlTarget)
                           )
                         }
                         disabled={!!pendingAction}
@@ -1144,7 +1233,13 @@ export function TaskRuntimePanel() {
           )}
 
           <div className="mb-2">
-            <CacheUsageCard summary={usageSummary} compact />
+            {hasMoreEvents ? (
+              <p className="text-xs text-[var(--text-tertiary)]">
+                执行记录未读完，用量汇总待确认。
+              </p>
+            ) : (
+              <CacheUsageCard summary={usageSummary} compact />
+            )}
           </div>
 
           {runId && (

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { channelApi } from '../../api/endpoints';
+import { channelApi, weixinQrApi } from '../../api/endpoints';
+import { WeixinQrCard } from './WeixinQrCard';
 import type {
   ManagedChannelId,
   ManagedChannelsConfiguration,
@@ -10,7 +11,10 @@ import type {
 function secretUpdate(value: string, clear: boolean): ChannelSecretUpdate {
   return clear ? { action: 'clear' } : value ? { action: 'set', value } : { action: 'preserve' };
 }
-function initialDraft(config: ManagedChannelsConfiguration, channel: ManagedChannelId) {
+function initialDraft(
+  config: ManagedChannelsConfiguration,
+  channel: Exclude<ManagedChannelId, 'weixin'>
+) {
   const current = channel === 'qqbot' ? config.qq : config.feishu;
   return {
     revision: config.revision,
@@ -31,6 +35,7 @@ function connectionLabel(status: ManagedChannelStatus | undefined): string {
     if (evidence === 'feishu_websocket_handshake') return '飞书 WebSocket 握手已确认';
     if (evidence === 'qq_session_ready' || evidence === 'qq_session_resumed')
       return 'QQ 会话就绪已确认';
+    if (evidence === 'weixin_authenticated_poll') return '微信鉴权轮询已确认';
     return '未知（尚无就绪证据）';
   }
   return {
@@ -48,7 +53,7 @@ function ChannelCard({
   onControl,
   onRefresh,
 }: {
-  channel: ManagedChannelId;
+  channel: Exclude<ManagedChannelId, 'weixin'>;
   configuration: ManagedChannelsConfiguration;
   status: ManagedChannelStatus | undefined;
   onControl: (
@@ -371,6 +376,22 @@ export function ChannelsPanel() {
       if (timer) clearTimeout(timer);
     };
   }, [refresh]);
+  const refreshWeixinAuthorization = useCallback(async () => {
+    const next = await channelApi.configuration();
+    if (!mounted.current) return;
+    setConfiguration(next);
+    const snapshot = await channelApi.status();
+    if (!mounted.current) return;
+    const instance = snapshot.channels.find((entry) => entry.id === 'weixin');
+    // A new authorization is connected through the original explicit owner;
+    // only its authenticated poll can subsequently publish transport Ready.
+    if (next.weixin?.enabled && next.weixin.has_credential && instance) {
+      const value = await channelApi.control('weixin', next.revision, instance, 'start');
+      if (mounted.current) publish(value.channels);
+    } else {
+      publish(snapshot.channels);
+    }
+  }, [publish]);
   const control = async (
     channel: ManagedChannelId,
     revision: string,
@@ -382,15 +403,64 @@ export function ChannelsPanel() {
     if (mounted.current && generation === request.current) publish(value.channels);
     await refresh();
   };
+  const weixinStatus = statuses.find((status) => status.id === 'weixin');
   return (
     <div className="space-y-4 p-4" style={{ color: 'var(--text-primary)' }}>
       <h2 className="text-base font-semibold">IM 渠道</h2>
-      <p className="text-xs">管理已有 QQ Bot 与飞书。保存配置、连接事实和消息投递分别呈现。</p>
+      <p className="text-xs">管理 QQ Bot、飞书与个人微信。授权、连接事实和消息投递分别呈现。</p>
       {error && <p role="alert">{error}</p>}
       {!configuration ? (
         <p>正在读取配置</p>
       ) : (
         <>
+          <WeixinQrCard
+            api={weixinQrApi}
+            expectedRevision={configuration.revision}
+            onChanged={refreshWeixinAuthorization}
+          />
+          <section
+            aria-label="微信连接状态"
+            className="space-y-2 rounded-lg border p-3"
+            style={{ borderColor: 'var(--border-color)' }}
+          >
+            <p className="text-xs">微信连接：{connectionLabel(weixinStatus)}</p>
+            {weixinStatus?.transport.error && (
+              <p role="alert" className="text-xs">
+                {weixinStatus.transport.error}
+              </p>
+            )}
+            {weixinStatus?.completed_cleanup_failures.map((failure, index) => (
+              <p key={`${index}:${failure}`} role="status" className="text-xs">
+                上次清理已结算，保留失败记录：{failure}
+              </p>
+            ))}
+            {weixinStatus?.transport.observed_at && (
+              <p className="text-xs">
+                观察于 {new Date(weixinStatus.transport.observed_at).toLocaleString()}
+              </p>
+            )}
+            {(['start', 'stop', 'reconnect'] as const).map((action) => {
+              const instance = weixinStatus;
+              return (
+                <button
+                  key={action}
+                  type="button"
+                  className="mr-2 rounded border px-2 py-1 text-xs"
+                  disabled={
+                    !instance || (!configuration.weixin?.has_credential && action !== 'stop')
+                  }
+                  onClick={() => {
+                    if (instance)
+                      void control('weixin', configuration.revision, instance, action).catch(() =>
+                        setError('微信连接操作失败，请刷新后重试。')
+                      );
+                  }}
+                >
+                  {action === 'start' ? '连接微信' : action === 'stop' ? '断开微信' : '重新连接'}
+                </button>
+              );
+            })}
+          </section>
           <ChannelCard
             channel="qqbot"
             configuration={configuration}

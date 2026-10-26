@@ -7,6 +7,13 @@ import type { ConversationInputPayload } from './ConversationInputPayload';
 export type ConversationInputFact =
   | { phase: 'persisted'; identity: ConversationInputIdentity; payload: ConversationInputPayload }
   | { phase: 'attempt_started'; attempt: ConversationInputAttempt; started_at_ms: number }
+  | {
+      phase: 'task_run_target_bound';
+      attempt: ConversationInputAttempt;
+      run_id: string;
+      bound_at_ms: number;
+    }
+  | { phase: 'driver_accepted'; attempt: ConversationInputAttempt; accepted_at_ms: number }
   | { phase: 'mailbox_accepted'; attempt: ConversationInputAttempt; accepted_at_ms: number }
   | { phase: 'drained'; attempt: ConversationInputAttempt; drained_at_ms: number }
   | {
@@ -28,6 +35,12 @@ export type ConversationInputFact =
       attempt: ConversationInputAttempt;
       reason: string;
       drained: boolean;
+      detected_at_ms: number;
+    }
+  | {
+      phase: 'recovery_uncertain';
+      identity: ConversationInputIdentity;
+      reason: string;
       detected_at_ms: number;
     }
   | {

@@ -4,19 +4,27 @@
 
 工作空间、项目与工程对应同一个 Workspace，任务/会话归属它，TaskRun/PlanTask 列表呈现执行记录。创建 Workspace 支持已有本地文件夹、新建本地文件夹和 SSH 远程项目，新建任务不创建目录。代码位置与本机 `Workspace.root` 产品数据分离；旧 manifest 仍按原 `project_root`、`root` 解析，不移动旧目录。位置和验证后的执行身份同属原 manifest/`project_root_revision`，参见 [ADR 0055](../adr/0055-project-workspaces.md)。
 
+创建或打开工作空间后，原 `workspaceStore` 使用后端 registry 回执按 ID 更新列表，成功进入时与当前选择一起发布；同 ID 的新 generation 替换旧项。创建已落盘但进入失败时只更新列表，保留原选择和错误，不再次创建或切换。迟到回执仍受原切换代次约束，不覆盖后继列表或焦点。
+
 项目树、编辑器、changes/diff、Git/worktree 和 Agent 文件/命令使用同一 host 的实际位置。GUI 请求捕获 workspace ID 与 generation，迟到响应不能覆盖另一个位置版本。目录选择器仍浏览本机目录；远程路径由项目连接验证，不能在本机 canonicalize。提供者未承诺修改时间时返回 `null`。保存保持原锁/preimage 与真实目标的比较替换边界；远端不支持时明确报告，写结果不确定时保留诊断，不自动重放。
 
 六个非本机项目文件入口通过原 ProductDataIo 观察最多 30 秒；Unconfirmed 只表示本次等待结束，原物理工作和 host 占用继续保留。真正完成后才清原 operation id，迟到失败保留原失败收据。本机/global 路径不改等待方式。位置重绑和 host 关闭沿原 idle 门禁，普通焦点切换不改变后台任务的目标。该观察不替代 SSH 后端对远端终态与未知结果的证明。
 
 完成结果的封装继续携带同一原 operation，直到取出确认或未观察丢弃。成功写入通道缓存不构成交付确认：缓存被丢弃仍保留未读取错误，已实际读取的业务错误正常返回调用方。
 
-用户级规则、记忆、产品会话和 journal 留本机；项目 AGENTS、Skill 和 Subagent 来源读取实际项目。必需读取失败从原可失败的模型入口返回。fresh Subagent 在实际隔离 cwd 已知后准备不可变指令与项目信息，现有模型前投影接口在冷 Execute/reset 或恢复后发布同一份已读取事实，以原 marker 替换旧 checkpoint 投影；角色根提示词保持原权威。模型前投影不执行文件 I/O，也不承担错误准入判断。
+用户级规则、记忆、产品会话和 journal 留本机；项目 AGENTS、Skill 和 Subagent 来源读取实际项目。必需读取失败从原可失败的模型入口返回。fresh Subagent 在实际隔离 cwd 已知后准备不可变指令与项目信息，现有模型前投影接口在冷 Execute/reset 或恢复后发布同一份已读取事实，以原 marker 替换旧 checkpoint 投影；角色根提示词保持原权威。这些已准备的项目事实投影不再次执行文件 I/O，也不承担项目来源的错误准入判断。
 
 主智能体每轮通过原 turn registration 携带已准备的项目事实；显式提供环境、没有 store/run 的嵌入调用也走同一入口。原 EKO projector 同时保留 Domain/TaskRuntime、turn policy、hot memory 和命令观察。并行的主智能体验证使用已有 execution ID 作为该独立调用的 turn ID，原根消息继续作为触发来源。fresh 默认及 Plugin Subagent 将自己的真实 checkout 事实与原 Domain-only renderer 组合；本机产品数据回执始终是带身份的资源 guard，不是命令工作目录。
 
 应用内嵌配置与用户 hooks/Skills 保留本机文件与原本机执行器；项目 hooks/Skills 捕获项目文件与执行器，后续切换 host 执行器不改写已登记的来源。hooks 仍按内嵌、用户文件、项目文件的原顺序合并，并在同一个 UserConfig 槽位整体替换。项目读取失败会阻止初次加载，显式重载失败保留上次有效集合。自动文件监听只覆盖本机配置和本机项目；SSH 项目没有远端 notify/poller，使用既有显式重载读取同一远端目标。
 
 项目终端捕获项目身份；显式本地/独立 SSH tab 保持各自目标。人手终端不占 Agent 执行槽、不要求 LLM 或 full-auto。原 child/reader 结算前保持 host I/O receipt；退出先关闭用户 PTY，再结算其依赖，认证 master 等 Agent/file 使用者结算后关闭。源码和前端测试不代替真实远程写入、原生 GUI 或平台能力验收。
+
+SSH 项目创建使用密码掩码表单，不展示认证终端。界面先订阅原会话事件，再启动原 OpenSSH master；只有原进程请求密码后才通过既有写入 IPC 暂时提交一次，提交后清空，失败或未知不自动重发。密码不进入 argv、env、配置、日志、模型或持久化 store。未知主机指纹由用户核对，不能自动确认。
+
+登录成功时清除尚未使用的口令并锁定密码框；修改凭据需先断开，不能用旧 master 的成功代替新密码验证。目录验证的界面观察限为 30 秒，超时显示未确认并解除界面忙碌；原物理验证仍保留，同一待完成请求的显式重试只继续观察。取消、关闭或换来源后的迟到结果不再发起创建。创建 IPC 一旦派发仍沿原创建/未知结算合同，不套用只读验证的重试方式。认证视图卸载后关闭失败的资源仍由应用持有，通过原应用退出路径重试结算，不假称关闭完成。
+
+“测试连接”调用捕获目标的 `test_project_ssh`，只使用原 `ssh -O check` 证明登录，不以 prompt 或进程启动为成功依据，也不要求填写目录。创建/重连时才通过同一连接执行 `verify_project_ssh`：相对路径和 `~/` 从远程 HOME 解析，再校验 SFTP canonical path 与原命令工作目录。未登录、目录缺失或读取失败保留表单与原错误，不发布工作空间。参见 [ADR 0055](../adr/0055-project-workspaces.md)。
 
 ## GUI 输入接收与草稿归属
 
@@ -25,6 +33,28 @@
 普通首条发送以原保存者返回的真实会话地址继续准入。迟到创建不覆盖后继会话或新草稿，发送方不在保存后重新读取当前焦点来路由输入。Started 的直接接受证明和本地 slash command 成功，与输入持久化回执分开；GUI 仅在原提交和当前草稿仍匹配时清稿。
 
 首次创建期间的提交展示权在第一次等待前绑定原 Hook 代次和原准入对象；原保存者在选中真实会话前通知该对象，只有仍属于原代次的 null→真实 ID 变化可以迁移。Stop、卸载、换会话或新草稿后不能重新取得展示权。创建成功与后续列表刷新、界面观察异常分开处理，不因观察失败再次创建。`/clear` 的原 reset 可在后台结算原会话，但返回后只在原 Workspace、选择、加载代次和新稿 epoch 均未变化时清理当前投影；原当前会话 reset 失败后仍按既有行为清空。这些回调复用原会话生命周期，不新增第二份 store 或执行 owner。
+
+## 必要原文的有界投影与可恢复暂停
+
+TaskRuntime journal 保存完整 user steer，原活动 capsule 对最近四条只放短文本或
+400字符预览及完整SHA引用。长原文共用 PreparedUserTurn/InputResourceRef 的落盘、
+SHA和引用格式，内容寻址缓存缺失或损坏只从 journal 重建；不增加输入store或权限。
+该 TaskRuntime 投影与上面的已准备项目事实是不同来源：其原文件读取通过既有
+TaskRuntimeOperation 进行，任何新原文物化/校验失败必须沿required错误通道阻断。
+
+原文仍在host产品数据目录，SSH项目的FileSystem/read_file不承担其读取。最终模型
+请求构建后用真实snapshot的artifact配置核验，并要求该请求实际暴露read_artifact。
+非空allowed_tools排除reader时暂停，不绕过或放宽上界；仅400字符预览不能代替全文。
+
+框架仅用既有typed AgentFailure发出required_context_unavailable。EKO共享一个
+machine-code分类helper：正式PlanTask经原exact-claim interruption及settlement CAS
+暂停；普通GUI/IM经原RunTurnFinished和turn_lifecycle暂停为NeedsInput。原failure
+原文、Goal和journal保留，不设置自动retry。修复来源后通过原expected-resume恢复，
+不创建新Run、不增加retry；取消/旧claim/物理未结算仍保原优先级。参见
+[ADR0048](../adr/0048-context-compression-product-policy.md)。
+
+这只是当前有界引用和错误消费边界，最近四条不代表所有持续有效要求。完整来源、
+显式替换、范围、版本及独立覆盖仍须按原要求链逐项验收。
 
 ## AgentRouter 阶段交接
 
@@ -397,8 +427,18 @@ primary、计划 Subagent、Verification 与 review 消费持久规则。原 poo
 完整集成及 native/main 验收待做。见 [ADR0054](../adr/0054-task-bound-domain-plugins.md) 和
 [包示例](../../../examples/domain-plugin/README.md)。
 
+## GUI 正式任务历史读取
+
+任务上下文面板发现所选 Workspace 内的原正式 TaskRun。库存与精确选择扩展既有 taskRuntimeStore；普通新建/最近任务会话仍由 ConversationStore 拥有。list_task_runs 将产品数据 generation 和状态筛选绑定到有界实时页，按创建时间/run_id 排序并明确 continuation；读取或修复失败保留已显示内容并反馈错误。库存与原 latest-task 共用 provenance 可见性判定，打开历史不会创建计划或把普通 turn 升级成任务。
+
+选择旧 run 后，详情、轮询和控制使用其精确 run_id，而非会话 latest。运行页/事件页不建立第二个任务或事件 store。事件读取返回有限片段、无精度损失的后续 sequence 和未读尾部标记，Subagent 历史未读完仍明确提示。原类型化控制回执区分 no-op、已接受请求、排期/恢复重试与物理或语义完成。同 ID 工作区换 generation 以及迟到请求由原 scope 和 GUI 选择世代隔离。
+
+有限传输不意味着已有索引或常量扫描。合法任务图/查询测量，以及浅深色、常用/最小窗口的原生行为仍需验收。Framework/SDK 示例不变，官网等待合格 EKO 源统一镜像。参见[任务面板指南](../guides/gui-task-runtime-panel.md)与[ADR 0008](../adr/0008-taskruntime-bounded-query-projections.md)。
+
+历史检查在同一个 Zustand store 中至多额外保留一份呈现快照，不替换当前聊天的 activeRun、任务数量、失败提示或消息归属。任务面板操作携带实际显示的 run_id；冲突提示的 Continue 使用原准入 Workspace/run 与类型化回执，不读取选中历史的状态来判断目标。迟到结果不能清除后继提示或覆盖另一个呈现快照。
+
 ## 会话事件投影与终态
 
 前端接纳框架 AgentEvent schema5 的 `transcript_projection_settlement`，完整保留保存结果分类、操作与会话/世代身份、尝试次数及错误信息。它是会话保存检查点，不是 TaskRun 或聊天回合完成；成功保存不改变运行状态，未确认、阻塞与冲突显示明确提示，真正的回合结束仍以原 `turn_status` 为准。
 
-事件排序器只有在对应投影处理成功后才消费该序号。投影异常保留原事件和游标供后续重试，不能提前删除事件后把终态永久挡在缺失序号之后。
+事件排序器只有在对应投影处理成功后才消费该序号。投影异常保留原事件和游标供后续重试，不能提前删除事件后把终态永久挡在缺失序号之后。恢复中的活跃回合查询也受已观察到的终态版本约束：实时终态抵达后，先前发出的迟到快照不能重新建立旧执行槽。界面修复与受控模型验收脚本分别验证；脚本必须通过原 `tool_search` 激活延迟曝光的 HITL 工具，不能凭普通回复或模拟前端状态认定原生人工确认已通过。

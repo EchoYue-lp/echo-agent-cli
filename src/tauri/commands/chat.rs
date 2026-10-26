@@ -35,6 +35,10 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 pub(crate) fn emit_chat_envelope(app: &tauri::AppHandle, envelope: &ChatEventEnvelope) -> bool {
+    // This is a backend durability fact, not a user conversation event.
+    if matches!(&envelope.payload, ChatDriverEvent::WeixinControlDelivery(_)) {
+        return true;
+    }
     if let Err(error) = app.emit("chat://event", envelope) {
         tracing::warn!(%error, "failed to emit canonical chat journal event");
         return false;
@@ -793,6 +797,7 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
         .find(|item| item.receipt.identity == input_identity)
         .cloned()
         .ok_or_else(|| IpcError::Validation("queued input is no longer pending".to_string()))?;
+    require_gui_owned_input(&queued_input.payload)?;
     let dispatch_queue_revision = input_frontier.queue_revision;
     let ws_root = scoped_runtime.execution_scope().root().to_path_buf();
     // ── Persist attachments + build multimodal message (if any) ──────────
@@ -1135,11 +1140,6 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
                 observed.map(|_| ())
             })
         });
-    // The durable attempt exists before the visible running projection.
-    let _ = emit_gui_turn_status(&sink, "running");
-    if let Some(batch) = staged_attachment_batch.take() {
-        batch.commit();
-    }
     let run_binding = queued_input.payload.domain_plugin.clone().map(|plugin| {
         use echo_agent_app_core::api::tasks::task_runtime::{
             RunTurnBinding, RunTurnOrigin, TurnVisibility,
@@ -1154,6 +1154,49 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
             expected_resume: None,
         }
     });
+    let (run_binding, input_source) = match state
+        .app_state
+        .bind_initial_user_input(
+            echo_agent_app_core::api::conversation_input::ConversationInputSource::Gui,
+            &started_input,
+            run_binding,
+        )
+        .await
+    {
+        Ok(bound) => bound,
+        Err(error) => {
+            let mut failures = vec![error.clone()];
+            if let Err(failure) = input_service
+                .recovery_required(input_attempt.clone(), error.clone())
+                .await
+            {
+                failures.push(failure.to_string());
+            }
+            if let Err(failure) = foreground_lease
+                .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message("input_admission", error),
+                ))
+                .await
+            {
+                failures.push(failure.to_string());
+            }
+            browser_approval_registration.close().await;
+            if let Err(failure) = prepared_turn.cleanup_resources(&spill_dir) {
+                failures.push(failure.to_string());
+            }
+            if let Some(batch) = staged_attachment_batch.take()
+                && let Err(failure) = batch.rollback()
+            {
+                failures.push(failure);
+            }
+            return Err(IpcError::Validation(failures.join("; ")));
+        }
+    };
+    // 固定原输入去向后才发布运行状态；TaskRuntime完整接受仍在原driver准入中。
+    let _ = emit_gui_turn_status(&sink, "running");
+    if let Some(batch) = staged_attachment_batch.take() {
+        batch.commit();
+    }
     let terminal_service = input_service.clone();
     let terminal_address = address.clone();
     let terminal_attempt = input_attempt;
@@ -1171,12 +1214,13 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
         foreground_lease.retain(held_browser.clone());
         let outcome = echo_agent_app_core::api::chat_driver::with_foreground_pool_execution(
             Arc::downgrade(&held_execution),
-            echo_agent_app_core::api::foreground_turn::drive_foreground_chat_with_bound_ingress(
+            echo_agent_app_core::api::foreground_turn::drive_foreground_chat_with_source_ingress(
                 foreground_lease,
                 &agent_handle_clone,
                 &prepared_turn,
                 res,
-                run_binding,
+                Some(run_binding),
+                Some(input_source),
                 input_observer,
                 move |outcome| {
                     let service = terminal_service.clone();
@@ -1313,6 +1357,7 @@ pub async fn steer_chat_message(
         .find(|item| item.receipt.identity == identity)
         .cloned()
         .ok_or_else(|| IpcError::Validation("queued input is no longer pending".to_string()))?;
+    require_gui_owned_input(&queued.payload)?;
     if let Some(selected) = queued.payload.domain_plugin.as_deref() {
         let run_id = snapshot.run_id.as_deref().ok_or_else(|| {
             IpcError::Validation("domain steer requires its original TaskRun identity".to_string())
@@ -1375,7 +1420,6 @@ pub async fn steer_chat_message(
             return Err(IpcError::Validation(format!("{error}{suffix}")));
         }
     };
-    let steer_text = queued.payload.text.clone();
     let steer_message = match prepared.to_message() {
         Ok(message) => message,
         Err(error) => {
@@ -1465,7 +1509,7 @@ pub async fn steer_chat_message(
     let observer = async move {
         let result: Result<ConversationInputReceipt, String> = match steer_rx.await {
             Ok(steer_result) => match observer_service
-                .observe_steer_through_drain(observer_attempt.clone(), steer_result)
+                .observe_durable_steer_through_drain(observer_attempt.clone(), steer_result)
                 .await
             {
                 Ok(receipt) if receipt.drained => {
@@ -1573,10 +1617,18 @@ pub async fn steer_chat_message(
             .map_err(|error| IpcError::Internal(error.to_string()))?;
         return Ok(receipt);
     }
-    let steer_result = agent
-        .steer_input_tracked(Some(&expected_turn_id), steer_message)
+    let steer_text = started.payload.text.clone();
+    let steer_result = state
+        .app_state
+        .steer_user_input_for_active_turn(
+            &state.app_state.session.foreground_turns,
+            echo_agent_app_core::api::conversation_input::ConversationInputSource::Gui,
+            &started,
+            &agent,
+            steer_message,
+        )
         .await;
-    if steer_result.is_ok()
+    if matches!(&steer_result, Ok(Ok(_)))
         && let Err(error) = state
             .app_state
             .record_user_steer_for_active_turn(
@@ -1702,6 +1754,19 @@ pub async fn replay_chat_events(
     }
 }
 
+// This is an ownership boundary for local recovery, not an agent permission:
+// GUI dispatch/edit must not consume channel input without its original route.
+fn require_gui_owned_input(
+    payload: &echo_agent_app_core::api::conversation_input::ConversationInputPayload,
+) -> Result<(), IpcError> {
+    if payload.channel_binding.is_some() {
+        return Err(IpcError::Validation(
+            "channel input remains owned by its original channel runtime".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn validate_queue_address(
     state: &TauriState,
     workspace_id: &str,
@@ -1805,6 +1870,13 @@ pub async fn remove_queued_chat_input(
         .list(&identity.address)
         .await
         .map_err(|error| IpcError::Internal(error.to_string()))?;
+    if let Some(input) = before
+        .items
+        .iter()
+        .find(|input| input.receipt.identity == identity)
+    {
+        require_gui_owned_input(&input.payload)?;
+    }
     let receipt = service
         .cancel(identity.clone())
         .await
@@ -1816,6 +1888,51 @@ pub async fn remove_queued_chat_input(
         before.queue_revision,
     ) {
         record_gui_transport_debt("cancelled_input_lifecycle", error);
+    }
+    Ok(receipt)
+}
+
+/// Atomically replace one pending queued input while preserving its id/order.
+/// The journal increments the input revision and rejects stale or already
+/// executing identities; the UI never edits a local queue copy.
+#[tauri::command]
+pub async fn replace_queued_chat_input(
+    state: tauri::State<'_, TauriState>,
+    app: tauri::AppHandle,
+    identity: ConversationInputIdentity,
+    expected_queue_revision: u64,
+    text: String,
+    attachments: Vec<echo_agent_app_core::api::types::AttachmentData>,
+    domain_plugin: Option<String>,
+) -> Result<ConversationInputReceipt, IpcError> {
+    validate_queue_address(
+        &state,
+        &identity.address.workspace_id,
+        &identity.address.conversation_id,
+    )
+    .await?;
+    let service = state.app_state.conversation_inputs();
+    let before = service
+        .list(&identity.address)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let receipt = service
+        .replace(
+            identity.clone(),
+            expected_queue_revision,
+            text,
+            attachments,
+            domain_plugin,
+        )
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    if let Err(error) = emit_conversation_input_lifecycle_after(
+        &app,
+        state.app_state.storage.chat_events.as_ref(),
+        &identity.address,
+        before.queue_revision,
+    ) {
+        record_gui_transport_debt("replaced_input_lifecycle", error);
     }
     Ok(receipt)
 }

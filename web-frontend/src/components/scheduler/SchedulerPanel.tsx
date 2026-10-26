@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import { useToastStore } from '../../stores/toastStore';
 import { SchedulerHistory, SchedulerRunLink } from './SchedulerHistory';
+import { WeixinNotificationConfiguration } from './WeixinNotification';
 
 // ── Cron helpers ───────────────────────────────────────────────────
 
@@ -478,6 +479,8 @@ export function SchedulerPanel() {
                     </button>
                   )}
                 </div>
+
+                <WeixinNotificationConfiguration task={task} />
 
                 {/* Run result */}
                 {runResult?.id === task.id && (

@@ -70,13 +70,49 @@ provenance 和 plan policy,不能从 route 文本或 plan 是否存在猜测。
    `Cancelled(Interrupted)`;已经持久化 `RunTurnFinished` 的 settlement debt 补为
    `Completed`;planless orchestrated run 保留 `Paused(BootRecovery)`;
 5. **死代码清理**:run-less else 分支与 `register_optional_run_driver` 随之删除。
-6. **用户 steer**:foreground owner 保存 exact `run_id`;GUI/TUI/CLI/channel 与
-   AgentRouter 的 user-authored live delivery共用 app-core 记录入口,在
-   `PreparedUserTurn` 重写前读取原始用户文本,再按 journal retention 进行 UTF-8 安全的
-   2000 字符有界持久化。Agent-origin message 不伪装成 user constraint。
+6. **用户 steer**:foreground owner 保存准确 `run_id`。原 `RunSteerRecorded` 保留完整原文，
+   近期展示投影仍有界；本事件不证明语义要求已经应用。GUI/IM 的来源接受按下节顺序先持久化，
+   然后才调用原 mailbox；TUI/CLI 与 AgentRouter 的来源身份接线仍是未迁移范围，不能把
+   其旧文本记录冒充新接受回执。Agent-origin message 不伪装成用户约束。
 7. **quiet wake**:active task/cell 检查与 `RunContinuationResumed` 在同一 run lock 内提交;
    continuation eligibility 发现新 activity 时重新持久化 deferred。
 8. **长 Goal artifact**:使用原子写,文件名绑定 goal revision 与 SHA-256,读取时复核 digest。
+
+## Plan14 第一片：原输入身份与任务持久接受
+
+实现参考根内固定 ZCode `3c5b227649371507ddc4eb46ac5133afe6db1cab`：
+`apps/zcode-cli/packages/core/src/runtime/methods/prompt-admission.ts` 的 reservation/guide/queue 与
+`apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/commands/prompt-turn.ts` 的准入、完成分离体现“原 runtime 按准确输入身份投递”的共性。
+ZCode 普通 Bot callback
+早于 sendText ACK 的窗口不作为本项目准入证明。EKO 的双原 journal 顺序、target-before-admission
+和 typed unknown 是复用本项目原机制后的工程取舍；不是 ZCode 已有相同 API。`RunInputAccepted`
+仍是同一原事件 union 的历史事实，不新增状态机；durable/context/applied 分离沿 Plan14 原要求。
+
+本片沿已批准的 Plan14 复用现有 journal、输入 attempt 与统一 turn driver，没有新增
+输入队列、要求 store、调度器或框架运行时字段。通用执行与取消仍归框架；来源快照、
+任务去向及 EKO 的持久接受策略归应用。
+
+1. 原 `ConversationInputFact::Persisted` 保存输入完整版本，原选择事务校验全队列
+   `queue_revision`。取得准确 attempt 后，在同一 ChatEventLog 原锁下写
+   `TaskRunTargetBound { attempt, run_id }`。绑定只核该输入的身份、修订、attempt、turn
+   和已有去向；其它 DATA 入队不撤销已合法取得的 claim。
+2. 绑定不是 TaskRuntime 接受，也不是 mailbox、Drained 或 Applied。任务日志新增明确
+   `RunInputAccepted { role, input_snapshot }`；用途仅为 `InitialGoal` 或 `Steer`。
+   首轮与原 `RunCreated` 在同一 journal batch 写入，Goal 使用原输入全文；模型继续消费
+   `PreparedUserTurn` 的有界引用。追加输入只写来源接受事实，不能据此加入有效要求投影。
+3. 只有原物理耐久结果 `Confirmed` 才准许后续投递。派生 checkpoint/展示修复失败与物理
+   journal 未确认分开；同源 ID/修订重试核清原 frame，不重新追加。原 checkpoint 版本推进，
+   旧 checkpoint 必须从同一 journal 重建来源去重索引。
+4. 这是两个原 journal 的顺序写入，不是跨日志原子事务。去向已绑定但任务尚不存在时，
+   只能用同一确定 ID 和原源版本重建；任务已结束、已编辑版本或归属不明时保留原输入并
+   阻断自动改绑。已 claim 的旧记录若缺少任务去向，原 `ever_claimed` 重放事实保守报告
+   `RecoveryRequired`，不猜当前或最新任务。取消/替换仍遵循原队列允许范围；绑定历史不抹除。
+5. 正常队列删除不接受 `AttemptStarted`；这与低层 reducer 可恢复 Cancelled 事实的能力
+   不同。用户 Stop 继续取消原准确 foreground token；旧 turn 的取消不能影响后继 turn。
+   已启动工具由原物理 owner 结算，不能因输入取消假装副作用回滚。
+6. `RunInputAccepted` 只建立历史来源索引，不填近期 `RunSteerRecorded` 投影。原 mailbox
+   成功后的近期记录保持原路径；“进入上下文”“语义已应用”“持续要求取消/替换”与来源的
+   精确关联仍属于 Plan14 后续切片。本片不宣称要求全集、自动 Goal/Plan 改写或完成门禁已闭合。
 
 ## 取舍
 

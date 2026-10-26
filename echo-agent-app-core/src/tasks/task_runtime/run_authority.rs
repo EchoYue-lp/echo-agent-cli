@@ -8,8 +8,9 @@ use chrono::{DateTime, Utc};
 use echo_agent::state::journal::{
     ApplyBatchReceipt, ApplyReceipt, CheckpointFrame, CheckpointStore, CheckpointedApplyError,
     CheckpointedReducer, EventJournal, FileCheckpointStore, FileEventJournal,
-    JournalBatchAppendError, JournalBatchCommitStatus, JournalBatchLookup, JournalDurabilityStatus,
-    JournalIdentity, MemoryCheckpointStore, PreparedJournalBatch,
+    JournalBatchAppendError, JournalBatchAppendReceipt, JournalBatchAppendResult,
+    JournalBatchCommitStatus, JournalBatchLookup, JournalDurabilityStatus, JournalIdentity,
+    JournalRecord, MemoryCheckpointStore, PreparedJournalBatch,
 };
 use echo_agent::utils::fs::{FileDurability, atomic_write, create_dir_all_durable};
 use serde::{Deserialize, Serialize};
@@ -165,6 +166,8 @@ pub(crate) struct RunBatchAppendReceipt {
     pub(crate) events: Vec<Arc<RuntimeTaskEvent>>,
     pub(crate) apply: ApplyBatchReceipt,
     pub(crate) history: HistoryProjectionApplyStatus,
+    /// Exact source receipt, retained only for typed journal adapters.
+    pub(crate) physical: Option<JournalBatchAppendReceipt<RuntimeJournalEvent>>,
 }
 
 enum RegistryStatus {
@@ -576,10 +579,20 @@ impl RunAuthority {
     pub(crate) fn append_batch_with_observer(
         &self,
         events: Vec<RuntimeJournalEvent>,
-        mut observer: impl FnMut(&RuntimeTaskEvent),
+        observer: impl FnMut(&RuntimeTaskEvent),
     ) -> Result<RunBatchAppendReceipt, ShadowError> {
         let prepared = PreparedJournalBatch::new(events)
             .map_err(|error| ShadowError::Encode(error.to_string()))?;
+        self.append_prepared_batch_with_observer(prepared, observer, false)
+    }
+
+    fn append_prepared_batch_with_observer(
+        &self,
+        prepared: PreparedJournalBatch<RuntimeJournalEvent>,
+        mut observer: impl FnMut(&RuntimeTaskEvent),
+        retain_physical: bool,
+    ) -> Result<RunBatchAppendReceipt, ShadowError> {
+        let exact = retain_physical.then(|| prepared.clone());
         let mut guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let mut prepared = Some(prepared);
         let mut attempts = 0_usize;
@@ -598,6 +611,29 @@ impl RunAuthority {
             let payload_digest = batch.payload_digest().to_string();
             let projected = match reconciled_projection.take() {
                 Some(projected) => projected,
+                None if retain_physical => {
+                    match state.journal.lookup_batch(&batch).map_err(|error| {
+                        ShadowError::BatchOutcomeUnknown {
+                            batch_id: batch_id.clone(),
+                            payload_digest: payload_digest.clone(),
+                            detail: error.to_string(),
+                        }
+                    })? {
+                        JournalBatchLookup::AlreadyCommitted(original) => {
+                            project_journal_records(original.records())?
+                        }
+                        JournalBatchLookup::Absent => {
+                            project_prepared_batch(&batch, state.journal.next_sequence())?
+                        }
+                        JournalBatchLookup::Conflict { error } => {
+                            return Err(ShadowError::BatchIdentityConflict {
+                                batch_id,
+                                payload_digest,
+                                detail: error,
+                            });
+                        }
+                    }
+                }
                 None => project_prepared_batch(&batch, state.journal.next_sequence())?,
             };
 
@@ -807,10 +843,45 @@ impl RunAuthority {
             for event in &projected {
                 observer(event.as_ref());
             }
+            let physical = if let Some(exact) = exact.as_ref() {
+                let original = match state.journal.lookup_batch(exact).map_err(|error| {
+                    ShadowError::BatchOutcomeUnknown {
+                        batch_id: batch_id.clone(),
+                        payload_digest: payload_digest.clone(),
+                        detail: error.to_string(),
+                    }
+                })? {
+                    JournalBatchLookup::AlreadyCommitted(original) => original,
+                    _ => {
+                        return Err(ShadowError::BatchOutcomeUnknown {
+                            batch_id,
+                            payload_digest,
+                            detail: "original typed adapter batch receipt is not recoverable"
+                                .to_string(),
+                        });
+                    }
+                };
+                // Identity, frame id and records come from the physical
+                // journal lookup. Durability/commit come from the same
+                // original authority's verified append/reopen/barrier above.
+                Some(
+                    JournalBatchAppendReceipt::from_parts(
+                        original.journal_identity().clone(),
+                        original.batch_id(),
+                        original.records().to_vec(),
+                        receipt.journal.clone(),
+                        receipt.commit,
+                    )
+                    .map_err(ShadowError::Encode)?,
+                )
+            } else {
+                None
+            };
             return Ok(RunBatchAppendReceipt {
                 events: projected,
                 apply: receipt,
                 history,
+                physical,
             });
         }
     }
@@ -1634,5 +1705,252 @@ fn projection_degraded(sequence: u64, error: impl std::fmt::Display) -> ShadowEr
             detail: error.to_string(),
         },
         Err(_) => ShadowError::SequenceOutOfRange { sequence },
+    }
+}
+
+#[cfg(test)]
+fn weixin_before_append_faults_for_test()
+-> &'static Mutex<HashMap<String, echo_agent::delivery::DeliveryPhase>> {
+    static FAULTS: OnceLock<Mutex<HashMap<String, echo_agent::delivery::DeliveryPhase>>> =
+        OnceLock::new();
+    FAULTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl RunAuthority {
+    /// A typed read view of the original physical journal, never a new store.
+    pub(crate) fn weixin_journal_snapshot(
+        &self,
+    ) -> Result<
+        (
+            JournalIdentity,
+            u64,
+            Vec<JournalRecord<super::weixin_delivery::WeixinEvent>>,
+        ),
+        ShadowError,
+    > {
+        let guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| ShadowError::AuthorityClosed(self.event_path.display().to_string()))?;
+        let head = state.journal.last_sequence();
+        let mut after = 0;
+        let mut delivery = Vec::new();
+        loop {
+            let records = state
+                .journal
+                .replay_after(after, REPLAY_BATCH)
+                .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
+            if records.is_empty() {
+                break;
+            }
+            for record in records {
+                after = record.sequence;
+                if record.event.event_type == RuntimeEventKind::WeixinDeliveryRecorded {
+                    delivery.push(Self::weixin_typed_record(record)?);
+                }
+            }
+        }
+        Ok((state.journal.journal_identity().clone(), head, delivery))
+    }
+
+    fn weixin_physical_batch(
+        &self,
+        batch: &PreparedJournalBatch<super::weixin_delivery::WeixinEvent>,
+    ) -> Result<PreparedJournalBatch<RuntimeJournalEvent>, ShadowError> {
+        let events = batch
+            .events()
+            .iter()
+            .map(|event| {
+                use echo_agent::delivery::DeliveryEvent;
+                let timestamp = match event.as_ref() {
+                    DeliveryEvent::Persisted { persisted_at, .. } => *persisted_at,
+                    DeliveryEvent::Claimed { claimed_at, .. } => *claimed_at,
+                    DeliveryEvent::EffectStarted { started_at, .. } => *started_at,
+                    DeliveryEvent::MailboxAccepted { accepted_at, .. } => *accepted_at,
+                    DeliveryEvent::Drained { drained_at, .. } => *drained_at,
+                    DeliveryEvent::Deferred { deferred_at, .. } => *deferred_at,
+                    DeliveryEvent::TurnSettled { settled_at, .. } => *settled_at,
+                };
+                Ok(RuntimeJournalEvent::new(
+                    self.expected_run_id.clone(),
+                    None,
+                    None,
+                    RuntimeEventKind::WeixinDeliveryRecorded,
+                    serde_json::to_value(event.as_ref())
+                        .map_err(|error| ShadowError::Encode(error.to_string()))?,
+                    timestamp,
+                ))
+            })
+            .collect::<Result<Vec<_>, ShadowError>>()?;
+        PreparedJournalBatch::with_identity(batch.batch_id(), events)
+            .map_err(|error| ShadowError::Encode(error.to_string()))
+    }
+
+    fn weixin_typed_record(
+        record: JournalRecord<RuntimeJournalEvent>,
+    ) -> Result<JournalRecord<super::weixin_delivery::WeixinEvent>, ShadowError> {
+        if record.event.event_type != RuntimeEventKind::WeixinDeliveryRecorded {
+            return Err(ShadowError::Encode(
+                "typed Weixin receipt includes another runtime event".to_string(),
+            ));
+        }
+        let event = serde_json::from_value(record.event.payload.clone())
+            .map_err(|error| ShadowError::Encode(error.to_string()))?;
+        Ok(JournalRecord::from_parts(
+            record.batch_id(),
+            record.sequence,
+            event,
+        ))
+    }
+
+    fn weixin_typed_receipt(
+        receipt: JournalBatchAppendReceipt<RuntimeJournalEvent>,
+    ) -> Result<JournalBatchAppendReceipt<super::weixin_delivery::WeixinEvent>, ShadowError> {
+        let records = receipt
+            .records()
+            .iter()
+            .cloned()
+            .map(Self::weixin_typed_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        JournalBatchAppendReceipt::from_parts(
+            receipt.journal_identity().clone(),
+            receipt.batch_id(),
+            records,
+            receipt.durability().clone(),
+            receipt.commit_status(),
+        )
+        .map_err(ShadowError::Encode)
+    }
+
+    pub(crate) fn append_weixin_prepared(
+        &self,
+        batch: PreparedJournalBatch<super::weixin_delivery::WeixinEvent>,
+    ) -> JournalBatchAppendResult<super::weixin_delivery::WeixinEvent> {
+        #[cfg(test)]
+        {
+            use echo_agent::delivery::{DeliveryEvent, DeliveryPhase};
+            let phase = batch.events().first().map(|event| match event.as_ref() {
+                DeliveryEvent::Persisted { .. } => DeliveryPhase::Persisted,
+                DeliveryEvent::Claimed { .. } => DeliveryPhase::Claimed,
+                DeliveryEvent::EffectStarted { .. } => DeliveryPhase::EffectStarted,
+                DeliveryEvent::MailboxAccepted { .. } => DeliveryPhase::MailboxAccepted,
+                DeliveryEvent::Drained { .. } => DeliveryPhase::Drained,
+                DeliveryEvent::Deferred { .. } => DeliveryPhase::Deferred,
+                DeliveryEvent::TurnSettled { .. } => DeliveryPhase::TurnSettled,
+            });
+            let refuse = {
+                let mut faults = weixin_before_append_faults_for_test()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if faults.get(&self.expected_run_id).copied() == phase {
+                    faults.remove(&self.expected_run_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if refuse {
+                return Err(JournalBatchAppendError::not_committed(
+                    batch,
+                    "injected original Weixin frame failure before physical append",
+                ));
+            }
+        }
+        let physical = self.weixin_physical_batch(&batch).map_err(|error| {
+            JournalBatchAppendError::not_committed(batch.clone(), error.to_string())
+        })?;
+        let receipt = self
+            .append_prepared_batch_with_observer(physical, |_| {}, true)
+            .map_err(|error| match error {
+                error @ ShadowError::BatchNotCommitted { .. } => {
+                    JournalBatchAppendError::not_committed(batch.clone(), error.to_string())
+                }
+                error @ ShadowError::BatchIdentityConflict { .. } => {
+                    JournalBatchAppendError::authority_poisoned(batch.clone(), error.to_string())
+                }
+                error => JournalBatchAppendError::outcome_unknown(batch.clone(), error.to_string()),
+            })?;
+        let physical = receipt.physical.ok_or_else(|| {
+            JournalBatchAppendError::outcome_unknown(
+                batch.clone(),
+                "original TaskRuntime adapter receipt missing",
+            )
+        })?;
+        Self::weixin_typed_receipt(physical)
+            .map_err(|error| JournalBatchAppendError::outcome_unknown(batch, error.to_string()))
+    }
+
+    pub(crate) fn lookup_weixin_prepared(
+        &self,
+        batch: &PreparedJournalBatch<super::weixin_delivery::WeixinEvent>,
+    ) -> echo_agent::error::Result<JournalBatchLookup<super::weixin_delivery::WeixinEvent>> {
+        let physical = self
+            .weixin_physical_batch(batch)
+            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+        let guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = guard.as_ref().ok_or_else(|| {
+            echo_agent::error::ReactError::Other(
+                "original TaskRuntime authority closed".to_string(),
+            )
+        })?;
+        match state.journal.lookup_batch(&physical)? {
+            JournalBatchLookup::Absent => Ok(JournalBatchLookup::Absent),
+            JournalBatchLookup::Conflict { error } => Ok(JournalBatchLookup::Conflict { error }),
+            JournalBatchLookup::AlreadyCommitted(receipt) => Self::weixin_typed_receipt(receipt)
+                .map(JournalBatchLookup::AlreadyCommitted)
+                .map_err(|error| echo_agent::error::ReactError::Other(error.to_string())),
+        }
+    }
+
+    pub(crate) fn replay_weixin_after(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> echo_agent::error::Result<Vec<JournalRecord<super::weixin_delivery::WeixinEvent>>> {
+        let guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = guard.as_ref().ok_or_else(|| {
+            echo_agent::error::ReactError::Other(
+                "original TaskRuntime authority closed".to_string(),
+            )
+        })?;
+        let mut after = after;
+        let mut delivery = Vec::new();
+        while delivery.len() < limit {
+            let records = state.journal.replay_after(after, REPLAY_BATCH)?;
+            if records.is_empty() {
+                break;
+            }
+            for record in records {
+                after = record.sequence;
+                if record.event.event_type == RuntimeEventKind::WeixinDeliveryRecorded {
+                    delivery.push(Self::weixin_typed_record(record).map_err(|error| {
+                        echo_agent::error::ReactError::Other(error.to_string())
+                    })?);
+                    if delivery.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(delivery)
+    }
+
+    #[cfg(all(test, feature = "channels"))]
+    pub(crate) fn fail_weixin_phase_before_append_for_test(
+        run_id: &str,
+        phase: echo_agent::delivery::DeliveryPhase,
+    ) {
+        weixin_before_append_faults_for_test()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(run_id.to_string(), phase);
+    }
+
+    pub(crate) fn weixin_journal_head(&self) -> Result<u64, ShadowError> {
+        let guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| ShadowError::AuthorityClosed(self.event_path.display().to_string()))?;
+        Ok(state.journal.last_sequence())
     }
 }

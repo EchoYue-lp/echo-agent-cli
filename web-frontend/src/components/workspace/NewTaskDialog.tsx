@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { X, FolderPlus, MoreHorizontal, ArrowRight, Trash2 } from 'lucide-react';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { workspaceApi, type ProjectSource, type Workspace } from '../../api/endpoints';
@@ -20,6 +20,24 @@ interface Props {
   initialSource?: ProjectSourceDraft['kind'];
 }
 
+function observeDirectory(original: Promise<{ path: string }>): Promise<{ path: string }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    original,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            new Error(
+              '远程目录验证尚未确认，未发起创建；可稍后再次点击重试观察，或取消。原验证仍由连接持有。'
+            )
+          ),
+        30_000
+      );
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props) {
   const workspaces = useWorkspaceStore((s) => s.workspaces);
   const current = useWorkspaceStore((s) => s.current);
@@ -36,8 +54,69 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
   const [reconnecting, setReconnecting] = useState<Workspace>();
   const [defaultRoot, setDefaultRoot] = useState('');
   const [creating, setCreating] = useState(false);
+  const [creationStage, setCreationStage] = useState('处理中…');
   const [error, setError] = useState('');
   const [showPicker, setShowPicker] = useState(false);
+  const live = useRef(false);
+  const opened = useRef(isOpen);
+  opened.current = isOpen;
+  const operation = useRef<symbol | null>(null);
+  const verification = useRef<{
+    key: string;
+    owner: string;
+    settled: boolean;
+    promise: Promise<{ path: string }>;
+  } | null>(null);
+
+  useEffect(() => {
+    live.current = true;
+    return () => {
+      live.current = false;
+      operation.current = null;
+    };
+  }, []);
+  useEffect(() => {
+    operation.current = null;
+    setCreating(false);
+  }, [isOpen, initialSource]);
+  const ownsOperation = (token: symbol) =>
+    live.current && opened.current && operation.current === token;
+  const verifyRemote = async (intent: Extract<ProjectSource, { kind: 'ssh' }>) => {
+    const target = {
+      kind: 'ssh' as const,
+      host: intent.host,
+      user: intent.user,
+      port: intent.port,
+    };
+    const key = JSON.stringify([intent.connection_id, target, intent.path.trim()]);
+    let pending = verification.current;
+    if (
+      pending &&
+      !pending.settled &&
+      pending.owner === intent.connection_id &&
+      pending.key !== key
+    )
+      throw new Error('原目录验证仍未确认，请等待原操作结算或断开连接；未发起创建。');
+    if (!pending || pending.key !== key || pending.settled) {
+      const record = {
+        key,
+        owner: intent.connection_id,
+        settled: false,
+        promise: workspaceApi.verifySsh(intent.connection_id, target, intent.path.trim()),
+      };
+      verification.current = record;
+      void record.promise.then(
+        () => {
+          record.settled = true;
+        },
+        () => {
+          record.settled = true;
+        }
+      );
+      pending = record;
+    }
+    return observeDirectory(pending.promise);
+  };
 
   useEffect(() => {
     if (isOpen) {
@@ -98,6 +177,7 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
   if (!isOpen) return null;
 
   const handleCreate = async () => {
+    if (operation.current) return;
     const name = newName.trim();
     if (!name) {
       setError('请输入工作空间名称');
@@ -105,16 +185,30 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
     }
     setCreating(true);
     setError('');
+    const token = Symbol('create-workspace');
+    operation.current = token;
     try {
-      const intent = source.kind === 'ssh' ? remoteSource : localProjectSource(source);
-      if (!intent) throw new Error('请先完成 SSH 认证并验证远程目录');
+      let intent = source.kind === 'ssh' ? remoteSource : localProjectSource(source);
+      if (!intent) throw new Error('请先测试 SSH 连接');
+      if (intent.kind === 'ssh') {
+        if (!intent.path.trim()) throw new Error('请输入远程项目文件夹，连接测试不要求目录');
+        setCreationStage('正在验证远程目录…');
+        const verified = await verifyRemote(intent);
+        if (!ownsOperation(token)) return;
+        intent = { ...intent, path: verified.path };
+      }
+      setCreationStage('正在创建工作空间…');
       await createAndSwitch(name, newKind, undefined, intent);
+      if (!ownsOperation(token)) return;
       onClose();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : '创建失败';
-      setError(msg);
+      if (ownsOperation(token)) setError(msg);
     } finally {
-      setCreating(false);
+      if (ownsOperation(token)) {
+        operation.current = null;
+        setCreating(false);
+      }
     }
   };
 
@@ -144,16 +238,26 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
   };
 
   const handleReconnect = async () => {
-    if (!reconnecting || remoteSource?.kind !== 'ssh') return;
+    if (!reconnecting || remoteSource?.kind !== 'ssh' || operation.current) return;
+    const token = Symbol('reconnect-workspace');
+    operation.current = token;
     setCreating(true);
     setError('');
     try {
+      setCreationStage('正在验证原远程目录…');
+      await verifyRemote(remoteSource);
+      if (!ownsOperation(token)) return;
+      setCreationStage('正在连接工作空间…');
       await switchTo(reconnecting.id, remoteSource.connection_id);
+      if (!ownsOperation(token)) return;
       onClose();
     } catch (error) {
-      setError(error instanceof Error ? error.message : '连接失败');
+      if (ownsOperation(token)) setError(error instanceof Error ? error.message : '连接失败');
     } finally {
-      setCreating(false);
+      if (ownsOperation(token)) {
+        operation.current = null;
+        setCreating(false);
+      }
     }
   };
 
@@ -166,6 +270,13 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
       const msg = e instanceof Error ? e.message : '删除失败';
       setError(msg);
     }
+  };
+
+  const returnToList = () => {
+    operation.current = null;
+    setRemoteSource(undefined);
+    setView('list');
+    setError('');
   };
 
   const kindIcon = (kind: { type: string }) => {
@@ -202,10 +313,7 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
             {view !== 'list' && (
               <button
                 disabled={creating}
-                onClick={() => {
-                  setView('list');
-                  setError('');
-                }}
+                onClick={returnToList}
                 className="text-xs px-2 py-1 rounded-md hover:opacity-80"
                 style={{ color: 'var(--text-secondary)' }}
               >
@@ -394,6 +502,9 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
                   value={newName}
                   onChange={(e) => setNewName(e.target.value)}
                   onKeyDown={(e) => {
+                    // Candidate confirmation must not create or switch projects.
+                    // WebKit may clear isComposing before its final Enter.
+                    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
                     if (e.key === 'Enter' && !creating) void handleCreate();
                   }}
                   placeholder="例：用户行为分析、NLP论文综述..."
@@ -447,15 +558,21 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
         {/* Footer (create view only) */}
         {view !== 'list' && (
           <div
-            className="flex items-center justify-end gap-2 border-t px-5 py-3"
+            className="flex flex-wrap items-center justify-end gap-2 border-t px-5 py-3"
             style={{ borderColor: 'var(--border-primary)' }}
           >
+            {source.kind === 'ssh' && !creating && (
+              <p className="mr-auto w-full text-xs text-[var(--text-tertiary)]" role="status">
+                {!remoteSource
+                  ? '请先测试 SSH 连接，登录成功后才可创建。'
+                  : !source.remotePath.trim()
+                    ? '连接已通过，请填写远程项目文件夹。'
+                    : '登录已通过；点击后验证远程目录并进入。'}
+              </p>
+            )}
             <button
               disabled={creating}
-              onClick={() => {
-                setView('list');
-                setError('');
-              }}
+              onClick={returnToList}
               className="rounded-lg px-4 py-2 text-sm transition-colors hover:opacity-80"
               style={{ color: 'var(--text-secondary)' }}
             >
@@ -467,12 +584,13 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
                 creating ||
                 (view === 'reconnect'
                   ? !remoteSource
-                  : !newName.trim() || (source.kind === 'ssh' && !remoteSource))
+                  : !newName.trim() ||
+                    (source.kind === 'ssh' && (!remoteSource || !source.remotePath.trim())))
               }
               className="rounded-lg px-5 py-2 text-sm font-medium text-[var(--text-on-accent)] transition-colors disabled:opacity-50"
               style={{ background: 'var(--accent)' }}
             >
-              {creating ? '处理中…' : view === 'reconnect' ? '连接并进入' : '创建并进入'}
+              {creating ? creationStage : view === 'reconnect' ? '连接并进入' : '创建并进入'}
             </button>
           </div>
         )}

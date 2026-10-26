@@ -802,7 +802,8 @@ impl echo_agent_app_core::api::chat_driver::ChatSink for ReplChatSink {
                     conversation_input_fact_phase(fact.as_ref())
                 ))
             }
-            echo_agent_app_core::api::chat_driver::ChatDriverEvent::HitlRequestReleased { .. } => true,
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::HitlRequestReleased { .. }
+            | echo_agent_app_core::api::chat_driver::ChatDriverEvent::WeixinControlDelivery(_) => true,
             echo_agent_app_core::api::chat_driver::ChatDriverEvent::ApprovalRequest {
                 request_id,
                 tool_name,
@@ -865,12 +866,16 @@ fn conversation_input_fact_phase(
     match fact {
         ConversationInputFact::Persisted { .. } => "persisted",
         ConversationInputFact::AttemptStarted { .. } => "attempt_started",
+        ConversationInputFact::TaskRunTargetBound { .. } => "task_target_bound",
         ConversationInputFact::MailboxAccepted { .. } => "mailbox_accepted",
-        ConversationInputFact::Drained { .. } => "drained",
+        ConversationInputFact::Drained { .. } | ConversationInputFact::DriverAccepted { .. } => {
+            "drained"
+        }
         ConversationInputFact::TurnSettled { .. } => "turn_settled",
         ConversationInputFact::Deferred { .. } => "deferred",
         ConversationInputFact::Reordered { .. } => "reordered",
-        ConversationInputFact::RecoveryRequired { .. } => "recovery_required",
+        ConversationInputFact::RecoveryRequired { .. }
+        | ConversationInputFact::RecoveryUncertain { .. } => "recovery_required",
         ConversationInputFact::Cancelled { .. } => "cancelled",
     }
 }
@@ -3723,6 +3728,7 @@ mod tests {
                 payload_sha256: "hash".to_string(),
             },
             payload: ConversationInputPayload {
+                channel_binding: None,
                 domain_plugin: None,
                 text: "hello".to_string(),
                 attachments: Vec::new(),

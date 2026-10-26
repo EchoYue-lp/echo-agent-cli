@@ -3,29 +3,51 @@ use crate::agent_router::{AgentAddress, AgentDeliveryRecord, AgentGroupMember, A
 use crate::state::AppState;
 use crate::workspace::WorkspaceId;
 use std::sync::Arc;
+/// Read/parse/admission knowledge from the original command owner. These are
+/// plain result values; the channel's existing delivery journal owns receipts.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AgentTextCommandError {
+    #[error("{0}")]
+    InvalidInput(String),
+    #[error("{0}")]
+    Unavailable(String),
+    #[error("{0}")]
+    Operation(String),
+}
+
 pub async fn list_agent_endpoints(state: Option<&Arc<AppState>>) -> String {
-    let Some(state) = state else {
-        return "Agent routing is not initialized.".to_string();
-    };
-    match state.discover_agent_endpoints().await {
-        Ok(endpoints) if endpoints.is_empty() => "No persisted Agent conversations.".to_string(),
-        Ok(endpoints) => endpoints
-            .into_iter()
-            .map(|endpoint| {
-                format!(
-                    "{}/{}  {}",
-                    endpoint.address.workspace_id,
-                    endpoint.address.conversation_id,
-                    endpoint
-                        .conversation_title
-                        .as_deref()
-                        .unwrap_or("Untitled conversation")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Err(error) => format!("Agent discovery failed: {error}"),
+    list_agent_endpoints_result(state)
+        .await
+        .unwrap_or_else(|error| error.to_string())
+}
+
+pub(crate) async fn list_agent_endpoints_result(
+    state: Option<&Arc<AppState>>,
+) -> Result<String, AgentTextCommandError> {
+    let state = state.ok_or_else(|| {
+        AgentTextCommandError::Unavailable("Agent routing is not initialized.".to_string())
+    })?;
+    let endpoints = state.discover_agent_endpoints().await.map_err(|error| {
+        AgentTextCommandError::Unavailable(format!("Agent discovery failed: {error}"))
+    })?;
+    if endpoints.is_empty() {
+        return Ok("No persisted Agent conversations.".to_string());
     }
+    Ok(endpoints
+        .into_iter()
+        .map(|endpoint| {
+            format!(
+                "{}/{}  {}",
+                endpoint.address.workspace_id,
+                endpoint.address.conversation_id,
+                endpoint
+                    .conversation_title
+                    .as_deref()
+                    .unwrap_or("Untitled conversation")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 pub async fn send_agent_text(
@@ -35,23 +57,42 @@ pub async fn send_agent_text(
     conversation_id: &str,
     text: &str,
 ) -> String {
-    let Some(state) = state else {
-        return "Agent routing is not initialized.".to_string();
-    };
+    send_agent_text_result(state, from, workspace_id, conversation_id, text)
+        .await
+        .unwrap_or_else(|error| error.to_string())
+}
+
+pub(crate) async fn send_agent_text_result(
+    state: Option<&Arc<AppState>>,
+    from: Option<AgentAddress>,
+    workspace_id: &str,
+    conversation_id: &str,
+    text: &str,
+) -> Result<String, AgentTextCommandError> {
+    let state = state.ok_or_else(|| {
+        AgentTextCommandError::Unavailable("Agent routing is not initialized.".to_string())
+    })?;
     let target = AgentAddress::new(
         WorkspaceId::from_raw(workspace_id.to_string()),
         conversation_id.to_string(),
     );
-    match state
+    let receipt = state
         .send_agent_message_owned(AgentMessage::user_text(from, target, text))
         .await
-    {
-        Ok(receipt) => format!(
-            "Message {} queued for {}/{}.",
-            receipt.message_id, receipt.target.workspace_id, receipt.target.conversation_id
-        ),
-        Err(error) => format!("Agent send failed: {error}"),
+        .map_err(|error| AgentTextCommandError::Operation(format!("Agent send failed: {error}")))?;
+    let display = format!(
+        "Message {} queued for {}/{}.",
+        receipt.message_id, receipt.target.workspace_id, receipt.target.conversation_id
+    );
+    // Queue admission is the operation result; it is not recipient execution.
+    // A degraded durable receipt must never become an Applied channel control.
+    if !matches!(
+        receipt.durability,
+        crate::agent_router::AgentDeliveryDurability::Confirmed
+    ) {
+        return Err(AgentTextCommandError::Operation(display));
     }
+    Ok(display)
 }
 
 pub async fn agent_delivery_status(
@@ -60,17 +101,31 @@ pub async fn agent_delivery_status(
     conversation_id: &str,
     message_id: Option<&str>,
 ) -> String {
-    let Some(state) = state else {
-        return "Agent routing is not initialized.".to_string();
-    };
+    agent_delivery_status_result(state, workspace_id, conversation_id, message_id)
+        .await
+        .unwrap_or_else(|error| error.to_string())
+}
+
+pub(crate) async fn agent_delivery_status_result(
+    state: Option<&Arc<AppState>>,
+    workspace_id: &str,
+    conversation_id: &str,
+    message_id: Option<&str>,
+) -> Result<String, AgentTextCommandError> {
+    let state = state.ok_or_else(|| {
+        AgentTextCommandError::Unavailable("Agent routing is not initialized.".to_string())
+    })?;
     let target = AgentAddress::new(
         WorkspaceId::from_raw(workspace_id.to_string()),
         conversation_id.to_string(),
     );
-    match state.agent_delivery_records(&target).await {
-        Ok(records) => format_delivery_records(records, message_id),
-        Err(error) => format!("Agent status failed: {error}"),
-    }
+    state
+        .agent_delivery_records(&target)
+        .await
+        .map(|records| format_delivery_records(records, message_id))
+        .map_err(|error| {
+            AgentTextCommandError::Unavailable(format!("Agent status failed: {error}"))
+        })
 }
 
 const AGENT_GROUP_USAGE: &str = "Usage: /agent-group <list|create|update|delete> [args]\n\
@@ -141,71 +196,99 @@ fn format_agent_groups(groups: Vec<crate::agent_router::AgentGroup>) -> String {
 }
 
 pub async fn execute_agent_group_command(state: Option<&Arc<AppState>>, args: &[&str]) -> String {
-    let Some(state) = state else {
-        return "Agent routing is not initialized.".to_string();
-    };
-    let Some(operation) = args.first().copied() else {
-        return AGENT_GROUP_USAGE.to_string();
-    };
+    execute_agent_group_command_result(state, args)
+        .await
+        .unwrap_or_else(|error| error.to_string())
+}
+
+pub(crate) async fn execute_agent_group_command_result(
+    state: Option<&Arc<AppState>>,
+    args: &[&str],
+) -> Result<String, AgentTextCommandError> {
+    let state = state.ok_or_else(|| {
+        AgentTextCommandError::Unavailable("Agent routing is not initialized.".to_string())
+    })?;
+    let usage = || AgentTextCommandError::InvalidInput(AGENT_GROUP_USAGE.to_string());
+    let operation = args.first().copied().ok_or_else(usage)?;
     match operation {
-        "list" => match state.list_agent_groups().await {
-            Ok(groups) => format_agent_groups(groups),
-            Err(error) => format!("Agent group list failed: {error}"),
-        },
+        "list" => state
+            .list_agent_groups()
+            .await
+            .map(format_agent_groups)
+            .map_err(|error| {
+                AgentTextCommandError::Unavailable(format!("Agent group list failed: {error}"))
+            }),
         "create" => {
             let (Some(name), Some(leader_workspace), Some(leader_conversation)) =
                 (args.get(1), args.get(2), args.get(3))
             else {
-                return AGENT_GROUP_USAGE.to_string();
+                return Err(usage());
             };
             let members = match args.get(4..).map(parse_group_members) {
                 Some(Ok(members)) => members,
-                Some(Err(error)) => return format!("Agent group create failed: {error}"),
-                None => return AGENT_GROUP_USAGE.to_string(),
+                Some(Err(error)) => {
+                    return Err(AgentTextCommandError::InvalidInput(format!(
+                        "Agent group create failed: {error}"
+                    )));
+                }
+                None => return Err(usage()),
             };
             let leader = AgentAddress::new(
                 WorkspaceId::from_raw((*leader_workspace).to_string()),
                 (*leader_conversation).to_string(),
             );
-            match state.create_agent_group(*name, leader, members).await {
-                Ok(group) => format!("Agent group {} created.", group.group_id),
-                Err(error) => format!("Agent group create failed: {error}"),
-            }
+            state
+                .create_agent_group(*name, leader, members)
+                .await
+                .map(|group| format!("Agent group {} created.", group.group_id))
+                .map_err(|error| {
+                    AgentTextCommandError::Operation(format!("Agent group create failed: {error}"))
+                })
         }
         "update" => {
             let (Some(group_id), Some(name), Some(leader_workspace), Some(leader_conversation)) =
                 (args.get(1), args.get(2), args.get(3), args.get(4))
             else {
-                return AGENT_GROUP_USAGE.to_string();
+                return Err(usage());
             };
             let members = match args.get(5..).map(parse_group_members) {
                 Some(Ok(members)) => members,
-                Some(Err(error)) => return format!("Agent group update failed: {error}"),
-                None => return AGENT_GROUP_USAGE.to_string(),
+                Some(Err(error)) => {
+                    return Err(AgentTextCommandError::InvalidInput(format!(
+                        "Agent group update failed: {error}"
+                    )));
+                }
+                None => return Err(usage()),
             };
             let leader = AgentAddress::new(
                 WorkspaceId::from_raw((*leader_workspace).to_string()),
                 (*leader_conversation).to_string(),
             );
-            match state
+            state
                 .update_agent_group(*group_id, *name, leader, members)
                 .await
-            {
-                Ok(group) => format!("Agent group {} updated.", group.group_id),
-                Err(error) => format!("Agent group update failed: {error}"),
-            }
+                .map(|group| format!("Agent group {} updated.", group.group_id))
+                .map_err(|error| {
+                    AgentTextCommandError::Operation(format!("Agent group update failed: {error}"))
+                })
         }
         "delete" => {
-            let Some(group_id) = args.get(1) else {
-                return AGENT_GROUP_USAGE.to_string();
-            };
-            match state.delete_agent_group(group_id).await {
-                Ok(true) => format!("Agent group {group_id} deleted."),
-                Ok(false) => format!("Agent group {group_id} does not exist."),
-                Err(error) => format!("Agent group delete failed: {error}"),
-            }
+            let group_id = args.get(1).ok_or_else(usage)?;
+            state
+                .delete_agent_group(group_id)
+                .await
+                .map(|deleted| {
+                    if deleted {
+                        format!("Agent group {group_id} deleted.")
+                    } else {
+                        format!("Agent group {group_id} does not exist.")
+                    }
+                })
+                .map_err(|error| {
+                    AgentTextCommandError::Operation(format!("Agent group delete failed: {error}"))
+                })
         }
-        _ => AGENT_GROUP_USAGE.to_string(),
+        _ => Err(usage()),
     }
 }
 

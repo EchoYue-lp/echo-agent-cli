@@ -8,6 +8,7 @@ use echo_agent_app_core::api::types::{
     AgentConfigResponse, ChannelsConfigResponse, FeishuConfigResponse, FullConfigResponse,
     LoggingConfigResponse, McpConfigResponse, ModelConfigResponse, QqConfigResponse,
     ServerConfigResponse, SessionConfigResponse, UpdateConfigRequest, UpdateFullConfigRequest,
+    WeixinConfigResponse,
 };
 
 fn configured_model_names(cfg: &echo_agent_app_core::api::config::EkoConfig) -> Vec<String> {
@@ -60,6 +61,16 @@ fn full_config_response(cfg: &echo_agent_app_core::api::config::EkoConfig) -> Fu
                 enabled: cfg.channels.feishu.enabled,
                 app_id: cfg.channels.feishu.app_id.clone(),
                 mode: cfg.channels.feishu.mode.clone(),
+            },
+            weixin: WeixinConfigResponse {
+                enabled: cfg.channels.weixin.enabled,
+                has_credential: cfg.channels.weixin.account.is_some(),
+                account_id: cfg
+                    .channels
+                    .weixin
+                    .account
+                    .as_ref()
+                    .map(|account| account.account_id.clone()),
             },
             session: SessionConfigResponse {
                 timeout_minutes: cfg.channels.session.timeout_minutes,

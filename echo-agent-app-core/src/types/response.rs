@@ -176,7 +176,16 @@ pub struct McpConfigResponse {
 pub struct ChannelsConfigResponse {
     pub qq: QqConfigResponse,
     pub feishu: FeishuConfigResponse,
+    pub weixin: WeixinConfigResponse,
     pub session: SessionConfigResponse,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "WeixinConfigResponse")]
+pub struct WeixinConfigResponse {
+    pub enabled: bool,
+    pub has_credential: bool,
+    pub account_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, TS)]

@@ -230,7 +230,53 @@ pub struct McpYamlConfig {
 pub struct ChannelsConfig {
     pub qq: QqChannelConfig,
     pub feishu: FeishuChannelConfig,
+    pub weixin: WeixinChannelConfig,
     pub session: SessionYamlConfig,
+}
+
+/// EKO's local account policy. Protocol types stay optional with `channels`,
+/// so ordinary config loading does not activate a transport dependency.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WeixinChannelConfig {
+    pub enabled: bool,
+    pub account: Option<WeixinAccountConfig>,
+    pub notifications: std::collections::HashMap<String, WeixinNotificationConfig>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct WeixinAccountConfig {
+    pub account_id: String,
+    pub bot_token: String,
+    pub base_url: String,
+    pub user_id: String,
+    /// Persisted authorization identity; a process restart does not rotate it.
+    pub generation: String,
+}
+
+impl std::fmt::Debug for WeixinAccountConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeixinAccountConfig")
+            .field("account_id", &self.account_id)
+            .field("bot_token", &"[redacted]")
+            .field("base_url", &"[redacted]")
+            .field("user_id", &self.user_id)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+/// A user-selected destination for future occurrences. The original run
+/// admission freezes this value; later configuration cannot retarget that run.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WeixinNotificationConfig {
+    pub definition_id: String,
+    pub account_id: String,
+    pub credential_generation: String,
+    pub peer_id: String,
+    pub context_ref: String,
+    pub workspace_id: String,
+    pub channel_conversation: String,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]

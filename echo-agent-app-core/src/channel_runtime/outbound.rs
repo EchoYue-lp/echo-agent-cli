@@ -550,24 +550,6 @@ fn channel_outbound_transport_with_rate<'a>(
     .boxed()
 }
 
-pub(super) fn immediate_channel_response<'a>(
-    message: &echo_agent::channels::InboundMessage,
-    text: impl Into<String>,
-) -> futures::stream::BoxStream<'a, echo_agent::error::Result<echo_agent::channels::OutboundMessage>>
-{
-    use futures::StreamExt;
-
-    let text = text.into();
-    let drafts =
-        futures::stream::once(async move { Ok(ChannelOutboundDraft::ordinary(text)) }).boxed();
-    channel_outbound_transport(
-        drafts,
-        message.channel_id.clone(),
-        message.reply_target().to_string(),
-        message.chat_type,
-    )
-}
-
 #[derive(Clone, Copy, Default)]
 enum ChannelAnsiState {
     #[default]

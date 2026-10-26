@@ -2105,7 +2105,27 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                         })
                     })
                     .unwrap_or_else(|| echo_agent::subagent::subagent_status_from_error(&error))?;
-                let request = if let Some(failure) = typed_failure.as_ref().filter(|failure| {
+                let request = if typed_failure.as_ref().is_some_and(|failure| {
+                    super::compact_context::is_required_context_unavailable(failure)
+                }) {
+                    // 沿原 exact-claim interruption/CAS 结算为 Paused，不能只设 Blocked
+                    // （原 resume_runtime_task 只恢复 Paused），也不能伪装物理未结算。
+                    let _requested =
+                        echo_agent::tasks::RuntimeDagController::request_task_interruption(
+                            self,
+                            run_id,
+                            &runtime_task,
+                            &claim,
+                            echo_agent::tasks::RuntimeInterruptionDisposition::Paused {
+                                reason: message.clone(),
+                            },
+                        )
+                        .await?;
+                    echo_agent::tasks::RuntimeTaskResolutionRequest::Blocked {
+                        error: message.clone(),
+                        disposition: echo_agent::tasks::RuntimeStopDisposition::Pause,
+                    }
+                } else if let Some(failure) = typed_failure.as_ref().filter(|failure| {
                     failure.retryable
                         && failure.category == echo_agent::error::AgentFailureCategory::Llm
                 }) {

@@ -60,7 +60,7 @@ const BYTES_PER_TOKEN: usize = 4;
 
 /// Number of Unicode scalar values retained as a preview when a paste is
 /// spilled. The preview is UTF-8 safe (collected via `chars().take`).
-const PREVIEW_CHARS: usize = 400;
+pub(crate) const PREVIEW_CHARS: usize = 400;
 const USER_INPUT_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Errors raised while preparing a user turn.
@@ -712,11 +712,57 @@ fn spill_to_artifact(
     display_name: &str,
     source: AttachmentSource,
 ) -> Result<InputResourceRef> {
+    spill_to_artifact_at(
+        text,
+        spill_dir,
+        conversation_id,
+        turn_id,
+        display_name,
+        source,
+        None,
+    )
+}
+
+/// 从原 Run journal 全文再物化只读输入缓存；不是第二份可编辑要求状态。
+/// 内容寻址保持重复投影/冷重开的引用稳定，丢失缓存仍可由 journal 重建。
+pub(crate) fn materialize_recorded_user_text(
+    text: &str,
+    spill_dir: &Path,
+    conversation_id: &str,
+    turn_id: &str,
+) -> Result<InputResourceRef> {
+    let name = format!(
+        "recorded-{}.txt",
+        hex::encode(Sha256::digest(text.as_bytes()))
+    );
+    spill_to_artifact_at(
+        text,
+        spill_dir,
+        Some(conversation_id),
+        Some(turn_id),
+        "recorded-user-instruction.txt",
+        AttachmentSource::Message,
+        Some(&name),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spill_to_artifact_at(
+    text: &str,
+    spill_dir: &Path,
+    conversation_id: Option<&str>,
+    turn_id: Option<&str>,
+    display_name: &str,
+    source: AttachmentSource,
+    stable_name: Option<&str>,
+) -> Result<InputResourceRef> {
     let conv = path_component(conversation_id.unwrap_or("unscoped"));
     let turn = path_component(turn_id.unwrap_or(&uuid::Uuid::new_v4().to_string()));
-    let nonce = uuid::Uuid::new_v4();
+    let file_name = stable_name
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}-paste.txt", uuid::Uuid::new_v4()));
     let directory = spill_dir.join(&conv).join(&turn);
-    let final_path = directory.join(format!("{nonce}-paste.txt"));
+    let final_path = directory.join(file_name);
 
     if let Err(error) = cleanup_user_input_older_than(spill_dir, USER_INPUT_MAX_AGE) {
         tracing::warn!(path = %spill_dir.display(), %error, "failed to clean expired user-input artifacts");
@@ -727,12 +773,18 @@ fn spill_to_artifact(
     })?;
 
     let bytes = text.as_bytes();
-    echo_agent::utils::fs::atomic_write(&final_path, bytes).map_err(|source| {
-        PreparedTurnError::Write {
-            path: final_path.clone(),
-            source,
-        }
-    })?;
+    // 稳定引用命中时不改 inode/mtime，原 read_artifact cursor 可继续读同一快照。
+    // 缺失或损坏仅从已读取的 journal 原文再物化；原文权威不写回此缓存。
+    let unchanged = stable_name.is_some()
+        && std::fs::read(&final_path).is_ok_and(|existing| existing.as_slice() == bytes);
+    if !unchanged {
+        echo_agent::utils::fs::atomic_write(&final_path, bytes).map_err(|source| {
+            PreparedTurnError::Write {
+                path: final_path.clone(),
+                source,
+            }
+        })?;
+    }
 
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -795,7 +847,10 @@ fn build_data_reference(artifact: &InputResourceRef) -> String {
 
 /// Preserve the semantics of an oversized original message. Unlike an
 /// attached paste, this artifact may itself contain the user's instructions.
-fn build_original_message_reference(original_text: &str, artifact: &InputResourceRef) -> String {
+pub(crate) fn build_original_message_reference(
+    original_text: &str,
+    artifact: &InputResourceRef,
+) -> String {
     let sha = artifact.sha256.as_deref().unwrap_or("(unknown)");
     let lines = artifact.lines.unwrap_or(0);
     let bytes = artifact.bytes;

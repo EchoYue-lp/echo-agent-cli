@@ -519,11 +519,15 @@ impl ArtifactKind {
 #[ts(export, rename = "RuntimeEventKind")]
 pub enum RuntimeEventKind {
     RunCreated,
+    /// Typed framework delivery events committed by the original TaskRun journal.
+    WeixinDeliveryRecorded,
     /// The user explicitly replaced the sole authoritative TaskRun Goal.
     RunGoalUpdated,
     /// A user steer landed in a run-bound turn — an incremental constraint
     /// that must survive context compression alongside the Goal.
     RunSteerRecorded,
+    /// 原输入版本已被任务journal耐久接受；不代表进入context、Applied或当前有效。
+    RunInputAccepted,
     /// Existing evidence was detached from an older Goal revision.
     RequirementEvidenceInvalidated,
     /// Unchanged evidence was explicitly rebound after a Goal-aware plan update.
@@ -634,8 +638,10 @@ impl RuntimeEventKind {
         use RuntimeEventKind::*;
         match self {
             RunCreated => "run_created",
+            WeixinDeliveryRecorded => "weixin_delivery_recorded",
             RunGoalUpdated => "run_goal_updated",
             RunSteerRecorded => "run_steer_recorded",
+            RunInputAccepted => "run_input_accepted",
             RequirementEvidenceInvalidated => "requirement_evidence_invalidated",
             RequirementEvidenceRevalidated => "requirement_evidence_revalidated",
             RequirementSkipped => "requirement_skipped",
@@ -739,8 +745,10 @@ impl RuntimeEventKind {
         use RuntimeEventKind::*;
         Some(match s {
             "run_created" => RunCreated,
+            "weixin_delivery_recorded" => WeixinDeliveryRecorded,
             "run_goal_updated" => RunGoalUpdated,
             "run_steer_recorded" => RunSteerRecorded,
+            "run_input_accepted" => RunInputAccepted,
             "requirement_evidence_invalidated" => RequirementEvidenceInvalidated,
             "requirement_evidence_revalidated" => RequirementEvidenceRevalidated,
             "requirement_skipped" => RequirementSkipped,
@@ -860,10 +868,33 @@ pub struct TaskRun {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One finite, live page of formal task runs. Continuations do not own a snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskRunPage {
+    pub items: Vec<TaskRun>,
+    pub next_continuation: Option<String>,
+}
+
+/// A finite journal slice; sequence positions retain the original lossless string wire.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskEventPage {
+    pub events: Vec<RuntimeTaskEvent>,
+    #[serde(
+        serialize_with = "serialize_seq_as_string",
+        deserialize_with = "deserialize_seq_from_string"
+    )]
+    #[ts(type = "string")]
+    pub next_after_sequence: i64,
+    pub has_more: bool,
+}
+
 /// Immutable product provenance for a TaskRun. This is deliberately separate
 /// from `route`: route is diagnostic text, while provenance controls recovery
 /// and surface projection without reviving a string-based interaction mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRunProvenance {
     ConversationTurn,
@@ -874,7 +905,8 @@ pub enum TaskRunProvenance {
 /// Whether an orchestrated primary Agent may complete read-only work directly
 /// or must first materialize a revisioned plan. It is execution policy, not a
 /// TaskRun lifecycle state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum RunPlanPolicy {
     #[default]
@@ -882,13 +914,15 @@ pub enum RunPlanPolicy {
     AllowDirect,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct TaskRunExecutionProfile {
     pub provenance: TaskRunProvenance,
     pub plan_policy: RunPlanPolicy,
     /// None means a legacy run without trustworthy delegation authorization.
     /// Only a genuinely new RunCreated admission captures the config default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<u8>", optional)]
     pub subagent_depth_limit: Option<crate::subagent_policy::SubagentDepthLimit>,
 }
 
@@ -949,14 +983,17 @@ impl TaskRunExecutionProfile {
 /// A later lookup must match every field and remain paused. This prevents a
 /// delayed command from driving a deleted-and-recreated run that reused the
 /// same external run id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct TaskRunResumeIdentity {
     pub run_id: String,
     pub workspace_id: String,
     pub conversation_id: String,
     pub root_message_id: String,
     pub created_at: DateTime<Utc>,
+    #[ts(type = "number")]
     pub goal_revision: u64,
+    #[ts(type = "number")]
     pub journal_sequence: u64,
     pub continuation_enabled: bool,
     pub execution_profile: TaskRunExecutionProfile,
@@ -1487,8 +1524,82 @@ pub struct RecordedUserSteer {
     pub recorded_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// 同一 TaskRun 接受的不可变源版本；原输入 journal 仍拥有可编辑队列与投递生命周期。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunInputSnapshot {
+    pub source: crate::conversation_input::ConversationInputSource,
+    pub identity: crate::conversation_input::ConversationInputIdentity,
+    pub payload: crate::conversation_input::ConversationInputPayload,
+}
+
+impl RunInputSnapshot {
+    pub(crate) fn key(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&(
+            &self.identity.address,
+            &self.identity.input_id,
+            self.identity.revision,
+        ))
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        use crate::conversation_input::{ConversationInputPayload, ConversationInputSource};
+        let identity = &self.identity;
+        if identity.input_id.trim().is_empty()
+            || identity.revision == 0
+            || identity.address.workspace_id.trim().is_empty()
+            || identity.address.conversation_id.trim().is_empty()
+            || identity.payload_sha256 != self.payload.payload_sha256
+            || (self.source != ConversationInputSource::Channel
+                && self.payload.channel_binding.is_some())
+        {
+            return Err("原输入身份、来源或修订不匹配".to_string());
+        }
+        let rebuilt = match self.payload.channel_binding.as_ref() {
+            Some(binding) => ConversationInputPayload::new_for_channel(
+                &identity.address,
+                self.payload.text.clone(),
+                self.payload.attachments.clone(),
+                self.payload.domain_plugin.clone(),
+                binding.clone(),
+            ),
+            None => ConversationInputPayload::new_with_domain(
+                self.payload.text.clone(),
+                self.payload.attachments.clone(),
+                self.payload.domain_plugin.clone(),
+            ),
+        }
+        .map_err(|_| "原输入版本无法验证".to_string())?;
+        if rebuilt.payload_sha256 != identity.payload_sha256 {
+            return Err("原输入正文与已持久摘要不匹配".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// 仅区分原输入接受用途，不承担投递或要求生效状态机。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunInputRole {
+    InitialGoal,
+    Steer,
+}
+
+/// 只证明 TaskRuntime 原 journal 已接受此源版本，不证明 mailbox、Drained 或 Applied。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunInputAcceptance {
+    pub role: RunInputRole,
+    pub run_id: String,
+    pub turn_id: String,
+    pub source: crate::conversation_input::ConversationInputSource,
+    pub identity: crate::conversation_input::ConversationInputIdentity,
+    pub journal_sequence: i64,
+    pub duplicate: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct RunStateEventIndex {
+    #[serde(default)]
+    pub(crate) accepted_user_inputs: std::collections::BTreeMap<String, RunInputAcceptance>,
     #[serde(default)]
     pub(crate) started_turns: std::collections::BTreeSet<String>,
     #[serde(default)]

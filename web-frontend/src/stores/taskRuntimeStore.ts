@@ -17,9 +17,20 @@ const MAX_EVENTS = 500;
 let refreshInFlight = false;
 let loadGeneration = 0;
 let refreshRequestGeneration = 0;
+let inventoryRequestGeneration = 0;
+let historyRequestGeneration = 0;
+let historyRefreshRequestGeneration = 0;
+let eventRequestGeneration = 0;
+let pollingTickInFlight = false;
 
 import { create } from 'zustand';
-import { taskRuntimeApi, toolExecutionApi } from '../api/endpoints';
+import {
+  taskRuntimeApi,
+  toolExecutionApi,
+  type ProductDataScope,
+  type TaskEventPage,
+} from '../api/endpoints';
+import { sameProductDataScope } from '../lib/productDataScope';
 import { viewAddress, type ViewAddress } from '../lib/viewAddress';
 import { ingestTaskRuntimeSubagentEvents } from './subagentRunStore';
 import {
@@ -41,10 +52,12 @@ import type {
   RunContinuationState,
   BackgroundCellState,
   CompletionGateReport,
+  TaskRunControlReceipt,
+  TaskRunResumeReceipt,
+  TaskRetryReceipt,
 } from '../generated';
 
 type RunSnapshot = {
-  run: TaskRun;
   plan: PlanRevision | null;
   todos: TodoItem[];
   artifacts: RuntimeArtifact[];
@@ -54,19 +67,22 @@ type RunSnapshot = {
   completionGate: CompletionGateReport;
 };
 
-async function loadRunSnapshot(workspaceId: string, run: TaskRun): Promise<RunSnapshot> {
+async function loadRunSnapshot(
+  workspaceId: string,
+  run: TaskRun,
+  generation?: string
+): Promise<RunSnapshot> {
   const [plan, todos, artifacts, recoveryBlockers, continuation, backgroundCells, completionGate] =
     await Promise.all([
-      taskRuntimeApi.getPlan(workspaceId, run.run_id),
-      taskRuntimeApi.listTodos(workspaceId, run.run_id),
-      taskRuntimeApi.listArtifacts(workspaceId, run.run_id),
-      taskRuntimeApi.listRecoveryBlockers(workspaceId, run.run_id),
-      taskRuntimeApi.getContinuation(workspaceId, run.run_id),
-      taskRuntimeApi.listBackgroundCells(workspaceId, run.run_id),
-      taskRuntimeApi.getCompletionGate(workspaceId, run.run_id),
+      taskRuntimeApi.getPlan(workspaceId, run.run_id, generation),
+      taskRuntimeApi.listTodos(workspaceId, run.run_id, generation),
+      taskRuntimeApi.listArtifacts(workspaceId, run.run_id, generation),
+      taskRuntimeApi.listRecoveryBlockers(workspaceId, run.run_id, generation),
+      taskRuntimeApi.getContinuation(workspaceId, run.run_id, generation),
+      taskRuntimeApi.listBackgroundCells(workspaceId, run.run_id, generation),
+      taskRuntimeApi.getCompletionGate(workspaceId, run.run_id, generation),
     ]);
   return {
-    run,
     plan,
     todos,
     artifacts,
@@ -75,6 +91,44 @@ async function loadRunSnapshot(workspaceId: string, run: TaskRun): Promise<RunSn
     backgroundCells,
     completionGate,
   };
+}
+
+function checkEventPage(page: TaskEventPage, runId: string, after: string): TaskEventPage {
+  if (!/^\d+$/.test(after) || page.events.length > 256)
+    throw new Error('执行记录分页位置或大小无效');
+  let sequence = BigInt(after);
+  for (const event of page.events) {
+    sequence += 1n;
+    if (event.run_id !== runId || !/^\d+$/.test(event.seq) || BigInt(event.seq) !== sequence) {
+      throw new Error('执行记录存在缺口或属于其它运行，请刷新');
+    }
+  }
+  if (
+    page.next_after_sequence !== sequence.toString() ||
+    (page.has_more && page.events.length === 0)
+  ) {
+    throw new Error('执行记录分页未提供有效的后续位置');
+  }
+  return page;
+}
+
+async function initialRunData(
+  workspaceId: string,
+  run: TaskRun,
+  generation?: string,
+  restoreChatTools = true
+) {
+  const [snapshot, page, persistedTools] = await Promise.all([
+    loadRunSnapshot(workspaceId, run, generation),
+    taskRuntimeApi.listEvents(workspaceId, run.run_id, '0', generation),
+    restoreChatTools
+      ? toolExecutionApi.list(workspaceId, run.conversation_id).catch((error) => {
+          console.warn('[TaskRuntime] Failed to restore persisted tool executions:', error);
+          return [];
+        })
+      : Promise.resolve([]),
+  ]);
+  return { snapshot, page: checkEventPage(page, run.run_id, '0'), persistedTools };
 }
 
 function completeTaskPatch(patch: Partial<TaskPatch>): TaskPatch {
@@ -93,7 +147,148 @@ function completeTaskPatch(patch: Partial<TaskPatch>): TaskPatch {
   };
 }
 
+export type TaskRuntimeView = Pick<
+  TaskRuntimeState,
+  | 'activeRun'
+  | 'plan'
+  | 'todos'
+  | 'events'
+  | 'artifacts'
+  | 'recoveryBlockers'
+  | 'continuation'
+  | 'backgroundCells'
+  | 'completionGate'
+  | 'lastSeq'
+  | 'hasMoreEvents'
+  | 'error'
+>;
+
+export type RunAddress = Pick<TaskRun, 'workspace_id' | 'run_id'> & {
+  workspace_generation: string;
+};
+
+/** One bounded historical presentation cache; ordinary chat consumers retain activeRun. */
+export function taskRuntimePresentation(state: TaskRuntimeState): TaskRuntimeView {
+  if (state.selectedRunId === state.activeRun?.run_id) return state;
+  return state.historySnapshot && state.selectedRunId === state.historySnapshot.activeRun?.run_id
+    ? state.historySnapshot
+    : state;
+}
+
+function viewForRun(state: TaskRuntimeState, runId?: string): TaskRuntimeView | null {
+  if (!runId || state.activeRun?.run_id === runId) return state;
+  return state.historySnapshot?.activeRun?.run_id === runId ? state.historySnapshot : null;
+}
+
+/** Select/refresh a presentation after the original API settles; this owns no execution. */
+async function runAction<T>(
+  get: () => TaskRuntimeState,
+  set: (patch: Partial<TaskRuntimeState>) => void,
+  target: string | RunAddress | undefined,
+  operation: (address: RunAddress, view: TaskRuntimeView | null) => Promise<T>,
+  refreshOnError = false,
+  apply?: (result: T) => Partial<TaskRuntimeView>,
+  throwOnError = false
+): Promise<T | undefined> {
+  const before = get();
+  const view = viewForRun(before, typeof target === 'string' ? target : target?.run_id);
+  const run = typeof target === 'object' ? target : view?.activeRun;
+  if (!run) return undefined;
+  const capturedScope =
+    typeof target === 'object'
+      ? { workspaceId: target.workspace_id, workspaceGeneration: target.workspace_generation }
+      : before.taskScope;
+  if (
+    !capturedScope ||
+    capturedScope.workspaceId !== run.workspace_id ||
+    !capturedScope.workspaceGeneration
+  ) {
+    set({ error: '任务范围已失效，请重新载入后重试' });
+    return undefined;
+  }
+  const address: RunAddress = { ...run, workspace_generation: capturedScope.workspaceGeneration };
+  const chatVersion = loadGeneration;
+  const historyVersion = historyRequestGeneration;
+  const stillOwned = () => {
+    const state = get();
+    return (
+      !!state.taskScope &&
+      sameProductDataScope(state.taskScope, capturedScope) &&
+      ((state.activeRun?.run_id === address.run_id &&
+        state.activeRun.workspace_id === address.workspace_id &&
+        loadGeneration === chatVersion) ||
+        (state.historySnapshot?.activeRun?.run_id === address.run_id &&
+          state.historySnapshot.activeRun.workspace_id === address.workspace_id &&
+          historyRequestGeneration === historyVersion))
+    );
+  };
+  const errorForTarget = (error: string | null) => {
+    if (!stillOwned()) return;
+    const state = get();
+    if (
+      state.activeRun?.run_id === address.run_id &&
+      state.activeRun.workspace_id === address.workspace_id
+    )
+      set({ error });
+    else if (state.historySnapshot) set({ historySnapshot: { ...state.historySnapshot, error } });
+  };
+  errorForTarget(null);
+  try {
+    const result = await operation(address, view);
+    if (
+      result &&
+      typeof result === 'object' &&
+      'run_id' in result &&
+      result.run_id !== address.run_id
+    ) {
+      throw new Error('后端回执不属于原运行');
+    }
+    if (stillOwned()) {
+      if (apply) {
+        const patch = apply(result);
+        if (
+          get().activeRun?.run_id === address.run_id &&
+          get().activeRun?.workspace_id === address.workspace_id
+        )
+          set(patch);
+        else if (get().historySnapshot)
+          set({ historySnapshot: { ...(get().historySnapshot as TaskRuntimeView), ...patch } });
+      }
+      await get().refresh(address.workspace_id, address.run_id);
+    }
+    return result;
+  } catch (error) {
+    if (refreshOnError && stillOwned()) await get().refresh(address.workspace_id, address.run_id);
+    const message = error instanceof Error ? error.message : String(error);
+    errorForTarget(message);
+    if (throwOnError) throw error instanceof Error ? error : new Error(message);
+    return undefined;
+  }
+}
+
 export interface TaskRuntimeState {
+  taskScope: ProductDataScope | null;
+  historySnapshot: TaskRuntimeView | null;
+  historyError: string | null;
+  refreshHistory: () => Promise<void>;
+  selectedRunId: string | null;
+  runPage: TaskRun[];
+  runStatuses: TaskRun['status'][];
+  nextRunContinuation: string | null;
+  loadingRuns: boolean;
+  runListError: string | null;
+  loadingRun: boolean;
+  hasMoreEvents: boolean;
+  loadingEvents: boolean;
+  bindScope: (scope: ProductDataScope) => void;
+  loadRuns: (
+    scope: ProductDataScope,
+    statuses?: TaskRun['status'][],
+    more?: boolean
+  ) => Promise<void>;
+  loadByRun: (scope: ProductDataScope, runId: string) => Promise<void>;
+  loadMoreEvents: () => Promise<void>;
+  followConversation: (workspaceId: string, conversationId: string) => Promise<void>;
   focusedAddress: ViewAddress | null;
   /// The run the right rail is currently focused on (latest for the active
   /// conversation). Null when no complex task is in flight.
@@ -131,16 +326,16 @@ export interface TaskRuntimeState {
   stopPolling: () => void;
   refresh: (workspaceId: string, runId: string) => Promise<void>;
   loadByConversation: (workspaceId: string, conversationId: string) => Promise<void>;
-  cancel: (runId: string) => Promise<void>;
-  pause: (runId: string) => Promise<void>;
+  cancel: (runId: string | RunAddress) => Promise<TaskRunControlReceipt | undefined>;
+  pause: (runId: string | RunAddress) => Promise<TaskRunControlReceipt | undefined>;
   updateGoal: (
-    runId: string,
+    runId: string | RunAddress,
     expectedRevision: number,
     goal: string,
     reason: string
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   updateContinuationBudgets: (
-    runId: string,
+    runId: string | RunAddress,
     tokenBudget: number | null,
     timeBudgetSeconds: number | null
   ) => Promise<void>;
@@ -151,19 +346,54 @@ export interface TaskRuntimeState {
     resolve: (action: 'continue' | 'edit' | 'cancel_and_start') => Promise<void>;
   }) => void;
   dismissInterruptPrompt: () => void;
-  updateTasks: (reason: string, operations: TaskUpdateOperation[]) => Promise<void>;
-  insertTask: (afterTaskId: string | null, task: TaskSpec) => Promise<void>;
-  skipTask: (taskId: string) => Promise<void>;
-  updateTask: (taskId: string, patch: Partial<TaskPatch>) => Promise<void>;
-  reorderTasks: (newOrder: string[]) => Promise<void>;
-  resumeTaskRun: () => Promise<void>;
-  retryBlockedTask: (taskId: string) => Promise<void>;
-  resolveRecoveryTask: (taskId: string, decision: 'skip') => Promise<void>;
-  skipGoalRequirement: (requirementId: string, reason: string) => Promise<void>;
+  updateTasks: (
+    reason: string,
+    operations: TaskUpdateOperation[],
+    targetRunId?: string | RunAddress
+  ) => Promise<void>;
+  insertTask: (
+    afterTaskId: string | null,
+    task: TaskSpec,
+    targetRunId?: string | RunAddress
+  ) => Promise<void>;
+  skipTask: (taskId: string, targetRunId?: string | RunAddress) => Promise<void>;
+  updateTask: (
+    taskId: string,
+    patch: Partial<TaskPatch>,
+    targetRunId?: string | RunAddress
+  ) => Promise<void>;
+  reorderTasks: (newOrder: string[], targetRunId?: string | RunAddress) => Promise<void>;
+  resumeTaskRun: (target?: RunAddress) => Promise<TaskRunResumeReceipt | undefined>;
+  retryBlockedTask: (
+    taskId: string,
+    targetRunId?: string | RunAddress
+  ) => Promise<TaskRetryReceipt | undefined>;
+  resolveRecoveryTask: (
+    taskId: string,
+    decision: 'skip',
+    targetRunId?: string | RunAddress
+  ) => Promise<void>;
+  skipGoalRequirement: (
+    requirementId: string,
+    reason: string,
+    targetRunId?: string | RunAddress
+  ) => Promise<void>;
   reset: () => void;
 }
 
 export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
+  taskScope: null,
+  historySnapshot: null,
+  historyError: null,
+  selectedRunId: null,
+  runPage: [],
+  runStatuses: [],
+  nextRunContinuation: null,
+  loadingRuns: false,
+  runListError: null,
+  loadingRun: false,
+  hasMoreEvents: false,
+  loadingEvents: false,
   focusedAddress: null,
   activeRun: null,
   plan: null,
@@ -181,24 +411,23 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   pollingInterval: null,
 
   startPolling: (workspaceId: string, runId: string) => {
-    const running = ['pending', 'running', 'paused'] as const;
-    const { pollingInterval } = get();
-    if (pollingInterval !== null) return; // already polling
+    if (!workspaceId || !runId || get().pollingInterval !== null) return;
+    const active = (run: TaskRun | null | undefined) =>
+      !!run && ['pending', 'running', 'paused'].includes(run.status);
     const interval = setInterval(() => {
-      // P1-7: refresh 含 5 个并行 API 的 Promise.all, 慢网络下可能 >2s。
-      // 若上一次未完成, 跳过本次 tick 防止请求堆积 + 乱序 set 覆盖。
-      // (用模块级 flag 而非 state, 避免触发多余渲染。)
-      if (refreshInFlight) return;
-      get()
-        .refresh(workspaceId, runId)
-        .then(() => {
-          const status = get().activeRun?.status;
-          if (status && !running.includes(status as (typeof running)[number])) {
-            get().stopPolling();
-          }
-        })
-        .catch(() => {
-          // refresh errors are handled inside refresh()
+      if (refreshInFlight || pollingTickInFlight) return;
+      pollingTickInFlight = true;
+      void (async () => {
+        const chat = get().activeRun;
+        if (active(chat) && chat) await get().refresh(chat.workspace_id, chat.run_id);
+        const history = get().historySnapshot?.activeRun;
+        if (active(history)) await get().refreshHistory();
+        if (!active(get().activeRun) && !active(get().historySnapshot?.activeRun))
+          get().stopPolling();
+      })()
+        .catch((error) => console.warn('[TaskRuntime] Poll observation failed:', error))
+        .finally(() => {
+          pollingTickInFlight = false;
         });
     }, 2000);
     set({ pollingInterval: interval });
@@ -212,144 +441,281 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     }
   },
 
-  refresh: async (workspaceId: string, runId: string) => {
-    const generation = loadGeneration;
-    const requestGeneration = refreshRequestGeneration + 1;
-    refreshRequestGeneration = requestGeneration;
-    // P1-7: refreshInFlight 防止 polling 重叠; finally 确保异常时也清除。
+  bindScope: (scope) => {
+    const previous = get().taskScope;
+    if (previous && sameProductDataScope(previous, scope)) return;
+    if (
+      (previous && !sameProductDataScope(previous, scope)) ||
+      (get().activeRun && get().activeRun?.workspace_id !== scope.workspaceId)
+    ) {
+      get().reset();
+    }
+    historyRequestGeneration += 1;
+    set({
+      taskScope: { ...scope },
+      historySnapshot: null,
+      historyError: null,
+      selectedRunId: null,
+    });
+  },
+
+  loadRuns: async (scope, statuses = [], more = false) => {
+    if (!get().taskScope || !sameProductDataScope(get().taskScope as ProductDataScope, scope))
+      get().bindScope(scope);
+    const request = ++inventoryRequestGeneration;
+    const filters = more ? get().runStatuses : statuses;
+    const cursor = more ? get().nextRunContinuation : null;
+    if (more && !cursor) return;
+    set({ loadingRuns: true, runListError: null });
+    try {
+      const page = await taskRuntimeApi.listRuns(scope, filters, cursor);
+      if (
+        request !== inventoryRequestGeneration ||
+        !get().taskScope ||
+        !sameProductDataScope(get().taskScope as ProductDataScope, scope)
+      )
+        return;
+      if (
+        page.items.length > 20 ||
+        page.items.some((run) => run.workspace_id !== scope.workspaceId) ||
+        (cursor !== null && page.next_continuation === cursor)
+      )
+        throw new Error('运行列表返回了无效目标或分页位置');
+      set({
+        runPage: page.items,
+        nextRunContinuation: page.next_continuation,
+        runStatuses: filters,
+      });
+    } catch (error) {
+      if (request === inventoryRequestGeneration)
+        set({ runListError: error instanceof Error ? error.message : String(error) });
+    } finally {
+      if (request === inventoryRequestGeneration) set({ loadingRuns: false });
+    }
+  },
+
+  loadByRun: async (scope, runId) => {
+    if (!get().taskScope || !sameProductDataScope(get().taskScope as ProductDataScope, scope))
+      get().bindScope(scope);
+    const generation = ++historyRequestGeneration;
+    eventRequestGeneration += 1;
+    const previousSelection = get().selectedRunId;
+    set({ selectedRunId: runId, loadingRun: true, loadingEvents: false, historyError: null });
+    try {
+      // Explicit history keeps its single snapshot even when this is also the live chat run.
+      // A subsequent chat turn may select another run without changing this inspector's target.
+      const run = await taskRuntimeApi.getRun(scope.workspaceId, runId, scope.workspaceGeneration);
+      if (generation !== historyRequestGeneration) return;
+      if (!run || run.run_id !== runId || run.workspace_id !== scope.workspaceId)
+        throw new Error('所选运行已不可用或不属于此工作空间');
+      const { snapshot, page } = await initialRunData(
+        scope.workspaceId,
+        run,
+        scope.workspaceGeneration,
+        false
+      );
+      if (generation !== historyRequestGeneration) return;
+      ingestTaskRuntimeSubagentEvents(run, snapshot.plan, page.events);
+      ingestTaskRuntimeToolExecutions(run, page.events);
+      set({
+        historySnapshot: {
+          ...snapshot,
+          activeRun: run,
+          events: page.events,
+          lastSeq: page.next_after_sequence,
+          hasMoreEvents: page.has_more,
+          error: null,
+        },
+        historyError: null,
+      });
+      if (['pending', 'running', 'paused'].includes(run.status))
+        get().startPolling(scope.workspaceId, runId);
+    } catch (error) {
+      if (generation === historyRequestGeneration)
+        set({
+          selectedRunId: previousSelection,
+          historyError: error instanceof Error ? error.message : String(error),
+        });
+    } finally {
+      if (generation === historyRequestGeneration) set({ loadingRun: false });
+    }
+  },
+
+  refreshHistory: async () => {
+    const view = get().historySnapshot;
+    const run = view?.activeRun;
+    const scope = get().taskScope;
+    if (!view || !run || !scope || get().selectedRunId !== run.run_id) return;
+    const generation = historyRequestGeneration;
+    const requestGeneration = ++historyRefreshRequestGeneration;
+    const after = view.lastSeq;
     refreshInFlight = true;
     try {
-      const [run, events] = await Promise.all([
-        taskRuntimeApi.getRun(workspaceId, runId),
-        taskRuntimeApi.listEvents(workspaceId, runId, get().lastSeq),
+      const [updated, rawPage] = await Promise.all([
+        taskRuntimeApi.getRun(scope.workspaceId, run.run_id, scope.workspaceGeneration),
+        taskRuntimeApi.listEvents(scope.workspaceId, run.run_id, after, scope.workspaceGeneration),
       ]);
-      if (generation !== loadGeneration || requestGeneration !== refreshRequestGeneration) {
+      if (
+        generation !== historyRequestGeneration ||
+        requestGeneration !== historyRefreshRequestGeneration ||
+        get().historySnapshot?.activeRun?.run_id !== run.run_id ||
+        get().historySnapshot?.lastSeq !== after
+      )
         return;
-      }
-      const lastSeq = events.length ? events[events.length - 1].seq : get().lastSeq;
-      if (!run) {
-        set({
-          activeRun: null,
-          plan: null,
-          todos: [],
-          events: [...get().events, ...events].slice(-MAX_EVENTS),
-          artifacts: [],
-          recoveryBlockers: [],
-          continuation: null,
-          backgroundCells: [],
-          completionGate: null,
-          lastSeq,
-          error: `TaskRuntime run ${runId} 暂时不可用`,
-        });
+      if (!updated || updated.run_id !== run.run_id || updated.workspace_id !== scope.workspaceId)
+        throw new Error('历史运行已不可用或目标不匹配');
+      const page = checkEventPage(rawPage, run.run_id, after);
+      const snapshot = await loadRunSnapshot(scope.workspaceId, updated, scope.workspaceGeneration);
+      if (
+        generation !== historyRequestGeneration ||
+        requestGeneration !== historyRefreshRequestGeneration ||
+        get().historySnapshot?.activeRun?.run_id !== run.run_id ||
+        get().historySnapshot?.lastSeq !== after
+      )
         return;
-      }
-      if (run.workspace_id !== workspaceId) {
-        throw new Error(`TaskRuntime 工作区不匹配：期望 ${workspaceId}，收到 ${run.workspace_id}`);
-      }
-      const {
-        plan,
-        todos,
-        artifacts,
-        recoveryBlockers,
-        continuation,
-        backgroundCells,
-        completionGate,
-      } = await loadRunSnapshot(workspaceId, run);
-      if (generation !== loadGeneration || requestGeneration !== refreshRequestGeneration) {
-        return;
-      }
-      ingestTaskRuntimeSubagentEvents(run, plan, events);
-      ingestTaskRuntimeToolExecutions(run, events);
+      ingestTaskRuntimeSubagentEvents(updated, snapshot.plan, page.events);
+      ingestTaskRuntimeToolExecutions(updated, page.events);
       set({
+        historySnapshot: {
+          ...snapshot,
+          activeRun: updated,
+          events: [...(get().historySnapshot?.events ?? []), ...page.events].slice(-MAX_EVENTS),
+          lastSeq: page.next_after_sequence,
+          hasMoreEvents: page.has_more,
+          error: null,
+        },
+      });
+    } catch (error) {
+      if (
+        generation === historyRequestGeneration &&
+        requestGeneration === historyRefreshRequestGeneration &&
+        get().historySnapshot?.activeRun?.run_id === run.run_id
+      )
+        set({
+          historySnapshot: {
+            ...(get().historySnapshot as TaskRuntimeView),
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+    } finally {
+      if (requestGeneration === historyRefreshRequestGeneration) refreshInFlight = false;
+    }
+  },
+
+  followConversation: async (workspaceId, conversationId) => {
+    historyRequestGeneration += 1;
+    historyRefreshRequestGeneration += 1;
+    eventRequestGeneration += 1;
+    refreshInFlight = false;
+    set({
+      selectedRunId: null,
+      historySnapshot: null,
+      historyError: null,
+      loadingRun: false,
+      loadingEvents: false,
+    });
+    await get().loadByConversation(workspaceId, conversationId);
+  },
+
+  refresh: async (workspaceId: string, runId: string) => {
+    if (get().historySnapshot?.activeRun?.run_id === runId && get().activeRun?.run_id !== runId) {
+      await get().refreshHistory();
+      return;
+    }
+    const generation = loadGeneration;
+    const requestGeneration = ++refreshRequestGeneration;
+    const scope = get().taskScope;
+    if (scope && scope.workspaceId !== workspaceId) return;
+    const after = get().lastSeq;
+    refreshInFlight = true;
+    try {
+      const [run, rawPage] = await Promise.all([
+        taskRuntimeApi.getRun(workspaceId, runId, scope?.workspaceGeneration),
+        taskRuntimeApi.listEvents(workspaceId, runId, after, scope?.workspaceGeneration),
+      ]);
+      if (generation !== loadGeneration || requestGeneration !== refreshRequestGeneration) return;
+      if (!run || run.run_id !== runId || run.workspace_id !== workspaceId)
+        throw new Error(`TaskRuntime run ${runId} 暂时不可用或目标不匹配`);
+      const page = checkEventPage(rawPage, runId, after);
+      const snapshot = await loadRunSnapshot(workspaceId, run, scope?.workspaceGeneration);
+      if (
+        generation !== loadGeneration ||
+        requestGeneration !== refreshRequestGeneration ||
+        get().lastSeq !== after
+      )
+        return;
+      ingestTaskRuntimeSubagentEvents(run, snapshot.plan, page.events);
+      ingestTaskRuntimeToolExecutions(run, page.events);
+      set({
+        ...snapshot,
         activeRun: run,
-        plan,
-        todos,
-        // Append-only: merge new events past lastSeq. Cap at 500 to prevent
-        // unbounded growth on long-running tasks (events are not rendered).
-        events: [...get().events, ...events].slice(-MAX_EVENTS),
-        artifacts,
-        recoveryBlockers,
-        continuation,
-        backgroundCells,
-        completionGate,
-        lastSeq,
+        events: [...get().events, ...page.events].slice(-MAX_EVENTS),
+        lastSeq: page.next_after_sequence,
+        hasMoreEvents: page.has_more,
         error: null,
       });
-    } catch (e) {
-      if (generation === loadGeneration && requestGeneration === refreshRequestGeneration) {
-        set({ error: e instanceof Error ? e.message : String(e) });
-      }
+    } catch (error) {
+      if (generation === loadGeneration && requestGeneration === refreshRequestGeneration)
+        set({ error: error instanceof Error ? error.message : String(error) });
     } finally {
       if (requestGeneration === refreshRequestGeneration) refreshInFlight = false;
     }
   },
 
+  loadMoreEvents: async () => {
+    const view = taskRuntimePresentation(get());
+    const run = view.activeRun;
+    if (!run || get().loadingEvents || !view.hasMoreEvents) return;
+    const generation = ++eventRequestGeneration;
+    set({ loadingEvents: true });
+    try {
+      await get().refresh(run.workspace_id, run.run_id);
+    } finally {
+      if (generation === eventRequestGeneration) set({ loadingEvents: false });
+    }
+  },
+
   loadByConversation: async (workspaceId: string, conversationId: string) => {
-    const generation = loadGeneration + 1;
-    loadGeneration = generation;
+    const generation = ++loadGeneration;
+    if (!get().selectedRunId) {
+      eventRequestGeneration += 1;
+      set({ loadingEvents: false });
+    }
     refreshRequestGeneration += 1;
     refreshInFlight = false;
-    // Loading a conversation is also the lifecycle boundary for polling. The
-    // run_started event and app restoration both enter through this method, so
-    // leaving polling to the chat command response can strand the panel on its
-    // initial Pending snapshot for the entire execution.
     get().stopPolling();
+    const scope = get().taskScope;
+    const token = scope?.workspaceId === workspaceId ? scope.workspaceGeneration : undefined;
     set({ focusedAddress: viewAddress(workspaceId, conversationId) });
     try {
-      const run = await taskRuntimeApi.latestRunForConversation(workspaceId, conversationId);
+      const run = await taskRuntimeApi.latestRunForConversation(workspaceId, conversationId, token);
       if (generation !== loadGeneration) return;
       if (run) {
-        if (run.workspace_id !== workspaceId || run.conversation_id !== conversationId) {
+        if (run.workspace_id !== workspaceId || run.conversation_id !== conversationId)
           throw new Error('TaskRuntime 返回了不属于当前会话的运行');
-        }
-        // Reset event cursor when switching runs so we don't cross streams.
-        set({ events: [], lastSeq: '0' });
-        const [
-          {
-            plan,
-            todos,
-            artifacts,
-            recoveryBlockers,
-            continuation,
-            backgroundCells,
-            completionGate,
-          },
-          events,
-          persistedTools,
-        ] = await Promise.all([
-          loadRunSnapshot(workspaceId, run),
-          taskRuntimeApi.listEvents(workspaceId, run.run_id, '0'),
-          toolExecutionApi.list(workspaceId, run.conversation_id).catch((error) => {
-            console.warn('[TaskRuntime] Failed to restore persisted tool executions:', error);
-            return [];
-          }),
-        ]);
+        const { snapshot, page, persistedTools } = await initialRunData(workspaceId, run, token);
         if (generation !== loadGeneration) return;
-        const lastSeq = events.length ? events[events.length - 1].seq : '0';
-        ingestTaskRuntimeSubagentEvents(run, plan, events);
+        ingestTaskRuntimeSubagentEvents(run, snapshot.plan, page.events);
         useToolExecutionStore
           .getState()
           .hydrateConversation(
             workspaceId,
             run.conversation_id,
-            mergeTaskRuntimeToolExecutions(persistedTools, taskRuntimeToolExecutions(run, events))
+            mergeTaskRuntimeToolExecutions(
+              persistedTools,
+              taskRuntimeToolExecutions(run, page.events)
+            )
           );
         set({
+          ...snapshot,
           activeRun: run,
-          plan,
-          todos,
-          events: events.slice(-MAX_EVENTS),
-          artifacts,
-          recoveryBlockers,
-          continuation,
-          backgroundCells,
-          completionGate,
-          lastSeq,
+          events: page.events,
+          lastSeq: page.next_after_sequence,
+          hasMoreEvents: page.has_more,
           error: null,
         });
-        if (run.status === 'pending' || run.status === 'running' || run.status === 'paused') {
+        if (['pending', 'running', 'paused'].includes(run.status))
           get().startPolling(workspaceId, run.run_id);
-        }
       } else {
         set({
           activeRun: null,
@@ -362,178 +728,212 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           backgroundCells: [],
           completionGate: null,
           lastSeq: '0',
+          hasMoreEvents: false,
           error: null,
         });
       }
-    } catch (e) {
-      if (generation === loadGeneration) {
-        set({ error: e instanceof Error ? e.message : String(e) });
-      }
+    } catch (error) {
+      if (generation === loadGeneration)
+        set({ error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      const history = get().historySnapshot?.activeRun;
+      if (history && ['pending', 'running', 'paused'].includes(history.status))
+        get().startPolling(history.workspace_id, history.run_id);
     }
   },
 
-  cancel: async (runId: string) => {
-    const workspaceId = get().activeRun?.workspace_id;
-    if (!workspaceId) {
-      set({ error: '当前任务运行缺少工作区身份' });
-      return;
-    }
-    try {
-      await taskRuntimeApi.cancelRun(workspaceId, runId);
-      await get().refresh(workspaceId, runId);
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
-  },
+  cancel: (runId) =>
+    runAction(
+      get,
+      set,
+      runId,
+      (address) =>
+        taskRuntimeApi.cancelRun(
+          address.workspace_id,
+          address.run_id,
+          address.workspace_generation
+        ),
+      false,
+      undefined,
+      true
+    ),
 
-  pause: async (runId: string) => {
-    const workspaceId = get().activeRun?.workspace_id;
-    if (!workspaceId) {
-      set({ error: '当前任务运行缺少工作区身份' });
-      return;
-    }
-    try {
-      await taskRuntimeApi.pauseRun(workspaceId, runId);
-      await get().refresh(workspaceId, runId);
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
-  },
+  pause: (runId) =>
+    runAction(get, set, runId, (address) =>
+      taskRuntimeApi.pauseRun(address.workspace_id, address.run_id, address.workspace_generation)
+    ),
 
   updateGoal: async (runId, expectedRevision, goal, reason) => {
-    const workspaceId = get().activeRun?.workspace_id;
-    if (!workspaceId) {
-      set({ error: '当前任务运行缺少工作区身份' });
-      return;
-    }
-    try {
-      await taskRuntimeApi.updateGoal(workspaceId, runId, expectedRevision, goal, reason);
-      await get().refresh(workspaceId, runId);
-    } catch (e) {
-      await get().refresh(workspaceId, runId);
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
+    const result = await runAction(
+      get,
+      set,
+      runId,
+      (address) =>
+        taskRuntimeApi.updateGoal(
+          address.workspace_id,
+          address.run_id,
+          expectedRevision,
+          goal,
+          reason,
+          address.workspace_generation
+        ),
+      true,
+      undefined,
+      true
+    );
+    return result !== undefined;
   },
 
   updateContinuationBudgets: async (runId, tokenBudget, timeBudgetSeconds) => {
-    const workspaceId = get().activeRun?.workspace_id;
-    if (!workspaceId) {
-      set({ error: '当前任务运行缺少工作区身份' });
-      return;
-    }
-    try {
-      await taskRuntimeApi.configureContinuation(
-        workspaceId,
-        runId,
+    await runAction(get, set, runId, (address) =>
+      taskRuntimeApi.configureContinuation(
+        address.workspace_id,
+        address.run_id,
         tokenBudget,
-        timeBudgetSeconds
-      );
-      await get().refresh(workspaceId, runId);
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
+        timeBudgetSeconds,
+        address.workspace_generation
+      )
+    );
   },
 
   openInterruptPrompt: (data) => set({ interruptPrompt: data }),
   dismissInterruptPrompt: () => set({ interruptPrompt: null }),
 
-  updateTasks: async (reason, operations) => {
-    const runId = get().activeRun?.run_id;
-    const workspaceId = get().activeRun?.workspace_id;
-    const baseRevision = get().plan?.revision;
-    if (!workspaceId || !runId || baseRevision === undefined) {
-      set({ error: '当前任务图尚未就绪，无法修改' });
-      return;
-    }
-    try {
-      const plan = await taskRuntimeApi.updateTasks(workspaceId, runId, {
-        base_revision: baseRevision,
-        reason,
-        operations,
-      });
-      set({ plan, error: null });
-      await get().refresh(workspaceId, runId);
-    } catch (e) {
-      await get().refresh(workspaceId, runId);
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
+  updateTasks: async (reason, operations, targetRunId) => {
+    await runAction(
+      get,
+      set,
+      targetRunId,
+      async (address, view) => {
+        if (view?.plan?.revision === undefined) throw new Error('当前任务图尚未就绪，无法修改');
+        return taskRuntimeApi.updateTasks(
+          address.workspace_id,
+          address.run_id,
+          {
+            base_revision: view.plan.revision,
+            reason,
+            operations,
+          },
+          address.workspace_generation
+        );
+      },
+      true,
+      (plan) => ({ plan, error: null })
+    );
   },
-  insertTask: async (afterTaskId, task) => {
-    await get().updateTasks(`新增任务：${task.title}`, [
-      { op: 'insert', after_task_id: afterTaskId, task },
-    ]);
+  insertTask: async (afterTaskId, task, targetRunId) => {
+    await get().updateTasks(
+      `新增任务：${task.title}`,
+      [{ op: 'insert', after_task_id: afterTaskId, task }],
+      targetRunId
+    );
   },
-  skipTask: async (taskId) => {
-    await get().updateTasks(`跳过任务：${taskId}`, [{ op: 'skip', task_id: taskId }]);
+  skipTask: async (taskId, targetRunId) => {
+    await get().updateTasks(`跳过任务：${taskId}`, [{ op: 'skip', task_id: taskId }], targetRunId);
   },
-  updateTask: async (taskId, patch) => {
-    await get().updateTasks(`更新任务：${taskId}`, [
-      { op: 'update', task_id: taskId, patch: completeTaskPatch(patch) },
-    ]);
+  updateTask: async (taskId, patch, targetRunId) => {
+    await get().updateTasks(
+      `更新任务：${taskId}`,
+      [{ op: 'update', task_id: taskId, patch: completeTaskPatch(patch) }],
+      targetRunId
+    );
   },
-  reorderTasks: async (newOrder) => {
-    await get().updateTasks('调整任务顺序', [{ op: 'reorder', task_ids: newOrder }]);
+  reorderTasks: async (newOrder, targetRunId) => {
+    await get().updateTasks('调整任务顺序', [{ op: 'reorder', task_ids: newOrder }], targetRunId);
   },
-  resumeTaskRun: async () => {
-    const runId = get().activeRun?.run_id;
-    const workspaceId = get().activeRun?.workspace_id;
-    if (!workspaceId || !runId) return;
-    try {
-      await taskRuntimeApi.resumeRun(workspaceId, runId);
-      set({ interruptPrompt: null });
-      await get().refresh(workspaceId, runId);
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
-  },
-  retryBlockedTask: async (taskId) => {
-    const runId = get().activeRun?.run_id;
-    const workspaceId = get().activeRun?.workspace_id;
-    if (!workspaceId || !runId) return;
-    try {
-      await taskRuntimeApi.retryBlockedTask(workspaceId, runId, taskId);
-      set({ interruptPrompt: null });
-      await get().refresh(workspaceId, runId);
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
-  },
-  resolveRecoveryTask: async (taskId, decision) => {
-    const runId = get().activeRun?.run_id;
-    const workspaceId = get().activeRun?.workspace_id;
-    if (!workspaceId || !runId) return;
-    try {
-      await taskRuntimeApi.resolveRecoveryTask(workspaceId, runId, taskId, decision);
-      await get().refresh(workspaceId, runId);
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
-  },
-  skipGoalRequirement: async (requirementId, reason) => {
-    const run = get().activeRun;
-    if (!run) return;
-    try {
-      const completionGate = await taskRuntimeApi.skipGoalRequirement(
-        run.workspace_id,
-        run.run_id,
-        run.goal_revision,
-        requirementId,
-        reason
+  resumeTaskRun: (target) => {
+    const prompt = get().interruptPrompt;
+    return runAction(get, set, target, async (address) => {
+      const receipt = await taskRuntimeApi.resumeRun(
+        address.workspace_id,
+        address.run_id,
+        address.workspace_generation
       );
-      set({ completionGate, error: null });
-      await get().refresh(run.workspace_id, run.run_id);
-    } catch (e) {
-      await get().refresh(run.workspace_id, run.run_id);
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
+      if (receipt.run_id !== address.run_id) throw new Error('恢复回执不属于原运行');
+      if (
+        prompt?.runId === address.run_id &&
+        get().interruptPrompt === prompt &&
+        get().taskScope?.workspaceGeneration === address.workspace_generation &&
+        get().taskScope?.workspaceId === address.workspace_id
+      )
+        set({ interruptPrompt: null });
+      return receipt;
+    });
+  },
+  retryBlockedTask: (taskId, targetRunId) => {
+    const prompt = get().interruptPrompt;
+    return runAction(get, set, targetRunId, async (address) => {
+      const receipt = await taskRuntimeApi.retryBlockedTask(
+        address.workspace_id,
+        address.run_id,
+        taskId,
+        address.workspace_generation
+      );
+      if (receipt.run_id !== address.run_id || receipt.task_id !== taskId)
+        throw new Error('重试回执不属于原任务');
+      if (
+        prompt?.runId === address.run_id &&
+        get().interruptPrompt === prompt &&
+        get().taskScope?.workspaceGeneration === address.workspace_generation &&
+        get().taskScope?.workspaceId === address.workspace_id
+      )
+        set({ interruptPrompt: null });
+      return receipt;
+    });
+  },
+  resolveRecoveryTask: async (taskId, decision, targetRunId) => {
+    await runAction(get, set, targetRunId, (address) =>
+      taskRuntimeApi.resolveRecoveryTask(
+        address.workspace_id,
+        address.run_id,
+        taskId,
+        decision,
+        address.workspace_generation
+      )
+    );
+  },
+  skipGoalRequirement: async (requirementId, reason, targetRunId) => {
+    await runAction(
+      get,
+      set,
+      targetRunId,
+      (address, view) => {
+        if (!view?.activeRun) throw new Error('目标运行尚未载入');
+        return taskRuntimeApi.skipGoalRequirement(
+          address.workspace_id,
+          address.run_id,
+          view.activeRun.goal_revision,
+          requirementId,
+          reason,
+          address.workspace_generation
+        );
+      },
+      true,
+      (completionGate) => ({ completionGate, error: null })
+    );
   },
 
   reset: () => {
     loadGeneration += 1;
+    inventoryRequestGeneration += 1;
+    historyRequestGeneration += 1;
+    eventRequestGeneration += 1;
     refreshRequestGeneration += 1;
     refreshInFlight = false;
     get().stopPolling();
     set({
+      taskScope: null,
+      historySnapshot: null,
+      historyError: null,
+      selectedRunId: null,
+      runPage: [],
+      runStatuses: [],
+      nextRunContinuation: null,
+      loadingRuns: false,
+      runListError: null,
+      loadingRun: false,
+      hasMoreEvents: false,
+      loadingEvents: false,
       focusedAddress: null,
       activeRun: null,
       plan: null,

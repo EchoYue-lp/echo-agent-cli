@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useContextPaneStore } from '../../stores/contextPaneStore';
 import { useConversationStore } from '../../stores/conversationStore';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 import {
   subagentRunStoreKey,
   useSubagentRunStore,
@@ -46,6 +47,7 @@ describe('ContextPane', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1440 });
     useContextPaneStore.setState({ target: null, returnTarget: null, width: 520 });
     useConversationStore.setState({ activeId: 'conversation-1' });
+    useWorkspaceStore.setState({ current: null });
     useSubagentRunStore.setState({ runs: {} });
     useUiStore.setState({ leftSidebarOpen: true });
   });
@@ -128,6 +130,28 @@ describe('ContextPane', () => {
     const resizeButton = screen.getByRole('button', { name: '调整上下文面板宽度' });
     fireEvent.keyDown(resizeButton, { key: 'ArrowRight' });
     expect(useContextPaneStore.getState().width).toBe(472);
+  });
+  it('closes a task target when its existing workspace id gets a different product-data generation', () => {
+    const workspace = {
+      id: 'workspace-1',
+      name: '项目',
+      root: '/local/data',
+      kind: { type: 'coding' },
+      metadata: { tags: [] },
+      product_data_generation: 'generation-a',
+      created_at: '2026-10-25T00:00:00Z',
+      last_active: '2026-10-25T00:00:00Z',
+    };
+    useWorkspaceStore.setState({ current: workspace });
+    render(<ContextPane />);
+    act(() => useContextPaneStore.getState().openTasks());
+    expect(screen.getByText('task-run-content')).toBeTruthy();
+    act(() =>
+      useWorkspaceStore.setState({
+        current: { ...workspace, product_data_generation: 'generation-b' },
+      })
+    );
+    expect(screen.queryByText('task-run-content')).toBeNull();
   });
 });
 

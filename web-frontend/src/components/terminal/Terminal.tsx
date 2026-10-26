@@ -379,6 +379,10 @@ export function Terminal({
         aria-multiline="true"
         className="min-h-0 flex-1 p-1"
         tabIndex={0}
+        onFocus={(event) => {
+          // Tab 到外层可访问文本框时，把实际键盘焦点交给 xterm 的输入区。
+          if (event.target === event.currentTarget) fitVisible.current?.();
+        }}
         style={{ outline: 'none' }}
       />
     </div>

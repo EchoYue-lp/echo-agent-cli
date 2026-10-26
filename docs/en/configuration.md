@@ -148,6 +148,82 @@ QQ and Feishu use the `channels` section and corresponding environment
 variables. Channels are a complete Agent surface and share the same chat
 driver, TaskRuntime, HITL, and memory authority as GUI and TUI.
 
+### Personal Weixin (source candidate; compilation and native checks pending)
+
+Personal Weixin uses `channels.weixin` and the existing channel page's QR flow,
+without a WeChat password, AppID or AppSecret form. QR encoding stays local.
+Numeric verification is confined to its dedicated interaction. Refresh/cancel
+retain original challenge identity; a late confirmation cannot replace newer
+configuration. The backend publishes account/token/scanner identity and persisted
+credential generation only after the original ConfigState owned-save/CAS commits.
+Ordinary configuration, status and Debug omit tokens, context, QR content and
+verification codes. Existing restrictive local file permissions remain in use;
+credentials do not enter prompts or logs. The empty configuration is:
+
+```yaml
+channels:
+  weixin:
+    enabled: false
+    account: null
+    notifications: {}
+```
+
+The candidate distinguishes configured/authorized, authenticated-poll Ready,
+and a send's Accepted. Saving or starting is not online evidence, and Accepted
+does not establish phone receipt. `-14` requires reauthentication. Forget removes
+local credentials/protocol state without claiming server revocation or deleting
+history or unsettled notifications. One active account accepts only the scanning
+user's direct text into the original Agent/TaskRun/HITL. Account replacement does
+not reuse old context, session or human-request identity. Groups/media/mixed media
+do not execute remaining text. No OpenClaw Gateway or desktop injection is used.
+
+The scheduled-task page can enable a notification for the exact task definition,
+addressed to the scanning user of the connected account. A prior phone direct
+message is required to capture its original context reference. `notifications`
+is EKO configuration, not a new product field on generic CronTask. Original
+occurrence admission freezes account, credential generation, peer, context
+reference, workspace, channel conversation and definition in the same TaskRuntime
+journal commit. Later configuration/project/login changes cannot retarget it.
+Actual completion results and artifact references use the original DeliveryLedger/
+TaskRuntime journal. Notification failure/Unknown does not alter task outcome or
+rerun its prompt; possibly sent Unknown effects are not automatically repeated.
+Sending windows, quotas, no-context and restart behavior require real service
+checks, without delivery guarantees.
+
+Control completion comes from the original effect owner's typed result, not
+rendered text or stream EOF. A confirmed no-admission result durably defers the
+same provider ID/payload and withholds ACK for retry. An uncertain or partial
+effect durably records Unknown before a recovery receipt and cannot auto-replay.
+The native channel commands explicitly accept snake_case argument keys, matching
+the existing endpoints and Tauri bridge.
+
+After original configured-channel startup, recovery scans original completed runs
+in global and registered workspace journals. Frozen occurrence/target identity
+reconstructs only notification work that never started, without rerunning the
+prompt or changing TaskRun Completed. Existing Accepted is not resent; a started
+unknown effect stays Unknown. Missing identity or durability remains a diagnostic.
+
+While queued, the original input pump's Weixin reply route retains only receiver,
+exact-message context and fenced-message-template data, without a response task,
+SessionStreamReceipt or delivery permit. After claim, the same single pump
+concurrently drives its original foreground and reply consumer through the
+original bounded sender; no Weixin inbox is added. Explicit absent context stays
+bound to the original message rather than borrowing a later peer token.
+
+**Pressure checks remain unrun:** the original pump's data route targets the
+previous 32-response-slots → blocked strict cursor → unreachable later `/reply`
+counterexample. Explicit Steer retains tracked live injection. Once durable input and the original
+supervised observer own it, the response acknowledges persistence while awaiting
+processing, without awaiting drain or adding a same-run output waiter. The original
+owner records later drain/recovery; acceptance does not claim application. The greater-than-32 plus later
+`/reply` regression, compilation and native checks have not run. Source wiring
+is not verified closure or complete Weixin/HITL Outcome acceptance. This candidate has no compilation or native
+acceptance; local fixtures, frontend checks, real GUI authentication/phone
+messages and main CI require separate evidence. Only the user performs final
+real authentication and sending in the GUI. The first-party protocol reference
+is [openclaw-weixin 874637a0, 2.4.10, MIT](https://github.com/Tencent/openclaw-weixin/tree/874637a0dbc24050f72d1385add4fc6170a2d726).
+See [ADR 0054](adr/0056-personal-weixin-channel.md).
+
 | Variable | Purpose |
 | --- | --- |
 | `EKO_DATA_DIR` | Override the `~/.eko` data root |
@@ -189,3 +265,5 @@ execution instead of replacing the run's original rules. Known sensitive values
 cannot be copied into a binding or journal. Manual terminal/MCP interaction is
 unaffected. See [the example](../../examples/domain-plugin/README.md). Current
 source work is uncompiled and adhoc background delegation remains incomplete.
+
+Saved, never-started Weixin inputs are restored to their original workspace and message context after authenticated Ready; attempted or uncertain work remains recovery-required. Recovery uses the original verified committed-prefix guarantee; incomplete uncommitted tails are distinct from corruption or claimed work. This source candidate has no build or native acceptance.

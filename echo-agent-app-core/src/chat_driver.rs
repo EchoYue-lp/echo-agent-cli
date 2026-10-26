@@ -113,6 +113,8 @@ pub enum ChatDriverEvent {
     },
     /// Typed durable ingress fact folded by the existing ChatEventLog reducer.
     InputLifecycle(Box<crate::conversation_input::ConversationInputFact>),
+    /// Backend-only control lifecycle; payload is a digest, never the command or HITL answer.
+    WeixinControlDelivery(Box<echo_agent::state::delivery::DeliveryEvent<String, String>>),
     ApprovalRequest {
         request_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -411,7 +413,28 @@ pub async fn drive_chat_turn_with_input_observer(
     binding: Option<RunTurnBinding>,
     input_observer: Option<InputReceiptObserver>,
 ) -> Result<TurnReceipt, ChatTurnError> {
-    match drive_chat_turn_dispatch(agent, turn, res, binding, input_observer).await? {
+    drive_chat_turn_with_input_source(agent, turn, res, binding, input_observer, None).await
+}
+
+/// 同一应用driver的不可变输入载体；不修改framework TurnRequest或另建输入owner。
+pub async fn drive_chat_turn_with_input_source(
+    agent: &AgentHandle,
+    turn: &crate::prepared_turn::PreparedUserTurn,
+    res: std::sync::Arc<crate::chat_resources::ChatResources>,
+    binding: Option<RunTurnBinding>,
+    input_observer: Option<InputReceiptObserver>,
+    input_source: Option<crate::conversation_input::BoundRunInput>,
+) -> Result<TurnReceipt, ChatTurnError> {
+    match drive_chat_turn_dispatch_with_source(
+        agent,
+        turn,
+        res,
+        binding,
+        input_observer,
+        input_source,
+    )
+    .await?
+    {
         RunTurnDriveOutcome::Driven(receipt) => Ok(*receipt),
         RunTurnDriveOutcome::Deferred => {
             Err("RunTurn continuation deferred before model execution".into())
@@ -435,8 +458,19 @@ async fn drive_chat_turn_dispatch(
     binding: Option<RunTurnBinding>,
     input_observer: Option<InputReceiptObserver>,
 ) -> Result<RunTurnDriveOutcome, ChatTurnError> {
+    drive_chat_turn_dispatch_with_source(agent, turn, res, binding, input_observer, None).await
+}
+
+async fn drive_chat_turn_dispatch_with_source(
+    agent: &AgentHandle,
+    turn: &crate::prepared_turn::PreparedUserTurn,
+    res: std::sync::Arc<crate::chat_resources::ChatResources>,
+    binding: Option<RunTurnBinding>,
+    input_observer: Option<InputReceiptObserver>,
+    input_source: Option<crate::conversation_input::BoundRunInput>,
+) -> Result<RunTurnDriveOutcome, ChatTurnError> {
     wait_for_previous_continuation_driver(&res, binding.as_ref()).await?;
-    match prepare_chat_execution(turn, res, binding).await? {
+    match prepare_chat_execution_with_source(turn, res, binding, input_source).await? {
         ChatExecutionPreparation::Ready(prepared) => {
             drive_prepared_chat(agent.clone(), turn, *prepared, None, input_observer)
                 .await
@@ -691,6 +725,15 @@ async fn prepare_chat_execution(
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: Option<RunTurnBinding>,
 ) -> Result<ChatExecutionPreparation, ChatTurnError> {
+    prepare_chat_execution_with_source(turn, res, binding, None).await
+}
+
+async fn prepare_chat_execution_with_source(
+    turn: &crate::prepared_turn::PreparedUserTurn,
+    res: std::sync::Arc<crate::chat_resources::ChatResources>,
+    binding: Option<RunTurnBinding>,
+    input_source: Option<crate::conversation_input::BoundRunInput>,
+) -> Result<ChatExecutionPreparation, ChatTurnError> {
     let foreground_progress = crate::foreground_turn::current_foreground_progress();
     if let Some(store) = res.store.as_ref() {
         let active_workspace_id = store.active_workspace_id();
@@ -759,6 +802,19 @@ async fn prepare_chat_execution(
     let formal_run_id = binding.run_id.clone().unwrap_or_else(|| {
         crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id)
     });
+    if let Some(input) = input_source.as_ref() {
+        input.snapshot.validate()?;
+        if !drives_task_run
+            || input.target.run_id != formal_run_id
+            || input.target.turn_id != turn_id
+            || input.target.identity != input.snapshot.identity
+            || input.snapshot.identity.address.workspace_id != res.execution_scope.workspace_id()
+            || res.conv_id.as_deref()
+                != Some(input.snapshot.identity.address.conversation_id.as_str())
+        {
+            return Err("原输入来源与准确TaskRun执行作用域不匹配，未执行".into());
+        }
+    }
     // Reject a conflicting explicit selection alongside the original binding
     // checks, before registering an execution owner for an invalid request.
     let resume_domain = if binding.expected_resume.is_some() && binding.domain_plugin.is_some() {
@@ -906,15 +962,18 @@ async fn prepare_chat_execution(
         let registration = task_driver_registration.take().ok_or_else(|| {
             "TaskRun-bound turn lost its driver registration during preparation".to_string()
         })?;
-        // The raw prepared instruction is the goal. For spilled long text it is
-        // the reference block, which is a better task goal than the full paste.
+        // 原输入载体保存完整Goal；PreparedUserTurn继续只负责模型使用的引用和资源。
         let task_store = store.as_ref().ok_or_else(|| {
             "TaskRun-bound turn lost its TaskRuntimeStore during preparation".to_string()
         })?;
         let owned_run_id = formal_run_id.clone();
         let owned_conversation_id = res.conv_id.clone();
         let owned_root_message_id = binding.root_message_id.clone();
-        let owned_instruction = turn.instruction.clone();
+        let owned_instruction = input_source
+            .as_ref()
+            .map(|input| input.snapshot.payload.text.clone())
+            .unwrap_or_else(|| turn.instruction.clone());
+        let owned_input_source = input_source.as_ref().map(|input| input.snapshot.clone());
         let owned_attachments = res.attachments.clone();
         let expected_resume = binding.expected_resume.clone();
         let origin = binding.origin;
@@ -928,7 +987,7 @@ async fn prepare_chat_execution(
                 let mut registration = registration;
                 registration.mark_preparation_started();
                 if expected_resume.is_none() {
-                    if let Err(error) = ensure_bound_task_run_with_domain(
+                    if let Err(error) = ensure_bound_task_run_with_domain_source(
                         &owned_store,
                         &owned_run_id,
                         owned_conversation_id.as_deref(),
@@ -937,6 +996,7 @@ async fn prepare_chat_execution(
                         &owned_attachments,
                         Some(&owned_trace_sink),
                         selected_domain.as_ref(),
+                        owned_input_source.as_ref(),
                     ) {
                         registration.fail_preparation(error.to_string());
                         return Err(error);
@@ -962,12 +1022,21 @@ async fn prepare_chat_execution(
                     }
                 }
                 let claim = if let Some(expected) = expected_resume.as_ref() {
-                    owned_store.resume_and_claim_run_turn_expected(
-                        expected,
-                        &owned_turn_id,
-                        origin,
-                        visibility,
-                    )
+                    match owned_input_source.as_ref() {
+                        Some(input) => owned_store.resume_and_claim_run_turn_expected_with_input(
+                            expected,
+                            &owned_turn_id,
+                            origin,
+                            visibility,
+                            input,
+                        ),
+                        None => owned_store.resume_and_claim_run_turn_expected(
+                            expected,
+                            &owned_turn_id,
+                            origin,
+                            visibility,
+                        ),
+                    }
                 } else if origin == RunTurnOrigin::Resume {
                     Err(crate::tasks::task_runtime::StoreError::InvalidPlan(
                         "resume RunTurn requires an exact queued TaskRun identity".to_string(),
@@ -984,7 +1053,14 @@ async fn prepare_chat_execution(
                 claim
             }
             Ok((registration, Err(error))) => {
-                registration.reject(error.to_string());
+                if matches!(
+                    &error,
+                    crate::tasks::task_runtime::StoreError::ResumeOutcomeUnknown { .. }
+                ) {
+                    registration.fail_preparation(error.to_string());
+                } else {
+                    registration.reject(error.to_string());
+                }
                 return Err(error.into());
             }
             Err(error) => {
@@ -1135,19 +1211,21 @@ async fn drive_prepared_chat(
             })
             .await;
     }
-    if prepared.drives_task_run
+    let launcher_cut = if prepared.drives_task_run
         && !continuation_dispatch_owned
         && let Some(store) = prepared.store.as_ref()
     {
-        crate::tasks::task_runtime::continuation::register_launcher(
+        Some(crate::tasks::task_runtime::continuation::register_launcher(
             store,
             &prepared.formal_run_id,
             agent.clone(),
             prepared.resources.clone(),
             prepared.binding.root_message_id.clone(),
             prepared.foreground_progress.clone(),
-        );
-    }
+        ))
+    } else {
+        None
+    };
     let mut result = if let Some(registration) = prepared.task_driver_registration.take() {
         let store = prepared
             .store
@@ -1288,6 +1366,21 @@ async fn drive_prepared_chat(
                     .into());
                 }
             }
+        } else if matches!(
+            status,
+            crate::tasks::task_runtime::TaskRunStatus::Completed
+                | crate::tasks::task_runtime::TaskRunStatus::Cancelled
+                | crate::tasks::task_runtime::TaskRunStatus::Failed
+        ) && let Some(cut) = launcher_cut
+        {
+            // 首回合直接结束时不会进入 continuation dispatch；仍须退休本回合
+            // 注册的被动 launcher，释放 renderer。原执行结果已返回，Observation
+            // 已在上方保留；原 generation 回执保护后继注册及其物理所有者。
+            crate::tasks::task_runtime::continuation::clear_launcher_at_cut(
+                store,
+                &prepared.formal_run_id,
+                cut,
+            );
         }
     }
     let observed_path = observe_execution_path(
@@ -1413,6 +1506,7 @@ fn ensure_bound_task_run(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn ensure_bound_task_run_with_domain(
     store: &crate::tasks::task_runtime::TaskRuntimeStore,
@@ -1423,6 +1517,31 @@ fn ensure_bound_task_run_with_domain(
     attachments: &[crate::attachments::AttachmentRef],
     trace_sink: Option<&crate::tasks::task_runtime::task_tools::TraceSink>,
     selected_domain: Option<&crate::domain_plugin::DomainBinding>,
+) -> Result<(), crate::tasks::task_runtime::StoreError> {
+    ensure_bound_task_run_with_domain_source(
+        store,
+        run_id,
+        conversation_id,
+        turn_id,
+        goal,
+        attachments,
+        trace_sink,
+        selected_domain,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_bound_task_run_with_domain_source(
+    store: &crate::tasks::task_runtime::TaskRuntimeStore,
+    run_id: &str,
+    conversation_id: Option<&str>,
+    turn_id: &str,
+    goal: &str,
+    attachments: &[crate::attachments::AttachmentRef],
+    trace_sink: Option<&crate::tasks::task_runtime::task_tools::TraceSink>,
+    selected_domain: Option<&crate::domain_plugin::DomainBinding>,
+    input_source: Option<&crate::tasks::task_runtime::RunInputSnapshot>,
 ) -> Result<(), crate::tasks::task_runtime::StoreError> {
     use crate::tasks::task_runtime::{AttendedMode, DomainProfile, TaskRunStatus};
 
@@ -1462,17 +1581,32 @@ fn ensure_bound_task_run_with_domain(
         .as_ref()
         .and_then(|state| state.domain_binding.as_ref());
     let effective_domain = selected_domain.or(persisted_domain);
-    let run = store.create_run_for_active_workspace_with_domain(
-        run_id,
-        conversation_id.unwrap_or("message:task"),
-        turn_id,
-        domain_profile,
-        run_goal,
-        route,
-        attended_mode,
-        execution_profile,
-        effective_domain,
-    )?;
+    let run = if let Some(input) = input_source {
+        store.create_run_for_active_workspace_with_source(
+            run_id,
+            conversation_id.unwrap_or("message:task"),
+            turn_id,
+            domain_profile,
+            run_goal,
+            route,
+            attended_mode,
+            execution_profile,
+            effective_domain,
+            input,
+        )?
+    } else {
+        store.create_run_for_active_workspace_with_domain(
+            run_id,
+            conversation_id.unwrap_or("message:task"),
+            turn_id,
+            domain_profile,
+            run_goal,
+            route,
+            attended_mode,
+            execution_profile,
+            effective_domain,
+        )?
+    };
     if !attachments.is_empty() {
         store.set_run_attachments(run_id, attachments)?;
     }
@@ -2449,6 +2583,274 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn original_input_source_reaches_real_driver_and_full_goal_after_spill()
+    -> anyhow::Result<()> {
+        use crate::chat_event_log::{ChatEventLog, ChatEventRetention};
+        use crate::conversation_input::{
+            ConversationInputAddress, ConversationInputService, ConversationInputSource,
+        };
+        use crate::tasks::task_runtime::{RunInputSnapshot, RuntimeEventKind, TaskRuntimeStore};
+        use std::sync::Arc;
+        let directory = tempfile::tempdir()?;
+        let task_root = directory.path().join("tasks");
+        let store = Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+            &task_root,
+        )?);
+        let _resource_scope = store.test_resource_scope();
+        let log = Arc::new(ChatEventLog::open(
+            directory.path().join("chat"),
+            ChatEventRetention::default(),
+        )?);
+        let service = ConversationInputService::new(log);
+        let address = ConversationInputAddress {
+            workspace_id: store.active_workspace_id(),
+            conversation_id: "original-input".into(),
+        };
+        let text = format!("{}完整原始Goal尾部🧭", "原文来源 ".repeat(3000));
+        let saved = service
+            .submit(
+                address.clone(),
+                "original-input-id".into(),
+                text.clone(),
+                Vec::new(),
+            )
+            .await?;
+        let turn_id = "original-input-turn";
+        let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(turn_id);
+        let started = service
+            .dispatch_selected(saved.identity, saved.queue_revision, turn_id.into())
+            .await?;
+        let attempt = started
+            .active_attempt
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("真实attempt缺失"))?;
+        service
+            .bind_task_target(attempt.clone(), run_id.clone())
+            .await?;
+        let source = crate::conversation_input::BoundRunInput {
+            target: crate::conversation_input::ConversationInputTaskTarget {
+                run_id: run_id.clone(),
+                turn_id: turn_id.into(),
+                identity: started.receipt.identity.clone(),
+            },
+            snapshot: RunInputSnapshot {
+                source: ConversationInputSource::Gui,
+                identity: started.receipt.identity.clone(),
+                payload: started.payload.clone(),
+            },
+        };
+        let prepared =
+            crate::prepared_turn::PreparedUserTurn::build(crate::prepared_turn::UserTurnInput {
+                text: &text,
+                attachments: &[],
+                spill_dir: &directory.path().join("spill"),
+                conversation_id: Some(&address.conversation_id),
+                turn_id: Some(turn_id),
+            })?;
+        assert_ne!(prepared.instruction, text);
+        assert!(!prepared.resources.is_empty());
+        let llm = Arc::new(echo_agent::testing::MockLlmClient::new().with_response("完成"));
+        let react_agent = echo_agent::agent::ReactAgentBuilder::new()
+            .model("source-admission")
+            .llm_client(llm.clone())
+            .tool(Box::new(
+                echo_agent::tools::files::files::ReadFileTool::new(),
+            ))
+            .build()?;
+        react_agent.set_pre_model_context_projector(Some(Arc::new(
+            crate::turn_context::EkoContextProjector::new(
+                crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
+                crate::turn_context::turn_prompt_context_registry(),
+            ),
+        )));
+        let agent = AgentHandle::new(react_agent);
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink: Arc::new(MockChatSink::default()),
+            webhook_emitter: None,
+            conv_id: Some(address.conversation_id.clone()),
+            root_message_id: turn_id.into(),
+            attachments: prepared.inline_attachment_refs(),
+            cancel: echo_agent::agent::CancellationToken::new(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let observe_service = service.clone();
+        let observe_attempt = attempt.clone();
+        let observer: InputReceiptObserver = Arc::new(move |receipt| {
+            let service = observe_service.clone();
+            let attempt = observe_attempt.clone();
+            Box::pin(async move {
+                service
+                    .observe_turn_input_through_drain(attempt, receipt)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        });
+        let driven = drive_chat_turn_with_input_source(
+            &agent,
+            &prepared,
+            resources,
+            None,
+            Some(observer),
+            Some(source),
+        )
+        .await;
+        let idle = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.wait_for_run_driver_idle(&run_id),
+        )
+        .await;
+        let outcome = driven.map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        idle?;
+        service.settle_attempt(&attempt, &outcome.outcome).await?;
+        assert!(matches!(outcome.outcome, TurnOutcome::Completed));
+        assert!(llm.call_count() > 0);
+        let events = store.list_events(&run_id, 0)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::RunInputAccepted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_run(&run_id)?
+                .ok_or_else(|| anyhow::anyhow!("原任务缺失"))?
+                .goal,
+            text
+        );
+        drop(agent);
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(&task_root)?;
+        assert_eq!(
+            reopened
+                .get_run(&run_id)?
+                .ok_or_else(|| anyhow::anyhow!("冷重开原任务缺失"))?
+                .goal,
+            text
+        );
+        assert_eq!(service.list(&address).await?.items.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_original_input_blocks_real_driver_before_model_and_preserves_queue()
+    -> anyhow::Result<()> {
+        use crate::chat_event_log::{ChatEventLog, ChatEventRetention};
+        use crate::conversation_input::{
+            ConversationInputAddress, ConversationInputPhase, ConversationInputService,
+            ConversationInputSource,
+        };
+        use crate::tasks::task_runtime::{RunInputSnapshot, TaskRuntimeStore};
+        use std::sync::Arc;
+        let directory = tempfile::tempdir()?;
+        let store = Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+            directory.path().join("tasks"),
+        )?);
+        let _resource_scope = store.test_resource_scope();
+        let service = ConversationInputService::new(Arc::new(ChatEventLog::open(
+            directory.path().join("chat"),
+            ChatEventRetention::default(),
+        )?));
+        let address = ConversationInputAddress {
+            workspace_id: store.active_workspace_id(),
+            conversation_id: "invalid-source".into(),
+        };
+        let saved = service
+            .submit(
+                address.clone(),
+                "invalid-source-id".into(),
+                "用户原输入保留".into(),
+                Vec::new(),
+            )
+            .await?;
+        let turn_id = "invalid-source-turn";
+        let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(turn_id);
+        let started = service
+            .dispatch_selected(saved.identity, saved.queue_revision, turn_id.into())
+            .await?;
+        let attempt = started
+            .active_attempt
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("真实attempt缺失"))?;
+        service
+            .bind_task_target(attempt.clone(), run_id.clone())
+            .await?;
+        let mut source = crate::conversation_input::BoundRunInput {
+            target: crate::conversation_input::ConversationInputTaskTarget {
+                run_id: run_id.clone(),
+                turn_id: turn_id.into(),
+                identity: started.receipt.identity.clone(),
+            },
+            snapshot: RunInputSnapshot {
+                source: ConversationInputSource::Gui,
+                identity: started.receipt.identity,
+                payload: started.payload,
+            },
+        };
+        source.snapshot.payload.text = "伪造的其它正文".into();
+        let llm = Arc::new(echo_agent::testing::MockLlmClient::new().with_response("不应调用"));
+        let agent = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("invalid-source")
+                .llm_client(llm.clone())
+                .build()?,
+        );
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink: Arc::new(MockChatSink::default()),
+            webhook_emitter: None,
+            conv_id: Some(address.conversation_id.clone()),
+            root_message_id: turn_id.into(),
+            attachments: Vec::new(),
+            cancel: echo_agent::agent::CancellationToken::new(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let result = drive_chat_turn_with_input_source(
+            &agent,
+            &make_turn("引用预览"),
+            resources,
+            None,
+            None,
+            Some(source),
+        )
+        .await;
+        service
+            .recovery_required(attempt, "输入来源校验失败，未执行".into())
+            .await?;
+        let retained = service.list(&address).await?;
+        assert!(result.is_err());
+        assert_eq!(llm.call_count(), 0);
+        assert!(store.get_run(&run_id)?.is_none());
+        let item = retained
+            .items
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("原队列丢失"))?;
+        assert_eq!(item.payload.text, "用户原输入保留");
+        assert_eq!(item.receipt.phase, ConversationInputPhase::RecoveryRequired);
+        assert!(!item.receipt.drained);
+        assert_eq!(
+            item.task_target
+                .as_ref()
+                .map(|target| target.run_id.as_str()),
+            Some(run_id.as_str())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn shared_foreground_reopened_owner_intent_stays_nonterminal() -> anyhow::Result<()> {
         use crate::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
         use crate::tasks::task_runtime::{
@@ -2684,6 +3086,71 @@ mod tests {
             last_event_sequence: 0,
             elapsed: std::time::Duration::ZERO,
         })
+    }
+
+    #[tokio::test]
+    async fn completed_first_turn_retires_continuation_renderer() -> Result<(), String> {
+        let turn_id = "first-turn-renderer-release";
+        let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(turn_id);
+        let store = std::sync::Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        let _resource_scope = store.test_resource_scope();
+        let agent = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("first-turn-renderer-release")
+                .llm_client(std::sync::Arc::new(
+                    echo_agent::testing::MockLlmClient::new().with_response("完成"),
+                ))
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let sink = std::sync::Arc::new(MockChatSink::default());
+        let renderer = std::sync::Arc::downgrade(&sink);
+        let resources = std::sync::Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink: sink.clone(),
+            webhook_emitter: None,
+            conv_id: Some("first-turn-renderer-conversation".to_string()),
+            root_message_id: turn_id.to_string(),
+            attachments: Vec::new(),
+            cancel: echo_agent::agent::CancellationToken::new(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let outcome = drive_chat(&agent, &make_turn("完成当前普通回合"), resources)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(outcome, TurnOutcome::Completed));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.wait_for_run_driver_idle(&run_id),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let run = store
+            .get_run(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "原 TaskRun 缺失".to_string())?;
+        assert_eq!(
+            run.status,
+            crate::tasks::task_runtime::TaskRunStatus::Completed
+        );
+        let (launcher, active, pending) =
+            crate::tasks::task_runtime::continuation::runtime_state_for_test(&store, &run_id);
+        drop(sink);
+        if launcher.is_some() || active.is_some() || pending || renderer.upgrade().is_some() {
+            return Err(format!(
+                "首回合已完成但仍持有 renderer：launcher={launcher:?}, active={active:?}, pending={pending}, renderer_strong={}",
+                renderer.strong_count()
+            ));
+        }
+        Ok(())
     }
 
     async fn drive_successful_model_with_observer(
@@ -3049,6 +3516,7 @@ mod tests {
                 | ChatDriverEvent::TurnStatus { .. }
                 | ChatDriverEvent::TurnConfiguration { .. }
                 | ChatDriverEvent::Interrupt { .. }
+                | ChatDriverEvent::WeixinControlDelivery(_)
                 | ChatDriverEvent::InputLifecycle(_)
                 | ChatDriverEvent::ApprovalRequest { .. }
                 | ChatDriverEvent::InputRequest { .. }
@@ -4570,6 +5038,7 @@ mod tests {
 
     // Tokio's fixed macro option names test harness threads, outside the
     // application's Subagent terminology.
+    // `worker_threads` is a fixed Tokio attribute, not an EKO execution role.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawned_task_execute_retains_pool_receipt_until_outer_driver_settles()
     -> Result<(), String> {
@@ -4722,6 +5191,170 @@ mod tests {
         tokio::time::timeout(TASK_EXECUTE_RECEIPT_TEST_TIMEOUT, pool.shutdown())
             .await
             .map_err(|_| "pool shutdown timed out after outer settlement".to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drive_chat_required_context_failure_pauses_existing_run_and_can_resume()
+    -> Result<(), String> {
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, TaskRunExecutionProfile, TaskRunResumeIdentity,
+            TaskRunStatus, TaskRuntimeStore,
+        };
+        use echo_agent::agent::CancellationToken;
+        use std::sync::Arc;
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(temporary.path().join(".eko/tasks"))
+                .map_err(|error| error.to_string())?,
+        );
+        let _resources = store.test_resource_scope();
+        let turn_id = "ordinary-required-context";
+        let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(turn_id);
+        store
+            .create_run_with_profile(
+                &run_id,
+                &store.active_workspace_id(),
+                "c1",
+                turn_id,
+                DomainProfile::General,
+                "保持普通会话原Goal",
+                "agent_task_plan",
+                AttendedMode::Attended,
+                TaskRunExecutionProfile::conversation_turn(),
+            )
+            .map_err(|error| error.to_string())?;
+        let original = format!("{}普通会话尾部限制🚀", "普通约束背景 ".repeat(2_000));
+        store
+            .record_run_steer(&run_id, "original-steer", &original)
+            .map_err(|error| error.to_string())?;
+        let artifacts = temporary.path().join(".eko/artifacts");
+        std::fs::write(&artifacts, "阻断原产品数据artifact目录")
+            .map_err(|error| error.to_string())?;
+        let model =
+            Arc::new(echo_agent::testing::MockLlmClient::new().with_response("普通回合恢复完成"));
+        let agent = echo_agent::agent::ReactAgentBuilder::new()
+            .model("mock-model")
+            .enable_tools()
+            .auto_project_rules(false)
+            .llm_client(model.clone())
+            .token_limit(8_000)
+            .tool_output_artifacts(crate::infra::tool_output_artifact_config(Some(
+                temporary.path(),
+            )))
+            .build()
+            .map_err(|error| error.to_string())?;
+        agent.set_pre_model_context_projector(Some(Arc::new(
+            crate::turn_context::EkoContextProjector::new(
+                crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
+                crate::turn_context::turn_prompt_context_registry(),
+            ),
+        )));
+        let agent = AgentHandle::new(agent);
+        let sink = Arc::new(MockChatSink::default());
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink: sink.clone(),
+            webhook_emitter: None,
+            conv_id: Some("c1".to_owned()),
+            root_message_id: turn_id.to_owned(),
+            attachments: Vec::new(),
+            cancel: CancellationToken::new(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        // 走原真实drive_chat/ensure_bound_task_run/RunTurn owner，而非只调用finalize helper。
+        let outcome = drive_chat(&agent, &make_turn("继续原普通任务"), resources)
+            .await
+            .map_err(|error| error.to_string())?;
+        let TurnOutcome::Failed(failure) = outcome else {
+            return Err("必要上下文错误没有沿原物理Turn失败返回".to_owned());
+        };
+        assert!(
+            crate::tasks::task_runtime::compact_context::is_required_context_unavailable(&failure)
+        );
+        assert!(!failure.retryable, "不能靠自动重试标志伪造可恢复暂停");
+        assert_eq!(model.call_count(), 0);
+        store.wait_for_run_driver_idle(&run_id).await;
+        let paused = store
+            .get_run_state(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("原TaskRun缺失")?;
+        assert_eq!(paused.run.status, TaskRunStatus::Paused);
+        assert_eq!(paused.run.goal, "保持普通会话原Goal");
+        assert_eq!(
+            paused
+                .continuation
+                .as_ref()
+                .and_then(|state| state.pause.as_ref())
+                .map(|pause| pause.reason),
+            Some(crate::tasks::task_runtime::RunPauseReason::NeedsInput)
+        );
+        assert!(
+            store
+                .get_plan(&run_id)
+                .map_err(|error| error.to_string())?
+                .is_none(),
+            "暂停不能强制普通聊天建图"
+        );
+        let ended = store
+            .list_events(&run_id, 0)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|event| {
+                event.event_type == crate::tasks::task_runtime::RuntimeEventKind::RunTurnFinished
+            })
+            .ok_or("原RunTurn终态缺失")?;
+        assert_eq!(
+            ended.payload.get("agent_failure"),
+            Some(&serde_json::to_value(&failure).map_err(|error| error.to_string())?)
+        );
+        assert_eq!(
+            paused
+                .recent_constraints
+                .first()
+                .map(|steer| steer.text.as_str()),
+            Some(original.as_str())
+        );
+        std::fs::remove_file(&artifacts).map_err(|error| error.to_string())?;
+        let expected = TaskRunResumeIdentity::capture(&paused);
+        let resume_turn = "ordinary-required-context-resume";
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink,
+            webhook_emitter: None,
+            conv_id: Some("c1".to_owned()),
+            root_message_id: resume_turn.to_owned(),
+            attachments: Vec::new(),
+            cancel: CancellationToken::new(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let resumed = drive_chat_turn(
+            &agent,
+            &make_turn("恢复原普通任务"),
+            resources,
+            Some(RunTurnBinding::resume_expected(expected, resume_turn)),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        assert_eq!(resumed.outcome, TurnOutcome::Completed);
+        store.wait_for_run_driver_idle(&run_id).await;
+        let after = store
+            .get_run(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("恢复后Run缺失")?;
+        assert_eq!(after.run_id, run_id);
+        assert_eq!(after.goal, "保持普通会话原Goal");
+        assert_eq!(model.call_count(), 1);
         Ok(())
     }
 

@@ -1936,14 +1936,44 @@ where
     Settle: Fn(TurnOutcome) -> SettleFuture + Send + Sync + 'static,
     SettleFuture: std::future::Future<Output = Result<(), String>> + Send + 'static,
 {
+    drive_foreground_chat_with_source_ingress(
+        lease,
+        agent,
+        turn,
+        resources,
+        binding,
+        None,
+        input_observer,
+        durable_terminal,
+    )
+    .await
+}
+
+/// 保留原foreground owner与终态观察，只增加应用原输入快照的薄参数。
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_foreground_chat_with_source_ingress<Settle, SettleFuture>(
+    lease: ForegroundTurnLease,
+    agent: &AgentHandle,
+    turn: &PreparedUserTurn,
+    resources: Arc<ChatResources>,
+    binding: Option<crate::tasks::task_runtime::types::RunTurnBinding>,
+    input_source: Option<crate::conversation_input::BoundRunInput>,
+    input_observer: crate::chat_driver::InputReceiptObserver,
+    durable_terminal: Settle,
+) -> Result<TurnOutcome, ChatTurnError>
+where
+    Settle: Fn(TurnOutcome) -> SettleFuture + Send + Sync + 'static,
+    SettleFuture: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
     let (result, settlement_outcome) =
         run_foreground_chat_with(&lease, resources, |controlled_resources| async move {
-            crate::chat_driver::drive_chat_turn_with_input_observer(
+            crate::chat_driver::drive_chat_turn_with_input_source(
                 agent,
                 turn,
                 controlled_resources,
                 binding,
                 Some(input_observer),
+                input_source,
             )
             .await
             .map(|receipt| receipt.outcome)

@@ -9,6 +9,9 @@ fn open_stream_authority(
     expected_stream_id: &str,
     retention: ChatEventRetention,
 ) -> Result<StreamAuthority, ChatEventLogError> {
+    // Framework ADR0007 verifies the complete committed prefix. Only an
+    // unterminated incomplete active-tail frame is discarded; it could not
+    // admit an effect through our confirmed InputLifecycle claim barrier.
     let journal = StreamJournal::open(
         path,
         retention.segment_rollover_bytes,
@@ -22,6 +25,8 @@ fn open_stream_authority(
         journal,
         pins,
         barrier_pending: false,
+        #[cfg(any(test, feature = "channels"))]
+        weixin_control_active: false,
     })
 }
 
@@ -143,6 +148,10 @@ impl RetentionPins {
                     .map(|(sequence, _)| sequence);
                 self.refresh_earliest_if_removed(pending.or(started));
             }
+            ChatDriverEvent::WeixinControlDelivery(_) => {
+                self.weixin_control_first.get_or_insert(sequence);
+                self.refresh_earliest();
+            }
             ChatDriverEvent::InputLifecycle(fact) => {
                 self.apply_conversation_input_fact(sequence, fact, true);
             }
@@ -192,6 +201,7 @@ impl RetentionPins {
             )
             .chain(self.active_cells.values())
             .chain(conversation_input_earliest.iter())
+            .chain(self.weixin_control_first.iter())
             .copied()
             .min();
     }
@@ -205,6 +215,14 @@ impl RetentionPins {
         self.queue_revision = self.queue_revision.max(sequence);
         match fact {
             ConversationInputFact::Persisted { identity, payload } => {
+                let previous_position = self
+                    .queue_order
+                    .iter()
+                    .position(|queued| queued == &identity.input_id);
+                let previous_first_sequence = self
+                    .conversation_inputs
+                    .get(&identity.input_id)
+                    .map(|entry| entry.first_sequence);
                 let receipt = ConversationInputReceipt {
                     identity: identity.clone(),
                     phase: ConversationInputPhase::Persisted,
@@ -223,19 +241,40 @@ impl RetentionPins {
                         projection: ConversationInputProjection {
                             receipt,
                             payload: payload.clone(),
+                            task_target: self
+                                .conversation_inputs
+                                .get(&identity.input_id)
+                                .and_then(|entry| entry.projection.task_target.clone()),
+                            claimed_before_current: self
+                                .conversation_inputs
+                                .get(&identity.input_id)
+                                .is_some_and(|entry| entry.ever_claimed),
                             active_attempt: None,
                         },
-                        first_sequence: sequence,
+                        first_sequence: previous_first_sequence.unwrap_or(sequence),
                         last_sequence: sequence,
                         terminal_fact_self_contained: false,
+                        ever_claimed: self
+                            .conversation_inputs
+                            .get(&identity.input_id)
+                            .is_some_and(|entry| entry.ever_claimed),
                     },
                 );
                 self.queue_order
                     .retain(|queued| queued != &identity.input_id);
-                self.queue_order.push(identity.input_id.clone());
+                if let Some(position) = previous_position {
+                    self.queue_order.insert(
+                        position.min(self.queue_order.len()),
+                        identity.input_id.clone(),
+                    );
+                } else {
+                    self.queue_order.push(identity.input_id.clone());
+                }
             }
             ConversationInputFact::AttemptStarted { attempt, .. } => {
                 if let Some(entry) = self.conversation_inputs.get_mut(&attempt.identity.input_id) {
+                    entry.projection.claimed_before_current = entry.ever_claimed;
+                    entry.ever_claimed = true;
                     entry.projection.receipt.phase = ConversationInputPhase::AttemptStarted;
                     entry.projection.receipt.attempt = Some(attempt.attempt);
                     entry.projection.receipt.attempt_id = Some(attempt.attempt_id.clone());
@@ -252,6 +291,36 @@ impl RetentionPins {
                 self.queue_order
                     .insert(0, attempt.identity.input_id.clone());
             }
+            ConversationInputFact::TaskRunTargetBound {
+                attempt, run_id, ..
+            } => {
+                if let Some(entry) = self.conversation_inputs.get_mut(&attempt.identity.input_id) {
+                    let receipt = &entry.projection.receipt;
+                    let exact = receipt.phase == ConversationInputPhase::AttemptStarted
+                        && receipt.identity == attempt.identity
+                        && receipt.attempt == Some(attempt.attempt)
+                        && receipt.attempt_id.as_deref() == Some(attempt.attempt_id.as_str())
+                        && receipt.turn_id.as_deref() == Some(attempt.turn_id.as_str())
+                        && !entry.projection.task_target.as_ref().is_some_and(|target| {
+                            target.run_id != *run_id
+                                || target.turn_id != attempt.turn_id
+                                || target.identity != attempt.identity
+                        });
+                    if exact {
+                        entry.projection.task_target =
+                            Some(crate::conversation_input::ConversationInputTaskTarget {
+                                run_id: run_id.clone(),
+                                turn_id: attempt.turn_id.clone(),
+                                identity: attempt.identity.clone(),
+                            });
+                    } else {
+                        entry.projection.receipt.phase = ConversationInputPhase::RecoveryRequired;
+                        entry.projection.receipt.reason =
+                            Some("原输入任务归属事实与原attempt冲突，禁止重投".to_string());
+                    }
+                    entry.last_sequence = sequence;
+                }
+            }
             ConversationInputFact::MailboxAccepted { attempt, .. } => {
                 self.update_attempt_receipt(
                     sequence,
@@ -262,7 +331,8 @@ impl RetentionPins {
                     None,
                 );
             }
-            ConversationInputFact::Drained { attempt, .. } => {
+            ConversationInputFact::Drained { attempt, .. }
+            | ConversationInputFact::DriverAccepted { attempt, .. } => {
                 self.ensure_terminal_tombstone(
                     sequence,
                     &attempt.identity,
@@ -342,6 +412,16 @@ impl RetentionPins {
                     Some(reason.clone()),
                 );
             }
+            ConversationInputFact::RecoveryUncertain {
+                identity, reason, ..
+            } => {
+                if let Some(entry) = self.conversation_inputs.get_mut(&identity.input_id) {
+                    entry.projection.receipt.phase = ConversationInputPhase::RecoveryRequired;
+                    entry.projection.receipt.reason = Some(reason.clone());
+                    entry.projection.receipt.duplicate = false;
+                    entry.last_sequence = sequence;
+                }
+            }
             ConversationInputFact::Cancelled {
                 identity,
                 attempt,
@@ -401,6 +481,7 @@ impl RetentionPins {
         reason: Option<String>,
     ) {
         if let Some(entry) = self.conversation_inputs.get_mut(&attempt.identity.input_id) {
+            entry.ever_claimed = true;
             entry.projection.receipt.phase = phase;
             entry.projection.receipt.attempt = Some(attempt.attempt);
             entry.projection.receipt.attempt_id = Some(attempt.attempt_id.clone());
@@ -436,17 +517,21 @@ impl RetentionPins {
                         queue_revision: self.queue_revision,
                     },
                     payload: ConversationInputPayload {
+                        channel_binding: None,
                         domain_plugin: None,
                         text: String::new(),
                         attachments: Vec::new(),
                         submitted_at_ms: 0,
                         payload_sha256: identity.payload_sha256.clone(),
                     },
+                    task_target: None,
+                    claimed_before_current: true,
                     active_attempt: None,
                 },
                 first_sequence: sequence,
                 last_sequence: sequence,
                 terminal_fact_self_contained,
+                ever_claimed: true,
             });
     }
 }
@@ -459,7 +544,11 @@ fn conversation_input_is_frontier(receipt: &ConversationInputReceipt) -> bool {
 }
 
 fn conversation_input_pin_sequence(entry: &FoldedConversationInput) -> u64 {
-    if conversation_input_is_frontier(&entry.projection.receipt) {
+    // A provider may replay after ACK loss. Preserve the original binding AND
+    // its complete lifecycle; a pruned tombstone is not a never-claimed proof.
+    if entry.projection.payload.channel_binding.is_some()
+        || conversation_input_is_frontier(&entry.projection.receipt)
+    {
         entry.first_sequence
     } else if entry.terminal_fact_self_contained {
         entry.last_sequence
@@ -539,6 +628,17 @@ fn conversation_input_fact_is_duplicate(
                         | ConversationInputPhase::RecoveryRequired
                 )
         }
+        ConversationInputFact::TaskRunTargetBound {
+            attempt, run_id, ..
+        } => {
+            receipt.phase == ConversationInputPhase::AttemptStarted
+                && exact_attempt(attempt)
+                && current.task_target.as_ref().is_some_and(|target| {
+                    target.run_id == *run_id
+                        && target.turn_id == attempt.turn_id
+                        && target.identity == attempt.identity
+                })
+        }
         ConversationInputFact::MailboxAccepted { attempt, .. } => {
             exact_attempt(attempt)
                 && matches!(
@@ -548,7 +648,10 @@ fn conversation_input_fact_is_duplicate(
                         | ConversationInputPhase::TurnSettled
                 )
         }
-        ConversationInputFact::Drained { attempt, .. } => exact_attempt(attempt) && receipt.drained,
+        ConversationInputFact::Drained { attempt, .. }
+        | ConversationInputFact::DriverAccepted { attempt, .. } => {
+            exact_attempt(attempt) && receipt.drained
+        }
         ConversationInputFact::TurnSettled {
             attempt,
             outcome,
@@ -577,6 +680,13 @@ fn conversation_input_fact_is_duplicate(
                 && receipt.phase == ConversationInputPhase::RecoveryRequired
                 && receipt.reason.as_deref() == Some(reason.as_str())
                 && receipt.drained == *drained
+        }
+        ConversationInputFact::RecoveryUncertain {
+            identity, reason, ..
+        } => {
+            receipt.identity == *identity
+                && receipt.phase == ConversationInputPhase::RecoveryRequired
+                && receipt.reason.as_deref() == Some(reason.as_str())
         }
         ConversationInputFact::Cancelled {
             identity,
@@ -788,6 +898,7 @@ fn append_durability(event: &ChatDriverEvent) -> FileDurability {
         | ChatDriverEvent::CommandCellWatchReady { .. }
         | ChatDriverEvent::CommandCellWatchDeliveryStarted { .. }
         | ChatDriverEvent::CommandCellWatchAcknowledged { .. }
+        | ChatDriverEvent::WeixinControlDelivery(_)
         | ChatDriverEvent::InputLifecycle(_)
         | ChatDriverEvent::ApprovalRequest { .. }
         | ChatDriverEvent::InputRequest { .. }
@@ -1168,6 +1279,11 @@ fn validate_conversation_input_event(
             "conversation input fact identity is incomplete".to_string(),
         ));
     }
+    if let ConversationInputFact::Persisted { payload, .. } = fact {
+        payload
+            .validate_channel_digest(&identity.address)
+            .map_err(|error| ChatEventLogError::InvalidEvent(error.to_string()))?;
+    }
     match fact {
         ConversationInputFact::Persisted { payload, .. }
             if (payload.text.trim().is_empty() && payload.attachments.is_empty())
@@ -1178,6 +1294,8 @@ fn validate_conversation_input_event(
             ))
         }
         ConversationInputFact::AttemptStarted { attempt, .. }
+        | ConversationInputFact::TaskRunTargetBound { attempt, .. }
+        | ConversationInputFact::DriverAccepted { attempt, .. }
         | ConversationInputFact::MailboxAccepted { attempt, .. }
         | ConversationInputFact::Drained { attempt, .. }
         | ConversationInputFact::TurnSettled { attempt, .. }
@@ -1191,8 +1309,14 @@ fn validate_conversation_input_event(
                 "conversation input attempt identity is incomplete".to_string(),
             ))
         }
+        ConversationInputFact::TaskRunTargetBound { run_id, .. } if run_id.trim().is_empty() => {
+            Err(ChatEventLogError::InvalidEvent(
+                "原输入任务去向为空".to_string(),
+            ))
+        }
         ConversationInputFact::Deferred { reason, .. }
         | ConversationInputFact::RecoveryRequired { reason, .. }
+        | ConversationInputFact::RecoveryUncertain { reason, .. }
             if reason.trim().is_empty() =>
         {
             Err(ChatEventLogError::InvalidEvent(
@@ -1261,4 +1385,54 @@ fn envelope_content_hash(integrity: EnvelopeIntegrity<'_>) -> Result<String, Cha
     let encoded = echo_agent::utils::canonical_json::canonical_json_bytes(&integrity)
         .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
     Ok(digest(&encoded))
+}
+
+fn validate_unclaimed_channel_input(
+    authority: &StreamAuthority,
+    current: &ConversationInputProjection,
+) -> Result<(), ConversationInputError> {
+    let receipt = &current.receipt;
+    let entry = authority
+        .pins
+        .conversation_inputs
+        .get(&receipt.identity.input_id)
+        .ok_or_else(|| ConversationInputError::StaleRevision {
+            input_id: receipt.identity.input_id.clone(),
+        })?;
+    let retention = authority.journal.retention_metadata();
+    if authority.barrier_pending
+        || retention.cleanup_pending
+        || retention.retained_floor > entry.first_sequence
+        || entry.ever_claimed
+        || receipt.phase != ConversationInputPhase::Persisted
+        || receipt.attempt.is_some()
+        || receipt.attempt_id.is_some()
+        || receipt.turn_id.is_some()
+        || receipt.drained
+        || current.active_attempt.is_some()
+        || current.payload.channel_binding.is_none()
+        || receipt.identity.payload_sha256 != current.payload.payload_sha256
+    {
+        return Err(ConversationInputError::Validation(
+            "channel input has no complete, confirmed never-claimed history".to_string(),
+        ));
+    }
+    if let Some(crate::conversation_input::ChannelInputBinding {
+        execution: crate::conversation_input::ChannelExecutionIntent::Resume { expected, .. },
+        ..
+    }) = current.payload.channel_binding.as_ref()
+    {
+        // A thin address conversion must be lossless for BOTH original resume
+        // drivers. Actual TaskRun revision/policy validation stays with them.
+        if expected.workspace_id != receipt.identity.address.workspace_id
+            || expected.conversation_id != receipt.identity.address.conversation_id
+        {
+            return Err(ConversationInputError::Validation(
+                "saved Resume intent does not match its original input address".to_string(),
+            ));
+        }
+    }
+    current
+        .payload
+        .validate_channel_digest(&receipt.identity.address)
 }

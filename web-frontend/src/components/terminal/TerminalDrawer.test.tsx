@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => {
     terminals: [] as Array<{
       disposed: boolean;
       writes: unknown[];
+      focusCalls: number;
       data?: (value: string) => void;
     }>,
     handlers: new Map<string, Set<(event: { payload: Record<string, unknown> }) => void>>(),
@@ -38,12 +39,15 @@ vi.mock('@xterm/xterm', () => ({
     cols = 80;
     disposed = false;
     writes: unknown[] = [];
+    focusCalls = 0;
     constructor() {
       mocks.terminals.push(this);
     }
     loadAddon() {}
     open() {}
-    focus() {}
+    focus() {
+      this.focusCalls += 1;
+    }
     resize() {}
     data?: (value: string) => void;
     onData(callback: (value: string) => void) {
@@ -107,6 +111,16 @@ function creates() {
 }
 
 describe('terminal drawer session observation', () => {
+  it('forwards keyboard focus from the accessible terminal wrapper to xterm', async () => {
+    render(<Terminal sessionId="focus-probe" />);
+    await waitFor(() => expect(creates()).toHaveLength(1));
+    const instance = mocks.terminals.at(0);
+    expect(instance).toBeDefined();
+    const before = instance?.focusCalls ?? 0;
+    fireEvent.focus(screen.getByRole('textbox', { name: '终端' }));
+    expect(instance?.focusCalls).toBeGreaterThan(before);
+  });
+
   it('captures the project generation once and keeps an explicit local terminal separate', async () => {
     mocks.workspace = {
       id: 'remote-project',

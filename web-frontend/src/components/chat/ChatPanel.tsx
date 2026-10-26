@@ -13,6 +13,8 @@ import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { FailureToast } from './FailureToast';
 import {
+  ArrowDown,
+  ArrowUp,
   BookOpen,
   Bot,
   CornerUpLeft,
@@ -27,7 +29,7 @@ import {
   Workflow,
   X,
 } from 'lucide-react';
-import { providerApi } from '../../api/endpoints';
+import { providerApi, type ProductDataScope } from '../../api/endpoints';
 import type { Attachment } from '../../types/api';
 import type { QueuedChatInput } from '../../hooks/useTauriChat';
 import { useContextPaneStore } from '../../stores/contextPaneStore';
@@ -38,7 +40,7 @@ import { dispatchGuiSlashCommand } from '../../lib/slashCommands';
 import { AgentPane } from './AgentPane';
 import { workspaceLocationLabel } from '../../lib/workspacePresentation';
 import { SideConversationDialog } from './SideConversationDialog';
-import type { ConfiguredModel } from '../../generated';
+import type { ConfiguredModel, TaskRun } from '../../generated';
 
 // Tauri IPC is the only live transport. The WebSocket transport
 // (hooks/useWebSocket.ts) was removed after the chat path migrated to Tauri
@@ -61,7 +63,10 @@ export function ChatPanel() {
   const openFiles = useContextPaneStore((state) => state.openFiles);
   const openWorkspaceView = useWorkspaceViewStore((state) => state.open);
   const todoCount = useTaskRuntimeStore((state) => state.todos.length);
+  const activeTaskRun = useTaskRuntimeStore((state) => state.activeRun);
+  const taskScope = useTaskRuntimeStore((state) => state.taskScope);
   const activeConversationId = useConversationStore((state) => state.activeId);
+  const conversationEpoch = useConversationStore((state) => state.newConversationEpoch);
   const conversations = useConversationStore((state) => state.conversations);
   const sideConversations = useConversationStore((state) => state.sideConversations);
   const updateSideConversationModel = useConversationStore(
@@ -146,6 +151,7 @@ export function ChatPanel() {
     queuedInputs,
     clearQueuedMessages,
     removeQueuedMessage,
+    replaceQueuedMessage,
     reorderQueuedMessage,
     steerQueuedMessage,
   } = useChatTransport();
@@ -512,12 +518,40 @@ export function ChatPanel() {
             )}
             {queuedInputs.length > 0 && (
               <QueuedInputList
-                items={queuedInputs}
+                key={JSON.stringify([
+                  productDataScope(currentWorkspace),
+                  activeConversationId,
+                  conversationEpoch,
+                ])}
+                items={queuedInputs.filter(
+                  (item) =>
+                    item.workspaceId === productDataScope(currentWorkspace).workspaceId &&
+                    item.conversationId === activeConversationId
+                )}
                 onRemove={removeQueuedMessage}
+                onReplace={replaceQueuedMessage}
                 onReorder={reorderQueuedMessage}
                 onSteer={steerQueuedMessage}
               />
             )}
+            {activeTaskRun &&
+              !['completed', 'cancelled'].includes(activeTaskRun.status) &&
+              activeTaskRun.conversation_id === activeConversationId &&
+              taskScope?.workspaceId === activeTaskRun.workspace_id &&
+              sameProductDataScope(taskScope, productDataScope(currentWorkspace)) && (
+                <GoalBar
+                  key={JSON.stringify([
+                    taskScope.workspaceId,
+                    taskScope.workspaceGeneration,
+                    activeConversationId,
+                    conversationEpoch,
+                    activeTaskRun.run_id,
+                  ])}
+                  run={activeTaskRun}
+                  scope={taskScope}
+                  conversationEpoch={conversationEpoch}
+                />
+              )}
             <ChatInput
               onSend={handleSend}
               isStreaming={isStreaming}
@@ -610,6 +644,280 @@ export function ChatPanel() {
   );
 }
 
+// UI observation is bounded; only the backend Goal CAS proves physical quiescence.
+const GOAL_WAIT_MILLISECONDS = 30_000;
+const GOAL_POLL_MILLISECONDS = 250;
+
+function GoalBar({
+  run,
+  scope,
+  conversationEpoch,
+}: {
+  run: TaskRun;
+  scope: ProductDataScope;
+  conversationEpoch: number;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [goal, setGoal] = useState(run.goal);
+  const [reason, setReason] = useState('用户更新目标');
+  const [editRevision, setEditRevision] = useState(run.goal_revision);
+  const [progress, setProgress] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ text: string; failed: boolean } | null>(null);
+  const mounted = useRef(false);
+  const operation = useRef<symbol | null>(null);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      operation.current = null;
+    };
+  }, []);
+  useEffect(() => {
+    if (!editing && !progress) {
+      setGoal(run.goal);
+      setEditRevision(run.goal_revision);
+    }
+  }, [run.goal, run.goal_revision, editing, progress]);
+  const target = {
+    workspace_id: run.workspace_id,
+    workspace_generation: scope.workspaceGeneration,
+    run_id: run.run_id,
+  };
+  const ownsView = () => {
+    const conversation = useConversationStore.getState();
+    const workspace = useWorkspaceStore.getState();
+    const state = useTaskRuntimeStore.getState();
+    return (
+      mounted.current &&
+      !workspace.isLoading &&
+      !conversation.isLoading &&
+      sameProductDataScope(scope, productDataScope(workspace.current)) &&
+      !!state.taskScope &&
+      sameProductDataScope(scope, state.taskScope) &&
+      conversation.activeId === run.conversation_id &&
+      conversation.newConversationEpoch === conversationEpoch &&
+      state.activeRun?.run_id === run.run_id &&
+      state.activeRun.workspace_id === run.workspace_id &&
+      state.activeRun.conversation_id === run.conversation_id
+    );
+  };
+  const readCurrent = (checkError = true) => {
+    if (!ownsView()) throw new Error('目标所属会话或工作空间已变化');
+    const state = useTaskRuntimeStore.getState();
+    if (checkError && state.error) throw new Error(state.error);
+    if (!state.activeRun) throw new Error('当前目标已不可用');
+    return state.activeRun;
+  };
+  const refreshCurrent = async () => {
+    if (!ownsView()) throw new Error('目标所属会话或工作空间已变化');
+    await useTaskRuntimeStore.getState().refresh(run.workspace_id, run.run_id);
+    return readCurrent();
+  };
+  const save = async () => {
+    const text = goal.trim();
+    if (!text || operation.current || !ownsView()) return;
+    const token = Symbol('goal-save');
+    operation.current = token;
+    setNotice(null);
+    const deadline = performance.now() + GOAL_WAIT_MILLISECONDS;
+    try {
+      let current = readCurrent(false);
+      if (current.goal_revision !== editRevision)
+        throw new Error('目标版本已变化，请保留草稿并重新核对后编辑');
+      if (current.status !== 'paused') {
+        setProgress('正在请求暂停任务…');
+        const receipt = await useTaskRuntimeStore.getState().pause(target);
+        if (!ownsView()) return;
+        if (!receipt?.success || receipt.run_id !== run.run_id)
+          throw new Error(useTaskRuntimeStore.getState().error ?? '暂停任务未被后端接受');
+      }
+      for (;;) {
+        if (!ownsView()) return;
+        setProgress('正在等待任务安全点…');
+        current = await refreshCurrent();
+        if (current.goal_revision !== editRevision)
+          throw new Error('目标版本已变化，请保留草稿并重新核对后编辑');
+        if (['completed', 'cancelled', 'failed'].includes(current.status))
+          throw new Error('运行状态已变化，目标尚未更新');
+        const state = useTaskRuntimeStore.getState();
+        const hasVisibleActivity =
+          !!state.continuation?.active_turn ||
+          state.backgroundCells.some((cell) =>
+            ['prepared', 'queued', 'running'].includes(cell.phase)
+          );
+        if (current.status === 'paused' && !hasVisibleActivity) {
+          setProgress('正在提交目标更新…');
+          let accepted = false;
+          let waitingForOwner = false;
+          try {
+            accepted = await useTaskRuntimeStore
+              .getState()
+              .updateGoal(target, editRevision, text, reason.trim() || '用户更新目标');
+          } catch (error) {
+            if (!ownsView()) return;
+            // These exact rejections occur before any Goal write in the original CAS.
+            // Do not retry conflicts, I/O failures, or an unconfirmed committed update.
+            const message = error instanceof Error ? error.message : String(error);
+            const prefix = `goal update rejected for run ${run.run_id}: `;
+            const busyReasons = [
+              'run still has an active driver',
+              'run still has an active RunTurn',
+              'run still has an active Subagent attempt',
+              'run still has an active command cell',
+            ];
+            if (!busyReasons.some((item) => message === prefix + item)) throw error;
+            waitingForOwner = true;
+          }
+          if (!ownsView()) return;
+          if (accepted) {
+            setProgress('正在确认目标记录…');
+            const updated = await refreshCurrent();
+            if (updated.goal_revision !== editRevision + 1 || updated.goal !== text)
+              throw new Error('目标提交后的记录尚未确认，请刷新核对；草稿已保留');
+            setEditing(false);
+            setNotice({
+              text: '目标已更新；旧任务计划与证据已失效，需要重新校验。',
+              failed: false,
+            });
+            return;
+          }
+          if (!waitingForOwner)
+            throw new Error(
+              useTaskRuntimeStore.getState().error ?? '目标更新未被后端接受，请检查版本后重试'
+            );
+        }
+        if (performance.now() >= deadline)
+          throw new Error('等待安全点超时；暂停请求仍有效，目标尚未更新，草稿已保留');
+        await new Promise<void>((resolve) => setTimeout(resolve, GOAL_POLL_MILLISECONDS));
+      }
+    } catch (error) {
+      if (ownsView())
+        setNotice({ text: error instanceof Error ? error.message : String(error), failed: true });
+    } finally {
+      if (mounted.current && operation.current === token) {
+        operation.current = null;
+        setProgress(null);
+      }
+    }
+  };
+  const endGoal = async () => {
+    if (operation.current || !ownsView()) return;
+    const token = Symbol('goal-end');
+    operation.current = token;
+    setProgress('正在结束目标…');
+    setNotice(null);
+    try {
+      const receipt = await useTaskRuntimeStore.getState().cancel(target);
+      if (!ownsView()) return;
+      if (!receipt?.success || receipt.run_id !== run.run_id)
+        throw new Error(
+          useTaskRuntimeStore.getState().error ?? '目标结束请求未被后端接受，请检查运行状态后重试'
+        );
+      const current = await refreshCurrent();
+      if (!ownsView()) return;
+      setNotice({
+        text: current.status === 'cancelled' ? '目标已结束' : '结束请求已接受，等待运行结算',
+        failed: false,
+      });
+    } catch (error) {
+      if (ownsView())
+        setNotice({ text: error instanceof Error ? error.message : String(error), failed: true });
+    } finally {
+      if (mounted.current && operation.current === token) {
+        operation.current = null;
+        setProgress(null);
+      }
+    }
+  };
+  return (
+    <section
+      className="mx-auto mb-2 w-full max-w-[980px] px-4 text-xs sm:px-6 lg:px-8"
+      aria-label="当前目标"
+      aria-busy={!!progress}
+    >
+      <div className="flex items-center gap-2">
+        <span className="shrink-0 text-[var(--text-tertiary)]">Goal r{run.goal_revision}</span>
+        {editing ? (
+          <>
+            <input
+              value={goal}
+              onChange={(event) => setGoal(event.target.value)}
+              disabled={!!progress}
+              className="min-w-0 flex-1 rounded border border-[var(--border-primary)] bg-[var(--bg-primary)] px-2 py-1 text-[var(--text-primary)]"
+              aria-label="编辑当前目标"
+            />
+            <input
+              value={reason}
+              onChange={(event) => setReason(event.target.value)}
+              disabled={!!progress}
+              className="hidden w-32 rounded border border-[var(--border-primary)] bg-[var(--bg-primary)] px-2 py-1 text-[var(--text-secondary)] sm:block"
+              aria-label="目标修改原因"
+            />
+            <button
+              type="button"
+              onClick={() => void save()}
+              disabled={!!progress || !goal.trim()}
+              className="text-[var(--accent)]"
+            >
+              保存
+            </button>
+            <button
+              type="button"
+              onClick={() => setEditing(false)}
+              disabled={!!progress}
+              className="text-[var(--text-tertiary)]"
+            >
+              取消
+            </button>
+          </>
+        ) : (
+          <>
+            <span className="min-w-0 flex-1 truncate text-[var(--text-secondary)]" title={run.goal}>
+              {run.goal}
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                setGoal(run.goal);
+                setEditRevision(run.goal_revision);
+                setNotice(null);
+                setEditing(true);
+              }}
+              disabled={!!progress}
+              className="text-[var(--text-tertiary)] hover:text-[var(--accent)]"
+              aria-label="编辑当前目标"
+            >
+              编辑
+            </button>
+            <button
+              type="button"
+              onClick={() => void endGoal()}
+              disabled={!!progress}
+              className="text-[var(--color-error)]"
+              aria-label="结束并删除当前目标"
+            >
+              结束目标
+            </button>
+          </>
+        )}
+      </div>
+      {progress && (
+        <p className="mt-1 text-[var(--text-secondary)]" role="status" aria-live="polite">
+          {progress}
+        </p>
+      )}
+      {notice && (
+        <p
+          className={`mt-1 ${notice.failed ? 'text-[var(--color-error)]' : 'text-[var(--text-tertiary)]'}`}
+          role={notice.failed ? 'alert' : 'status'}
+        >
+          {notice.text}
+        </p>
+      )}
+    </section>
+  );
+}
+
 function WorkspaceMenu({
   onSelect,
   openAnalysis,
@@ -657,75 +965,339 @@ function WorkspaceMenu({
   );
 }
 
+function queuedInputVersion(item: QueuedChatInput): string {
+  return JSON.stringify([
+    item.identity.address.workspace_id,
+    item.identity.address.conversation_id,
+    item.identity.input_id,
+    item.identity.revision,
+    item.identity.payload_sha256,
+    !!item.channelOwned,
+  ]);
+}
+
 function QueuedInputList({
   items,
   onRemove,
+  onReplace,
   onReorder,
   onSteer,
 }: {
   items: QueuedChatInput[];
   onRemove: (id: string) => void;
+  onReplace: (id: string, text: string) => Promise<boolean>;
   onReorder: (sourceId: string, targetId: string) => void;
   onSteer: (id: string) => Promise<boolean>;
 }) {
   const [draggedId, setDraggedId] = useState<string | null>(null);
-
+  const [editing, setEditing] = useState<{ id: string; version: string } | null>(null);
+  const [editingText, setEditingText] = useState('');
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState<{
+    id: string;
+    version: string;
+    text: string;
+    failed: boolean;
+  } | null>(null);
+  const live = useRef(false);
+  const request = useRef<symbol | null>(null);
+  const latestItems = useRef(items);
+  latestItems.current = items;
+  useEffect(() => {
+    live.current = true;
+    return () => {
+      live.current = false;
+      request.current = null;
+    };
+  }, []);
+  const stillOwnsItem = (id: string, version: string) =>
+    live.current &&
+    latestItems.current.some(
+      (item) => item.id === id && queuedInputVersion(item) === version && !item.channelOwned
+    );
+  const saveEdit = async (item: QueuedChatInput) => {
+    if (!editing || request.current || item.channelOwned) return;
+    const original = editing;
+    if (!stillOwnsItem(original.id, original.version)) {
+      setFeedback({
+        id: item.id,
+        version: queuedInputVersion(item),
+        text: '排队消息已变化，请保留草稿并重新核对后编辑',
+        failed: true,
+      });
+      return;
+    }
+    const token = Symbol('steer-edit');
+    request.current = token;
+    setBusyId(item.id);
+    setFeedback(null);
+    try {
+      const accepted = await onReplace(original.id, editingText);
+      if (!live.current || request.current !== token) return;
+      if (accepted) {
+        setEditing(null);
+        return;
+      }
+      if (!stillOwnsItem(original.id, original.version)) return;
+      setFeedback({
+        ...original,
+        text: '编辑未被接受，草稿已保留；请刷新队列后重试',
+        failed: true,
+      });
+    } catch (error) {
+      if (stillOwnsItem(original.id, original.version))
+        setFeedback({
+          ...original,
+          text: error instanceof Error ? error.message : String(error),
+          failed: true,
+        });
+    } finally {
+      if (live.current && request.current === token) {
+        request.current = null;
+        setBusyId(null);
+      }
+    }
+  };
+  const execute = async (item: QueuedChatInput) => {
+    if (request.current || item.channelOwned) return;
+    const version = queuedInputVersion(item);
+    const token = Symbol('steer-execute');
+    request.current = token;
+    setBusyId(item.id);
+    setFeedback(null);
+    try {
+      const accepted = await onSteer(item.id);
+      if (stillOwnsItem(item.id, version))
+        setFeedback({
+          id: item.id,
+          version,
+          text: accepted ? '已送达当前任务' : '尚未确认送达，请查看输入状态或错误后重试',
+          failed: false,
+        });
+    } catch (error) {
+      if (stillOwnsItem(item.id, version))
+        setFeedback({
+          id: item.id,
+          version,
+          text: error instanceof Error ? error.message : String(error),
+          failed: true,
+        });
+    } finally {
+      if (live.current && request.current === token) {
+        request.current = null;
+        setBusyId(null);
+      }
+    }
+  };
   return (
-    <section className="mx-auto mb-2 w-full max-w-[980px] px-4 sm:px-6 lg:px-8">
+    <section
+      className="mx-auto mb-2 w-full max-w-[980px] px-4 sm:px-6 lg:px-8"
+      aria-label="Steer 队列"
+    >
       <div className="mb-1 flex items-center justify-between px-1 text-[11px] text-[var(--text-tertiary)]">
-        <span>排队任务 {items.length}</span>
-        <span>拖动调整执行顺序</span>
+        <span>Steer · {items.length} 条</span>
+        <span>拖动或用上下移按钮调整顺序</span>
       </div>
       <div className="max-h-40 space-y-1 overflow-y-auto">
         {items.map((item, index) => (
           <div
             key={item.id}
-            draggable
-            onDragStart={() => setDraggedId(item.id)}
+            role="group"
+            aria-label={`Steer ${index + 1}`}
+            draggable={!item.channelOwned && !busyId && editing?.id !== item.id}
+            onDragStart={(event) => {
+              if (item.channelOwned || busyId) {
+                event.preventDefault();
+                return;
+              }
+              setDraggedId(item.id);
+            }}
             onDragEnd={() => setDraggedId(null)}
-            onDragOver={(event) => event.preventDefault()}
+            onDragOver={(event) => {
+              if (!item.channelOwned) event.preventDefault();
+            }}
             onDrop={(event) => {
               event.preventDefault();
-              if (draggedId) onReorder(draggedId, item.id);
+              const source = latestItems.current.find((entry) => entry.id === draggedId);
+              if (source && !source.channelOwned && !item.channelOwned && !busyId)
+                onReorder(source.id, item.id);
               setDraggedId(null);
             }}
-            className="flex min-h-9 items-center gap-2 border-l-2 border-[var(--border-primary)] bg-[var(--bg-secondary)] px-2 py-1.5 text-xs transition-colors hover:bg-[var(--bg-hover)]"
+            className="border-l-2 border-[var(--border-primary)] bg-[var(--bg-secondary)] px-2 py-1.5 text-xs transition-colors hover:bg-[var(--bg-hover)]"
             style={{ opacity: draggedId === item.id ? 0.55 : 1 }}
           >
-            <GripVertical
-              size={14}
-              className="shrink-0 cursor-grab text-[var(--text-tertiary)] active:cursor-grabbing"
-              aria-hidden="true"
-            />
-            <span className="w-5 shrink-0 text-center tabular-nums text-[var(--text-tertiary)]">
-              {index + 1}
-            </span>
-            <span className="min-w-0 flex-1 truncate text-[var(--text-secondary)]">
-              {item.text || item.attachments?.map((file) => file.name).join(', ') || '附件'}
-            </span>
-            <button
-              type="button"
-              onClick={() => void onSteer(item.id)}
-              className="flex h-7 w-7 shrink-0 items-center justify-center text-[var(--text-tertiary)] hover:text-[var(--accent)]"
-              title="补充到当前任务"
-              aria-label="补充到当前任务"
-            >
-              <CornerUpLeft size={14} />
-            </button>
-            <button
-              type="button"
-              onClick={() => onRemove(item.id)}
-              className="flex h-7 w-7 shrink-0 items-center justify-center text-[var(--text-tertiary)] hover:text-[var(--color-error)]"
-              title="移出队列"
-              aria-label="移出队列"
-            >
-              <X size={14} />
-            </button>
+            <div className="flex min-h-9 items-center gap-2">
+              <GripVertical
+                size={14}
+                className="shrink-0 cursor-grab text-[var(--text-tertiary)] active:cursor-grabbing"
+                aria-hidden="true"
+              />
+              <span className="w-5 shrink-0 text-center tabular-nums text-[var(--text-tertiary)]">
+                {index + 1}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-[var(--text-secondary)]">
+                {editing?.id === item.id ? (
+                  <input
+                    autoFocus
+                    value={editingText}
+                    disabled={!!busyId || item.channelOwned}
+                    onChange={(event) => setEditingText(event.target.value)}
+                    onKeyDown={(event) => {
+                      // IME confirmation belongs to text entry, including WebKit's
+                      // composition-end Enter where only keyCode 229 is retained.
+                      if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229)
+                        return;
+                      if (event.key === 'Escape' && !busyId) setEditing(null);
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        void saveEdit(item);
+                      }
+                    }}
+                    className="w-full rounded border border-[var(--border-primary)] bg-[var(--bg-primary)] px-1.5 py-0.5 text-xs text-[var(--text-primary)]"
+                    aria-label="编辑排队消息"
+                  />
+                ) : (
+                  item.text || item.attachments?.map((file) => file.name).join(', ') || '附件'
+                )}
+              </span>
+              <span className="shrink-0 text-[10px] text-[var(--text-tertiary)]">
+                {item.channelOwned
+                  ? '渠道处理'
+                  : queuedInputPhaseLabel(item.phase, item.drained, item.steerOutcome)}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  const target = index > 0 ? items.at(index - 1) : undefined;
+                  if (target && !target.channelOwned) onReorder(item.id, target.id);
+                }}
+                disabled={
+                  !!busyId ||
+                  item.channelOwned ||
+                  index === 0 ||
+                  !!items.at(index - 1)?.channelOwned
+                }
+                className="flex h-7 w-7 shrink-0 items-center justify-center text-[var(--text-tertiary)] hover:text-[var(--accent)] disabled:opacity-40"
+                title="上移 Steer"
+                aria-label="上移 Steer"
+              >
+                <ArrowUp size={14} />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const target = items.at(index + 1);
+                  if (target && !target.channelOwned) onReorder(item.id, target.id);
+                }}
+                disabled={
+                  !!busyId ||
+                  item.channelOwned ||
+                  index === items.length - 1 ||
+                  !!items.at(index + 1)?.channelOwned
+                }
+                className="flex h-7 w-7 shrink-0 items-center justify-center text-[var(--text-tertiary)] hover:text-[var(--accent)] disabled:opacity-40"
+                title="下移 Steer"
+                aria-label="下移 Steer"
+              >
+                <ArrowDown size={14} />
+              </button>
+              {editing?.id === item.id ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void saveEdit(item)}
+                    disabled={!!busyId || item.channelOwned}
+                    aria-label="保存 Steer 编辑"
+                  >
+                    保存
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setEditing(null)}
+                    disabled={!!busyId}
+                    aria-label="取消 Steer 编辑"
+                  >
+                    取消
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditing({ id: item.id, version: queuedInputVersion(item) });
+                    setEditingText(item.text);
+                    setFeedback(null);
+                  }}
+                  disabled={!!busyId || item.channelOwned}
+                  className="flex h-7 w-7 shrink-0 items-center justify-center text-[var(--text-tertiary)] hover:text-[var(--accent)]"
+                  title="编辑排队消息"
+                  aria-label="编辑排队消息"
+                >
+                  ✎
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => void execute(item)}
+                disabled={!!busyId || item.channelOwned}
+                className="flex h-7 w-7 shrink-0 items-center justify-center text-[var(--text-tertiary)] hover:text-[var(--accent)]"
+                title="立即执行 Steer"
+                aria-label="立即执行 Steer"
+              >
+                <CornerUpLeft size={14} />
+              </button>
+              <button
+                type="button"
+                onClick={() => onRemove(item.id)}
+                disabled={!!busyId || item.channelOwned}
+                className="flex h-7 w-7 shrink-0 items-center justify-center text-[var(--text-tertiary)] hover:text-[var(--color-error)]"
+                title="移出队列"
+                aria-label="移出队列"
+              >
+                <X size={14} />
+              </button>
+            </div>
+            {busyId === item.id && (
+              <p role="status" aria-live="polite">
+                正在处理 Steer…
+              </p>
+            )}
+            {feedback?.id === item.id && feedback.version === queuedInputVersion(item) && (
+              <p role={feedback.failed ? 'alert' : 'status'}>{feedback.text}</p>
+            )}
           </div>
         ))}
       </div>
     </section>
   );
+}
+
+function queuedInputPhaseLabel(
+  phase: QueuedChatInput['phase'],
+  drained: boolean,
+  steerOutcome?: QueuedChatInput['steerOutcome']
+): string {
+  if (steerOutcome === 'rejected') return '已拒绝';
+  if (steerOutcome === 'retained') return '已保留';
+  if (drained) return '已送达';
+  switch (phase) {
+    case 'persisted':
+      return '已排队';
+    case 'attempt_started':
+      return '执行中';
+    case 'mailbox_accepted':
+      return '已接受';
+    case 'deferred':
+      return '已保留';
+    case 'recovery_required':
+      return '需恢复';
+    case 'turn_settled':
+      return '已结算';
+    case 'cancelled':
+      return '已取消';
+    default:
+      return '待处理';
+  }
 }
 
 function runStatusLabel(status: string, isStreaming: boolean) {

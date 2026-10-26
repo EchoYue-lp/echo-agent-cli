@@ -617,3 +617,88 @@
     padding: 13px;
   }
 }
+
+/* Run inventory is a read projection above the existing PlanTask/detail surface. */
+.eko-task-history {
+  padding: 16px;
+  border-bottom: 1px solid var(--border-secondary);
+  font-size: 12px;
+}
+.eko-task-history header,
+.eko-task-history footer,
+.eko-task-history-filter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.eko-task-history h2 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 600;
+}
+.eko-task-history p {
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+.eko-task-history-filter {
+  margin: 12px 0;
+  color: var(--text-secondary);
+}
+.eko-task-history select {
+  max-width: 100%;
+  padding: 6px 8px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: 8px;
+  color: var(--text-primary);
+}
+.eko-task-history-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.eko-task-history-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: 100%;
+  text-align: left;
+  padding: 10px;
+  border: 1px solid var(--border-secondary);
+  border-radius: 10px;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  overflow-wrap: anywhere;
+}
+.eko-task-history-row:hover,
+.eko-task-history-row[aria-current='true'] {
+  border-color: var(--accent);
+  background: var(--bg-secondary);
+}
+.eko-task-history-row span {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.eko-task-history footer {
+  margin-top: 12px;
+  color: var(--text-tertiary);
+}
+.eko-task-history .eko-task-history-error {
+  color: var(--color-error, var(--text-primary));
+}
+.eko-task-history-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 14px;
+  padding: 12px;
+  border: 1px solid var(--border-secondary);
+  border-radius: 10px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { ChannelsPanel } from './ChannelsPanel';
 const api = vi.hoisted(() => ({
   configuration: vi.fn(),
@@ -8,9 +8,17 @@ const api = vi.hoisted(() => ({
   status: vi.fn(),
   control: vi.fn(),
 }));
-vi.mock('../../api/endpoints', () => ({ channelApi: api }));
+const qrApi = vi.hoisted(() => ({
+  begin: vi.fn(),
+  status: vi.fn(),
+  verify: vi.fn(),
+  cancel: vi.fn(),
+  forget: vi.fn(),
+}));
+vi.mock('../../api/endpoints', () => ({ channelApi: api, weixinQrApi: qrApi }));
 const configuration = {
   revision: 'desired-new',
+  weixin: { enabled: false, has_credential: false },
   qq: { enabled: true, app_id: 'app', has_secret: true },
   feishu: {
     enabled: false,
@@ -40,6 +48,11 @@ beforeEach(() => {
   vi.clearAllMocks();
   api.configuration.mockResolvedValue(configuration);
   api.status.mockResolvedValue({ configuration_revision: 'desired-new', channels: [instance] });
+  qrApi.status.mockResolvedValue({
+    phase: 'idle',
+    has_credential: false,
+    configuration_revision: 'desired-new',
+  });
 });
 afterEach(cleanup);
 it('preserves omitted secrets and keeps saving separate from original connection control', async () => {
@@ -89,4 +102,127 @@ it('shows completed cleanup errors separately from current connection evidence',
   expect(await screen.findByText('上次清理已结算，保留失败记录：old pump failed')).toBeTruthy();
   expect(screen.getByText(/原连接资源已结算/)).toBeTruthy();
   expect(screen.queryByText('在线')).toBeNull();
+});
+it('preserves Feishu secret handling while Weixin uses its dedicated QR card', async () => {
+  api.save.mockResolvedValue({ ...configuration, revision: 'saved' });
+  render(<ChannelsPanel />);
+  fireEvent.change(await screen.findByLabelText('飞书 App ID'), {
+    target: { value: 'feishu-app' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: '保存飞书配置' }));
+  await waitFor(() =>
+    expect(api.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: 'feishu',
+        expected_revision: 'desired-new',
+        app_id: 'feishu-app',
+        secret: { action: 'preserve' },
+        verification_token: { action: 'preserve' },
+      })
+    )
+  );
+  expect(screen.getByRole('button', { name: '获取微信二维码' })).toBeTruthy();
+  expect(screen.queryByLabelText('个人微信密钥')).toBeNull();
+  expect(api.control).not.toHaveBeenCalled();
+});
+it('does not reconnect saved Weixin authorization or infer Ready when opening the page', async () => {
+  api.configuration.mockResolvedValue({
+    ...configuration,
+    weixin: { enabled: true, has_credential: true, account_id: 'personal-account' },
+  });
+  api.status.mockResolvedValue({
+    configuration_revision: 'desired-new',
+    channels: [
+      { ...instance, id: 'weixin', transport: { ...instance.transport, phase: 'stopped' } },
+    ],
+  });
+  qrApi.status.mockResolvedValue({
+    phase: 'authorized',
+    has_credential: true,
+    account_id: 'personal-account',
+    configuration_revision: 'desired-new',
+  });
+  render(<ChannelsPanel />);
+  expect(await screen.findByText('授权已保存')).toBeTruthy();
+  expect(screen.queryByText('授权已保存，正在连接')).toBeNull();
+  expect(screen.getByText('微信连接：传输已停止')).toBeTruthy();
+  expect(screen.queryByText(/微信.*已确认/)).toBeNull();
+  expect(api.control).not.toHaveBeenCalled();
+});
+
+it('仅在原微信鉴权轮询已就绪时显示确认，保留其它渠道的证据门槛', async () => {
+  api.status.mockResolvedValue({
+    configuration_revision: 'desired-new',
+    channels: [
+      {
+        ...instance,
+        id: 'weixin',
+        transport: { ...instance.transport, phase: 'ready', evidence: 'weixin_authenticated_poll' },
+      },
+      {
+        ...instance,
+        transport: { ...instance.transport, phase: 'ready', evidence: 'qq_session_ready' },
+      },
+      {
+        ...instance,
+        id: 'feishu',
+        transport: {
+          ...instance.transport,
+          phase: 'ready',
+          evidence: 'feishu_websocket_handshake',
+        },
+      },
+    ],
+  });
+  render(<ChannelsPanel />);
+  expect(await screen.findByText('微信连接：微信鉴权轮询已确认')).toBeTruthy();
+  expect(screen.getByText('QQ 会话就绪已确认')).toBeTruthy();
+  expect(screen.getByText('飞书 WebSocket 握手已确认')).toBeTruthy();
+  expect(api.control).not.toHaveBeenCalled();
+});
+
+it.each([
+  ['connecting', 'weixin_authenticated_poll', '正在连接'],
+  ['ready', null, '未知（尚无就绪证据）'],
+])('微信阶段 %s 不因凭据或不完整证据而冒称Ready', async (phase, evidence, label) => {
+  api.configuration.mockResolvedValue({
+    ...configuration,
+    weixin: { enabled: true, has_credential: true },
+  });
+  api.status.mockResolvedValue({
+    configuration_revision: 'desired-new',
+    channels: [
+      { ...instance, id: 'weixin', transport: { ...instance.transport, phase, evidence } },
+    ],
+  });
+  render(<ChannelsPanel />);
+  expect(await screen.findByText(`微信连接：${label}`)).toBeTruthy();
+  expect(screen.queryByText('微信连接：微信鉴权轮询已确认')).toBeNull();
+  expect(api.control).not.toHaveBeenCalled();
+});
+
+it('微信连接区呈现原传输错误、已结算清理失败和观察时间', async () => {
+  const observedAt = '2026-10-26T10:00:00Z';
+  api.status.mockResolvedValue({
+    configuration_revision: 'desired-new',
+    channels: [
+      {
+        ...instance,
+        id: 'weixin',
+        completed_cleanup_failures: ['原微信 reader 关闭失败'],
+        transport: {
+          phase: 'failed',
+          evidence: null,
+          error: '微信鉴权轮询失败，请重新连接',
+          observed_at: observedAt,
+        },
+      },
+    ],
+  });
+  render(<ChannelsPanel />);
+  const connection = within(await screen.findByRole('region', { name: '微信连接状态' }));
+  expect(await connection.findByText('微信连接：连接失败')).toBeTruthy();
+  expect(connection.getByText('微信鉴权轮询失败，请重新连接')).toBeTruthy();
+  expect(connection.getByText('上次清理已结算，保留失败记录：原微信 reader 关闭失败')).toBeTruthy();
+  expect(connection.getByText(`观察于 ${new Date(observedAt).toLocaleString()}`)).toBeTruthy();
 });

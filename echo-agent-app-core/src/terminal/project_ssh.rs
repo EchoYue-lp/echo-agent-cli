@@ -487,6 +487,25 @@ impl ProjectSshConnection {
     /// Natural `ssh -O check` success is authentication/transport evidence;
     /// neither a prompt nor the earlier local PTY spawn is such evidence.
     pub async fn check_authenticated(self: &Arc<Self>) -> Result<(), String> {
+        if self.authentication_ready().await? {
+            Ok(())
+        } else {
+            Err("SSH 登录尚未完成，请检查用户名和密码后重新测试连接".to_string())
+        }
+    }
+
+    /// 登录测试只读取原 ControlMaster，不访问项目目录，也不会另建认证连接。
+    pub async fn test_target_authenticated(
+        self: &Arc<Self>,
+        expected_target: TerminalTarget,
+    ) -> Result<bool, String> {
+        if self.target != expected_target.normalized()? {
+            return Err("SSH 认证属于另一连接目标，请重新测试连接".to_string());
+        }
+        self.authentication_ready().await
+    }
+
+    async fn authentication_ready(self: &Arc<Self>) -> Result<bool, String> {
         let operation = self.operation()?;
         let connection = Arc::clone(self);
         tokio::spawn(async move {
@@ -503,15 +522,13 @@ impl ProjectSshConnection {
                 Ok(status) => status,
                 Err(error) => {
                     connection.retain_child(child, operation).await;
-                    return Err(format!("original SSH check child wait failed; owner retained: {error}"));
+                    return Err(format!(
+                        "original SSH check child wait failed; owner retained: {error}"
+                    ));
                 }
             };
             drop(operation);
-            if status.success() {
-                Ok(())
-            } else {
-                Err("project SSH authentication is not ready; complete the GUI authentication terminal or reconnect".to_string())
-            }
+            Ok(status.success())
         })
         .await
         .map_err(|error| format!("SSH connection check observation failed: {error}"))?
@@ -533,7 +550,31 @@ impl ProjectSshConnection {
     pub async fn verify_directory(self: &Arc<Self>, path: String) -> Result<String, String> {
         validate_remote_text(&path)?;
         self.check_authenticated().await?;
-        sftp::verify_directory(Arc::clone(self), path).await
+        // 远程相对路径属于远程用户 HOME，不能继承本机 cwd 或把 ~/ 当作 SFTP 字面目录。
+        let resolved = self
+            .sandbox()
+            .execute(
+                SandboxCommand::program(
+                    "/bin/sh",
+                    vec!["-c".to_string(), remote_directory_command(&path)?],
+                )
+                .with_working_dir("/"),
+            )
+            .await
+            .map_err(|error| format!("远程目录解析失败：{error}"))?;
+        if !resolved.success() || resolved.output_truncated {
+            return Err(
+                "远程文件夹不存在或无法访问，请检查目录；相对路径按远程用户 home 解析".to_string(),
+            );
+        }
+        let canonical = resolved
+            .stdout
+            .strip_suffix('\n')
+            .unwrap_or(&resolved.stdout);
+        if !canonical.starts_with('/') {
+            return Err("远程目录未返回完整绝对路径，项目尚未创建".to_string());
+        }
+        sftp::verify_directory(Arc::clone(self), canonical.to_string()).await
     }
 
     pub async fn verify_target_directory(
@@ -559,6 +600,22 @@ impl ProjectSshConnection {
         }
         Ok(path)
     }
+}
+
+fn remote_directory_command(path: &str) -> Result<String, String> {
+    validate_remote_text(path)?;
+    let directory = if path.starts_with('/') {
+        shell_quote(path)?
+    } else if path == "~" {
+        "\"$HOME\"".to_string()
+    } else if let Some(relative) = path.strip_prefix("~/") {
+        format!("\"$HOME\"/{}", shell_quote(relative)?)
+    } else if path.starts_with('~') {
+        return Err("仅支持绝对路径、远程 home 下的相对路径或 ~/ 路径".to_string());
+    } else {
+        format!("\"$HOME\"/{}", shell_quote(path)?)
+    };
+    Ok(format!("cd -- {directory} && pwd -P"))
 }
 
 impl TerminalService {
@@ -764,7 +821,99 @@ pub(super) fn remote_path(path: &Path) -> Result<&str, String> {
 
 #[cfg(test)]
 mod tests {
+    use echo_agent::tools::filesystem::FileSystem;
+
     use super::*;
+
+    #[test]
+    fn relative_project_directory_resolves_remote_home_not_current_directory() -> Result<(), String>
+    {
+        let home = std::env::var("HOME").map_err(|error| error.to_string())?;
+        let expected = std::fs::canonicalize(home).map_err(|error| error.to_string())?;
+        for selected in [".", "~", "~/."] {
+            let result = std::process::Command::new("/bin/sh")
+                .args(["-c", &remote_directory_command(selected)?])
+                .current_dir("/")
+                .output()
+                .map_err(|error| error.to_string())?;
+            assert!(result.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&result.stdout).trim_end(),
+                expected.to_string_lossy()
+            );
+        }
+        assert!(remote_directory_command("~other/project").is_err());
+        assert!(remote_directory_command("bad\0path").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_directory_keeps_shell_text_literal() -> Result<(), String> {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let directory = temporary.path().join("中文 ' $(touch must-not-exist)");
+        std::fs::create_dir(&directory).map_err(|error| error.to_string())?;
+        let selected = directory.to_str().ok_or("test path is not UTF-8")?;
+        let result = std::process::Command::new("/bin/sh")
+            .args(["-c", &remote_directory_command(selected)?])
+            .current_dir(temporary.path())
+            .output()
+            .map_err(|error| error.to_string())?;
+        assert!(result.status.success());
+        assert!(!temporary.path().join("must-not-exist").exists());
+        let expected = directory
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout).trim_end(),
+            expected.to_string_lossy()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn masked_form_bytes_reach_original_pty_without_password_echo() -> Result<(), String> {
+        use super::super::TerminalEvent;
+        let service = TerminalService::new();
+        let mut receiver = service.subscribe();
+        service
+            .create_with_shell_for_test("masked-probe".into(), None, 24, 80, "/bin/sh".into())
+            .await?;
+        let probe = async {
+            service.write("masked-probe", b"stty -echo; printf '%s%s\\n' SSH_ PASSWORD_READY; IFS= read -r answer; if [ \"$answer\" = public-probe-42 ]; then printf '%s%s\\n' INPUT_ REACHED_PTY; fi; exit\r").await?;
+            let mut output = Vec::new();
+            loop {
+                match receiver.recv().await.map_err(|error| error.to_string())? {
+                    TerminalEvent::Output { bytes, .. } => {
+                        output.extend(bytes);
+                        if String::from_utf8_lossy(&output).contains("SSH_PASSWORD_READY") {
+                            break;
+                        }
+                    }
+                    TerminalEvent::Issue { message, .. } => return Err(message),
+                    TerminalEvent::Exited { .. } => return Err("PTY 在输入挑战前退出".to_string()),
+                }
+            }
+            service.write("masked-probe", b"public-probe-42\r").await?;
+            let mut after_prompt = Vec::new();
+            loop {
+                match receiver.recv().await.map_err(|error| error.to_string())? {
+                    TerminalEvent::Output { bytes, .. } => after_prompt.extend(bytes),
+                    TerminalEvent::Issue { message, .. } => return Err(message),
+                    TerminalEvent::Exited { .. } => break,
+                }
+            }
+            let received = String::from_utf8_lossy(&after_prompt);
+            assert!(received.contains("INPUT_REACHED_PTY"));
+            assert!(!received.contains("public-probe-42"));
+            Ok(())
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), probe)
+            .await
+            .map_err(|_| "PTY 输入挑战超时".to_string());
+        service.close_all().await?;
+        result?
+    }
 
     #[test]
     fn quoting_keeps_unicode_and_shell_metacharacters_literal() -> Result<(), String> {
@@ -889,6 +1038,49 @@ mod tests {
             .err();
         assert!(error.is_some_and(|error| error.contains("different project SSH target")));
         assert_eq!(connection.active_operations.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_adapters_keep_effective_identity_without_network_access() -> Result<(), String>
+    {
+        let service = TerminalService::new();
+        let connection = ProjectSshConnection::prepare(
+            &service,
+            "project-adapter-fixture",
+            TerminalTarget::Ssh {
+                host: "eko-alias".into(),
+                user: None,
+                port: None,
+            },
+        )?;
+        let effective = TerminalTarget::Ssh {
+            host: "198.51.100.7".into(),
+            user: Some("echo".into()),
+            port: Some(2222),
+        };
+        connection
+            .effective_target
+            .set(effective.clone())
+            .map_err(|_| "test effective target already exists".to_string())?;
+
+        assert!(
+            connection
+                .verify_effective_target(&connection.target)
+                .is_err()
+        );
+        let files = connection.file_system("/srv/项目".to_string())?;
+        assert_eq!(
+            files.current_dir().map_err(|error| error.to_string())?,
+            PathBuf::from("/srv/项目")
+        );
+        let executor = connection.sandbox();
+        assert_eq!(executor.name(), "ssh");
+        assert_eq!(
+            executor.isolation_level(),
+            echo_agent::sandbox::IsolationLevel::None
+        );
         Ok(())
     }
 

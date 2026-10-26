@@ -11,7 +11,7 @@ import {
   X,
 } from 'lucide-react';
 import { Modal } from '../common/Modal';
-import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
+import { useTaskRuntimeStore, type RunAddress } from '../../stores/taskRuntimeStore';
 import { useContextPaneStore } from '../../stores/contextPaneStore';
 import type {
   PlanRevision,
@@ -20,7 +20,7 @@ import type {
   TaskRun,
   TodoItem,
 } from '../../generated';
-import type { SubagentRunState } from '../../stores/subagentRunStore';
+import { latestSubagentRunsByTask, type SubagentRunState } from '../../stores/subagentRunStore';
 
 const TASK_KIND_LABEL: Record<string, string> = {
   read_only_review: '审查',
@@ -43,6 +43,8 @@ type TaskFilter = (typeof FILTERS)[number][0];
 
 export interface TaskActionReceipt {
   runId: string;
+  workspaceId: string;
+  workspaceGeneration: string;
   taskId?: string;
   text: string;
   failed: boolean;
@@ -50,12 +52,13 @@ export interface TaskActionReceipt {
 
 export type TaskAction = (
   label: string,
-  operation: () => Promise<void>,
+  operation: () => Promise<unknown>,
   taskId?: string
 ) => Promise<boolean>;
 
 interface TaskRuntimeListProps {
   run: TaskRun;
+  controlTarget: RunAddress;
   plan: PlanRevision | null;
   todos: TodoItem[];
   traceRuns: SubagentRunState[];
@@ -88,6 +91,7 @@ export function taskTimestamp(value: string | null): string {
 
 export function TaskRuntimeList({
   run,
+  controlTarget,
   plan,
   todos,
   traceRuns,
@@ -127,27 +131,31 @@ export function TaskRuntimeList({
     const title = newTitle.trim();
     if (!title || !plan) return;
     const succeeded = await onAction('新增任务', () =>
-      useTaskRuntimeStore.getState().insertTask(plan.tasks.at(-1)?.id ?? null, {
-        id: `task_${Date.now()}`,
-        title,
-        description: `执行任务：${title}`,
-        kind: 'implementation',
-        agent_role: 'general-purpose',
-        domain_profile: plan.domain_profile,
-        // Preserve the displayed binding; the original revision service resolves the role.
-        domain_binding: plan.domain_binding,
-        domain_role: null,
-        depends_on: [],
-        parallel_group: null,
-        execution_target: null,
-        files: [],
-        allowed_tools: [],
-        required_artifacts: [],
-        execution_checks: [],
-        acceptance_criteria: [],
-        max_retries: 3,
-        sort_order: plan.tasks.reduce((max, task) => Math.max(max, task.sort_order), 0) + 10,
-      })
+      useTaskRuntimeStore.getState().insertTask(
+        plan.tasks.at(-1)?.id ?? null,
+        {
+          id: `task_${Date.now()}`,
+          title,
+          description: `执行任务：${title}`,
+          kind: 'implementation',
+          agent_role: 'general-purpose',
+          domain_profile: plan.domain_profile,
+          // Preserve the displayed binding; the original revision service resolves the role.
+          domain_binding: plan.domain_binding,
+          domain_role: null,
+          depends_on: [],
+          parallel_group: null,
+          execution_target: null,
+          files: [],
+          allowed_tools: [],
+          required_artifacts: [],
+          execution_checks: [],
+          acceptance_criteria: [],
+          max_retries: 3,
+          sort_order: plan.tasks.reduce((max, task) => Math.max(max, task.sort_order), 0) + 10,
+        },
+        controlTarget
+      )
     );
     if (succeeded) {
       setAdding(false);
@@ -335,6 +343,7 @@ export function TaskRuntimeList({
           key={`${run.run_id}:${selected.task_id}`}
           {...{
             run,
+            controlTarget,
             plan,
             traceRuns,
             artifacts,
@@ -355,6 +364,7 @@ export function TaskRuntimeList({
 
 function TaskDetail({
   run,
+  controlTarget,
   plan,
   todo,
   traceRuns,
@@ -368,10 +378,9 @@ function TaskDetail({
   onClose,
 }: Omit<TaskRuntimeListProps, 'todos'> & { todo: TodoItem; onClose: () => void }) {
   const task = plan?.tasks.find((item) => item.id === todo.task_id);
-  const execution = traceRuns
-    .filter((item) => item.taskId === todo.task_id)
-    .sort((a, b) => b.startedAt - a.startedAt)
-    .at(0);
+  const execution = latestSubagentRunsByTask(traceRuns).find(
+    (item) => item.runId === run.run_id && item.taskId === todo.task_id
+  );
   const blocker = recoveryBlockers.find((item) => item.task_id === todo.task_id);
   const taskArtifacts = artifacts.filter((item) => item.task_id === todo.task_id);
   const [editing, setEditing] = useState(false);
@@ -383,7 +392,10 @@ function TaskDetail({
     ['paused', 'failed'].includes(run.status) &&
     todo.retry_count < todo.max_retries;
   const detailReceipt =
-    actionReceipt?.runId === run.run_id && actionReceipt.taskId === todo.task_id
+    actionReceipt?.runId === run.run_id &&
+    actionReceipt.taskId === todo.task_id &&
+    actionReceipt.workspaceId === controlTarget.workspace_id &&
+    actionReceipt.workspaceGeneration === controlTarget.workspace_generation
       ? actionReceipt
       : null;
   return (
@@ -533,7 +545,9 @@ function TaskDetail({
               void onAction(
                 '更新任务标题',
                 () =>
-                  useTaskRuntimeStore.getState().updateTask(todo.task_id, { title: title.trim() }),
+                  useTaskRuntimeStore
+                    .getState()
+                    .updateTask(todo.task_id, { title: title.trim() }, controlTarget),
                 todo.task_id
               ).then((succeeded) => {
                 if (succeeded) setEditing(false);
@@ -582,7 +596,7 @@ function TaskDetail({
                 onClick={() =>
                   void onAction(
                     '跳过任务',
-                    () => useTaskRuntimeStore.getState().skipTask(todo.task_id),
+                    () => useTaskRuntimeStore.getState().skipTask(todo.task_id, controlTarget),
                     todo.task_id
                   ).then((succeeded) => {
                     if (succeeded) setConfirmSkip(false);
@@ -614,7 +628,8 @@ function TaskDetail({
               onClick={() =>
                 void onAction(
                   '重试任务',
-                  () => useTaskRuntimeStore.getState().retryBlockedTask(todo.task_id),
+                  () =>
+                    useTaskRuntimeStore.getState().retryBlockedTask(todo.task_id, controlTarget),
                   todo.task_id
                 )
               }

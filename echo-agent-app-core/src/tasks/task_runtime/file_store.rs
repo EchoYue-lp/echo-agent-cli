@@ -12,7 +12,7 @@
 use super::file_shadow::FileTaskShadow;
 use super::types::{
     Artifact, PlanRevision, PlanTask, ReviewResult, RunStateSnapshot, RuntimeTaskEvent,
-    TaskExecutionSummary, TaskPlan, TaskRun, TodoItem, TodoStatus,
+    TaskExecutionSummary, TaskPlan, TaskRun, TaskRunPage, TaskRunStatus, TodoItem, TodoStatus,
 };
 
 /// File-backed read store. Cheap to clone (wraps a `FileTaskShadow`).
@@ -31,6 +31,34 @@ pub(crate) struct TaskRunLoadIssue {
 pub(crate) struct TaskRunScan {
     pub runs: Vec<TaskRun>,
     pub issues: Vec<TaskRunLoadIssue>,
+}
+
+// Read-only cursor state travels with the caller, never in a second registry.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+struct TaskRunPageKey {
+    created_at: chrono::DateTime<chrono::Utc>,
+    run_id: String,
+}
+
+impl From<&TaskRun> for TaskRunPageKey {
+    fn from(run: &TaskRun) -> Self {
+        Self {
+            created_at: run.created_at,
+            run_id: run.run_id.clone(),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskRunContinuation {
+    version: u8,
+    workspace_id: String,
+    workspace_generation: String,
+    statuses: Vec<String>,
+    limit: usize,
+    upper: TaskRunPageKey,
+    after: TaskRunPageKey,
 }
 
 impl FileTaskStore {
@@ -119,6 +147,123 @@ impl FileTaskStore {
         // enough for the run-list UI; exact tie-break is not load-bearing here).
         runs.sort_by_key(|a| std::cmp::Reverse(a.created_at));
         Ok(TaskRunScan { runs, issues })
+    }
+
+    /// The same provenance rule serves latest-conversation and historical views.
+    pub(crate) fn task_ui_visible(&self, state: &RunStateSnapshot) -> Result<bool, FileReadError> {
+        Ok(!state.execution_profile.is_conversation_turn()
+            || self.read_plan_resilient(&state.run.run_id)?.is_some())
+    }
+
+    /// Bound retained headers and transport. ID enumeration and authority recovery
+    /// still scan the collection; this is not a persistent index or a transaction snapshot.
+    pub(crate) fn task_run_page(
+        &self,
+        workspace_id: &str,
+        workspace_generation: &str,
+        statuses: &[TaskRunStatus],
+        limit: usize,
+        continuation: Option<&str>,
+    ) -> Result<TaskRunPage, FileReadError> {
+        if !(1..=20).contains(&limit) || workspace_generation.is_empty() {
+            return Err(FileReadError::InvalidPlan(
+                "task page requires a generation and limit 1..20".into(),
+            ));
+        }
+        let mut status_keys = statuses
+            .iter()
+            .map(|value| value.as_str().to_string())
+            .collect::<Vec<_>>();
+        status_keys.sort();
+        status_keys.dedup();
+        let cursor = continuation
+            .map(|value| {
+                if value.chars().take(4097).count() > 4096 {
+                    return Err(FileReadError::InvalidPlan(
+                        "task continuation is too long".into(),
+                    ));
+                }
+                let cursor: TaskRunContinuation = serde_json::from_str(value).map_err(|error| {
+                    FileReadError::InvalidPlan(format!("invalid task continuation: {error}"))
+                })?;
+                if cursor.version != 1
+                    || cursor.workspace_id != workspace_id
+                    || cursor.workspace_generation != workspace_generation
+                    || cursor.statuses != status_keys
+                    || cursor.limit != limit
+                    || cursor.after > cursor.upper
+                {
+                    return Err(FileReadError::InvalidPlan(
+                        "task continuation does not match this query; refresh the list".into(),
+                    ));
+                }
+                Ok(cursor)
+            })
+            .transpose()?;
+        let mut upper = cursor.as_ref().map(|value| value.upper.clone());
+        let mut items = Vec::with_capacity(limit.saturating_add(1));
+        for run_id in self.shadow.list_task_query_run_ids()? {
+            // Unlike the generic legacy list, a failed candidate is not silently
+            // omitted: a partial collection must not look like a complete page.
+            let Some(state) = self.read_run_state_resilient(&run_id)? else {
+                continue;
+            };
+            if state.run.workspace_id != workspace_id {
+                return Err(FileReadError::InvalidPlan(format!(
+                    "TaskRun {run_id} belongs to another workspace"
+                )));
+            }
+            if (!statuses.is_empty() && !statuses.contains(&state.run.status))
+                || !self.task_ui_visible(&state)?
+            {
+                continue;
+            }
+            let key = TaskRunPageKey::from(&state.run);
+            if let Some(cursor) = &cursor {
+                if key > cursor.upper || key >= cursor.after {
+                    continue;
+                }
+            } else if upper.as_ref().is_none_or(|value| key > *value) {
+                upper = Some(key);
+            }
+            items.push(state.run);
+            items.sort_by(|left, right| {
+                right
+                    .created_at
+                    .cmp(&left.created_at)
+                    .then_with(|| right.run_id.cmp(&left.run_id))
+            });
+            items.truncate(limit.saturating_add(1));
+        }
+        let has_more = items.len() > limit;
+        items.truncate(limit);
+        let next_continuation = if has_more {
+            match (upper, items.last()) {
+                (Some(upper), Some(last)) => Some(
+                    serde_json::to_string(&TaskRunContinuation {
+                        version: 1,
+                        workspace_id: workspace_id.to_string(),
+                        workspace_generation: workspace_generation.to_string(),
+                        statuses: status_keys,
+                        limit,
+                        upper,
+                        after: TaskRunPageKey::from(last),
+                    })
+                    .map_err(|error| FileReadError::InvalidPlan(error.to_string()))?,
+                ),
+                _ => {
+                    return Err(FileReadError::InvalidPlan(
+                        "task page lost its continuation position".into(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        Ok(TaskRunPage {
+            items,
+            next_continuation,
+        })
     }
 
     pub(crate) fn list_runs(&self) -> Result<Vec<TaskRun>, FileReadError> {

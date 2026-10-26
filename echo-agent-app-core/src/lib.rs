@@ -73,6 +73,8 @@ pub(crate) mod types;
 pub(crate) mod unified_memory;
 pub(crate) mod utils;
 pub(crate) mod webhook;
+#[cfg(feature = "channels")]
+mod weixin_cron;
 pub(crate) mod workflow_service;
 pub(crate) mod workspace;
 pub(crate) mod workspace_routing;

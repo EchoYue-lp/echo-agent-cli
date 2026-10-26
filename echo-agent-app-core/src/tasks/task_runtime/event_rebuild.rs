@@ -299,6 +299,8 @@ pub(crate) struct EventFoldState {
     #[serde(default)]
     recent_constraints: Vec<RecordedUserSteer>,
     #[serde(default)]
+    accepted_user_inputs: std::collections::BTreeMap<String, super::types::RunInputAcceptance>,
+    #[serde(default)]
     execution_profile: TaskRunExecutionProfile,
     #[serde(default)]
     project_binding: Option<ProjectExecutionBinding>,
@@ -342,6 +344,77 @@ pub(crate) struct EventFoldState {
     missing_record_sequence: bool,
 }
 
+/// 原接受事实只折叠来源索引；不写近期context投影，也不把取消/替换解释成已应用。
+fn fold_run_input_snapshot(
+    event: &RuntimeTaskEvent,
+    run: Option<&TaskRun>,
+    accepted: &mut std::collections::BTreeMap<String, super::types::RunInputAcceptance>,
+) -> Result<(), String> {
+    use super::types::RunInputRole;
+    let role: RunInputRole = serde_json::from_value(
+        event
+            .payload
+            .get("role")
+            .cloned()
+            .ok_or_else(|| "任务输入接受缺少明确用途".to_string())?,
+    )
+    .map_err(|_| "任务输入接受用途无法恢复".to_string())?;
+    let snapshot: super::types::RunInputSnapshot = serde_json::from_value(
+        event
+            .payload
+            .get("input_snapshot")
+            .cloned()
+            .ok_or_else(|| "任务输入接受缺少原源快照".to_string())?,
+    )
+    .map_err(|_| "任务输入源快照无法恢复".to_string())?;
+    snapshot.validate()?;
+    let turn_id = json_string(&event.payload, "turn_id").unwrap_or_default();
+    if turn_id.trim().is_empty()
+        || run.is_none_or(|run| {
+            run.run_id != event.run_id
+                || run.workspace_id != snapshot.identity.address.workspace_id
+                || run.conversation_id != snapshot.identity.address.conversation_id
+                || (role == RunInputRole::InitialGoal
+                    && (run.goal != snapshot.payload.text || run.root_message_id != turn_id))
+        })
+    {
+        return Err("任务输入源不属于原运行地址或原始Goal".to_string());
+    }
+    let key = snapshot
+        .key()
+        .map_err(|_| "任务输入身份无法恢复".to_string())?;
+    if let Some(previous) = accepted.get(&key) {
+        if previous.identity != snapshot.identity
+            || previous.source != snapshot.source
+            || previous.turn_id != turn_id
+            || previous.role != role
+        {
+            return Err("同一任务输入修订发生身份或目标冲突".to_string());
+        }
+        return Ok(());
+    }
+    if accepted.values().any(|previous| {
+        previous.identity.address == snapshot.identity.address
+            && previous.identity.input_id == snapshot.identity.input_id
+            && previous.identity.revision > snapshot.identity.revision
+    }) {
+        return Err("任务输入旧修订迟于已接受的新修订".to_string());
+    }
+    accepted.insert(
+        key,
+        super::types::RunInputAcceptance {
+            role,
+            run_id: event.run_id.clone(),
+            turn_id,
+            source: snapshot.source,
+            identity: snapshot.identity,
+            journal_sequence: event.seq,
+            duplicate: false,
+        },
+    );
+    Ok(())
+}
+
 impl EventFoldState {
     pub(crate) fn has_committed_plan(&self) -> bool {
         self.plan.is_some()
@@ -360,7 +433,7 @@ impl EventFoldState {
     }
 
     pub(crate) fn has_current_query_projection_schema(&self) -> bool {
-        self.query_projection_schema == Some(4)
+        self.query_projection_schema == Some(5)
     }
 
     #[cfg(test)]
@@ -384,6 +457,7 @@ impl EventFoldState {
             background_cells,
             continuation,
             recent_constraints,
+            accepted_user_inputs,
             execution_profile,
             project_binding,
             domain_binding,
@@ -405,7 +479,7 @@ impl EventFoldState {
             sequence_overflow: _,
             missing_record_sequence: _,
         } = self;
-        *query_projection_schema = Some(4);
+        *query_projection_schema = Some(5);
         use RuntimeEventKind as K;
         for ev in std::slice::from_ref(event) {
             seen_run_ids.insert(ev.run_id.clone());
@@ -529,6 +603,13 @@ impl EventFoldState {
                         json_string(&ev.payload, "continuation_deferred_reason");
                     completion.requirement_skips.clear();
                     completion.revalidations.clear();
+                }
+                K::RunInputAccepted => {
+                    if let Err(error) =
+                        fold_run_input_snapshot(ev, run.as_ref(), accepted_user_inputs)
+                    {
+                        *invalid_execution = Some(error);
+                    }
                 }
                 K::RunSteerRecorded => {
                     if let Some(text) = json_string(&ev.payload, "text") {
@@ -1436,6 +1517,7 @@ impl EventFoldState {
             project_binding: self.project_binding.clone(),
             domain_binding: self.domain_binding.clone(),
             event_index: RunStateEventIndex {
+                accepted_user_inputs: self.accepted_user_inputs.clone(),
                 started_turns: self.started_turns.clone(),
                 accounted_usage: self.accounted_usage.clone(),
                 accounted_compactions: self.accounted_compactions.clone(),

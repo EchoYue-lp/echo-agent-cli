@@ -1365,8 +1365,23 @@ impl ApplicationServices {
         }
 
         let app_state = Arc::new(state);
-        app_state.register_agent_control_tools().await;
         lifecycle.bind_app_state(app_state.clone());
+        // Publish the original channel binding before recovery awaits: an
+        // admitted cron callback may already hold its workspace generation.
+        #[cfg(feature = "channels")]
+        let channel_runtime = {
+            let channels = Arc::new(crate::channel_runtime::ChannelRuntime::new(&app_state));
+            lifecycle.bind_channel_runtime(channels.clone());
+            if let Err(error) = app_state
+                .scheduler
+                .weixin_notifications
+                .bind(&app_state, &channels)
+            {
+                return Err(rollback_composition(lifecycle, anyhow::anyhow!(error)).await);
+            }
+            channels
+        };
+        app_state.register_agent_control_tools().await;
         if let Err(error) = app_state.recover_pending_conversation_handoffs().await {
             return Err(rollback_composition(lifecycle, anyhow::anyhow!(error)).await);
         }
@@ -1400,12 +1415,6 @@ impl ApplicationServices {
             lifecycle.track_background_task("Dreaming", dreaming_task);
         }
 
-        #[cfg(feature = "channels")]
-        let channel_runtime = {
-            let channels = Arc::new(crate::channel_runtime::ChannelRuntime::new(&app_state));
-            lifecycle.bind_channel_runtime(channels.clone());
-            channels
-        };
         Ok(Self {
             app_state,
             #[cfg(feature = "channels")]

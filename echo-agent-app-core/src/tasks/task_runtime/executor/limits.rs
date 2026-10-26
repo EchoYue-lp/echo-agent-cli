@@ -449,6 +449,61 @@ pub async fn launch_task_run_resume(
     cancel: CancellationToken,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<TaskRunResumeLaunch, StoreError> {
+    launch_task_run_resume_input(
+        store,
+        expected,
+        primary_agent,
+        pool_execution,
+        review_integration,
+        trace_sink,
+        cancel,
+        workspace_io,
+        None,
+    )
+    .await
+}
+
+/// 同一原launch owner额外携带输入历史，源接受与原expected CAS在原run锁内同batch完成。
+#[cfg(feature = "channels")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn launch_task_run_resume_with_input(
+    store: Arc<TaskRuntimeStore>,
+    expected: TaskRunResumeIdentity,
+    primary_agent: crate::agent_handle::AgentHandle,
+    pool_execution: Option<crate::agent_pool::AgentPoolExecutionLease>,
+    review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    trace_sink: Option<ExecSink>,
+    cancel: CancellationToken,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
+    turn_id: String,
+    input: super::types::RunInputSnapshot,
+) -> Result<TaskRunResumeLaunch, StoreError> {
+    launch_task_run_resume_input(
+        store,
+        expected,
+        primary_agent,
+        pool_execution,
+        review_integration,
+        trace_sink,
+        cancel,
+        workspace_io,
+        Some((turn_id, input)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn launch_task_run_resume_input(
+    store: Arc<TaskRuntimeStore>,
+    expected: TaskRunResumeIdentity,
+    primary_agent: crate::agent_handle::AgentHandle,
+    pool_execution: Option<crate::agent_pool::AgentPoolExecutionLease>,
+    review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    trace_sink: Option<ExecSink>,
+    cancel: CancellationToken,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
+    input: Option<(String, super::types::RunInputSnapshot)>,
+) -> Result<TaskRunResumeLaunch, StoreError> {
     let run_id = expected.run_id.clone();
     let admission = store.reserve_run_driver_admission(run_id.clone(), cancel.clone())?;
     let generation_lease = store.lease_active_workspace_generation()?;
@@ -524,7 +579,13 @@ pub async fn launch_task_run_resume(
             }
             let execution_profile = snapshot.execution_profile;
             let run_goal = snapshot.run.goal;
-            if let Err(error) = store.resume_task_run_expected(&expected) {
+            let resumed = match input.as_ref() {
+                Some((turn_id, input)) => {
+                    store.resume_task_run_expected_with_input(&expected, turn_id, input)
+                }
+                None => store.resume_task_run_expected(&expected),
+            };
+            if let Err(error) = resumed {
                 let detail = error.to_string();
                 if matches!(error, StoreError::ResumeOutcomeUnknown { .. }) {
                     registration.fail_preparation(detail);

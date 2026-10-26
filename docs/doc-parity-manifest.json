@@ -529,6 +529,30 @@
       "sourceLanguage": "zh",
       "translationStatus": "reviewed",
       "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0054-task-bound-domain-plugins.md",
+      "targetPath": "adr/0054-task-bound-domain-plugins.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0055-project-workspaces.md",
+      "targetPath": "adr/0055-project-workspaces.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0056-personal-weixin-channel.md",
+      "targetPath": "adr/0056-personal-weixin-channel.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
     }
   ]
 }

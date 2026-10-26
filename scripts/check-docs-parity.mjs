@@ -43,11 +43,14 @@ function adrIdentity(text) {
     ? 'proposed'
     : normalizedStatus.includes('reference snapshot')
       ? 'reference snapshot'
-      : normalizedStatus.includes('accepted') || normalizedStatus.includes('采纳')
+      : normalizedStatus.includes('accepted') ||
+          normalizedStatus.includes('采纳') ||
+          normalizedStatus.includes('已接受')
         ? 'accepted'
         : normalizedStatus;
   const superseded =
-    text.match(/^(?:>|-\s*)?\s*(?:superseded[- ]by|被替代于?)\s*[:：]\s*(.+)$/im)?.[1]?.trim() ?? '';
+    text.match(/^(?:>|-\s*)?\s*(?:superseded[- ]by|被替代于?)\s*[:：]\s*(.+)$/im)?.[1]?.trim() ??
+    '';
   return { number, status, superseded };
 }
 
@@ -70,7 +73,8 @@ function prose(text) {
 function generatedEntries() {
   const entries = [];
   for (const legacyPath of markdownFiles(docsRoot).filter(
-    (path) => !path.startsWith('zh/') && !path.startsWith('en/') && path !== 'doc-parity-manifest.json',
+    (path) =>
+      !path.startsWith('zh/') && !path.startsWith('en/') && path !== 'doc-parity-manifest.json'
   )) {
     const legacyText = readText(join(docsRoot, legacyPath));
     let targetPath = legacyPath;
@@ -116,7 +120,9 @@ function writeManifest() {
     entries: generatedEntries(),
   };
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-  console.log(`Wrote ${manifest.entries.length} migration entries to ${relative(repositoryRoot, manifestPath)}`);
+  console.log(
+    `Wrote ${manifest.entries.length} migration entries to ${relative(repositoryRoot, manifestPath)}`
+  );
 }
 
 function checkManifest() {
@@ -141,7 +147,9 @@ function checkManifest() {
   const scope = process.argv.includes('--scope')
     ? process.argv[process.argv.indexOf('--scope') + 1]
     : undefined;
-  const entries = scope ? manifest.entries.filter((entry) => entry.kind === scope) : manifest.entries;
+  const entries = scope
+    ? manifest.entries.filter((entry) => entry.kind === scope)
+    : manifest.entries;
   const targetPaths = new Set();
   let adrCount = 0;
   for (const entry of entries) {
@@ -165,14 +173,18 @@ function checkManifest() {
       errors.push(`Legacy source is missing: docs/${legacyPath}`);
     }
     if (translationStatus !== 'reviewed') {
-      errors.push(`Translation is not reviewed: ${targetPath} (${translationStatus ?? 'missing status'})`);
+      errors.push(
+        `Translation is not reviewed: ${targetPath} (${translationStatus ?? 'missing status'})`
+      );
     }
   }
 
   const zhPaths = markdownFiles(languageRoots.zh);
   const enPaths = markdownFiles(languageRoots.en);
-  if (!existsSync(languageRoots.zh)) errors.push('Missing docs/zh; migrate the first source batch before publishing.');
-  if (!existsSync(languageRoots.en)) errors.push('Missing docs/en; reviewed translations are required before publishing.');
+  if (!existsSync(languageRoots.zh))
+    errors.push('Missing docs/zh; migrate the first source batch before publishing.');
+  if (!existsSync(languageRoots.en))
+    errors.push('Missing docs/en; reviewed translations are required before publishing.');
   const expected = [...targetPaths].sort();
   for (const path of expected) {
     if (!zhPaths.includes(path)) errors.push(`Missing zh pair: ${path}`);
@@ -185,14 +197,20 @@ function checkManifest() {
     const zhProse = prose(zhText);
     const enProse = prose(enText);
     if (!hasHan(zhProse)) errors.push(`zh page has no Han-language signal: ${path}`);
-    if (!hasLatin(enProse) || hasHan(enProse)) errors.push(`en page has an invalid language signal: ${path}`);
-    if (/(?:migration_pending|unreviewed|not yet reviewed|pending translation|待翻译|未审阅)/i.test(enText)) {
+    if (!hasLatin(enProse) || hasHan(enProse))
+      errors.push(`en page has an invalid language signal: ${path}`);
+    if (
+      /(?:migration_pending|unreviewed|not yet reviewed|pending translation|待翻译|未审阅)/i.test(
+        enText
+      )
+    ) {
       errors.push(`en page contains an unreviewed marker: ${path}`);
     }
     if (path.startsWith('adr/')) {
       const zhAdr = adrIdentity(zhText);
       const enAdr = adrIdentity(enText);
-      if (!zhAdr.number || zhAdr.number !== enAdr.number) errors.push(`ADR number mismatch: ${path}`);
+      if (!zhAdr.number || zhAdr.number !== enAdr.number)
+        errors.push(`ADR number mismatch: ${path}`);
       if (zhAdr.status !== enAdr.status || zhAdr.superseded !== enAdr.superseded) {
         errors.push(`ADR status/superseded mismatch: ${path}`);
       }
@@ -207,7 +225,9 @@ function checkManifest() {
     if (!targetPaths.has(path)) errors.push(`Unexpected en page: ${path}`);
   }
   if (errors.length === 0) {
-    console.log(`Docs parity passed${scope ? ` for ${scope}` : ''}: ${expected.length} pairs, ${adrCount} ADRs.`);
+    console.log(
+      `Docs parity passed${scope ? ` for ${scope}` : ''}: ${expected.length} pairs, ${adrCount} ADRs.`
+    );
   }
   return errors;
 }

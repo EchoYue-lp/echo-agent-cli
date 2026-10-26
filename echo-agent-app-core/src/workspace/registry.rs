@@ -793,6 +793,38 @@ mod tests {
     }
 
     #[test]
+    fn ssh_project_round_trip_preserves_raw_and_effective_locations() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(temp.path().join("data"))?;
+        let raw = ProjectLocation::Ssh {
+            host: "eko-alias".to_string(),
+            user: None,
+            port: None,
+            path: "~/项目".to_string(),
+        };
+        let effective = ProjectLocation::Ssh {
+            host: "198.51.100.7".to_string(),
+            user: Some("echo".to_string()),
+            port: Some(2222),
+            path: "/srv/项目".to_string(),
+        };
+
+        let workspace = registry.create_project(
+            "remote-round-trip",
+            WorkspaceKind::Code { repo_url: None },
+            raw.clone(),
+            Some(effective.clone()),
+        )?;
+        let reopened = registry.inspect(&workspace.id)?;
+
+        assert_eq!(reopened.project_location(), raw);
+        assert_eq!(reopened.execution_location(), effective);
+        assert!(reopened.local_project_root().is_none());
+        assert_eq!(reopened.project_root, None);
+        Ok(())
+    }
+
+    #[test]
     fn new_project_creates_one_directory_and_never_adopts_existing_content() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let registry = WorkspaceRegistry::with_base_dir(temp.path().join("data"))?;

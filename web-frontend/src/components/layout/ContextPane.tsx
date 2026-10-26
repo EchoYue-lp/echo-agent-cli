@@ -47,6 +47,17 @@ export function ContextPane() {
     useContextPaneStore.getState().reset();
   }, [workspace?.id, activeConversationId]);
 
+  const previousTaskScope = useRef(workspaceScope);
+  useEffect(() => {
+    if (
+      previousTaskScope.current !== workspaceScope &&
+      useContextPaneStore.getState().target?.kind === 'tasks'
+    ) {
+      useContextPaneStore.getState().reset();
+    }
+    previousTaskScope.current = workspaceScope;
+  }, [workspaceScope]);
+
   useEffect(() => {
     if (!target) return;
     const handleEscape = (event: KeyboardEvent) => {

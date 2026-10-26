@@ -188,7 +188,7 @@ impl TaskContinuationRuntime {
         resources: Arc<ChatResources>,
         root_message_id: String,
         foreground: Option<crate::foreground_turn::ForegroundTurnProgress>,
-    ) {
+    ) -> ContinuationGenerationCut {
         // A launcher never retains a workspace generation. While a foreground
         // chain is active it carries only the non-owning progress capability;
         // deferred launchers replace that capability and renderer atomically.
@@ -229,6 +229,12 @@ impl TaskContinuationRuntime {
                 },
             },
         );
+        // 注册和回执在同一锁内完成，后继注册不能被旧回合的清理接管。
+        ContinuationGenerationCut {
+            launcher: Some(generation),
+            active: None,
+            owned: None,
+        }
     }
 
     fn request(self: &Arc<Self>, run_id: &str, origin: RunTurnOrigin) -> ContinueRequestOutcome {
@@ -1252,14 +1258,14 @@ pub(crate) fn register_launcher(
     resources: Arc<ChatResources>,
     root_message_id: String,
     foreground: Option<crate::foreground_turn::ForegroundTurnProgress>,
-) {
+) -> ContinuationGenerationCut {
     runtime_for(store).register_launcher(
         run_id,
         fallback_agent,
         resources,
         root_message_id,
         foreground,
-    );
+    )
 }
 
 pub(crate) fn request_continue(
@@ -1440,6 +1446,37 @@ mod tests {
             human_loop_provider: None,
         });
         Ok((store, agent, resources))
+    }
+
+    #[tokio::test]
+    async fn registered_cut_cannot_retire_replacement_renderer() -> Result<(), String> {
+        let (store, agent, mut resources) = retry_wait_fixture("renderer-generation")?;
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Arc::get_mut(&mut resources)
+            .ok_or_else(|| "测试资源在注册前已有其它所有者".to_string())?
+            .sink = Arc::new(DropTrackingSink(dropped.clone()));
+        let first = register_launcher(
+            &store,
+            "renderer-generation",
+            agent.clone(),
+            resources.clone(),
+            "renderer-generation-root".to_string(),
+            None,
+        );
+        let replacement = register_launcher(
+            &store,
+            "renderer-generation",
+            agent,
+            resources.clone(),
+            "renderer-generation-root".to_string(),
+            None,
+        );
+        drop(resources);
+        clear_launcher_at_cut(&store, "renderer-generation", first);
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        clear_launcher_at_cut(&store, "renderer-generation", replacement);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        Ok(())
     }
 
     fn install_retry_wait_barrier(

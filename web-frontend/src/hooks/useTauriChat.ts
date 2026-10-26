@@ -2,7 +2,7 @@ import { useRef, useCallback, useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { useChatStore } from '../stores/chatStore';
 import { useConversationStore } from '../stores/conversationStore';
-import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
+import { useTaskRuntimeStore, type TaskRuntimeState } from '../stores/taskRuntimeStore';
 import { useToastStore } from '../stores/toastStore';
 import { useToolExecutionStore } from '../stores/toolExecutionStore';
 import { useWorkspaceStore } from '../stores/workspaceStore';
@@ -32,7 +32,17 @@ export type QueuedChatInput = {
   workspaceId: string;
   conversationId: string;
   identity: ConversationInputIdentity;
+  phase: ConversationInputReceipt['phase'];
+  drained: boolean;
+  channelOwned?: boolean;
+  steerOutcome?: 'retained' | 'rejected';
 };
+
+// Channel inputs keep their original pump and recovery owner even when their
+// conversation is opened in the GUI. Do not dispatch or rewrite their payload.
+function channelOwnsInput(input: ConversationInputProjection): boolean {
+  return 'channel_binding' in input.payload && input.payload.channel_binding != null;
+}
 
 /** Capture identity/target before encoding; retain the prepared payload for retries. */
 export type ChatSendSubmission = {
@@ -124,6 +134,7 @@ export function useTauriChat() {
   const assistantIdRef = useRef<string | null>(null);
   const isCancelledRef = useRef(false);
   const activeTurnIdRef = useRef<string | null>(null);
+  const terminalProjectionRevisionRef = useRef(0);
   const currentMessageKeyRef = useRef<string | null>(null);
   const currentConversationIdRef = useRef<string | null>(activeConversationId);
   const currentWorkspaceIdRef = useRef(currentWorkspaceId);
@@ -148,6 +159,9 @@ export function useTauriChat() {
     | null
   >(null);
   const [frontier, setFrontier] = useState<ConversationInputFrontier>(EMPTY_FRONTIER);
+  const [steerOutcomes, setSteerOutcomes] = useState<
+    Record<string, QueuedChatInput['steerOutcome']>
+  >({});
 
   const captureInputProjection = useCallback(() => {
     const generation = identityGenerationRef.current;
@@ -227,6 +241,13 @@ export function useTauriChat() {
     frontierAppliedOrdinalRef.current = requestOrdinal;
     frontierRef.current = next;
     setFrontier(next);
+    setSteerOutcomes((previous) => {
+      const activeIds = new Set(next.items.map((item) => item.receipt.identity.input_id));
+      const retained = Object.fromEntries(
+        Object.entries(previous).filter(([inputId]) => activeIds.has(inputId))
+      );
+      return Object.keys(retained).length === Object.keys(previous).length ? previous : retained;
+    });
     return next;
   }, []);
 
@@ -259,6 +280,7 @@ export function useTauriChat() {
     currentConversationIdRef.current = activeConversationId;
     frontierRef.current = EMPTY_FRONTIER;
     setFrontier(EMPTY_FRONTIER);
+    setSteerOutcomes({});
     if (adoptsCurrentTurn) {
       if (adoptsPendingAdmission && pendingAdmissionRef.current) {
         pendingAdmissionRef.current.identityGeneration = identityGenerationRef.current;
@@ -291,7 +313,7 @@ export function useTauriChat() {
     }
     const snapshot = frontierRef.current;
     const next = snapshot.items[0];
-    if (!next) return;
+    if (!next || channelOwnsInput(next)) return;
     const inputId = next.receipt.identity.input_id;
     if (dispatchingInputIdRef.current === inputId) return;
     dispatchingInputIdRef.current = inputId;
@@ -391,6 +413,8 @@ export function useTauriChat() {
         event.payload.source === 'turn_status' &&
         ['completed', 'failed', 'cancelled'].includes(event.payload.event.status);
       if (terminalStatus) {
+        // 实时终态比此前发出的活跃快照更新，迟到快照不能复活这个执行槽。
+        terminalProjectionRevisionRef.current += 1;
         activeTurnIdRef.current = null;
         currentMessageKeyRef.current = null;
         assistantIdRef.current = null;
@@ -510,8 +534,13 @@ export function useTauriChat() {
       }
       pendingCleanup.push(unlistenExec);
       try {
+        const recoveryTerminalRevision = terminalProjectionRevisionRef.current;
         const snapshot = await getActiveTurnSnapshot();
-        if (!aborted && setupIdentityGeneration === identityGenerationRef.current) {
+        if (
+          !aborted &&
+          setupIdentityGeneration === identityGenerationRef.current &&
+          recoveryTerminalRevision === terminalProjectionRevisionRef.current
+        ) {
           restoreActiveTurnRefs(snapshot);
           const activeConversation = useConversationStore.getState().activeId;
           const snapshotIsMessageScope = snapshot?.conversation_id.startsWith('message:') ?? false;
@@ -754,17 +783,30 @@ export function useTauriChat() {
           for (const event of pendingEvents) applyEvent(event);
           if (outcome !== 'queued' && chatResult.run_id && chatResult.goal) {
             const admittedConversationId = conversationId;
-            useTaskRuntimeStore.getState().openInterruptPrompt({
-              runId: chatResult.run_id,
+            const admittedRunId = chatResult.run_id;
+            const prompt: NonNullable<TaskRuntimeState['interruptPrompt']> = {
+              runId: admittedRunId,
               goal: chatResult.goal,
               newMessage: chatResult.new_message ?? text,
               resolve: async (action) => {
+                const ownsPrompt = () =>
+                  isOriginalView() && useTaskRuntimeStore.getState().interruptPrompt === prompt;
+                if (!ownsPrompt()) return;
                 if (action === 'continue') {
-                  const run = useTaskRuntimeStore.getState().activeRun;
-                  if (run?.status === 'paused') {
-                    await useTaskRuntimeStore.getState().resumeTaskRun();
+                  // The conflict result owns this run; a historical inspector never supplies its identity.
+                  const receipt = await useTaskRuntimeStore.getState().resumeTaskRun({
+                    workspace_id: workspaceId,
+                    workspace_generation: workspaceScope.workspaceGeneration,
+                    run_id: admittedRunId,
+                  });
+                  if ((!receipt || receipt.run_id !== admittedRunId) && ownsPrompt()) {
+                    throw new Error(
+                      useTaskRuntimeStore.getState().error ?? '后端未确认此运行的恢复请求'
+                    );
                   }
-                  useTaskRuntimeStore.getState().dismissInterruptPrompt();
+                  if (receipt?.run_id === admittedRunId && ownsPrompt()) {
+                    useTaskRuntimeStore.getState().dismissInterruptPrompt();
+                  }
                   return;
                 }
                 if (action === 'edit') {
@@ -773,10 +815,14 @@ export function useTauriChat() {
                 }
                 await apiInvoke('cancel_task_run', {
                   workspaceId,
-                  runId: chatResult.run_id,
+                  workspaceGeneration: workspaceScope.workspaceGeneration,
+                  runId: admittedRunId,
                 });
+                if (!ownsPrompt()) return;
                 useTaskRuntimeStore.getState().dismissInterruptPrompt();
                 const current = await refreshFrontier(workspaceId, admittedConversationId);
+                if (!isOriginalView() || useTaskRuntimeStore.getState().interruptPrompt !== null)
+                  return;
                 const selected = current.items.find(
                   (item) => item.receipt.identity.input_id === chatResult.input_id
                 );
@@ -787,7 +833,8 @@ export function useTauriChat() {
                   });
                 }
               },
-            });
+            };
+            useTaskRuntimeStore.getState().openInterruptPrompt(prompt);
           }
           currentMessageKeyRef.current = null;
           activeTurnIdRef.current = null;
@@ -844,6 +891,7 @@ export function useTauriChat() {
 
   const steerConversationInput = useCallback(
     async (queued: ConversationInputProjection, expectedQueueRevision: number) => {
+      if (channelOwnsInput(queued)) return false;
       const conversationId = useConversationStore.getState().activeId;
       const workspaceScope = productDataScope(useWorkspaceStore.getState().current);
       if (
@@ -874,6 +922,10 @@ export function useTauriChat() {
         );
         if (!isCurrentSteer()) return result.drained;
         if (!result.drained) {
+          setSteerOutcomes((previous) => ({
+            ...previous,
+            [queued.receipt.identity.input_id]: 'retained',
+          }));
           useToastStore.getState().addToast('info', '当前阶段不能插入，已保留在排队队列中');
           return false;
         }
@@ -894,6 +946,10 @@ export function useTauriChat() {
         return true;
       } catch (error) {
         if (isCurrentSteer()) {
+          setSteerOutcomes((previous) => ({
+            ...previous,
+            [queued.receipt.identity.input_id]: 'rejected',
+          }));
           useToastStore.getState().addToast('error', `补充当前任务失败：${errorMessage(error)}`);
         }
         return false;
@@ -1201,6 +1257,10 @@ export function useTauriChat() {
     workspaceId: item.receipt.identity.address.workspace_id,
     conversationId: item.receipt.identity.address.conversation_id,
     identity: item.receipt.identity,
+    phase: item.receipt.phase,
+    drained: item.receipt.drained,
+    channelOwned: channelOwnsInput(item),
+    steerOutcome: steerOutcomes[item.receipt.identity.input_id],
   }));
 
   const clearQueuedMessages = useCallback(() => {
@@ -1208,6 +1268,7 @@ export function useTauriChat() {
     if (snapshot.items.length === 0) return;
     void (async () => {
       for (const item of snapshot.items) {
+        if (channelOwnsInput(item)) continue;
         await apiInvoke('remove_queued_chat_input', {
           identity: item.receipt.identity,
         });
@@ -1224,7 +1285,7 @@ export function useTauriChat() {
       const item = frontierRef.current.items.find(
         (candidate) => candidate.receipt.identity.input_id === id
       );
-      if (!item) return;
+      if (!item || channelOwnsInput(item)) return;
       void apiInvoke('remove_queued_chat_input', { identity: item.receipt.identity })
         .then(() =>
           refreshFrontier(
@@ -1239,9 +1300,56 @@ export function useTauriChat() {
     [refreshFrontier]
   );
 
+  const replaceQueuedMessage = useCallback(
+    async (id: string, text: string) => {
+      const snapshot = frontierRef.current;
+      const item = snapshot.items.find((candidate) => candidate.receipt.identity.input_id === id);
+      if (
+        !item ||
+        channelOwnsInput(item) ||
+        (!text.trim() && item.payload.attachments.length === 0)
+      )
+        return false;
+      const isCurrentEdit = captureInputProjection();
+      try {
+        await apiInvoke<ConversationInputReceipt>('replace_queued_chat_input', {
+          identity: item.receipt.identity,
+          expectedQueueRevision: snapshot.queue_revision,
+          text,
+          attachments: item.payload.attachments,
+          domainPlugin: item.payload.domain_plugin ?? null,
+        });
+        if (!isCurrentEdit()) return false;
+        setSteerOutcomes((previous) => {
+          if (!(id in previous)) return previous;
+          const next = { ...previous };
+          delete next[id];
+          return next;
+        });
+        await refreshFrontier(
+          item.receipt.identity.address.workspace_id,
+          item.receipt.identity.address.conversation_id
+        );
+        return isCurrentEdit();
+      } catch (error) {
+        if (isCurrentEdit())
+          useToastStore.getState().addToast('error', `编辑排队消息失败：${errorMessage(error)}`);
+        return false;
+      }
+    },
+    [captureInputProjection, refreshFrontier]
+  );
+
   const reorderQueuedMessage = useCallback(
     (sourceId: string, targetId: string) => {
       const snapshot = frontierRef.current;
+      if (
+        snapshot.items.some(
+          (item) =>
+            [sourceId, targetId].includes(item.receipt.identity.input_id) && channelOwnsInput(item)
+        )
+      )
+        return;
       const current = snapshot.items.map((item) => ({
         id: item.receipt.identity.input_id,
         identity: item.receipt.identity,
@@ -1283,6 +1391,7 @@ export function useTauriChat() {
     queuedInputs,
     clearQueuedMessages,
     removeQueuedMessage,
+    replaceQueuedMessage,
     reorderQueuedMessage,
     steerQueuedMessage,
   };

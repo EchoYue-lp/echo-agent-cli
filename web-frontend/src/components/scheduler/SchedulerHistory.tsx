@@ -7,6 +7,7 @@ import type {
   SchedulerRunReference,
 } from '../../api/endpoints';
 import { useToastStore } from '../../stores/toastStore';
+import { WeixinNotificationResult } from './WeixinNotification';
 
 export function SchedulerRunLink({ run }: { run: SchedulerRunReference }) {
   const open = async () => {
@@ -41,9 +42,12 @@ export function SchedulerRunLink({ run }: { run: SchedulerRunReference }) {
     }
   };
   return (
-    <button className="text-xs underline" onClick={() => void open()}>
-      查看任务结果 {run.run_id}
-    </button>
+    <div className="space-y-2">
+      <button className="text-xs underline" onClick={() => void open()}>
+        查看任务结果 {run.run_id}
+      </button>
+      <WeixinNotificationResult runId={run.run_id} />
+    </div>
   );
 }
 

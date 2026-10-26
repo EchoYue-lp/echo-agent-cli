@@ -35,7 +35,10 @@ accepted
 - GUI 文件操作和项目终端捕获 workspace ID 与原 generation，在后端借原 host control/I/O receipt。人手终端不占 Agent 执行槽，不要求 LLM 或 full-auto。活动 PTY 的 receipt 保持到原 child/reader 结算，防止项目删除或重关联误判空闲。
 - 六个非本机项目文件操作使用原 ProductDataIo 的显式 30 秒观察，包含等待原信号量的时间，返回同一 u64 operation 的类型化 Unconfirmed；这是等待反馈上限，不是取消或远端执行期限。超时或观察者被丢弃只把该原 id 标为 retained，原 detached 物理任务、permit 与 host receipt 保持到真实结算；迟到失败保留在原失败收据。本机/global 调用保持原等待方式。普通侧栏焦点切换保持原多 host 行为，位置重绑、重连和 host 退休仍受原 idle 门禁约束。
 - 已物理完成的观察结果通过结果封装移交同一个原 operation；实际取出才确认交付，未读取的缓存结果被丢弃时先记录其错误再结算同 id。通道发送成功不等于已被观察。正常读取到的业务错误返回调用方，不记作未观察的退出失败。
-- 认证通过创建弹窗的原 PTY 完成，密码不进入项目 metadata、持久化前端 store 或模型。成功后原连接 owner 移交给 Workspace；取消只关闭本次 draft。认证 master 与普通终端 tab 分开，关闭 tab不自动关闭项目连接。
+- 创建弹窗用密码掩码表单完成认证，不展示黑色终端。认证仍由原系统 OpenSSH PTY、ControlMaster 和私有 control socket 拥有；表单只在原 SSH 已请求密码后，通过既有终端写入 IPC 暂时发送一次，随后清除本次密码。密码不进入 argv、env、项目 metadata、日志、持久化前端 store 或模型；未知写入不自动重发。主机指纹沿 OpenSSH 原提示明确交用户确认。
+- “测试连接”只核对相同目标的原 `ssh -O check` 结果，不读取项目目录；目录可以稍后填写。点击创建/进入时才在同一 owner 上校验目录，`ssh-test`、`.` 和 `~/ssh-test` 按远程用户 HOME 解析，绝对路径保持绝对语义；命令 `pwd -P`、SFTP canonical path 与实际工作目录必须一致，读取失败不创建项目。
+- 成功后原连接 owner 移交给 Workspace；取消只关闭本次 draft。认证 master 与普通终端 tab 分开，关闭 tab 不自动关闭项目连接。普通终端保留 xterm 的键盘输入；外层可访问文本框获得焦点时转交给实际输入区。
+- 登录成功后清空未使用的口令并禁用密码编辑；换密码先断开重测，不能复用旧连接宣称新凭据通过。只读目录验证在 GUI 最多观察 30 秒，超时保留原验证 Promise 和物理 owner，同一 pending 请求只允许显式重试观察；旧观察迟到不自动创建。创建 IPC 的未知结果仍沿原合同处理。视图退役后的关闭失败会明确提示资源仍被应用持有，由原退出流程重试，不声称已有同 ID 的 GUI 关闭重试入口。
 - 退出时先封准入，按原终端 owner 关闭并观察用户 PTY，再等待依赖的 host/I/O 资源；共享认证 master 等 Agent/file 操作结算后才关闭。不用杀本地 SSH 子进程冒充远端副作用已停止。
 
 ## 影响
@@ -49,3 +52,9 @@ TaskRun 在原 `RunCreated`/目标版本中绑定经验证的位置 identity 和
 回归覆盖本地旧数据、三来源 payload、失败回滚、有效位置变化、隔离 cwd、规则读取失败、连接移交、终端物理结算，以及带受控物理 barrier、丢失观察者和独立 operation id 的有界观察。观察入口不能修复后端提前返回未知错误并丢弃物理资源的问题，transport 未知结算仍须独立验证。真实远程认证与选定目录验收是独立证据，不由 mock 或端口连通替代。
 
 这是 EKO GUI/IPC 的产品能力，不新增框架 SDK 示例或独立终端产品入口。正式 API 的通用文件提供者示例由框架自己的编译链验证；官网镜像必须在真实 EKO source checkpoint 后使用原同步机制，不把任务分支写成已发布 main。
+
+### 密码表单的成熟实现依据与取舍（2026-10-26）
+
+[OpenSSH `ssh(1)`](https://man.openbsd.org/ssh.1) 区分终端读取与 `SSH_ASKPASS` 图形询问；[VS Code Remote SSH 故障排查](https://code.visualstudio.com/docs/remote/troubleshooting)也明确将等待认证提示与连接完成分开。EKO 已有原 PTY/ControlMaster、二进制终端写入和连接移交，因此保留这一权威，改用掩码表单呈现，不再增加 askpass helper 或第二套连接 owner。表单是应用界面策略，登录成功仍由原 ControlMaster 证明，不能从密码提示、按钮点击或本地进程启动推断。
+
+旧黑终端反例与新交互分别记录：浏览器真实 Modal/xterm 下，外层文本框聚焦时公开 probe 没有写入，直接聚焦 helper 输入区后产生写入；这证明一个输入可达性缺口，不倒推用户每次真实失败的原因。新表单/生命周期前端回归、原 PTY 无回显控制、目录解析和真实 SSH 验收按各自证据结算，源码或 mock 通过不代表 `ubuntu@111.229.245.175` 的真实认证已通过。
