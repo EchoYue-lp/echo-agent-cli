@@ -1,13 +1,27 @@
 import { create } from 'zustand';
 import { isHitlRequestIdentity, sameHitlIdentity } from '../types/api';
 import type { HitlRequestIdentity } from '../types/api';
-import type { ChatMessage, ApprovalRequest, ExecutionRound, ChatRunStatus } from '../types/api';
+import type {
+  AssistantMessageBlock,
+  ChatMessage,
+  ApprovalRequest,
+  ExecutionRound,
+  ChatRunStatus,
+} from '../types/api';
 import { useConversationStore } from './conversationStore';
 
 /** In-progress round being built during streaming */
 interface CurrentRound {
   thinking?: { content: string };
   toolCallIds: string[];
+}
+
+export interface ChatActivity {
+  key: string;
+  label: string;
+  startedAt: number;
+  lastEventAt: number;
+  scope?: string;
 }
 
 /** 当前上下文窗口占用快照（对齐 Claude Code statusline 语义）。 */
@@ -59,6 +73,10 @@ interface ChatState {
   isCancelled: boolean;
   isThinking: boolean;
   runStatus: ChatRunStatus;
+  /** 仅来自实际运行事件；计时刷新不产生新事件或发现。 */
+  activity: ChatActivity | null;
+  observeActivity: (key: string, label: string, at?: number, scope?: string) => void;
+  noteActivityEvent: (at?: number) => void;
   pendingHitlRequests: PendingHitlRequest[];
   /** True when viewing a loaded historical conversation (agent has no context) */
   isHistoryView: boolean;
@@ -78,6 +96,7 @@ interface ChatState {
     attachments?: ChatMessage['attachments']
   ) => string;
   appendToken: (id: string, token: string) => void;
+  appendAssistantBlock: (id: string, block: AssistantMessageBlock) => void;
   appendThinking: (id: string, token: string) => void;
   startThinkingSegment: (id: string) => void;
   recordToolStart: (messageId: string, toolExecutionId: string) => void;
@@ -148,11 +167,35 @@ export const useChatStore = create<ChatState>((set, get) => ({
   isCancelled: false,
   isThinking: false,
   runStatus: 'idle',
+  activity: null,
   pendingHitlRequests: [],
   isHistoryView: false,
   currentRound: null,
   contextWindow: null,
   usageAccumulator: { totalInput: 0, totalCached: 0 },
+
+  observeActivity: (key, label, at = Date.now(), scope) =>
+    set((state) => {
+      if (!state.isStreaming || !Number.isFinite(at)) return state;
+      const previous = state.activity;
+      if (previous && at < previous.lastEventAt) return state;
+      return {
+        activity: {
+          key,
+          label,
+          startedAt: previous?.key === key ? previous.startedAt : at,
+          lastEventAt: Math.max(previous?.lastEventAt ?? at, at),
+          scope,
+        },
+      };
+    }),
+  noteActivityEvent: (at = Date.now()) =>
+    set((state) => ({
+      activity:
+        state.isStreaming && state.activity && Number.isFinite(at)
+          ? { ...state.activity, lastEventAt: Math.max(state.activity.lastEventAt, at) }
+          : state.activity,
+    })),
 
   addUserMessage: (content, attachments) => {
     const id = nextId();
@@ -177,6 +220,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       messages: state.messages.filter((message) => !removed.has(message.id)),
       isStreaming: false,
       isThinking: false,
+      activity: null,
     }));
     scheduleAutoSave();
   },
@@ -190,6 +234,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           id,
           role: 'assistant',
           content: '',
+          finalAnswerConfirmed: false,
           thinkingSegments: [],
           executionSteps: [],
           executionRounds: [],
@@ -200,6 +245,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isStreaming: true,
       isCancelled: false,
       runStatus: 'running',
+      activity: null,
     }));
     return id;
   },
@@ -231,6 +277,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             id: nextAssistantId,
             role: 'assistant' as const,
             content: '',
+            finalAnswerConfirmed: false,
             thinkingSegments: [],
             executionSteps: [],
             executionRounds: [],
@@ -241,6 +288,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         isStreaming: true,
         isCancelled: false,
         runStatus: 'running' as const,
+        activity: null,
       };
     });
     scheduleAutoSave();
@@ -255,6 +303,37 @@ export const useChatStore = create<ChatState>((set, get) => ({
       updated[idx] = { ...updated[idx], content: updated[idx].content + token };
       return { messages: updated };
     });
+  },
+
+  appendAssistantBlock: (id, block) => {
+    set((state) => ({
+      messages: state.messages.map((message) => {
+        if (message.id !== id || !message.isStreaming) return message;
+        const blocks = [...(message.assistantBlocks ?? [])];
+        const index = blocks.findIndex(
+          (entry) =>
+            entry.block.request_id === block.request_id && entry.block.block_id === block.block_id
+        );
+        if (index >= 0) {
+          const previous = blocks[index];
+          if (!previous || previous.block.complete || block.sequence < previous.block.sequence)
+            return message;
+          if (previous.block.phase !== 'unknown' && previous.block.phase !== block.phase)
+            return message;
+          blocks[index] = { block, content: previous.content + block.delta };
+          return { ...message, assistantBlocks: blocks };
+        }
+        blocks.push({ block, content: block.delta });
+        return {
+          ...message,
+          assistantBlocks: blocks,
+          executionSteps: [
+            ...(message.executionSteps ?? []),
+            { type: 'assistant' as const, index: blocks.length - 1 },
+          ],
+        };
+      }),
+    }));
   },
 
   appendThinking: (id, token) => {
@@ -361,9 +440,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   applyFinalAnswer: (id, content) => {
+    if (!content.trim()) return;
     set((state) => ({
       messages: state.messages.map((message) =>
-        message.id === id ? { ...message, content: content || message.content } : message
+        message.id === id && !message.finalAnswerConfirmed
+          ? { ...message, content, finalAnswerConfirmed: true }
+          : message
       ),
     }));
     scheduleAutoSave();
@@ -374,6 +456,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isStreaming: false,
       isThinking: false,
       pendingHitlRequests: [],
+      activity: null,
       messages: state.messages.map((message) =>
         message.id === id ? { ...message, isStreaming: false } : message
       ),
@@ -400,6 +483,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isStreaming: false,
       isThinking: false,
       runStatus: isRunning ? 'running' : 'waiting_approval',
+      activity: null,
       messages: s.messages.map((m) => (m.id === id ? { ...m, content, isStreaming: false } : m)),
     }));
     scheduleAutoSave();
@@ -413,6 +497,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           id: nextId(),
           role: 'assistant',
           content,
+          finalAnswerConfirmed: false,
           isStreaming: false,
           timestamp: Date.now(),
         },
@@ -421,10 +506,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
     scheduleAutoSave();
   },
 
-  setStreaming: (v) => set({ isStreaming: v }),
+  setStreaming: (v) => set((state) => ({ isStreaming: v, activity: v ? state.activity : null })),
   setRunStatus: (status) =>
     set((state) => ({
       runStatus: status,
+      activity: ['idle', 'completed', 'failed', 'cancelled'].includes(status)
+        ? null
+        : state.activity,
       isStreaming: !['idle', 'completed', 'failed', 'cancelled'].includes(status),
       isCancelled: status === 'cancelled',
       isThinking: status === 'thinking',
@@ -439,6 +527,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isThinking: false,
       isCancelled: false,
       runStatus: 'idle',
+      activity: null,
       pendingHitlRequests: [],
       messages: state.messages.map((message) =>
         message.isStreaming ? { ...message, isStreaming: false } : message
@@ -506,6 +595,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       contextWindow: null,
       usageAccumulator: { totalInput: 0, totalCached: 0 },
       runStatus: 'idle',
+      activity: null,
     }),
 
   replaceMessages: (messages) =>
@@ -519,6 +609,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       contextWindow: null,
       usageAccumulator: { totalInput: 0, totalCached: 0 },
       runStatus: 'idle',
+      activity: null,
     }),
 
   setHistoryView: (v) => set({ isHistoryView: v }),

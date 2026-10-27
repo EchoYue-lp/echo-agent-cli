@@ -5,6 +5,7 @@ import { useToastStore } from './toastStore';
 import { useToolExecutionStore } from './toolExecutionStore';
 import { useSubagentRunStore } from './subagentRunStore';
 import { useTaskRuntimeStore } from './taskRuntimeStore';
+import { transcriptToolExecution } from '../types/api';
 import { GLOBAL_WORKSPACE_ID, viewAddress, type ViewAddress } from '../lib/viewAddress';
 import type {
   ChatMessage,
@@ -12,6 +13,8 @@ import type {
   ExecutionStep,
   SavedMessage,
   SideConversationEntry,
+  TranscriptToolRecord,
+  ToolExecution,
 } from '../types/api';
 
 let listGeneration = 0;
@@ -203,6 +206,8 @@ export function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
       role: m.role,
       content: m.content,
       internal_agent: m.internalAgent,
+      assistant_blocks: m.assistantBlocks,
+      final_answer_confirmed: m.finalAnswerConfirmed,
     };
 
     // Save thinking segments
@@ -213,7 +218,7 @@ export function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
     // Save execution steps (chronological order of thinking/tool interleaving)
     if (m.executionSteps && m.executionSteps.length > 0) {
       entry.execution_steps = m.executionSteps.map((s) =>
-        s.type === 'thinking'
+        s.type === 'thinking' || s.type === 'assistant'
           ? { type: s.type, index: s.index }
           : { type: s.type, call_id: s.callId }
       );
@@ -257,6 +262,175 @@ export function restoredMessageId(
   message: SavedMessage
 ): string {
   return message.message_id ?? `loaded-${conversationId}-${index}`;
+}
+
+/** Restore display references without turning transcript text into runtime state. */
+function restoreTranscriptTools(
+  saved: SavedMessage[],
+  messages: ChatMessage[],
+  workspaceId: string,
+  conversationId: string,
+  tools: Readonly<Record<string, ToolExecution>>
+): ChatMessage[] {
+  const callCounts = new Map<string, number>();
+  for (const message of saved) {
+    for (const call of message.tool_calls ?? []) {
+      callCounts.set(call.id, (callCounts.get(call.id) ?? 0) + 1);
+    }
+  }
+  const resultMeta = saved.map((message) => {
+    if (message.role !== 'tool' || !message.tool_result) return null;
+    try {
+      const value: unknown = JSON.parse(message.tool_result);
+      if (!value || typeof value !== 'object') return null;
+      const fields = value as Record<string, unknown>;
+      return {
+        callId: typeof fields.tool_call_id === 'string' ? fields.tool_call_id : undefined,
+        name: typeof fields.name === 'string' ? fields.name : undefined,
+      };
+    } catch {
+      return null;
+    }
+  });
+  const pairedResults = new Set<number>();
+  const byIndex = new Map<number, ChatMessage>();
+  let visibleIndex = 0;
+  saved.forEach((source, sourceIndex) => {
+    if (source.role !== 'user' && source.role !== 'assistant') return;
+    const message = messages.at(visibleIndex);
+    visibleIndex += 1;
+    if (!message) return;
+    byIndex.set(sourceIndex, message);
+    if (source.role !== 'assistant') return;
+    const existingIds = new Set([
+      ...(message.executionSteps?.flatMap((step) => (step.type === 'tool' ? [step.callId] : [])) ??
+        []),
+      ...(message.executionRounds?.flatMap((round) => round.toolCallIds) ?? []),
+    ]);
+    const claimedReferences = new Set<string>();
+    const records = (source.tool_calls ?? []).map((call, callIndex): TranscriptToolRecord => {
+      const unique = callCounts.get(call.id) === 1;
+      const record: TranscriptToolRecord = {
+        id: `transcript:${JSON.stringify([workspaceId, conversationId, sourceIndex, callIndex, call.id])}`,
+        workspaceId,
+        conversationId,
+        messageId: source.message_id,
+        callId: call.id,
+        callType: call.type,
+        name: call.function.name,
+        requestedArguments: call.function.arguments,
+        identityAmbiguous: !unique,
+      };
+      const summary = transcriptToolExecution(record, tools);
+      // An old opaque reference can identify a display row without proving its
+      // runtime owner. Reusing that key never grants a terminal status.
+      const matchingReferences = [...existingIds].filter((id) => {
+        const referenced = tools[id];
+        return (
+          !claimedReferences.has(id) &&
+          referenced &&
+          referenced.workspace_id === workspaceId &&
+          referenced.conversation_id === conversationId &&
+          referenced.call_id === call.id &&
+          referenced.name === call.function.name
+        );
+      });
+      if (summary && existingIds.has(summary.id)) record.id = summary.id;
+      else if (existingIds.has(call.id) && !claimedReferences.has(call.id)) record.id = call.id;
+      else if (matchingReferences.length === 1) record.id = matchingReferences.at(0) ?? record.id;
+      else if (summary) record.id = summary.id;
+      if (existingIds.has(record.id)) claimedReferences.add(record.id);
+      const resultIndexes: number[] = [];
+      if (unique) {
+        for (let index = sourceIndex + 1; index < saved.length; index += 1) {
+          if (saved.at(index)?.role === 'user') break;
+          const meta = resultMeta.at(index);
+          if (meta?.callId === call.id && meta.name === call.function.name)
+            resultIndexes.push(index);
+        }
+      }
+      if (resultIndexes.length === 1) {
+        const resultIndex = resultIndexes.at(0);
+        if (resultIndex != null) {
+          record.recordedOutput = saved.at(resultIndex)?.content ?? '';
+          pairedResults.add(resultIndex);
+        }
+      }
+      return record;
+    });
+    // Every retained reference gets the same message-bound status gate. A bare
+    // execution key with no source owner must not bypass it through tools[id].
+    for (const id of existingIds) {
+      if (records.some((record) => record.id === id)) continue;
+      const referenced = tools[id];
+      const exactOwner =
+        referenced &&
+        source.message_id &&
+        referenced.workspace_id === workspaceId &&
+        referenced.conversation_id === conversationId &&
+        referenced.owner.kind === 'chat' &&
+        referenced.owner.message_id === source.message_id;
+      records.push({
+        id,
+        workspaceId,
+        conversationId,
+        messageId: source.message_id,
+        callId: exactOwner ? referenced.call_id : undefined,
+        name: exactOwner ? referenced.name : undefined,
+        identityAmbiguous: !exactOwner || (callCounts.get(referenced.call_id) ?? 0) > 1,
+      });
+    }
+    message.transcriptTools = records;
+    const missing = records.filter((record) => !existingIds.has(record.id));
+    if (missing.length === 0) return;
+    if (message.executionSteps?.length) {
+      message.executionSteps = [
+        ...message.executionSteps,
+        ...missing.map((record) => ({ type: 'tool' as const, callId: record.id })),
+      ];
+    } else if (message.executionRounds?.length) {
+      message.executionRounds = [
+        ...message.executionRounds,
+        { toolCallIds: missing.map((record) => record.id) },
+      ];
+    } else {
+      message.executionSteps = [
+        ...(message.thinkingSegments?.map((_segment, index) => ({
+          type: 'thinking' as const,
+          index,
+        })) ?? []),
+        ...missing.map((record) => ({ type: 'tool' as const, callId: record.id })),
+      ];
+    }
+  });
+  return saved.flatMap((source, sourceIndex) => {
+    const message = byIndex.get(sourceIndex);
+    if (message) return [message];
+    if (source.role !== 'tool' || pairedResults.has(sourceIndex)) return [];
+    const id = `transcript-result:${JSON.stringify([workspaceId, conversationId, sourceIndex])}`;
+    const meta = resultMeta.at(sourceIndex);
+    return [
+      {
+        id,
+        role: 'tool' as const,
+        content: source.content ?? '',
+        internalAgent: source.internal_agent ?? false,
+        isStreaming: false,
+        timestamp: 0,
+        transcriptTools: [
+          {
+            id,
+            workspaceId,
+            conversationId,
+            callId: meta?.callId,
+            name: meta?.name,
+            recordedOutput: source.content ?? '',
+            identityAmbiguous: true,
+          },
+        ],
+      },
+    ];
+  });
 }
 
 function projectSideInitialPrompt(conversationId: string, messageId: string, prompt: string): void {
@@ -434,14 +608,9 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     const generation = loadGeneration + 1;
     loadGeneration = generation;
     loadingConversationId = id;
-    useChatStore.getState().clearMessages();
-    useTaskRuntimeStore.getState().reset();
-    useToolExecutionStore.getState().clear();
-    useSubagentRunStore.getState().clear();
-    // Publish the selected id only after transcript/tool hydration completes.
-    // This makes the chat hook rebind the live turn after `replaceMessages`
-    // instead of creating a placeholder that the late transcript load erases.
-    set({ isLoading: true, activeId: null });
+    // Keep the current view and its live projection until the requested record
+    // has loaded successfully. A parse error must not erase the prior view.
+    set({ isLoading: true });
 
     try {
       const [record, tools] = await Promise.all([
@@ -449,12 +618,19 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         toolExecutionApi.list(workspaceId, id),
       ]);
       if (generation !== loadGeneration || get().workspaceId !== workspaceId) return;
+      useChatStore.getState().clearMessages();
+      useTaskRuntimeStore.getState().reset();
+      useToolExecutionStore.getState().clear();
+      useSubagentRunStore.getState().clear();
+      // Publish the selected id only after transcript/tool hydration completes.
+      set({ activeId: null });
 
       // Restore agent context on the backend so conversation can continue.
       let restoreReady = true;
       try {
         await conversationApi.restore(workspaceId, id);
       } catch (e) {
+        if (generation !== loadGeneration || get().workspaceId !== workspaceId) return;
         restoreReady = false;
         console.error('Failed to restore agent context:', e);
         useToastStore.getState().addToast('error', '会话上下文恢复失败，已切换为只读历史视图');
@@ -476,6 +652,8 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
             role: m.role as 'user' | 'assistant',
             content: m.content || '',
             internalAgent: m.internal_agent ?? false,
+            assistantBlocks: m.assistant_blocks,
+            finalAnswerConfirmed: m.final_answer_confirmed,
             isStreaming: false,
             timestamp: Date.now(),
           };
@@ -500,6 +678,9 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
               if (step.type === 'thinking' && step.index != null) {
                 steps.push({ type: 'thinking', index: step.index });
               }
+              if (step.type === 'assistant' && step.index != null) {
+                steps.push({ type: 'assistant', index: step.index });
+              }
               if (step.type === 'tool' && step.call_id) {
                 steps.push({ type: 'tool', callId: step.call_id });
               }
@@ -522,7 +703,15 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         });
 
       const chatStore = useChatStore.getState();
-      chatStore.replaceMessages(chatMessages);
+      chatStore.replaceMessages(
+        restoreTranscriptTools(
+          record.messages,
+          chatMessages,
+          workspaceId,
+          id,
+          useToolExecutionStore.getState().tools
+        )
+      );
       chatStore.setHistoryView(!restoreReady);
 
       set((state) => ({
@@ -535,9 +724,10 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       loadingConversationId = null;
     } catch (e) {
       console.error('Failed to load conversation:', e);
-      if (generation === loadGeneration) {
+      if (generation === loadGeneration && get().workspaceId === workspaceId) {
         loadingConversationId = null;
         set({ isLoading: false });
+        useToastStore.getState().addToast('error', '无法加载会话或工具历史；原始记录保留，请重试');
       }
     }
   },

@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useState } from 'react';
+import { memo, useCallback, useEffect, useState, useRef } from 'react';
 import {
   AlertTriangle,
   Check,
@@ -12,14 +12,18 @@ import {
 } from 'lucide-react';
 import { toolExecutionApi } from '../../api/endpoints';
 import { errorMessage } from '../../lib/tauri-bridge';
-import { workspaceIdForView } from '../../lib/viewAddress';
 import { useToolExecutionStore } from '../../stores/toolExecutionStore';
-import { useWorkspaceStore } from '../../stores/workspaceStore';
-import type { ToolExecutionDetailChunk, ToolExecutionDetailManifest } from '../../types/api';
+import {
+  transcriptToolExecution,
+  type TranscriptToolRecord,
+  type ToolExecutionDetailChunk,
+  type ToolExecutionDetailManifest,
+} from '../../types/api';
 
 interface InlineToolCallProps {
   toolId: string;
   index?: number;
+  transcript?: TranscriptToolRecord;
 }
 
 const LIVE_DETAIL_AUTOLOAD_CHARS = 256 * 1024;
@@ -42,18 +46,76 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
-export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToolCallProps) {
-  const tool = useToolExecutionStore((state) => state.tools[toolId]);
-  const workspaceId = useWorkspaceStore((state) => workspaceIdForView(state.current?.id));
+interface BoundDetailState {
+  binding: string | null;
+  manifest: ToolExecutionDetailManifest | null;
+  chunks: ToolExecutionDetailChunk[];
+  cursor: string | null;
+  complete: boolean;
+  loading: boolean;
+  loadError: string | null;
+}
+
+function emptyDetail(binding: string | null): BoundDetailState {
+  return {
+    binding,
+    manifest: null,
+    chunks: [],
+    cursor: null,
+    complete: false,
+    loading: false,
+    loadError: null,
+  };
+}
+
+export const InlineToolCall = memo(function InlineToolCall({
+  toolId,
+  transcript,
+}: InlineToolCallProps) {
+  const tool = useToolExecutionStore((state) =>
+    transcript ? transcriptToolExecution(transcript, state.tools) : state.tools[toolId]
+  );
+  const bindingKey = tool
+    ? JSON.stringify([
+        tool.workspace_id,
+        tool.conversation_id ?? null,
+        tool.run_id ?? null,
+        tool.owner.kind === 'chat'
+          ? ['chat', tool.owner.message_id]
+          : ['subagent', tool.owner.subagent_run_id],
+        tool.call_id,
+        tool.name,
+        tool.id,
+        tool.detail_ref,
+      ])
+    : null;
   const [expanded, setExpanded] = useState(false);
-  const [manifest, setManifest] = useState<ToolExecutionDetailManifest | null>(null);
-  const [chunks, setChunks] = useState<ToolExecutionDetailChunk[]>([]);
-  const [cursor, setCursor] = useState<string | null>(null);
-  const [complete, setComplete] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [detail, setDetail] = useState<BoundDetailState>(() => emptyDetail(bindingKey));
+  const detailRef = useRef(detail);
+  const bindingGeneration = useRef(0);
+  const activeRequest = useRef<{ binding: string; generation: number } | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
+  const publishDetail = useCallback((next: BoundDetailState) => {
+    detailRef.current = next;
+    setDetail(next);
+  }, []);
+
+  useEffect(() => {
+    bindingGeneration.current += 1;
+    activeRequest.current = null;
+    publishDetail(emptyDetail(bindingKey));
+    setCopied(null);
+    return () => {
+      bindingGeneration.current += 1;
+      activeRequest.current = null;
+    };
+  }, [bindingKey, publishDetail]);
+
+  // A newly rendered binding must never expose the previous binding's data,
+  // even before the effect above has reset its local request state.
+  const scopedDetail = detail.binding === bindingKey ? detail : emptyDetail(bindingKey);
+  const { manifest, chunks, complete, loading, loadError } = scopedDetail;
 
   useEffect(() => {
     if (tool?.status !== 'running') return;
@@ -63,33 +125,60 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
 
   const loadPage = useCallback(
     async (initial: boolean) => {
-      if (!tool || !tool.detail_ref || loading || complete) return;
-      setLoading(true);
-      setLoadError(null);
+      const current = detailRef.current;
+      if (
+        !tool ||
+        !tool.detail_ref ||
+        !bindingKey ||
+        current.binding !== bindingKey ||
+        activeRequest.current
+      )
+        return;
+      if (current.complete) return;
+      const request = { binding: bindingKey, generation: bindingGeneration.current };
+      activeRequest.current = request;
+      publishDetail({ ...current, loading: true, loadError: null });
+      const isCurrent = () =>
+        activeRequest.current === request &&
+        bindingGeneration.current === request.generation &&
+        detailRef.current.binding === request.binding;
       try {
         const [nextManifest, page] = await Promise.all([
-          initial || !manifest || manifest.status !== tool.status
-            ? toolExecutionApi.detail(workspaceId, tool.detail_ref)
-            : Promise.resolve(manifest),
-          toolExecutionApi.readOutput(workspaceId, tool.detail_ref, initial ? null : cursor),
+          initial || !current.manifest || current.manifest.status !== tool.status
+            ? toolExecutionApi.detail(tool.workspace_id, tool.detail_ref)
+            : Promise.resolve(current.manifest),
+          toolExecutionApi.readOutput(
+            tool.workspace_id,
+            tool.detail_ref,
+            initial ? null : current.cursor
+          ),
         ]);
-        setManifest(nextManifest);
-        setChunks((current) => (initial ? page.chunks : [...current, ...page.chunks]));
-        setCursor(page.next_cursor ?? null);
-        setComplete(page.complete);
+        if (!isCurrent()) return;
+        if (nextManifest.id !== tool.id) throw new Error('工具详情与当前执行身份不一致');
+        publishDetail({
+          ...detailRef.current,
+          manifest: nextManifest,
+          chunks: initial ? page.chunks : [...detailRef.current.chunks, ...page.chunks],
+          cursor: page.next_cursor ?? null,
+          complete: page.complete,
+        });
       } catch (error) {
-        setLoadError(errorMessage(error));
+        if (!isCurrent()) return;
+        publishDetail({ ...detailRef.current, loadError: errorMessage(error) });
       } finally {
-        setLoading(false);
+        if (isCurrent()) {
+          activeRequest.current = null;
+          publishDetail({ ...detailRef.current, loading: false });
+        }
       }
     },
-    [complete, cursor, loading, manifest, tool, workspaceId]
+    [bindingKey, publishDetail, tool]
   );
 
   useEffect(() => {
-    if (!expanded || manifest || !tool?.detail_ref) return;
+    if (!expanded || manifest || loadError || !tool?.detail_ref) return;
     void loadPage(true);
-  }, [expanded, loadPage, manifest, tool]);
+  }, [expanded, loadError, loadPage, manifest, tool]);
 
   useEffect(() => {
     const loadedCharacters = chunks.reduce((total, chunk) => total + chunk.text.length, 0);
@@ -118,45 +207,56 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
     void loadPage(false);
   }, [expanded, loadPage, manifest?.status, tool]);
 
-  if (!tool) return null;
+  if (!tool && !transcript) return null;
 
-  const duration =
-    (tool.duration_ms ?? Math.max(0, (tool.finished_at ?? now) - tool.started_at)) / 1000;
+  const status = tool?.status ?? 'unknown';
+  const name = tool?.name ?? transcript?.name ?? '工具记录';
+  const duration = tool
+    ? (tool.duration_ms ?? Math.max(0, (tool.finished_at ?? now) - tool.started_at)) / 1000
+    : null;
   const statusIcon =
-    tool.status === 'running' ? (
+    status === 'running' ? (
       <LoaderCircle size={12} className="animate-spin text-[var(--accent)]" />
-    ) : tool.status === 'succeeded' ? (
+    ) : status === 'succeeded' ? (
       <Check size={12} className="text-[var(--color-success)]" />
-    ) : tool.status === 'failed' || tool.status === 'timed_out' ? (
+    ) : status === 'failed' || status === 'timed_out' ? (
       <X size={12} className="text-[var(--color-error)]" />
+    ) : !tool ? (
+      <AlertTriangle size={12} className="text-[var(--color-warning)]" />
     ) : (
       <CircleStop size={12} className="text-[var(--text-tertiary)]" />
     );
-  const argsText = manifest ? formatArgs(manifest.invocation.args) : '';
+  const currentManifest = tool && manifest?.id === tool.id ? manifest : null;
+  const argsText = currentManifest ? formatArgs(currentManifest.invocation.args) : '';
   const outputText = chunks.map((chunk) => `[${chunk.channel}]\n${chunk.text}`).join('\n');
-  const summary = toolSummaryText(tool.name, tool.args_preview);
+  const summary = toolSummaryText(name, tool?.args_preview ?? '');
   const loadedCharacters = chunks.reduce((total, chunk) => total + chunk.text.length, 0);
-  const liveLoadingPaused =
-    tool.status === 'running' && loadedCharacters >= LIVE_DETAIL_AUTOLOAD_CHARS;
-  const statusText =
-    tool.status === 'running'
+  const liveLoadingPaused = status === 'running' && loadedCharacters >= LIVE_DETAIL_AUTOLOAD_CHARS;
+  const statusText = !tool
+    ? '状态未恢复'
+    : status === 'running'
       ? 'running'
-      : tool.status === 'succeeded'
+      : status === 'succeeded'
         ? 'success'
-        : tool.status === 'failed'
+        : status === 'failed'
           ? 'failed'
-          : tool.status === 'cancelled'
+          : status === 'cancelled'
             ? 'cancelled'
-            : tool.status === 'timed_out'
+            : status === 'timed_out'
               ? 'timed out'
-              : tool.status === 'interrupted'
+              : status === 'interrupted'
                 ? 'interrupted'
                 : 'unknown';
 
   const copyText = async (text: string, label: string) => {
+    const generation = bindingGeneration.current;
     await navigator.clipboard.writeText(text);
+    if (bindingGeneration.current !== generation || detailRef.current.binding !== bindingKey)
+      return;
     setCopied(label);
-    window.setTimeout(() => setCopied(null), 1500);
+    window.setTimeout(() => {
+      if (bindingGeneration.current === generation) setCopied(null);
+    }, 1500);
   };
 
   return (
@@ -171,29 +271,53 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
         <span className="shrink-0">{statusIcon}</span>
         <Wrench size={12} className="shrink-0 text-[var(--text-tertiary)]" />
         <span className="min-w-0 flex-1 truncate leading-5 text-[var(--text-primary)]">
-          <span>{tool.name}</span>
-          {tool.args_preview && (
-            <span className="ml-1.5 text-[var(--text-tertiary)]">· {tool.args_preview}</span>
+          <span>{name}</span>
+          {(tool?.args_preview ?? '') && (
+            <span className="ml-1.5 text-[var(--text-tertiary)]">· {tool?.args_preview ?? ''}</span>
           )}
         </span>
         <span className="shrink-0 text-[10px] text-[var(--text-tertiary)]">{statusText}</span>
         <span className="shrink-0 tabular-nums text-[var(--text-tertiary)]">
-          {duration.toFixed(1)}s
+          {duration != null ? `${duration.toFixed(1)}s` : null}
         </span>
       </button>
 
       {expanded && (
         <div className="ml-5 mt-1 min-w-0 border-l border-[var(--border-primary)] pl-3">
-          {!tool.detail_ref && (
+          {!tool?.detail_ref && !transcript && (
             <div className="text-[10px] text-[var(--text-tertiary)]">仅保留工具执行摘要</div>
+          )}
+          {transcript && (
+            <section className="mb-3 space-y-2 text-[10px] text-[var(--text-secondary)]">
+              {!tool && <p>状态未恢复；以下仅为原始请求与会话记录。</p>}
+              {transcript.requestedArguments != null && (
+                <section>
+                  <div className="mb-1 text-[var(--text-tertiary)]">原始请求参数</div>
+                  <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words">
+                    {transcript.requestedArguments}
+                  </pre>
+                </section>
+              )}
+              {transcript.recordedOutput != null && (
+                <section>
+                  <div className="mb-1 text-[var(--text-tertiary)]">原始记录正文</div>
+                  <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words">
+                    {transcript.recordedOutput}
+                  </pre>
+                </section>
+              )}
+            </section>
           )}
           {loadError && (
             <div className="mb-2 flex items-center gap-1.5 text-[var(--color-error)]">
               <AlertTriangle size={11} />
               <span>{loadError}</span>
+              <button type="button" disabled={loading} onClick={() => void loadPage(true)}>
+                重试加载
+              </button>
             </div>
           )}
-          {manifest && (
+          {currentManifest && (
             <>
               <section className="mb-3">
                 <div className="mb-1 flex items-center justify-between text-[9px] uppercase text-[var(--text-tertiary)]">
@@ -210,8 +334,8 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
               <section>
                 <div className="mb-1 flex items-center justify-between text-[9px] uppercase text-[var(--text-tertiary)]">
                   <span>
-                    输出 · {formatBytes(manifest.output_bytes)}
-                    {manifest.result?.truncated ? ' · Agent 上下文已截断' : ''}
+                    输出 · {formatBytes(currentManifest.output_bytes)}
+                    {currentManifest.result?.truncated ? ' · Agent 上下文已截断' : ''}
                   </span>
                   {outputText && (
                     <button type="button" onClick={() => copyText(outputText, 'output')}>
@@ -219,21 +343,23 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
                     </button>
                   )}
                 </div>
-                {manifest.result?.failure && (
+                {currentManifest.result?.failure && (
                   <div className="mb-2 border-l-2 border-[var(--color-error)] pl-2 text-[10px] text-[var(--text-secondary)]">
-                    {manifest.result.failure.category} · {manifest.result.failure.recovery}
+                    {currentManifest.result.failure.category} ·{' '}
+                    {currentManifest.result.failure.recovery}
                   </div>
                 )}
-                {manifest.result && Object.keys(manifest.result.metadata).length > 0 && (
-                  <details className="mb-2 text-[10px] text-[var(--text-secondary)]">
-                    <summary className="cursor-pointer text-[var(--text-tertiary)]">
-                      metadata
-                    </summary>
-                    <pre className="mt-1 overflow-auto whitespace-pre-wrap break-words bg-[var(--bg-code)] p-2 text-[10px] leading-relaxed text-[var(--color-code-text)]">
-                      {formatArgs(manifest.result.metadata)}
-                    </pre>
-                  </details>
-                )}
+                {currentManifest.result &&
+                  Object.keys(currentManifest.result.metadata).length > 0 && (
+                    <details className="mb-2 text-[10px] text-[var(--text-secondary)]">
+                      <summary className="cursor-pointer text-[var(--text-tertiary)]">
+                        metadata
+                      </summary>
+                      <pre className="mt-1 overflow-auto whitespace-pre-wrap break-words bg-[var(--bg-code)] p-2 text-[10px] leading-relaxed text-[var(--color-code-text)]">
+                        {formatArgs(currentManifest.result.metadata)}
+                      </pre>
+                    </details>
+                  )}
                 <div className="max-h-96 space-y-2 overflow-auto bg-[var(--bg-code)] p-2">
                   {chunks.map((chunk, index) => (
                     <section key={`${chunk.channel}-${index}`}>
@@ -254,7 +380,7 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
                     实时加载已暂停，避免长日志占满页面内存。
                   </div>
                 )}
-                {!complete && (tool.status !== 'running' || liveLoadingPaused) && (
+                {!complete && (status !== 'running' || liveLoadingPaused) && (
                   <button
                     type="button"
                     onClick={() => void loadPage(false)}

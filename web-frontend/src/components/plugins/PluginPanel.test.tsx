@@ -17,7 +17,10 @@ vi.mock('../../api/endpoints', () => ({
   extensionRequestScope: () => ({ workspace_id: 'global', workspace_generation: 'global' }),
 }));
 vi.mock('../../stores/workspaceStore', () => ({
-  useWorkspaceStore: (selector: (s: { current: null }) => unknown) => selector({ current: null }),
+  useWorkspaceStore: Object.assign(
+    (selector: (s: { current: null }) => unknown) => selector({ current: null }),
+    { getState: () => ({ current: null }) }
+  ),
 }));
 vi.mock('../../stores/uiStore', () => ({
   applyPluginTheme: vi.fn(),

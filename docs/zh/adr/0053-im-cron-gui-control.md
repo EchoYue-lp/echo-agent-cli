@@ -58,3 +58,11 @@ Cron edit 使用原捕获的 definition/revision；手动执行无损投影原 o
 ## 实现参考与取舍
 
 [Tokio graceful shutdown](https://tokio.rs/tokio/topics/shutdown) 区分通知停止与等待已接收任务完成；[Tokio JoinHandle](https://docs.rs/tokio/latest/tokio/task/struct.JoinHandle.html) 明确 drop handle 会 detach task。因此 EKO 在原应用 owner 保留原句柄并观察真实结算。未采用扩大所有 generic external-owner 合同的方案：渠道生命周期组合属于应用层。本地仍需要这些保护，是为了避免应用清理 bug 或误丢已接收工作，不新增用户交互权限门。
+
+## 2026-10-27 手动执行的并发观察隔离
+
+SchedulerPanel 对每个原 scheduler task 独立保留 pending 与手动回执，防止同时运行 A/B 时较早返回的一项覆盖另一项结果或解除其按钮禁用。同步 pending ref 只限制页面上的同任务重复操作；不同 task 可并行，已结算后再次手动运行仍交原 runner 创建独立 occurrence。GUI 不产生 occurrence、TaskRun 或完成事实。
+
+页面关闭只撤销该页面的观察；已准入的 callback 仍归原后台 owner。旧页面迟到结果不写新页面、不发全局成功提示、不再次刷新；重开从原列表／历史读取。并发列表刷新使用最后请求序号，旧响应不覆盖新定义。IPC 响应丢失只表示回执未确认，提示读取原历史，不自动重发，也不把它投影成运行失败。
+
+这个切片沿用已有 UI 临时状态，未新增 store、执行器、重试、框架 API、凭据或发送行为。现有 examples 没有此 GUI 面板的独立示例，故不新增代码示例；官网对“定时任务管理”的能力说明未改变，待实际合流由官网 owner 核对源指纹。定向组件验证不能代替 native、真实 IM／微信、完整矩阵或 main CI 验收。

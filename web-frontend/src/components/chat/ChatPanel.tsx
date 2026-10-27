@@ -1,6 +1,7 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useChatStore } from '../../stores/chatStore';
 import { MessageBubble } from './MessageBubble';
+import { ExecutionStatus } from './ExecutionStatus';
 import { HitlDialog } from './HitlDialog';
 import { ChatInput } from './ChatInput';
 import { WelcomeScreen } from './WelcomeScreen';
@@ -52,6 +53,7 @@ export function ChatPanel() {
   const pendingHitlRequests = useChatStore((s) => s.pendingHitlRequests);
   const pendingHitlRequest = pendingHitlRequests.at(0) ?? null;
   const isStreaming = useChatStore((s) => s.isStreaming);
+  const hasActivity = useChatStore((s) => s.activity !== null);
   const isCancelled = useChatStore((s) => s.isCancelled);
   const runStatus = useChatStore((s) => s.runStatus);
   const currentWorkspace = useWorkspaceStore((s) => s.current);
@@ -586,11 +588,17 @@ export function ChatPanel() {
                 );
               })}
 
+              <ExecutionStatus />
+
               {isStreaming &&
+                !hasActivity &&
                 !messages.some(
                   (m) =>
                     m.isStreaming &&
                     (m.content.trim() ||
+                      m.assistantBlocks?.some(
+                        (view) => view.content.trim() && view.block.phase !== 'final_answer'
+                      ) ||
                       m.thinkingSegments?.some((segment) => segment.content.trim()))
                 ) && (
                   <div className="flex items-center gap-3 px-1 py-3">

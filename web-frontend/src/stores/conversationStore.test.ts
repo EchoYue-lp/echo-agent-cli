@@ -1,4 +1,11 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+// @vitest-environment jsdom
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import { createElement } from 'react';
+import { cleanup, fireEvent, render, screen, within, waitFor } from '@testing-library/react';
+import { useToolExecutionStore } from './toolExecutionStore';
+import { useSubagentRunStore } from './subagentRunStore';
+import { useToastStore } from './toastStore';
+import { MessageBubble } from '../components/chat/MessageBubble';
 
 const mocks = vi.hoisted(() => ({
   getConversation: vi.fn(),
@@ -69,6 +76,7 @@ function sideEntry() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useToastStore.getState().clearAll();
   mocks.listToolExecutions.mockResolvedValue([]);
   mocks.restoreConversation.mockResolvedValue(undefined);
   mocks.listConversations.mockResolvedValue([]);
@@ -934,5 +942,463 @@ describe('conversation message identity', () => {
       conversations: [],
       sideConversations: [],
     });
+  });
+});
+
+afterEach(cleanup);
+
+function canonicalHistoryCall(overrides: Record<string, unknown> = {}) {
+  return {
+    message_id: 'canonical-assistant',
+    role: 'assistant',
+    content: null,
+    tool_calls: [
+      {
+        id: 'canonical-call',
+        type: 'function',
+        function: { name: 'shell', arguments: '{"command":"echo 中文 🧭"}' },
+      },
+    ],
+    ...overrides,
+  };
+}
+function canonicalHistoryResult(content = '[Error] 原记录正文') {
+  return {
+    role: 'tool',
+    content,
+    tool_result: JSON.stringify({ tool_call_id: 'canonical-call', name: 'shell' }),
+  };
+}
+function canonicalHistorySummary(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'known-detail',
+    workspace_id: 'global',
+    conversation_id: 'canonical-history',
+    run_id: 'known-run',
+    owner: { kind: 'chat', message_id: 'canonical-assistant' },
+    call_id: 'canonical-call',
+    name: 'shell',
+    args_preview: 'echo',
+    status: 'failed',
+    started_at: 100,
+    finished_at: 200,
+    duration_ms: 100,
+    detail_ref: 'known-detail',
+    ...overrides,
+  };
+}
+
+describe('canonical tool transcript recovery', () => {
+  it('reuses an exact existing display reference across duplicate call ids without granting status or output ownership', async () => {
+    mocks.getConversation.mockResolvedValue({
+      messages: [
+        canonicalHistoryCall({ execution_steps: [{ type: 'tool', call_id: 'known-detail' }] }),
+        canonicalHistoryCall({ message_id: 'other-canonical-message' }),
+        canonicalHistoryResult('重复call不能借给任何一条原文'),
+      ],
+    });
+    mocks.listToolExecutions.mockResolvedValue([canonicalHistorySummary({ status: 'succeeded' })]);
+    await useConversationStore.getState().loadConversation('canonical-history');
+    const first = useChatStore.getState().messages[0];
+    expect(first?.executionSteps).toEqual([{ type: 'tool', callId: 'known-detail' }]);
+    expect(first?.transcriptTools).toHaveLength(1);
+    expect(first?.transcriptTools?.[0]).toMatchObject({
+      id: 'known-detail',
+      identityAmbiguous: true,
+    });
+    expect(first?.transcriptTools?.[0]?.recordedOutput).toBeUndefined();
+    if (!first) throw new Error('missing first canonical message');
+    render(createElement(MessageBubble, { message: first }));
+    fireEvent.click(screen.getByRole('button', { name: '展开执行过程' }));
+    expect(screen.getByText('1 个工具 · 1 个状态未恢复')).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: '展开工具执行过程' }));
+    expect(screen.getByRole('button', { name: /shell.*状态未恢复/ })).toBeDefined();
+    expect(screen.queryByText('success', { exact: true })).toBeNull();
+    expect(useToolExecutionStore.getState().tools['known-detail']?.status).toBe('succeeded');
+  });
+
+  it('preserves a legacy opaque execution reference only with its exact persisted message owner', async () => {
+    mocks.getConversation.mockResolvedValue({
+      messages: [
+        {
+          message_id: 'canonical-assistant',
+          role: 'assistant',
+          content: '',
+          execution_steps: [{ type: 'tool', call_id: 'known-detail' }],
+        },
+      ],
+    });
+    mocks.listToolExecutions.mockResolvedValue([canonicalHistorySummary()]);
+    await useConversationStore.getState().loadConversation('canonical-history');
+    const message = useChatStore.getState().messages[0];
+    expect(message?.executionSteps).toEqual([{ type: 'tool', callId: 'known-detail' }]);
+    if (!message) throw new Error('missing history');
+    render(createElement(MessageBubble, { message }));
+    fireEvent.click(screen.getByRole('button', { name: '展开执行过程' }));
+    expect(screen.getByText(/1 个失败/)).toBeDefined();
+    expect(screen.queryByText('历史执行状态未恢复')).toBeNull();
+  });
+
+  it('still reports the current restore failure and keeps its loaded transcript read-only', async () => {
+    mocks.getConversation.mockResolvedValue({
+      messages: [{ role: 'assistant', content: '可读历史' }],
+    });
+    mocks.restoreConversation.mockRejectedValueOnce(new Error('current context restore failed'));
+    await useConversationStore.getState().loadConversation('current-failed-restore');
+    expect(useConversationStore.getState().activeId).toBe('current-failed-restore');
+    expect(useChatStore.getState().isHistoryView).toBe(true);
+    expect(useChatStore.getState().messages.map((message) => message.content)).toEqual([
+      '可读历史',
+    ]);
+    expect(useToastStore.getState().toasts).toEqual([
+      expect.objectContaining({
+        type: 'error',
+        message: '会话上下文恢复失败，已切换为只读历史视图',
+      }),
+    ]);
+  });
+
+  it('keeps an ownerless canonical call with an existing detail reference to one unknown row', async () => {
+    mocks.getConversation.mockResolvedValue({
+      messages: [
+        canonicalHistoryCall({
+          message_id: undefined,
+          execution_steps: [{ type: 'tool', call_id: 'known-detail' }],
+        }),
+        canonicalHistoryResult(),
+      ],
+    });
+    mocks.listToolExecutions.mockResolvedValue([canonicalHistorySummary({ status: 'succeeded' })]);
+    await useConversationStore.getState().loadConversation('canonical-history');
+    const message = useChatStore.getState().messages[0];
+    expect(message?.executionSteps).toEqual([{ type: 'tool', callId: 'known-detail' }]);
+    if (!message) throw new Error('missing history');
+    render(createElement(MessageBubble, { message }));
+    fireEvent.click(screen.getByRole('button', { name: '展开执行过程' }));
+    expect(screen.getByText('1 个工具 · 1 个状态未恢复')).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: '展开工具执行过程' }));
+    expect(screen.getByRole('button', { name: /shell.*状态未恢复/ })).toBeDefined();
+    expect(screen.queryByText('success', { exact: true })).toBeNull();
+  });
+
+  it('does not borrow a terminal status through a bare legacy execution key without an owner', async () => {
+    mocks.getConversation.mockResolvedValue({
+      messages: [
+        {
+          role: 'assistant',
+          content: '',
+          execution_steps: [{ type: 'tool', call_id: 'known-detail' }],
+        },
+      ],
+    });
+    mocks.listToolExecutions.mockResolvedValue([canonicalHistorySummary({ status: 'succeeded' })]);
+    await useConversationStore.getState().loadConversation('canonical-history');
+    const message = useChatStore.getState().messages[0];
+    if (!message) throw new Error('missing history');
+    render(createElement(MessageBubble, { message }));
+    fireEvent.click(screen.getByRole('button', { name: '展开执行过程' }));
+    expect(screen.getByText('1 个工具 · 1 个状态未恢复')).toBeDefined();
+  });
+
+  it('does not let a failed old inner restore turn a newer loaded conversation into history-only mode', async () => {
+    let rejectRestore: (error: Error) => void = () => undefined;
+    const restoreA = new Promise<never>((_resolve, reject) => {
+      rejectRestore = reject;
+    });
+    mocks.getConversation
+      .mockResolvedValueOnce({ messages: [{ role: 'assistant', content: 'A正文' }] })
+      .mockResolvedValueOnce({ messages: [{ role: 'assistant', content: 'B正文' }] });
+    mocks.restoreConversation.mockReturnValueOnce(restoreA).mockResolvedValueOnce(undefined);
+    const loadingA = useConversationStore.getState().loadConversation('conversation-A');
+    await waitFor(() =>
+      expect(mocks.restoreConversation).toHaveBeenCalledWith('global', 'conversation-A')
+    );
+    await useConversationStore.getState().loadConversation('conversation-B');
+    expect(useChatStore.getState().isHistoryView).toBe(false);
+    rejectRestore(new Error('late inner A restore error'));
+    await loadingA;
+    expect(useConversationStore.getState().activeId).toBe('conversation-B');
+    expect(useChatStore.getState().messages.map((message) => message.content)).toEqual(['B正文']);
+    expect(useChatStore.getState().isHistoryView).toBe(false);
+    expect(useToastStore.getState().toasts).toEqual([]);
+  });
+
+  it('preserves an internal tool record marker without presenting it as an assistant reply', async () => {
+    mocks.getConversation.mockResolvedValue({
+      messages: [{ ...canonicalHistoryResult('内部原记录'), internal_agent: true }],
+    });
+    await useConversationStore.getState().loadConversation('canonical-history');
+    const record = useChatStore.getState().messages[0];
+    expect(record).toMatchObject({ role: 'tool', internalAgent: true, content: '内部原记录' });
+    if (!record) throw new Error('missing tool record');
+    render(
+      createElement(MessageBubble, { message: record, onFork: vi.fn(), onRegenerate: vi.fn() })
+    );
+    expect(screen.getByText('Agent 内部工具记录')).toBeDefined();
+    expect(screen.queryByRole('button', { name: '分叉会话' })).toBeNull();
+  });
+
+  it('keeps orphan records as tool rows without stealing assistant actions or Subagent ownership', async () => {
+    mocks.getConversation.mockResolvedValue({
+      messages: [
+        { message_id: 'assistant-before', role: 'assistant', content: '前一条正文' },
+        canonicalHistoryResult('未关联结果正文'),
+        { message_id: 'assistant-after', role: 'assistant', content: '后一条真实回复' },
+      ],
+    });
+    await useConversationStore.getState().loadConversation('canonical-history');
+    const messages = useChatStore.getState().messages;
+    const tool = messages.find((message) => message.role === 'tool');
+    expect(tool?.content).toBe('未关联结果正文');
+    useSubagentRunStore.getState().ingest({
+      kind: 'subagent',
+      workspace_id: 'global',
+      conversation_id: 'canonical-history',
+      subagent_run_id: 'legacy-subagent',
+      run_id: 'legacy-run',
+      task_id: 'legacy-task',
+      agent: 'reviewer',
+      event: 'completed',
+      summary: '真实 Subagent 结果',
+    });
+    render(
+      createElement(
+        'div',
+        {},
+        messages.map((message) =>
+          createElement(
+            'div',
+            { key: message.id, 'data-testid': message.id },
+            createElement(MessageBubble, { message, onFork: vi.fn(), onRegenerate: vi.fn() })
+          )
+        )
+      )
+    );
+    if (!tool) throw new Error('missing original tool record');
+    const recordRow = within(screen.getByTestId(tool.id));
+    expect(recordRow.queryByRole('button', { name: '分叉会话' })).toBeNull();
+    expect(recordRow.queryByRole('button', { name: '重新生成' })).toBeNull();
+    expect(recordRow.queryByRole('button', { name: /Subagent/ })).toBeNull();
+    expect(recordRow.getByRole('button', { name: '复制原记录' })).toBeDefined();
+    const finalRow = within(screen.getByTestId('assistant-after'));
+    expect(finalRow.getByRole('button', { name: '分叉会话' })).toBeDefined();
+    expect(finalRow.getByRole('button', { name: '重新生成' })).toBeDefined();
+    fireEvent.click(finalRow.getByRole('button', { name: '展开执行过程' }));
+    expect(finalRow.getByRole('button', { name: /Subagent.*reviewer/ })).toBeDefined();
+    expect(
+      within(screen.getByTestId('assistant-before')).queryByRole('button', { name: /Subagent/ })
+    ).toBeNull();
+  });
+
+  it('retains the selected conversation when malformed history fails and reports a retryable error', async () => {
+    useConversationStore.setState({ activeId: 'old-selection' });
+    const messages: ChatMessage[] = [
+      { id: 'old-message', role: 'assistant', content: '原对话内容', timestamp: 1 },
+    ];
+    useChatStore.setState({ messages });
+    mocks.getConversation.mockRejectedValueOnce(new Error('tool history parse failed'));
+    await useConversationStore.getState().loadConversation('bad-history');
+    expect(useConversationStore.getState().activeId).toBe('old-selection');
+    expect(useChatStore.getState().messages).toBe(messages);
+    expect(useConversationStore.getState().isLoading).toBe(false);
+    expect(useToastStore.getState().toasts).toEqual([
+      expect.objectContaining({
+        type: 'error',
+        message: '无法加载会话或工具历史；原始记录保留，请重试',
+      }),
+    ]);
+  });
+
+  it('does not send a failed old request toast into a newer selected conversation', async () => {
+    let rejectOld: (error: Error) => void = () => undefined;
+    const old = new Promise<never>((_resolve, reject) => {
+      rejectOld = reject;
+    });
+    mocks.getConversation
+      .mockReturnValueOnce(old)
+      .mockResolvedValueOnce({ messages: [{ role: 'assistant', content: '新会话正文' }] });
+    const pending = useConversationStore.getState().loadConversation('bad-history');
+    await useConversationStore.getState().loadConversation('new-selection');
+    rejectOld(new Error('late old parse error'));
+    await pending;
+    expect(useConversationStore.getState().activeId).toBe('new-selection');
+    expect(useChatStore.getState().messages.map((message) => message.content)).toEqual([
+      '新会话正文',
+    ]);
+    expect(useToastStore.getState().toasts).toEqual([]);
+  });
+
+  it.each([
+    { workspace_id: 'foreign-workspace' },
+    { conversation_id: 'foreign-conversation' },
+    { owner: { kind: 'chat', message_id: 'foreign-owner' } },
+    { owner: { kind: 'subagent', subagent_run_id: 'foreign-subagent' } },
+    { name: 'other-tool' },
+  ])('does not borrow a status across an identity boundary: %j', async (foreign) => {
+    mocks.getConversation.mockResolvedValue({ messages: [canonicalHistoryCall()] });
+    mocks.listToolExecutions.mockResolvedValue([canonicalHistorySummary(foreign)]);
+    await useConversationStore.getState().loadConversation('canonical-history');
+    const message = useChatStore.getState().messages[0];
+    expect(
+      message?.executionSteps?.some(
+        (step) => step.type === 'tool' && step.callId === 'known-detail'
+      )
+    ).toBe(false);
+    if (!message) throw new Error('missing history');
+    render(createElement(MessageBubble, { message }));
+    fireEvent.click(screen.getByRole('button', { name: '展开执行过程' }));
+    expect(screen.getByText('历史执行状态未恢复')).toBeDefined();
+  });
+
+  it('does not infer the original owner from a unique call id in an older message', async () => {
+    mocks.getConversation.mockResolvedValue({
+      messages: [canonicalHistoryCall({ message_id: undefined })],
+    });
+    mocks.listToolExecutions.mockResolvedValue([canonicalHistorySummary()]);
+    await useConversationStore.getState().loadConversation('canonical-history');
+    expect(
+      useChatStore
+        .getState()
+        .messages[0]?.executionSteps?.some(
+          (step) => step.type === 'tool' && step.callId === 'known-detail'
+        )
+    ).toBe(false);
+  });
+
+  it('preserves duplicate calls and an unpaired result as separate unknown records', async () => {
+    mocks.getConversation.mockResolvedValue({
+      messages: [
+        canonicalHistoryCall(),
+        canonicalHistoryCall({ message_id: 'second-owner' }),
+        canonicalHistoryResult('重复身份的原始记录'),
+      ],
+    });
+    mocks.listToolExecutions.mockResolvedValue([canonicalHistorySummary()]);
+    await useConversationStore.getState().loadConversation('canonical-history');
+    const messages = useChatStore.getState().messages;
+    expect(messages).toHaveLength(3);
+    expect(
+      messages
+        .flatMap((message) => message.transcriptTools ?? [])
+        .every((record) => record.identityAmbiguous)
+    ).toBe(true);
+    expect(messages[0]?.transcriptTools?.[0]?.recordedOutput).toBeUndefined();
+    expect(messages[1]?.transcriptTools?.[0]?.recordedOutput).toBeUndefined();
+    expect(messages[2]?.transcriptTools?.[0]?.recordedOutput).toBe('重复身份的原始记录');
+    expect(
+      new Set(
+        messages.flatMap((message) => message.transcriptTools?.map((record) => record.id) ?? [])
+      ).size
+    ).toBe(3);
+  });
+
+  it('does not fabricate a request or status for an orphan result', async () => {
+    mocks.getConversation.mockResolvedValue({ messages: [canonicalHistoryResult('孤立工具正文')] });
+    await useConversationStore.getState().loadConversation('canonical-history');
+    expect(useChatStore.getState().messages[0]).toMatchObject({
+      role: 'tool',
+      content: '孤立工具正文',
+      transcriptTools: [
+        expect.objectContaining({ recordedOutput: '孤立工具正文', identityAmbiguous: true }),
+      ],
+    });
+    expect(
+      useChatStore.getState().messages[0]?.transcriptTools?.[0]?.requestedArguments
+    ).toBeUndefined();
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([]);
+  });
+
+  it('does not duplicate existing execution references when canonical calls are present', async () => {
+    mocks.getConversation.mockResolvedValue({
+      messages: [
+        canonicalHistoryCall({ execution_steps: [{ type: 'tool', call_id: 'known-detail' }] }),
+        canonicalHistoryResult(),
+      ],
+    });
+    mocks.listToolExecutions.mockResolvedValue([canonicalHistorySummary()]);
+    await useConversationStore.getState().loadConversation('canonical-history');
+    expect(useChatStore.getState().messages[0]?.executionSteps).toEqual([
+      { type: 'tool', callId: 'known-detail' },
+    ]);
+  });
+
+  it('keeps a real running execution live and adopts only its real later terminal event', async () => {
+    const running = canonicalHistorySummary({
+      status: 'running',
+      finished_at: null,
+      duration_ms: null,
+    });
+    mocks.getConversation.mockResolvedValue({
+      messages: [canonicalHistoryCall(), canonicalHistoryResult('[Error] is not proof of failure')],
+    });
+    mocks.listToolExecutions.mockResolvedValue([running]);
+    await useConversationStore.getState().loadConversation('canonical-history');
+    expect(useToolExecutionStore.getState().tools['known-detail']).toEqual(running);
+    const message = useChatStore.getState().messages[0];
+    if (!message) throw new Error('missing history');
+    render(createElement(MessageBubble, { message }));
+    expect(screen.queryByText('已完成', { exact: true })).toBeNull();
+    expect(screen.queryByRole('button', { name: '展开执行过程' })).toBeNull();
+    expect(screen.getByText('正在执行 1 个工具')).toBeDefined();
+    expect(screen.queryByText(/1 个失败/)).toBeNull();
+  });
+
+  it('keeps a new active stream when an old history request returns late', async () => {
+    const old = deferred<{ messages: ReturnType<typeof canonicalHistoryCall>[] }>();
+    mocks.getConversation.mockReturnValueOnce(old.promise);
+    const pending = useConversationStore.getState().loadConversation('canonical-history');
+    await useConversationStore.getState().startNew();
+    const id = useChatStore.getState().startAssistantMessage('new-stream');
+    useChatStore.getState().appendToken(id, '新流式正文');
+    old.resolve({ messages: [canonicalHistoryCall()] });
+    await pending;
+    expect(useChatStore.getState().messages.map((message) => message.content)).toEqual([
+      '新流式正文',
+    ]);
+    expect(useChatStore.getState().isStreaming).toBe(true);
+  });
+
+  it('recovers call steps against an exact workspace/conversation/owner summary', async () => {
+    mocks.getConversation.mockResolvedValue({
+      messages: [canonicalHistoryCall(), canonicalHistoryResult()],
+    });
+    mocks.listToolExecutions.mockResolvedValue([canonicalHistorySummary()]);
+    await useConversationStore.getState().loadConversation('canonical-history');
+    const message = useChatStore.getState().messages[0];
+    expect(message?.executionSteps).toEqual([{ type: 'tool', callId: 'known-detail' }]);
+    expect(useToolExecutionStore.getState().tools['known-detail']?.status).toBe('failed');
+  });
+
+  it('keeps unknown call details on the message without adding synthetic status to the live store', async () => {
+    mocks.getConversation.mockResolvedValue({
+      messages: [
+        canonicalHistoryCall(),
+        canonicalHistoryResult('{"success":true,"output":"原记录"}'),
+      ],
+    });
+    await useConversationStore.getState().loadConversation('canonical-history');
+    const message = useChatStore.getState().messages[0];
+    expect(message).toMatchObject({
+      transcriptTools: [
+        expect.objectContaining({
+          callId: 'canonical-call',
+          name: 'shell',
+          requestedArguments: '{"command":"echo 中文 🧭"}',
+          recordedOutput: '{"success":true,"output":"原记录"}',
+        }),
+      ],
+    });
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([]);
+    if (!message) throw new Error('missing historical message');
+    render(createElement(MessageBubble, { message }));
+    expect(screen.getByText('历史执行状态未恢复')).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: '展开执行过程' }));
+    fireEvent.click(screen.getByRole('button', { name: '展开工具执行过程' }));
+    fireEvent.click(screen.getByRole('button', { name: /shell.*状态未恢复/ }));
+    expect(screen.getByText('原始请求参数')).toBeDefined();
+    expect(screen.getByText('{"command":"echo 中文 🧭"}')).toBeDefined();
+    expect(screen.getByText('{"success":true,"output":"原记录"}')).toBeDefined();
+    expect(screen.queryByText('success', { exact: true })).toBeNull();
+    expect(screen.queryByText(/\d+\.\d+s/)).toBeNull();
   });
 });

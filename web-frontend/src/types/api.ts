@@ -357,7 +357,43 @@ export interface TranscriptProjectionSettlement {
   detail: string | null;
 }
 
+/** Framework AssistantMessageBlock 的无损呈现合同；缺失阶段保持 unknown。 */
+export interface AssistantMessageBlock {
+  block_id: string;
+  request_id: string;
+  sequence: number;
+  phase: 'reasoning' | 'commentary' | 'partial_answer' | 'final_answer' | 'unknown';
+  delta: string;
+  complete: boolean;
+  provider: string | null;
+  reasoning: unknown;
+}
+
+export interface AssistantBlockView {
+  block: AssistantMessageBlock;
+  content: string;
+}
+
 export type AgentEvent =
+  | {
+      type: 'execution_status';
+      data: {
+        execution_id: string;
+        request_id: string | null;
+        sequence: number;
+        phase: string;
+        status:
+          | 'started'
+          | 'waiting'
+          | 'tool_pending'
+          | 'candidate'
+          | 'settled'
+          | 'cancelled'
+          | 'failed';
+        reason: string | null;
+      };
+    }
+  | { type: 'assistant_message'; data: { block: AssistantMessageBlock } }
   | { type: 'token'; data: string }
   | { type: 'think_start' }
   | { type: 'think_end'; data: { prompt_tokens: number; completion_tokens: number } }
@@ -677,17 +713,55 @@ export interface ExecutionRound {
   toolCallIds: string[];
 }
 
-export type ExecutionStep = { type: 'thinking'; index: number } | { type: 'tool'; callId: string };
+export type ExecutionStep =
+  | { type: 'thinking'; index: number }
+  | { type: 'tool'; callId: string }
+  | { type: 'assistant'; index: number };
+
+/** Canonical transcript display only; it is never an execution status or a control target. */
+export interface TranscriptToolRecord {
+  id: string;
+  workspaceId: string;
+  conversationId: string;
+  messageId?: string;
+  callId?: string;
+  callType?: string;
+  name?: string;
+  requestedArguments?: string;
+  recordedOutput?: string;
+  identityAmbiguous?: boolean;
+}
+
+/** A transcript may use a live status only with a unique exact owner and call identity. */
+export function transcriptToolExecution(
+  record: TranscriptToolRecord,
+  tools: Readonly<Record<string, ToolExecution>>
+): ToolExecution | undefined {
+  if (record.identityAmbiguous || !record.messageId || !record.callId || !record.name) return;
+  const matches = Object.values(tools).filter(
+    (tool) =>
+      tool.workspace_id === record.workspaceId &&
+      tool.conversation_id === record.conversationId &&
+      tool.owner.kind === 'chat' &&
+      tool.owner.message_id === record.messageId &&
+      tool.call_id === record.callId &&
+      tool.name === record.name
+  );
+  return matches.length === 1 ? matches.at(0) : undefined;
+}
 
 // Chat store types
 export interface ChatMessage {
   id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'tool';
   content: string;
+  assistantBlocks?: AssistantBlockView[];
+  /** 只由运行时最终发布事件设置，块完成/phase 本身不产生资格。 */
+  finalAnswerConfirmed?: boolean;
   /** AgentRouter coordination retained only in a Side Conversation view. */
   internalAgent?: boolean;
   thinkingContent?: string; // deprecated, kept for history display
-  thinkingSegments?: { content: string }[];
+  thinkingSegments?: { content: string; kind?: 'reasoning' | 'historical_execution' }[];
   attachments?: {
     name: string;
     mime_type: string;
@@ -702,6 +776,8 @@ export interface ChatMessage {
   executionSteps?: ExecutionStep[];
   /** Execution rounds: each round = one ReAct iteration (thinking + tool batch) */
   executionRounds?: ExecutionRound[];
+  /** Message-bound original request/result text; never persisted as a ToolResult. */
+  transcriptTools?: TranscriptToolRecord[];
 }
 
 export interface ApprovalRequest {
@@ -754,7 +830,9 @@ export interface SavedMessage {
   role: string;
   content: string | null;
   internal_agent?: boolean;
-  tool_calls?: { id: string; name: string; arguments: string }[];
+  assistant_blocks?: AssistantBlockView[];
+  final_answer_confirmed?: boolean;
+  tool_calls?: { id: string; type: string; function: { name: string; arguments: string } }[];
   thinking_segments?: string[];
   execution_steps?: { type: string; index?: number; call_id?: string }[];
   execution_rounds?: {

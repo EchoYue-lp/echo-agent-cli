@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { ToolExecution } from '../../types/api';
+import type { ToolExecution, TranscriptToolRecord } from '../../types/api';
 import { toolExecutionGroupPresentation } from './ToolExecutionGroup';
 
 describe('ToolExecutionGroup', () => {
@@ -65,5 +65,51 @@ describe('ToolExecutionGroup', () => {
         'call-b': timedOut,
       })
     ).toMatchObject({ failedCount: 1, uncertainCount: 1, missingCount: 0 });
+  });
+});
+
+describe('ToolExecutionGroup transcript identity', () => {
+  const transcript: TranscriptToolRecord = {
+    id: 'record-1',
+    workspaceId: 'workspace-1',
+    conversationId: 'conversation-1',
+    messageId: 'message-1',
+    callId: 'call-1',
+    name: 'shell',
+  };
+  const real: ToolExecution = {
+    id: 'detail-1',
+    workspace_id: 'workspace-1',
+    conversation_id: 'conversation-1',
+    owner: { kind: 'chat', message_id: 'message-1' },
+    call_id: 'call-1',
+    name: 'shell',
+    args_preview: '',
+    status: 'running',
+    started_at: 1,
+    finished_at: null,
+    duration_ms: null,
+    detail_ref: 'detail-1',
+  };
+  it('uses only the uniquely addressed live summary for the same original message', () => {
+    expect(
+      toolExecutionGroupPresentation(['record-1'], { 'detail-1': real }, [transcript])
+    ).toMatchObject({ runningCount: 1, missingCount: 0 });
+  });
+  it('keeps duplicate identities and foreign owners unknown', () => {
+    expect(
+      toolExecutionGroupPresentation(
+        ['record-1'],
+        { 'detail-1': real, 'detail-2': { ...real, id: 'detail-2' } },
+        [transcript]
+      )
+    ).toMatchObject({ runningCount: 0, missingCount: 1 });
+    expect(
+      toolExecutionGroupPresentation(
+        ['record-1'],
+        { 'record-1': { ...real, owner: { kind: 'chat', message_id: 'other-message' } } },
+        [transcript]
+      )
+    ).toMatchObject({ runningCount: 0, missingCount: 1 });
   });
 });

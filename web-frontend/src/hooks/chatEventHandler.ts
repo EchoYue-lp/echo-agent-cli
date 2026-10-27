@@ -33,7 +33,8 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
   if (
     payload.source === 'approval_request' ||
     payload.source === 'input_request' ||
-    payload.source === 'selection_request'
+    payload.source === 'selection_request' ||
+    payload.source === 'hitl_request_released'
   ) {
     const identity = payload.event.identity;
     if (
@@ -47,7 +48,26 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
   }
   switch (payload.source) {
     case 'agent': {
-      handleAgentEvent(payload.event.payload, ctx);
+      const scope = JSON.stringify([
+        envelope.workspace_id,
+        envelope.conversation_id,
+        envelope.root_turn_id,
+        envelope.turn_id,
+      ]);
+      const at = Date.parse(envelope.timestamp);
+      const activity = useChatStore.getState().activity;
+      const ownsOperation =
+        !ctx.isCancelledRef.current &&
+        ctx.currentMessageKeyRef.current === envelope.root_turn_id &&
+        (!activity?.scope || activity.scope === scope) &&
+        Number.isFinite(at);
+      // 重放保留原事件时刻；其它会话的frontier通知不推进当前操作时钟。
+      if (ownsOperation) useChatStore.getState().noteActivityEvent(at);
+      handleAgentEvent(
+        payload.event.payload,
+        ctx,
+        ownsOperation ? { at, scope, eventId: envelope.event_id } : undefined
+      );
       break;
     }
     case 'turn_status': {
@@ -155,13 +175,64 @@ export function applyExecutionEvent(
   }
 }
 
-function handleAgentEvent(event: AgentEvent, ctx: EventContext): void {
+function handleAgentEvent(
+  event: AgentEvent,
+  ctx: EventContext,
+  observation?: { at: number; scope: string; eventId: string }
+): void {
   switch (event.type) {
+    case 'execution_status': {
+      if (
+        observation &&
+        event.data.phase === 'Thinking' &&
+        (event.data.status === 'started' || event.data.status === 'waiting')
+      ) {
+        useChatStore
+          .getState()
+          .observeActivity(
+            `request:${event.data.request_id ?? event.data.execution_id}`,
+            '模型正在响应',
+            observation.at,
+            observation.scope
+          );
+      }
+      // 执行观测（含Settled）不发布最终正文、不改变TaskRun或TurnStatus。
+      break;
+    }
+    case 'assistant_message': {
+      const id = ctx.assistantIdRef.current;
+      if (id && !ctx.isCancelledRef.current) {
+        useChatStore.getState().appendAssistantBlock(id, event.data.block);
+        if (
+          observation &&
+          useChatStore.getState().activity?.key !== `request:${event.data.block.request_id}`
+        ) {
+          useChatStore
+            .getState()
+            .observeActivity(
+              `request:${event.data.block.request_id}`,
+              '模型正在响应',
+              observation.at,
+              observation.scope
+            );
+        }
+      }
+      break;
+    }
     case 'token':
       handleChatEvent({ type: 'token', data: event.data }, ctx);
       break;
     case 'think_start':
       handleChatEvent({ type: 'run_status', status: 'thinking' }, ctx);
+      if (observation && !useChatStore.getState().activity?.key.startsWith('request:'))
+        useChatStore
+          .getState()
+          .observeActivity(
+            `model:${observation.eventId}`,
+            '模型正在响应',
+            observation.at,
+            observation.scope
+          );
       handleChatEvent({ type: 'thinking_start' }, ctx);
       break;
     case 'think_end':
@@ -191,6 +262,15 @@ function handleAgentEvent(event: AgentEvent, ctx: EventContext): void {
       break;
     case 'tool_call':
       handleChatEvent({ type: 'run_status', status: 'using_tool' }, ctx);
+      if (observation)
+        useChatStore
+          .getState()
+          .observeActivity(
+            `tool:${event.data.call_id}`,
+            `执行工具 ${event.data.invocation.name}`,
+            observation.at,
+            observation.scope
+          );
       break;
     case 'tool_batch_start':
       handleChatEvent({ type: 'tool_batch_start', tool_count: event.data.tool_count }, ctx);
@@ -253,18 +333,9 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
       if (ctx.isCancelledRef.current) break;
       const id = ctx.assistantIdRef.current;
       if (id && event.data) {
-        // Route the token by thinking state: tokens arriving between
-        // thinking_start and thinking_end are the model's reasoning / per-step
-        // thought (emitted by the backend as ThinkStart→Token→ThinkEnd). They
-        // must go into thinkingSegments so they render in the collapsible
-        // "思考与执行" block, NOT into message.content (which is reserved for
-        // the final answer). Without this split, the thought is silently
-        // merged into the answer text and the thinking block stays empty.
-        if (ctx.currentThinkingIdRef.current) {
-          store.appendThinking(id, event.data);
-        } else {
-          store.appendToken(id, event.data);
-        }
+        if (store.messages.find((message) => message.id === id)?.assistantBlocks?.length) break;
+        // 旧起止事件只有运行观测语义；正文类型由消息块显式表达，不能由前序信号推断。
+        store.appendToken(id, event.data);
       }
       break;
     }
@@ -279,7 +350,7 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     }
     case 'thinking_end': {
       if (ctx.isCancelledRef.current) break;
-      // Close the thinking window so subsequent tokens route to content again.
+      // 仅关闭旧观察窗口，不改变后续正文 Token 的类型。
       ctx.currentThinkingIdRef.current = null;
       break;
     }

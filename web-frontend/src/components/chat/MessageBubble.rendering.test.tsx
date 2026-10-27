@@ -6,7 +6,7 @@ import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useToolExecutionStore } from '../../stores/toolExecutionStore';
 import type { ChatMessage, ToolExecution } from '../../types/api';
-import { MessageBubble } from './MessageBubble';
+import { MessageBubble, isExecutionProcessCompleted } from './MessageBubble';
 
 const emptyReply: ChatMessage = {
   id: 'empty-assistant',
@@ -111,15 +111,32 @@ describe('聊天正文与空消息投影', () => {
     expect(screen.getByText('failed', { exact: true })).toBeDefined();
   });
 
-  it('只有思考内容时保留折叠详情，不误判成空记录', () => {
+  it('旧思考没有原生来源证明时显示历史执行说明并保留折叠详情', () => {
     render(
       <MessageBubble
         message={{ ...emptyReply, thinkingSegments: [{ content: '需要保留的思考' }] }}
       />
     );
+    expect(screen.getByText('历史执行状态未恢复', { exact: true })).toBeDefined();
+    expect(screen.queryByText('已完成', { exact: true })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: '展开执行过程' }));
-    fireEvent.click(screen.getByRole('button', { name: '展开思考' }));
+    fireEvent.click(screen.getByRole('button', { name: '展开历史执行说明' }));
     expect(screen.getByText('需要保留的思考')).toBeDefined();
+  });
+
+  it('显式 provider reasoning 保留思考标签，不与旧执行说明混淆', () => {
+    render(
+      <MessageBubble
+        message={{
+          ...emptyReply,
+          thinkingSegments: [{ content: '原生推理摘要', kind: 'reasoning' }],
+        }}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: '展开执行过程' }));
+    expect(screen.queryByRole('button', { name: '展开历史执行说明' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '展开思考' }));
+    expect(screen.getByText('原生推理摘要')).toBeDefined();
   });
 
   it('只有关联 Subagent 时保留其执行详情', () => {
@@ -238,4 +255,67 @@ describe('聊天正文与空消息投影', () => {
     expect(screen.getAllByRole('button', { name: '复制' }).length).toBe(2);
     expect(screen.queryByRole('button', { name: '分叉会话' })).toBeNull();
   });
+});
+
+it('does not mark a non-streaming tool history completed while its exact tool is still running', () => {
+  const tool: ToolExecution = {
+    id: 'still-running-detail',
+    workspace_id: 'workspace-1',
+    conversation_id: 'conversation-1',
+    run_id: 'run-1',
+    call_id: 'still-running-call',
+    owner: { kind: 'chat', message_id: emptyReply.id },
+    name: 'read_file',
+    args_preview: '原始调用',
+    status: 'running',
+    started_at: 1,
+    finished_at: null,
+    duration_ms: null,
+    detail_ref: '',
+  };
+  useToolExecutionStore.getState().replaceAll([tool]);
+  render(
+    <MessageBubble
+      message={{ ...emptyReply, executionSteps: [{ type: 'tool', callId: tool.id }] }}
+    />
+  );
+  expect(screen.queryByText('已完成', { exact: true })).toBeNull();
+  expect(screen.queryByRole('button', { name: '展开执行过程' })).toBeNull();
+  expect(screen.getByText('正在执行 1 个工具')).toBeDefined();
+});
+
+it('retains the exact TaskRun terminal authority over delayed tool presentation', () => {
+  expect(isExecutionProcessCompleted(false, true, 'completed', [], true)).toBe(true);
+  expect(isExecutionProcessCompleted(false, true, 'failed', [], true)).toBe(true);
+  expect(isExecutionProcessCompleted(false, false, null, [], true)).toBe(false);
+});
+
+it('keeps a known tool failure visible while the settled process is collapsed', () => {
+  const tool: ToolExecution = {
+    id: 'failed-history-detail',
+    workspace_id: 'workspace-1',
+    conversation_id: 'conversation-1',
+    run_id: 'run-1',
+    call_id: 'failed-history-call',
+    owner: { kind: 'chat', message_id: emptyReply.id },
+    name: 'read_file',
+    args_preview: '有错误的调用',
+    status: 'failed',
+    started_at: 1,
+    finished_at: 2,
+    duration_ms: 1,
+    detail_ref: '',
+  };
+  useToolExecutionStore.getState().replaceAll([tool]);
+  const { container } = render(
+    <MessageBubble
+      message={{ ...emptyReply, executionSteps: [{ type: 'tool', callId: tool.id }] }}
+    />
+  );
+  expect(screen.getByText('1 个工具失败')).toBeDefined();
+  expect(screen.getByRole('button', { name: '展开执行过程' }).getAttribute('aria-expanded')).toBe(
+    'false'
+  );
+  expect(container.querySelector('.lucide-check')).toBeNull();
+  expect(useToolExecutionStore.getState().tools[tool.id]?.status).toBe('failed');
 });

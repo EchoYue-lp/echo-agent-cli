@@ -1,14 +1,16 @@
 import { useMemo, useState, memo } from 'react';
-import type { ChatMessage } from '../../types/api';
+import { transcriptToolExecution, type ChatMessage } from '../../types/api';
 import { Copy, Check, RefreshCw, GitFork, Pencil, X, ArrowUp, File, Download } from 'lucide-react';
 import MarkdownContent from '../common/MarkdownContent';
 import { ThinkingSegment } from './ThinkingSegment';
+import { NativeMessageTimeline } from './NativeMessageTimeline';
 import { ParallelExecutionBlock, visibleSubagentRuns } from './ParallelExecutionBlock';
 import { ToolExecutionGroup } from './ToolExecutionGroup';
 import { ExecutionProcessGroup } from './ExecutionProcessGroup';
 import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useChatStore } from '../../stores/chatStore';
+import { useToolExecutionStore } from '../../stores/toolExecutionStore';
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -57,6 +59,7 @@ function isImageFile(mime: string): boolean {
 interface FlatStep {
   type: 'thinking' | 'tool';
   thinkingContent?: string;
+  thinkingKind?: 'reasoning' | 'historical_execution';
   toolId?: string;
   toolIndex: number;
 }
@@ -64,6 +67,7 @@ interface FlatStep {
 interface ThinkingDisplayItem {
   type: 'thinking';
   content: string;
+  kind?: 'reasoning' | 'historical_execution';
 }
 
 interface ToolDisplayItem {
@@ -77,17 +81,18 @@ export function isExecutionProcessCompleted(
   messageIsStreaming: boolean | undefined,
   activeRunBelongsToMessage: boolean,
   activeRunStatus: string | null,
-  subagentStatuses: readonly string[]
+  subagentStatuses: readonly string[],
+  hasRunningTools = false
 ): boolean {
   if (messageIsStreaming) return false;
   if (activeRunBelongsToMessage) {
     // TaskRun is the authoritative lifecycle. A missing or delayed Subagent
-    // terminal event must not leave a completed task expanded forever.
+    // or tool terminal event must not leave a completed task expanded forever.
     return Boolean(
       activeRunStatus && ['completed', 'failed', 'cancelled'].includes(activeRunStatus)
     );
   }
-  return subagentStatuses.every((status) => status !== 'running');
+  return !hasRunningTools && subagentStatuses.every((status) => status !== 'running');
 }
 
 export function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkingTotal: number } {
@@ -99,7 +104,12 @@ export function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkin
       if (step.type === 'thinking') {
         const seg = message.thinkingSegments?.[step.index];
         if (seg && seg.content.trim()) {
-          steps.push({ type: 'thinking', thinkingContent: seg.content, toolIndex: 0 });
+          steps.push({
+            type: 'thinking',
+            thinkingContent: seg.content,
+            thinkingKind: seg.kind,
+            toolIndex: 0,
+          });
           thinkingTotal++;
         }
       } else if (step.type === 'tool') {
@@ -121,7 +131,12 @@ export function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkin
     // Fallback for messages without explicit execution order.
     const segs = (message.thinkingSegments || []).filter((s) => s.content.trim());
     segs.forEach((s) => {
-      steps.push({ type: 'thinking', thinkingContent: s.content, toolIndex: 0 });
+      steps.push({
+        type: 'thinking',
+        thinkingContent: s.content,
+        thinkingKind: s.kind,
+        toolIndex: 0,
+      });
       thinkingTotal++;
     });
     if (thinkingTotal === 0 && message.thinkingContent?.trim()) {
@@ -138,7 +153,11 @@ export function groupExecutionSteps(steps: FlatStep[]): ExecutionDisplayItem[] {
 
   for (const step of steps) {
     if (step.type === 'thinking') {
-      items.push({ type: 'thinking', content: step.thinkingContent ?? '' });
+      items.push({
+        type: 'thinking',
+        content: step.thinkingContent ?? '',
+        ...(step.thinkingKind ? { kind: step.thinkingKind } : {}),
+      });
       continue;
     }
 
@@ -152,6 +171,19 @@ export function groupExecutionSteps(steps: FlatStep[]): ExecutionDisplayItem[] {
   }
 
   return items;
+}
+
+/** Read only the tool facts already proved for each displayed reference. */
+function displayedToolStatuses(
+  message: ChatMessage,
+  items: ExecutionDisplayItem[],
+  tools: ReturnType<typeof useToolExecutionStore.getState>['tools']
+): (string | undefined)[] {
+  const ids = new Set(items.flatMap((item) => (item.type === 'tools' ? item.toolIds : [])));
+  return [...ids].map((id) => {
+    const record = message.transcriptTools?.find((entry) => entry.id === id);
+    return (record ? transcriptToolExecution(record, tools) : tools[id])?.status;
+  });
 }
 
 export const MessageBubble = memo(function MessageBubble({
@@ -188,6 +220,10 @@ export const MessageBubble = memo(function MessageBubble({
 
   const { steps, thinkingTotal } = flattenSteps(message);
   const executionItems = groupExecutionSteps(steps);
+  const hasNativeTimeline = Boolean(message.assistantBlocks?.length);
+  const hasVisibleNativeContent = message.assistantBlocks?.some(
+    (view) => view.block.phase !== 'final_answer' && Boolean(view.content.trim())
+  );
   const activeRun = useTaskRuntimeStore((state) => state.activeRun);
   const subagentRuns = useSubagentRunStore((state) => state.runs);
   const chatMessages = useChatStore((state) => state.messages);
@@ -201,35 +237,90 @@ export const MessageBubble = memo(function MessageBubble({
   const messageIds = useMemo(() => new Set(chatMessages.map((item) => item.id)), [chatMessages]);
   const visibleRuns = useMemo(
     () =>
-      visibleSubagentRuns(
-        Object.values(subagentRuns),
-        activeRun,
-        message.id,
-        lastAssistantMessageId,
-        messageIds
-      ),
-    [activeRun, lastAssistantMessageId, message.id, messageIds, subagentRuns]
+      message.role === 'tool'
+        ? []
+        : visibleSubagentRuns(
+            Object.values(subagentRuns),
+            activeRun,
+            message.id,
+            lastAssistantMessageId,
+            messageIds
+          ),
+    [activeRun, lastAssistantMessageId, message.id, message.role, messageIds, subagentRuns]
   );
   const activeRunBelongsToMessage = Boolean(
     activeRun &&
     (activeRun.root_message_id === message.id ||
       (!messageIds.has(activeRun.root_message_id) && message.id === lastAssistantMessageId))
   );
+  const hasRunningTools = useToolExecutionStore((state) =>
+    displayedToolStatuses(message, executionItems, state.tools).includes('running')
+  );
+  const toolFailureCount = useToolExecutionStore(
+    (state) =>
+      displayedToolStatuses(message, executionItems, state.tools).filter(
+        (status) => status === 'failed' || status === 'timed_out'
+      ).length
+  );
+  // Keep the existing action/turn lifecycle gate. Tool-summary knowledge only
+  // refines the process presentation and does not create another Run state.
   const executionCompleted = isExecutionProcessCompleted(
     message.isStreaming,
     activeRunBelongsToMessage,
     activeRun?.status ?? null,
     visibleRuns.map((run) => run.status)
   );
+  const processCompleted = isExecutionProcessCompleted(
+    message.isStreaming,
+    activeRunBelongsToMessage,
+    activeRun?.status ?? null,
+    visibleRuns.map((run) => run.status),
+    hasRunningTools
+  );
   const hasExecutionProcess = executionItems.length > 0 || visibleRuns.length > 0;
+  const hasUnrestoredTranscript = useToolExecutionStore(
+    (state) =>
+      (!hasNativeTimeline &&
+        executionItems.some((item) => item.type === 'thinking' && item.kind !== 'reasoning')) ||
+      (message.transcriptTools?.some((record) => !transcriptToolExecution(record, state.tools)) ??
+        false) ||
+      displayedToolStatuses(message, executionItems, state.tools).some(
+        (status) => status == null || status === 'unknown' || status === 'interrupted'
+      )
+  );
   const hasBody = Boolean(message.content.trim());
   let thinkingIndex = 0;
+
+  // A canonical tool record is not an assistant turn and cannot own Subagents,
+  // regeneration or Fork. Its key addresses this display row only.
+  if (message.role === 'tool') {
+    return (
+      <div className="animate-fade-up py-3">
+        {message.internalAgent && (
+          <span className="text-[10px] text-[var(--text-tertiary)]">Agent 内部工具记录</span>
+        )}
+        <ToolExecutionGroup
+          toolIds={message.transcriptTools?.map((record) => record.id) ?? []}
+          transcriptTools={message.transcriptTools}
+        />
+        {message.content && (
+          <ActionButton
+            icon={<Copy size={13} />}
+            label="复制原记录"
+            onClick={() => copyToClipboard(message.content)}
+            copyMode
+          />
+        )}
+      </div>
+    );
+  }
 
   // Canonical history includes empty assistant rows for tool calls. Render only
   // their visible projections; ChatPanel owns the single empty-stream status.
   if (
     !isUser &&
     !hasBody &&
+    !hasVisibleNativeContent &&
     images.length === 0 &&
     files.length === 0 &&
     !hasExecutionProcess &&
@@ -370,8 +461,13 @@ export const MessageBubble = memo(function MessageBubble({
                 Agent 内部消息
               </span>
             )}
-            {hasExecutionProcess ? (
-              <ExecutionProcessGroup completed={executionCompleted}>
+            {hasNativeTimeline && <NativeMessageTimeline message={message} />}
+            {!hasNativeTimeline && hasExecutionProcess ? (
+              <ExecutionProcessGroup
+                completed={processCompleted}
+                unrestored={hasUnrestoredTranscript}
+                toolFailureCount={toolFailureCount}
+              >
                 {/* Thinking + tools */}
                 <div className="space-y-1">
                   {executionItems.map((item, i) => {
@@ -383,11 +479,18 @@ export const MessageBubble = memo(function MessageBubble({
                           index={thinkingIndex}
                           total={thinkingTotal}
                           content={item.content}
+                          kind={item.kind}
                           isStreaming={!executionCompleted}
                         />
                       );
                     }
-                    return <ToolExecutionGroup key={`tools-${i}`} toolIds={item.toolIds} />;
+                    return (
+                      <ToolExecutionGroup
+                        key={`tools-${i}`}
+                        toolIds={item.toolIds}
+                        transcriptTools={message.transcriptTools}
+                      />
+                    );
                   })}
                 </div>
 
@@ -458,14 +561,17 @@ export const MessageBubble = memo(function MessageBubble({
                         onClick={() => onRegenerate(message.id)}
                       />
                     )}
-                    {onFork && !message.internalAgent && (
-                      <ActionButton
-                        icon={<GitFork size={13} />}
-                        label="分叉会话"
-                        onClick={() => onFork(message.id)}
-                        disabled={forkDisabled || !executionCompleted}
-                      />
-                    )}
+                    {onFork &&
+                      !message.internalAgent &&
+                      (message.finalAnswerConfirmed === true ||
+                        (message.finalAnswerConfirmed == null && !hasNativeTimeline)) && (
+                        <ActionButton
+                          icon={<GitFork size={13} />}
+                          label="分叉会话"
+                          onClick={() => onFork(message.id)}
+                          disabled={forkDisabled || !executionCompleted}
+                        />
+                      )}
                   </div>
                 )}
               </div>

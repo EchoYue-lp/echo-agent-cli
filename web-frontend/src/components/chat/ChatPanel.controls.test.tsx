@@ -228,6 +228,17 @@ describe('主交互页入口', () => {
 });
 
 describe('真实流式消息与等待状态', () => {
+  it('已有真实操作状态时不叠加第二条空白等待提示', () => {
+    mocks.renderRealBubble = true;
+    useChatStore.getState().startAssistantMessage('operation-waiting');
+    useChatStore.getState().setRunStatus('thinking');
+    useChatStore.getState().observeActivity('request:one', '模型正在响应');
+    const { container } = render(<ChatPanel />);
+    expect(screen.getByLabelText('当前执行状态')).toBeTruthy();
+    expect(screen.getByText('模型正在响应')).toBeTruthy();
+    expect(container.querySelectorAll('.spinner')).toHaveLength(0);
+  });
+
   it('从空思考段、空白增量到首个可见内容始终保留且只保留一处等待状态', () => {
     mocks.renderRealBubble = true;
     const id = useChatStore.getState().startAssistantMessage('stream-thinking');

@@ -134,6 +134,13 @@ describe('canonical chat event v4 contract', () => {
     const b = { ...a, response_target: 'target-b' };
     const base = fixture.at(0);
     if (!base) throw new Error('contract fixture is incomplete');
+    const addressedBase = {
+      ...base,
+      workspace_id: scope.workspace_id,
+      conversation_id: scope.conversation_id,
+      root_turn_id: scope.root_turn_id,
+      turn_id: scope.turn_id,
+    };
     for (const identity of [a, b]) {
       useChatStore
         .getState()
@@ -141,7 +148,7 @@ describe('canonical chat event v4 contract', () => {
     }
     handleChatEventEnvelope(
       {
-        ...base,
+        ...addressedBase,
         payload: {
           source: 'hitl_request_released',
           event: {
@@ -153,7 +160,7 @@ describe('canonical chat event v4 contract', () => {
     );
     expect(useChatStore.getState().pendingHitlRequests).toHaveLength(2);
     handleChatEventEnvelope(
-      { ...base, payload: { source: 'hitl_request_released', event: { identity: a } } },
+      { ...addressedBase, payload: { source: 'hitl_request_released', event: { identity: a } } },
       context()
     );
     expect(useChatStore.getState().pendingHitlRequests).toEqual([
