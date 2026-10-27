@@ -71,7 +71,7 @@ provenance 和 plan policy,不能从 route 文本或 plan 是否存在猜测。
    `Completed`;planless orchestrated run 保留 `Paused(BootRecovery)`;
 5. **死代码清理**:run-less else 分支与 `register_optional_run_driver` 随之删除。
 6. **用户 steer**:foreground owner 保存准确 `run_id`。原 `RunSteerRecorded` 保留完整原文，
-   近期展示投影仍有界；本事件不证明语义要求已经应用。GUI/IM 的来源接受按下节顺序先持久化，
+   近期展示投影仍有界；本事件不证明主模型已经理解或执行，也不要求先写独立语义Applied账本。GUI/IM 的来源接受按下节顺序先持久化，
    然后才调用原 mailbox；TUI/CLI 与 AgentRouter 的来源身份接线仍是未迁移范围，不能把
    其旧文本记录冒充新接受回执。Agent-origin message 不伪装成用户约束。
 7. **quiet wake**:active task/cell 检查与 `RunContinuationResumed` 在同一 run lock 内提交;
@@ -86,7 +86,7 @@ provenance 和 plan policy,不能从 route 文本或 plan 是否存在猜测。
 ZCode 普通 Bot callback
 早于 sendText ACK 的窗口不作为本项目准入证明。EKO 的双原 journal 顺序、target-before-admission
 和 typed unknown 是复用本项目原机制后的工程取舍；不是 ZCode 已有相同 API。`RunInputAccepted`
-仍是同一原事件 union 的历史事实，不新增状态机；durable/context/applied 分离沿 Plan14 原要求。
+仍是同一原事件 union 的历史事实，不新增状态机。以下Plan14来源与原接受/上下文证据保留历史；当前普通Steer理解与Goal权限以文末2026-10-27裁决为准。
 
 本片沿已批准的 Plan14 复用现有 journal、输入 attempt 与统一 turn driver，没有新增
 输入队列、要求 store、调度器或框架运行时字段。通用执行与取消仍归框架；来源快照、
@@ -138,3 +138,23 @@ ZCode 普通 Bot callback
 
 - 同分支后续实现:Subagent 终态唤醒轮次(泛化 `wake_after_cell_terminal`)、
   `RunSteerRecorded` 中途约束锚定、TaskExecutionSummary 引用化与 goal 超长落盘。
+
+
+## 2026-10-27 裁决：Steer 由主模型理解，已有 Goal 仅用户可改
+
+用户明确：普通Steer由主模型结合历史理解并在执行中按需更新计划，不先调用独立模型，
+也不强制串联“有效要求更新 → 计划调整 → 验收调整”。该裁决替换旧Plan14的独立理解和
+强制传播承诺，旧原文修复、接纳、幂等、错误与恢复证据保留各自真实范围，不改称全部通过。
+
+TaskRun.goal是必填字段，未建立该运行目标时复用原初始化设置初始Goal。已有Run的重试、
+ensure_scope与create_run重入返回原目标；普通Steer接纳/消费和模型task_update不能改写已有
+Goal、goal_revision或goal_hash。用户通过GUI目标编辑或IM `/task-goal` 显式修改，继续使用
+原RunGoalActorSource、expected_goal_revision/CAS和安全点；用户目标变更的原版本失效规则保留。
+
+用户“结束并删除当前目标”沿原结束/取消入口退出活动目标呈现，不向后端写空Goal或抹去
+历史事实。普通执行取消同样按原生命周期结算并保留goal/revision/hash，不能把取消运行等同
+修改或历史删除Goal而另加权限门控。原Stop、HITL、恢复与物理结算owner不变。
+
+必要历史、完整长原文及末尾限制继续沿原journal、压缩投影与read_artifact读取；缺失或
+校验失败时原required_context_unavailable暂停相关新副作用，原Goal和可恢复owner保留。
+这里不新增GoalStore、要求解释器、第二份队列/状态机或结构化模型协议，也不裁剪通用框架/SDK API。

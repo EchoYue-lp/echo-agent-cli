@@ -53,8 +53,9 @@ machine-code分类helper：正式PlanTask经原exact-claim interruption及settle
 不创建新Run、不增加retry；取消/旧claim/物理未结算仍保原优先级。参见
 [ADR0048](../adr/0048-context-compression-product-policy.md)。
 
-这只是当前有界引用和错误消费边界，最近四条不代表所有持续有效要求。完整来源、
-显式替换、范围、版本及独立覆盖仍须按原要求链逐项验收。
+这只是当前有界引用和错误消费边界，最近四条不代表完整历史。普通Steer由主模型结合
+历史理解并按需调整计划；原文、输入身份与必要上下文继续沿原journal和reader恢复，
+不再要求独立意图模型或统一强制的有效要求/计划/验收更新流水线。
 
 ## AgentRouter 阶段交接
 
@@ -442,3 +443,23 @@ primary、计划 Subagent、Verification 与 review 消费持久规则。原 poo
 前端接纳框架 AgentEvent schema5 的 `transcript_projection_settlement`，完整保留保存结果分类、操作与会话/世代身份、尝试次数及错误信息。它是会话保存检查点，不是 TaskRun 或聊天回合完成；成功保存不改变运行状态，未确认、阻塞与冲突显示明确提示，真正的回合结束仍以原 `turn_status` 为准。
 
 事件排序器只有在对应投影处理成功后才消费该序号。投影异常保留原事件和游标供后续重试，不能提前删除事件后把终态永久挡在缺失序号之后。恢复中的活跃回合查询也受已观察到的终态版本约束：实时终态抵达后，先前发出的迟到快照不能重新建立旧执行槽。界面修复与受控模型验收脚本分别验证；脚本必须通过原 `tool_search` 激活延迟曝光的 HITL 工具，不能凭普通回复或模拟前端状态认定原生人工确认已通过。
+
+
+## 2026-10-27 裁决：Steer 由主模型理解，已有 Goal 仅用户可改
+
+用户明确：普通Steer由主模型结合历史理解并在执行中按需更新计划，不先调用独立模型，
+也不强制串联“有效要求更新 → 计划调整 → 验收调整”。该裁决替换旧Plan14的独立理解和
+强制传播承诺，旧原文修复、接纳、幂等、错误与恢复证据保留各自真实范围，不改称全部通过。
+
+TaskRun.goal是必填字段，未建立该运行目标时复用原初始化设置初始Goal。已有Run的重试、
+ensure_scope与create_run重入返回原目标；普通Steer接纳/消费和模型task_update不能改写已有
+Goal、goal_revision或goal_hash。用户通过GUI目标编辑或IM `/task-goal` 显式修改，继续使用
+原RunGoalActorSource、expected_goal_revision/CAS和安全点；用户目标变更的原版本失效规则保留。
+
+用户“结束并删除当前目标”沿原结束/取消入口退出活动目标呈现，不向后端写空Goal或抹去
+历史事实。普通执行取消同样按原生命周期结算并保留goal/revision/hash，不能把取消运行等同
+修改或历史删除Goal而另加权限门控。原Stop、HITL、恢复与物理结算owner不变。
+
+必要历史、完整长原文及末尾限制继续沿原journal、压缩投影与read_artifact读取；缺失或
+校验失败时原required_context_unavailable暂停相关新副作用，原Goal和可恢复owner保留。
+这里不新增GoalStore、要求解释器、第二份队列/状态机或结构化模型协议，也不裁剪通用框架/SDK API。

@@ -129,7 +129,7 @@ npm run build
 
 ### 构建并发与批次后清理(强制)
 
-- 同机最多两条 focused Rust 构建/测试并发，完整 all-feature/GUI/语言矩阵同一时间只运行一套；每条 Rust 构建 `jobs <= 2`，dev/test debuginfo 关闭。
+- 同机最多五条 focused Rust 构建/测试并发，完整 all-feature/GUI/语言矩阵同一时间只运行一套；每条 Rust 构建 `jobs <= 5`，dev/test debuginfo 关闭。
 - 每个 worktree 使用自有独立 target，禁止与其它聊天或 primary 共用 `CARGO_TARGET_DIR`。重构建前后记录 `df`/`du`；可用空间低于 5 GiB 时停止新的重构建。
 - **每个编译/测试批次结束后及时 `cargo clean` 自有准确 target**：先把必要日志、真实退出状态以及需保留的 Host/制品保存到 target 外（原始日志放本仓 ignored `.echo-semantic/local/<task-id>/`）；再确认该 target 无活动 cargo/rustc/Host 或其它制品读取者，最后只清本任务准确 target。不能先删再声称证据或制品可恢复，不能误清其它聊天或 primary 缓存。
 - 纯文档/只读任务没有产生 Cargo 产物时明确报告不适用，不为形式清理无关目录。工作树、分支、未提交/未跟踪源码、stash、保留 tag 和原件的维护清理按独立授权及协调归属执行，不借 `cargo clean` 扩大范围。
@@ -170,3 +170,9 @@ import 的正式契约。同一 ref 的旧 run 由 concurrency gate 自动取消
 `RTM_NEWADDR: Operation not permitted` 失败——这是运行环境限制,不是回归;测试侧应探测
 能力降级或跳过。不得仅因共享 runner 负载而反复放宽产品测试等待时间或加入 `gdb` 等
 常驻诊断依赖;需要调查时使用临时诊断分支。
+
+## 2026-10-27 本轮六项依赖风险的用户复评
+
+用户在当前新协调会话明确批准“继续保留原六个依赖，完成本次修复和验证”。本轮实际锁为`3fb8955b56e86eb4bef2454d3328b6ef8eb7f36d7663806387f3b990244e7ed6`（856包），本次运行隔离/Goal边界GREEN冻结consumer为`d38f9a06ca1df7f042295d579bf8144ab3a741a92b6b5bd99fb104941c58ecd9`（321输入），以`.cargo/accepted-dependency-risks.json`及原风险决策文档的本日中文后继为机器身份/真实用户来源。原b0完整源码未复原已明确告知，不据旧小增量假设自动续期；本轮直接对当前完整来源复评，六项name/version/source/checksum/advisory/kind保持。
+
+这覆盖上文各历史锁/consumer的CLI当前时态，不改变Framework/SDK独立合同，不扩大风险集合或以后迭代许可；scanner自然1与精确gate0必须分开保留，原六测试和actual/canonical两gate实际通过后才有本切片风险资格。后继本轮源增量须重新核暴露面、冻结并执行原精确gate；锁/身份/范围变化必须重新裁决。编译/测试/fmt、mainCI与原生验收门禁不变。

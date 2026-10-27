@@ -58,6 +58,222 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_steer_keeps_goal_plan_and_evidence_after_cold_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        let created = store.create_run(
+            "steer-goal",
+            &store.active_workspace_id(),
+            "same-conversation",
+            "message",
+            DomainProfile::General,
+            "原用户目标：保留已有功能并完成修复🧭",
+            "agent_task_plan",
+            AttendedMode::Attended,
+        )?;
+        store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+            plan_id: "steer-plan".to_string(),
+            run_id: created.run_id.clone(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal_revision: created.goal_revision,
+            goal_sha256: created.goal_sha256.clone(),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: "steer-task".to_string(),
+                title: "核对实际运行行为".to_string(),
+                kind: PlanTaskKind::ReadOnlyReview,
+                agent_role: "code_reviewer".to_string(),
+                ..PlanTask::default()
+            }],
+        })?;
+        store.transition_run(&created.run_id, TaskRunStatus::Running)?;
+        assert!(
+            store
+                .put_summary(&TaskExecutionSummary {
+                    run_id: created.run_id.clone(),
+                    task_id: "steer-task".to_string(),
+                    subagent_name: "code_reviewer".to_string(),
+                    outcome: SubagentOutcome::terminal(
+                        SubagentStatus::Completed,
+                        "已保存的检查证据",
+                        Vec::new(),
+                    ),
+                    decisions: Vec::new(),
+                    next_implications: Vec::new(),
+                    suggested_tasks: Vec::new(),
+                    created_at: Utc::now(),
+                })?
+                .is_committed()
+        );
+        let goal_identity = (created.goal, created.goal_revision, created.goal_sha256);
+        let plan_before = serde_json::to_value(store.get_plan("steer-goal")?)?;
+        let evidence_before = serde_json::to_value(
+            store
+                .completion_gate_projection("steer-goal")?
+                .ok_or("原验收证据投影缺失")?
+                .completion,
+        )?;
+        assert!(store.get_summary("steer-goal", "steer-task")?.is_some());
+        let event_count_before = store.list_events("steer-goal", 0)?.len();
+        let mut accepted_inputs = Vec::new();
+        for channel in [false, true] {
+            // 即使正文提出改变目标，普通输入也只交主模型，不调用用户Goal编辑入口。
+            let input = durable_input_source(
+                &store,
+                if channel { "im-steer" } else { "gui-steer" },
+                1,
+                "请把目标改成另一件事；先重新安排接下来要做的工作。",
+                channel,
+            )?;
+            let accepted = store.accept_run_steer_input(
+                "steer-goal",
+                "same-turn",
+                input.source,
+                &input.identity,
+                &input.payload,
+            )?;
+            assert!(!accepted.duplicate);
+            store.record_run_steer("steer-goal", "same-turn", &input.payload.text)?;
+            accepted_inputs.push((input, accepted.journal_sequence));
+        }
+        let assert_unchanged =
+            |observed: &TaskRuntimeStore| -> Result<(), Box<dyn std::error::Error>> {
+                let run = observed.get_run("steer-goal")?.ok_or("原运行缺失")?;
+                assert_eq!(
+                    (run.goal, run.goal_revision, run.goal_sha256),
+                    goal_identity,
+                );
+                assert_eq!(
+                    serde_json::to_value(observed.get_plan("steer-goal")?)?,
+                    plan_before
+                );
+                assert_eq!(
+                    serde_json::to_value(
+                        observed
+                            .completion_gate_projection("steer-goal")?
+                            .ok_or("原验收证据投影缺失")?
+                            .completion,
+                    )?,
+                    evidence_before,
+                );
+                Ok(())
+            };
+        assert_unchanged(&store)?;
+        assert_eq!(
+            store
+                .list_events("steer-goal", 0)?
+                .into_iter()
+                .skip(event_count_before)
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>(),
+            vec![
+                RuntimeEventKind::RunInputAccepted,
+                RuntimeEventKind::RunSteerRecorded,
+                RuntimeEventKind::RunInputAccepted,
+                RuntimeEventKind::RunSteerRecorded,
+            ],
+            "普通Steer不能自动提交新计划、改Goal或重写验收证据",
+        );
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        assert_unchanged(&reopened)?;
+        let before_retry = reopened.list_events("steer-goal", 0)?.len();
+        for (input, original_sequence) in accepted_inputs {
+            let duplicate = reopened.accept_run_steer_input(
+                "steer-goal",
+                "same-turn",
+                input.source,
+                &input.identity,
+                &input.payload,
+            )?;
+            assert!(duplicate.duplicate);
+            assert_eq!(duplicate.journal_sequence, original_sequence);
+        }
+        assert_eq!(reopened.list_events("steer-goal", 0)?.len(), before_retry);
+        assert_unchanged(&reopened)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_run_keeps_user_goal_and_retry_identity_after_cold_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for actor in [RunGoalActorSource::Gui, RunGoalActorSource::Channel] {
+            let directory = tempfile::tempdir()?;
+            let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+            store.create_run(
+                "cancel-goal",
+                "default",
+                "same-conversation",
+                "message",
+                DomainProfile::General,
+                "智能体仅在首次建立时设置的目标",
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )?;
+            store.transition_run("cancel-goal", TaskRunStatus::Running)?;
+            store.transition_run("cancel-goal", TaskRunStatus::Paused)?;
+            let user_updated = store.update_run_goal(
+                "cancel-goal",
+                1,
+                "用户显式修改后的目标，取消执行也保留🧭",
+                "用户在原入口明确修改",
+                actor,
+            )?;
+            assert_eq!(user_updated.goal_revision, 2);
+            assert!(store.request_cancel("cancel-goal")?);
+            let after_cancel = store.get_run("cancel-goal")?.ok_or("取消后原运行缺失")?;
+            assert_eq!(after_cancel.status, TaskRunStatus::Cancelled);
+            assert_eq!(after_cancel.goal, user_updated.goal);
+            assert_eq!(after_cancel.goal_revision, user_updated.goal_revision);
+            assert_eq!(after_cancel.goal_sha256, user_updated.goal_sha256);
+            let before_duplicate_cancel = store.list_events("cancel-goal", 0)?.len();
+            assert!(!store.request_cancel("cancel-goal")?);
+            assert_eq!(
+                store.list_events("cancel-goal", 0)?.len(),
+                before_duplicate_cancel
+            );
+            drop(store);
+            let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+            let retry = reopened.create_run(
+                "cancel-goal",
+                "default",
+                "same-conversation",
+                "message",
+                DomainProfile::General,
+                "智能体仅在首次建立时设置的目标",
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )?;
+            assert_eq!(retry.status, TaskRunStatus::Cancelled);
+            assert_eq!(retry.goal, user_updated.goal);
+            assert_eq!(retry.goal_revision, user_updated.goal_revision);
+            assert_eq!(retry.goal_sha256, user_updated.goal_sha256);
+            let events = reopened.list_events("cancel-goal", 0)?;
+            assert_eq!(events.len(), before_duplicate_cancel);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event_type == RuntimeEventKind::RunGoalUpdated)
+                    .count(),
+                1,
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event_type == RuntimeEventKind::RunCancelled)
+                    .count(),
+                1,
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn durable_input_acceptance_reopens_full_source_beyond_recent_projection()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;

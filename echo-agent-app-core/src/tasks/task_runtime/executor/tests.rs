@@ -4022,10 +4022,13 @@ Read the runtime path and found one missing branch.
                     .map_err(|error| error.to_string())?,
             );
             let execution_id = format!("{run_id}:bound-child:1:1");
-            let identity = echo_agent::subagent::SubagentAttemptIdentity::for_run(
+            // 与真实 task dispatch 共用应用 helper，避免手写 for_run 让消费者
+            // 回归绕开跨 Run 身份丢失的实际接缝。
+            let (_control_identity, identity) = super::super::subagent_control::attempt_identity(
                 &run_id,
                 &task.id,
                 &execution_id,
+                1,
                 1,
             )
             .map_err(|error| error.to_string())?;

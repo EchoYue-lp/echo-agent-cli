@@ -20,7 +20,7 @@ POLICY = json.loads(gate.POLICY_PATH.read_text())
 
 def report_for(risks: list[dict]) -> dict:
     report = {
-        "database": {"advisory-count": 1}, "lockfile": {"dependency-count": 855},
+        "database": {"advisory-count": 1}, "lockfile": {"dependency-count": 856},
         "settings": {"target_arch": [], "target_os": [], "severity": None, "ignore": [],
                      "informational_warnings": ["unmaintained", "unsound", "notice"]},
         "vulnerabilities": {"found": False, "count": 0, "list": []}, "warnings": {},
@@ -36,9 +36,9 @@ def report_for(risks: list[dict]) -> dict:
 
 class AcceptedRiskTests(unittest.TestCase):
     def test_exact_six_and_clean_official_results(self):
-        self.assertEqual(len(gate.verify_report(report_for(POLICY["accepted"]), 1, POLICY, 855)), 6)
-        self.assertEqual(gate.verify_report(report_for([]), 0, POLICY, 855), [])
-        self.assertEqual(len(gate.verify_inputs(gate.ROOT, POLICY)), 855)
+        self.assertEqual(len(gate.verify_report(report_for(POLICY["accepted"]), 1, POLICY, 856)), 6)
+        self.assertEqual(gate.verify_report(report_for([]), 0, POLICY, 856), [])
+        self.assertEqual(len(gate.verify_inputs(gate.ROOT, POLICY)), 856)
 
     def test_added_advisory_and_changed_identity_never_inherit_acceptance(self):
         for field in (*gate.IDENTITY_FIELDS, "advisory", "kind"):
@@ -46,13 +46,13 @@ class AcceptedRiskTests(unittest.TestCase):
                 risks = copy.deepcopy(POLICY["accepted"])
                 risks[0][field] += "-changed"
                 with self.assertRaises(ValueError):
-                    gate.verify_report(report_for(risks), 1, POLICY, 855)
+                    gate.verify_report(report_for(risks), 1, POLICY, 856)
         report = report_for(POLICY["accepted"])
         extra = copy.deepcopy(report["warnings"]["unsound"][0])
         extra["advisory"]["id"] = "RUSTSEC-2099-0001"
         report["warnings"]["unsound"].append(extra)
         with self.assertRaises(ValueError):
-            gate.verify_report(report, 1, POLICY, 855)
+            gate.verify_report(report, 1, POLICY, 856)
 
     def test_vulnerability_yank_filters_schema_and_scanner_failure_block(self):
         alterations = [
@@ -61,21 +61,21 @@ class AcceptedRiskTests(unittest.TestCase):
             ("warnings", {"notice": [{}]}),
             ("settings", {"ignore": ["RUSTSEC-2024-0429"]}),
             ("database", {"advisory-count": 0}),
-            ("lockfile", {"dependency-count": 854}),
+            ("lockfile", {"dependency-count": 855}),
         ]
         for key, value in alterations:
             with self.subTest(key=key, value=value):
                 report = report_for(POLICY["accepted"])
                 report[key] = value
                 with self.assertRaises((ValueError, KeyError)):
-                    gate.verify_report(report, 1, POLICY, 855)
+                    gate.verify_report(report, 1, POLICY, 856)
         for code in (-9, 0, 2, 101):
             with self.subTest(scanner_exit=code), self.assertRaises(ValueError):
-                gate.verify_report(report_for(POLICY["accepted"]), code, POLICY, 855)
+                gate.verify_report(report_for(POLICY["accepted"]), code, POLICY, 856)
         with self.assertRaises(ValueError):
-            gate.verify_report({"error": "database fetch failed"}, 1, POLICY, 855)
+            gate.verify_report({"error": "database fetch failed"}, 1, POLICY, 856)
         with self.assertRaises(ValueError):
-            gate.verify_report(report_for([]), 1, POLICY, 855)
+            gate.verify_report(report_for([]), 1, POLICY, 856)
 
     def make_consumer(self, root: Path) -> dict:
         for name in ("src", "src-tauri", "echo-agent-app-core/src", ".cargo", "scripts"):
@@ -94,7 +94,7 @@ class AcceptedRiskTests(unittest.TestCase):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 policy = self.make_consumer(root)
-                self.assertEqual(len(gate.verify_inputs(root, policy)), 855)
+                self.assertEqual(len(gate.verify_inputs(root, policy)), 856)
                 path = root / name
                 path.write_bytes((path.read_bytes() if path.exists() else b"") + b"\n# changed\n")
                 with self.assertRaises(ValueError):

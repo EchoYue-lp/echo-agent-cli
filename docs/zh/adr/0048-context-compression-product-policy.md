@@ -64,5 +64,25 @@ Cancelled、旧 claim 与 ExecutionNotSettled 的原优先级保持，不新增 
 
 验收须真实走超过8000 token的 ContextManager、冷重开/重复压缩、损坏缓存重建，
 以及 execute_run 和 drive_chat 的暂停后恢复。SSH read_file-only 控制须证明最终工具
-范围不变、模型/脚本/远端FileSystem均不调用。完整有效要求的分类、替换、范围、版本
-及独立coverage仍需后续切片，不能由最近四条或 generic 模型零调用冒充完成。
+范围不变、模型/脚本/远端FileSystem均不调用。必要历史和完整原文仍须由主模型在真实压缩/恢复后读取；最近四条预览不代表完整历史。
+2026-10-27用户裁决已撤销独立意图分类与强制有效要求/计划/验收链，不再为这些旧方案建立后续切片。
+
+
+## 2026-10-27 裁决：Steer 由主模型理解，已有 Goal 仅用户可改
+
+用户明确：普通Steer由主模型结合历史理解并在执行中按需更新计划，不先调用独立模型，
+也不强制串联“有效要求更新 → 计划调整 → 验收调整”。该裁决替换旧Plan14的独立理解和
+强制传播承诺，旧原文修复、接纳、幂等、错误与恢复证据保留各自真实范围，不改称全部通过。
+
+TaskRun.goal是必填字段，未建立该运行目标时复用原初始化设置初始Goal。已有Run的重试、
+ensure_scope与create_run重入返回原目标；普通Steer接纳/消费和模型task_update不能改写已有
+Goal、goal_revision或goal_hash。用户通过GUI目标编辑或IM `/task-goal` 显式修改，继续使用
+原RunGoalActorSource、expected_goal_revision/CAS和安全点；用户目标变更的原版本失效规则保留。
+
+用户“结束并删除当前目标”沿原结束/取消入口退出活动目标呈现，不向后端写空Goal或抹去
+历史事实。普通执行取消同样按原生命周期结算并保留goal/revision/hash，不能把取消运行等同
+修改或历史删除Goal而另加权限门控。原Stop、HITL、恢复与物理结算owner不变。
+
+必要历史、完整长原文及末尾限制继续沿原journal、压缩投影与read_artifact读取；缺失或
+校验失败时原required_context_unavailable暂停相关新副作用，原Goal和可恢复owner保留。
+这里不新增GoalStore、要求解释器、第二份队列/状态机或结构化模型协议，也不裁剪通用框架/SDK API。
