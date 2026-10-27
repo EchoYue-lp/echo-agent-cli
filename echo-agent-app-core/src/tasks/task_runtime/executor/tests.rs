@@ -3426,11 +3426,16 @@ Read the runtime path and found one missing branch.
         has_tools: bool,
         schema_bytes: usize,
         estimated_tokens: usize,
+        tool_result_names: Vec<String>,
+        search_receipt_count: usize,
+        search_activated_list_dir: bool,
+        search_no_eligible_match: bool,
     }
 
     #[derive(Default)]
     struct PrimaryVerificationMetadataClient {
         requests: std::sync::Mutex<Vec<PrimaryVerificationToolRequest>>,
+        script: Option<Arc<echo_agent::testing::MockLlmClient>>,
     }
 
     impl PrimaryVerificationMetadataClient {
@@ -3447,6 +3452,34 @@ Read the runtime path and found one missing branch.
                 .map(|definition| definition.function.name.clone())
                 .collect::<Vec<_>>();
             names.sort_unstable();
+            // 只投影原运行时实际交给下一请求的工具回执，不注入消息或保存正文。
+            let tool_results = request
+                .messages
+                .iter()
+                .filter(|message| matches!(message.role, echo_agent::llm::types::Role::Tool))
+                .collect::<Vec<_>>();
+            let tool_result_names = tool_results
+                .iter()
+                .filter_map(|message| message.name.clone())
+                .collect::<Vec<_>>();
+            let search_receipts = tool_results
+                .iter()
+                .filter(|message| {
+                    message.name.as_deref() == Some("tool_search")
+                        && message.tool_call_id.as_deref() == Some("tool-search-request-consumer")
+                })
+                .collect::<Vec<_>>();
+            let search_activated_list_dir = search_receipts.iter().any(|message| {
+                message.text_content().is_some_and(|content| {
+                    content.starts_with("Activated tool schemas for the next turn:")
+                        && content.lines().any(|line| line.starts_with("- list_dir:"))
+                })
+            });
+            let search_no_eligible_match = search_receipts.iter().any(|message| {
+                message.text_content().is_some_and(|content| {
+                    content.starts_with("No eligible tools matched 'list_dir'.")
+                })
+            });
             // 只在实际模型边界保留无内容元数据；不保存 prompt、参数 schema 或整个请求。
             self.requests
                 .lock()
@@ -3458,6 +3491,10 @@ Read the runtime path and found one missing branch.
                     has_tools: request.tools.is_some(),
                     schema_bytes: stats.schema_bytes,
                     estimated_tokens: stats.estimated_tokens,
+                    tool_result_names,
+                    search_receipt_count: search_receipts.len(),
+                    search_activated_list_dir,
+                    search_no_eligible_match,
                 });
             Ok(())
         }
@@ -3473,6 +3510,12 @@ Read the runtime path and found one missing branch.
             request: echo_agent::llm::ChatRequest,
         ) -> BoxFuture<'_, echo_agent::error::Result<echo_agent::llm::ChatResponse>> {
             let observed = self.observe(&request);
+            if let Some(script) = self.script.as_ref() {
+                return Box::pin(async move {
+                    observed?;
+                    echo_agent::llm::LlmClient::chat(script.as_ref(), request).await
+                });
+            }
             drop(request);
             Box::pin(async move {
                 observed?;
@@ -3495,6 +3538,12 @@ Read the runtime path and found one missing branch.
             >,
         > {
             let observed = self.observe(&request);
+            if let Some(script) = self.script.as_ref() {
+                return Box::pin(async move {
+                    observed?;
+                    echo_agent::llm::LlmClient::chat_stream(script.as_ref(), request).await
+                });
+            }
             drop(request);
             Box::pin(async move {
                 observed?;
@@ -3521,9 +3570,11 @@ Read the runtime path and found one missing branch.
         }
     }
 
-    async fn primary_verification_actual_request(
+    async fn primary_verification_actual_requests(
         allowed_tools: &[&str],
-    ) -> Result<(HashSet<String>, PrimaryVerificationToolRequest), String> {
+        client: Arc<PrimaryVerificationMetadataClient>,
+    ) -> Result<(HashSet<String>, Vec<PrimaryVerificationToolRequest>), String> {
+        let searching = client.script.is_some();
         let fixture = tempfile::tempdir().map_err(|error| error.to_string())?;
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let _resource_scope = store.test_resource_scope();
@@ -3532,7 +3583,12 @@ Read the runtime path and found one missing branch.
             vec![PlanTask {
                 id: "verify-model-tools".to_string(),
                 title: "核对 primary verification 的实际工具曝光".to_string(),
-                description: "无需执行工具，正常回答验证完成。".to_string(),
+                description: if searching {
+                    "仅调用 tool_search 查询 list_dir，再正常回答验证完成；不执行目标工具。"
+                        .to_string()
+                } else {
+                    "无需执行工具，正常回答验证完成。".to_string()
+                },
                 kind: PlanTaskKind::Verification,
                 agent_role: "primary".to_string(),
                 allowed_tools: allowed_tools
@@ -3557,7 +3613,11 @@ Read the runtime path and found one missing branch.
         // 使用原 EKO factory、真实内置注册和 TaskRuntime 工具；只替换受控模型传输。
         let created = crate::infra::create_agent_with_diagnostics(
             &crate::infra::AgentCreateParams {
-                system_prompt: Some("按要求正常回答，不调用工具。".to_string()),
+                system_prompt: Some(if searching {
+                    "仅搜索延迟工具；收到真实搜索回执后正常回答，不执行目标工具。".to_string()
+                } else {
+                    "按要求正常回答，不调用工具。".to_string()
+                }),
                 working_dir: Some(fixture.path().to_path_buf()),
                 workspace_data_root: Some(fixture.path().join("product-data")),
                 task_runtime_store: Some(store.clone()),
@@ -3568,7 +3628,6 @@ Read the runtime path and found one missing branch.
             &crate::config::EkoConfig::default(),
         )
         .await?;
-        let client = Arc::new(PrimaryVerificationMetadataClient::default());
         let mut agent = created.agent;
         let registered = agent.tool_names().into_iter().collect::<HashSet<_>>();
         agent.set_llm_client(client.clone());
@@ -3619,10 +3678,43 @@ Read the runtime path and found one missing branch.
             .as_ref()
             .ok_or_else(|| "原 primary verification 未保存正常回答".to_string())?;
         assert!(outcome.summary.contains("验证完成。"));
-        let mut requests = client
-            .requests
-            .lock()
-            .map_err(|_| "验证元数据锁不可用".to_string())?;
+        let requests = std::mem::take(
+            &mut *client
+                .requests
+                .lock()
+                .map_err(|_| "验证元数据锁不可用".to_string())?,
+        );
+        for (index, request) in requests.iter().enumerate() {
+            assert!(request.names.iter().all(|name| registered.contains(name)));
+            assert!(
+                request.schema_bytes <= 16_000,
+                "实际请求 schema 超出 16,000 bytes：{}",
+                request.schema_bytes
+            );
+            assert!(
+                request.estimated_tokens <= 4_000,
+                "实际请求 schema 超出 4,000 估算 token：{}",
+                request.estimated_tokens
+            );
+            eprintln!(
+                "primary verification request={} tools={:?} schema_bytes={} estimated_tokens={}",
+                index.saturating_add(1),
+                request.names,
+                request.schema_bytes,
+                request.estimated_tokens
+            );
+        }
+        Ok((registered, requests))
+    }
+
+    async fn primary_verification_actual_request(
+        allowed_tools: &[&str],
+    ) -> Result<(HashSet<String>, PrimaryVerificationToolRequest), String> {
+        let (registered, mut requests) = primary_verification_actual_requests(
+            allowed_tools,
+            Arc::new(PrimaryVerificationMetadataClient::default()),
+        )
+        .await?;
         assert_eq!(
             requests.len(),
             1,
@@ -3631,21 +3723,6 @@ Read the runtime path and found one missing branch.
         let request = requests
             .pop()
             .ok_or_else(|| "最终模型请求缺失".to_string())?;
-        assert!(request.names.iter().all(|name| registered.contains(name)));
-        assert!(
-            request.schema_bytes <= 16_000,
-            "实际请求 schema 超出 16,000 bytes：{}",
-            request.schema_bytes
-        );
-        assert!(
-            request.estimated_tokens <= 4_000,
-            "实际请求 schema 超出 4,000 估算 token：{}",
-            request.estimated_tokens
-        );
-        eprintln!(
-            "primary verification tools={:?} schema_bytes={} estimated_tokens={}",
-            request.names, request.schema_bytes, request.estimated_tokens
-        );
         Ok((registered, request))
     }
 
@@ -3698,6 +3775,88 @@ Read the runtime path and found one missing branch.
             !request.has_tools,
             "空交集应成为实际 ChatRequest.tools=None，不能回退全量"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn primary_verification_tool_search_activation_reaches_next_model_request()
+    -> Result<(), String> {
+        for target_allowed in [true, false] {
+            let allowed_tools = if target_allowed {
+                vec!["tool_search", "read_file", "list_dir"]
+            } else {
+                vec!["tool_search", "read_file"]
+            };
+            let client = Arc::new(PrimaryVerificationMetadataClient {
+                script: Some(Arc::new(
+                    echo_agent::testing::MockLlmClient::new()
+                        .then_tool_call(
+                            "tool-search-request-consumer",
+                            "tool_search",
+                            r#"{"query":"list_dir","limit":1}"#,
+                        )
+                        .with_response("验证完成。"),
+                )),
+                ..Default::default()
+            });
+            let (registered, requests) =
+                primary_verification_actual_requests(&allowed_tools, client).await?;
+            for required in ["tool_search", "read_file", "list_dir"] {
+                assert!(
+                    registered.contains(required),
+                    "原 factory 必须注册 {required}"
+                );
+            }
+            assert_eq!(requests.len(), 2, "真实搜索后必须进入下一次模型请求");
+            let first = requests
+                .first()
+                .ok_or_else(|| "首个真实模型请求缺失".to_string())?;
+            let second = requests
+                .get(1)
+                .ok_or_else(|| "搜索后的真实模型请求缺失".to_string())?;
+            let first_names = first
+                .names
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            let second_names = second
+                .names
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            let hard_bound = allowed_tools.iter().copied().collect::<HashSet<_>>();
+            assert!(first.has_tools && second.has_tools);
+            assert_eq!(first_names, HashSet::from(["read_file", "tool_search"]));
+            assert!(
+                !first.names.iter().any(|name| name == "list_dir"),
+                "目标必须真实延迟，不能用默认已曝光工具冒充激活"
+            );
+            for request in &requests {
+                assert!(
+                    request
+                        .names
+                        .iter()
+                        .all(|name| hard_bound.contains(name.as_str())),
+                    "每次实际模型请求都必须保持当前非空 hard bound"
+                );
+            }
+            assert!(first.tool_result_names.is_empty());
+            assert_eq!(first.search_receipt_count, 0);
+            assert_eq!(second.tool_result_names, vec!["tool_search".to_string()]);
+            assert_eq!(
+                second.search_receipt_count, 1,
+                "原搜索回执必须被下一请求消费"
+            );
+            if target_allowed {
+                assert_eq!(second_names, hard_bound);
+                assert!(second.search_activated_list_dir);
+                assert!(!second.search_no_eligible_match);
+            } else {
+                assert_eq!(second_names, first_names);
+                assert!(!second.search_activated_list_dir);
+                assert!(second.search_no_eligible_match);
+            }
+        }
         Ok(())
     }
 
