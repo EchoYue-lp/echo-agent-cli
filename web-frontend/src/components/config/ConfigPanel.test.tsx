@@ -5,6 +5,12 @@ import { ConfigPanel } from './ConfigPanel';
 
 const api = vi.hoisted(() => ({ get: vi.fn(), getFull: vi.fn(), updateFull: vi.fn() }));
 vi.mock('../../api/endpoints', () => ({ configApi: api }));
+vi.hoisted(() => {
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    value: () => ({ matches: false }),
+  });
+});
 
 function fullConfig(depth: number = 1) {
   return {
@@ -41,6 +47,22 @@ describe('EKO subagent depth configuration', () => {
       '3',
     ]);
     expect(screen.getByText(/对新任务生效/)).toBeTruthy();
+  });
+
+  it('基础页不再重复编辑QQ和飞书，导航至原IM渠道入口', async () => {
+    const { useUiStore } = await import('../../stores/uiStore');
+    useUiStore.setState({ settingsOpen: true, activeSettingsTab: 'config' });
+    render(<ConfigPanel />);
+    await screen.findByRole('combobox', { name: '最大子智能体层数' });
+    expect(screen.queryByRole('heading', { name: 'QQ 机器人' })).toBeNull();
+    expect(screen.queryByRole('heading', { name: '飞书' })).toBeNull();
+    expect(screen.queryByText('客户端密钥')).toBeNull();
+    expect(screen.queryByText('应用密钥')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '前往IM渠道' }));
+    expect(useUiStore.getState().activeSettingsTab).toBe('channels');
+    expect(useUiStore.getState().settingsOpen).toBe(true);
+    expect(api.updateFull).not.toHaveBeenCalled();
+    useUiStore.setState({ settingsOpen: false, activeSettingsTab: 'providers' });
   });
 
   it('saves the selected limit through the existing owned config endpoint', async () => {

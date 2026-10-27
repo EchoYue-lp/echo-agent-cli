@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import {
   X,
@@ -106,12 +106,27 @@ const defaultSettingsItem: SettingsItem = {
   description: '模型、供应商和默认模型',
 };
 
+const channelsItem: SettingsItem = {
+  id: 'channels',
+  label: 'IM 渠道',
+  icon: Globe,
+  maturity: 'core',
+  description: '消息渠道配置、连接与收发',
+};
+
 const settingsGroups: SettingsGroup[] = [
   {
-    label: '模型与扩展',
+    label: '基础与扩展',
     tier: 'core',
     items: [
       defaultSettingsItem,
+      {
+        id: 'config',
+        label: '基础配置',
+        icon: Settings,
+        maturity: 'core',
+        description: '智能体与常用应用配置',
+      },
       {
         id: 'tools',
         label: '工具',
@@ -169,13 +184,6 @@ const settingsGroups: SettingsGroup[] = [
     tier: 'core',
     items: [
       {
-        id: 'channels',
-        label: 'IM 渠道',
-        icon: Globe,
-        maturity: 'advanced',
-        description: '消息渠道连接与收发',
-      },
-      {
         id: 'scheduler',
         label: '定时任务',
         icon: Timer,
@@ -223,13 +231,6 @@ const settingsGroups: SettingsGroup[] = [
     tier: 'advanced',
     items: [
       {
-        id: 'config',
-        label: '配置',
-        icon: Settings,
-        maturity: 'advanced',
-        description: '底层应用配置',
-      },
-      {
         id: 'worktree',
         label: 'Worktree',
         icon: GitBranch,
@@ -271,13 +272,22 @@ const panels: Record<SettingsTabId, React.FC> = {
 
 export function SettingsDialog() {
   const { settingsOpen, closeSettings, activeSettingsTab, setActiveSettingsTab } = useUiStore();
-  const activeItem = settingsGroups
-    .flatMap((group) => group.items)
-    .find((item) => item.id === activeSettingsTab);
+  const activeItem =
+    activeSettingsTab === 'channels'
+      ? channelsItem
+      : settingsGroups
+          .flatMap((group) => group.items)
+          .find((item) => item.id === activeSettingsTab);
   // 旧选择只影响展示；仍沿用原设置 store 和按需加载的面板。
   const effectiveItem = activeItem ?? defaultSettingsItem;
   const effectiveSettingsTab = effectiveItem.id;
   const Panel = panels[effectiveSettingsTab];
+  const independentChannels = effectiveSettingsTab === 'channels';
+  const closeButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    // 基础页导航到独立渠道后，原链接已卸载，焦点留在现有弹窗的关闭控件。
+    if (settingsOpen && independentChannels) closeButton.current?.focus();
+  }, [settingsOpen, independentChannels]);
   const [expandedAdvanced, setExpandedAdvanced] = useState<Record<string, boolean>>({});
   const activeGroup = settingsGroups.find((group) =>
     group.items.some((item) => item.id === effectiveSettingsTab)
@@ -288,7 +298,7 @@ export function SettingsDialog() {
   return (
     <Modal
       onClose={closeSettings}
-      ariaLabelledBy="settings-dialog-title"
+      ariaLabelledBy={independentChannels ? 'channels-dialog-title' : 'settings-dialog-title'}
       className="settings-dialog animate-scale-in flex h-[min(760px,88vh)] w-[92vw] max-w-[1080px] overflow-hidden rounded-xl border border-[var(--border-primary)] bg-[var(--settings-dialog-bg)] shadow-[var(--shadow-xl)] max-sm:h-screen max-sm:w-screen max-sm:max-w-none max-sm:rounded-none"
       style={
         {
@@ -300,82 +310,90 @@ export function SettingsDialog() {
       }
     >
       {/* Left sidebar — settings nav */}
-      <div className="flex w-[196px] shrink-0 max-sm:w-[144px] flex-col border-r border-[var(--border-primary)] bg-[var(--settings-sidebar-bg)]">
-        <div className="flex h-16 shrink-0 items-center px-5">
-          <h2
-            id="settings-dialog-title"
-            className="text-sm font-semibold text-[var(--text-primary)]"
-          >
-            设置
-          </h2>
-        </div>
-        <nav aria-label="设置分类" className="flex-1 space-y-4 overflow-y-auto px-3 pb-4">
-          {settingsGroups.map((group) => (
-            <div key={group.label} role="group" aria-label={group.label}>
-              {group.tier === 'advanced' ? (
-                <button
-                  type="button"
-                  aria-expanded={Boolean(
-                    expandedAdvanced[group.label] || activeGroup?.label === group.label
-                  )}
-                  onClick={() =>
-                    setExpandedAdvanced((prev) => ({ ...prev, [group.label]: !prev[group.label] }))
-                  }
-                  className="mb-1 flex w-full items-center justify-between px-2 py-1 text-xs font-medium text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
-                >
-                  {group.label}
-                  {expandedAdvanced[group.label] || activeGroup?.label === group.label ? (
-                    <ChevronDown size={12} />
-                  ) : (
-                    <ChevronRight size={12} />
-                  )}
-                </button>
-              ) : (
-                <div className="mb-1 px-2 py-1 text-xs font-medium text-[var(--text-tertiary)]">
-                  {group.label}
-                </div>
-              )}
-              {(group.tier === 'core' ||
-                expandedAdvanced[group.label] ||
-                activeGroup?.label === group.label) &&
-                group.items.map(({ id, label, icon: Icon, maturity, description }) => (
+      {!independentChannels && (
+        <div className="flex w-[196px] shrink-0 max-sm:w-[144px] flex-col border-r border-[var(--border-primary)] bg-[var(--settings-sidebar-bg)]">
+          <div className="flex h-16 shrink-0 items-center px-5">
+            <h2
+              id="settings-dialog-title"
+              className="text-sm font-semibold text-[var(--text-primary)]"
+            >
+              设置
+            </h2>
+          </div>
+          <nav aria-label="设置分类" className="flex-1 space-y-4 overflow-y-auto px-3 pb-4">
+            {settingsGroups.map((group) => (
+              <div key={group.label} role="group" aria-label={group.label}>
+                {group.tier === 'advanced' ? (
                   <button
-                    key={id}
                     type="button"
-                    title={description}
-                    aria-current={effectiveSettingsTab === id ? 'page' : undefined}
-                    onClick={() => setActiveSettingsTab(id)}
-                    className={`flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left transition-all duration-150
+                    aria-expanded={Boolean(
+                      expandedAdvanced[group.label] || activeGroup?.label === group.label
+                    )}
+                    onClick={() =>
+                      setExpandedAdvanced((prev) => ({
+                        ...prev,
+                        [group.label]: !prev[group.label],
+                      }))
+                    }
+                    className="mb-1 flex w-full items-center justify-between px-2 py-1 text-xs font-medium text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
+                  >
+                    {group.label}
+                    {expandedAdvanced[group.label] || activeGroup?.label === group.label ? (
+                      <ChevronDown size={12} />
+                    ) : (
+                      <ChevronRight size={12} />
+                    )}
+                  </button>
+                ) : (
+                  <div className="mb-1 px-2 py-1 text-xs font-medium text-[var(--text-tertiary)]">
+                    {group.label}
+                  </div>
+                )}
+                {(group.tier === 'core' ||
+                  expandedAdvanced[group.label] ||
+                  activeGroup?.label === group.label) &&
+                  group.items.map(({ id, label, icon: Icon, maturity, description }) => (
+                    <button
+                      key={id}
+                      type="button"
+                      title={description}
+                      aria-current={effectiveSettingsTab === id ? 'page' : undefined}
+                      onClick={() => setActiveSettingsTab(id)}
+                      className={`flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left transition-all duration-150
                     ${
                       effectiveSettingsTab === id
                         ? 'bg-[var(--settings-active-bg)] text-[var(--text-primary)]'
                         : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
                     }`}
-                  >
-                    <Icon size={15} className="shrink-0" />
-                    <span className="min-w-0 flex-1">
-                      <span className="flex min-w-0 items-center gap-2">
-                        <span className="truncate text-sm font-medium">{label}</span>
-                        {maturity === 'lab' && (
-                          <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]">
-                            实验
-                          </span>
-                        )}
+                    >
+                      <Icon size={15} className="shrink-0" />
+                      <span className="min-w-0 flex-1">
+                        <span className="flex min-w-0 items-center gap-2">
+                          <span className="truncate text-sm font-medium">{label}</span>
+                          {maturity === 'lab' && (
+                            <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]">
+                              实验
+                            </span>
+                          )}
+                        </span>
                       </span>
-                    </span>
-                  </button>
-                ))}
-            </div>
-          ))}
-        </nav>
-      </div>
+                    </button>
+                  ))}
+              </div>
+            ))}
+          </nav>
+        </div>
+      )}
 
       {/* Content area */}
       <div className="flex flex-1 flex-col min-w-0 bg-[var(--settings-content-bg)]">
         <div className="flex h-16 shrink-0 items-center justify-between gap-4 border-b border-[var(--border-secondary)] px-6 max-sm:px-4">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <span className="text-sm font-semibold text-[var(--text-primary)]">
+              <span
+                id={independentChannels ? 'channels-dialog-title' : undefined}
+                className="text-sm font-semibold text-[var(--text-primary)]"
+              >
                 {effectiveItem.label}
               </span>
               {effectiveItem.maturity === 'lab' && (
@@ -393,7 +411,8 @@ export function SettingsDialog() {
           <button
             type="button"
             onClick={closeSettings}
-            aria-label="关闭设置"
+            ref={closeButton}
+            aria-label={independentChannels ? '关闭IM渠道' : '关闭设置'}
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
           >
             <X size={16} />
@@ -406,7 +425,11 @@ export function SettingsDialog() {
               key={effectiveSettingsTab}
               fallback={
                 <div role="alert" className="space-y-3 text-sm text-[var(--text-secondary)]">
-                  <p>此设置页面加载失败。你可以选择其他设置项、关闭设置，或刷新页面后再试。</p>
+                  <p>
+                    {independentChannels
+                      ? 'IM渠道页面加载失败。你可以关闭IM渠道，或刷新页面后再试。'
+                      : '此设置页面加载失败。你可以选择其他设置项、关闭设置，或刷新页面后再试。'}
+                  </p>
                   <div className="flex gap-2">
                     <button
                       type="button"

@@ -125,6 +125,109 @@ it('preserves Feishu secret handling while Weixin uses its dedicated QR card', a
   expect(screen.queryByLabelText('个人微信密钥')).toBeNull();
   expect(api.control).not.toHaveBeenCalled();
 });
+
+it.each([
+  ['qqbot', 'QQ Bot'],
+  ['feishu', '飞书'],
+] as const)('%s在原IM页保留启用、AppID及设置/明确清除密钥', async (channel, name) => {
+  api.save
+    .mockResolvedValueOnce({ ...configuration, revision: 'saved' })
+    .mockResolvedValueOnce({ ...configuration, revision: 'cleared' });
+  render(<ChannelsPanel />);
+  const app = await screen.findByLabelText(`${name} App ID`);
+  fireEvent.change(app, { target: { value: `${channel}-new-app` } });
+  const enabled = screen.getByLabelText(`启用${name}配置`) as HTMLInputElement;
+  if (!enabled.checked) fireEvent.click(enabled);
+  const secret = screen.getByLabelText(`${name}密钥`) as HTMLInputElement;
+  expect(secret.type).toBe('password');
+  fireEvent.change(secret, { target: { value: 'synthetic-test-secret' } });
+  fireEvent.click(screen.getByRole('button', { name: `保存${name}配置` }));
+  await waitFor(() =>
+    expect(api.save).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        channel,
+        expected_revision: 'desired-new',
+        enabled: true,
+        app_id: `${channel}-new-app`,
+        secret: { action: 'set', value: 'synthetic-test-secret' },
+      })
+    )
+  );
+  await waitFor(() => expect(secret.value).toBe(''));
+  fireEvent.click(screen.getByLabelText(`明确清除${name}密钥`));
+  fireEvent.click(screen.getByRole('button', { name: `保存${name}配置` }));
+  await waitFor(() =>
+    expect(api.save).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        channel,
+        expected_revision: 'saved',
+        secret: { action: 'clear' },
+      })
+    )
+  );
+  expect(api.control).not.toHaveBeenCalled();
+});
+
+it('飞书模式、webhook及验证token继续使用原渠道保存合同', async () => {
+  api.save.mockResolvedValue({ ...configuration, revision: 'saved' });
+  render(<ChannelsPanel />);
+  fireEvent.change(await screen.findByLabelText('飞书连接模式'), {
+    target: { value: 'webhook' },
+  });
+  fireEvent.change(screen.getByLabelText('飞书监听地址'), {
+    target: { value: '127.0.0.1:9012' },
+  });
+  fireEvent.change(screen.getByLabelText('飞书webhook路径'), { target: { value: '/events' } });
+  const token = screen.getByLabelText('飞书Verification token') as HTMLInputElement;
+  expect(token.type).toBe('password');
+  fireEvent.change(token, { target: { value: 'synthetic-verification-token' } });
+  fireEvent.click(screen.getByRole('button', { name: '保存飞书配置' }));
+  await waitFor(() =>
+    expect(api.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: 'feishu',
+        mode: 'webhook',
+        webhook_bind: '127.0.0.1:9012',
+        webhook_path: '/events',
+        secret: { action: 'preserve' },
+        verification_token: { action: 'set', value: 'synthetic-verification-token' },
+      })
+    )
+  );
+  expect(await screen.findByText('飞书配置已保存')).toBeTruthy();
+  expect(api.control).not.toHaveBeenCalled();
+});
+
+it.each([
+  ['qqbot', 'QQ Bot'],
+  ['feishu', '飞书'],
+] as const)('%s缺值校验或保存失败不清草稿、不冒保存成功', async (channel, name) => {
+  api.save.mockRejectedValueOnce(new Error('已启用渠道缺少App ID或密钥'));
+  render(<ChannelsPanel />);
+  const app = await screen.findByLabelText(`${name} App ID`);
+  fireEvent.change(app, { target: { value: '' } });
+  const enabled = screen.getByLabelText(`启用${name}配置`) as HTMLInputElement;
+  if (!enabled.checked) fireEvent.click(enabled);
+  const secret = screen.getByLabelText(`${name}密钥`) as HTMLInputElement;
+  fireEvent.change(secret, { target: { value: 'synthetic-draft-secret' } });
+  fireEvent.click(screen.getByRole('button', { name: `保存${name}配置` }));
+  expect(await screen.findByRole('alert')).toHaveProperty(
+    'textContent',
+    '已启用渠道缺少App ID或密钥'
+  );
+  expect(api.save).toHaveBeenCalledWith(
+    expect.objectContaining({ channel, app_id: '', enabled: true })
+  );
+  expect(screen.queryByText(`${name}配置已保存`)).toBeNull();
+  expect(secret.value).toBe('synthetic-draft-secret');
+  expect((app as HTMLInputElement).value).toBe('');
+  expect(
+    (screen.getByRole('button', { name: `保存${name}配置` }) as HTMLButtonElement).disabled
+  ).toBe(false);
+  expect(api.control).not.toHaveBeenCalled();
+});
 it('does not reconnect saved Weixin authorization or infer Ready when opening the page', async () => {
   api.configuration.mockResolvedValue({
     ...configuration,
