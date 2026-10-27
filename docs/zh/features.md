@@ -25,6 +25,12 @@ Agent shell、MCP 与共享 Task/Subagent 能力不随独立终端入口退役�
 | 附件与长输入   | 上传文件、长粘贴和超预算文本落到 workspace artifact，再按引用读取             | `echo-agent-app-core/src/attachments.rs`        |
 | 上下文压缩     | summary/hybrid/sliding/adaptive 策略、默认 token 近期窗口、跨 surface focus/cancel 与 goal/recovery 投影 | `echo-agent-app-core/src/manual_compression.rs` |
 
+GUI 聊天正文沿同一内容列直接对齐，不再为助手消息预留机器人头像列。历史中没有正文、
+附件、思考、已恢复工具步骤、关联 Subagent 或内部消息标记的空记录不占消息行；流式
+等待仍由聊天页既有状态行呈现，正文到达后继续显示原内容与完成操作。工具、思考和
+Subagent 继续使用原有可展开执行过程，附件、错误、内部消息标记、复制、重新生成及分叉
+入口保持可见或按原状态开放。界面整理沿用原历史与工具状态恢复，不推断缺失的执行结果。
+
 ## 任务与 Subagent
 
 | 能力              | 当前实现                                                                             | 主要依据                                                         |
@@ -119,6 +125,10 @@ GUI 设置已挂载渠道与定时任务页面，配置、控制及历史继续�
 - Trace、usage/cache、context budget、Tool/Subagent execution 与 TaskRuntime event 均有
   typed projection；长输出按需加载，不进入首屏完整状态。
 - 所有 EKO 数据以普通文件、JSON 或 JSONL 保存；应用不依赖 SQLite。
+
+设置页使用统一的表单字号、间距、控件高度与错误反馈，基础配置常显，QQ、飞书和个人微信
+继续在独立 IM 渠道页管理。模型编辑沿原弹窗设置初始焦点，按 Esc 关闭后回到触发按钮；
+取消和保存失败保留原来的草稿与写入规则。界面排版调整不改变配置含义、默认值或保存接口。
 
 ## CommandCell 观察
 

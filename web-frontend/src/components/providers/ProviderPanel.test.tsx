@@ -160,6 +160,21 @@ describe('ProviderPanel', () => {
     expect((getByLabelText('图片') as HTMLInputElement).checked).toBe(true);
   });
 
+  it.each([
+    ['编辑 Team Gateway', 'Provider 名称'],
+    ['为 Team Gateway 添加模型', 'API 模型名称'],
+  ])('关闭%s编辑器后恢复原触发控件焦点', async (triggerName, fieldName) => {
+    const { getByLabelText, getByRole, queryByRole } = render(<ProviderPanel />);
+    const trigger = await waitFor(() => getByRole('button', { name: triggerName }));
+    trigger.focus();
+    fireEvent.click(trigger);
+    const field = getByLabelText(fieldName);
+    await waitFor(() => expect(document.activeElement).toBe(field));
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => expect(queryByRole('dialog')).toBeNull());
+    expect(document.activeElement).toBe(trigger);
+  });
+
   it('summarizes inferred thinking levels without expanding every option', async () => {
     const { findByText, queryByText } = render(<ProviderPanel />);
 

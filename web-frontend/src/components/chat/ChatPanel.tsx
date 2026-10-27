@@ -590,7 +590,8 @@ export function ChatPanel() {
                 !messages.some(
                   (m) =>
                     m.isStreaming &&
-                    (m.content || (m.thinkingSegments && m.thinkingSegments.length > 0))
+                    (m.content.trim() ||
+                      m.thinkingSegments?.some((segment) => segment.content.trim()))
                 ) && (
                   <div className="flex items-center gap-3 px-1 py-3">
                     <div className="spinner" />

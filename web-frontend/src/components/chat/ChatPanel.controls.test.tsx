@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => {
   });
   return {
     queue: [] as QueuedChatInput[],
+    renderRealBubble: false,
     replace: vi.fn(),
     remove: vi.fn(),
     reorder: vi.fn(),
@@ -40,7 +41,13 @@ vi.mock('../../hooks/useTauriChat', () => ({
 // Keep the real ChatPanel/AgentPane/footer and controls; unrelated surfaces do
 // not take part in these TaskRuntime and durable-input presentation contracts.
 vi.mock('./ChatInput', () => ({ ChatInput: () => <div aria-label="测试输入框" /> }));
-vi.mock('./MessageBubble', () => ({ MessageBubble: () => null }));
+vi.mock('./MessageBubble', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./MessageBubble')>();
+  return {
+    MessageBubble: (props: Parameters<typeof actual.MessageBubble>[0]) =>
+      mocks.renderRealBubble ? <actual.MessageBubble {...props} /> : null,
+  };
+});
 vi.mock('./HitlDialog', () => ({ HitlDialog: () => null }));
 vi.mock('./WelcomeScreen', () => ({ WelcomeScreen: () => null }));
 vi.mock('./FailureToast', () => ({ FailureToast: () => null }));
@@ -50,6 +57,7 @@ import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { useConversationStore } from '../../stores/conversationStore';
 import { useChatStore } from '../../stores/chatStore';
+import { useSubagentRunStore } from '../../stores/subagentRunStore';
 
 const originalActions = useTaskRuntimeStore.getState();
 const workspace: Workspace = {
@@ -146,6 +154,8 @@ function cell(phase: BackgroundCellState['phase']): BackgroundCellState {
 beforeEach(() => {
   vi.resetAllMocks();
   mocks.queue = [];
+  mocks.renderRealBubble = false;
+  useSubagentRunStore.getState().clear();
   useTaskRuntimeStore.getState().stopPolling();
   useWorkspaceStore.setState({ current: workspace, isLoading: false });
   useConversationStore.setState({
@@ -214,6 +224,56 @@ describe('主交互页入口', () => {
     expect(screen.queryByRole('button', { name: '新建支线对话' })).toBeNull();
     expect(screen.getByLabelText('测试输入框')).toBeTruthy();
     expect(screen.getByRole('button', { name: '编辑当前目标' })).toBeTruthy();
+  });
+});
+
+describe('真实流式消息与等待状态', () => {
+  it('从空思考段、空白增量到首个可见内容始终保留且只保留一处等待状态', () => {
+    mocks.renderRealBubble = true;
+    const id = useChatStore.getState().startAssistantMessage('stream-thinking');
+    const { container } = render(<ChatPanel />);
+    expect(container.querySelectorAll('.spinner')).toHaveLength(1);
+
+    act(() => useChatStore.getState().startThinkingSegment(id));
+    expect(useChatStore.getState().messages.at(-1)?.thinkingSegments).toEqual([{ content: '' }]);
+    expect(
+      container.querySelectorAll('.spinner'),
+      '真实 startThinkingSegment 只有空段时仍应显示等待'
+    ).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: '折叠思考' })).toBeNull();
+
+    act(() => useChatStore.getState().appendThinking(id, ' \n\t '));
+    expect(container.querySelectorAll('.spinner')).toHaveLength(1);
+    act(() => useChatStore.getState().appendThinking(id, '正在分析 中文 🧭'));
+    expect(screen.getByText('正在分析 中文 🧭')).toBeTruthy();
+    expect(container.querySelectorAll('.spinner')).toHaveLength(0);
+
+    act(() => useChatStore.getState().startThinkingSegment(id));
+    expect(container.querySelectorAll('.spinner')).toHaveLength(0);
+    act(() => useChatStore.getState().appendToken(id, '正文首段 中文'));
+    expect(screen.getByText('正文首段 中文')).toBeTruthy();
+    expect(container.querySelectorAll('.spinner')).toHaveLength(0);
+    act(() => useChatStore.getState().applyFinalAnswer(id, '完整回复 中文'));
+    act(() => useChatStore.getState().settleAssistantMessage(id));
+    expect(screen.getByText('完整回复 中文')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '分叉会话' })).toBeTruthy();
+    expect(container.querySelectorAll('.spinner')).toHaveLength(0);
+  });
+
+  it('仅有空白正文时继续等待，首个正文字符到达后由真实气泡承接', () => {
+    mocks.renderRealBubble = true;
+    const id = useChatStore.getState().startAssistantMessage('stream-text');
+    const { container } = render(<ChatPanel />);
+    act(() => useChatStore.getState().appendToken(id, ' \n\t '));
+    expect(container.querySelectorAll('.spinner'), '空白正文被气泡隐藏时仍应显示等待').toHaveLength(
+      1
+    );
+    expect(screen.queryByRole('button', { name: '复制' })).toBeNull();
+    act(() => useChatStore.getState().appendToken(id, '正文 中文 🧭'));
+    expect(screen.getByText('正文 中文 🧭')).toBeTruthy();
+    expect(container.querySelectorAll('.spinner')).toHaveLength(0);
+    act(() => useChatStore.getState().startThinkingSegment(id));
+    expect(container.querySelectorAll('.spinner')).toHaveLength(0);
   });
 });
 

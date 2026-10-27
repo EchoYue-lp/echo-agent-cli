@@ -24,6 +24,7 @@ import {
 import { useUiStore, type SettingsTabId } from '../../stores/uiStore';
 import { Modal } from '../common/Modal';
 import { ErrorBoundary } from '../common/ErrorBoundary';
+import './SettingsDialog.css';
 
 // Keep panel identities at module scope; closed settings should not eagerly load every screen.
 const ChannelsPanel = lazy(() =>
@@ -311,11 +312,11 @@ export function SettingsDialog() {
     >
       {/* Left sidebar — settings nav */}
       {!independentChannels && (
-        <div className="flex w-[196px] shrink-0 max-sm:w-[144px] flex-col border-r border-[var(--border-primary)] bg-[var(--settings-sidebar-bg)]">
-          <div className="flex h-16 shrink-0 items-center px-5">
+        <div className="settings-navigation flex w-[196px] shrink-0 max-sm:w-[144px] flex-col border-r border-[var(--border-secondary)] bg-[var(--settings-sidebar-bg)]">
+          <div className="flex h-18 shrink-0 items-center px-5">
             <h2
               id="settings-dialog-title"
-              className="text-sm font-semibold text-[var(--text-primary)]"
+              className="text-base font-semibold text-[var(--text-primary)]"
             >
               设置
             </h2>
@@ -387,12 +388,12 @@ export function SettingsDialog() {
 
       {/* Content area */}
       <div className="flex flex-1 flex-col min-w-0 bg-[var(--settings-content-bg)]">
-        <div className="flex h-16 shrink-0 items-center justify-between gap-4 border-b border-[var(--border-secondary)] px-6 max-sm:px-4">
+        <div className="flex min-h-18 shrink-0 items-center justify-between gap-4 border-b border-[var(--border-secondary)] px-7 py-4 max-sm:px-4">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <span
                 id={independentChannels ? 'channels-dialog-title' : undefined}
-                className="text-sm font-semibold text-[var(--text-primary)]"
+                className="text-base font-semibold text-[var(--text-primary)]"
               >
                 {effectiveItem.label}
               </span>
@@ -419,7 +420,13 @@ export function SettingsDialog() {
           </button>
         </div>
         <div className="flex-1 overflow-y-auto">
-          <div className="animate-fade-up p-6 max-sm:p-4">
+          <div
+            className={
+              independentChannels
+                ? 'animate-fade-up p-6 max-sm:p-4'
+                : 'settings-panel-content animate-fade-up mx-auto w-full max-w-[800px] px-7 py-6 max-sm:px-4'
+            }
+          >
             {/* A failed optional screen must leave the workspace and settings navigation mounted. */}
             <ErrorBoundary
               key={effectiveSettingsTab}

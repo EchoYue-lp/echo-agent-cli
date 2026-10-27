@@ -1,17 +1,6 @@
 import { useMemo, useState, memo } from 'react';
 import type { ChatMessage } from '../../types/api';
-import {
-  Bot,
-  Copy,
-  Check,
-  RefreshCw,
-  GitFork,
-  Pencil,
-  X,
-  ArrowUp,
-  File,
-  Download,
-} from 'lucide-react';
+import { Copy, Check, RefreshCw, GitFork, Pencil, X, ArrowUp, File, Download } from 'lucide-react';
 import MarkdownContent from '../common/MarkdownContent';
 import { ThinkingSegment } from './ThinkingSegment';
 import { ParallelExecutionBlock, visibleSubagentRuns } from './ParallelExecutionBlock';
@@ -135,7 +124,7 @@ export function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkin
       steps.push({ type: 'thinking', thinkingContent: s.content, toolIndex: 0 });
       thinkingTotal++;
     });
-    if (thinkingTotal === 0 && message.thinkingContent) {
+    if (thinkingTotal === 0 && message.thinkingContent?.trim()) {
       steps.push({ type: 'thinking', thinkingContent: message.thinkingContent, toolIndex: 0 });
       thinkingTotal++;
     }
@@ -233,19 +222,26 @@ export const MessageBubble = memo(function MessageBubble({
     visibleRuns.map((run) => run.status)
   );
   const hasExecutionProcess = executionItems.length > 0 || visibleRuns.length > 0;
+  const hasBody = Boolean(message.content.trim());
   let thinkingIndex = 0;
 
-  return (
-    <div className="animate-fade-up flex gap-3 py-3.5">
-      {/* Avatar — assistant only; user messages are full-width rows (no bubble) */}
-      {!isUser && (
-        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-[var(--accent-bg)] text-[var(--accent)] shadow-[var(--shadow-sm)]">
-          <Bot size={14} />
-        </div>
-      )}
+  // Canonical history includes empty assistant rows for tool calls. Render only
+  // their visible projections; ChatPanel owns the single empty-stream status.
+  if (
+    !isUser &&
+    !hasBody &&
+    images.length === 0 &&
+    files.length === 0 &&
+    !hasExecutionProcess &&
+    !message.internalAgent
+  ) {
+    return null;
+  }
 
+  return (
+    <div className="animate-fade-up py-3">
       {/* Content */}
-      <div className="min-w-0 flex-1 space-y-2">
+      <div className="min-w-0 space-y-2">
         {/* Images */}
         {images.length > 0 && (
           <div className={`grid gap-2 ${images.length === 1 ? 'grid-cols-1' : 'grid-cols-2'}`}>
@@ -404,7 +400,7 @@ export const MessageBubble = memo(function MessageBubble({
             )}
 
             {/* Final text — no left border, plain markdown flow */}
-            {message.content && (
+            {hasBody && (
               <div className="group/msg relative">
                 {editing ? (
                   <div className="rounded-lg border-2 border-[var(--accent)] bg-[var(--bg-primary)] px-4 py-3 shadow-[var(--shadow-md)]">

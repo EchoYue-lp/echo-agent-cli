@@ -102,23 +102,34 @@ export function ConfigPanel() {
     return <div className="p-3 text-sm text-[var(--text-tertiary)]">加载中...</div>;
 
   return (
-    <div className="space-y-4 p-3">
+    <div className="settings-basic space-y-7">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="settings-panel-toolbar flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <h3 className="text-sm font-semibold text-[var(--text-primary)]">基础配置</h3>
           {dirty && (
-            <span className="rounded-full bg-amber-500 px-2 py-0.5 text-[10px] font-medium text-white">
+            <span className="rounded-md bg-[var(--bg-secondary)] px-2 py-1 text-xs text-[var(--text-secondary)]">
               未保存
             </span>
           )}
         </div>
         <div className="flex items-center gap-2">
-          {message && <span className="text-xs text-emerald-500">{message}</span>}
+          {message && (
+            <span
+              role="status"
+              className="text-sm"
+              style={{
+                color:
+                  message === '已保存' ? 'var(--color-success-text)' : 'var(--color-error-text)',
+              }}
+            >
+              {message}
+            </span>
+          )}
           <button
             onClick={save}
             disabled={saving || !dirty}
-            className="rounded-lg bg-[var(--accent)] px-3 py-1 text-xs font-medium text-[var(--text-on-accent)] transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30"
+            className="btn btn-primary min-h-9 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {saving ? '保存中...' : '保存'}
           </button>
@@ -127,8 +138,11 @@ export function ConfigPanel() {
 
       {/* Prompt reads the live Agent; depth reads committed product config. */}
       <Section title="智能体">
-        <div className="space-y-1">
-          <label htmlFor="max-subagent-depth" className="text-xs text-[var(--text-secondary)]">
+        <div className="settings-config-field space-y-2">
+          <label
+            htmlFor="max-subagent-depth"
+            className="text-sm font-medium text-[var(--text-primary)]"
+          >
             最大子智能体层数
           </label>
           <select
@@ -147,7 +161,7 @@ export function ConfigPanel() {
             <option value="2">2 层：允许子智能体继续分工</option>
             <option value="3">3 层：最多三层</option>
           </select>
-          <p className="text-[11px] leading-relaxed text-[var(--text-tertiary)]">
+          <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
             主智能体为第 0 层。对新任务生效，已运行任务及其重试、恢复保持原上限。
           </p>
         </div>
@@ -156,8 +170,8 @@ export function ConfigPanel() {
           value={edit.agent?.system_prompt ?? agentConfig.system_prompt}
           onChange={(v) => markDirty({ agent: { ...edit.agent, system_prompt: v } })}
           multiline
-          rows={16}
-          className="min-h-[320px] resize-y font-mono leading-relaxed"
+          rows={8}
+          className="min-h-[200px] resize-y font-mono leading-relaxed"
         />
       </Section>
 
@@ -165,19 +179,20 @@ export function ConfigPanel() {
         <button
           type="button"
           onClick={() => setAdvancedOpen((open) => !open)}
-          className="w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-3 py-2 text-left text-xs font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)]"
+          aria-expanded={advancedOpen}
+          className="min-h-9 rounded-lg px-3 py-2 text-left text-sm text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)]"
         >
           {advancedOpen ? '收起高级运行参数' : '展开高级运行参数'}
         </button>
         {advancedOpen && (
-          <div className="space-y-2 rounded-lg border border-[var(--border-secondary)] bg-[var(--bg-secondary)] p-3">
+          <div className="mt-3 space-y-3 rounded-lg bg-[var(--bg-secondary)] p-4">
             <Field
               label="单轮推理安全上限"
               value={String(edit.agent?.max_iterations ?? agentConfig.max_iterations)}
               onChange={(v) => markDirty({ agent: { ...edit.agent, max_iterations: Number(v) } })}
               type="number"
             />
-            <p className="text-[11px] leading-relaxed text-[var(--text-tertiary)]">
+            <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
               仅用于调试或防止异常循环。0 表示不限制，长程 CoWork 任务建议保持 0。
             </p>
           </div>
@@ -200,7 +215,7 @@ export function ConfigPanel() {
         <button
           type="button"
           onClick={() => useUiStore.getState().setActiveSettingsTab('channels')}
-          className="text-xs font-medium text-[var(--accent)] underline underline-offset-2"
+          className="inline-flex min-h-9 items-center text-sm font-medium text-[var(--accent)] underline-offset-4 hover:underline"
         >
           前往IM渠道
         </button>
@@ -239,12 +254,10 @@ export function ConfigPanel() {
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-lg border border-[var(--border-primary)] p-3">
-      <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">
-        {title}
-      </h4>
-      <div className="space-y-2">{children}</div>
-    </div>
+    <section className="settings-config-section border-b border-[var(--border-secondary)] pb-7 last:border-0 last:pb-0">
+      <h4 className="mb-4 text-sm font-semibold text-[var(--text-primary)]">{title}</h4>
+      <div className="space-y-5">{children}</div>
+    </section>
   );
 }
 
@@ -265,12 +278,11 @@ function Field({
   rows?: number;
   className?: string;
 }) {
-  const cls =
-    'w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-2 py-1.5 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--border-focus)]';
+  const cls = 'input w-full text-sm';
   const controlClassName = `${cls} ${className ?? ''}`;
   return (
-    <div>
-      <label className="mb-1 block text-xs text-[var(--text-secondary)]">{label}</label>
+    <label className="settings-config-field block space-y-2">
+      <span className="block text-sm font-medium text-[var(--text-primary)]">{label}</span>
       {multiline ? (
         <textarea
           value={value}
@@ -287,6 +299,6 @@ function Field({
           className={controlClassName}
         />
       )}
-    </div>
+    </label>
   );
 }
