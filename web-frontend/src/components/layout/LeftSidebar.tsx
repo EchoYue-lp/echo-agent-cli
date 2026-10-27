@@ -460,8 +460,11 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       <div className="flex h-14 items-center justify-between px-4">
         <div className="flex items-center gap-2">
           <BrandIcon size="md" />
-          <span className="text-sm font-semibold tracking-tight text-[var(--text-primary)]">
-            EKO
+          <span
+            className="text-sm font-semibold tracking-tight text-[var(--text-primary)]"
+            title="Eclip /ˈɛk.lɪp/"
+          >
+            Eclip
           </span>
         </div>
         <button

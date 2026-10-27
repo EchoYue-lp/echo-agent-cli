@@ -225,7 +225,7 @@ export function TerminalDrawer() {
           <button
             disabled={!isTauri()}
             onClick={() => setSshForm((open) => !open)}
-            title={isTauri() ? '系统 OpenSSH 交互终端' : 'SSH 需要 EKO 桌面应用'}
+            title={isTauri() ? '系统 OpenSSH 交互终端' : 'SSH 需要 Eclip 桌面应用'}
             className="rounded px-2 py-1 text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] disabled:opacity-40"
           >
             SSH

@@ -82,7 +82,7 @@ describe('HitlDialog', () => {
     expect(props.onApproval).not.toHaveBeenCalled();
     expect(props.onInput).not.toHaveBeenCalled();
     expect(props.onSelection).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: /EKO 正在等你回复/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Eclip 正在等你回复/ }));
     expect(screen.getByRole('dialog', { name: '操作确认' })).toBeTruthy();
   });
 
@@ -93,7 +93,7 @@ describe('HitlDialog', () => {
     expect(document.activeElement).toBe(answer);
     fireEvent.change(answer, { target: { value: '保留中文🙂\n还有第二行 ' } });
     fireEvent.click(screen.getByRole('button', { name: '关闭对话框' }));
-    fireEvent.click(screen.getByRole('button', { name: /EKO 正在等你回复/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Eclip 正在等你回复/ }));
     expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe(
       '保留中文🙂\n还有第二行 '
     );

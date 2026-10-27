@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Sparkles, Play, Clock, Loader2 } from 'lucide-react';
+import { Play, Clock, Loader2 } from 'lucide-react';
+import { BrandIcon } from '../common/BrandIcon';
 import { sessionApi } from '../../api/endpoints';
 import { useConversationStore } from '../../stores/conversationStore';
 import { useUiStore } from '../../stores/uiStore';
@@ -99,20 +100,23 @@ export function WelcomeScreen({
   return (
     <div className="mx-auto flex w-full max-w-[980px] flex-col items-center px-6 pb-7 pt-8 text-center">
       <div className="mb-2 flex flex-col items-center">
-        <div className="animate-slide-up mb-4 flex h-10 w-10 items-center justify-center rounded-2xl bg-[var(--bg-secondary)] text-[var(--text-secondary)]">
-          <Sparkles size={20} />
+        <div className="animate-slide-up mb-4">
+          <BrandIcon size="lg" />
         </div>
         <h1
           className="animate-slide-up text-[clamp(28px,3.2vw,40px)] font-semibold tracking-[-0.04em] text-[var(--text-primary)]"
           style={{ animationDelay: '0.05s' }}
         >
-          EKO，和你一起把事做好
+          Eclip
         </h1>
+        <p className="mt-1 text-sm text-[var(--text-tertiary)]" aria-label="品牌读音">
+          /ˈɛk.lɪp/
+        </p>
         <p
           className="animate-slide-up mt-2 text-sm text-[var(--text-secondary)]"
           style={{ animationDelay: '0.1s' }}
         >
-          从一个想法开始，剩下的我们一起完成。
+          听见你的声音，让想法飞跃。
         </p>
       </div>
 

@@ -31,7 +31,7 @@ export function ChromeSetupDialog({
 
   const refresh = useCallback(async () => {
     if (!isTauri()) {
-      setError('Chrome 连接仅在 EKO 桌面应用中可用');
+      setError('Chrome 连接仅在 Eclip 桌面应用中可用');
       return;
     }
     try {
@@ -119,7 +119,7 @@ export function ChromeSetupDialog({
             1. 安装 Playwright Extension
           </div>
           <p className="text-xs leading-relaxed text-[var(--text-tertiary)]">
-            官方扩展允许 EKO 连接现有 Chrome 标签页，并复用当前登录状态。
+            官方扩展允许 Eclip 连接现有 Chrome 标签页，并复用当前登录状态。
           </p>
           <button
             type="button"

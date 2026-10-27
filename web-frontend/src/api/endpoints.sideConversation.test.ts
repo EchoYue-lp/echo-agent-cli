@@ -69,7 +69,7 @@ describe('GUI-only Side Conversation IPC adapter', () => {
         title: null,
         model_id: null,
       })
-    ).rejects.toThrow('requires the EKO desktop GUI');
+    ).rejects.toThrow('requires the Eclip desktop GUI');
     expect(bridge.apiInvoke).not.toHaveBeenCalled();
   });
 

@@ -1,6 +1,10 @@
-# EKO 文档（中文主源）
+# Eclip 文档（中文主源）
 
-本目录是 EKO 长期文档的中文编辑主源。页面按教程、操作、参考、架构、项目状态和 ADR
+**Eclip /ˈɛk.lɪp/**，读作 **EK-lip**，两个音节。**听见你的声音，让想法飞跃。**
+
+品牌延续 Echo（回声、共鸣）的初衷，图标与用法见 [品牌说明](../../design/branding/README.md)。
+
+本目录是 Eclip 长期文档的中文编辑主源。页面按教程、操作、参考、架构、项目状态和 ADR
 分类，并与 `docs/en/` 使用完全相同的相对路径。
 
 所有长期文档已迁移完成。旧根目录路径由
@@ -11,4 +15,4 @@ node ../../scripts/check-docs-parity.mjs
 ```
 
 框架公共能力请阅读同级 `echo-agent` 仓库的正式文档；跨语言 SDK、协议合同和 Host 适配器请阅读独立的
-[echo-agent-sdk](https://github.com/EchoYue-lp/echo-agent-sdk) 仓库。本目录只记录 EKO 应用策略和组合方式。
+[echo-agent-sdk](https://github.com/EchoYue-lp/echo-agent-sdk) 仓库。本目录只记录 Eclip 应用策略和组合方式。

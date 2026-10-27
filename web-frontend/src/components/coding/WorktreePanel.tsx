@@ -335,7 +335,9 @@ export function WorktreePanel() {
         <section className="space-y-2">
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2">
-              <h3 className="text-sm font-semibold text-[var(--text-primary)]">EKO review queue</h3>
+              <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+                Eclip review queue
+              </h3>
               <span className="text-xs text-[var(--text-tertiary)]">
                 {visibleUnattended.length}
               </span>
@@ -562,7 +564,9 @@ export function WorktreePanel() {
                     </span>
                     {isMain && <span className="text-[10px] text-[var(--accent)]">main</span>}
                     {isSubagent && (
-                      <span className="text-[10px] text-[var(--color-success)]">EKO Subagent</span>
+                      <span className="text-[10px] text-[var(--color-success)]">
+                        Eclip Subagent
+                      </span>
                     )}
                   </div>
                   <div className="mt-0.5 flex items-center gap-2 text-[11px] text-[var(--text-tertiary)]">

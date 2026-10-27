@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/nickel-lang/json-schema-store/main/tauri.v2.schema.json",
-  "productName": "EKO",
+  "productName": "Eclip",
   "version": "1.0.0",
   "identifier": "com.eko.desktop",
   "mainBinaryName": "echo-agent-tauri",
@@ -19,7 +19,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "EKO",
+        "title": "Eclip",
         "width": 1400,
         "height": 900,
         "minWidth": 900,

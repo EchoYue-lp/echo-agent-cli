@@ -661,7 +661,7 @@ export const conversationApi = {
   createSide: (request: SideConversationCreateRequest) => {
     const { workspace_id, ...sideRequest } = request;
     if (!isTauri()) {
-      return Promise.reject(new Error('Side Conversation requires the EKO desktop GUI'));
+      return Promise.reject(new Error('Side Conversation requires the Eclip desktop GUI'));
     }
     return apiInvoke<SideConversationLaunchReceipt>('create_conversation', {
       workspaceId: workspace_id,
@@ -670,7 +670,7 @@ export const conversationApi = {
   },
   updateSideModel: (workspaceId: string, conversationId: string, modelId: string | null) => {
     if (!isTauri()) {
-      return Promise.reject(new Error('Side Conversation requires the EKO desktop GUI'));
+      return Promise.reject(new Error('Side Conversation requires the Eclip desktop GUI'));
     }
     return apiInvoke<{ success: boolean }>('update_conversation', {
       workspaceId,
@@ -680,7 +680,7 @@ export const conversationApi = {
   },
   retrySide: (workspaceId: string, conversationId: string) => {
     if (!isTauri()) {
-      return Promise.reject(new Error('Side Conversation requires the EKO desktop GUI'));
+      return Promise.reject(new Error('Side Conversation requires the Eclip desktop GUI'));
     }
     return apiInvoke<SideConversationLaunchReceipt>('update_conversation', {
       workspaceId,
@@ -690,7 +690,7 @@ export const conversationApi = {
   },
   markSideViewed: (workspaceId: string, conversationId: string) => {
     if (!isTauri()) {
-      return Promise.reject(new Error('Side Conversation requires the EKO desktop GUI'));
+      return Promise.reject(new Error('Side Conversation requires the Eclip desktop GUI'));
     }
     return apiInvoke<{ success: boolean }>('update_conversation', {
       workspaceId,
@@ -1487,7 +1487,7 @@ export interface SaveAnalysisInput {
 }
 
 function analysisRequiresDesktop<T>(): Promise<T> {
-  return Promise.reject(new Error('文件化分析工作台需要 EKO 桌面运行时'));
+  return Promise.reject(new Error('文件化分析工作台需要 Eclip 桌面运行时'));
 }
 
 export const analysisApi = {
@@ -1570,7 +1570,7 @@ export const terminalApi = {
       request.target ?? (request.projectWorkspaceId ? undefined : { kind: 'local' as const });
     if (!isTauri() && (target?.kind === 'ssh' || request.projectWorkspaceId)) {
       return Promise.reject<TerminalSession>(
-        new Error('SSH terminals require the EKO desktop application')
+        new Error('SSH terminals require the Eclip desktop application')
       );
     }
     return isTauri()
@@ -1888,7 +1888,7 @@ export interface ReviewExportArtifact {
 }
 
 function researchRequiresDesktop<T>(): Promise<T> {
-  return Promise.reject(new Error('文件化研究工作台需要 EKO 桌面运行时'));
+  return Promise.reject(new Error('文件化研究工作台需要 Eclip 桌面运行时'));
 }
 
 export const papersApi = {

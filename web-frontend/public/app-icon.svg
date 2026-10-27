@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">Eclip · 简笔猫头</title>
+  <desc id="desc">天蓝底，略微歪头的白色卡通猫头；短耳、两只小眼睛和简单猫嘴，无写实毛发。</desc>
+  <defs>
+    <linearGradient id="sky" x1="512" y1="0" x2="512" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#91D7F8"/>
+      <stop offset="1" stop-color="#70BFEA"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="url(#sky)"/>
+  <g transform="rotate(-9 512 512)">
+    <path d="M267 448L260 289C259 269 275 261 291 273L391 346C467 321 557 321 633 346L733 273C749 261 765 269 764 289L757 448C789 488 804 535 795 582C780 668 673 733 512 733C351 733 244 668 229 582C220 535 235 488 267 448Z" fill="#FFFEFB"/>
+    <path d="M297 321L302 410L357 374Z" fill="#B4E3F8"/>
+    <path d="M727 321L722 410L667 374Z" fill="#B4E3F8"/>
+    <path d="M401 505V540M623 505V540" stroke="#326C8A" stroke-width="31" stroke-linecap="round"/>
+    <path d="M493 584C500 580 524 580 531 584C531 591 520 599 512 601C504 599 493 591 493 584Z" fill="#326C8A"/>
+    <path d="M512 601V615M512 615C501 634 482 636 468 622M512 615C523 634 542 636 556 622" stroke="#326C8A" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M289 560L342 570M290 603L341 596M735 560L682 570M734 603L683 596" stroke="#87C8E9" stroke-width="12" stroke-linecap="round"/>
+  </g>
+</svg>

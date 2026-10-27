@@ -1,16 +1,20 @@
-# EKO
+# Eclip /ˈɛk.lɪp/
+
+**听见你的声音，让想法飞跃。**
+
+读作 **EK-lip**，两个音节，重音在前。品牌延续 Echo 的初衷：让 AI 听见用户的声音、理解诉求、产生共鸣并解决问题。图标与使用规范见 [品牌说明](design/branding/README.md)。
 
 > 一个基于 [echo-agent](https://github.com/EchoYue-lp/echo-agent) 的通用 AI Agent 产品，支持 Coding、数据分析和学术研究三大核心能力。
 
 框架的跨语言 SDK 产品（Rust Host/Protocol、TypeScript、Python、Java 以及版本化合同）维护在独立的
-[echo-agent-sdk](https://github.com/EchoYue-lp/echo-agent-sdk) 仓库；EKO 只负责应用层组合与产品策略。
+[echo-agent-sdk](https://github.com/EchoYue-lp/echo-agent-sdk) 仓库；Eclip 只负责应用层组合与产品策略。
 
 [![Rust](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/license/mit)
 
 ## 📋 项目简介
 
-EKO 是一个生产级的通用 Agent 产品，基于 Rust 生态构建，提供 **TUI（终端界面）** 和 **GUI（桌面应用）** 两种交互模式，专注于以下核心场景：
+Eclip 是一个生产级的通用 Agent 产品，基于 Rust 生态构建，提供 **TUI（终端界面）** 和 **GUI（桌面应用）** 两种交互模式，专注于以下核心场景：
 
 - **💻 Coding** — 代码生成、审查、重构、调试、测试
 - **📊 数据分析** — 结构化数据分析、统计、可视化、报告生成
@@ -100,7 +104,7 @@ GUI、TUI 和 CLI 共享 `model_providers`、`configured_models` 和 `default_mo
 
 #### 配置文件位置
 
-EKO 按以下优先级查找配置文件：
+Eclip 按以下优先级查找配置文件：
 
 1. 命令行参数: `--config <path>`
 2. 环境变量: `EKO_CONFIG`
@@ -179,12 +183,12 @@ cargo tauri build
 
 | 平台    | 产物                                                         |
 | ------- | ------------------------------------------------------------ |
-| macOS   | `target/release/bundle/macos/EKO.app`                        |
-|         | `target/release/bundle/dmg/EKO_*.dmg`                        |
+| macOS   | `target/release/bundle/macos/Eclip.app`                      |
+|         | `target/release/bundle/dmg/Eclip_*.dmg`                      |
 | Linux   | `target/release/bundle/deb/echo-agent-tauri_*.deb`           |
 |         | `target/release/bundle/appimage/echo-agent-tauri_*.AppImage` |
-| Windows | `target/release/bundle/msi/EKO_*.msi`                        |
-|         | `target/release/bundle/nsis/EKO_*.exe`                       |
+| Windows | `target/release/bundle/msi/Eclip_*.msi`                      |
+|         | `target/release/bundle/nsis/Eclip_*.exe`                     |
 
 > **注意**：不要只把 `target/release/echo-agent-tauri` 复制进 `.app` 目录来当作安装包；那只是裸后端二进制，可能缺少前端资源、图标和平台元数据。
 
@@ -257,7 +261,7 @@ echo-agent-cli 启用以下 echo-agent 框架 features：
 | `web` / `media` / `chart` | Web、多模态与图表工具 |
 | `research` / `rag`        | 学术研究与检索能力    |
 
-EKO 不启用 framework `sqlite` feature；会话、runtime、memory 和 TaskRun 使用文件存储。
+Eclip 不启用 framework `sqlite` feature；会话、runtime、memory 和 TaskRun 使用文件存储。
 
 ---
 
@@ -369,7 +373,7 @@ EKO 不启用 framework `sqlite` feature；会话、runtime、memory 和 TaskRun
 | `/mcp`     | `m`      | MCP 服务器管理 |
 | `/plugins` | `plugin` | 插件管理       |
 
-EKO 插件采用扁平包结构：根目录使用 `plugin.json`，Skills、MCP、Subagents、
+Eclip 插件采用扁平包结构：根目录使用 `plugin.json`，Skills、MCP、Subagents、
 Hooks、monitors、themes 和 output styles 都从固定根位置发现，不使用
 namespace 或组件路径声明。旧 `.echo-plugin/manifest.yaml` 不再支持。
 完整格式见 [echo-agent 插件系统文档](../echo-agent/docs/zh/32-plugin-system.md)。
@@ -395,21 +399,21 @@ namespace 或组件路径声明。旧 `.echo-plugin/manifest.yaml` 不再支持�
 
 #### Advanced 高级功能
 
-| 命令                | 别名    | 描述                                          |
-| ------------------- | ------- | --------------------------------------------- |
-| `/checkpoint`       | `/save` | 强制保存当前 runtime checkpoint               |
-| `/sessions [query]` | `ss`    | 从 canonical ConversationStore 列出或搜索会话 |
-| `/archive-session <conversation-id>` |       | 归档会话（从当前列表隐藏） |
-| `/restore-session <conversation-id>` |       | 恢复已归档会话 |
-| `/export`           |         | 导出会话                                      |
-| `/profile`          | `prof`  | 配置档案管理                                  |
-| `/verbose`          |         | 切换详细模式                                  |
-| `/doctor`           | `doc`   | 诊断配置问题                                  |
-| `/delegate`         | `dl`    | 委托子 Agent                                  |
-| `/search`           |         | 搜索功能                                      |
-| `/inspect`          | `ins`   | 检查状态                                      |
-| `/trace`            | `tr`    | 追踪观测（sessions/summary/stats）            |
-| `/workspace`        | `ws`    | 工作区管理                                    |
+| 命令                                 | 别名    | 描述                                          |
+| ------------------------------------ | ------- | --------------------------------------------- |
+| `/checkpoint`                        | `/save` | 强制保存当前 runtime checkpoint               |
+| `/sessions [query]`                  | `ss`    | 从 canonical ConversationStore 列出或搜索会话 |
+| `/archive-session <conversation-id>` |         | 归档会话（从当前列表隐藏）                    |
+| `/restore-session <conversation-id>` |         | 恢复已归档会话                                |
+| `/export`                            |         | 导出会话                                      |
+| `/profile`                           | `prof`  | 配置档案管理                                  |
+| `/verbose`                           |         | 切换详细模式                                  |
+| `/doctor`                            | `doc`   | 诊断配置问题                                  |
+| `/delegate`                          | `dl`    | 委托子 Agent                                  |
+| `/search`                            |         | 搜索功能                                      |
+| `/inspect`                           | `ins`   | 检查状态                                      |
+| `/trace`                             | `tr`    | 追踪观测（sessions/summary/stats）            |
+| `/workspace`                         | `ws`    | 工作区管理                                    |
 
 #### Security 安全
 
@@ -477,7 +481,7 @@ CI 只由 `main` 推送触发；任务分支先按 [AGENTS.md](AGENTS.md) 完成
 framework `scripts/generate-vendored-media-audit-lock.py` 与其 `vendor/registry-origins.toml`，
 以 `--lockfile` 指向本仓库锁、`--output` 指向新的临时文件，追加同一官方 scanner 审计。
 临时视图只恢复三个 bundled parent 的原 registry source/checksum 归属，保留真实锁的其它节点和依赖边，
-实际构建锁保持原样。Python 3.11+ 仅用于这项开发审计工具，不是 EKO 运行依赖。
+实际构建锁保持原样。Python 3.11+ 仅用于这项开发审计工具，不是 Eclip 运行依赖。
 
 当前交付按[人的精确风险决定](docs/supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md)
 暂时保留 glib 0.18.5、proc-macro-error 1.0.4、bincode 1.3.3。
@@ -587,9 +591,9 @@ echo-agent (AI Agent 框架)
 
 ### 退役的语言服务
 
-EKO 不再请求 framework `lsp` feature，不注册语言服务工具，也不提供 `/lsp`、LSP 设置页或 IPC。
+Eclip 不再请求 framework `lsp` feature，不注册语言服务工具，也不提供 `/lsp`、LSP 设置页或 IPC。
 旧 `.lsp.yaml` 与插件 `lsp.yaml` 只产生明确退休诊断，用户文件保持原样；混合插件仍处理合法组件。
-框架 A2A/LSP API 此阶段仍为其它消费者保留，待 EKO/SDK 去依赖共同验收后另行删除。
+框架 A2A/LSP API 此阶段仍为其它消费者保留，待 Eclip/SDK 去依赖共同验收后另行删除。
 独立 TUI、CLI/JSONL、IM、cron、终端与其它 Agent 能力本次继续保留。
 
 ---
@@ -622,7 +626,7 @@ workspaces/
 详细文档请参阅 `docs/` 目录：
 
 - [文档入口](docs/README.md) — `zh` 主源、`en` 审阅翻译和迁移状态
-- [中文文档](docs/zh/README.md) — EKO 长期文档主源（迁移完成后承载全部页面）
+- [中文文档](docs/zh/README.md) — Eclip 长期文档主源（迁移完成后承载全部页面）
 - [English documentation](docs/en/README.md) — reviewed English release tree
 - [文档 parity gate](scripts/check-docs-parity.mjs) — 发布前的 fail-closed 检查
 

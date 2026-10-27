@@ -257,7 +257,7 @@ export function Terminal({
         ]);
         if (disposed || closeWanted || resourcesDisposed) return;
       } else if (target.kind === 'ssh') {
-        throw new Error('SSH 终端仅支持 EKO 桌面应用');
+        throw new Error('SSH 终端仅支持 Eclip 桌面应用');
       }
       let pendingSize: { rows: number; cols: number } | undefined;
       let resizing = false;
@@ -359,7 +359,7 @@ export function Terminal({
   return (
     <div className="flex h-full flex-col overflow-hidden rounded-lg bg-[#0a0a0a]">
       <div className="flex items-center justify-between border-b border-gray-800 px-3 py-1 text-[10px] text-gray-400">
-        <span className="font-mono">EKO Terminal</span>
+        <span className="font-mono">Eclip Terminal</span>
         <span>{state.message ?? state.phase}</span>
       </div>
       {issue && (

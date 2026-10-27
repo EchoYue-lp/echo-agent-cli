@@ -272,7 +272,7 @@ export function ProjectSourceFields({
         </button>
       )}
       {draft.kind === 'ssh' && !isTauri() && (
-        <p className="text-xs text-[var(--text-tertiary)]">远程项目需要 EKO 桌面应用。</p>
+        <p className="text-xs text-[var(--text-tertiary)]">远程项目需要 Eclip 桌面应用。</p>
       )}
       {issue && (
         <p role="alert" className="text-xs text-[var(--color-error-text)]">

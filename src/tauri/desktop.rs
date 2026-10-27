@@ -56,7 +56,7 @@ fn install_panic_hook() {
                     "display dialog \"EKO crashed during startup.\\n\\n\
                      Details have been written to the crash log.\\n\\n\
                      Run from Terminal to see full output:\\n\
-                     /Applications/EKO.app/Contents/MacOS/echo-agent-cli\" \
+                     /Applications/Eclip.app/Contents/MacOS/echo-agent-tauri\" \
                      with title \"EKO\" buttons {\"OK\"} default button \"OK\"",
                 )
                 .output();
@@ -113,7 +113,7 @@ pub async fn run_desktop_entry() -> anyhow::Result<()> {
                 "EKO starting at {}\n\
                  If you see this file, the app is running but may have failed to display.\n\
                  Try running from Terminal:\n\
-                 /Applications/EKO.app/Contents/MacOS/echo-agent-cli\n",
+                 /Applications/Eclip.app/Contents/MacOS/echo-agent-tauri\n",
                 chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
             ),
         );

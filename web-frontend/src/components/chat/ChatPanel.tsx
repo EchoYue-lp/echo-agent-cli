@@ -394,7 +394,7 @@ export function ChatPanel() {
               <div className="truncate text-[13px] font-medium text-[var(--text-primary)]">
                 {activeSide
                   ? activeSide.title
-                  : activeConversation?.title || currentWorkspace?.name || 'EKO'}
+                  : activeConversation?.title || currentWorkspace?.name || 'Eclip'}
               </div>
               <div className="truncate text-[10px] text-[var(--text-tertiary)]">
                 {activeSide

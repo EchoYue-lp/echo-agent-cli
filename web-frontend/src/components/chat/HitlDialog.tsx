@@ -114,7 +114,7 @@ function HitlRequestDialog({
           <Icon size={17} />
         </span>
         <span className="hitl-pending-copy">
-          <strong>{submitted ? '回复已提交，等待确认' : 'EKO 正在等你回复'}</strong>
+          <strong>{submitted ? '回复已提交，等待确认' : 'Eclip 正在等你回复'}</strong>
           <span>{request.prompt || label}</span>
         </span>
         <span className="hitl-count">{requests.length} 项待处理</span>
@@ -134,7 +134,7 @@ function HitlRequestDialog({
               <Icon size={23} aria-hidden="true" />
             </div>
             <div className="hitl-heading-copy">
-              <p className="hitl-eyebrow">EKO · 需要你的参与</p>
+              <p className="hitl-eyebrow">Eclip · 需要你的参与</p>
               <h2>{label}</h2>
             </div>
             <button
@@ -167,7 +167,7 @@ function HitlRequestDialog({
               <p className="hitl-question">
                 {request.prompt ||
                   (request.kind === 'approval'
-                    ? '请确认是否允许 EKO 执行以下操作。'
+                    ? '请确认是否允许 Eclip 执行以下操作。'
                     : '继续之前，还需要你补充一些信息。')}
               </p>
 
@@ -238,7 +238,7 @@ function HitlRequestDialog({
                     }}
                     placeholder={
                       request.kind === 'selection'
-                        ? '给 EKO 一点额外说明…'
+                        ? '给 Eclip 一点额外说明…'
                         : '在这里输入，中文和多行内容均可…'
                     }
                     rows={request.kind === 'input' ? 4 : 3}
