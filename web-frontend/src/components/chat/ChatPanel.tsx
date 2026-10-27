@@ -23,7 +23,6 @@ import {
   FlaskConical,
   Globe2,
   GripVertical,
-  GitFork,
   MoreHorizontal,
   PanelRightOpen,
   Workflow,
@@ -39,7 +38,6 @@ import { useToolExecutionStore } from '../../stores/toolExecutionStore';
 import { dispatchGuiSlashCommand } from '../../lib/slashCommands';
 import { AgentPane } from './AgentPane';
 import { workspaceLocationLabel } from '../../lib/workspacePresentation';
-import { SideConversationDialog } from './SideConversationDialog';
 import type { ConfiguredModel, TaskRun } from '../../generated';
 
 // Tauri IPC is the only live transport. The WebSocket transport
@@ -89,7 +87,6 @@ export function ChatPanel() {
 
   // ── 按需卡片状态 ──
   const [failureToastDismissed, setFailureToastDismissed] = useState(false);
-  const [sideConversationOpen, setSideConversationOpen] = useState(false);
   const [isForking, setIsForking] = useState(false);
   const forkInProgress = useRef(false);
   const [configuredModels, setConfiguredModels] = useState<ConfiguredModel[]>([]);
@@ -272,10 +269,6 @@ export function ChatPanel() {
     }
   }, [messages, pendingHitlRequest, isStreaming]);
 
-  const handleSuggestionClick = (text: string) => {
-    sendMessage(text);
-  };
-
   const openPrimaryWorkbench = (view: 'analysis' | 'research' | 'workflow' | 'extract') => {
     useUiStore.getState().beginNavigation();
     useContextPaneStore.getState().reset();
@@ -428,17 +421,6 @@ export function ChatPanel() {
                   </select>
                 </label>
               )}
-              {!activeSide && activeConversationId && (
-                <button
-                  type="button"
-                  onClick={() => setSideConversationOpen(true)}
-                  className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-                  title="新建支线对话"
-                  aria-label="新建支线对话"
-                >
-                  <GitFork size={15} />
-                </button>
-              )}
               <div className="hidden items-center gap-2 sm:flex">
                 <span className="h-2 w-2 rounded-full bg-[var(--accent)]" />
                 <span>{runStatusLabel(runStatus, isStreaming)}</span>
@@ -563,7 +545,7 @@ export function ChatPanel() {
         }
       >
         {messages.length === 0 ? (
-          <WelcomeScreen onSuggestionClick={handleSuggestionClick} />
+          <WelcomeScreen />
         ) : (
           <div className="mx-auto w-full max-w-[980px] px-4 sm:px-6 lg:px-8">
             <div className="space-y-1 pb-6 pt-5">
@@ -636,10 +618,6 @@ export function ChatPanel() {
           </div>
         )}
       </AgentPane>
-      <SideConversationDialog
-        isOpen={sideConversationOpen}
-        onClose={() => setSideConversationOpen(false)}
-      />
     </>
   );
 }

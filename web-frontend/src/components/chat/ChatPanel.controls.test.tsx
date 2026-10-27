@@ -44,7 +44,6 @@ vi.mock('./MessageBubble', () => ({ MessageBubble: () => null }));
 vi.mock('./HitlDialog', () => ({ HitlDialog: () => null }));
 vi.mock('./WelcomeScreen', () => ({ WelcomeScreen: () => null }));
 vi.mock('./FailureToast', () => ({ FailureToast: () => null }));
-vi.mock('./SideConversationDialog', () => ({ SideConversationDialog: () => null }));
 
 import { ChatPanel } from './ChatPanel';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
@@ -207,6 +206,15 @@ afterEach(() => {
     refresh: originalActions.refresh,
   });
   vi.useRealTimers();
+});
+
+describe('主交互页入口', () => {
+  it('已选中对话时也不提供顶部新建支线入口', () => {
+    render(<ChatPanel />);
+    expect(screen.queryByRole('button', { name: '新建支线对话' })).toBeNull();
+    expect(screen.getByLabelText('测试输入框')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '编辑当前目标' })).toBeTruthy();
+  });
 });
 
 describe('composer Goal controls', () => {

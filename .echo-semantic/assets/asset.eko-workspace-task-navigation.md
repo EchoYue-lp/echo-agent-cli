@@ -72,6 +72,14 @@ active 只表示这些 React 入口在当前源码注册并可达。当前提交
 
 本批于 2026-10-25T12:27:32Z 在原固定期限内保存并逐文件核对构建归档、结算自有读者、清除独立 node_modules/dist；没有 Cargo 产物，不清其它工作区缓存。S3 独立审查、中央合流与真实 Tauri/模型验收仍需完成。前段 Plan11 的 67/21、browser-v2 及其 native 限制保留各自原快照范围，不能作为新 S3 的工程或视觉证明；当前资产中的验证说明也不把父级 Plan 或 Goal 宣布完成。
 
+## 2026-10-27 首页与明确任务入口调整
+
+用户明确选择首页标题“把想法变成成果”，并要求删除存在多任务歧义的“继续上次对话”卡片，以及顶部“新建支线对话”按钮。`web-frontend/src/components/chat/WelcomeScreen.tsx` 因而只呈现标题、品牌与原输入区，不再查询最后会话；原空建议列表及其唯一回调退出。`web-frontend/src/components/chat/ChatPanel.tsx` 只移除该专用 props、顶部按钮及其唯一本地弹窗状态，不改变发送、附件、Goal/Steer 或会话身份。
+
+继续已有任务仍从原侧栏选择明确 Conversation，普通回复下方的 Fork、已有 Side Conversation 的关系/历史/导航/模型选择与底层 API 保留。此调整只收敛可见入口，不删除共享恢复能力，不新建会话状态权威，也不将待议的 Worktree 分叉视为已实现。
+
+`web-frontend/src/components/chat/WelcomeScreen.test.tsx` 核对标题、未查询/自动恢复最后会话、卡片退出与原图标素材；`web-frontend/src/components/chat/ChatPanel.controls.test.tsx` 核对已选中对话时顶部入口也退出，同时原输入和 Goal 控件可达。`docs/zh/getting-started.md` 同步说明明确任务选择。原观察标识和以上历史测试不改写；当前源码、相关回归、真实原生加载与完整 Goal 资格分别结算，本文不因入口调整声明原生已升级。
+
 ## 候选关系
 
 本资产只把当前已注册的 GUI 入口与真实消费者显式关联到原 Conversation collaboration authority，不创建并行能力菜单、持久存储或第二份相同 UI 资产。既有 terminal/channel/plugin/退役人工协作资产的身份和历史保持，各自不承担本首页导航事实。
