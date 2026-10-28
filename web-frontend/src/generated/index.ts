@@ -214,6 +214,7 @@ export * from './TodoItem';
 export * from './TodoStatus';
 export * from './ToolCallInfo';
 export * from './ToolInfo';
+export * from './ToolCategory';
 export * from './ToolControlReceipt';
 export * from './ToolSource';
 export * from './TurnVisibility';

@@ -2417,27 +2417,75 @@ impl AppState {
     ) -> std::result::Result<Vec<crate::types::ToolInfo>, crate::tool_control::ToolControlError>
     {
         let policy_disabled = self.tool_control.snapshot()?.disabled_tools;
-        let (definitions, mut disabled) = handle
+        let (definitions, mut disabled, sources) = handle
             .read(|agent| {
                 let runtime = echo_agent::agent::AgentRunSnapshot::from_agent(agent);
                 (
                     agent.tool_definitions(),
                     runtime.tools.disabled_tools.clone(),
+                    crate::tool_control::mcp_tool_sources(agent),
                 )
             })
             .await;
-        disabled.extend(policy_disabled);
+        disabled.extend(policy_disabled.iter().cloned());
 
         Ok(definitions
             .into_iter()
             .map(|def| crate::types::ToolInfo {
                 enabled: !disabled.contains(&def.function.name),
+                policy_enabled: !policy_disabled.contains(&def.function.name),
+                required_reason: crate::tool_control::required_tool_reason(&def.function.name)
+                    .map(str::to_string),
+                category: crate::tool_control::tool_category(&def.function.name),
+                source: sources
+                    .get(&def.function.name)
+                    .cloned()
+                    .unwrap_or(crate::types::ToolSource::Unknown),
                 name: def.function.name,
                 description: def.function.description,
                 parameters: def.function.parameters,
-                source: crate::types::ToolSource::Builtin,
             })
             .collect())
+    }
+
+    /// GUI选择持原transition读锁直至取目录/操作完成，不能跨workspace焦点漂移。
+    /// 本地仍需校验：防迟到页面操作误改替代workspace中的同名工具。
+    pub async fn tool_control_runtime_for_scope(
+        &self,
+        workspace_id: &str,
+        workspace_generation: &str,
+    ) -> std::result::Result<(tokio::sync::OwnedRwLockReadGuard<()>, ScopedChatRuntime), String>
+    {
+        let publication = self
+            .workspace
+            .transition
+            .clone()
+            .try_read_owned()
+            .map_err(|_| "工作空间正在切换，请重新加载工具".to_string())?;
+        if self
+            .workspace
+            .transitioning
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err("工作空间正在切换，请重新加载工具".to_string());
+        }
+        let host = self.workspace.current.read().await.clone();
+        let matches = match host {
+            Some(host) => {
+                let workspace = host.workspace().await;
+                workspace.id.to_string() == workspace_id
+                    && workspace.opaque_product_data_generation() == workspace_generation
+            }
+            None => workspace_id == "global" && workspace_generation == "global",
+        };
+        if !matches {
+            return Err("工作空间或工程版本已变化，请重新加载工具".to_string());
+        }
+        let runtime = self
+            .current_chat_runtime_inner()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((publication, runtime))
     }
 
     /// Apply one direct-user tool visibility choice to every current pool.
@@ -2461,6 +2509,7 @@ impl AppState {
             });
         }
 
+        crate::tool_control::validate_tool_choice(name, enabled)?;
         let mutation = self.tool_control.set_enabled(name, enabled)?;
         match self.connection.pool.as_ref() {
             Some(pool) => pool.publish_tool_control_generation().await?,
@@ -4217,14 +4266,44 @@ impl AppState {
                 return Ok(false);
             }
         };
+        let input = (|| -> std::io::Result<echo_agent::llm::types::Message> {
+            let spill_dir = crate::prepared_turn::resolve_user_input_spill_dir(Some(
+                runtime.execution_scope().root(),
+            ));
+            let mut prepared =
+                crate::prepared_turn::PreparedUserTurn::runtime_instruction(instruction.clone());
+            prepared.bind_agent_input(
+                &claim.payload,
+                &spill_dir,
+                &target.conversation_id,
+                &snapshot.active_turn_id,
+            )?;
+            prepared.to_message()
+        })();
+        let input = match input {
+            Ok(input) => input,
+            Err(error) => {
+                self.agent_router
+                    .turn_settled(
+                        &claim,
+                        None,
+                        crate::agent_router::AgentDeliveryOutcome::Failed,
+                        false,
+                        Some(format!(
+                            "Agent input preparation failed before injection: {error}"
+                        )),
+                        false,
+                        None,
+                    )
+                    .await?;
+                return Ok(true);
+            }
+        };
         self.agent_router
             .begin_injection(&claim, snapshot.active_turn_id.clone())
             .await?;
         match agent
-            .steer_input_tracked(
-                Some(&snapshot.active_turn_id),
-                echo_agent::llm::types::Message::user(instruction.clone()),
-            )
+            .steer_input_tracked(Some(&snapshot.active_turn_id), input)
             .await
         {
             Ok(mut receipt) => {
@@ -4703,7 +4782,18 @@ impl AppState {
                 conversation_id: Some(&target.conversation_id),
                 turn_id: Some(&root_turn_id),
             },
-        ) {
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|mut turn| {
+            turn.bind_agent_input(
+                &claim.payload,
+                &spill_dir,
+                &target.conversation_id,
+                &root_turn_id,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(turn)
+        }) {
             Ok(turn) => turn,
             Err(error) => {
                 let detail = format!("Agent message preparation failed: {error}");

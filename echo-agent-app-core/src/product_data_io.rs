@@ -2227,10 +2227,12 @@ mod tests {
         let workspace = crate::workspace::Workspace {
             id: crate::workspace::WorkspaceId::from_name("observed-workspace"),
             name: "observed-workspace".to_string(),
-            root,
+            root: root.clone(),
             project_root: None,
             kind: crate::workspace::WorkspaceKind::General,
-            metadata: crate::workspace::WorkspaceMetadata::default(),
+            metadata: crate::workspace::WorkspaceMetadata::new(
+                crate::workspace::ProjectLocation::Local { path: root.clone() },
+            ),
             product_data_generation: String::new(),
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),

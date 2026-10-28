@@ -668,7 +668,7 @@ describe('task runtime list and details', () => {
         name: '项目',
         root: '/local/data',
         kind: { type: 'coding' },
-        metadata: { tags: [] },
+        metadata: { tags: [], project_location: { kind: 'local' as const, path: '/local/data' } },
         product_data_generation: 'generation-1',
         created_at: '2026-10-25T00:00:00Z',
         last_active: '2026-10-25T00:00:00Z',
@@ -743,7 +743,7 @@ describe('task runtime list and details', () => {
       role: 'assistant' as const,
       content: '当前聊天回复',
       timestamp: 1,
-      thinkingSegments: [{ content: '当前执行分析' }],
+      finalAnswerConfirmed: true,
     };
     useChatStore.setState({ messages: [message] });
     render(

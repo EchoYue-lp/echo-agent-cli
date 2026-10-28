@@ -25,8 +25,6 @@ pub struct ConversationInputAddress {
 #[serde(rename_all = "snake_case")]
 pub enum ConversationInputSource {
     Gui,
-    Tui,
-    Cli,
     Channel,
 }
 
@@ -34,8 +32,6 @@ impl ConversationInputSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::Gui => "gui",
-            Self::Tui => "tui",
-            Self::Cli => "cli",
             Self::Channel => "channel",
         }
     }
@@ -1566,7 +1562,7 @@ mod tests {
                 .map_err(|error| error.to_string())?;
         assert_eq!(gui, same);
         assert_ne!(gui, channel);
-        assert!(stable_scoped_input_id(&address(), ConversationInputSource::Tui, "").is_err());
+        assert!(stable_scoped_input_id(&address(), ConversationInputSource::Gui, "").is_err());
         Ok(())
     }
 

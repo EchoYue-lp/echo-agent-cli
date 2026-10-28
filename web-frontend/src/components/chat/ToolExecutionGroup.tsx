@@ -1,3 +1,4 @@
+import { AgentSentMessage } from './AgentSentMessage';
 import { memo, useState } from 'react';
 import {
   AlertTriangle,
@@ -15,6 +16,7 @@ import { InlineToolCall } from './InlineToolCall';
 interface ToolExecutionGroupProps {
   toolIds: string[];
   transcriptTools?: readonly TranscriptToolRecord[];
+  grouped?: boolean;
 }
 
 export function toolExecutionGroupPresentation(
@@ -57,6 +59,7 @@ export function toolExecutionGroupPresentation(
 export const ToolExecutionGroup = memo(function ToolExecutionGroup({
   toolIds,
   transcriptTools = [],
+  grouped = false,
 }: ToolExecutionGroupProps) {
   const [expanded, setExpanded] = useState(false);
   const toolsById = useToolExecutionStore((state) => state.tools);
@@ -82,6 +85,33 @@ export const ToolExecutionGroup = memo(function ToolExecutionGroup({
       <Check size={12} className="text-[var(--color-success)]" />
     );
 
+  if (!grouped) {
+    // Preserve original execution-step order while surfacing communication results outside collapsed tools.
+    const communication = toolIds.some((id) => {
+      const record = transcriptTools.find((row) => row.id === id);
+      const tool = record ? transcriptToolExecution(record, toolsById) : toolsById[id];
+      return tool != null && ['agent_message', 'agent_followup'].includes(tool.name);
+    });
+    if (communication)
+      return (
+        <>
+          {toolIds.map((id) => {
+            const record = transcriptTools.find((row) => row.id === id);
+            const tool = record ? transcriptToolExecution(record, toolsById) : toolsById[id];
+            return tool && ['agent_message', 'agent_followup'].includes(tool.name) ? (
+              <AgentSentMessage key={id} tool={tool} transcript={record} />
+            ) : (
+              <ToolExecutionGroup
+                key={id}
+                toolIds={[id]}
+                transcriptTools={transcriptTools}
+                grouped
+              />
+            );
+          })}
+        </>
+      );
+  }
   return (
     <div className="my-1 min-w-0 pl-2">
       <button

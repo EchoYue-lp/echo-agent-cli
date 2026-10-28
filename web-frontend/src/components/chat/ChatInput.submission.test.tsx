@@ -71,7 +71,7 @@ const workspace: Workspace = {
   root: '/data/a',
   project_root: '/code/a',
   kind: { type: 'code' },
-  metadata: { tags: [] },
+  metadata: { tags: [], project_location: { kind: 'local' as const, path: '/code/a' } },
   product_data_generation: 'a-v1',
   created_at: '',
   last_active: '',

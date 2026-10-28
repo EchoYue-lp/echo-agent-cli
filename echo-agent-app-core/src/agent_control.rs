@@ -960,7 +960,11 @@ impl AgentControlService {
             .await?;
         }
         match request.target.clone() {
-            AgentTarget::Conversation { target } => {
+            AgentTarget::Conversation { mut target } => {
+                if target.workspace_generation.is_none() {
+                    target.workspace_generation =
+                        self.workspace_generation(&target.workspace_id).await;
+                }
                 if request.delivery != AgentMessageDelivery::Live {
                     return Err(AgentControlError::Invalid(
                         "next_attempt delivery is only valid for TaskSubagentTarget".to_string(),
@@ -1885,6 +1889,69 @@ impl AgentControlTool {
         Self { service, operation }
     }
 
+    async fn bind_invocation_source(
+        &self,
+        mut request: AgentMessageRequest,
+        ctx: &ToolContext,
+    ) -> Result<AgentMessageRequest, AgentControlError> {
+        // Exact TaskSubagent controls retain their original lineage/attempt authority.
+        if !matches!(&request.target, AgentTarget::Conversation { .. }) {
+            return Ok(request);
+        }
+        let workspace = self
+            .service
+            .conversation_workspace_id
+            .as_ref()
+            .ok_or_else(|| AgentControlError::Invalid("原工具调用的来源工作区不可用".into()))?;
+        // TaskRun is already the product conversation authority for cron, resume and Subagent invocations.
+        let run_source = match ctx.run_id.as_deref() {
+            Some(run_id) => self
+                .service
+                .get_run(run_id)
+                .await?
+                .filter(|run| &run.workspace_id == workspace)
+                .map(|run| run.conversation_id),
+            None => None,
+        };
+        let source = if let Some(conversation_id) = run_source {
+            ConversationTarget {
+                workspace_id: workspace.clone(),
+                conversation_id,
+                workspace_generation: None,
+            }
+        } else {
+            let conversation_id = ctx
+                .conversation_id
+                .clone()
+                .ok_or_else(|| AgentControlError::Invalid("原工具调用的来源会话不可用".into()))?;
+            let source = ConversationTarget {
+                workspace_id: workspace.clone(),
+                conversation_id,
+                workspace_generation: None,
+            };
+            if !ctx
+                .resource_guards
+                .iter()
+                .any(|guard| guard.matches_identity(&source))
+            {
+                return Err(AgentControlError::Invalid(
+                    "工具trace来源不属于原产品会话".into(),
+                ));
+            }
+            source
+        };
+        if request.from.as_ref().is_some_and(|claimed| {
+            claimed.workspace_id != source.workspace_id
+                || claimed.conversation_id != source.conversation_id
+        }) {
+            return Err(AgentControlError::Invalid(
+                "Agent消息来源与原调用会话不一致".into(),
+            ));
+        }
+        request.from = Some(source);
+        Ok(request)
+    }
+
     fn operation_name(&self) -> &'static str {
         match self.operation {
             AgentControlOperation::List => "agent_list",
@@ -2110,8 +2177,10 @@ impl Tool for AgentControlTool {
                     }
                 }
                 AgentControlOperation::Message | AgentControlOperation::Followup => {
-                    let request = serde_json::from_value::<AgentMessageRequest>(value)
-                        .map_err(|error| AgentControlError::Invalid(error.to_string()));
+                    let request = match serde_json::from_value::<AgentMessageRequest>(value) {
+                        Ok(request) => self.bind_invocation_source(request, ctx).await,
+                        Err(error) => Err(AgentControlError::Invalid(error.to_string())),
+                    };
                     match request {
                         Ok(request) if matches!(self.operation, AgentControlOperation::Message) => {
                             operation_result(self.service.message(request).await)
@@ -3438,6 +3507,161 @@ mod tests {
             }
         });
         assert!(message_validator.validate(&valid_source).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gui_communication_source_crosses_spawn_in_the_original_tool_context()
+    -> anyhow::Result<()> {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".echo-semantic/local/agent-source-tests");
+        std::fs::create_dir_all(&base)?;
+        let root = tempfile::tempdir_in(base)?;
+        let service = Arc::new(service(root.path()).map_err(anyhow::Error::msg)?);
+        seed_conversations(&service, &["caller", "target", "impostor"])
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let source = ConversationTarget {
+            workspace_id: "global".into(),
+            conversation_id: "caller".into(),
+            workspace_generation: None,
+        };
+        let ctx = ToolContext {
+            conversation_id: Some("caller".into()),
+            resource_guards: vec![echo_agent::tools::InvocationResourceGuard::new_identified(
+                (),
+                source,
+            )],
+            ..ToolContext::default()
+        };
+        let tool = AgentControlTool::new(Arc::clone(&service), AgentControlOperation::Message);
+        let parameters: ToolParameters = serde_json::from_value(json!({
+            "target": { "type": "conversation", "workspace_id": "global", "conversation_id": "target" },
+            "message_id": "cross-spawn-original", "text": "源和完整正文🧪",
+        }))?;
+        let result = tokio::spawn(async move {
+            assert!(crate::chat_resources::current_chat_resources().is_none());
+            tool.execute_with_context(parameters, &ctx).await
+        })
+        .await??;
+        assert!(result.success, "{:?}", result.error);
+        let target = AgentAddress::new(WorkspaceId::from_raw("global".into()), "target");
+        let records = service.router.records(&target).await?;
+        let record = records
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("original inbox record missing"))?;
+        assert_eq!(
+            record.payload.origin,
+            crate::agent_router::AgentMessageOrigin::Agent
+        );
+        assert_eq!(
+            record
+                .payload
+                .from
+                .as_ref()
+                .map(|address| address.conversation_id.as_str()),
+            Some("caller")
+        );
+        assert_eq!(record.payload.text(), "源和完整正文🧪");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gui_source_binding_preserves_real_task_subagent_control_without_new_marker()
+    -> anyhow::Result<()> {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".echo-semantic/local/agent-source-tests");
+        std::fs::create_dir_all(&base)?;
+        let root = tempfile::tempdir_in(base)?;
+        let service = Arc::new(service(root.path()).map_err(anyhow::Error::msg)?);
+        seed_task_plan(&service.task_runtime, "run-a").map_err(anyhow::Error::msg)?;
+        let tool = AgentControlTool::new(Arc::clone(&service), AgentControlOperation::Message);
+        let parameters: ToolParameters = serde_json::from_value(json!({
+            "target": { "type": "task_subagent", "workspace_id": "global", "run_id": "run-a", "task_id": "task-a", "plan_revision": 1, "execution_id": "pending:run-a:task-a:1:1", "attempt": 1 },
+            "delivery": "next_attempt", "command_id": "original-control", "text": "original guidance",
+        }))?;
+        let ctx = ToolContext {
+            conversation_id: Some("runtime-trace".into()),
+            ..ToolContext::default()
+        };
+        let first = tool.execute_with_context(parameters.clone(), &ctx).await?;
+        let second = tool.execute_with_context(parameters, &ctx).await?;
+        assert!(first.success && second.success);
+        assert_eq!(
+            second
+                .data
+                .as_ref()
+                .and_then(|data| data.get("duplicate"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn gui_source_binding_reads_original_taskrun_for_cron_resume_and_subagent_conversation_sends()
+    -> anyhow::Result<()> {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".echo-semantic/local/agent-source-tests");
+        std::fs::create_dir_all(&base)?;
+        let root = tempfile::tempdir_in(base)?;
+        let service = Arc::new(service(root.path()).map_err(anyhow::Error::msg)?);
+        seed_task_plan(&service.task_runtime, "run-source").map_err(anyhow::Error::msg)?;
+        seed_conversations(&service, &["conversation-a", "target"])
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let tool = AgentControlTool::new(Arc::clone(&service), AgentControlOperation::Message);
+        let parameters: ToolParameters = serde_json::from_value(
+            json!({ "target": {"type":"conversation","workspace_id":"global","conversation_id":"target"}, "text":"task owned source", "message_id":"task-owned" }),
+        )?;
+        let ctx = ToolContext {
+            run_id: Some("run-source".into()),
+            conversation_id: None,
+            ..ToolContext::default()
+        };
+        let result = tool.execute_with_context(parameters, &ctx).await?;
+        assert!(result.success, "{:?}", result.error);
+        let target = AgentAddress::new(WorkspaceId::from_raw("global".into()), "target");
+        let records = service.router.records(&target).await?;
+        assert_eq!(
+            records
+                .first()
+                .and_then(|record| record.payload.from.as_ref())
+                .map(|address| address.conversation_id.as_str()),
+            Some("conversation-a")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gui_conversation_source_rejects_foreign_marker_without_enqueue() -> anyhow::Result<()>
+    {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".echo-semantic/local/agent-source-tests");
+        std::fs::create_dir_all(&base)?;
+        let root = tempfile::tempdir_in(base)?;
+        let service = Arc::new(service(root.path()).map_err(anyhow::Error::msg)?);
+        seed_conversations(&service, &["caller", "target"])
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let ctx = ToolContext {
+            conversation_id: Some("caller".into()),
+            resource_guards: vec![echo_agent::tools::InvocationResourceGuard::new_identified(
+                (),
+                ConversationTarget {
+                    workspace_id: "global".into(),
+                    conversation_id: "foreign".into(),
+                    workspace_generation: None,
+                },
+            )],
+            ..ToolContext::default()
+        };
+        let tool = AgentControlTool::new(Arc::clone(&service), AgentControlOperation::Message);
+        let parameters: ToolParameters = serde_json::from_value(
+            json!({ "target": {"type":"conversation","workspace_id":"global","conversation_id":"target"}, "text":"must not enqueue" }),
+        )?;
+        assert!(!tool.execute_with_context(parameters, &ctx).await?.success);
+        let target = AgentAddress::new(WorkspaceId::from_raw("global".into()), "target");
+        assert!(service.router.records(&target).await?.is_empty());
         Ok(())
     }
 }

@@ -34,7 +34,14 @@ vi.mock('../api/endpoints', () => ({
     updateSideModel: mocks.updateSideConversationModel,
     retrySide: mocks.retrySideConversation,
     markSideViewed: mocks.markSideConversationViewed,
-    get: mocks.getConversation,
+    get: (...args: unknown[]) =>
+      mocks.getConversation(...args).then((record: { messages: Record<string, unknown>[] }) => ({
+        ...record,
+        messages: record.messages.map((message, index) => ({
+          created_at: `2026-10-28T00:00:${String(index).padStart(2, '0')}Z`,
+          ...message,
+        })),
+      })),
     save: mocks.saveConversation,
     update: mocks.updateConversation,
     delete: mocks.deleteConversation,
@@ -77,7 +84,7 @@ function forkRequest(): ConversationForkRequest {
         head: null,
         branch: 'eko/fork-test',
         path: null,
-        project_location: { kind: 'local', path: '/source' },
+        project_location: { kind: 'local' as const, path: '/source' },
         ssh_target: null,
         source_connection_generation: null,
         draft_connection_id: null,
@@ -345,12 +352,15 @@ describe('conversation message identity', () => {
     expect(chatMessagesToSaved(messages)[0]?.message_id).toBe('assistant-turn-1');
   });
 
-  it('restores the persisted id and gives old records a deterministic fallback', () => {
-    const persisted = { message_id: 'assistant-turn-1', role: 'assistant', content: '' };
-    const legacy: SavedMessage = { role: 'assistant', content: '' };
+  it('restores the current canonical persisted message identity', () => {
+    const persisted = {
+      created_at: '2026-10-28T00:00:00Z',
+      message_id: 'assistant-turn-1',
+      role: 'assistant',
+      content: '',
+    };
 
     expect(restoredMessageId('conversation-1', 2, persisted)).toBe('assistant-turn-1');
-    expect(restoredMessageId('conversation-1', 2, legacy)).toBe('loaded-conversation-1-2');
   });
 
   it('does not duplicate pasted or oversized attachment bodies in UI persistence', () => {
@@ -559,7 +569,7 @@ describe('conversation message identity', () => {
       created_at: '2026-10-27T00:00:00Z',
       last_active: '2026-10-27T00:00:00Z',
       kind: { type: 'code' },
-      metadata: { tags: [] },
+      metadata: { tags: [], project_location: { kind: 'local' as const, path: '/product/new' } },
       product_data_generation: 'new-generation',
     };
     mocks.listWorkspaces.mockResolvedValueOnce({ workspaces: [workspace], count: 1 });
@@ -593,7 +603,10 @@ describe('conversation message identity', () => {
       created_at: '2026-10-27T00:00:00Z',
       last_active: '2026-10-27T00:00:00Z',
       kind: { type: 'code' },
-      metadata: { tags: [] },
+      metadata: {
+        tags: [],
+        project_location: { kind: 'local' as const, path: '/product/current' },
+      },
       product_data_generation: 'current-generation',
     };
     useWorkspaceStore.setState({ workspaces: [workspace] });
@@ -628,7 +641,10 @@ describe('conversation message identity', () => {
       created_at: '2026-10-27T00:00:00Z',
       last_active: '2026-10-27T00:00:00Z',
       kind: { type: 'code' },
-      metadata: { tags: [] },
+      metadata: {
+        tags: [],
+        project_location: { kind: 'local' as const, path: '/product/current' },
+      },
       product_data_generation: 'current-generation',
     };
     const stale = { ...workspace, product_data_generation: 'old-generation' };
@@ -663,7 +679,10 @@ describe('conversation message identity', () => {
       created_at: '',
       last_active: '',
       kind: { type: 'code' },
-      metadata: { tags: [] },
+      metadata: {
+        tags: [],
+        project_location: { kind: 'local' as const, path: '/product/deleted' },
+      },
       product_data_generation: 'old-generation',
     };
     mocks.branchConversation.mockResolvedValueOnce({
@@ -700,7 +719,7 @@ describe('conversation message identity', () => {
       created_at: '2026-10-27T00:00:00Z',
       last_active: '2026-10-27T00:00:00Z',
       kind: { type: 'code' },
-      metadata: { tags: [] },
+      metadata: { tags: [], project_location: { kind: 'local' as const, path: '/product/new' } },
       product_data_generation: 'target-generation',
     };
     const request = forkRequest();
@@ -755,7 +774,7 @@ describe('conversation message identity', () => {
       created_at: '2026-10-27T00:00:00Z',
       last_active: '2026-10-27T00:00:00Z',
       kind: { type: 'code' },
-      metadata: { tags: [] },
+      metadata: { tags: [], project_location: { kind: 'local' as const, path: '/product/new' } },
       product_data_generation: 'target-generation',
     };
     const request = forkRequest();
@@ -1483,7 +1502,12 @@ describe('canonical tool transcript recovery', () => {
       messages: [
         { message_id: 'assistant-before', role: 'assistant', content: '前一条正文' },
         canonicalHistoryResult('未关联结果正文'),
-        { message_id: 'assistant-after', role: 'assistant', content: '后一条真实回复' },
+        {
+          message_id: 'assistant-after',
+          role: 'assistant',
+          content: '后一条真实回复',
+          final_answer_confirmed: true,
+        },
       ],
     });
     await useConversationStore.getState().loadConversation('canonical-history');
@@ -1743,4 +1767,80 @@ describe('canonical tool transcript recovery', () => {
     expect(screen.queryByText('success', { exact: true })).toBeNull();
     expect(screen.queryByText(/\d+\.\d+s/)).toBeNull();
   });
+});
+
+it('places a newly persisted Agent input after real cold human/assistant history, not before load-time timestamps', async () => {
+  const { agentInputMessages, withAgentInputs } = await import('../lib/agentCommunication');
+  useConversationStore.setState({ workspaceId: 'global', activeId: null, newConversationEpoch: 1 });
+  mocks.getConversation.mockResolvedValueOnce({
+    messages: [
+      {
+        message_id: 'human',
+        role: 'user',
+        content: 'earlier human',
+        created_at: '2026-10-28T00:00:00Z',
+      },
+      {
+        message_id: 'reply',
+        role: 'assistant',
+        content: 'earlier assistant',
+        created_at: '2026-10-28T00:00:01Z',
+      },
+    ],
+  });
+  await useConversationStore.getState().loadConversation('cold-target');
+  const messages = useChatStore.getState().messages;
+  expect(messages.map((message) => message.timestamp)).toEqual([
+    Date.parse('2026-10-28T00:00:00Z'),
+    Date.parse('2026-10-28T00:00:01Z'),
+  ]);
+  const record = {
+    message_id: 'pending-agent',
+    route: { workspace_id: 'global', conversation_id: 'cold-target' },
+    payload: {
+      message_id: 'pending-agent',
+      from: { workspace_id: 'source', conversation_id: 'sender' },
+      to: { workspace_id: 'global', conversation_id: 'cold-target' },
+      origin: 'agent' as const,
+      payload: { kind: 'text' as const, text: 'persisted after old history' },
+      created_at: '2026-10-28T00:00:02Z',
+    },
+    persisted_at: '2026-10-28T00:00:02Z',
+    phase: 'persisted',
+    outcome: null,
+    drained: false,
+    reason: null,
+    turn_id: null,
+    attempt: 0,
+  };
+  const timeline = withAgentInputs(messages, agentInputMessages([record], 'global', 'cold-target'));
+  expect(timeline.map((message) => message.content)).toEqual([
+    'earlier human',
+    'earlier assistant',
+    'persisted after old history',
+  ]);
+  expect(useChatStore.getState().messages).toHaveLength(2);
+});
+
+it('does not create or rename a conversation from an Agent observation alone', async () => {
+  const { restoredAgentInput } = await import('../lib/agentCommunication');
+  const payload = {
+    message_id: 'agent-only',
+    from: { workspace_id: 'source', conversation_id: 'sender' },
+    to: { workspace_id: 'global', conversation_id: 'existing' },
+    origin: 'agent' as const,
+    payload: { kind: 'text' as const, text: 'not a human title' },
+    created_at: '2026-10-28T00:00:00Z',
+  };
+  useConversationStore.setState({ activeId: 'existing', workspaceId: 'global' });
+  const record: ChatMessage = {
+    role: 'user',
+    ...restoredAgentInput(payload, 'global', 'existing'),
+  };
+  expect(await useConversationStore.getState().saveCurrent([record])).toEqual({
+    workspace_id: 'global',
+    conversation_id: 'existing',
+  });
+  expect(mocks.updateConversation).not.toHaveBeenCalled();
+  expect(mocks.saveConversation).not.toHaveBeenCalled();
 });

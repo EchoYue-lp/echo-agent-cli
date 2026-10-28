@@ -1,3 +1,4 @@
+import { restoredAgentInput } from '../lib/agentCommunication';
 import { create } from 'zustand';
 import { useChatStore } from './chatStore';
 import {
@@ -211,10 +212,13 @@ export function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
   const saved: SavedMessage[] = [];
 
   for (const m of messages) {
+    // AgentRouter owns these observations; they must never become user input rows.
+    if (m.agentInput) continue;
     // Save the main message
     const entry: SavedMessage = {
       message_id: m.id,
       role: m.role,
+      created_at: new Date(m.timestamp).toISOString(),
       content: m.content,
       internal_agent: m.internalAgent,
       assistant_blocks: m.assistantBlocks,
@@ -223,26 +227,13 @@ export function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
       final_answer_source: m.finalAnswerSource,
     };
 
-    // Save thinking segments
-    if (m.thinkingSegments && m.thinkingSegments.length > 0) {
-      entry.thinking_segments = m.thinkingSegments.map((s) => s.content);
-    }
-
     // Save execution steps (chronological order of thinking/tool interleaving)
     if (m.executionSteps && m.executionSteps.length > 0) {
       entry.execution_steps = m.executionSteps.map((s) =>
-        s.type === 'thinking' || s.type === 'assistant'
+        s.type === 'assistant'
           ? { type: s.type, index: s.index }
           : { type: s.type, call_id: s.callId }
       );
-    }
-
-    // Save execution rounds (round-based model with thinking + parallel tools)
-    if (m.executionRounds && m.executionRounds.length > 0) {
-      entry.execution_rounds = m.executionRounds.map((r) => ({
-        thinking: r.thinking ? { content: r.thinking.content } : undefined,
-        tool_call_ids: [...r.toolCallIds],
-      }));
     }
 
     // Save user-uploaded attachments (data URLs) so the message renders on reload
@@ -267,6 +258,12 @@ export function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
   }
 
   return saved;
+}
+
+function canonicalMessageTimestamp(message: SavedMessage): number {
+  const timestamp = Date.parse(message.created_at);
+  if (!Number.isFinite(timestamp)) throw new Error('会话消息缺少有效的原始时间');
+  return timestamp;
 }
 
 export function restoredMessageId(
@@ -318,7 +315,6 @@ function restoreTranscriptTools(
     const existingIds = new Set([
       ...(message.executionSteps?.flatMap((step) => (step.type === 'tool' ? [step.callId] : [])) ??
         []),
-      ...(message.executionRounds?.flatMap((round) => round.toolCallIds) ?? []),
     ]);
     const claimedReferences = new Set<string>();
     const records = (source.tool_calls ?? []).map((call, callIndex): TranscriptToolRecord => {
@@ -396,25 +392,10 @@ function restoreTranscriptTools(
     message.transcriptTools = records;
     const missing = records.filter((record) => !existingIds.has(record.id));
     if (missing.length === 0) return;
-    if (message.executionSteps?.length) {
-      message.executionSteps = [
-        ...message.executionSteps,
-        ...missing.map((record) => ({ type: 'tool' as const, callId: record.id })),
-      ];
-    } else if (message.executionRounds?.length) {
-      message.executionRounds = [
-        ...message.executionRounds,
-        { toolCallIds: missing.map((record) => record.id) },
-      ];
-    } else {
-      message.executionSteps = [
-        ...(message.thinkingSegments?.map((_segment, index) => ({
-          type: 'thinking' as const,
-          index,
-        })) ?? []),
-        ...missing.map((record) => ({ type: 'tool' as const, callId: record.id })),
-      ];
-    }
+    message.executionSteps = [
+      ...(message.executionSteps ?? []),
+      ...missing.map((record) => ({ type: 'tool' as const, callId: record.id })),
+    ];
   });
   return saved.flatMap((source, sourceIndex) => {
     const message = byIndex.get(sourceIndex);
@@ -429,7 +410,7 @@ function restoreTranscriptTools(
         content: source.content ?? '',
         internalAgent: source.internal_agent ?? false,
         isStreaming: false,
-        timestamp: 0,
+        timestamp: canonicalMessageTimestamp(source),
         transcriptTools: [
           {
             id,
@@ -544,8 +525,15 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     if (messages.length === 0) return null;
     let savedId = activeId;
 
-    const firstUserMsg = messages.find((m) => m.role === 'user');
-    const title = firstUserMsg?.content?.slice(0, 50) || 'New Chat';
+    const firstUserMsg = messages.find(
+      (m) => m.role === 'user' && !m.internalAgent && !m.agentInput
+    );
+    // A received observation cannot create or rename a conversation as if the user submitted it.
+    if (!firstUserMsg) return activeId ? viewAddress(workspaceId, activeId) : null;
+    const title =
+      firstUserMsg?.content?.slice(0, 50) ||
+      get().conversations.find((conversation) => conversation.id === activeId)?.title ||
+      'New Chat';
     if (import.meta.env.DEV)
       console.debug('[saveCurrent] activeId:', activeId, 'msgCount:', messages.length);
 
@@ -662,8 +650,8 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         .map((m, idx) => {
           const base: ChatMessage = {
             // P2-7: 此前用 `loaded-${Date.now()}-${idx}`, 每次加载产生不同 id,
-            // React key 变化导致消息列表全量重渲染。改用会话 id + 索引, 同一会话
-            // 每次加载产生确定性 id, key 稳定。timestamp 仍用 now (无服务端时间)。
+            // React key 变化导致消息列表全量重渲染。改用会话 id + 索引；
+            // 时间只读后端原始 created_at，不用加载时刻冒消息顺序。
             id: restoredMessageId(id, idx, m),
             role: m.role as 'user' | 'assistant',
             content: m.content || '',
@@ -676,29 +664,13 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
               ? m.execution_status?.execution_id
               : undefined,
             isStreaming: false,
-            timestamp: Date.now(),
+            timestamp: canonicalMessageTimestamp(m),
+            ...(m.agent_input ? restoredAgentInput(m.agent_input, workspaceId, id) : {}),
           };
-
-          // Restore thinking segments
-          if (m.thinking_segments && m.thinking_segments.length > 0) {
-            base.thinkingSegments = m.thinking_segments.map((s) => ({ content: s }));
-          }
-
-          // Restore execution rounds (round-based model).
-          // Typed via the SavedMessage shape instead of `any` (P1-40).
-          if (m.execution_rounds && m.execution_rounds.length > 0) {
-            base.executionRounds = m.execution_rounds.map((round) => ({
-              thinking: round.thinking ? { content: round.thinking.content } : undefined,
-              toolCallIds: [...round.tool_call_ids],
-            }));
-          }
 
           // Restore chronological order using stable tool execution IDs.
           if (m.execution_steps && m.execution_steps.length > 0) {
             base.executionSteps = m.execution_steps.reduce<ExecutionStep[]>((steps, step) => {
-              if (step.type === 'thinking' && step.index != null) {
-                steps.push({ type: 'thinking', index: step.index });
-              }
               if (step.type === 'assistant' && step.index != null) {
                 steps.push({ type: 'assistant', index: step.index });
               }

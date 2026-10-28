@@ -83,14 +83,38 @@ pub struct ToolInfo {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    /// 当前Agent的实际可用投影；不同于用户对后续运行的选择。
     pub enabled: bool,
+    pub policy_enabled: bool,
+    pub required_reason: Option<String>,
+    pub category: Option<ToolCategory>,
     pub source: ToolSource,
 }
 
-#[derive(Debug, Serialize, TS)]
+/// EKO设置页的功能展示；不参与Framework执行许可或工具预算。
+#[derive(Debug, Serialize, TS, Clone, Copy, PartialEq, Eq)]
+#[ts(export, rename = "ToolCategory")]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCategory {
+    TaskCollaboration,
+    FilesCode,
+    CommandsRuntime,
+    SearchBrowse,
+    DataDocuments,
+    MemorySkills,
+}
+
+#[derive(Debug, Serialize, TS, Clone, PartialEq, Eq)]
 #[ts(export, rename = "ToolSource")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolSource {
     Builtin,
+    Mcp {
+        server: String,
+        tool: String,
+        plugin_id: Option<String>,
+    },
+    Unknown,
 }
 
 // ── MCP 相关 ─────────────────────────────────────────────────

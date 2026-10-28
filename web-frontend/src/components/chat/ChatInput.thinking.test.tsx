@@ -37,6 +37,7 @@ vi.mock('../../stores/workspaceStore', () => {
         project_execution_location: mocks.remote
           ? { kind: 'ssh', user: 'echo', host: 'remote', port: null, path: '/srv/project' }
           : { kind: 'local', path: '/code/project' },
+        project_location: { kind: 'local' as const, path: '/code/project' },
       },
       product_data_generation: 'v1',
     };

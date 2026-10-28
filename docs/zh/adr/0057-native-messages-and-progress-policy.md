@@ -26,7 +26,7 @@ GUI 显示实际模型或工具事件所指明的操作、该操作耗时及最�
 - 同执行的 Stop Hook 继续仍是同一执行；Agent 执行结算不代替整个 TaskRun 目标完成。
 - GUI、IM、cron 与 Subagent 各自呈现同一事实，不获得另一套结束权威。
 - 整段 Guard 模式下，未通过的最终内容不能提前公开；显示层不能通过流式缓存绕过。
-- 旧日志保原件，只读归一历史；无法判断的旧控制文字显示为历史执行说明，不重新注册旧工具或补成功。
+- 旧日志仅保原件与恢复资料；用户于2026-10-28取消旧版本兼容义务，不再运行旧控制文字归一或来源重建。新版本自身的历史、Fork、恢复和幂等继续验收。
 
 ## 验证与文档同步
 
@@ -73,31 +73,15 @@ None、Some(empty)、未批准/未发布的块和无工具无 status 的 Unknown
 机制、store、执行器或结束权威。
 
 
-## 2026-10-28：旧控制调用的来源边界与真实getter接线
+## 已退役决定：旧控制来源 getter（2026-10-28用户NoCompat裁决）
 
-通用旧历史投影、pending恢复、CAS、候选校验和执行结算继续归Framework。EKO复用已发布的
-`PreModelContextProjector::recovered_tool_origins`：`EkoContextProjector`委托其原
-`TaskRuntimeContextProjector`，后者及`PreparedProjectContext`消费同一应用来源适配。
-这些对象已在原factory、pool／runtime重绑和ProjectAgentAdapter装配路径构造，不新增store、
-journal、注册表或第二执行器。getter回传空列表明确表示Unknown，不表示恢复或执行许可。
+本节原兼容方案已由用户亲编总Goal取消，原实施与测试回执只保历史切点，不算当前版本通过。
+EKO 删除 `legacy_eko_history` 及两个 projector override 和一处委托，不继续维护旧
+think／final 工具日志来源识别。Framework 的合理公开 API 由其独立复用语义决定，不因
+本应用退役此适配而删除。当前自定义同名工具仍按真实注册执行；原生 provider 坐标和
+签名／加密 Message 回传、同版本 cold／Fork／import／幂等与副作用不重放仍须保留。
 
-旧默认工厂确实默认注册FinalAnswerTool、没有默认注册ThinkTool；旧同名add_tool会被拒绝。
-但旧公开API也允许`replace_tool`、remove后重新注册和`set_tool_manager`。原checkpoint、
-RunStore trace和ToolInvocation没有保存当时工厂／实际注册实现身份。今日factory、当前同名
-工具绑定、scope导入代数、匹配call_id／参数、路径或备份时的binary都不能排除旧自定义实现。
-当前Custom存在不能追认历史Custom，当前缺席也不能追认历史Builtin。原生ToolCall自带
-provider_source时更不能被当作旧控制调用；该字段只证明provider坐标，不证明工具实现。
-
-因此当前EKO适配不签出任何未经原记录可靠证明的Builtin或Custom来源：已配对历史保原件并沿
-Frame现有模型读取；未知pending必须沿原restore／明确不可恢复路径拒绝，不能改派今日同名工具、
-补假ToolResult、重放已完成副作用或补成功终态。新执行显式调用当前自定义think／final_answer仍走
-普通工具pipeline，不按名称退役。已真正可靠绑定的来源可由Frame既有来源接口处理；本轮未找到
-可对旧EKO控制call作此证明的耐久正例，不能把默认Unknown接线称为全部旧历史恢复已闭合。
-
-没有要求旧数据持有从未保存的签名。可靠来源缺口若要在未来解决，最小位置是原注册producer在
-原事件／恢复记录里保实际实现来源与原call身份，或原import／archive owner提供已有可信记录的
-精确绑定；不新增store或第二状态权威，也不能把新字段倒填成旧历史事实。普通无控制调用及已合法
-配对历史不因本适配新增门控。实际归档、fixture、定向测试、正式Rust和原生验收分别报告。
+旧方案的完整原文与失败／通过回执保存在 Git 保存点和工程保全包，不继续进入当前运行时或验收分母。
 
 ## 2026-10-28：普通 source 的耐久 publication 投影与有界读取
 
@@ -216,3 +200,58 @@ generation、conversation、loadGeneration／epoch 和执行身份拒绝迟到�
 完整气泡的 live／cold、单／多块、Guard、不同执行同名块、加载失败与视图切换分别验证。
 前端消费夹具只证明呈现；真实后端 DTO 仍须由原 Guard、FileStore、journal／import 链取得
 并重放完整气泡，不能把夹具中的 Settled 当作真实后端执行结果。
+
+
+## 2026-10-28：当前前端投影收敛与旧格式退役
+
+候选取舍：继续双写 round／字符串思考会保留两套来源；只删旧 consumer 会丢掉尚在副写
+的当前工具记录。因此同步停止 `currentRound/executionRounds` 副写，复用原真实工具
+summary `started → recordToolStart → executionSteps`，再移除 OlderRounds 和旧思考回退。
+不增加新 store、执行器或结束 validator。
+
+当前 native 消息以 `assistantBlocks` 保留原 block／request、phase、序号和 Reasoning；
+`executionSteps` 只记录 assistant 索引和工具引用的实际顺序。Reasoning 继续由原
+`NativeMessageTimeline`／`ThinkingSegment` 独立折叠，空 delta 可读取原签名块公开文字和
+opaque summary，私有签名／加密字段仍只作原件。`thinkingContent/thinkingSegments`、
+`thinking_segments/execution_rounds` 及相应无序、旧 round fallback 不再作为前端来源。
+Rust DTO／旧数组 parser 由所属 owner 同步收敛，本切片不另建兼容转换。
+
+模型起止、工具批次与运行 notice 继续沿原事件入口观测，不制造空思考块、round 副本或
+完成资格。批次观测不得调用会重开全局 streaming 的状态副写；completed、failed 或
+cancelled 后的迟到 batch 不得复活输入框／队列忙碌状态。工具状态和步骤仍来自实际
+summary，终态仍来自原运行时。运行时 `FinalAnswer` 事件及其回调明确保留；Bubble 不再
+以缺少 `finalAnswerConfirmed` 的普通正文授予 Fork，仍须遵守原执行与流式门槛。
+
+b529 的实际 Settled／选定批准块／publication 身份及双序号域规则继续生效。前端分支
+重新发送后续轮时保留原前缀的 native 块和 canonical 步骤；spinner 与 Timeline 共用公开
+native 文字提取，不从已退役字符串思考推断等待或阶段。只改变呈现，不改 TaskRun／Goal。
+
+原候选快照保存了新契约与消费者的 JS／类型／lint／格式回执；正式组合源的结果另行记录，
+不按本节续期历史通过。纯旧格式回退验收已由用户取消并标为退役，无新增 skip，也不把
+取消项改记通过。这些是 JS／DTO 消费证据；正式源合流、真实 Rust get 投影原件桥、
+完整执行链和新版 native 窗口仍须分别取得当前证据，不能由同源旧票或文档晋级。
+
+内部 UI 不提供可独立编译的 MessageBubble API example；不新增无调用方示例或长 soak。
+在所属 `web-frontend` 中，直接消费者验证入口为：
+
+```sh
+npx vitest run \
+  src/components/chat/ChatPanel.controls.test.tsx \
+  src/components/chat/MessageBubble.completed.test.tsx \
+  src/components/chat/MessageBubble.fork.test.tsx \
+  src/components/chat/MessageBubble.rendering.test.tsx \
+  src/components/chat/MessageBubble.test.ts \
+  src/components/chat/NativeMessageTimeline.test.tsx \
+  src/components/task/TaskRuntimeList.test.tsx \
+  src/hooks/chatEventHandler.contract.test.ts \
+  src/hooks/chatEventHandler.hitlReplay.test.ts \
+  src/hooks/chatEventHandler.test.ts \
+  src/stores/chatStore.toolExecution.test.ts \
+  src/stores/conversationStore.test.ts \
+  src/types/api.contract.test.ts
+```
+
+原 domain-plugin／产品 soak examples 不消费这些 UI DTO，Framework／SDK API 未因本件
+变化，故不修改其示例。官网用户能力介绍仅需同步旧格式承诺取消与 runtime 最终事件保留
+的边界；由 Delivery 在真实 EKO 来源固定并审阅后处理中文提案，不手改自动镜像或同步
+manifest，不提前宣告实际后端桥、新版 native 或网站部署通过。

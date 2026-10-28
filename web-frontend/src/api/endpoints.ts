@@ -1,3 +1,4 @@
+import type { AgentCommunicationInput } from '../lib/agentCommunication';
 import { get, post, put, del } from './client';
 import { isTauri, apiInvoke } from '../lib/tauri-bridge';
 // A-tier types that have identical generated counterparts — import from
@@ -257,7 +258,10 @@ export const sessionApi = {
       : post<{ success: boolean; snapshot_id?: string }>('/session/checkpoint'),
   listCheckpoints: (workspaceId: string, conversationId: string) =>
     isTauri()
-      ? apiInvoke<SnapshotInfo[]>('list_checkpoints', { workspaceId, conversationId })
+      ? apiInvoke<SnapshotInfo[]>('list_checkpoints', {
+          workspaceId,
+          conversationId,
+        })
       : get<SnapshotInfo[]>('/session/checkpoints'),
   restoreCheckpoint: (workspaceId: string, conversationId: string, id: string) =>
     isTauri()
@@ -270,16 +274,19 @@ export const sessionApi = {
 };
 
 export const toolsApi = {
-  list: () => (isTauri() ? apiInvoke<ToolInfo[]>('list_tools') : get<ToolInfo[]>('/tools')),
-  get: (name: string) =>
-    isTauri() ? apiInvoke<ToolInfo>('get_tool', { name }) : get<ToolInfo>(`/tools/${name}`),
-  enable: (name: string) =>
+  list: (scope: ProductDataScope) =>
+    isTauri() ? apiInvoke<ToolInfo[]>('list_tools', { ...scope }) : get<ToolInfo[]>('/tools'),
+  get: (name: string, scope: ProductDataScope) =>
     isTauri()
-      ? apiInvoke<ToolControlReceipt>('enable_tool', { name })
+      ? apiInvoke<ToolInfo>('get_tool', { name, ...scope })
+      : get<ToolInfo>(`/tools/${name}`),
+  enable: (name: string, scope: ProductDataScope) =>
+    isTauri()
+      ? apiInvoke<ToolControlReceipt>('enable_tool', { name, ...scope })
       : post<ToolControlReceipt>(`/tools/${name}/enable`),
-  disable: (name: string) =>
+  disable: (name: string, scope: ProductDataScope) =>
     isTauri()
-      ? apiInvoke<ToolControlReceipt>('disable_tool', { name })
+      ? apiInvoke<ToolControlReceipt>('disable_tool', { name, ...scope })
       : post<ToolControlReceipt>(`/tools/${name}/disable`),
 };
 
@@ -318,9 +325,9 @@ export const skillsApi = {
 export const mcpApi = {
   list: (requestScope: ExtensionRequestScope) =>
     isTauri()
-      ? apiInvoke<ExtensionCommandReceipt>('list_mcp_servers', { requestScope }).then(
-          mcpServersFromReceipt
-        )
+      ? apiInvoke<ExtensionCommandReceipt>('list_mcp_servers', {
+          requestScope,
+        }).then(mcpServersFromReceipt)
       : get<TauriMcpServerInfo[]>('/mcp'),
   get: (requestScope: ExtensionRequestScope, name: string) =>
     isTauri()
@@ -342,7 +349,10 @@ export const mcpApi = {
   },
   disconnect: (requestScope: ExtensionRequestScope, name: string) =>
     isTauri()
-      ? apiInvoke<ExtensionCommandReceipt>('disconnect_mcp_server', { requestScope, name })
+      ? apiInvoke<ExtensionCommandReceipt>('disconnect_mcp_server', {
+          requestScope,
+          name,
+        })
       : post<{ success: boolean }>(`/mcp/${name}/disconnect`),
   toggle: (requestScope: ExtensionRequestScope, name: string, enabled: boolean) =>
     isTauri()
@@ -358,7 +368,10 @@ export const mcpApi = {
     isTauri() ? apiInvoke<McpConfig>('get_mcp_config') : get<McpConfig>('/mcp/config'),
   updateConfig: (requestScope: ExtensionRequestScope, config: McpConfig) =>
     isTauri()
-      ? apiInvoke<ExtensionCommandReceipt>('update_mcp_config', { requestScope, config })
+      ? apiInvoke<ExtensionCommandReceipt>('update_mcp_config', {
+          requestScope,
+          config,
+        })
       : put<{ success: boolean; message?: string; errors?: string[] }>('/mcp/config', config),
 };
 
@@ -387,7 +400,10 @@ export function mcpConfigDisposition(
 ): { status: 'settled' | 'pending' | 'failed'; message: string } {
   if ('extension' in result) {
     if (result.extension !== 'mcp') {
-      return { status: 'failed', message: 'Unexpected Extension receipt for MCP command' };
+      return {
+        status: 'failed',
+        message: 'Unexpected Extension receipt for MCP command',
+      };
     }
     const detail =
       result.receipt?.action === 'configured'
@@ -434,7 +450,11 @@ export const memoryApi = {
         }),
   search: (workspaceId: string, query: string, namespace?: string) =>
     isTauri()
-      ? apiInvoke<MemoryEntry[]>('search_memory', { workspaceId, query, namespace })
+      ? apiInvoke<MemoryEntry[]>('search_memory', {
+          workspaceId,
+          query,
+          namespace,
+        })
       : post<MemoryEntry[]>('/memory/search', {
           workspace_id: workspaceId,
           query,
@@ -456,7 +476,10 @@ export const memoryApi = {
       : get<NamespacesResponse>('/memory/namespaces'),
   reflect: (workspaceId: string, conversationId?: string) =>
     isTauri()
-      ? apiInvoke<ReflectionReceipt>('reflect_session', { workspaceId, conversationId })
+      ? apiInvoke<ReflectionReceipt>('reflect_session', {
+          workspaceId,
+          conversationId,
+        })
       : post<ReflectionReceipt>('/memory/reflect', {
           workspace_id: workspaceId,
           conversation_id: conversationId,
@@ -472,21 +495,30 @@ export const autoMemoryApi = {
         ),
   toggle: (workspaceId: string, enabled: boolean) =>
     isTauri()
-      ? apiInvoke<AutoMemoryStatus>('toggle_auto_memory', { workspaceId, enabled })
+      ? apiInvoke<AutoMemoryStatus>('toggle_auto_memory', {
+          workspaceId,
+          enabled,
+        })
       : post<AutoMemoryStatus>('/auto-memory/toggle', {
           workspace_id: workspaceId,
           enabled,
         }),
   preview: (workspaceId: string) =>
     isTauri()
-      ? apiInvoke<AutoMemoryPreview>('get_auto_memory_observations', { workspaceId })
+      ? apiInvoke<AutoMemoryPreview>('get_auto_memory_observations', {
+          workspaceId,
+        })
       : get<AutoMemoryPreview>(
           `/auto-memory/observations?workspace_id=${encodeURIComponent(workspaceId)}`
         ),
   extract: (workspaceId: string) =>
     isTauri()
-      ? apiInvoke<AutoMemoryExtractResult>('extract_auto_memory', { workspaceId })
-      : post<AutoMemoryExtractResult>('/auto-memory/extract', { workspace_id: workspaceId }),
+      ? apiInvoke<AutoMemoryExtractResult>('extract_auto_memory', {
+          workspaceId,
+        })
+      : post<AutoMemoryExtractResult>('/auto-memory/extract', {
+          workspace_id: workspaceId,
+        }),
 };
 
 export const configApi = {
@@ -529,7 +561,9 @@ export const permissionsApi = {
       : post<PermissionRule>('/permissions/rules', rule),
   removeRule: (name: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean }>('remove_permission_rule', { matcher: name })
+      ? apiInvoke<{ success: boolean }>('remove_permission_rule', {
+          matcher: name,
+        })
       : del<{ success: boolean }>(`/permissions/rules/${name}`),
 };
 
@@ -614,7 +648,10 @@ export const compressApi = {
       : post<CompressResponse>('/compress', options),
   getStats: (workspaceId: string, conversationId?: string) =>
     isTauri()
-      ? apiInvoke<CompressionStats>('get_compression_stats', { workspaceId, conversationId })
+      ? apiInvoke<CompressionStats>('get_compression_stats', {
+          workspaceId,
+          conversationId,
+        })
       : get<CompressionStats>('/compress/stats'),
 };
 
@@ -727,6 +764,11 @@ export interface ConversationForkReceipt {
 }
 
 export const conversationApi = {
+  agentInputs: (scope: ProductDataScope, id: string) =>
+    apiInvoke<AgentCommunicationInput[]>('get_agent_communication_inputs', {
+      ...scope,
+      id,
+    }),
   list: (workspaceId: string) =>
     isTauri()
       ? apiInvoke<ConversationListItem[]>('list_conversations', { workspaceId })
@@ -883,13 +925,20 @@ export const conversationApi = {
         }>(`/conversations/${id}/restore`),
   search: (workspaceId: string, query: string, limit?: number) =>
     isTauri()
-      ? apiInvoke<ConversationListItem[]>('search_conversations', { workspaceId, query, limit })
+      ? apiInvoke<ConversationListItem[]>('search_conversations', {
+          workspaceId,
+          query,
+          limit,
+        })
       : get<ConversationListItem[]>(`/conversations/search?q=${encodeURIComponent(query)}`),
 };
 
 export const toolExecutionApi = {
   list: (workspaceId: string, conversationId: string) =>
-    apiInvoke<ToolExecution[]>('list_tool_executions', { workspaceId, conversationId }),
+    apiInvoke<ToolExecution[]>('list_tool_executions', {
+      workspaceId,
+      conversationId,
+    }),
   detail: (workspaceId: string, detailRef: string) =>
     apiInvoke<ToolExecutionDetailManifest>('get_tool_execution_detail', {
       workspaceId,
@@ -965,7 +1014,11 @@ export const taskRuntimeApi = {
   // ── Reads ────────────────────────────────────────────────────────────
   getRun: (workspaceId: string, runId: string, workspaceGeneration?: string) =>
     isTauri()
-      ? apiInvoke<TaskRun | null>('get_task_run', { workspaceId, runId, workspaceGeneration })
+      ? apiInvoke<TaskRun | null>('get_task_run', {
+          workspaceId,
+          runId,
+          workspaceGeneration,
+        })
       : get<TaskRun | null>(`/task_runtime/runs/${runId}`),
   getCompletionGate: (workspaceId: string, runId: string, workspaceGeneration?: string) =>
     isTauri()
@@ -1085,7 +1138,10 @@ export const taskRuntimeApi = {
         ),
   interruptSubagent: (workspaceId: string, identity: SubagentControlIdentity) =>
     isTauri()
-      ? apiInvoke<SubagentControlReceipt>('interrupt_task_subagent', { workspaceId, identity })
+      ? apiInvoke<SubagentControlReceipt>('interrupt_task_subagent', {
+          workspaceId,
+          identity,
+        })
       : post<SubagentControlReceipt>(
           `/task_runtime/runs/${identity.run_id}/subagents/${identity.execution_id}/interrupt`,
           { identity }
@@ -1117,17 +1173,30 @@ export const taskRuntimeApi = {
     limit = 20
   ) =>
     isTauri()
-      ? apiInvoke<TaskRunPage>('list_task_runs', { ...scope, statuses, limit, continuation })
+      ? apiInvoke<TaskRunPage>('list_task_runs', {
+          ...scope,
+          statuses,
+          limit,
+          continuation,
+        })
       : get<TaskRunPage>(
           `/task_runtime/runs?${new URLSearchParams({ workspace_id: scope.workspaceId, workspace_generation: scope.workspaceGeneration, statuses: statuses.join(','), limit: String(limit), ...(continuation ? { continuation } : {}) })}`
         ),
   getPlan: (workspaceId: string, runId: string, workspaceGeneration?: string) =>
     isTauri()
-      ? apiInvoke<PlanRevision | null>('get_task_plan', { workspaceId, runId, workspaceGeneration })
+      ? apiInvoke<PlanRevision | null>('get_task_plan', {
+          workspaceId,
+          runId,
+          workspaceGeneration,
+        })
       : get<PlanRevision | null>(`/task_runtime/runs/${runId}/plan`),
   listTodos: (workspaceId: string, runId: string, workspaceGeneration?: string) =>
     isTauri()
-      ? apiInvoke<TodoItem[]>('list_task_todos', { workspaceId, runId, workspaceGeneration })
+      ? apiInvoke<TodoItem[]>('list_task_todos', {
+          workspaceId,
+          runId,
+          workspaceGeneration,
+        })
       : get<TodoItem[]>(`/task_runtime/runs/${runId}/todos`),
   listEvents: (workspaceId: string, runId: string, sinceSeq = '0', workspaceGeneration?: string) =>
     isTauri()
@@ -1155,7 +1224,11 @@ export const taskRuntimeApi = {
       : get<string>(`/task_runtime/runs/${runId}/progress.md`),
   listReviews: (workspaceId: string, runId: string, taskId: string) =>
     isTauri()
-      ? apiInvoke<ReviewResult[]>('list_task_reviews', { workspaceId, runId, taskId })
+      ? apiInvoke<ReviewResult[]>('list_task_reviews', {
+          workspaceId,
+          runId,
+          taskId,
+        })
       : get<ReviewResult[]>(`/task_runtime/runs/${runId}/tasks/${taskId}/reviews`),
   getTaskSummary: (workspaceId: string, runId: string, taskId: string) =>
     isTauri()
@@ -1602,7 +1675,11 @@ export const analysisApi = {
       : analysisRequiresDesktop<AnalysisSummary[]>(),
   create: (scope: ProductDataScope, title: string, language: AnalysisLanguage) =>
     isTauri()
-      ? apiInvoke<AnalysisDocument>('create_analysis', { ...scope, title, language })
+      ? apiInvoke<AnalysisDocument>('create_analysis', {
+          ...scope,
+          title,
+          language,
+        })
       : analysisRequiresDesktop<AnalysisDocument>(),
   get: (scope: ProductDataScope, analysisId: string) =>
     isTauri()
@@ -1627,7 +1704,10 @@ export const analysisApi = {
       : analysisRequiresDesktop<AnalysisDocument>(),
   cancel: (scope: ProductDataScope, analysisId: string) =>
     isTauri()
-      ? apiInvoke<AnalysisCancelReceipt>('cancel_analysis', { ...scope, analysisId })
+      ? apiInvoke<AnalysisCancelReceipt>('cancel_analysis', {
+          ...scope,
+          analysisId,
+        })
       : analysisRequiresDesktop<AnalysisCancelReceipt>(),
   delete: (scope: ProductDataScope, analysisId: string) =>
     isTauri()
@@ -2039,30 +2119,48 @@ export const papersApi = {
     }
   ) =>
     isTauri()
-      ? apiInvoke<ScholarlyIngestResult>('search_scholarly_sources', { ...scope, request })
+      ? apiInvoke<ScholarlyIngestResult>('search_scholarly_sources', {
+          ...scope,
+          request,
+        })
       : researchRequiresDesktop<ScholarlyIngestResult>(),
   importZotero: (scope: ProductDataScope, request: ZoteroSyncRequest) =>
     isTauri()
-      ? apiInvoke<ZoteroSyncResult>('import_zotero_library', { ...scope, request })
+      ? apiInvoke<ZoteroSyncResult>('import_zotero_library', {
+          ...scope,
+          request,
+        })
       : researchRequiresDesktop<ZoteroSyncResult>(),
   exportZotero: (scope: ProductDataScope, request: ZoteroSyncRequest) =>
     isTauri()
-      ? apiInvoke<ZoteroSyncResult>('export_zotero_library', { ...scope, request })
+      ? apiInvoke<ZoteroSyncResult>('export_zotero_library', {
+          ...scope,
+          request,
+        })
       : researchRequiresDesktop<ZoteroSyncResult>(),
   enrichEuropePmc: (scope: ProductDataScope, sourceId: string) =>
     isTauri()
-      ? apiInvoke<EuropePmcEnrichmentResult>('enrich_paper_europe_pmc', { ...scope, sourceId })
+      ? apiInvoke<EuropePmcEnrichmentResult>('enrich_paper_europe_pmc', {
+          ...scope,
+          sourceId,
+        })
       : researchRequiresDesktop<EuropePmcEnrichmentResult>(),
 };
 
 export const evidenceApi = {
   list: (scope: ProductDataScope, params?: { sourceId?: string; reviewId?: string }) =>
     isTauri()
-      ? apiInvoke<EvidenceRecord[]>('list_research_evidence', { ...scope, ...params })
+      ? apiInvoke<EvidenceRecord[]>('list_research_evidence', {
+          ...scope,
+          ...params,
+        })
       : researchRequiresDesktop<EvidenceRecord[]>(),
   upsert: (scope: ProductDataScope, request: UpsertEvidenceRequest) =>
     isTauri()
-      ? apiInvoke<EvidenceRecord>('upsert_research_evidence', { ...scope, request })
+      ? apiInvoke<EvidenceRecord>('upsert_research_evidence', {
+          ...scope,
+          request,
+        })
       : researchRequiresDesktop<EvidenceRecord>(),
   delete: (scope: ProductDataScope, evidenceId: string) =>
     isTauri()
@@ -2073,18 +2171,26 @@ export const evidenceApi = {
 export const systematicReviewsApi = {
   list: (scope: ProductDataScope) =>
     isTauri()
-      ? apiInvoke<SystematicReviewSummary[]>('list_systematic_reviews', { ...scope })
+      ? apiInvoke<SystematicReviewSummary[]>('list_systematic_reviews', {
+          ...scope,
+        })
       : researchRequiresDesktop<SystematicReviewSummary[]>(),
   create: (
     scope: ProductDataScope,
     request: { title: string; question: string; domain: ReviewDomain }
   ) =>
     isTauri()
-      ? apiInvoke<SystematicReviewDocument>('create_systematic_review', { ...scope, request })
+      ? apiInvoke<SystematicReviewDocument>('create_systematic_review', {
+          ...scope,
+          request,
+        })
       : researchRequiresDesktop<SystematicReviewDocument>(),
   get: (scope: ProductDataScope, reviewId: string) =>
     isTauri()
-      ? apiInvoke<SystematicReviewDocument>('get_systematic_review', { ...scope, reviewId })
+      ? apiInvoke<SystematicReviewDocument>('get_systematic_review', {
+          ...scope,
+          reviewId,
+        })
       : researchRequiresDesktop<SystematicReviewDocument>(),
   save: (scope: ProductDataScope, document: SystematicReviewDocument) =>
     isTauri()
@@ -2101,7 +2207,10 @@ export const systematicReviewsApi = {
       : researchRequiresDesktop<boolean>(),
   audit: (scope: ProductDataScope, reviewId: string) =>
     isTauri()
-      ? apiInvoke<CitationAuditReport>('audit_systematic_review', { ...scope, reviewId })
+      ? apiInvoke<CitationAuditReport>('audit_systematic_review', {
+          ...scope,
+          reviewId,
+        })
       : researchRequiresDesktop<CitationAuditReport>(),
   export: (scope: ProductDataScope, reviewId: string, format: ReviewExportFormat) =>
     isTauri()
@@ -2147,7 +2256,7 @@ export interface Workspace {
     description?: string;
     tags: string[];
     project_root_revision?: number;
-    project_location?: ProjectLocation;
+    project_location: ProjectLocation;
     project_execution_location?: ProjectLocation;
   };
   product_data_generation: string;
@@ -2187,11 +2296,23 @@ export type WorkspaceCreateAndSwitchResponse =
 
 export const workspaceApi = {
   connectSsh: (connectionId: string, target: TerminalTarget, rows: number, cols: number) =>
-    apiInvoke<TerminalSession>('connect_project_ssh', { connectionId, target, rows, cols }),
+    apiInvoke<TerminalSession>('connect_project_ssh', {
+      connectionId,
+      target,
+      rows,
+      cols,
+    }),
   testSsh: (connectionId: string, target: TerminalTarget) =>
-    apiInvoke<{ authenticated: boolean }>('test_project_ssh', { connectionId, target }),
+    apiInvoke<{ authenticated: boolean }>('test_project_ssh', {
+      connectionId,
+      target,
+    }),
   verifySsh: (connectionId: string, target: TerminalTarget, path: string) =>
-    apiInvoke<{ path: string }>('verify_project_ssh', { connectionId, target, path }),
+    apiInvoke<{ path: string }>('verify_project_ssh', {
+      connectionId,
+      target,
+      path,
+    }),
   closeSsh: (connectionId: string) => apiInvoke<void>('close_project_ssh', { connectionId }),
   list: () =>
     isTauri()
@@ -2269,7 +2390,10 @@ export const workspaceApi = {
       : del<{ success: boolean }>(`/workspaces/${id}`),
   linkProject: (id: string, path: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; workspace: Workspace }>('link_project', { id, path })
+      ? apiInvoke<{ success: boolean; workspace: Workspace }>('link_project', {
+          id,
+          path,
+        })
       : post<{ success: boolean; workspace: Workspace }>(`/workspaces/${id}/link`, { path }),
   defaultRoot: (name: string) =>
     isTauri()
@@ -2860,15 +2984,16 @@ function pluginStyleActivationFromReceipt(
 export const pluginApi = {
   list: (requestScope: ExtensionRequestScope) =>
     isTauri()
-      ? apiInvoke<ExtensionCommandReceipt>('list_plugins', { requestScope }).then(
-          pluginListFromReceipt
-        )
+      ? apiInvoke<ExtensionCommandReceipt>('list_plugins', {
+          requestScope,
+        }).then(pluginListFromReceipt)
       : get<PluginListResult>('/plugins'),
   get: (requestScope: ExtensionRequestScope, name: string) =>
     isTauri()
-      ? apiInvoke<ExtensionCommandReceipt>('get_plugin', { requestScope, name }).then(
-          pluginInfoReceipt
-        )
+      ? apiInvoke<ExtensionCommandReceipt>('get_plugin', {
+          requestScope,
+          name,
+        }).then(pluginInfoReceipt)
       : get<PluginInfoResult>(`/plugins/${name}`),
   install: (requestScope: ExtensionRequestScope, req: { source: string; scope?: string }) =>
     isTauri()
@@ -2891,9 +3016,10 @@ export const pluginApi = {
       : post<PluginMutationResult>('/plugins/uninstall', req),
   enable: (requestScope: ExtensionRequestScope, name: string) =>
     isTauri()
-      ? apiInvoke<ExtensionCommandReceipt>('enable_plugin', { requestScope, name }).then(
-          (receipt) => pluginMutationFromReceipt(receipt, `Plugin '${name}' enabled`)
-        )
+      ? apiInvoke<ExtensionCommandReceipt>('enable_plugin', {
+          requestScope,
+          name,
+        }).then((receipt) => pluginMutationFromReceipt(receipt, `Plugin '${name}' enabled`))
       : post<PluginMutationResult>(`/plugins/${name}/enable`),
   disable: (requestScope: ExtensionRequestScope, name: string) =>
     isTauri()
@@ -2916,9 +3042,9 @@ export const pluginApi = {
       : post<PluginMutationResult>(`/plugins/${name}/config`, { values }),
   reload: (requestScope: ExtensionRequestScope) =>
     isTauri()
-      ? apiInvoke<ExtensionCommandReceipt>('reload_plugins', { requestScope }).then((receipt) =>
-          pluginMutationFromReceipt(receipt, 'Plugins reloaded')
-        )
+      ? apiInvoke<ExtensionCommandReceipt>('reload_plugins', {
+          requestScope,
+        }).then((receipt) => pluginMutationFromReceipt(receipt, 'Plugins reloaded'))
       : post<{
           success: boolean;
           total?: number;
@@ -2947,15 +3073,16 @@ export const pluginApi = {
         }),
   validate: (requestScope: ExtensionRequestScope, directory: string) =>
     isTauri()
-      ? apiInvoke<ExtensionCommandReceipt>('validate_plugin', { requestScope, directory }).then(
-          pluginValidationFromReceipt
-        )
+      ? apiInvoke<ExtensionCommandReceipt>('validate_plugin', {
+          requestScope,
+          directory,
+        }).then(pluginValidationFromReceipt)
       : post<PluginValidationReport>('/plugins/validate', { directory }),
   themes: (requestScope: ExtensionRequestScope) =>
     isTauri()
-      ? apiInvoke<ExtensionCommandReceipt>('list_plugin_themes', { requestScope }).then(
-          pluginThemesFromReceipt
-        )
+      ? apiInvoke<ExtensionCommandReceipt>('list_plugin_themes', {
+          requestScope,
+        }).then(pluginThemesFromReceipt)
       : get<PluginThemesResult>('/plugins/themes'),
   activateTheme: (requestScope: ExtensionRequestScope, name: string | null) =>
     isTauri()
@@ -2970,9 +3097,9 @@ export const pluginApi = {
         }>('/plugins/theme', { name }),
   outputStyles: (requestScope: ExtensionRequestScope) =>
     isTauri()
-      ? apiInvoke<ExtensionCommandReceipt>('list_plugin_output_styles', { requestScope }).then(
-          pluginStylesFromReceipt
-        )
+      ? apiInvoke<ExtensionCommandReceipt>('list_plugin_output_styles', {
+          requestScope,
+        }).then(pluginStylesFromReceipt)
       : get<PluginOutputStylesResult>('/plugins/output-styles'),
   activateOutputStyle: (requestScope: ExtensionRequestScope, name: string | null) =>
     isTauri()
@@ -3097,9 +3224,9 @@ export const hooksApi = {
       : get<HookSourceListResult>('/hooks'),
   reload: (requestScope: ExtensionRequestScope) =>
     isTauri()
-      ? apiInvoke<ExtensionCommandReceipt>('reload_hooks', { requestScope }).then(
-          hookReloadFromReceipt
-        )
+      ? apiInvoke<ExtensionCommandReceipt>('reload_hooks', {
+          requestScope,
+        }).then(hookReloadFromReceipt)
       : post<HooksReloadSummary>('/hooks/reload'),
   events: () =>
     isTauri() ? apiInvoke<string[]>('list_hook_events') : get<string[]>('/hooks/events'),
@@ -3185,7 +3312,9 @@ export const weixinNotificationApi = {
       enabled,
     }),
   result: (run_id: string) =>
-    apiInvoke<WeixinNotificationResult>('get_weixin_notification_result', { run_id }),
+    apiInvoke<WeixinNotificationResult>('get_weixin_notification_result', {
+      run_id,
+    }),
 };
 
 // Existing channel management projects the original application owners.
@@ -3249,7 +3378,9 @@ export interface ManagedChannelPatch {
 export const channelApi = {
   configuration: () => apiInvoke<ManagedChannelsConfiguration>('get_channel_configuration'),
   save: (patch: ManagedChannelPatch) =>
-    apiInvoke<ManagedChannelsConfiguration>('save_channel_configuration', { patch }),
+    apiInvoke<ManagedChannelsConfiguration>('save_channel_configuration', {
+      patch,
+    }),
   status: () => apiInvoke<ManagedChannelStatusResponse>('list_channel_status'),
   control: (
     channel: ManagedChannelId,
@@ -3392,11 +3523,20 @@ export const schedulerApi = {
       : post<SchedulerManualResponse>(`/scheduler/tasks/${id}/run`),
   edit: (expected: SchedulerTask, edit: { name: string; cron_expr: string; prompt: string }) =>
     isTauri()
-      ? apiInvoke<SchedulerEditResponse>('edit_scheduler_task', { expected, edit })
-      : put<SchedulerEditResponse>(`/scheduler/tasks/${expected.id}`, { expected, edit }),
+      ? apiInvoke<SchedulerEditResponse>('edit_scheduler_task', {
+          expected,
+          edit,
+        })
+      : put<SchedulerEditResponse>(`/scheduler/tasks/${expected.id}`, {
+          expected,
+          edit,
+        }),
   history: (cursor: SchedulerHistoryCursor | null = null, limit = 128) =>
     isTauri()
-      ? apiInvoke<SchedulerHistoryResponse>('read_scheduler_history', { cursor, limit })
+      ? apiInvoke<SchedulerHistoryResponse>('read_scheduler_history', {
+          cursor,
+          limit,
+        })
       : post<SchedulerHistoryResponse>('/scheduler/history', { cursor, limit }),
   delete: (id: string) =>
     isTauri()
@@ -3459,7 +3599,9 @@ export const worktreeApi = {
   remove: (scope: ProductDataScope, path: string) =>
     apiInvoke<{ success: boolean }>('remove_worktree', { ...scope, path }),
   listUnattended: (scope: ProductDataScope) =>
-    apiInvoke<UnattendedWorktreeInfo[]>('list_unattended_worktrees', { ...scope }),
+    apiInvoke<UnattendedWorktreeInfo[]>('list_unattended_worktrees', {
+      ...scope,
+    }),
   mergeUnattended: (scope: ProductDataScope, runId: string) =>
     apiInvoke<UnattendedWorktreeMergeResult>('merge_unattended_worktree', {
       ...scope,
@@ -3471,5 +3613,7 @@ export const worktreeApi = {
       runId,
     }),
   cleanupUnattended: (scope: ProductDataScope) =>
-    apiInvoke<UnattendedWorktreeCleanupResult>('cleanup_unattended_worktrees', { ...scope }),
+    apiInvoke<UnattendedWorktreeCleanupResult>('cleanup_unattended_worktrees', {
+      ...scope,
+    }),
 };

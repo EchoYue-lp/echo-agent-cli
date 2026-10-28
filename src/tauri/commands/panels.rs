@@ -1677,12 +1677,20 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
     let mut current_head = String::new();
     let mut current_branch = String::new();
     let mut current_lock_reason: Option<String> = None;
+    let mut current_has_head = false;
+    let mut current_has_branch = false;
+    let mut current_bare = false;
+    let mut current_invalid = false;
 
     let flush = |items: &mut Vec<WorktreeInfo>,
                  path: &mut Option<PathBuf>,
                  head: &mut String,
                  branch: &mut String,
-                 lock_reason: &mut Option<String>| {
+                 lock_reason: &mut Option<String>,
+                 has_head: &mut bool,
+                 has_branch: &mut bool,
+                 bare: &mut bool,
+                 invalid: &mut bool| {
         let Some(path_buf) = path.take() else {
             return;
         };
@@ -1695,6 +1703,16 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
                 .unwrap_or(branch.as_str())
                 .to_string()
         };
+        if *invalid || (!*bare && !*has_head) {
+            head.clear();
+            branch.clear();
+            lock_reason.take();
+            *has_head = false;
+            *has_branch = false;
+            *bare = false;
+            *invalid = false;
+            return;
+        }
         items.push(WorktreeInfo {
             path: path_buf.to_string_lossy().to_string(),
             branch: display_branch,
@@ -1705,15 +1723,17 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
         });
         head.clear();
         branch.clear();
+        *has_head = false;
+        *has_branch = false;
+        *bare = false;
+        *invalid = false;
     };
 
-    // -z 是原生 Git 无歧义路径合同，避免中文、换行及空白路径被 C quote。
-    // 保留非 NUL 入口只供既有历史/静态夹具读取。
-    let fields = if output.contains('\0') {
-        output.split('\0').collect::<Vec<_>>()
-    } else {
-        output.lines().collect::<Vec<_>>()
-    };
+    // 真实 producer 唯一使用 --porcelain -z；缺少终止符的旧文本或截断数据不构成列表事实。
+    if !output.is_empty() && !output.ends_with('\0') {
+        return items;
+    }
+    let fields = output.split('\0');
     for line in fields {
         if line.is_empty() {
             flush(
@@ -1722,6 +1742,10 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
                 &mut current_head,
                 &mut current_branch,
                 &mut current_lock_reason,
+                &mut current_has_head,
+                &mut current_has_branch,
+                &mut current_bare,
+                &mut current_invalid,
             );
             continue;
         }
@@ -1732,12 +1756,26 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
                 &mut current_head,
                 &mut current_branch,
                 &mut current_lock_reason,
+                &mut current_has_head,
+                &mut current_has_branch,
+                &mut current_bare,
+                &mut current_invalid,
             );
             current_path = Some(PathBuf::from(path));
         } else if let Some(head) = line.strip_prefix("HEAD ") {
+            if current_has_head {
+                current_invalid = true;
+            }
+            current_has_head = true;
             current_head = head.to_string();
         } else if let Some(branch) = line.strip_prefix("branch ") {
+            if current_has_branch {
+                current_invalid = true;
+            }
+            current_has_branch = true;
             current_branch = branch.to_string();
+        } else if line == "bare" {
+            current_bare = true;
         } else if let Some(reason) = line.strip_prefix("locked ") {
             current_lock_reason = Some(reason.to_string());
         }
@@ -1748,6 +1786,10 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
         &mut current_head,
         &mut current_branch,
         &mut current_lock_reason,
+        &mut current_has_head,
+        &mut current_has_branch,
+        &mut current_bare,
+        &mut current_invalid,
     );
     items
 }
@@ -2547,11 +2589,76 @@ mod scoped_control_tests {
     #[test]
     fn worktree_projection_does_not_canonicalize_target_paths_on_host() {
         let target = Path::new("/remote/不存在的项目🙂");
-        let output = "worktree /remote/不存在的项目🙂\nHEAD abcdef1234567890\nbranch refs/heads/main\n\nworktree /remote/不存在的项目🙂-review\nHEAD 1234567890abcdef\nbranch refs/heads/review\n\n";
+        let output = "worktree /remote/不存在的项目🙂\0HEAD abcdef1234567890\0branch refs/heads/main\0\0worktree /remote/不存在的项目🙂-review\0HEAD 1234567890abcdef\0branch refs/heads/review\0\0";
         let listed = parse_worktree_list(output, target);
         assert_eq!(listed.len(), 2);
         assert!(listed.first().is_some_and(|entry| !entry.managed));
         assert!(listed.get(1).is_some_and(|entry| entry.managed && entry.path == "/remote/不存在的项目🙂-review"));
+    }
+
+    #[test]
+    fn worktree_projection_accepts_bare_record_without_head() {
+        let rows = parse_worktree_list("worktree /remote/bare.git\0bare\0\0", Path::new("/source"));
+        assert!(
+            rows.first()
+                .is_some_and(|entry| entry.commit_oid.is_empty() && entry.branch == "(detached)")
+        );
+    }
+
+    #[test]
+    fn worktree_projection_rejects_non_bare_missing_or_duplicate_identity() {
+        let root = Path::new("/source");
+        assert!(
+            parse_worktree_list("worktree /remote/missing\0branch refs/heads/main\0\0", root)
+                .is_empty()
+        );
+        assert!(
+            parse_worktree_list("worktree /remote/duplicate\0HEAD abc\0HEAD def\0\0", root)
+                .is_empty()
+        );
+        assert!(
+            parse_worktree_list(
+                "worktree /remote/duplicate\0HEAD abc\0branch main\0branch other\0\0",
+                root
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn worktree_projection_accepts_bare_record_without_head() {
+        let rows = parse_worktree_list("worktree /remote/bare.git\0bare\0\0", Path::new("/source"));
+        assert!(
+            rows.first()
+                .is_some_and(|entry| entry.commit_oid.is_empty() && entry.branch == "(detached)")
+        );
+    }
+
+    #[test]
+    fn worktree_projection_rejects_non_bare_missing_or_duplicate_identity() {
+        let root = Path::new("/source");
+        assert!(
+            parse_worktree_list("worktree /remote/missing\0branch refs/heads/main\0\0", root)
+                .is_empty()
+        );
+        assert!(
+            parse_worktree_list("worktree /remote/duplicate\0HEAD abc\0HEAD def\0\0", root)
+                .is_empty()
+        );
+        assert!(
+            parse_worktree_list(
+                "worktree /remote/duplicate\0HEAD abc\0branch main\0branch other\0\0",
+                root
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn worktree_projection_rejects_text_or_truncated_non_nul_input() {
+        let root = Path::new("/project");
+        assert!(parse_worktree_list("worktree /project\nHEAD abc\n", root).is_empty());
+        assert!(parse_worktree_list("worktree /project\0HEAD abc", root).is_empty());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+import type { AgentCommunicationInput } from '../lib/agentCommunication';
 import { create } from 'zustand';
 import { isHitlRequestIdentity, sameHitlIdentity } from '../types/api';
 import type { HitlRequestIdentity } from '../types/api';
@@ -7,16 +8,9 @@ import type {
   NativeFinalAnswerSource,
   ChatMessage,
   ApprovalRequest,
-  ExecutionRound,
   ChatRunStatus,
 } from '../types/api';
 import { useConversationStore } from './conversationStore';
-
-/** In-progress round being built during streaming */
-interface CurrentRound {
-  thinking?: { content: string };
-  toolCallIds: string[];
-}
 
 export interface ChatActivity {
   key: string;
@@ -70,6 +64,16 @@ export function cacheHitRate(acc: ContextUsageAccumulator): number | null {
 }
 
 interface ChatState {
+  agentInputs: AgentCommunicationInput[];
+  agentInputsBinding: string | null;
+  agentInputReadError: { binding: string; message: string } | null;
+  noteAgentInputReadError: (binding: string, message: string) => void;
+  observeAgentInputs: (
+    workspaceId: string,
+    conversationId: string,
+    records: AgentCommunicationInput[],
+    binding: string
+  ) => void;
   messages: ChatMessage[];
   isStreaming: boolean;
   isCancelled: boolean;
@@ -82,8 +86,6 @@ interface ChatState {
   pendingHitlRequests: PendingHitlRequest[];
   /** True when viewing a loaded historical conversation (agent has no context) */
   isHistoryView: boolean;
-  /** Current round being built during streaming */
-  currentRound: CurrentRound | null;
   /** 当前上下文窗口占用（来自最近一次 llm_usage 事件的真实 prompt_tokens）。null = 首次响应前 / 刚压缩后。 */
   contextWindow: ContextWindowUsage | null;
   /** 会话级缓存命中率累加器（压缩保留，clear/replace 清零）。 */
@@ -105,11 +107,7 @@ interface ChatState {
     publicationEventId?: string | null
   ) => void;
   observeExecutionStatus: (id: string, status: NativeExecutionStatus) => void;
-  appendThinking: (id: string, token: string) => void;
-  startThinkingSegment: (id: string) => void;
   recordToolStart: (messageId: string, toolExecutionId: string) => void;
-  startToolBatch: (toolCount: number) => void;
-  endToolBatch: () => void;
   applyFinalAnswer: (id: string, content: string, executionId?: string | null) => void;
   applyFinalAnswerSource: (id: string, source: NativeFinalAnswerSource) => void;
   settleAssistantMessage: (id: string) => void;
@@ -171,6 +169,15 @@ function scheduleAutoSave() {
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
+  agentInputs: [],
+  agentInputsBinding: null,
+  agentInputReadError: null,
+  noteAgentInputReadError: (binding, message) => set({ agentInputReadError: { binding, message } }),
+  observeAgentInputs: (workspaceId, conversationId, records, binding) => {
+    const view = useConversationStore.getState();
+    if (view.workspaceId !== workspaceId || view.activeId !== conversationId) return;
+    set({ agentInputs: records, agentInputsBinding: binding, agentInputReadError: null });
+  },
   messages: [],
   isStreaming: false,
   isCancelled: false,
@@ -179,7 +186,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
   activity: null,
   pendingHitlRequests: [],
   isHistoryView: false,
-  currentRound: null,
   contextWindow: null,
   usageAccumulator: { totalInput: 0, totalCached: 0 },
 
@@ -202,7 +208,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((state) => ({
       activity:
         state.isStreaming && state.activity && Number.isFinite(at)
-          ? { ...state.activity, lastEventAt: Math.max(state.activity.lastEventAt, at) }
+          ? {
+              ...state.activity,
+              lastEventAt: Math.max(state.activity.lastEventAt, at),
+            }
           : state.activity,
     })),
 
@@ -244,9 +253,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           role: 'assistant',
           content: '',
           finalAnswerConfirmed: false,
-          thinkingSegments: [],
           executionSteps: [],
-          executionRounds: [],
           isStreaming: true,
           timestamp: Date.now(),
         },
@@ -269,7 +276,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         .filter((message) => {
           if (message.id !== assistantId || message.role !== 'assistant') return true;
           return Boolean(
-            message.content || message.thinkingSegments?.length || message.executionSteps?.length
+            message.content || message.assistantBlocks?.length || message.executionSteps?.length
           );
         });
       return {
@@ -287,9 +294,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             role: 'assistant' as const,
             content: '',
             finalAnswerConfirmed: false,
-            thinkingSegments: [],
             executionSteps: [],
-            executionRounds: [],
             isStreaming: true,
             timestamp: Date.now(),
           },
@@ -357,41 +362,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
   },
 
-  appendThinking: (id, token) => {
-    set((s) => {
-      const idx = s.messages.findIndex((m) => m.id === id);
-      if (idx === -1) return { messages: s.messages };
-      const m = s.messages[idx];
-      const segments = [...(m.thinkingSegments || [])];
-      if (segments.length === 0) {
-        segments.push({ content: token });
-      } else {
-        const last = { ...segments[segments.length - 1] };
-        segments[segments.length - 1] = { ...last, content: last.content + token };
-      }
-      const updated = [...s.messages];
-      updated[idx] = { ...m, thinkingSegments: segments };
-      return { messages: updated };
-    });
-  },
-
-  startThinkingSegment: (id) => {
-    set((s) => {
-      const messages = s.messages.map((m) => {
-        if (m.id !== id) return m;
-        const thinkingSegments = [...(m.thinkingSegments || []), { content: '' }];
-        const executionSteps = [
-          ...(m.executionSteps || []),
-          { type: 'thinking' as const, index: thinkingSegments.length - 1 },
-        ];
-        return { ...m, thinkingSegments, executionSteps };
-      });
-      // If there's an in-progress round, it's now complete (thinking→tools→done),
-      // so start a fresh round for this new thinking phase.
-      return { messages };
-    });
-  },
-
   setThinking: (v) => set({ isThinking: v, runStatus: v ? 'thinking' : get().runStatus }),
 
   recordToolStart: (messageId, toolExecutionId) => {
@@ -409,54 +379,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         ];
         return { ...m, executionSteps };
       });
-      const currentRound = s.currentRound
-        ? {
-            ...s.currentRound,
-            toolCallIds: s.currentRound.toolCallIds.includes(toolExecutionId)
-              ? s.currentRound.toolCallIds
-              : [...s.currentRound.toolCallIds, toolExecutionId],
-          }
-        : { toolCallIds: [toolExecutionId] };
-      return { messages, currentRound, runStatus: 'using_tool' };
+      return { messages, runStatus: 'using_tool' };
     });
-    scheduleAutoSave();
-  },
-
-  /** Start a new tool batch (received tool_batch_start event from backend) */
-  startToolBatch: () => {
-    const state = get();
-    // Capture the last thinking segment from the streaming message.
-    // During streaming, thinking content is accumulated on message.thinkingSegments,
-    // not on currentRound. When a tool batch starts, we must explicitly associate
-    // the preceding thinking with the upcoming tools to form a complete ExecutionRound.
-    const streamingMsg = state.messages.find((m) => m.isStreaming);
-    const segments = streamingMsg?.thinkingSegments;
-    const lastSegment = segments && segments.length > 0 ? segments[segments.length - 1] : null;
-    set({
-      currentRound: {
-        thinking: lastSegment?.content ? { content: lastSegment.content } : undefined,
-        toolCallIds: [],
-      },
-    });
-  },
-
-  /** End current tool batch (received tool_batch_end event from backend).
-   *  Push the current round into the streaming message's executionRounds. */
-  endToolBatch: () => {
-    const { currentRound } = get();
-    if (!currentRound) return;
-    const round: ExecutionRound = {
-      thinking: currentRound.thinking,
-      toolCallIds: [...currentRound.toolCallIds],
-    };
-    set((s) => ({
-      currentRound: null,
-      messages: s.messages.map((m) => {
-        if (!m.isStreaming) return m;
-        const executionRounds = [...(m.executionRounds || []), round];
-        return { ...m, executionRounds };
-      }),
-    }));
     scheduleAutoSave();
   },
 
@@ -637,12 +561,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
   clearMessages: () =>
     set({
       messages: [],
+      agentInputs: [],
+      agentInputsBinding: null,
+      agentInputReadError: null,
       isStreaming: false,
       isCancelled: false,
       isThinking: false,
       isHistoryView: false,
       pendingHitlRequests: [],
-      currentRound: null,
       contextWindow: null,
       usageAccumulator: { totalInput: 0, totalCached: 0 },
       runStatus: 'idle',

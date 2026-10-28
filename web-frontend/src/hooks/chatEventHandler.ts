@@ -359,7 +359,7 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
       if (ctx.isCancelledRef.current) break;
       const id = ctx.assistantIdRef.current;
       if (id) {
-        store.startThinkingSegment(id);
+        // 起止仅是运行观测；公开Reasoning正文只消费原assistant_message块。
         ctx.currentThinkingIdRef.current = id;
       }
       break;
@@ -394,12 +394,12 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     }
     case 'tool_batch_start': {
       if (ctx.isCancelledRef.current) break;
-      store.startToolBatch(event.tool_count ?? 0);
+      // 批次仅观测；真实summary→recordToolStart维护工具状态和顺序，不重开已结算stream。
       break;
     }
     case 'tool_batch_end': {
       if (ctx.isCancelledRef.current) break;
-      store.endToolBatch();
+      // 工具顺序由真实summary started→recordToolStart维护；batch结束不制造完成事实。
       break;
     }
     case 'chart': {

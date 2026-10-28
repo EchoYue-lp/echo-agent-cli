@@ -1511,10 +1511,12 @@ mod tests {
         Workspace {
             id: WorkspaceId::from_name(name),
             name: name.to_string(),
-            root,
+            root: root.clone(),
             project_root: None,
             kind: WorkspaceKind::General,
-            metadata: WorkspaceMetadata::default(),
+            metadata: WorkspaceMetadata::new(crate::workspace::ProjectLocation::Local {
+                path: root.clone(),
+            }),
             product_data_generation: String::new(),
             created_at: Utc::now(),
             last_active: Utc::now(),

@@ -1232,16 +1232,6 @@ impl PreparedProjectContext {
 }
 
 impl echo_agent::compression::PreModelContextProjector for PreparedProjectContext {
-    fn recovered_tool_origins<'a>(
-        &'a self,
-        context: &'a echo_agent::compression::ProjectionContext,
-        messages: &'a [echo_agent::llm::types::Message],
-    ) -> BoxFuture<'a, echo_agent::error::Result<Vec<echo_agent::compression::RecoveredToolOrigin>>>
-    {
-        // Fresh/Project适配仍是原同一对象；没有原producer证据时不能从其当前装配补出旧来源。
-        crate::legacy_eko_history::recovered_tool_origins(context, messages)
-    }
-
     fn project<'a>(
         &'a self,
         context: &'a echo_agent::compression::ProjectionContext,
@@ -2072,66 +2062,14 @@ fn build_readonly_subagent_agent(
 }
 
 #[cfg(test)]
-mod legacy_source_factory_tests {
+mod current_source_factory_tests {
     use super::*;
     use echo_agent::agent::{Agent, AgentEvent};
     use futures::StreamExt;
 
     #[tokio::test]
-    async fn prepared_project_actual_installation_preserves_unknown_paired_source_before_model()
-    -> anyhow::Result<()> {
-        let dir = crate::legacy_eko_history::production_getter_tests::temporary()?;
-        let (state, traces) = crate::legacy_eko_history::production_getter_tests::durable_fixture(
-            dir.path(),
-            1,
-            true,
-        )
-        .await?;
-        let mut agent = crate::legacy_eko_history::production_getter_tests::agent(state, traces)?;
-        let llm =
-            Arc::new(echo_agent::testing::MockLlmClient::new().with_response("current final"));
-        agent.set_llm_client(llm.clone());
-        let prepared = PreparedProjectContext {
-            instructions: crate::unified_memory::load_instruction_projection_strict_with_state(
-                Some(dir.path()),
-                Some(dir.path()),
-            )?,
-            project: None,
-        };
-        prepared.publish_for_fresh_subagent(&mut agent).await;
-        let raw = agent
-            .execute_stream("restore existing owned history")
-            .await?
-            .collect::<Vec<_>>()
-            .await;
-        let events = raw
-            .into_iter()
-            .collect::<echo_agent::error::Result<Vec<_>>>()?;
-        assert!(
-            matches!(events.last(),Some(AgentEvent::ExecutionStatus(status)) if status.status==echo_agent::agent::ExecutionStatusKind::Settled)
-        );
-        let sent = llm
-            .last_messages()
-            .ok_or_else(|| anyhow::anyhow!("actual model was not called"))?;
-        assert!(
-            sent.iter()
-                .flat_map(|message| message.tool_calls.iter().flatten())
-                .any(|call| call.id == "original-control" && call.function.name == "final_answer"),
-            "实际Prepared getter也不能把来源不明但已配对的旧调用误退役",
-        );
-        assert!(
-            sent.iter().any(|message| message
-                .text_content()
-                .is_some_and(|text| text.contains("actual old tool result"))),
-            "不得丢失旧实际结果"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn actual_eko_factory_fresh_same_named_custom_runs_and_does_not_borrow_old_origin()
-    -> anyhow::Result<()> {
-        let dir = crate::legacy_eko_history::production_getter_tests::temporary()?;
+    async fn actual_eko_factory_current_custom_tool_executes_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let mut created = create_agent_with_diagnostics(
             &AgentCreateParams {
                 conversation_id: Some("fresh-factory-custom".into()),
@@ -2180,6 +2118,45 @@ mod legacy_source_factory_tests {
             matches!(events.last(),Some(AgentEvent::ExecutionStatus(status)) if status.status==echo_agent::agent::ExecutionStatusKind::Settled)
         );
         created.agent.close().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn current_provider_tool_coordinates_survive_canonical_projection() -> anyhow::Result<()> {
+        let source = echo_agent::llm::types::ProviderOutputSource {
+            protocol: echo_agent::llm::LlmApiProtocol::Responses,
+            request_id: "native-response".into(),
+            item_id: "native-call".into(),
+            output_index: 0,
+            content_index: None,
+            content_kind: Some("function_call".into()),
+            phase: None,
+        };
+        let message = echo_agent::llm::types::Message::assistant_with_tools(vec![
+            echo_agent::llm::types::ToolCall {
+                provider_source: Some(source),
+                id: "current-provider-call".into(),
+                call_type: "function".into(),
+                function: echo_agent::llm::types::FunctionCall {
+                    name: "final_answer".into(),
+                    arguments: r#"{"answer":"current custom payload"}"#.into(),
+                },
+            },
+        ]);
+        let stored = echo_agent::memory::project_message("current-provider", &message)?;
+        let restored = echo_agent::memory::restore_message(&stored)?;
+        assert_eq!(
+            serde_json::to_value(&restored)?,
+            serde_json::to_value(&message)?
+        );
+        assert!(
+            restored
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| calls.first())
+                .and_then(|call| call.provider_source.as_ref())
+                .is_some()
+        );
         Ok(())
     }
 }

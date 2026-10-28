@@ -2723,7 +2723,9 @@ mod tests {
             root: root.clone(),
             project_root: None,
             kind: WorkspaceKind::General,
-            metadata: WorkspaceMetadata::default(),
+            metadata: WorkspaceMetadata::new(crate::workspace::ProjectLocation::Local {
+                path: root.clone(),
+            }),
             product_data_generation: String::new(),
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),

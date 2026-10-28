@@ -228,29 +228,19 @@ async fn scoped_store(
 #[cfg(test)]
 fn pack_ui_projection(message: &mut SavedMessage) -> Option<String> {
     let has_display_content = message.content.is_some();
-    let has_thinking = message.thinking_segments.is_some();
     let has_steps = message.execution_steps.is_some();
-    let has_rounds = message.execution_rounds.is_some();
     let has_attachments = message
         .attachments
         .as_ref()
         .is_some_and(|attachments| !attachments.is_empty());
     let has_message_id = message.message_id.is_some();
-    if !(has_message_id
-        || has_display_content
-        || has_thinking
-        || has_steps
-        || has_rounds
-        || has_attachments)
-    {
+    if !(has_message_id || has_display_content || has_steps || has_attachments) {
         return None;
     }
     serde_json::to_string(&AttachmentsPayload {
         message_id: message.message_id.take(),
         display_content: message.content.clone(),
-        thinking_segments: message.thinking_segments.take().unwrap_or_default(),
         execution_steps: message.execution_steps.take().unwrap_or_default(),
-        execution_rounds: message.execution_rounds.take(),
         native_history_import: None,
         attachments: message.attachments.take().unwrap_or_default(),
     })
@@ -379,28 +369,20 @@ fn branch_prefix(
     conversation_id: &str,
     include_turn: bool,
 ) -> Result<Vec<StoredMessage>, IpcError> {
-    let mut current_user_index = 0usize;
-    let boundary = stored.iter().position(|message| {
-        if message.role != "user" {
-            return false;
-        }
-        if current_user_index == user_turn_index {
-            return true;
-        }
-        current_user_index = current_user_index.saturating_add(1);
-        false
-    });
+    let human_positions = human_message_positions(stored)?;
+    let boundary = human_positions.get(user_turn_index).copied();
     let boundary = boundary.ok_or_else(|| {
         IpcError::Validation(format!(
             "user turn index {user_turn_index} is outside the canonical transcript"
         ))
     })?;
     let boundary = if include_turn {
-        let end = stored
+        // A visible human ordinal may contain Agent guidance. Copy that context losslessly;
+        // only the next human prompt starts another GUI ordinal.
+        let end = human_positions
             .iter()
-            .enumerate()
-            .skip(boundary.saturating_add(1))
-            .find_map(|(index, message)| (message.role == "user").then_some(index))
+            .copied()
+            .find(|index| *index > boundary)
             .unwrap_or(stored.len());
         // A fork includes a complete reply and its tool results, never a half-written turn.
         let final_reply = stored.get(end.saturating_sub(1)).filter(|message| {
@@ -447,21 +429,57 @@ fn strip_branch_ui_references(raw: Option<String>) -> Option<String> {
     // Tool execution details and message ids are scoped to the source
     // conversation. Canonical framework projection fields remain untouched.
     object.remove("message_id");
-    object.remove("execution_steps");
-    object.remove("execution_rounds");
     serde_json::to_string(&value).ok().or(Some(raw))
+}
+
+fn stored_agent_input(message: &StoredMessage) -> Result<bool, IpcError> {
+    let canonical = echo_agent::memory::restore_message(message)
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    echo_agent_app_core::api::prepared_turn::persisted_agent_input(&canonical)
+        .map(|input| input.is_some())
+        .map_err(|error| IpcError::Internal(error.to_string()))
+}
+
+fn human_message_positions(stored: &[StoredMessage]) -> Result<Vec<usize>, IpcError> {
+    let mut result = Vec::new();
+    for (index, message) in stored.iter().enumerate() {
+        if message.role == "user" && !stored_agent_input(message)? {
+            result.push(index);
+        }
+    }
+    Ok(result)
 }
 
 fn retain_public_messages(
     stored: &mut Vec<StoredMessage>,
     internal_ids: &std::collections::HashSet<i64>,
-) {
-    stored.retain(|message| {
-        !message.id.is_some_and(|id| internal_ids.contains(&id))
-            && !echo_agent_app_core::api::side_conversation::is_internal_agent_message(
-                message.attachments_json.as_deref(),
-            )
-    });
+) -> Result<(), IpcError> {
+    // Same exact provenance policy for GUI, fork and branch. Corruption never becomes human input.
+    retain_gui_messages(stored, internal_ids)
+}
+
+fn retain_gui_messages(
+    stored: &mut Vec<StoredMessage>,
+    internal_ids: &std::collections::HashSet<i64>,
+) -> Result<(), IpcError> {
+    let mut visible = Vec::with_capacity(stored.len());
+    for message in stored.drain(..) {
+        let canonical = echo_agent::memory::restore_message(&message)
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        let communication =
+            echo_agent_app_core::api::prepared_turn::persisted_agent_input(&canonical)
+                .map_err(|error| IpcError::Internal(error.to_string()))?;
+        if communication.is_some()
+            || (!message.id.is_some_and(|id| internal_ids.contains(&id))
+                && !echo_agent_app_core::api::side_conversation::is_internal_agent_message(
+                    message.attachments_json.as_deref(),
+                ))
+        {
+            visible.push(message);
+        }
+    }
+    *stored = visible;
+    Ok(())
 }
 
 async fn load_agent_transcript(
@@ -547,6 +565,8 @@ fn project_stored_message_with_publications(
     } else {
         None
     };
+    let agent_input = echo_agent_app_core::api::prepared_turn::persisted_agent_input(&restored)
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
     let stored_native_blocks = restored
         .assistant_blocks
         .filter(|blocks| !blocks.is_empty())
@@ -559,33 +579,23 @@ fn project_stored_message_with_publications(
         .map(|view| view.blocks.clone())
         .or(stored_native_blocks);
     let tool_calls = restored.tool_calls;
-    let internal_agent = echo_agent_app_core::api::side_conversation::is_internal_agent_message(
-        message.attachments_json.as_deref(),
-    );
-    let (
-        message_id,
-        display_content,
-        thinking_segments,
-        mut execution_steps,
-        execution_rounds,
-        attachments,
-    ) = attachment_payload
+    let internal_agent = agent_input.is_some()
+        || echo_agent_app_core::api::side_conversation::is_internal_agent_message(
+            message.attachments_json.as_deref(),
+        );
+    let (message_id, display_content, mut execution_steps, attachments) = attachment_payload
         .map(|payload| {
-            let thinking_segments =
-                (!payload.thinking_segments.is_empty()).then_some(payload.thinking_segments);
             let execution_steps =
                 (!payload.execution_steps.is_empty()).then_some(payload.execution_steps);
             let attachments = (!payload.attachments.is_empty()).then_some(payload.attachments);
             (
                 payload.message_id,
                 payload.display_content,
-                thinking_segments,
                 execution_steps,
-                payload.execution_rounds,
                 attachments,
             )
         })
-        .unwrap_or((None, None, None, None, None, None));
+        .unwrap_or((None, None, None, None));
 
     if let Some(blocks) = native_blocks.as_ref() {
         let mut steps: Vec<echo_agent_app_core::api::conversation_projection::SavedExecutionStep> =
@@ -618,7 +628,12 @@ fn project_stored_message_with_publications(
     Ok(SavedMessage {
         message_id,
         role: message.role,
-        content,
+        created_at: message.created_at,
+        content: agent_input
+            .as_ref()
+            .map(|input| input.text().to_string())
+            .or(content),
+        agent_input,
         assistant_blocks: native_blocks,
         final_answer_confirmed,
         execution_status: native_publication
@@ -631,10 +646,8 @@ fn project_stored_message_with_publications(
             .and_then(|view| view.final_answer_source.clone()),
         internal_agent,
         tool_calls,
-        thinking_segments,
         tool_result: message.tool_result_json,
         execution_steps,
-        execution_rounds,
         attachments,
     })
 }
@@ -738,17 +751,17 @@ mod tests {
         SavedMessage {
             message_id: Some(id.to_string()),
             role: role.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
             content: Some(content.to_string()),
             assistant_blocks: None,
             final_answer_confirmed: false,
             execution_status: None,
             final_answer_source: None,
             internal_agent: false,
+            agent_input: None,
             tool_calls: None,
-            thinking_segments: None,
             tool_result: None,
             execution_steps: None,
-            execution_rounds: None,
             attachments: None,
         }
     }
@@ -942,6 +955,7 @@ mod tests {
                 .and_then(|index| index.checked_add(1)),
             conversation_id: "side-1".to_string(),
             role: role.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
             content: Some(content.to_string()),
             attachments_json: None,
             tool_calls_json: None,
@@ -1170,6 +1184,7 @@ mod tests {
             id: i64::try_from(index).ok(),
             conversation_id: "source".to_string(),
             role: role.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
             content: Some(content.to_string()),
             attachments_json: None,
             tool_calls_json: (index == 1).then(|| "[]".to_string()),
@@ -1215,6 +1230,7 @@ mod tests {
             id: i64::try_from(index).ok(),
             conversation_id: "source".to_string(),
             role: role.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
             content: Some(content.to_string()),
             attachments_json: None,
             tool_calls_json: None,
@@ -1222,7 +1238,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
         })
         .collect::<Vec<_>>();
-        retain_public_messages(&mut stored, &std::collections::HashSet::from([2, 3]));
+        retain_public_messages(&mut stored, &std::collections::HashSet::from([2, 3]))?;
         let fork = branch_prefix(&stored, 1, "fork", true)?;
         assert_eq!(fork.len(), 4);
         assert_eq!(
@@ -1243,46 +1259,50 @@ mod tests {
     }
 
     #[test]
-    fn branch_prefix_removes_source_scoped_ui_references() -> anyhow::Result<()> {
-        let stored = [StoredMessage {
-            id: Some(1),
-            conversation_id: "source".to_string(),
-            role: "assistant".to_string(),
-            content: Some("answer".to_string()),
-            attachments_json: Some(
-                serde_json::json!({
-                    "_echo_message_version": 1,
-                    "content": {"Text": "canonical"},
-                    "message_id": "source-message",
-                    "execution_steps": [{"type": "tool", "call_id": "call-1"}],
-                    "execution_rounds": [{"tool_call_ids": ["call-1"]}],
-                    "thinking_segments": ["kept"]
-                })
-                .to_string(),
-            ),
-            tool_calls_json: None,
-            tool_result_json: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-        }];
-
-        let raw = strip_branch_ui_references(
+    fn branch_prefix_replaces_ui_identity_and_keeps_current_canonical_steps() -> anyhow::Result<()>
+    {
+        let original = echo_agent::llm::types::Message::assistant_with_tools(vec![
+            echo_agent::llm::types::ToolCall {
+                provider_source: None,
+                id: "call-1".to_string(),
+                call_type: "function".to_string(),
+                function: echo_agent::llm::types::FunctionCall {
+                    name: "lookup".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            },
+        ]);
+        let mut stored = echo_agent::memory::project_message("source", &original)?;
+        let mut value: serde_json::Value = serde_json::from_str(
             stored
-                .first()
-                .and_then(|message| message.attachments_json.clone()),
-        )
-        .ok_or_else(|| anyhow::anyhow!("branch projection missing"))?;
-        let value: serde_json::Value = serde_json::from_str(&raw)?;
-        assert_eq!(
-            value.get("_echo_message_version"),
-            Some(&serde_json::json!(1))
+                .attachments_json
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("canonical payload missing"))?,
+        )?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("canonical object missing"))?;
+        object.insert("message_id".into(), serde_json::json!("source-message"));
+        object.insert(
+            "execution_steps".into(),
+            serde_json::json!([{"type":"tool","call_id":"call-1"}]),
         );
-        assert_eq!(
-            value.get("thinking_segments"),
-            Some(&serde_json::json!(["kept"]))
-        );
+        stored.attachments_json = strip_branch_ui_references(Some(serde_json::to_string(&value)?));
+        let value: serde_json::Value = serde_json::from_str(
+            stored
+                .attachments_json
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("branch payload missing"))?,
+        )?;
         assert!(value.get("message_id").is_none());
-        assert!(value.get("execution_steps").is_none());
-        assert!(value.get("execution_rounds").is_none());
+        assert_eq!(
+            value.get("execution_steps"),
+            Some(&serde_json::json!([{"type":"tool","call_id":"call-1"}]))
+        );
+        assert_eq!(
+            serde_json::to_value(echo_agent::memory::restore_message(&stored)?)?,
+            serde_json::to_value(original)?
+        );
         Ok(())
     }
 
@@ -1718,7 +1738,7 @@ pub async fn get_conversation(
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
     if side_relation.is_none() {
-        retain_public_messages(&mut stored, &internal_message_ids);
+        retain_gui_messages(&mut stored, &internal_message_ids)?;
     } else {
         state
             .app_state
@@ -2408,11 +2428,10 @@ async fn reply_fork_prefix(
         .map_err(IpcError::Internal)?
         .into_iter()
         .collect();
-    retain_public_messages(&mut messages, &internal);
-    let target = messages
-        .iter()
-        .filter(|message| message.role == "user")
-        .nth(user_turn_index)
+    retain_public_messages(&mut messages, &internal)?;
+    let target = human_message_positions(&messages)?
+        .get(user_turn_index)
+        .and_then(|index| messages.get(*index))
         .ok_or_else(|| IpcError::Validation("所选用户回合已不存在".into()))?;
     let resource_display =
         echo_agent_app_core::api::prepared_turn::resource_history_display_text(target)
@@ -3184,11 +3203,10 @@ pub async fn branch_conversation(
         .map_err(IpcError::Internal)?
         .into_iter()
         .collect();
-    retain_public_messages(&mut stored, &internal_ids);
-    let target = stored
-        .iter()
-        .filter(|message| message.role == "user")
-        .nth(user_turn_index)
+    retain_public_messages(&mut stored, &internal_ids)?;
+    let target = human_message_positions(&stored)?
+        .get(user_turn_index)
+        .and_then(|index| stored.get(*index))
         .ok_or_else(|| {
             IpcError::Validation(format!(
                 "user turn index {user_turn_index} is outside the canonical transcript"
@@ -3423,4 +3441,115 @@ pub async fn search_conversations(
         })
         .collect::<Vec<_>>();
     serde_json::to_value(results).map_err(|e| IpcError::Internal(e.to_string()))
+}
+
+/// Read-only GUI observation of the existing durable inbox, with the normal scope fence.
+#[tauri::command]
+pub async fn get_agent_communication_inputs(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    workspace_generation: String,
+    id: String,
+) -> Result<Vec<echo_agent_app_core::api::agent_router::AgentDeliveryRecord>, IpcError> {
+    let _control = state
+        .app_state
+        .workspace_control_for_generation(&workspace_id, &workspace_generation)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let target = echo_agent_app_core::api::agent_router::AgentAddress::new(
+        echo_agent_app_core::api::workspace::WorkspaceId::from_raw(workspace_id.clone()),
+        id,
+    );
+    let records = state
+        .app_state
+        .agent_delivery_records(&target)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let _same = state
+        .app_state
+        .workspace_control_for_generation(&workspace_id, &workspace_generation)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    Ok(records
+        .into_iter()
+        .filter(|record| {
+            record.payload.origin
+                == echo_agent_app_core::api::agent_router::AgentMessageOrigin::Agent
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod agent_communication_view_tests {
+    use super::*;
+    use echo_agent_app_core::api::prepared_turn::{PreparedUserTurn, persisted_agent_input};
+    fn source() -> anyhow::Result<(tempfile::TempDir, StoredMessage)> {
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".echo-semantic/local/agent-communication-view-tests");
+        std::fs::create_dir_all(&directory)?;
+        let root = tempfile::tempdir_in(directory)?;
+        let input = echo_agent_app_core::api::agent_router::AgentMessage::agent_text(
+            Some(echo_agent_app_core::api::agent_router::AgentAddress::new(
+                echo_agent_app_core::api::workspace::WorkspaceId::from_raw("w".into()),
+                "source",
+            )),
+            echo_agent_app_core::api::agent_router::AgentAddress::new(
+                echo_agent_app_core::api::workspace::WorkspaceId::from_raw("w".into()),
+                "c",
+            ),
+            "Agent原始输入",
+        );
+        let mut turn = PreparedUserTurn::runtime_instruction("模型指令");
+        turn.bind_agent_input(&input, root.path(), "c", "turn")?;
+        Ok((
+            root,
+            echo_agent::memory::project_message("c", &turn.to_message()?)?,
+        ))
+    }
+    #[test]
+    fn agent_input_is_kept_in_fork_context_without_counting_as_a_human_prompt() -> anyhow::Result<()>
+    {
+        let (_root, input) = source()?;
+        let human = echo_agent::memory::project_message(
+            "c",
+            &echo_agent::llm::types::Message::user("human"),
+        )?;
+        let reply = echo_agent::memory::project_message(
+            "c",
+            &echo_agent::llm::types::Message::assistant("reply"),
+        )?;
+        let rows = vec![human.clone(), reply.clone(), input, reply, human];
+        assert_eq!(human_message_positions(&rows)?, vec![0, 4]);
+        let fork = branch_prefix(&rows, 0, "fork", true)?;
+        assert_eq!(fork.len(), 4);
+        let retained = fork
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("Agent context disappeared"))?;
+        assert!(persisted_agent_input(&echo_agent::memory::restore_message(retained)?)?.is_some());
+        assert_eq!(branch_prefix(&rows, 1, "fork", false)?.len(), 4);
+        Ok(())
+    }
+    #[test]
+    fn corrupt_typed_source_is_rejected_by_gui_and_fork_instead_of_becoming_human()
+    -> anyhow::Result<()> {
+        let (_root, input) = source()?;
+        let mut value: serde_json::Value = serde_json::from_str(
+            input
+                .attachments_json
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("canonical metadata missing"))?,
+        )?;
+        let serialized = serde_json::to_string(&value)?;
+        // A known typed-source body change retains the old digest and must fail in the shared reader.
+        let changed = serialized.replace("Agent原始输入", "tampered");
+        value = serde_json::from_str(&changed)?;
+        let mut input = input;
+        input.attachments_json = Some(serde_json::to_string(&value)?);
+        let mut gui = vec![input.clone()];
+        assert!(retain_gui_messages(&mut gui, &std::collections::HashSet::new()).is_err());
+        let mut fork = vec![input.clone()];
+        assert!(retain_public_messages(&mut fork, &std::collections::HashSet::new()).is_err());
+        assert!(branch_prefix(&[input], 0, "fork", false).is_err());
+        Ok(())
+    }
 }

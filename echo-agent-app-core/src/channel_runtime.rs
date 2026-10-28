@@ -9375,6 +9375,7 @@ mod tests {
                     instruction: "原根轮次仅等取消".into(),
                     resources: Vec::new(),
                     authorship: crate::prepared_turn::InstructionAuthorship::User,
+                    agent_input: None,
                 };
                 crate::chat_driver::with_foreground_pool_execution(
                     Arc::downgrade(&held),

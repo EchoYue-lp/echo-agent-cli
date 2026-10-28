@@ -18,7 +18,7 @@ const mocks = vi.hoisted(() => ({
         name: '研究工作区',
         root: '/tmp/research',
         kind: { type: 'research' },
-        metadata: { tags: [] },
+        metadata: { tags: [], project_location: { kind: 'local' as const, path: '/tmp/research' } },
         product_data_generation: 'workspace-generation',
         created_at: '2026-08-14T00:00:00Z',
         last_active: '2026-08-14T00:00:00Z',

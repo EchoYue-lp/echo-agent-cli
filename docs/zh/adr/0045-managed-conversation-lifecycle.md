@@ -63,3 +63,10 @@ GUI 与可编辑目标正文通过 resource_history_display_text 隐藏本产品
 弃用正文扫描、按内容命中 sidecar、终态补记 journal。复用已有资源能力，无新增 F Message 字段、存储或 canonical digest 算法；新 Parts 自然进入既有 digest。参考本轮按发布索引核对的 types、conversation projection、steer、stream_channel、snapshot 源码，精确 SHA 见 framework-read-evidence.json。现有 provider adapter 已将 ResourceLink 转成模型文字，无新增供应商 wire variant。
 
 实际 reader、Managed 文件存储、源删除后再 Fork 由候选 Rust 回归覆盖。本轮未执行 Cargo/native/SSH/PTY，结构闭合不等于运行验收完成。工具 producer 的最小 F 增量尚未正式采用。
+
+
+## 2026-10-28：当前消息元数据合同与分叉步骤
+
+用户明确开发阶段不保留旧格式兼容。AttachmentsPayload 只接受当前 object，旧 thinking 数组解析与 thinking_segments/execution_rounds 双轨 DTO、round types 和旧接纳测试退役。Reasoning/正文继续来自原生 assistant blocks；工具步骤通过 canonical tool_calls 和 execution_steps 的原 call_id 承载；实际 execution_status/final_answer_source、native_history_import、附件与原始资源 bytes/SHA/reader 不受这次表面退役影响。
+
+Fork 和 Side 复制前缀只移除来源会话本地的 UI message_id，不再清除 canonical 工具步骤。测试沿实际当前 Message producer 验证 clone 后的原消息内容与 call_id 不变，不依赖手写旧 wrapper。目标 runtime/scope 的普通 idle、同版 cold/history/reload/refork、CAS/幂等及不重放真实副作用仍属于必验合同；没有原 publication 的文本不能因此被补写为最终成功，两个旧准入旁路由 EKO 主 owner 与原 typed producer 统一闭合。

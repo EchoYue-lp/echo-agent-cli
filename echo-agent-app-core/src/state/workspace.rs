@@ -985,7 +985,9 @@ impl crate::chat_driver::ChatSink for AgentDeliveryCaptureSink {
     }
 }
 
-fn render_agent_delivery_instruction(message: &crate::agent_router::AgentMessage) -> String {
+pub(crate) fn render_agent_delivery_instruction(
+    message: &crate::agent_router::AgentMessage,
+) -> String {
     if message.origin == crate::agent_router::AgentMessageOrigin::User
         && matches!(
             &message.payload,

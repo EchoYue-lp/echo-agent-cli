@@ -25,7 +25,10 @@ const serializedToolInfo = {
   description: 'Read a file',
   parameters: { type: 'object', properties: { path: { type: 'string' } } },
   enabled: true,
-  source: 'Builtin',
+  policy_enabled: true,
+  required_reason: null,
+  category: 'files_code',
+  source: { kind: 'unknown' },
 } satisfies ToolInfo;
 
 const serializedToolControlReceipt = {

@@ -239,6 +239,8 @@ pub struct PreparedUserTurn {
     /// runtime. This is independent of RunTurnOrigin: a user-authored message
     /// can resume an existing run.
     pub authorship: InstructionAuthorship,
+    /// Original AgentRouter input and its real artifact. View provenance never changes authorship.
+    pub agent_input: Option<(PathBuf, crate::agent_router::AgentMessage)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,6 +367,7 @@ impl PreparedUserTurn {
             instruction,
             resources,
             authorship: InstructionAuthorship::User,
+            agent_input: None,
         })
     }
 
@@ -373,7 +376,37 @@ impl PreparedUserTurn {
             instruction: instruction.into(),
             resources: Vec::new(),
             authorship: InstructionAuthorship::Runtime,
+            agent_input: None,
         }
+    }
+
+    /// Freeze the already accepted AgentRouter payload in the existing input-artifact/ResourceLink path.
+    /// The canonical message carries typed origin across FileStore reload and Fork; no wrapper parsing.
+    pub fn bind_agent_input(
+        &mut self,
+        message: &crate::agent_router::AgentMessage,
+        spill_dir: &Path,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> std::io::Result<()> {
+        if message.origin != crate::agent_router::AgentMessageOrigin::Agent {
+            return Ok(());
+        }
+        let raw = serde_json::to_string(message).map_err(std::io::Error::other)?;
+        let resource = spill_to_artifact(
+            &raw,
+            spill_dir,
+            Some(conversation_id),
+            Some(turn_id),
+            "agent-message.json",
+            AttachmentSource::Upload,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.agent_input = Some((resource.path.clone(), message.clone()));
+        self.resources.push(resource);
+        // Model/runtime guidance is never a direct-user approval or Goal mutation.
+        self.authorship = InstructionAuthorship::Runtime;
+        Ok(())
     }
 
     pub fn runtime_authored(mut self) -> Self {
@@ -1467,6 +1500,7 @@ mod tests {
             instruction: build_original_message_reference(text, resource),
             resources: vec![resource.clone()],
             authorship: InstructionAuthorship::User,
+            agent_input: None,
         }
         .to_message()?)
     }
@@ -1753,6 +1787,7 @@ mod tests {
             instruction,
             resources: vec![original.clone()],
             authorship: InstructionAuthorship::User,
+            agent_input: None,
         }
         .to_message()?;
         let mut user = project_message("branch", &user_message)?;
@@ -2122,6 +2157,176 @@ mod tests {
         assert!(report.resources.is_empty());
         assert_eq!(rows, before);
         assert!(!target.exists());
+        Ok(())
+    }
+}
+
+/// Only the original typed ResourceLink may classify a canonical Agent input.
+pub fn persisted_agent_input(
+    message: &Message,
+) -> anyhow::Result<Option<crate::agent_router::AgentMessage>> {
+    provenance::persisted_agent_input(message)
+}
+
+#[cfg(test)]
+mod agent_communication_source_tests {
+    use super::*;
+    use echo_agent::memory::{ConversationStore, FileConversationStore, NewConversation};
+
+    fn root() -> anyhow::Result<tempfile::TempDir> {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".echo-semantic/local/agent-communication-tests");
+        std::fs::create_dir_all(&base)?;
+        Ok(tempfile::tempdir_in(base)?)
+    }
+    fn input() -> crate::agent_router::AgentMessage {
+        crate::agent_router::AgentMessage::agent_text(
+            Some(crate::agent_router::AgentAddress::new(
+                crate::workspace::WorkspaceId::from_raw("source".into()),
+                "sender",
+            )),
+            crate::agent_router::AgentAddress::new(
+                crate::workspace::WorkspaceId::from_raw("target".into()),
+                "conversation",
+            ),
+            "原始Agent输入\n中文🧪及完整尾部约束",
+        )
+    }
+    fn prepare(
+        root: &Path,
+    ) -> anyhow::Result<(PreparedUserTurn, crate::agent_router::AgentMessage)> {
+        let input = input();
+        let mut turn = PreparedUserTurn::runtime_instruction("模型侧指令原样保持");
+        turn.bind_agent_input(&input, root, "conversation", "original-turn")?;
+        Ok((turn, input))
+    }
+    #[test]
+    fn typed_agent_input_roundtrip_keeps_origin_fulltext_and_original_instruction()
+    -> anyhow::Result<()> {
+        let root = root()?;
+        let (turn, input) = prepare(root.path())?;
+        assert_eq!(turn.authorship, InstructionAuthorship::Runtime);
+        assert_eq!(turn.instruction, "模型侧指令原样保持");
+        let stored = echo_agent::memory::project_message("conversation", &turn.to_message()?)?;
+        let restored = echo_agent::memory::restore_message(&stored)?;
+        assert_eq!(persisted_agent_input(&restored)?, Some(input));
+        assert!(
+            persisted_agent_input(&Message::user("[eko_agent_message] fake source"))?.is_none()
+        );
+        Ok(())
+    }
+    #[test]
+    fn typed_agent_input_fork_copies_real_artifact_and_keeps_original_source() -> anyhow::Result<()>
+    {
+        let root = root()?;
+        let source_root = root.path().join("source");
+        let target_root = root.path().join("target");
+        let (turn, input) = prepare(&source_root)?;
+        let mut rows = vec![echo_agent::memory::project_message(
+            "conversation",
+            &turn.to_message()?,
+        )?];
+        let report = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&source_root),
+            Some(&target_root),
+            "fork",
+        );
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(report.resources.len(), 1);
+        assert!(report.resources.iter().all(
+            |receipt| receipt.reader_verified && receipt.target_path.starts_with(&target_root)
+        ));
+        let copied = rows
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("copied row missing"))?;
+        assert_eq!(
+            persisted_agent_input(&echo_agent::memory::restore_message(copied)?)?,
+            Some(input)
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn typed_agent_input_new_filestore_reopen_preserves_canonical_source()
+    -> anyhow::Result<()> {
+        let root = root()?;
+        let (turn, input) = prepare(&root.path().join("artifacts"))?;
+        let directory = root.path().join("store");
+        let store = FileConversationStore::new(&directory)?;
+        let authority = store
+            .ensure_projection_epoch(echo_agent::memory::EnsureConversationProjectionRequest {
+                conversation: NewConversation {
+                    conversation_id: "conversation".into(),
+                    user_id: "default".into(),
+                    agent_type: None,
+                    title: None,
+                },
+                expected_tombstone_epoch: None,
+            })
+            .await?
+            .authority;
+        let rows = vec![echo_agent::memory::project_message(
+            "conversation",
+            &turn.to_message()?,
+        )?];
+        let import = echo_agent::memory::ManagedConversationImport::prepare_for_generation(
+            "conversation",
+            authority.epoch,
+            authority.revision,
+            "original-input-generation",
+            rows,
+        )?;
+        store.import_managed_messages(import).await?;
+        drop(store);
+        let reopened = FileConversationStore::new(directory)?;
+        let rows = reopened.get_messages("conversation").await?;
+        let row = rows
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("cold row missing"))?;
+        assert_eq!(
+            persisted_agent_input(&echo_agent::memory::restore_message(row)?)?,
+            Some(input)
+        );
+        Ok(())
+    }
+    #[test]
+    fn typed_agent_input_bad_metadata_rejects_before_resource_copy() -> anyhow::Result<()> {
+        let root = root()?;
+        let (turn, _) = prepare(&root.path().join("source"))?;
+        let mut message = turn.to_message()?;
+        if let echo_agent::llm::types::MessageContent::Parts(parts) = &mut message.content {
+            for part in parts {
+                if let ContentPart::ResourceLink { resource } = part {
+                    if let Some(value) = resource
+                        .meta
+                        .as_mut()
+                        .and_then(|meta| meta.get_mut("eko_agent_communication"))
+                    {
+                        let text = value
+                            .get_mut("message")
+                            .and_then(|message| message.get_mut("payload"))
+                            .and_then(|payload| payload.get_mut("text"))
+                            .ok_or_else(|| anyhow::anyhow!("typed source text missing"))?;
+                        *text = serde_json::json!("tampered body");
+                    }
+                }
+            }
+        }
+        assert!(persisted_agent_input(&message).is_err());
+        let mut rows = vec![echo_agent::memory::project_message(
+            "conversation",
+            &message,
+        )?];
+        let before = rows.clone();
+        let report = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&root.path().join("source")),
+            Some(&root.path().join("target")),
+            "fork",
+        );
+        assert!(report.error.is_some());
+        assert!(report.resources.is_empty());
+        assert_eq!(rows, before);
         Ok(())
     }
 }

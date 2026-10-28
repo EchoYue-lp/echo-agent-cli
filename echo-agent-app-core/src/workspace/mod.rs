@@ -264,7 +264,7 @@ pub enum ProjectSource {
 // ── WorkspaceMetadata ───────────────────────────────────────────────
 
 /// 工作区元数据。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceMetadata {
     /// 描述信息。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -279,15 +279,26 @@ pub struct WorkspaceMetadata {
     /// second generation store.
     #[serde(default)]
     pub project_root_revision: u64,
-    /// The manifest owns location and revision together; legacy manifests
-    /// continue to resolve `project_root`, then `root`, without rewriting data.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_location: Option<ProjectLocation>,
+    /// 当前 manifest 必须显式记录用户选择的位置，与 revision 归同一 registry 权威。
+    /// 不从产品数据目录或旧 project_root 推断缺失的位置。
+    pub project_location: ProjectLocation,
     /// Verified execution identity for indirect locations (SSH config aliases
     /// and remote paths). It is published atomically with the user location
     /// and the existing revision, never reconstructed from a socket name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_execution_location: Option<ProjectLocation>,
+}
+
+impl WorkspaceMetadata {
+    pub fn new(project_location: ProjectLocation) -> Self {
+        Self {
+            description: None,
+            tags: Vec::new(),
+            project_root_revision: 0,
+            project_location,
+            project_execution_location: None,
+        }
+    }
 }
 
 // ── Workspace ───────────────────────────────────────────────────────
@@ -310,7 +321,6 @@ pub struct Workspace {
     /// 工作区类型。
     pub kind: WorkspaceKind,
     /// 元数据。
-    #[serde(default)]
     pub metadata: WorkspaceMetadata,
     /// Backend-issued opaque incarnation token for product-data IPC.
     ///
@@ -328,15 +338,7 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn project_location(&self) -> ProjectLocation {
-        self.metadata
-            .project_location
-            .clone()
-            .unwrap_or_else(|| ProjectLocation::Local {
-                path: self
-                    .project_root
-                    .clone()
-                    .unwrap_or_else(|| self.root.clone()),
-            })
+        self.metadata.project_location.clone()
     }
 
     /// A local project path is only available for a local location. Remote
@@ -492,7 +494,9 @@ mod tests {
             root: PathBuf::from("/tmp/test"),
             project_root: None,
             kind: WorkspaceKind::General,
-            metadata: WorkspaceMetadata::default(),
+            metadata: WorkspaceMetadata::new(crate::workspace::ProjectLocation::Local {
+                path: PathBuf::from("/tmp/test"),
+            }),
             product_data_generation: String::new(),
             created_at: Utc::now(),
             last_active: Utc::now(),
@@ -513,7 +517,7 @@ mod tests {
                 "name": "Timezone",
                 "root": "/tmp/timezone",
                 "kind": { "type": "general" },
-                "metadata": { "tags": [], "project_root_revision": 7 },
+                "metadata": { "tags": [], "project_root_revision": 7, "project_location": { "kind":"local", "path":"/tmp/timezone" } },
                 "product_data_generation": "forged-or-stale-token",
                 "created_at": created_at,
                 "last_active": created_at
@@ -538,21 +542,29 @@ mod tests {
     }
 
     #[test]
-    fn legacy_manifest_keeps_local_project_and_product_paths_distinct() -> anyhow::Result<()> {
-        let workspace: Workspace = serde_json::from_value(serde_json::json!({
-            "id": "legacy", "name": "Legacy", "root": "/local/product-data", "project_root": "/local/code",
-            "kind": {"type": "general"}, "metadata": {"tags": []},
-            "created_at": "2026-08-24T00:00:00Z", "last_active": "2026-08-24T00:00:00Z"
-        }))?;
-        assert_eq!(workspace.root, PathBuf::from("/local/product-data"));
+    fn manifest_requires_explicit_current_project_location() -> anyhow::Result<()> {
+        let mut value = serde_json::json!({
+            "id":"current", "name":"Current", "root":"/local/product-data", "project_root":"/local/code",
+            "kind":{"type":"general"}, "metadata":{"tags":[],"project_root_revision":0},
+            "created_at":"2026-10-28T00:00:00Z", "last_active":"2026-10-28T00:00:00Z"
+        });
+        assert!(serde_json::from_value::<Workspace>(value.clone()).is_err());
+        let metadata = value
+            .get_mut("metadata")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| anyhow::anyhow!("metadata missing"))?;
+        metadata.insert(
+            "project_location".into(),
+            serde_json::json!({"kind":"local","path":"/explicit/code"}),
+        );
+        let workspace: Workspace = serde_json::from_value(value)?;
         assert_eq!(
             workspace.project_location(),
             ProjectLocation::Local {
-                path: PathBuf::from("/local/code")
+                path: PathBuf::from("/explicit/code")
             }
         );
-        assert_eq!(workspace.metadata.project_root_revision, 0);
-        assert!(workspace.metadata.project_execution_location.is_none());
+        assert_eq!(workspace.root, PathBuf::from("/local/product-data"));
         Ok(())
     }
 
@@ -575,7 +587,7 @@ mod tests {
             "id": "remote", "name": "Remote", "root": "/local/data", "kind": {"type": "code"},
             "created_at": "2026-08-24T00:00:00Z", "last_active": "2026-08-24T00:00:00Z"
         }))?;
-        workspace.metadata.project_location = Some(raw.clone());
+        workspace.metadata.project_location = raw.clone();
         workspace.metadata.project_execution_location = Some(actual.clone());
         let parsed: Workspace = serde_json::from_slice(&serde_json::to_vec(&workspace)?)?;
         assert_eq!(parsed.project_location(), raw);

@@ -772,10 +772,12 @@ mod tests {
         let workspace = crate::workspace::Workspace {
             id: crate::workspace::WorkspaceId::from_name("shared-subagent-bus"),
             name: "Shared Subagent bus".to_string(),
-            root,
+            root: root.clone(),
             project_root: None,
             kind: WorkspaceKind::General,
-            metadata: crate::workspace::WorkspaceMetadata::default(),
+            metadata: crate::workspace::WorkspaceMetadata::new(
+                crate::workspace::ProjectLocation::Local { path: root.clone() },
+            ),
             product_data_generation: String::new(),
             created_at: now,
             last_active: now,
@@ -884,10 +886,15 @@ mod tests {
         let workspace = crate::workspace::Workspace {
             id: crate::workspace::WorkspaceId::from_name("linked-project-context"),
             name: "Linked project context".to_string(),
-            root: workspace_root,
+            root: workspace_root.clone(),
+
             project_root: Some(project_root.clone()),
             kind: WorkspaceKind::General,
-            metadata: crate::workspace::WorkspaceMetadata::default(),
+            metadata: crate::workspace::WorkspaceMetadata::new(
+                crate::workspace::ProjectLocation::Local {
+                    path: workspace_root.clone(),
+                },
+            ),
             product_data_generation: String::new(),
             created_at: now,
             last_active: now,
@@ -3268,6 +3275,7 @@ mod tests {
             instruction: "Inspect this evidence".to_string(),
             resources: Vec::new(),
             authorship: crate::prepared_turn::InstructionAuthorship::User,
+            agent_input: None,
         };
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
@@ -3509,6 +3517,7 @@ mod tests {
                 instruction: "resume".to_string(),
                 resources: Vec::new(),
                 authorship: crate::prepared_turn::InstructionAuthorship::User,
+                agent_input: None,
             };
             let result = crate::chat_driver::with_foreground_pool_execution(
                 Arc::downgrade(&held_execution),

@@ -1,8 +1,8 @@
+import { AgentInputMessage } from './AgentInputMessage';
 import { useMemo, useState, memo } from 'react';
 import { transcriptToolExecution, type ChatMessage } from '../../types/api';
 import { Copy, Check, RefreshCw, GitFork, Pencil, X, ArrowUp, File, Download } from 'lucide-react';
 import MarkdownContent from '../common/MarkdownContent';
-import { ThinkingSegment } from './ThinkingSegment';
 import { NativeMessageTimeline, nativeAssistantBlockText } from './NativeMessageTimeline';
 import { ParallelExecutionBlock, visibleSubagentRuns } from './ParallelExecutionBlock';
 import { ToolExecutionGroup } from './ToolExecutionGroup';
@@ -55,19 +55,11 @@ function isImageFile(mime: string): boolean {
   return mime.startsWith('image/');
 }
 
-/** Project the persisted execution timeline into renderable steps. */
+/** 原生Reasoning由NativeMessageTimeline呈现；此投影只处理当前工具引用。 */
 interface FlatStep {
-  type: 'thinking' | 'tool';
-  thinkingContent?: string;
-  thinkingKind?: 'reasoning' | 'historical_execution';
-  toolId?: string;
+  type: 'tool';
+  toolId: string;
   toolIndex: number;
-}
-
-interface ThinkingDisplayItem {
-  type: 'thinking';
-  content: string;
-  kind?: 'reasoning' | 'historical_execution';
 }
 
 interface ToolDisplayItem {
@@ -75,7 +67,7 @@ interface ToolDisplayItem {
   toolIds: string[];
 }
 
-type ExecutionDisplayItem = ThinkingDisplayItem | ToolDisplayItem;
+type ExecutionDisplayItem = ToolDisplayItem;
 
 export function isExecutionProcessCompleted(
   messageIsStreaming: boolean | undefined,
@@ -95,82 +87,18 @@ export function isExecutionProcessCompleted(
   return !hasRunningTools && subagentStatuses.every((status) => status !== 'running');
 }
 
-export function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkingTotal: number } {
+export function flattenSteps(message: ChatMessage): { steps: FlatStep[] } {
   const steps: FlatStep[] = [];
-  let thinkingTotal = 0;
-
-  if (message.executionSteps && message.executionSteps.length > 0) {
-    message.executionSteps.forEach((step) => {
-      if (step.type === 'thinking') {
-        const seg = message.thinkingSegments?.[step.index];
-        if (seg && seg.content.trim()) {
-          steps.push({
-            type: 'thinking',
-            thinkingContent: seg.content,
-            thinkingKind: seg.kind,
-            toolIndex: 0,
-          });
-          thinkingTotal++;
-        }
-      } else if (step.type === 'tool') {
-        steps.push({ type: 'tool', toolId: step.callId, toolIndex: steps.length });
-      }
-    });
-  } else if (message.executionRounds && message.executionRounds.length > 0) {
-    // Older persisted conversations may only have round-level execution data.
-    message.executionRounds.forEach((round) => {
-      if (round.thinking && round.thinking.content.trim()) {
-        steps.push({ type: 'thinking', thinkingContent: round.thinking.content, toolIndex: 0 });
-        thinkingTotal++;
-      }
-      round.toolCallIds.forEach((callId) => {
-        steps.push({ type: 'tool', toolId: callId, toolIndex: steps.length });
-      });
-    });
-  } else {
-    // Fallback for messages without explicit execution order.
-    const segs = (message.thinkingSegments || []).filter((s) => s.content.trim());
-    segs.forEach((s) => {
-      steps.push({
-        type: 'thinking',
-        thinkingContent: s.content,
-        thinkingKind: s.kind,
-        toolIndex: 0,
-      });
-      thinkingTotal++;
-    });
-    if (thinkingTotal === 0 && message.thinkingContent?.trim()) {
-      steps.push({ type: 'thinking', thinkingContent: message.thinkingContent, toolIndex: 0 });
-      thinkingTotal++;
-    }
+  for (const step of message.executionSteps ?? []) {
+    if (step.type === 'tool')
+      steps.push({ type: 'tool', toolId: step.callId, toolIndex: steps.length });
   }
-  return { steps, thinkingTotal };
+  return { steps };
 }
 
-/** Collapse each uninterrupted run of tool calls into one display item. */
+/** 无native块的工具视图仍沿canonical步骤顺序呈现。 */
 export function groupExecutionSteps(steps: FlatStep[]): ExecutionDisplayItem[] {
-  const items: ExecutionDisplayItem[] = [];
-
-  for (const step of steps) {
-    if (step.type === 'thinking') {
-      items.push({
-        type: 'thinking',
-        content: step.thinkingContent ?? '',
-        ...(step.thinkingKind ? { kind: step.thinkingKind } : {}),
-      });
-      continue;
-    }
-
-    if (!step.toolId) continue;
-    const previous = items.at(-1);
-    if (previous?.type === 'tools') {
-      previous.toolIds.push(step.toolId);
-    } else {
-      items.push({ type: 'tools', toolIds: [step.toolId] });
-    }
-  }
-
-  return items;
+  return steps.length ? [{ type: 'tools', toolIds: steps.map((step) => step.toolId) }] : [];
 }
 
 /** Read only the tool facts already proved for each displayed reference. */
@@ -218,7 +146,7 @@ export const MessageBubble = memo(function MessageBubble({
   const images = message.attachments?.filter((a) => isImageFile(a.mime_type)) ?? [];
   const files = message.attachments?.filter((a) => !isImageFile(a.mime_type)) ?? [];
 
-  const { steps, thinkingTotal } = flattenSteps(message);
+  const { steps } = flattenSteps(message);
   const executionItems = groupExecutionSteps(steps);
   const hasNativeTimeline = Boolean(message.assistantBlocks?.length);
   const hasVisibleNativeContent = message.assistantBlocks?.some(
@@ -280,8 +208,6 @@ export const MessageBubble = memo(function MessageBubble({
   const hasExecutionProcess = executionItems.length > 0 || visibleRuns.length > 0;
   const hasUnrestoredTranscript = useToolExecutionStore(
     (state) =>
-      (!hasNativeTimeline &&
-        executionItems.some((item) => item.type === 'thinking' && item.kind !== 'reasoning')) ||
       (message.transcriptTools?.some((record) => !transcriptToolExecution(record, state.tools)) ??
         false) ||
       displayedToolStatuses(message, executionItems, state.tools).some(
@@ -289,7 +215,8 @@ export const MessageBubble = memo(function MessageBubble({
       )
   );
   const hasBody = Boolean(message.content.trim());
-  let thinkingIndex = 0;
+
+  if (message.role === 'user' && message.agentInput) return <AgentInputMessage message={message} />;
 
   // A canonical tool record is not an assistant turn and cannot own Subagents,
   // regeneration or Fork. Its key addresses this display row only.
@@ -330,7 +257,7 @@ export const MessageBubble = memo(function MessageBubble({
   }
 
   return (
-    <div className="animate-fade-up py-3">
+    <div className={`animate-fade-up py-3 ${isUser ? 'ml-auto w-fit max-w-[85%]' : 'w-full'}`}>
       {/* Content */}
       <div className="min-w-0 space-y-2">
         {/* Images */}
@@ -468,22 +395,9 @@ export const MessageBubble = memo(function MessageBubble({
                 unrestored={hasUnrestoredTranscript}
                 toolFailureCount={toolFailureCount}
               >
-                {/* Thinking + tools */}
+                {/* canonical工具引用 */}
                 <div className="space-y-1">
                   {executionItems.map((item, i) => {
-                    if (item.type === 'thinking') {
-                      thinkingIndex++;
-                      return (
-                        <ThinkingSegment
-                          key={`think-${i}`}
-                          index={thinkingIndex}
-                          total={thinkingTotal}
-                          content={item.content}
-                          kind={item.kind}
-                          isStreaming={!executionCompleted}
-                        />
-                      );
-                    }
                     return (
                       <ToolExecutionGroup
                         key={`tools-${i}`}
@@ -561,17 +475,14 @@ export const MessageBubble = memo(function MessageBubble({
                         onClick={() => onRegenerate(message.id)}
                       />
                     )}
-                    {onFork &&
-                      !message.internalAgent &&
-                      (message.finalAnswerConfirmed === true ||
-                        (message.finalAnswerConfirmed == null && !hasNativeTimeline)) && (
-                        <ActionButton
-                          icon={<GitFork size={13} />}
-                          label="分叉会话"
-                          onClick={() => onFork(message.id)}
-                          disabled={forkDisabled || !executionCompleted}
-                        />
-                      )}
+                    {onFork && !message.internalAgent && message.finalAnswerConfirmed === true && (
+                      <ActionButton
+                        icon={<GitFork size={13} />}
+                        label="分叉会话"
+                        onClick={() => onFork(message.id)}
+                        disabled={forkDisabled || !executionCompleted}
+                      />
+                    )}
                   </div>
                 )}
               </div>

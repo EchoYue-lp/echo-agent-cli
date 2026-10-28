@@ -44,7 +44,8 @@ describe('chat and TaskRuntime lifecycle separation', () => {
 
     const message = useChatStore.getState().messages.find((entry) => entry.id === id);
     expect(message?.content).toBe('已检查当前实现，接下来运行验证。验证完成。');
-    expect(message?.thinkingSegments?.some((segment) => segment.content.trim())).toBe(false);
+    expect(message?.executionSteps).toEqual([]);
+    expect(message?.assistantBlocks).toBeUndefined();
     expect(message?.isStreaming).toBe(true);
   });
 

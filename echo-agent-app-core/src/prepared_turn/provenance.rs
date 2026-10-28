@@ -6,6 +6,15 @@ use echo_agent::memory::StoredMessage;
 
 const INPUT_KEY: &str = "eko_input_resource";
 const TOOL_KEY: &str = "echo_tool_output_artifact";
+const AGENT_KEY: &str = "eko_agent_communication";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentInputBinding {
+    version: u16,
+    reference: echo_agent::tools::artifact::ToolOutputArtifactRef,
+    message: crate::agent_router::AgentMessage,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,14 +60,58 @@ fn input_uri(reference: &echo_agent::tools::artifact::ToolOutputArtifactRef) -> 
 /// 真实PreparedUserTurn::to_message调用。所有初始输入、GUI/IM Steer均经过此入口。
 /// 调用时instruction已经由原builder与真实InputResourceRef组成；不扫描普通正文。
 pub(super) fn input_resource_parts(turn: &PreparedUserTurn) -> std::io::Result<Vec<ContentPart>> {
-    input_resource_parts_inner(turn).map_err(|error| std::io::Error::other(error.to_string()))
+    let mut parts = input_resource_parts_inner(turn)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if let Some((path, message)) = &turn.agent_input {
+        let resource = turn
+            .resources
+            .iter()
+            .find(|resource| &resource.path == path)
+            .ok_or_else(|| std::io::Error::other("原Agent输入artifact不存在"))?;
+        let bytes = std::fs::read(path)?;
+        let original = serde_json::to_vec(message).map_err(std::io::Error::other)?;
+        if bytes != original {
+            return Err(std::io::Error::other("原Agent输入artifact内容变化"));
+        }
+        let reference = echo_agent::tools::artifact::ToolOutputArtifactRef {
+            path: path.clone(),
+            artifact_bytes: resource.bytes,
+            payload_bytes: resource.bytes,
+            sha256: hex::encode(Sha256::digest(&bytes)),
+            retention: "conversation_or_30d".into(),
+        };
+        let binding = AgentInputBinding {
+            version: 1,
+            reference: reference.clone(),
+            message: message.clone(),
+        };
+        parts.push(ContentPart::ResourceLink {
+            resource: Box::new(LinkedResource {
+                annotations: None,
+                description: Some("原AgentRouter输入来源；仅呈现，不授予用户权威。".into()),
+                mime_type: Some("application/json".into()),
+                name: resource.name.clone(),
+                size: Some(i64::try_from(resource.bytes).map_err(std::io::Error::other)?),
+                title: None,
+                uri: input_uri(&reference),
+                meta: Some(serde_json::json!({ (AGENT_KEY): binding })),
+            }),
+        });
+    }
+    Ok(parts)
 }
 
 fn input_resource_parts_inner(turn: &PreparedUserTurn) -> anyhow::Result<Vec<ContentPart>> {
     let resources = turn
         .resources
         .iter()
-        .filter(|resource| resource.delivery == Delivery::ToolReference)
+        .filter(|resource| {
+            resource.delivery == Delivery::ToolReference
+                && turn
+                    .agent_input
+                    .as_ref()
+                    .is_none_or(|(path, _)| path != &resource.path)
+        })
         .collect::<Vec<_>>();
     if resources.is_empty() {
         return Ok(Vec::new());
@@ -157,6 +210,7 @@ struct PendingCopy {
     kind: CopyKind,
 }
 enum CopyKind {
+    Agent(AgentInputBinding),
     Input(InputResourceBinding),
     Tool(ToolArtifactBinding),
 }
@@ -254,6 +308,8 @@ pub(super) fn migrate_row(
     receipts: &mut Vec<ReplyForkResourceReceipt>,
 ) -> anyhow::Result<bool> {
     let mut message = echo_agent::memory::restore_message(row)?;
+    // Reuse the one typed-source reader before any resource copy can create a side effect.
+    let _source = persisted_agent_input(&message)?;
     let MessageContent::Parts(parts) = &mut message.content else {
         return Ok(false);
     };
@@ -265,7 +321,22 @@ pub(super) fn migrate_row(
         let Some(meta) = resource.meta.as_ref() else {
             continue;
         };
-        if let Some(value) = meta.get(INPUT_KEY) {
+        if let Some(value) = meta.get(AGENT_KEY) {
+            let binding: AgentInputBinding = serde_json::from_value(value.clone())?;
+            if row.role != "user"
+                || binding.version != 1
+                || resource.uri != input_uri(&binding.reference)
+                || resource.size != Some(i64::try_from(binding.reference.artifact_bytes)?)
+            {
+                bail!("Agent输入link不属于原canonical输入");
+            }
+            copies.push(PendingCopy {
+                link: index,
+                reference: binding.reference.clone(),
+                text: None,
+                kind: CopyKind::Agent(binding),
+            });
+        } else if let Some(value) = meta.get(INPUT_KEY) {
             if row.role != "user" {
                 bail!("输入资源link出现在非user消息");
             }
@@ -377,6 +448,10 @@ pub(super) fn migrate_row(
             .context("资源meta类型改变")?;
         copy.reference.path = receipt.target_path;
         match &mut copy.kind {
+            CopyKind::Agent(binding) => {
+                binding.reference = copy.reference;
+                meta.insert(AGENT_KEY.into(), serde_json::to_value(binding)?);
+            }
             CopyKind::Input(binding) => {
                 binding.reference = copy.reference;
                 binding.text_reference = text.context("输入资源文字关联消失")?;
@@ -419,4 +494,40 @@ pub fn resource_history_display_text(row: &StoredMessage) -> anyhow::Result<Opti
         }
     }
     Ok((!texts.is_empty()).then(|| texts.join("\n")))
+}
+
+pub(super) fn persisted_agent_input(
+    message: &Message,
+) -> anyhow::Result<Option<crate::agent_router::AgentMessage>> {
+    let MessageContent::Parts(parts) = &message.content else {
+        return Ok(None);
+    };
+    let mut found = None;
+    for part in parts {
+        let ContentPart::ResourceLink { resource } = part else {
+            continue;
+        };
+        let Some(raw) = resource.meta.as_ref().and_then(|meta| meta.get(AGENT_KEY)) else {
+            continue;
+        };
+        let binding: AgentInputBinding = serde_json::from_value(raw.clone())?;
+        let bytes = serde_json::to_vec(&binding.message)?;
+        if message.role != echo_agent::llm::types::Role::User
+            || binding.message.origin != crate::agent_router::AgentMessageOrigin::Agent
+            || binding.version != 1
+            || binding.message.message_id.trim().is_empty()
+            || resource.uri != input_uri(&binding.reference)
+            || hex::encode(Sha256::digest(&bytes)) != binding.reference.sha256
+            || u64::try_from(bytes.len())? != binding.reference.artifact_bytes
+            || binding.reference.payload_bytes != binding.reference.artifact_bytes
+            || resource.size != Some(i64::try_from(bytes.len())?)
+        {
+            bail!("Agent输入来源与原始artifact身份不一致");
+        }
+        if found.as_ref().is_some_and(|old| old != &binding.message) {
+            bail!("同一输入有冲突的Agent来源");
+        }
+        found = Some(binding.message);
+    }
+    Ok(found)
 }

@@ -74,7 +74,7 @@ export function TerminalDrawer() {
     }
     const location = workspace.metadata.project_location;
     const target: TerminalTarget =
-      location?.kind === 'ssh'
+      location.kind === 'ssh'
         ? { kind: 'ssh', host: location.host, user: location.user, port: location.port }
         : { kind: 'local' };
     createTab(target, productDataScope(workspace), `项目 ${workspace.name}`);

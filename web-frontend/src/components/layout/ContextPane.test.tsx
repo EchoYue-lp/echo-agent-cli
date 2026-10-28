@@ -137,7 +137,7 @@ describe('ContextPane', () => {
       name: '项目',
       root: '/local/data',
       kind: { type: 'coding' },
-      metadata: { tags: [] },
+      metadata: { tags: [], project_location: { kind: 'local' as const, path: '/local/data' } },
       product_data_generation: 'generation-a',
       created_at: '2026-10-25T00:00:00Z',
       last_active: '2026-10-25T00:00:00Z',

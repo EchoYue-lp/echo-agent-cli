@@ -134,7 +134,8 @@ impl WorkspaceRegistry {
         kind: WorkspaceKind,
         root: PathBuf,
     ) -> anyhow::Result<Workspace> {
-        self.create_at_with_location(name, kind, root, None, None)
+        let location = ProjectLocation::Local { path: root.clone() };
+        self.create_at_with_location(name, kind, root, location, None)
     }
 
     /// Publish a project using the same manifest/index authority, keeping EKO
@@ -151,7 +152,7 @@ impl WorkspaceRegistry {
             name,
             kind,
             self.default_root(name),
-            Some(location),
+            location,
             execution_location,
         )
     }
@@ -219,7 +220,7 @@ impl WorkspaceRegistry {
         name: &str,
         kind: WorkspaceKind,
         root: PathBuf,
-        location: Option<ProjectLocation>,
+        location: ProjectLocation,
         execution_location: Option<ProjectLocation>,
     ) -> anyhow::Result<Workspace> {
         let id = WorkspaceId::from_name(name);
@@ -251,16 +252,15 @@ impl WorkspaceRegistry {
             name: name.to_string(),
             root: root.clone(),
             project_root: match &location {
-                Some(ProjectLocation::Local { path }) => Some(path.clone()),
+                ProjectLocation::Local { path } => Some(path.clone()),
                 _ => None,
             },
             kind,
-            metadata: WorkspaceMetadata::default(),
+            metadata: WorkspaceMetadata::new(location),
             product_data_generation: String::new(),
             created_at: now,
             last_active: now,
         };
-        workspace.metadata.project_location = location;
         workspace.metadata.project_execution_location = execution_location;
         workspace.refresh_product_data_generation();
 
@@ -407,8 +407,7 @@ impl WorkspaceRegistry {
 
     /// 删除工作区。
     ///
-    /// Remove EKO state and its index entry, preserving project code even for
-    /// legacy workspaces that stored code next to application data.
+    /// 仅删除本产品状态与索引；产品数据与用户文件同目录时仍保护用户代码。
     pub fn delete(&self, id: &WorkspaceId) -> anyhow::Result<()> {
         let index = self.load_index()?;
         let root = index
@@ -433,9 +432,8 @@ impl WorkspaceRegistry {
                 // The Workspace owns its link, never the linked directory.
                 fs::remove_file(&state_dir)?;
             } else {
-                // Legacy roots may mix product data with project rules and
-                // user extensions. Remove known product data, preserving
-                // project.md/local.md, Skills/Subagents and unknown content.
+                // 本地目录可能混有用户规则和扩展；只删除已知产品数据，
+                // 保留 project.md/local.md、Skills/Subagents 与未知内容。
                 for directory in [
                     "sessions",
                     "conversations",
@@ -511,7 +509,7 @@ impl WorkspaceRegistry {
                 .ok_or_else(|| anyhow::anyhow!("Project-root revision overflow"))?;
         }
         workspace.project_root = Some(canonical);
-        workspace.metadata.project_location = Some(location);
+        workspace.metadata.project_location = location;
         workspace.metadata.project_execution_location = None;
         workspace.refresh_product_data_generation();
         self.save_manifest(&workspace)?;
@@ -668,6 +666,44 @@ mod tests {
         std::fs::write(&file, "not a project directory")?;
 
         assert!(registry.link_project(&workspace.id, file).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn every_current_constructor_persists_explicit_location() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(tmp.path().join("registry"))?;
+        let default = registry.create("current-default", WorkspaceKind::General)?;
+        assert_eq!(
+            default.project_location(),
+            ProjectLocation::Local {
+                path: default.root.clone()
+            }
+        );
+        let custom_root = tmp.path().join("custom-data");
+        let custom = registry.create_at(
+            "current-custom",
+            WorkspaceKind::General,
+            custom_root.clone(),
+        )?;
+        assert_eq!(
+            custom.project_location(),
+            ProjectLocation::Local { path: custom_root }
+        );
+        for workspace in [default, custom] {
+            let raw = std::fs::read_to_string(WorkspaceLayout::manifest(&workspace.root))?;
+            let value: serde_json::Value = serde_json::from_str(&raw)?;
+            assert!(
+                value
+                    .get("metadata")
+                    .and_then(|value| value.get("project_location"))
+                    .is_some()
+            );
+            assert_eq!(
+                registry.inspect(&workspace.id)?.project_location(),
+                workspace.project_location()
+            );
+        }
         Ok(())
     }
 
@@ -914,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_legacy_default_workspace_preserves_user_code() -> anyhow::Result<()> {
+    fn deleting_current_default_workspace_preserves_user_code() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let registry = WorkspaceRegistry::with_base_dir(temp.path().to_path_buf())?;
         let workspace = registry.create("legacy", WorkspaceKind::General)?;

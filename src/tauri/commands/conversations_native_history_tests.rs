@@ -1462,6 +1462,18 @@ mod resource_chain_acceptance {
         mode: NativeFixtureMode,
         source_rows: SourceRows,
     ) -> anyhow::Result<Seed> {
+        seed_and_close_with_model_mode(workspace, log_path, conversation, mode, source_rows, true)
+            .await
+    }
+
+    async fn seed_and_close_with_model_mode(
+        workspace: &core::workspace::Workspace,
+        log_path: &Path,
+        conversation: &str,
+        mode: NativeFixtureMode,
+        source_rows: SourceRows,
+        model_streaming: bool,
+    ) -> anyhow::Result<Seed> {
         use core::workspace::layout::WorkspaceLayout;
         let artifacts = WorkspaceLayout::artifacts(&workspace.root);
         let raw = format!("{}\n原文完整尾部🙂", "原始用户中文🙂\n".repeat(6000));
@@ -1509,6 +1521,7 @@ mod resource_chain_acceptance {
         let model = Arc::new(ResourceChainModel(AtomicUsize::new(0), mode));
         let mut builder = ReactAgentBuilder::new()
             .llm_client(model.clone())
+            .model_streaming(model_streaming)
             .auto_project_rules(false)
             .conversation_id(conversation)
             .conversation_store(store.clone())
@@ -2313,7 +2326,9 @@ mod resource_chain_acceptance {
             "正文由普通native进度块呈现，不复制成聚合final"
         );
         assert!(
-            view.thinking_segments.as_ref().is_none_or(Vec::is_empty),
+            serde_json::to_value(&view)?
+                .get("thinking_segments")
+                .is_none(),
             "普通进度不能进入reasoning区"
         );
         let steps = view
@@ -2506,6 +2521,23 @@ mod resource_chain_acceptance {
         source_rows: SourceRows,
         unprojected_history_records: Option<u64>,
     ) -> anyhow::Result<()> {
+        complete_chain_with_model_mode(
+            destination,
+            mode,
+            source_rows,
+            unprojected_history_records,
+            true,
+        )
+        .await
+    }
+
+    async fn complete_chain_with_model_mode(
+        destination: ReplyForkDestination,
+        mode: NativeFixtureMode,
+        source_rows: SourceRows,
+        unprojected_history_records: Option<u64>,
+        model_streaming: bool,
+    ) -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let repo = code_fixture(root.path())?;
         let registry = Arc::new(core::workspace::registry::WorkspaceRegistry::with_base_dir(
@@ -2519,8 +2551,15 @@ mod resource_chain_acceptance {
         let source = registry.link_project(&source.id, repo.clone())?;
         let source_id = "resource-source-conversation";
         let log_path = root.path().join("events");
-        let seed =
-            seed_and_completely_close(&source, &log_path, source_id, mode, source_rows).await?;
+        let seed = seed_and_close_with_model_mode(
+            &source,
+            &log_path,
+            source_id,
+            mode,
+            source_rows,
+            model_streaming,
+        )
+        .await?;
         if let Some(records) = unprojected_history_records {
             prepare_unprojected_cold_history_fixture(
                 &log_path,
@@ -2993,7 +3032,11 @@ mod resource_chain_acceptance {
                 view.content.is_none(),
                 "进度不得再复制聚合content作为最终正文"
             );
-            assert!(view.thinking_segments.as_ref().is_none_or(Vec::is_empty));
+            assert!(
+                serde_json::to_value(&view)?
+                    .get("thinking_segments")
+                    .is_none()
+            );
             let actual = view.assistant_blocks.as_deref().context("合法进度丢失")?;
             assert_eq!(actual.len(), expected.len());
             for (actual, expected) in actual.iter().zip(&expected) {
@@ -3964,6 +4007,47 @@ mod resource_chain_acceptance {
             NativeFixtureMode::EmptyApproved,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn reply_fork_nonstreaming_driver_cold_store_current_target_import_and_refork()
+    -> anyhow::Result<()> {
+        complete_chain_with_model_mode(
+            ReplyForkDestination::CurrentWorkspace,
+            NativeFixtureMode::Original,
+            SourceRows::Untouched,
+            None,
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn reply_fork_nonstreaming_driver_cold_store_worktree_import_and_refork()
+    -> anyhow::Result<()> {
+        complete_chain_with_model_mode(
+            ReplyForkDestination::NewWorktree,
+            NativeFixtureMode::Original,
+            SourceRows::Untouched,
+            None,
+            false,
+        )
+        .await
+    }
+
+    #[test]
+    fn reply_fork_plain_text_without_original_native_identity_is_rejected() {
+        let message = Message::assistant("字符串不能证明最终发布".into());
+        assert!(
+            validated_reply_fork_publication_events(
+                &message,
+                "source-workspace",
+                "source-conversation",
+                &[],
+            )
+            .is_err(),
+            "无原publication/actual status的文本不能作为已确认Fork来源"
+        );
     }
 
     #[tokio::test]

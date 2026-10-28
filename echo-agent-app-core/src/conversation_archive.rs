@@ -93,7 +93,18 @@ pub(crate) fn committed_internal_turn_ids(
     }
     let mut matching = Vec::new();
     for (index, message) in messages.iter().enumerate().skip(intent.start_index) {
-        if message.role != "user" || message.content.as_deref() != Some(instruction) {
+        if message.role != "user" {
+            continue;
+        }
+        let canonical =
+            echo_agent::memory::restore_message(message).map_err(|error| error.to_string())?;
+        let source = crate::prepared_turn::persisted_agent_input(&canonical)
+            .map_err(|error| error.to_string())?;
+        let matches_intent = match source {
+            Some(input) => crate::state::render_agent_delivery_instruction(&input) == instruction,
+            None => message.content.as_deref() == Some(instruction),
+        };
+        if !matches_intent {
             continue;
         }
         let created_at = DateTime::parse_from_rfc3339(&message.created_at)

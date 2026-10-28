@@ -254,14 +254,6 @@ pub fn task_runtime_projection_registry() -> Arc<TaskRuntimeProjectionRegistry> 
 }
 
 impl PreModelContextProjector for TaskRuntimeContextProjector {
-    fn recovered_tool_origins<'a>(
-        &'a self,
-        context: &'a ProjectionContext,
-        messages: &'a [Message],
-    ) -> BoxFuture<'a, AgentResult<Vec<echo_agent::compression::RecoveredToolOrigin>>> {
-        crate::legacy_eko_history::recovered_tool_origins(context, messages)
-    }
-
     fn validate_model_request<'a>(
         &'a self,
         context: &'a ProjectionContext,

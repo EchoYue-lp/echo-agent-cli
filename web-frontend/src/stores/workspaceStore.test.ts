@@ -81,7 +81,10 @@ function workspace(id: string, name: string, generation: string): Workspace {
     product_data_generation: generation,
     root: `/product-data/${id}`,
     kind: { type: 'code' },
-    metadata: { tags: [] },
+    metadata: {
+      tags: [],
+      project_location: { kind: 'local' as const, path: `/product-data/${id}` },
+    },
     created_at: '',
     last_active: '',
   };
@@ -401,7 +404,7 @@ describe('workspaceStore file identity integration', () => {
         ...workspace('workspace-a', 'Workspace A', 'generation-a'),
         root: '/workspace-a',
         kind: { type: 'code' },
-        metadata: { tags: [] },
+        metadata: { tags: [], project_location: { kind: 'local' as const, path: '/workspace-a' } },
         created_at: '',
         last_active: '',
       },

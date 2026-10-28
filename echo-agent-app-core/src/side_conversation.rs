@@ -776,8 +776,6 @@ fn strip_conversation_local_ui(raw: Option<String>) -> Option<String> {
         return Some(raw);
     };
     object.remove("message_id");
-    object.remove("execution_steps");
-    object.remove("execution_rounds");
     serde_json::to_string(&value).ok().or(Some(raw))
 }
 

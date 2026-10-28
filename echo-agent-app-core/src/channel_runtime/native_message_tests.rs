@@ -1036,3 +1036,125 @@ async fn native_clean_execution_tail_publishes_one_confirmed_answer_through_orig
     assert!(!delivered.concat().contains("unconfirmed-tail-candidate"));
     Ok(())
 }
+
+/// 原HITL provider与原renderer共享同一个foreground；物理收尾不由展示事件推断。
+#[tokio::test]
+async fn native_hitl_response_target_and_settled_status_keep_original_foreground()
+-> anyhow::Result<()> {
+    use crate::hitl::{ChannelHumanLoopProvider, ChannelHumanLoopResolution};
+    use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
+    for channel in ["weixin", "qqbot", "feishu"] {
+        let hitl = ChannelHumanLoopProvider::new();
+        let prompts = hitl.subscribe_prompts();
+        let (driver_tx, driver_rx) = tokio::sync::mpsc::channel(4);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let cancel = CancellationToken::new();
+        let events = super::channel_render_event_stream(
+            driver_rx,
+            prompts,
+            terminal_rx,
+            super::ChannelStreamDropGuard(cancel.clone()),
+        );
+        let mut output = aggregate_by_sentence(
+            events,
+            channel.into(),
+            "local-test".into(),
+            ChatType::Direct,
+        )
+        .await;
+        driver_tx
+            .try_send(ChannelRenderEvent::Driver(execution_event(
+                "physical-stream",
+                "physical-turn",
+                "physical-execution",
+                1,
+                AgentEvent::ExecutionStatus(echo_agent::agent::ExecutionStatus {
+                    execution_id: "physical-execution".into(),
+                    request_id: Some("native-request-original".into()),
+                    sequence: 1,
+                    phase: AgentEvent::Cancelled.phase(),
+                    status: echo_agent::agent::ExecutionStatusKind::Settled,
+                    reason: None,
+                    adapter_generated: false,
+                }),
+            )?))
+            .map_err(|_| anyhow::anyhow!("original renderer receiver closed"))?;
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+            .await?
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("settled status missing"))?;
+        assert!(settled.text.contains("[execution:physical-execution]"));
+        assert!(!cancel.is_cancelled());
+
+        let mut request = HumanLoopRequest::input("确认原生任务继续🙂");
+        request.request_id = Some("native-request-original".into());
+        // 不改现300s上限，也不实际等待；直接poll原future完成真实注册。
+        let pending = hitl.request(request);
+        futures::pin_mut!(pending);
+        assert!(pending.as_mut().now_or_never().is_none());
+        let prompt = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+            .await?
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("original HITL prompt missing"))?;
+        let response_target = prompt
+            .text
+            .split("Use /reply ")
+            .nth(1)
+            .and_then(|text| text.split_whitespace().next())
+            .ok_or_else(|| anyhow::anyhow!("original response_target missing"))?;
+        assert_ne!(response_target, "native-request-original");
+        assert!(matches!(
+            hitl.try_resolve_message("/reply native-request-original continue"),
+            ChannelHumanLoopResolution::Rejected(_)
+        ));
+        assert!(pending.as_mut().now_or_never().is_none());
+        driver_tx
+            .try_send(ChannelRenderEvent::Driver(execution_event(
+                "physical-stream",
+                "physical-turn",
+                "physical-execution",
+                2,
+                block(
+                    AssistantPhase::FinalAnswer,
+                    "unconfirmed-native-candidate",
+                    2,
+                    true,
+                ),
+            )?))
+            .map_err(|_| anyhow::anyhow!("original renderer receiver closed"))?;
+        assert!(output.next().now_or_never().is_none());
+        assert!(matches!(
+            hitl.try_resolve_message(&format!("/reply {response_target} continue")),
+            ChannelHumanLoopResolution::Resolved(_)
+        ));
+        assert!(matches!(pending.await?, HumanLoopResponse::Text(text) if text == "continue"));
+        driver_tx
+            .try_send(ChannelRenderEvent::Driver(execution_event(
+                "physical-stream",
+                "physical-turn",
+                "physical-execution",
+                3,
+                AgentEvent::FinalAnswer("original runtime confirmed answer🙂".into()),
+            )?))
+            .map_err(|_| anyhow::anyhow!("original renderer receiver closed"))?;
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+            .await?
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("confirmed answer missing"))?;
+        assert_eq!(answer.text, "original runtime confirmed answer🙂");
+        assert!(output.next().now_or_never().is_none());
+        assert!(!cancel.is_cancelled());
+        terminal_tx
+            .send(Ok(TurnOutcome::Completed))
+            .map_err(|_| anyhow::anyhow!("original terminal receiver closed"))?;
+        assert!(output.next().now_or_never().is_none(), "必须先排空原driver");
+        drop(driver_tx);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+                .await?
+                .is_none()
+        );
+        assert!(cancel.is_cancelled());
+    }
+    Ok(())
+}

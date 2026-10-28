@@ -28,20 +28,14 @@ describe('聊天正文与空消息投影', () => {
   it('已结束的空 canonical assistant 行不会留下机器人或消息空壳', () => {
     const { container, rerender } = render(<MessageBubble message={emptyReply} />);
     expect(container.childElementCount).toBe(0);
-    rerender(
-      <MessageBubble
-        message={{ ...emptyReply, content: ' \n\t ', thinkingSegments: [{ content: ' ' }] }}
-      />
-    );
-    expect(container.childElementCount).toBe(0);
-    rerender(<MessageBubble message={{ ...emptyReply, thinkingContent: ' \n\t ' }} />);
+    rerender(<MessageBubble message={{ ...emptyReply, content: ' \n\t ' }} />);
     expect(container.childElementCount).toBe(0);
   });
 
   it('多条空记录之后仍保留正文与操作，不绘制机器人列', () => {
     const messages: ChatMessage[] = [
       ...Array.from({ length: 4 }, (_, index) => ({ ...emptyReply, id: `empty-${index}` })),
-      { ...emptyReply, id: 'final', content: '真实结果 中文 🧭' },
+      { ...emptyReply, id: 'final', content: '真实结果 中文 🧭', finalAnswerConfirmed: true },
     ];
     const regenerate = vi.fn();
     const fork = vi.fn();
@@ -111,29 +105,30 @@ describe('聊天正文与空消息投影', () => {
     expect(screen.getByText('failed', { exact: true })).toBeDefined();
   });
 
-  it('旧思考没有原生来源证明时显示历史执行说明并保留折叠详情', () => {
-    render(
-      <MessageBubble
-        message={{ ...emptyReply, thinkingSegments: [{ content: '需要保留的思考' }] }}
-      />
-    );
-    expect(screen.getByText('历史执行状态未恢复', { exact: true })).toBeDefined();
-    expect(screen.queryByText('已完成', { exact: true })).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: '展开执行过程' }));
-    fireEvent.click(screen.getByRole('button', { name: '展开历史执行说明' }));
-    expect(screen.getByText('需要保留的思考')).toBeDefined();
-  });
-
-  it('显式 provider reasoning 保留思考标签，不与旧执行说明混淆', () => {
+  it('原生Reasoning始终从typed块显示，不需要旧字符串思考投影', () => {
     render(
       <MessageBubble
         message={{
           ...emptyReply,
-          thinkingSegments: [{ content: '原生推理摘要', kind: 'reasoning' }],
+          assistantBlocks: [
+            {
+              block: {
+                block_id: 'reasoning',
+                request_id: 'request-native',
+                sequence: 0,
+                phase: 'reasoning',
+                delta: '原生推理摘要',
+                complete: true,
+                provider: 'fixture',
+                reasoning: null,
+              },
+              content: '原生推理摘要',
+            },
+          ],
+          executionSteps: [{ type: 'assistant', index: 0 }],
         }}
       />
     );
-    fireEvent.click(screen.getByRole('button', { name: '展开执行过程' }));
     expect(screen.queryByRole('button', { name: '展开历史执行说明' })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: '展开思考' }));
     expect(screen.getByText('原生推理摘要')).toBeDefined();

@@ -48,7 +48,7 @@ function workspace(id: string): Workspace {
     name: id,
     root: `/${id}`,
     kind: { type: 'general' },
-    metadata: { tags: [] },
+    metadata: { tags: [], project_location: { kind: 'local' as const, path: `/${id}` } },
     product_data_generation: 'workspace-a-generation',
     created_at: '2026-08-24T00:00:00Z',
     last_active: '2026-08-24T00:00:00Z',

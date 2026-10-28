@@ -1,6 +1,13 @@
+import {
+  agentInputMessages,
+  withAgentInputs,
+  type AgentCommunicationInput,
+} from '../../lib/agentCommunication';
+import { useAgentCommunicationInputs } from '../../hooks/useAgentCommunicationInputs';
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useChatStore } from '../../stores/chatStore';
 import { MessageBubble } from './MessageBubble';
+import { nativeAssistantBlockText } from './NativeMessageTimeline';
 import { ReplyForkDialog, type ReplyForkSource } from './ReplyForkDialog';
 import { ExecutionStatus } from './ExecutionStatus';
 import { HitlDialog } from './HitlDialog';
@@ -48,6 +55,8 @@ import type { ConfiguredModel, TaskRun } from '../../generated';
 function useChatTransport() {
   return useTauriChat();
 }
+
+const EMPTY_AGENT_INPUTS: AgentCommunicationInput[] = [];
 
 export function ChatPanel() {
   const messages = useChatStore((s) => s.messages);
@@ -138,6 +147,27 @@ export function ChatPanel() {
     };
   }, [activeSideConversationId]);
 
+  const agentInputBinding = useAgentCommunicationInputs(
+    useConversationStore((state) => state.workspaceId),
+    activeConversationId
+  );
+  const agentInputs = useChatStore((state) =>
+    state.agentInputsBinding === agentInputBinding ? state.agentInputs : EMPTY_AGENT_INPUTS
+  );
+  const agentInputReadError = useChatStore((state) =>
+    state.agentInputReadError?.binding === agentInputBinding
+      ? state.agentInputReadError.message
+      : null
+  );
+  const timelineMessages = withAgentInputs(
+    messages,
+    agentInputMessages(
+      agentInputs,
+      useConversationStore((state) => state.workspaceId),
+      activeConversationId ?? ''
+    )
+  );
+
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
@@ -195,8 +225,6 @@ export function ChatPanel() {
       const prefix = chatStore.messages.slice(0, userMessageIndex).map((message, index) => ({
         ...message,
         id: `loaded-${branch.id}-${index}`,
-        executionSteps: undefined,
-        executionRounds: undefined,
       }));
       chatStore.replaceMessages(prefix);
       useToolExecutionStore.getState().clear();
@@ -264,9 +292,11 @@ export function ChatPanel() {
 
   useEffect(() => {
     if (isNearBottomRef.current && bottomRef.current) {
-      bottomRef.current.scrollIntoView({ behavior: isStreaming ? 'auto' : 'smooth' });
+      bottomRef.current.scrollIntoView({
+        behavior: isStreaming ? 'auto' : 'smooth',
+      });
     }
-  }, [messages, pendingHitlRequest, isStreaming]);
+  }, [messages, agentInputs, pendingHitlRequest, isStreaming]);
 
   const openPrimaryWorkbench = (view: 'analysis' | 'research' | 'workflow' | 'extract') => {
     useUiStore.getState().beginNavigation();
@@ -538,18 +568,26 @@ export function ChatPanel() {
               isStreaming={isStreaming}
               onCancel={cancel}
               queuedCount={queuedInputs.length}
-              home={messages.length === 0}
+              home={timelineMessages.length === 0}
             />
           </div>
         }
       >
-        {messages.length === 0 ? (
+        {agentInputReadError && (
+          <div
+            role="status"
+            className="mx-auto max-w-[980px] px-4 pt-2 text-xs text-[var(--color-error)]"
+          >
+            跨会话消息读取失败，已有记录保留：{agentInputReadError}
+          </div>
+        )}
+        {timelineMessages.length === 0 ? (
           <WelcomeScreen />
         ) : (
           <div className="mx-auto w-full max-w-[980px] px-4 sm:px-6 lg:px-8">
             <div className="space-y-1 pb-6 pt-5">
-              {messages.map((msg, idx) => {
-                const prevMsg = idx > 0 ? messages[idx - 1] : null;
+              {timelineMessages.map((msg, idx) => {
+                const prevMsg = idx > 0 ? timelineMessages[idx - 1] : null;
                 const showSeparator =
                   idx === 0 ||
                   (prevMsg &&
@@ -596,9 +634,10 @@ export function ChatPanel() {
                     m.isStreaming &&
                     (m.content.trim() ||
                       m.assistantBlocks?.some(
-                        (view) => view.content.trim() && view.block.phase !== 'final_answer'
-                      ) ||
-                      m.thinkingSegments?.some((segment) => segment.content.trim()))
+                        (view) =>
+                          view.block.phase !== 'final_answer' &&
+                          nativeAssistantBlockText(view).trim()
+                      ))
                 ) && (
                   <div className="flex items-center gap-3 px-1 py-3">
                     <div className="spinner" />
@@ -633,7 +672,7 @@ export function ChatPanel() {
 
 // Only the final visible message of a user turn can offer Fork. The backend
 // independently verifies its canonical prefix and replacement admission.
-function completedReplyForks(messages: readonly ChatMessage[]): Map<string, number> {
+export function completedReplyForks(messages: readonly ChatMessage[]): Map<string, number> {
   const replies = new Map<string, number>();
   let userTurnIndex = -1;
   let lastVisible: ChatMessage | undefined;
@@ -811,7 +850,10 @@ function GoalBar({
       }
     } catch (error) {
       if (ownsView())
-        setNotice({ text: error instanceof Error ? error.message : String(error), failed: true });
+        setNotice({
+          text: error instanceof Error ? error.message : String(error),
+          failed: true,
+        });
     } finally {
       if (mounted.current && operation.current === token) {
         operation.current = null;
@@ -840,7 +882,10 @@ function GoalBar({
       });
     } catch (error) {
       if (ownsView())
-        setNotice({ text: error instanceof Error ? error.message : String(error), failed: true });
+        setNotice({
+          text: error instanceof Error ? error.message : String(error),
+          failed: true,
+        });
     } finally {
       if (mounted.current && operation.current === token) {
         operation.current = null;
@@ -1246,7 +1291,10 @@ function QueuedInputList({
                 <button
                   type="button"
                   onClick={() => {
-                    setEditing({ id: item.id, version: queuedInputVersion(item) });
+                    setEditing({
+                      id: item.id,
+                      version: queuedInputVersion(item),
+                    });
                     setEditingText(item.text);
                     setFeedback(null);
                   }}

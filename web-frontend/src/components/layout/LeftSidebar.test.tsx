@@ -79,7 +79,7 @@ const workspace = (id: string): Workspace => ({
   root: `/product-data/${id}`,
   project_root: `/code/${id}`,
   kind: { type: 'code' },
-  metadata: { tags: [] },
+  metadata: { tags: [], project_location: { kind: 'local' as const, path: `/code/${id}` } },
   product_data_generation: `${id}-v1`,
   created_at: '',
   last_active: id,

@@ -500,10 +500,12 @@ mod model_mutation_tests {
                 .switch_workspace(Workspace {
                     id: crate::workspace::WorkspaceId::from_name(&name),
                     name,
-                    root,
+                    root: root.clone(),
                     project_root: None,
                     kind: crate::workspace::WorkspaceKind::General,
-                    metadata: crate::workspace::WorkspaceMetadata::default(),
+                    metadata: crate::workspace::WorkspaceMetadata::new(
+                        crate::workspace::ProjectLocation::Local { path: root.clone() },
+                    ),
                     product_data_generation: String::new(),
                     created_at: Utc::now(),
                     last_active: Utc::now(),
@@ -544,6 +546,175 @@ mod model_mutation_tests {
     }
 
     #[tokio::test]
+    async fn tool_choice_keeps_inflight_snapshot_and_only_changes_next_invocation()
+    -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let primary = fixture.state.connection.primary_agent();
+        let original = primary
+            .read(echo_agent::agent::AgentRunSnapshot::from_agent)
+            .await;
+        assert!(
+            original
+                .tools
+                .tools_for_llm()
+                .iter()
+                .any(|tool| tool.function.name == "shell")
+        );
+        let disabled = fixture
+            .state
+            .set_tool_enabled(&primary, "shell", false)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(!disabled.policy_enabled);
+        let later = primary
+            .read(echo_agent::agent::AgentRunSnapshot::from_agent)
+            .await;
+        assert!(
+            !later
+                .tools
+                .tools_for_llm()
+                .iter()
+                .any(|tool| tool.function.name == "shell")
+        );
+        assert!(
+            original
+                .tools
+                .tools_for_llm()
+                .iter()
+                .any(|tool| tool.function.name == "shell"),
+            "设置不得热改原执行已捕获的工具选择"
+        );
+        let enabled = fixture
+            .state
+            .set_tool_enabled(&primary, "shell", true)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(enabled.revision > disabled.revision);
+        assert!(
+            !later
+                .tools
+                .tools_for_llm()
+                .iter()
+                .any(|tool| tool.function.name == "shell"),
+            "后继开启也不能改写先前已禁用的快照"
+        );
+        let newest = primary
+            .read(echo_agent::agent::AgentRunSnapshot::from_agent)
+            .await;
+        assert!(
+            newest
+                .tools
+                .tools_for_llm()
+                .iter()
+                .any(|tool| tool.function.name == "shell")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_choice_enable_does_not_widen_readonly_positive_invocation_bound()
+    -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let primary = fixture.state.connection.primary_agent();
+        fixture
+            .state
+            .set_tool_enabled(&primary, "shell", false)
+            .await
+            .map_err(|error| error.to_string())?;
+        fixture
+            .state
+            .set_tool_enabled(&primary, "shell", true)
+            .await
+            .map_err(|error| error.to_string())?;
+        let invocation = echo_agent::agent::AgentInvocationContext {
+            allowed_tools: Some(std::collections::HashSet::from([
+                "read_artifact".to_string()
+            ])),
+            tool_access: Some(echo_agent::tools::ToolAccess::ReadOnly),
+            ..Default::default()
+        };
+        let bounded = primary
+            .read(|agent| {
+                echo_agent::agent::AgentRunSnapshot::from_agent_with_invocation(agent, &invocation)
+            })
+            .await;
+        let names = bounded
+            .tools
+            .tools_for_llm()
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["read_artifact".to_string()],
+            "GUI选择不得把系统必需或已启用shell加入原只读正上界以外"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_product_tool_control_rejects_required_before_policy_mutation()
+    -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let primary = fixture.state.connection.primary_agent();
+        primary
+            .write(|agent| {
+                if !agent.tool_names().iter().any(|name| name == "task_create") {
+                    agent.add_tool(Box::new(echo_agent::testing::MockTool::new("task_create")));
+                }
+            })
+            .await;
+        let before = fixture
+            .state
+            .tool_control
+            .snapshot()
+            .map_err(|error| error.to_string())?;
+        let rejected = fixture
+            .state
+            .set_tool_enabled(&primary, "task_create", false)
+            .await;
+        assert!(
+            matches!(rejected, Err(crate::tool_control::ToolControlError::Required { name, .. }) if name == "task_create")
+        );
+        let after = fixture
+            .state
+            .tool_control
+            .snapshot()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(before.revision, after.revision);
+        assert_eq!(before.disabled_tools, after.disabled_tools);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn product_tool_scope_rejects_stale_focus_and_keeps_original_publication_guard()
+    -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        assert!(
+            fixture
+                .state
+                .tool_control_runtime_for_scope("foreign", "global")
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .state
+                .tool_control_runtime_for_scope("global", "stale")
+                .await
+                .is_err()
+        );
+        let (publication, _runtime) = fixture
+            .state
+            .tool_control_runtime_for_scope("global", "global")
+            .await?;
+        assert!(fixture.state.workspace.transition.try_write().is_err());
+        drop(publication);
+        assert!(fixture.state.workspace.transition.try_write().is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn tool_control_generation_reaches_loaded_and_future_workspace_agents()
     -> Result<(), String> {
         let fixture = fixture(valid_config()?, false).await?;
@@ -562,10 +733,12 @@ mod model_mutation_tests {
                 .switch_workspace(Workspace {
                     id: crate::workspace::WorkspaceId::from_name(&name),
                     name,
-                    root,
+                    root: root.clone(),
                     project_root: None,
                     kind: crate::workspace::WorkspaceKind::General,
-                    metadata: crate::workspace::WorkspaceMetadata::default(),
+                    metadata: crate::workspace::WorkspaceMetadata::new(
+                        crate::workspace::ProjectLocation::Local { path: root.clone() },
+                    ),
                     product_data_generation: String::new(),
                     created_at: Utc::now(),
                     last_active: Utc::now(),
@@ -3132,10 +3305,12 @@ mod workspace_transition_tests {
         Workspace {
             id: crate::workspace::WorkspaceId::from_name(name),
             name: name.to_string(),
-            root,
+            root: root.clone(),
             project_root: None,
             kind: crate::workspace::WorkspaceKind::General,
-            metadata: crate::workspace::WorkspaceMetadata::default(),
+            metadata: crate::workspace::WorkspaceMetadata::new(
+                crate::workspace::ProjectLocation::Local { path: root.clone() },
+            ),
             product_data_generation: String::new(),
             created_at: Utc::now(),
             last_active: Utc::now(),

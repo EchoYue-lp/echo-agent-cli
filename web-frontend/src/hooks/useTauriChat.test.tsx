@@ -572,7 +572,7 @@ describe('useTauriChat foreground turn recovery', () => {
         name: 'original',
         root: '/original',
         kind: { type: 'coding' },
-        metadata: { tags: [] },
+        metadata: { tags: [], project_location: { kind: 'local' as const, path: '/original' } },
         product_data_generation: 'generation-a',
         created_at: '2026-10-25T00:00:00Z',
         last_active: '2026-10-25T00:00:00Z',
@@ -610,7 +610,7 @@ describe('useTauriChat foreground turn recovery', () => {
               name: 'new',
               root: '/new',
               kind: { type: 'coding' },
-              metadata: { tags: [] },
+              metadata: { tags: [], project_location: { kind: 'local' as const, path: '/new' } },
               product_data_generation: 'new-generation',
               created_at: '2026-10-25T00:00:00Z',
               last_active: '2026-10-25T00:00:00Z',
@@ -799,7 +799,15 @@ describe('useTauriChat foreground turn recovery', () => {
           }
           if (command === 'list_conversations' || command === 'list_tool_executions') return [];
           if (command === 'get_conversation')
-            return { messages: [{ role: 'user', content: 'other conversation contents' }] };
+            return {
+              messages: [
+                {
+                  role: 'user',
+                  content: 'other conversation contents',
+                  created_at: '2026-10-28T00:00:00Z',
+                },
+              ],
+            };
           if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
           if (command === 'send_chat_message') {
             requestedRoot = String((args?.request as { messageKey: string }).messageKey);
@@ -1305,7 +1313,10 @@ describe('useTauriChat foreground turn recovery', () => {
             name: 'replacement',
             root: '/replacement',
             kind: { type: 'coding' },
-            metadata: { tags: [] },
+            metadata: {
+              tags: [],
+              project_location: { kind: 'local' as const, path: '/replacement' },
+            },
             product_data_generation: 'reopened',
             created_at: '',
             last_active: '',
@@ -1926,7 +1937,10 @@ describe('useTauriChat foreground turn recovery', () => {
         name: 'Controlled local workspace',
         root: '/controlled-local',
         kind: { type: 'coding' },
-        metadata: { tags: [] },
+        metadata: {
+          tags: [],
+          project_location: { kind: 'local' as const, path: '/controlled-local' },
+        },
         product_data_generation: 'generation-a',
         created_at: '2026-10-25T00:00:00Z',
         last_active: '2026-10-25T00:00:00Z',
@@ -2084,7 +2098,10 @@ describe('useTauriChat foreground turn recovery', () => {
       name: 'Steer workspace',
       root: '/steer-workspace',
       kind: { type: 'coding' },
-      metadata: { tags: [] },
+      metadata: {
+        tags: [],
+        project_location: { kind: 'local' as const, path: '/steer-workspace' },
+      },
       product_data_generation: 'generation-a',
       created_at: '2026-10-25T00:00:00Z',
       last_active: '2026-10-25T00:00:00Z',

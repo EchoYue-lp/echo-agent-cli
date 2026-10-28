@@ -1,7 +1,7 @@
 //! EKO product command and receipt surface for framework tool visibility.
 //!
 //! The revisioned policy authority is `echo_agent::tools::control`; this module
-//! owns only EKO's command text and effective-enabled receipt.
+//! owns EKO的必需依赖、显示分类/来源与命令回执，不另持注册或执行权威.
 
 #[cfg(test)]
 use std::collections::HashSet;
@@ -12,8 +12,132 @@ use ts_rs::TS;
 use crate::agent_handle::AgentHandle;
 
 pub use echo_agent::tools::control::{
-    ToolControlError, ToolControlMutation, ToolControlService, ToolControlSnapshot,
+    ToolControlMutation, ToolControlService, ToolControlSnapshot,
 };
+
+/// EKO产品拒绝信息适配；通用revisioned选择仍由原Framework service持有。
+#[derive(Debug, thiserror::Error)]
+pub enum ToolControlError {
+    #[error("tool '{name}' is not registered")]
+    NotRegistered { name: String },
+    #[error("系统必需工具 {name} 不能关闭：{reason}")]
+    Required { name: String, reason: String },
+    #[error(transparent)]
+    Framework(#[from] echo_agent::tools::control::ToolControlError),
+}
+
+/// 仅锁定EKO真实依赖，而不是所有内置或初始曝光工具。
+/// 本地仍需此约束：防止产品自己的设置操作破坏唯一任务/必读原文路径。
+pub(crate) fn required_tool_reason(name: &str) -> Option<&'static str> {
+    match name {
+        // tool_exposure::initial_visible_tools与ToolSearchTool是延迟能力发现唯一入口。
+        "tool_search" => Some("按需发现并启用未在首轮展开的工具"),
+        // infra/factory.rs的任务指导与tasks/task_runtime/register.rs共用同一revisioned graph。
+        "task_create" | "task_update" | "task_list" | "task_execute" => {
+            Some("维护并执行唯一的任务图，接纳目标、变更与真实执行结果")
+        }
+        // compact_context.rs的长Goal/artifact要求阅读回执；不能用猜测替代完整原文。
+        "read_artifact" => Some("读取完整目标、约束原文和工具产物"),
+        _ => None,
+    }
+}
+
+pub(crate) fn validate_tool_choice(name: &str, enabled: bool) -> Result<(), ToolControlError> {
+    if !enabled && let Some(reason) = required_tool_reason(name) {
+        return Err(ToolControlError::Required {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// 明确的产品显示归类；名称只用于分类，不推断来源/必需性/执行许可。
+pub(crate) fn tool_category(name: &str) -> Option<crate::types::ToolCategory> {
+    use crate::types::ToolCategory::*;
+    match name {
+        "tool_search" | "task_create" | "task_update" | "task_list" | "task_execute"
+        | "agent_tool" | "agent_spawn" | "agent_list" | "agent_inspect" | "agent_wait"
+        | "agent_followup" | "agent_message" | "agent_interrupt" | "agent_resume"
+        | "agent_handoff" | "agent_group" | "ask_user" => Some(TaskCollaboration),
+        "read_file" | "read_artifact" | "apply_patch" | "grep" | "glob" | "list_dir"
+        | "code_search" | "repo_map" | "diff" | "git_status" | "git_diff" | "git_log"
+        | "git_blame" | "git_branch" | "git_commit" | "enter_worktree" | "exit_worktree"
+        | "list_worktrees" => Some(FilesCode),
+        "shell"
+        | "run_code"
+        | "wait"
+        | "stop_cell"
+        | "list_cells"
+        | "watch_cell"
+        | "interrupt_command_cell_watch" => Some(CommandsRuntime),
+        "web_search"
+        | "web_fetch"
+        | "web_extract"
+        | "arxiv_search"
+        | "semantic_scholar_search"
+        | "pubmed_search"
+        | "crossref_search"
+        | "browser_backend"
+        | "browser_navigate"
+        | "browser_snapshot"
+        | "browser_click"
+        | "browser_fill"
+        | "browser_screenshot"
+        | "browser_back"
+        | "browser_reload"
+        | "browser_tabs"
+        | "browser_click_at"
+        | "browser_type_at"
+        | "browser_scroll"
+        | "browser_console"
+        | "browser_network"
+        | "browser_dom_inspect"
+        | "browser_performance_trace"
+        | "browser_developer_mode" => Some(SearchBrowse),
+        "view_image" | "image_fetch" | "pdf_extract" | "pdf_info" | "excel_read" | "excel_info"
+        | "excel_profile" | "excel_to_csv" | "excel_write" | "word_read" | "word_info"
+        | "word_structure" | "text_search" | "text_stats" | "text_process" | "text_export"
+        | "generate_chart" | "sql_query" | "list_tables" | "describe_table" | "bibtex_generate" => {
+            Some(DataDocuments)
+        }
+        "recall" | "search_memory" | "store_memory" | "load_skill" | "list_skills"
+        | "read_skill" | "skill" => Some(MemorySkills),
+        _ => None,
+    }
+}
+
+/// 只投影真实连接的producer身份，不拆工具名猜MCP或插件来源。
+/// ToolManager尚无非MCP来源合同，未提供的来源明确Unknown，不能假称Builtin。
+pub(crate) fn mcp_tool_sources(
+    agent: &echo_agent::agent::ReactAgent,
+) -> std::collections::HashMap<String, crate::types::ToolSource> {
+    use echo_agent::mcp::{McpServerId, McpServerOwner, McpToolAdapter};
+    let mut sources = std::collections::HashMap::new();
+    for selector in agent.list_mcp_servers() {
+        let Some(id) = McpServerId::parse_selector(&selector) else {
+            continue;
+        };
+        let Some(client) = agent.mcp_client(&selector) else {
+            continue;
+        };
+        let plugin_id = match &id.owner {
+            McpServerOwner::Direct => None,
+            McpServerOwner::Plugin(plugin) => Some(plugin.clone()),
+        };
+        for tool in client.tools() {
+            sources.insert(
+                McpToolAdapter::exposed_name_for_identity(&id, &tool.name),
+                crate::types::ToolSource::Mcp {
+                    server: id.local_name.clone(),
+                    tool: tool.name.clone(),
+                    plugin_id: plugin_id.clone(),
+                },
+            );
+        }
+    }
+    sources
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[ts(export, rename = "ToolControlReceipt")]
@@ -49,7 +173,7 @@ pub async fn execute_tool_control_command(
         .unwrap_or_else(|error| error.to_string())
 }
 
-/// One executor serves both the legacy renderer and observed channel controls.
+/// 原文本通道与结构化控制共用此执行入口。
 /// Callers inspect this native result before any error is turned into text.
 pub(crate) async fn execute_tool_control_command_result(
     state: &crate::state::AppState,
@@ -153,5 +277,71 @@ mod tests {
         assert_eq!(enabled.revision, 2);
         assert!(service.snapshot()?.disabled_tools.is_empty());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod product_policy_tests {
+    use super::*;
+
+    #[test]
+    fn system_dependencies_reject_disable_without_mutating_framework_policy()
+    -> Result<(), ToolControlError> {
+        let service = ToolControlService::default();
+        for name in [
+            "tool_search",
+            "task_create",
+            "task_update",
+            "task_list",
+            "task_execute",
+            "read_artifact",
+        ] {
+            assert!(matches!(
+                validate_tool_choice(name, false),
+                Err(ToolControlError::Required { .. })
+            ));
+            validate_tool_choice(name, true)?;
+        }
+        assert!(service.snapshot()?.disabled_tools.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn optional_builtin_is_not_required_and_unknown_metadata_is_not_guessed()
+    -> Result<(), ToolControlError> {
+        validate_tool_choice("shell", false)?;
+        assert!(required_tool_reason("shell").is_none());
+        assert!(required_tool_reason("task_create_custom").is_none());
+        assert!(tool_category("mcp__random__shell").is_none());
+        assert!(tool_category("new_dynamic_capability").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn six_groups_do_not_change_registry_or_execution_policy() {
+        assert_eq!(
+            tool_category("task_list"),
+            Some(crate::types::ToolCategory::TaskCollaboration)
+        );
+        assert_eq!(
+            tool_category("read_file"),
+            Some(crate::types::ToolCategory::FilesCode)
+        );
+        assert_eq!(
+            tool_category("shell"),
+            Some(crate::types::ToolCategory::CommandsRuntime)
+        );
+        assert_eq!(
+            tool_category("browser_navigate"),
+            Some(crate::types::ToolCategory::SearchBrowse)
+        );
+        assert_eq!(
+            tool_category("pdf_info"),
+            Some(crate::types::ToolCategory::DataDocuments)
+        );
+        assert_eq!(
+            tool_category("search_memory"),
+            Some(crate::types::ToolCategory::MemorySkills)
+        );
     }
 }

@@ -12,6 +12,8 @@ pub struct SavedMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
     pub role: String,
+    /// Original canonical timestamp, never the GUI load time.
+    pub created_at: String,
     pub content: Option<String>,
     /// 原 Framework 消息的块投影；它不拥有执行完成权威。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -29,10 +31,11 @@ pub struct SavedMessage {
     /// Side Conversation views retain and label them.
     #[serde(default, skip_serializing_if = "is_false")]
     pub internal_agent: bool,
-    pub tool_calls: Option<Vec<SavedToolCall>>,
-    /// Thinking/reasoning segments from the LLM (e.g., DeepSeek thinking process)
+    /// Original typed AgentRouter payload preserved in the canonical input ResourceLink.
+    /// This is display provenance, never a direct-user instruction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking_segments: Option<Vec<String>>,
+    pub agent_input: Option<crate::agent_router::AgentMessage>,
+    pub tool_calls: Option<Vec<SavedToolCall>>,
     /// Tool call result (for tool role messages)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result: Option<String>,
@@ -40,10 +43,6 @@ pub struct SavedMessage {
     /// for correct chronological interleaving when loading from history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_steps: Option<Vec<SavedExecutionStep>>,
-    /// Lightweight UI ordering for thinking/tool rounds. Tool payloads live in
-    /// the application-owned tool execution repository; this stores IDs only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_rounds: Option<Vec<SavedExecutionRound>>,
     /// User-uploaded attachments (images/documents) attached to this message.
     /// Small resources retain their data URL; artifact-backed text keeps only
     /// display metadata so its body is not duplicated in conversation JSON.
@@ -536,22 +535,7 @@ pub struct SavedExecutionStep {
     pub call_id: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct SavedExecutionRound {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<SavedRoundThinking>,
-    #[serde(default)]
-    pub tool_call_ids: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct SavedRoundThinking {
-    pub content: String,
-}
-
-/// Combined payload stored in attachments_json (backward compatible).
-/// Old format: `["thinking1", "thinking2"]` (plain array)
-/// New format: `{"thinking_segments": [...], "execution_steps": [...], "attachments": [...]}`
+/// 当前消息的 UI 附件元数据；仅接受 object，不解析旧 thinking 数组或 round 投影。
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AttachmentsPayload {
     /// Stable GUI message identity used to attach TaskRun/Subagent history after reload.
@@ -562,11 +546,7 @@ pub struct AttachmentsPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_content: Option<String>,
     #[serde(default)]
-    pub thinking_segments: Vec<String>,
-    #[serde(default)]
     pub execution_steps: Vec<SavedExecutionStep>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_rounds: Option<Vec<SavedExecutionRound>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_history_import: Option<NativeHistoryImport>,
     /// Real user-uploaded attachments (images/documents). Despite the column
@@ -577,25 +557,13 @@ pub struct AttachmentsPayload {
 }
 
 impl AttachmentsPayload {
-    /// Parse from JSON string, handling both old and new formats.
+    /// 当前格式只有 object；旧数组不能被按字段顺序误解成当前 struct。
     pub fn parse(s: &str) -> Option<Self> {
         let value = serde_json::from_str::<serde_json::Value>(s).ok()?;
-        if value.is_object() {
-            return serde_json::from_value(value).ok();
+        if !value.is_object() {
+            return None;
         }
-        if value.is_array() {
-            let segments = serde_json::from_value::<Vec<String>>(value).ok()?;
-            return Some(Self {
-                message_id: None,
-                display_content: None,
-                thinking_segments: segments,
-                execution_steps: Vec::new(),
-                execution_rounds: None,
-                native_history_import: None,
-                attachments: Vec::new(),
-            });
-        }
-        None
+        serde_json::from_value(value).ok()
     }
 }
 
@@ -659,16 +627,16 @@ mod tests {
         let msg = SavedMessage {
             message_id: Some("message-1".to_string()),
             role: "user".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
             content: Some("hello".to_string()),
             assistant_blocks: None,
             final_answer_confirmed: false,
             execution_status: None,
             final_answer_source: None,
             internal_agent: false,
+            agent_input: None,
             tool_calls: None,
-            thinking_segments: None,
             execution_steps: None,
-            execution_rounds: None,
             tool_result: None,
             attachments: None,
         };
@@ -678,29 +646,33 @@ mod tests {
     }
 
     #[test]
-    fn attachments_payload_round_trips_tool_execution_ids() {
-        let rounds = vec![SavedExecutionRound {
-            thinking: Some(SavedRoundThinking {
-                content: "inspect".to_string(),
-            }),
-            tool_call_ids: vec!["detail-1".to_string()],
-        }];
+    fn attachments_payload_round_trips_current_tool_steps_without_retired_fields()
+    -> Result<(), String> {
         let payload = AttachmentsPayload {
             message_id: Some("message-1".to_string()),
             display_content: Some("visible text".to_string()),
-            thinking_segments: Vec::new(),
-            execution_steps: Vec::new(),
-            execution_rounds: Some(rounds.clone()),
+            execution_steps: vec![SavedExecutionStep {
+                step_type: "tool".to_string(),
+                index: None,
+                call_id: Some("call-1".to_string()),
+            }],
             native_history_import: None,
             attachments: Vec::new(),
         };
-        let encoded = serde_json::to_string(&payload).unwrap_or_default();
-        let decoded = AttachmentsPayload::parse(&encoded);
-
+        let encoded = serde_json::to_string(&payload).map_err(|error| error.to_string())?;
+        let decoded = AttachmentsPayload::parse(&encoded).ok_or("current payload missing")?;
         assert_eq!(
-            decoded.and_then(|value| value.execution_rounds),
-            Some(rounds)
+            decoded
+                .execution_steps
+                .first()
+                .and_then(|step| step.call_id.as_deref()),
+            Some("call-1")
         );
+        let wire: serde_json::Value =
+            serde_json::from_str(&encoded).map_err(|error| error.to_string())?;
+        assert!(wire.get("thinking_segments").is_none());
+        assert!(wire.get("execution_rounds").is_none());
+        Ok(())
     }
 
     #[test]
@@ -720,11 +692,9 @@ mod tests {
     }
 
     #[test]
-    fn attachments_payload_accepts_legacy_thinking_array() {
-        let decoded = AttachmentsPayload::parse(r#"["分析","完成"]"#);
-        assert_eq!(
-            decoded.map(|value| value.thinking_segments),
-            Some(vec!["分析".to_string(), "完成".to_string()])
-        );
+    fn attachments_payload_rejects_non_object_input() {
+        for raw in [r#"["分析","完成"]"#, "[]", "null", "42", r#""text""#] {
+            assert!(AttachmentsPayload::parse(raw).is_none());
+        }
     }
 }

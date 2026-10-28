@@ -23,7 +23,7 @@ accepted
 
 ## 决策
 
-- 原 Workspace manifest/registry 是唯一位置权威。`root` 保持本机产品数据目录；新项目的代码目录单独保存在 `metadata.project_location`。旧 manifest 未写新字段时仍按原 `project_root`、`root` 顺序解析，不移动或删除用户目录。
+- 原 Workspace manifest/registry 是唯一位置权威。`root` 保持本机产品数据目录；新项目的代码目录单独保存在 `metadata.project_location`。当前 manifest 的 `metadata.project_location` 必填；默认 create/create_at 也显式记录 Local(root)，不按旧 `project_root` 或产品目录推断缺失位置。缺字段拒读，原文件保留，不自动迁移。
 - `ProjectLocation` 区分 `Local { path }` 和 `Ssh { host, user, port, path }`。SSH 路径保存为字符串，绝不交给本机 canonicalize。远端实际目录由 SFTP 与同一执行连接确认。
 - 用户配置与执行身份分别保存在同一 manifest：`project_location` 用于配置/展示，`project_execution_location` 保存经过验证的实际 SSH hostname/user/port 和实际目录。系统 `ssh -G` 解析一次后，同一个连接固定有效目标；重新连接必须匹配已保存身份。原 `project_root_revision` 同时保护两项信息，不添加独立版本表或任务状态。
 - 已有本地文件夹只关联；新建文件夹使用 exclusive 单目录创建，不覆盖已有目录。注册失败只回滚本次拥有的产品数据与仍为空的新目录。移除工作区只删除 EKO 数据，不删除项目代码。
@@ -49,7 +49,7 @@ TaskRun 在原 `RunCreated`/目标版本中绑定经验证的位置 identity 和
 
 ## 验证与文档边界
 
-回归覆盖本地旧数据、三来源 payload、失败回滚、有效位置变化、隔离 cwd、规则读取失败、连接移交、终端物理结算，以及带受控物理 barrier、丢失观察者和独立 operation id 的有界观察。观察入口不能修复后端提前返回未知错误并丢弃物理资源的问题，transport 未知结算仍须独立验证。真实远程认证与选定目录验收是独立证据，不由 mock 或端口连通替代。
+回归覆盖当前必填位置、新建与同版冷载、三来源 payload、失败回滚、有效位置变化、隔离 cwd、规则读取失败、连接移交、终端物理结算，以及带受控物理 barrier、丢失观察者和独立 operation id 的有界观察。观察入口不能修复后端提前返回未知错误并丢弃物理资源的问题，transport 未知结算仍须独立验证。真实远程认证与选定目录验收是独立证据，不由 mock 或端口连通替代。
 
 这是 EKO GUI/IPC 的产品能力，不新增框架 SDK 示例或独立终端产品入口。正式 API 的通用文件提供者示例由框架自己的编译链验证；官网镜像必须在真实 EKO source checkpoint 后使用原同步机制，不把任务分支写成已发布 main。
 
@@ -74,3 +74,10 @@ TaskRun 在原 `RunCreated`/目标版本中绑定经验证的位置 identity 和
 代码 HEAD-only 与历史资源保全分别处理：未提交代码留源，目标恢复所需的已知产品资源逐 bytes/大小/SHA 复制。来源关闭或独立清理后，目标仍由原 reader 读取自己的副本，不扩大 reader 根。部分创建/复制失败保留真实资源，从既有列表和 managed import 继续检查，不自动重建或删除用户代码。真实 SSH/终端矩阵与本机资源测试分开验收。
 
 恢复提示依据实际 receipt：已有 Workspace、conversation 或 created／observed Worktree 时提示相应列表；只有分支残留且没有可打开对象时，不承诺列表存在目标。界面保留原错误与核对重试入口，不据 stderr 创建 pending store、认领或删除 live ref。旧包的失败与后继源码、集成和原生阳性结果分别保留。
+
+
+## 2026-10-28：开发阶段唯一位置合同
+
+用户明确本项目不承担旧版本兼容。位置改为当前必填类型，当前 registry 的默认、本地目录与已验证 SSH 创建入口先提供显式位置，再取消旧 manifest 的缺字段推断；不改变原 registry、revision、execution identity 或连接 owner。当前测试夹具随新合同明确位置，旧 manifest 自动推断的验收退役，不以 skip 或兼容分支维持。
+
+前端 Workspace 类型同步必填位置，显示与项目终端直接读取该位置；verified SSH identity 仍用于实际执行展示，原用户配置保持独立。仅历史格式不再接纳，同版 inspect/reopen、代际校验、SSH 认证与 namespace、索引恢复和删除时保用户代码继续验收。Git Worktree 只解析实际生产者使用的 `--porcelain -z`，保留中文、emoji 和换行路径；非 NUL 旧文本或缺终止符的输入不构成可观察列表事实。

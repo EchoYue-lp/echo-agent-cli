@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { QueuedChatInput } from '../../hooks/useTauriChat';
 import type { TaskRun, TaskRunControlReceipt, BackgroundCellState } from '../../generated';
 import type { Workspace } from '../../api/endpoints';
+import { conversationApi } from '../../api/endpoints';
 
 const mocks = vi.hoisted(() => {
   Object.defineProperty(window, 'matchMedia', {
@@ -13,6 +14,7 @@ const mocks = vi.hoisted(() => {
   return {
     queue: [] as QueuedChatInput[],
     renderRealBubble: false,
+    send: vi.fn(),
     replace: vi.fn(),
     remove: vi.fn(),
     reorder: vi.fn(),
@@ -26,7 +28,7 @@ const mocks = vi.hoisted(() => {
 vi.mock('../../hooks/useTauriChat', () => ({
   useTauriChat: () => ({
     queuedInputs: mocks.queue,
-    sendMessage: vi.fn(),
+    sendMessage: mocks.send,
     sendApproval: vi.fn(),
     sendInput: vi.fn(),
     sendSelection: vi.fn(),
@@ -66,7 +68,7 @@ const workspace: Workspace = {
   root: '/data/a',
   project_root: '/code/a',
   kind: { type: 'code' },
-  metadata: { tags: [] },
+  metadata: { tags: [], project_location: { kind: 'local' as const, path: '/code/a' } },
   product_data_generation: 'generation-a',
   created_at: '',
   last_active: '',
@@ -153,6 +155,7 @@ function cell(phase: BackgroundCellState['phase']): BackgroundCellState {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  vi.spyOn(conversationApi, 'agentInputs').mockResolvedValue([]);
   mocks.queue = [];
   mocks.renderRealBubble = false;
   useSubagentRunStore.getState().clear();
@@ -168,6 +171,9 @@ beforeEach(() => {
   });
   useChatStore.setState({
     messages: [],
+    agentInputs: [],
+    agentInputsBinding: null,
+    agentInputReadError: null,
     pendingHitlRequests: [],
     isStreaming: false,
     isCancelled: false,
@@ -209,6 +215,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   useTaskRuntimeStore.setState({
     updateGoal: originalActions.updateGoal,
     pause: originalActions.pause,
@@ -239,34 +246,43 @@ describe('真实流式消息与等待状态', () => {
     expect(container.querySelectorAll('.spinner')).toHaveLength(0);
   });
 
-  it('从空思考段、空白增量到首个可见内容始终保留且只保留一处等待状态', () => {
+  it('从空native Reasoning、空白delta到可见内容只保留一处等待状态', () => {
     mocks.renderRealBubble = true;
     useChatStore.setState({
       messages: [{ id: 'stream-user', role: 'user', content: '用户问题', timestamp: 1 }],
     });
     const id = useChatStore.getState().startAssistantMessage('stream-thinking');
     const { container } = render(<ChatPanel />);
+    const append = (
+      block_id: string,
+      delta: string,
+      sequence: number,
+      phase: 'reasoning' | 'commentary' = 'reasoning'
+    ) =>
+      act(() =>
+        useChatStore.getState().appendAssistantBlock(id, {
+          block_id,
+          request_id: 'request',
+          sequence,
+          phase,
+          delta,
+          complete: false,
+          provider: 'fixture',
+          reasoning: null,
+        })
+      );
     expect(container.querySelectorAll('.spinner')).toHaveLength(1);
-
-    act(() => useChatStore.getState().startThinkingSegment(id));
-    expect(useChatStore.getState().messages.at(-1)?.thinkingSegments).toEqual([{ content: '' }]);
-    expect(
-      container.querySelectorAll('.spinner'),
-      '真实 startThinkingSegment 只有空段时仍应显示等待'
-    ).toHaveLength(1);
-    expect(screen.queryByRole('button', { name: '折叠思考' })).toBeNull();
-
-    act(() => useChatStore.getState().appendThinking(id, ' \n\t '));
+    append('reason', '', 0);
+    append('reason', ' \n\t ', 1);
     expect(container.querySelectorAll('.spinner')).toHaveLength(1);
-    act(() => useChatStore.getState().appendThinking(id, '正在分析 中文 🧭'));
+    append('reason', '正在分析 中文 🧭', 2);
+    expect(container.querySelectorAll('.spinner')).toHaveLength(0);
+    fireEvent.click(screen.getByRole('button', { name: '展开思考' }));
     expect(screen.getByText('正在分析 中文 🧭')).toBeTruthy();
+    append('reason-next', '', 3);
     expect(container.querySelectorAll('.spinner')).toHaveLength(0);
-
-    act(() => useChatStore.getState().startThinkingSegment(id));
-    expect(container.querySelectorAll('.spinner')).toHaveLength(0);
-    act(() => useChatStore.getState().appendToken(id, '正文首段 中文'));
+    append('body', '正文首段 中文', 4, 'commentary');
     expect(screen.getByText('正文首段 中文')).toBeTruthy();
-    expect(container.querySelectorAll('.spinner')).toHaveLength(0);
     act(() => useChatStore.getState().applyFinalAnswer(id, '完整回复 中文'));
     act(() => useChatStore.getState().settleAssistantMessage(id));
     expect(screen.getByText('完整回复 中文')).toBeTruthy();
@@ -313,7 +329,18 @@ describe('真实流式消息与等待状态', () => {
     act(() => useChatStore.getState().appendToken(id, '正文 中文 🧭'));
     expect(screen.getByText('正文 中文 🧭')).toBeTruthy();
     expect(container.querySelectorAll('.spinner')).toHaveLength(0);
-    act(() => useChatStore.getState().startThinkingSegment(id));
+    act(() =>
+      useChatStore.getState().appendAssistantBlock(id, {
+        block_id: 'empty-reason',
+        request_id: 'request',
+        sequence: 0,
+        phase: 'reasoning',
+        delta: '',
+        complete: false,
+        provider: null,
+        reasoning: null,
+      })
+    );
     expect(container.querySelectorAll('.spinner')).toHaveLength(0);
   });
 });
@@ -788,4 +815,112 @@ describe('composer Steer controls', () => {
     expect(mocks.remove).not.toHaveBeenCalled();
     expect(mocks.steer).not.toHaveBeenCalled();
   });
+});
+
+describe('canonical branch prefix', () => {
+  it('重新生成后续回复时保留前缀native与工具顺序，不把新steps随旧round一起清空', async () => {
+    mocks.renderRealBubble = true;
+    useTaskRuntimeStore.setState({ activeRun: null });
+    const original = useConversationStore.getState().branchCurrent;
+    const branch = vi
+      .fn()
+      .mockResolvedValue({ id: 'branch-canonical', targetContent: '第二轮问题' });
+    useConversationStore.setState({ branchCurrent: branch });
+    useChatStore.setState({
+      isStreaming: false,
+      messages: [
+        { id: 'u1', role: 'user', content: '第一轮问题', timestamp: 1 },
+        {
+          id: 'a1',
+          role: 'assistant',
+          content: '第一轮已确认回答',
+          timestamp: 2,
+          finalAnswerConfirmed: true,
+          assistantBlocks: [
+            {
+              block: {
+                block_id: 'before',
+                request_id: 'request-one',
+                sequence: 0,
+                phase: 'commentary',
+                delta: '原生进度',
+                complete: true,
+                provider: null,
+                reasoning: null,
+              },
+              content: '原生进度',
+            },
+          ],
+          executionSteps: [
+            { type: 'assistant', index: 0 },
+            { type: 'tool', callId: 'original-tool' },
+          ],
+        },
+        { id: 'u2', role: 'user', content: '第二轮问题', timestamp: 3 },
+        {
+          id: 'a2',
+          role: 'assistant',
+          content: '第二轮已确认回答',
+          timestamp: 4,
+          finalAnswerConfirmed: true,
+        },
+      ],
+    });
+    try {
+      render(<ChatPanel />);
+      const buttons = screen.getAllByRole('button', { name: '重新生成' });
+      const last = buttons.at(-1);
+      if (!last) throw new Error('missing regenerate');
+      fireEvent.click(last);
+      await waitFor(() => expect(mocks.send).toHaveBeenCalled());
+      const prefix = useChatStore
+        .getState()
+        .messages.find((message) => message.role === 'assistant');
+      expect(prefix?.assistantBlocks?.at(0)?.block.block_id).toBe('before');
+      expect(prefix?.executionSteps).toEqual([
+        { type: 'assistant', index: 0 },
+        { type: 'tool', callId: 'original-tool' },
+      ]);
+    } finally {
+      useConversationStore.setState({ branchCurrent: original });
+    }
+  });
+});
+
+it('shows a typed inbox-only Agent input in the real empty ChatPanel instead of the welcome branch', () => {
+  mocks.renderRealBubble = true;
+  useTaskRuntimeStore.setState({ activeRun: null });
+  const record = {
+    message_id: 'inbox-only',
+    route: { workspace_id: workspace.id, conversation_id: run.conversation_id },
+    payload: {
+      message_id: 'inbox-only',
+      from: { workspace_id: 'source', conversation_id: 'sender' },
+      to: { workspace_id: workspace.id, conversation_id: run.conversation_id },
+      origin: 'agent' as const,
+      payload: { kind: 'text' as const, text: '只有真实收件，没有本地用户或助手消息' },
+      created_at: '2026-10-28T07:00:00Z',
+    },
+    persisted_at: '2026-10-28T07:00:00Z',
+    phase: 'persisted',
+    outcome: null,
+    drained: false,
+    reason: null,
+    turn_id: null,
+    attempt: 0,
+  };
+  useChatStore.setState({
+    agentInputs: [record],
+    agentInputsBinding: JSON.stringify([
+      workspace.id,
+      workspace.product_data_generation,
+      run.conversation_id,
+      1,
+    ]),
+  });
+  render(<ChatPanel />);
+  expect(screen.getByText('来自 Agent · source/sender')).toBeDefined();
+  expect(screen.getByText('只有真实收件，没有本地用户或助手消息')).toBeDefined();
+  expect(screen.queryByRole('button', { name: '编辑' })).toBeNull();
+  expect(useChatStore.getState().messages).toEqual([]);
 });

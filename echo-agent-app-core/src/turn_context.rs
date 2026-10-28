@@ -301,15 +301,6 @@ impl EkoContextProjector {
 }
 
 impl PreModelContextProjector for EkoContextProjector {
-    fn recovered_tool_origins<'a>(
-        &'a self,
-        context: &'a ProjectionContext,
-        messages: &'a [Message],
-    ) -> BoxFuture<'a, AgentResult<Vec<echo_agent::compression::RecoveredToolOrigin>>> {
-        // 原EKO装配已经拥有此TaskRuntime projector；来源只沿Frame已有getter，不另设恢复器。
-        self.task_runtime.recovered_tool_origins(context, messages)
-    }
-
     fn validate_model_request<'a>(
         &'a self,
         context: &'a ProjectionContext,

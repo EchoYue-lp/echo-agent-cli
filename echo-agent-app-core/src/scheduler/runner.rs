@@ -2669,4 +2669,193 @@ mod tests {
         reopened.shutdown_run_drivers().await?;
         Ok(())
     }
+
+    /// 原送达future尚未返回时，原occurrence owner必须保留；不另造通知重试或调度器。
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn native_cron_notification_waits_for_original_physical_send_and_never_replays()
+    -> anyhow::Result<()> {
+        use echo_agent::agent::{AssistantMessageBlock, AssistantPhase};
+        use echo_agent::llm::types::DeltaMessage;
+        use echo_agent::testing::StreamChunk;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct OriginalSendGate {
+            recorded: RecordingWeixin,
+            entered: tokio::sync::Notify,
+            release: CancellationToken,
+        }
+        impl WeixinCronDelivery for OriginalSendGate {
+            fn freeze_target<'a>(
+                &'a self,
+                invocation: &'a SchedulerInvocation,
+                workspace_id: &'a str,
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<
+                    Option<crate::tasks::task_runtime::weixin_delivery::WeixinDeliveryTarget>,
+                    String,
+                >,
+            > {
+                self.recorded.freeze_target(invocation, workspace_id)
+            }
+            fn send<'a>(
+                &'a self,
+                target: &'a crate::tasks::task_runtime::weixin_delivery::WeixinDeliveryTarget,
+                message_id: &'a str,
+                text: &'a str,
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<echo_agent::channels::weixin::WeixinSendOutcome, String>,
+            > {
+                Box::pin(async move {
+                    self.entered.notify_one();
+                    self.release.cancelled().await;
+                    self.recorded.send(target, message_id, text).await
+                })
+            }
+        }
+        let answer = format!("{}NATIVE-NOTIFY-END", "原生完整回答🌱".repeat(600));
+        let native = |phase, delta: String, sequence| AssistantMessageBlock {
+            provider_source: None,
+            block_id: format!("native-cron-{sequence}"),
+            request_id: "native-cron-original-request".into(),
+            sequence,
+            phase,
+            delta,
+            complete: true,
+            provider: Some("offline-native-provider".into()),
+            reasoning: None,
+        };
+        let model = Arc::new(MockLlmClient::new().with_stream_script(vec![
+            StreamChunk::Delta(DeltaMessage {
+                role: Some("assistant".into()),
+                content: None,
+                reasoning_content: None,
+                reasoning_blocks: None,
+                assistant_blocks: Some(vec![
+                    native(
+                        AssistantPhase::Reasoning,
+                        "private-native-reasoning".into(),
+                        1,
+                    ),
+                    native(AssistantPhase::FinalAnswer, answer.clone(), 2),
+                ]),
+                tool_calls: None,
+            }),
+            StreamChunk::Terminal {
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+        let agent = AgentHandle::new(
+            ReactAgentBuilder::new()
+                .llm_client(model.clone())
+                .system_prompt("offline native cron")
+                .build()?,
+        );
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let _resources = store.test_resource_scope();
+        let sender = Arc::new(OriginalSendGate {
+            recorded: RecordingWeixin {
+                freeze_calls: AtomicUsize::new(0),
+                sends: std::sync::Mutex::new(Vec::new()),
+            },
+            entered: tokio::sync::Notify::new(),
+            release: CancellationToken::new(),
+        });
+        let fire = build_occurrence_fire_fn_with_weixin(
+            agent,
+            Some(store.clone()),
+            None,
+            None,
+            None,
+            Some(sender.clone()),
+        );
+        let mut task = CronTask::new("native send barrier", "0 0 1 1 *", "original native answer");
+        task.definition_id = "native-original-definition".into();
+        let invocation = invocation("native-original-notification-slot", task);
+        let identity =
+            OccurrenceIdentity::from_scheduler_invocation(store.active_workspace_id(), &invocation);
+        let observe = async {
+            let reached =
+                tokio::time::timeout(std::time::Duration::from_secs(5), sender.entered.notified())
+                    .await;
+            if reached.is_err() {
+                sender.release.cancel();
+                return Err(anyhow::anyhow!(
+                    "original send did not reach its physical barrier"
+                ));
+            }
+            // 先收集原事实，先释放并join，再判断；断言失败不得遗留刻意阻塞的发送。
+            let receipt_before = store.weixin_notification_status(&identity.run_id());
+            let physically_owned_before = store.active_run_driver_count();
+            let sends_before = sender
+                .recorded
+                .sends
+                .lock()
+                .map(|sends| sends.len())
+                .map_err(|_| "send observer poisoned".to_string());
+            let duplicate =
+                tokio::time::timeout(std::time::Duration::from_secs(1), fire(invocation.clone()))
+                    .await;
+            sender.release.cancel();
+            Ok((
+                receipt_before,
+                sends_before,
+                duplicate,
+                physically_owned_before,
+            ))
+        };
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(12), async {
+            tokio::join!(fire(invocation.clone()), observe)
+        })
+        .await;
+        sender.release.cancel();
+        let (original, observed) = joined?;
+        original?;
+        let (receipt_before, sends_before, duplicate, physically_owned_before) = observed?;
+        assert_eq!(physically_owned_before.map_err(anyhow::Error::msg)?, 1);
+        assert!(!store.has_unsettled_driver_resources());
+        assert_eq!(sends_before.map_err(anyhow::Error::msg)?, 0);
+        assert!(receipt_before?.is_some_and(|receipt| receipt.outcome.is_none()));
+        assert!(duplicate?.is_err(), "同一物理owner未收尾时不能重新准入");
+        // 完成后的同slot重投仍仅观察原结果，不新调模型或发通知。
+        fire(invocation).await?;
+        assert_eq!(model.call_count(), 1);
+        assert_eq!(sender.recorded.freeze_calls.load(Ordering::SeqCst), 1);
+        let sends = sender
+            .recorded
+            .sends
+            .lock()
+            .map_err(|_| anyhow::anyhow!("send observer poisoned"))?;
+        assert_eq!(sends.len(), 1);
+        let (_, sent) = sends
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("original send missing"))?;
+        assert!(sent.contains(&answer));
+        assert!(!sent.contains("private-native-reasoning"));
+        assert_eq!(
+            store
+                .get_run(&identity.run_id())?
+                .ok_or_else(|| anyhow::anyhow!("original TaskRun missing"))?
+                .status,
+            TaskRunStatus::Completed
+        );
+        assert_eq!(
+            store
+                .weixin_notification_status(&identity.run_id())?
+                .ok_or_else(|| anyhow::anyhow!("original notification receipt missing"))?
+                .outcome,
+            Some(echo_agent::delivery::DeliveryOutcome::Completed)
+        );
+        drop(sends);
+        store.shutdown_run_drivers().await?;
+        assert_eq!(
+            store
+                .active_run_driver_count()
+                .map_err(anyhow::Error::msg)?,
+            0
+        );
+        Ok(())
+    }
 }

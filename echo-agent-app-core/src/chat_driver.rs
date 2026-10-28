@@ -2222,6 +2222,16 @@ async fn drive_chat_inner(
         // `trace_sink` here is the framework-Value form; `scoped_with_ctx_run_id`
         // re-scopes it into `CURRENT_TRACE_SINK` for tools (e.g. task_execute)
         // running inside the framework's spawned tool executor.
+        if let Some(source_conversation) = res.conv_id.as_ref() {
+            resource_guards.push(echo_agent::tools::InvocationResourceGuard::new_identified(
+                (),
+                crate::agent_control::ConversationTarget {
+                    workspace_id: res.execution_scope.workspace_id().to_string(),
+                    conversation_id: source_conversation.clone(),
+                    workspace_generation: None,
+                },
+            ));
+        }
         let event_identity = EventIdentity::for_chat(
             conversation_id.clone(),
             turn_id.clone(),
@@ -2611,6 +2621,7 @@ mod tests {
             instruction: text.to_string(),
             resources: vec![],
             authorship: crate::prepared_turn::InstructionAuthorship::User,
+            agent_input: None,
         }
     }
 

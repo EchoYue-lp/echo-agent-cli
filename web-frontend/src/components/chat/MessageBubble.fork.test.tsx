@@ -12,6 +12,7 @@ const reply: ChatMessage = {
   content: '已经完成的回复',
   timestamp: 1,
   isStreaming: false,
+  finalAnswerConfirmed: true,
 };
 
 describe('reply Fork action', () => {

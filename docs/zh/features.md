@@ -16,19 +16,19 @@ native与发布各自验收，文稿同步不把保留能力统称“全验收�
 原生消息分层与60秒安全点报告策略按各自真实源码和回执验收；已有接缝/focused不代新版原生验收，
 详见 [ADR 0057](./adr/0057-native-messages-and-progress-policy.md)。
 
-| 能力           | 当前实现                                                                      | 主要依据                                        |
-| -------------- | ----------------------------------------------------------------------------- | ----------------------------------------------- |
-| 流式对话       | GUI与channel共享 `drive_chat` 与 typed `TurnOutcome`         | `echo-agent-app-core/src/chat_driver.rs`        |
-| 多会话 Agent   | `AgentPool` 按 conversation 维护 Agent，忙会话不会被驱逐                      | `echo-agent-app-core/src/agent_pool/pool.rs`         |
-| Channel 会话   | app-core 原 owner 管理 sender-scoped 产品 ID 与 incarnation Agent/checkpoint/cache ID，reset 保留历史 | `echo-agent-app-core/src/channel_runtime.rs`、`channel_runtime/input_pump.rs` |
-| 前台 turn 控制 | admission、steer、cancel、settlement 由 app-core 统一拥有                     | `echo-agent-app-core/src/foreground_turn.rs`    |
-| 会话追加输入   | 保留交互surface共用 durable frontier、tracked drain 与 exact terminal       | `echo-agent-app-core/src/conversation_input.rs` |
-| 会话历史       | framework `FileConversationStore` 为权威，EKO 只做 workspace 绑定和 UI 投影   | `echo-agent-app-core/src/workspace/runtime.rs`  |
-| 分叉会话       | GUI 完成回复下方提供“复制 / 重新生成 / 分叉会话”；Fork 包含该回复所在的完整回合和工具记录，打开带 `(branch)` 标题的独立普通会话，刷新当前工作区列表并保留原会话；后续回合及隐藏内部消息不复制。编辑/重新生成仍在目标用户回合前分叉并重发 | `src/tauri/commands/conversations.rs`、`web-frontend/src/components/chat/ChatPanel.tsx` |
-| 支线对话       | GUI 专属侧栏布局；committed context 快照、一级 Subagent 关系、独立模型/turn 与隐藏内部消息，channel无专用入口 | `echo-agent-app-core/src/side_conversation.rs`、`web-frontend/src/components/chat/SideConversationDialog.tsx` |
-| 会话归档       | 侧边栏只显示未归档会话；“设置 -> 项目数据 -> 归档”可恢复或永久删除 | `echo-agent-app-core/src/conversation_archive.rs`、`web-frontend/src/components/sessions/ArchivedConversationsPanel.tsx` |
-| 附件与长输入   | 上传文件、长粘贴和超预算文本落到 workspace artifact，再按引用读取             | `echo-agent-app-core/src/attachments.rs`        |
-| 上下文压缩     | summary/hybrid/sliding/adaptive 策略、默认 token 近期窗口、跨 surface focus/cancel 与 goal/recovery 投影 | `echo-agent-app-core/src/manual_compression.rs` |
+| 能力           | 当前实现                                                                                                                                                                                                                                 | 主要依据                                                                                                                 |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| 流式对话       | GUI与channel共享 `drive_chat` 与 typed `TurnOutcome`                                                                                                                                                                                     | `echo-agent-app-core/src/chat_driver.rs`                                                                                 |
+| 多会话 Agent   | `AgentPool` 按 conversation 维护 Agent，忙会话不会被驱逐                                                                                                                                                                                 | `echo-agent-app-core/src/agent_pool/pool.rs`                                                                             |
+| Channel 会话   | app-core 原 owner 管理 sender-scoped 产品 ID 与 incarnation Agent/checkpoint/cache ID，reset 保留历史                                                                                                                                    | `echo-agent-app-core/src/channel_runtime.rs`、`channel_runtime/input_pump.rs`                                            |
+| 前台 turn 控制 | admission、steer、cancel、settlement 由 app-core 统一拥有                                                                                                                                                                                | `echo-agent-app-core/src/foreground_turn.rs`                                                                             |
+| 会话追加输入   | 保留交互surface共用 durable frontier、tracked drain 与 exact terminal                                                                                                                                                                    | `echo-agent-app-core/src/conversation_input.rs`                                                                          |
+| 会话历史       | framework `FileConversationStore` 为权威，EKO 只做 workspace 绑定和 UI 投影                                                                                                                                                              | `echo-agent-app-core/src/workspace/runtime.rs`                                                                           |
+| 分叉会话       | GUI 完成回复下方提供“复制 / 重新生成 / 分叉会话”；Fork 包含该回复所在的完整回合和工具记录，打开带 `(branch)` 标题的独立普通会话，刷新当前工作区列表并保留原会话；后续回合及隐藏内部消息不复制。编辑/重新生成仍在目标用户回合前分叉并重发 | `src/tauri/commands/conversations.rs`、`web-frontend/src/components/chat/ChatPanel.tsx`                                  |
+| 支线对话       | GUI 专属侧栏布局；committed context 快照、一级 Subagent 关系、独立模型/turn 与隐藏内部消息，channel无专用入口                                                                                                                            | `echo-agent-app-core/src/side_conversation.rs`、`web-frontend/src/components/chat/SideConversationDialog.tsx`            |
+| 会话归档       | 侧边栏只显示未归档会话；“设置 -> 项目数据 -> 归档”可恢复或永久删除                                                                                                                                                                       | `echo-agent-app-core/src/conversation_archive.rs`、`web-frontend/src/components/sessions/ArchivedConversationsPanel.tsx` |
+| 附件与长输入   | 上传文件、长粘贴和超预算文本落到 workspace artifact，再按引用读取                                                                                                                                                                        | `echo-agent-app-core/src/attachments.rs`                                                                                 |
+| 上下文压缩     | summary/hybrid/sliding/adaptive 策略、默认 token 近期窗口、跨 surface focus/cancel 与 goal/recovery 投影                                                                                                                                 | `echo-agent-app-core/src/manual_compression.rs`                                                                          |
 
 GUI 聊天正文沿同一内容列直接对齐，不再为助手消息预留机器人头像列。历史中没有正文、
 附件、思考、已恢复工具步骤、关联 Subagent 或内部消息标记的空记录不占消息行；流式
@@ -43,15 +43,15 @@ Subagent 继续使用原有可展开执行过程，附件、错误、内部消�
 
 ## 任务与 Subagent
 
-| 能力              | 当前实现                                                                             | 主要依据                                                         |
-| ----------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------- |
-| 统一任务关系      | `task_create/task_update/task_list/task_execute` 使用同一个 revisioned TaskRun graph | `echo-agent-app-core/src/tasks/task_runtime/register.rs`         |
-| 动态 DAG          | 原子 plan、revision patch、claim、重试、取消、safe-point reload                      | `echo-agent-app-core/src/tasks/task_runtime/store/runtime.rs`            |
-| 长程继续          | Goal、RunTurn、budget、provider retry、boot admission、checkpoint-backed hot state   | `echo-agent-app-core/src/tasks/task_runtime/continuation.rs`     |
+| 能力              | 当前实现                                                                                                                 | 主要依据                                                         |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------- |
+| 统一任务关系      | `task_create/task_update/task_list/task_execute` 使用同一个 revisioned TaskRun graph                                     | `echo-agent-app-core/src/tasks/task_runtime/register.rs`         |
+| 动态 DAG          | 原子 plan、revision patch、claim、重试、取消、safe-point reload                                                          | `echo-agent-app-core/src/tasks/task_runtime/store/runtime.rs`    |
+| 长程继续          | Goal、RunTurn、budget、provider retry、boot admission、checkpoint-backed hot state                                       | `echo-agent-app-core/src/tasks/task_runtime/continuation.rs`     |
 | Subagent 执行     | direct、planned、fork、teammate、team 共用 prompt compiler；typed message、有效工具面和 workspace 由 invocation 统一编译 | `echo-agent-app-core/src/subagent_prompt.rs`                     |
-| Subagent 控制     | message、follow-up、interrupt、attempt identity 与 durable outcome                  | `echo-agent-app-core/src/tasks/task_runtime/subagent_control.rs` |
-| 后台 command cell | bounded async admission、typed cursor wait、owner cancel、boot orphan closure        | framework cell runtime + app-core `command_cells.rs`             |
-| Worktree 隔离     | 逻辑任务复用、content-aware cleanup、review/merge/discard                            | `echo-agent-app-core/src/tasks/task_runtime/worktree.rs`         |
+| Subagent 控制     | message、follow-up、interrupt、attempt identity 与 durable outcome                                                       | `echo-agent-app-core/src/tasks/task_runtime/subagent_control.rs` |
+| 后台 command cell | bounded async admission、typed cursor wait、owner cancel、boot orphan closure                                            | framework cell runtime + app-core `command_cells.rs`             |
+| Worktree 隔离     | 逻辑任务复用、content-aware cleanup、review/merge/discard                                                                | `echo-agent-app-core/src/tasks/task_runtime/worktree.rs`         |
 
 插件 Subagent 同样使用 `EkoSubagentPromptCompiler` 并共享 framework tool visibility policy；
 注册期 prompt 声明 concrete tool surface，invocation 再合并有效 allowlist、workspace 与 typed
@@ -67,21 +67,21 @@ launcher不维护跨TaskRun metadata DAG或轮询器。依赖图由同一TaskRun
 
 ## 工具与扩展
 
-| 能力           | 当前实现                                                                                 | 主要依据                                               |
-| -------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------ |
-| 文件与代码修改 | canonical transactional `apply_patch`，不保留平行编辑工具                                | `echo-agent` tool registry                             |
-| Workspace diff | 显式 workspace generation、已验证 Git ref、app-core 统一结构化 hunk，Tauri 仅映射 wire DTO | `echo-agent-app-core/src/diff.rs`                      |
-| 代码执行与分析 | `run_code` 使用 EKO 锁定的 Python analytics runtime                                      | `echo-agent-app-core/src/analysis_runtime.rs`          |
-| Terminal       | 本地/系统 OpenSSH 交互终端与 Agent shell 分离；源码已准备，原生/远端待验                                        | `echo-agent-app-core/src/terminal.rs`                  |
-| Browser/Chrome | 托管 Chromium、Chrome extension backend、tab/session/observation 与保留入口／Subagent的同owner控制            | Browser runtime + Extension dispatcher                 |
-| 工作流         | 一份 file-backed catalog 与 framework Graph executor；GUI/channel 共用服务       | `echo-agent-app-core/src/workflow_service.rs`          |
-| 结构化抽取     | pooled Agent `extract_json`、JSON Schema 输入/输出验证、typed 多 surface outcome         | `echo-agent-app-core/src/structured_extraction.rs`     |
-| MCP            | 一份用户 `mcp.json`、真实 reconcile、scope-keyed health、plugin name ownership           | `McpConfigRuntime` + Extension control                 |
-| Tool output    | summary/detail 分离、opaque detail ref、cursor page、文件/JSONL 恢复                     | `echo-agent-app-core/src/tool_execution_projection.rs` |
-| Agent 协作控制面 | discriminated Conversation/TaskSubagent target、bounded list/inspect/message/followup/wait/interrupt | `echo-agent-app-core/src/agent_control.rs` |
-| Hooks/Webhooks | 生命周期事件、command/Subagent/MCP actions、配置热重载                                   | `echo-agent-app-core/src/hook_config_loader.rs`        |
-| Plugins        | framework prepared generation、captured target fanout、typed generation receipt、Subagents/scope-qualified monitors/themes/styles | `echo-agent-app-core/src/plugin_runtime/runtime.rs` |
-| Skills         | 递归发现、安装、启停、upstream staging sync、flat policy 原子写与即时 reconcile         | `skills_hub/` + `extension_control/skills.rs`                 |
+| 能力             | 当前实现                                                                                                                          | 主要依据                                               |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| 文件与代码修改   | canonical transactional `apply_patch`，不保留平行编辑工具                                                                         | `echo-agent` tool registry                             |
+| Workspace diff   | 显式 workspace generation、已验证 Git ref、app-core 统一结构化 hunk，Tauri 仅映射 wire DTO                                        | `echo-agent-app-core/src/diff.rs`                      |
+| 代码执行与分析   | `run_code` 使用 EKO 锁定的 Python analytics runtime                                                                               | `echo-agent-app-core/src/analysis_runtime.rs`          |
+| Terminal         | 本地/系统 OpenSSH 交互终端与 Agent shell 分离；源码已准备，原生/远端待验                                                          | `echo-agent-app-core/src/terminal.rs`                  |
+| Browser/Chrome   | 托管 Chromium、Chrome extension backend、tab/session/observation 与保留入口／Subagent的同owner控制                                | Browser runtime + Extension dispatcher                 |
+| 工作流           | 一份 file-backed catalog 与 framework Graph executor；GUI/channel 共用服务                                                        | `echo-agent-app-core/src/workflow_service.rs`          |
+| 结构化抽取       | pooled Agent `extract_json`、JSON Schema 输入/输出验证、typed 多 surface outcome                                                  | `echo-agent-app-core/src/structured_extraction.rs`     |
+| MCP              | 一份用户 `mcp.json`、真实 reconcile、scope-keyed health、plugin name ownership                                                    | `McpConfigRuntime` + Extension control                 |
+| Tool output      | summary/detail 分离、opaque detail ref、cursor page、文件/JSONL 恢复                                                              | `echo-agent-app-core/src/tool_execution_projection.rs` |
+| Agent 协作控制面 | discriminated Conversation/TaskSubagent target、bounded list/inspect/message/followup/wait/interrupt                              | `echo-agent-app-core/src/agent_control.rs`             |
+| Hooks/Webhooks   | 生命周期事件、command/Subagent/MCP actions、配置热重载                                                                            | `echo-agent-app-core/src/hook_config_loader.rs`        |
+| Plugins          | framework prepared generation、captured target fanout、typed generation receipt、Subagents/scope-qualified monitors/themes/styles | `echo-agent-app-core/src/plugin_runtime/runtime.rs`    |
+| Skills           | 递归发现、安装、启停、upstream staging sync、flat policy 原子写与即时 reconcile                                                   | `skills_hub/` + `extension_control/skills.rs`          |
 
 ### Extension Control Authority
 
@@ -108,13 +108,13 @@ store。
 
 ## 专业工作台
 
-| 能力         | 当前实现                                                                   | 主要依据                                                 |
-| ------------ | -------------------------------------------------------------------------- | -------------------------------------------------------- |
-| 数据分析     | file-backed analysis、脚本执行、数据/图表/report artifact                  | `echo-agent-app-core/src/analysis.rs`                    |
-| 学术研究     | paper library、scholarly search、Zotero、Europe PMC、citation audit/export | `echo-agent-app-core/src/research.rs`                    |
-| 医学研究     | PICO/PECO、screening、RoB、GRADE、PRISMA、适用性风险                       | `web-frontend/src/components/papers/ReviewWorkbench.tsx` |
-| Sandbox      | GUI 已挂载配置、可用性检查和真实本地 sandbox execution                     | `src/tauri/commands/panels.rs`                           |
-| 定时任务     | file-backed cron scheduler、GUI与保留渠道控制与原样 prompt                  | `echo-agent-app-core/src/scheduler/`                     |
+| 能力         | 当前实现                                                                                                                       | 主要依据                                                                      |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------- |
+| 数据分析     | file-backed analysis、脚本执行、数据/图表/report artifact                                                                      | `echo-agent-app-core/src/analysis.rs`                                         |
+| 学术研究     | paper library、scholarly search、Zotero、Europe PMC、citation audit/export                                                     | `echo-agent-app-core/src/research.rs`                                         |
+| 医学研究     | PICO/PECO、screening、RoB、GRADE、PRISMA、适用性风险                                                                           | `web-frontend/src/components/papers/ReviewWorkbench.tsx`                      |
+| Sandbox      | GUI 已挂载配置、可用性检查和真实本地 sandbox execution                                                                         | `src/tauri/commands/panels.rs`                                                |
+| 定时任务     | file-backed cron scheduler、GUI与保留渠道控制与原样 prompt                                                                     | `echo-agent-app-core/src/scheduler/`                                          |
 | 记忆与自进化 | generation-bound layered memory、safe-point hot projection、`/reflect`、Review Inbox、Curator、rule/Skill promotion、dashboard | `echo-agent-app-core/src/evolution/`、`echo-agent-app-core/src/reflection.rs` |
 
 GUI 设置已挂载渠道与定时任务页面，配置、控制及历史继续使用原 ChannelRuntime、scheduler
@@ -159,7 +159,6 @@ Hooks 继续属于 application/plugin configuration。仓库根 `.agents/skills/
 projection 参与每个 Agent。详见 ADR
 [0041](./adr/0041-external-only-skills.md)。
 
-
 ### 退役的 LSP 消费者
 
 EKO 不再请求框架 LSP feature、注册语言服务器工具或暴露 LSP 命令/设置/IPC。
@@ -167,3 +166,7 @@ EKO 不再请求框架 LSP feature、注册语言服务器工具或暴露 LSP �
 收据。框架 A2A/LSP 的删除与组合验证按各自仓库独立验收。EKO 的独立 TUI、REPL、
 CLI/JSONL 产品入口也已退出；GUI 内置终端、Agent shell、IM、cron、MCP 与 Subagent
 继续保留。源码退出不代表本轮删后 Rust、原生或发布验收已完成。
+
+### 自动协作通信的时间线呈现
+
+AI向其它会话发送的消息显示紧凑发送记录，typed目标可点击打开。来自其它Agent的输入显示来源、原始正文与投递观察，右对齐并支持展开全文；这不会赋予用户身份、Goal权限或本人编辑操作。输入来源由当前写路径耐久保存，新版本重载与Fork继续保留，旧wrapper不做兼容解码。这里只呈现既有自动协作事实，不提供手工收件人、组或收据管理页面。
