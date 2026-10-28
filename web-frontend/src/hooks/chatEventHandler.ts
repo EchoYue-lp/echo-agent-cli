@@ -8,6 +8,10 @@
  */
 
 import { useChatStore } from '../stores/chatStore';
+import { captureConversationView, useConversationStore } from '../stores/conversationStore';
+import { useWorkspaceStore } from '../stores/workspaceStore';
+import { productDataScope, sameProductDataScope } from '../lib/productDataScope';
+import { conversationApi } from '../api/endpoints';
 import { isHitlRequestIdentity } from '../types/api';
 import {
   ingestSubagentExecEvent,
@@ -66,12 +70,17 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
       handleAgentEvent(
         payload.event.payload,
         ctx,
-        ownsOperation ? { at, scope, eventId: envelope.event_id } : undefined
+        ownsOperation ? { at, scope, eventId: envelope.event_id } : undefined,
+        payload.event.execution_id,
+        payload.event.event_id
       );
       break;
     }
     case 'turn_status': {
+      const messageId = ctx.assistantIdRef.current;
       handleChatEvent({ type: 'run_status', status: payload.event.status }, ctx);
+      if (messageId && payload.event.status === 'completed')
+        void refreshNativeFinalPresentation(envelope, messageId);
       break;
     }
     case 'execution_path':
@@ -178,10 +187,15 @@ export function applyExecutionEvent(
 function handleAgentEvent(
   event: AgentEvent,
   ctx: EventContext,
-  observation?: { at: number; scope: string; eventId: string }
+  observation?: { at: number; scope: string; eventId: string },
+  executionId?: string | null,
+  publicationEventId?: string
 ): void {
   switch (event.type) {
     case 'execution_status': {
+      const id = ctx.assistantIdRef.current;
+      if (id && !ctx.isCancelledRef.current && executionId === event.data.execution_id)
+        useChatStore.getState().observeExecutionStatus(id, event.data);
       if (
         observation &&
         event.data.phase === 'Thinking' &&
@@ -202,7 +216,9 @@ function handleAgentEvent(
     case 'assistant_message': {
       const id = ctx.assistantIdRef.current;
       if (id && !ctx.isCancelledRef.current) {
-        useChatStore.getState().appendAssistantBlock(id, event.data.block);
+        useChatStore
+          .getState()
+          .appendAssistantBlock(id, event.data.block, executionId, publicationEventId);
         if (
           observation &&
           useChatStore.getState().activity?.key !== `request:${event.data.block.request_id}`
@@ -282,7 +298,7 @@ function handleAgentEvent(
       handleChatEvent({ type: 'chart', spec: event.data.spec }, ctx);
       break;
     case 'final_answer':
-      handleChatEvent({ type: 'final_answer', data: event.data }, ctx);
+      handleChatEvent({ type: 'final_answer', data: event.data, execution_id: executionId }, ctx);
       break;
     case 'cancelled':
       handleChatEvent({ type: 'cancelled' }, ctx);
@@ -397,7 +413,7 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
       ctx.currentThinkingIdRef.current = null;
       const id = ctx.assistantIdRef.current;
       if (id) {
-        store.applyFinalAnswer(id, event.data);
+        store.applyFinalAnswer(id, event.data, event.execution_id);
       }
       break;
     }
@@ -523,4 +539,48 @@ function settleTurnProjection(store: ReturnType<typeof useChatStore.getState>, c
   ctx.currentMessageIdRef.current = null;
   ctx.isCancelledRef.current = false;
   ctx.currentThinkingIdRef.current = null;
+}
+
+/** 复用既有 conversation.get 的 publication 视图，不新建 transcript 或执行状态。 */
+async function refreshNativeFinalPresentation(envelope: ChatEventEnvelope, messageId: string) {
+  const address = useConversationStore.getState();
+  const ownsView = captureConversationView();
+  const scope = productDataScope(useWorkspaceStore.getState().current);
+  const message = useChatStore.getState().messages.find((entry) => entry.id === messageId);
+  const status = message?.executionStatus;
+  if (
+    !envelope.conversation_id ||
+    address.workspaceId !== envelope.workspace_id ||
+    address.activeId !== envelope.conversation_id ||
+    scope.workspaceId !== envelope.workspace_id ||
+    !message?.finalAnswerConfirmed ||
+    status?.status !== 'settled' ||
+    message.finalAnswerExecutionId !== status.execution_id
+  )
+    return;
+  try {
+    const record = await conversationApi.get(envelope.workspace_id, envelope.conversation_id);
+    const currentAddress = useConversationStore.getState();
+    if (
+      !ownsView() ||
+      currentAddress.workspaceId !== envelope.workspace_id ||
+      currentAddress.activeId !== envelope.conversation_id ||
+      !sameProductDataScope(scope, productDataScope(useWorkspaceStore.getState().current))
+    )
+      return;
+    const matches = record.messages.filter((entry) => {
+      const source = entry.final_answer_source;
+      return (
+        entry.final_answer_confirmed &&
+        source &&
+        source.execution_id === status.execution_id &&
+        source.request_id === status.request_id &&
+        source.sequence === status.sequence
+      );
+    });
+    const source = matches.length === 1 ? matches.at(0)?.final_answer_source : undefined;
+    if (source) useChatStore.getState().applyFinalAnswerSource(messageId, source);
+  } catch {
+    // 来源缺失时保留普通消息；不能用同文或末块位置补造 candidate identity。
+  }
 }

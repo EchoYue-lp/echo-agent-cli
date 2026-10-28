@@ -27,7 +27,7 @@ manual_compression。永久保留所有用户输入会破坏活动窗口的上�
   全文；最近四条的活动投影按时间顺序保留短原文或 400 字符预览与完整 SHA 的稳定引用。
   长原文沿原 PreparedUserTurn/InputResourceRef 落在 host 产品数据目录，缓存缺失/篡改
   只能从原 journal 再物化，不把尾部丢弃后宣称约束完整。它们不是新请求或新的
-  canonical system policy，退出 run scope 时删除 projection。最近四条不代表全部有效要求。
+  canonical system policy，退出 run scope 时删除 projection。最近四条只是呈现预览；完整历史通过同journal派生来源入口按需读取，不产生独立有效要求账本。
 - ConversationStore 保存完整 transcript，ContextManager 保存活动窗口，RuntimeStateStore
   保存恢复 checkpoint，TaskRuntimeStore 保存 goal/执行事实，Trace/ChatEventLog 保存诊断和事件。
 
@@ -86,3 +86,33 @@ Goal、goal_revision或goal_hash。用户通过GUI目标编辑或IM `/task-goal`
 必要历史、完整长原文及末尾限制继续沿原journal、压缩投影与read_artifact读取；缺失或
 校验失败时原required_context_unavailable暂停相关新副作用，原Goal和可恢复owner保留。
 这里不新增GoalStore、要求解释器、第二份队列/状态机或结构化模型协议，也不裁剪通用框架/SDK API。
+
+## 2026-10-27 可发现的完整原文入口
+
+保留原Goal/Steer产品权限：普通追加输入只交主模型结合历史理解；已有Goal只由用户显式更新或结束，不引入独立意图模型或统一强制要求/计划/验收流程。压缩后可读原文不等于全部原文常驻上下文。
+
+原TaskRuntime的原始输入来源族从同一个journal派生，原始接纳与投递事实分别保留。模型在有界恢复capsule中取得准确Run、journal identity及固定序号前缀的不可变引用，通过既有`read_artifact`按需分页恢复十三条以上输入前的原文及末尾限制。完整来源由原有界journal读取覆盖到切点，不能把近期4/8条或一个256事件结果页当作全集。
+
+派生来源缓存可重建，不拥有Goal、计划、要求或输入生命周期状态。每个已发布文件按真实源内容和原journal代际稳定命名；无新来源的重复刷新保留inode/mtime，后继追加不覆盖旧文件。最终请求校验的是模型实际看到的固定前缀，因此并发新输入不会混入旧页；下一安全点刷新为新引用。旧引用的Run、代际、SHA和cursor仍由原reader核验。
+
+关键来源读取、物化、校验或最终`read_artifact`资格缺失时保留原required-context失败→暂停→expected-resume链，不以降空历史、放宽工具范围或重放未知副作用替代恢复。原文文件固定落在本机产品data-root，SSH项目的FileSystem/read_file不能冒充本机原文读取。
+
+验证必须检查真实压缩后的模型请求可发现入口，以及真实tool结果逐页进入后继模型调用并覆盖早期全文/末尾；fixture本地回读或把旧正文再次当当前输入不构成此资格。
+
+### canonical长Goal与原文历史分别保持来源
+
+当前长Goal沿原GoalContract接缝物化到host artifacts，并携带原Goal revision/hash及Run/journal代际；原tasks/objective仅归档。legacy无Accepted的长初始化目标及用户后来改过的长目标都可由原host read_artifact读取，不为它们添加伪输入或扩展raw来源事件类别，也不把新Goal写入旧raw前缀。短目标按原内联方式；实际已完整呈现的必要原文不因派生引用新增reader要求，NoTools/限定read_file正常正控继续成立。真正被省略的必要长Goal或早期原文缺reader则沿原暂停/expected-resume，不放宽W。
+
+完整可见性的判断以最终实际模型请求为准：既有 GoalContract 能内联的边界与未启用 continuation 时的恢复预览边界分别沿用；预览会省略的 canonical Goal 发布 host 引用。当前 PreparedUserTurn 已完整内联的中段文字（超过预览长度但未到 spill 边界）保持 NoTools／read_file-only 正常执行。此前真实配对 read_artifact 调用和 Tool 结果若仍完整留在请求中，按分页字节范围、全文覆盖及原 SHA 核对后也算全文可见；缺页、重叠不一致或 SHA 不符不算。核对不会从本地文件补入缺失模型文字，也不把“文件存在”当作“模型已读取”。同一 Goal 的已发布引用资格仍绑定 Run、journal、revision 与 hash，不随当前投影显示模式改变。
+
+### 分页消费者测试的真实封包边界
+
+分页测试必须绑定实际模型请求里的 assistant 调用、原 ToolCall 和 ToolResult 的同一调用 ID。
+`read_artifact` 的第一页省略可选 string 参数 `cursor`；发送 JSON null 会被原 schema 校验
+拒绝，此时模型中的 `[Error]` 是错误结果，不构成原文页或原文截断的证据。
+
+成功页按原 reader 在真实输出末尾附加的分页 notice 解包，不按 expected 字符数截取首部。
+验证模型 Tool 文本与原 ToolResult 完整输出相同，再核对文件坐标、原 SHA、连续字节范围、
+每页完整 UTF-8 内容与 SHA，并从实际模型页重构整个来源文件。只出现短 marker、fixture
+本地可读或 sidecar preview 均不等于全文进入模型。验收继续使用原 8000-token 上限和
+2000-token 页预算；本节约束验证方法，具体通过资格以对应实际命令与快照回执为准。

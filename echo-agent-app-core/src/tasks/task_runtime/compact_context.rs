@@ -22,6 +22,8 @@ use super::types::{BackgroundCellState, PlanTask, TaskExecutionSummary, TodoItem
 
 /// Stable application marker identifying the run-level recovery projection.
 pub const RUNTIME_RECOVERY_MARKER: &str = "[eko_runtime_recovery_capsule]";
+const RAW_INPUT_HISTORY_MARKER: &str = "[eko_original_input_history]";
+const CANONICAL_GOAL_REFERENCE_MARKER: &str = "[eko_canonical_goal_reference]";
 /// Stable objective contract projected separately from volatile recovery state.
 pub const RUNTIME_GOAL_MARKER: &str = "[eko_run_goal_contract]";
 pub(crate) const DOMAIN_METHOD_MARKER: &str = "[eko_bound_domain_method]";
@@ -37,9 +39,9 @@ pub(crate) fn is_required_context_unavailable(failure: &echo_agent::error::Agent
 /// before the Subagent finishes.
 pub const TASK_CONTEXT_MARKER: &str = "[task_context]";
 
-const MAX_GOAL_CHARS: usize = 420;
+pub(crate) const MAX_GOAL_CHARS: usize = 420;
 const MAX_GOAL_CONTRACT_CHARS: usize = 8_000;
-const MAX_TASK_TITLE_CHARS: usize = 96;
+pub(crate) const MAX_TASK_TITLE_CHARS: usize = 96;
 const MAX_TASK_DESC_CHARS: usize = 220;
 const MAX_SUMMARY_CHARS: usize = 260;
 const MAX_ITEMS_PER_FIELD: usize = 3;
@@ -252,6 +254,14 @@ pub fn task_runtime_projection_registry() -> Arc<TaskRuntimeProjectionRegistry> 
 }
 
 impl PreModelContextProjector for TaskRuntimeContextProjector {
+    fn recovered_tool_origins<'a>(
+        &'a self,
+        context: &'a ProjectionContext,
+        messages: &'a [Message],
+    ) -> BoxFuture<'a, AgentResult<Vec<echo_agent::compression::RecoveredToolOrigin>>> {
+        crate::legacy_eko_history::recovered_tool_origins(context, messages)
+    }
+
     fn validate_model_request<'a>(
         &'a self,
         context: &'a ProjectionContext,
@@ -272,7 +282,7 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
             let Some(store) = self.registry.store(run_id) else {
                 return Ok(());
             };
-            let run_id = run_id.to_owned();
+            let run_id = run_id.to_string();
             let model_tools = request
                 .tools
                 .as_deref()
@@ -281,38 +291,161 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
                 .map(|tool| tool.function.name.clone())
                 .collect::<std::collections::HashSet<_>>();
             let artifacts = artifacts.cloned();
+            let advertised = raw_history_reference_from_request(request, &run_id);
+            let goals = goal_references_from_request(request, &run_id);
+            let observed_reads = observed_artifact_reads(request);
+            let visible = request
+                .messages
+                .iter()
+                .filter(|message| message.role == echo_agent::llm::types::Role::User)
+                .filter_map(|message| message.content.as_text())
+                .collect::<Vec<_>>();
             super::executor::TaskRuntimeOperation::new(store)
-                .run_store("qualify TaskRuntime source references against final model request", move |store| {
-                    let state = store.get_run_state(&run_id)?
-                        .ok_or_else(|| super::store::StoreError::RunNotFound(run_id.clone()))?;
-                    let required = state.recent_constraints.iter().rev().take(4)
-                        .filter(|steer| steer.text.chars().count() > crate::prepared_turn::PREVIEW_CHARS)
-                        .collect::<Vec<_>>();
-                    if required.is_empty() { return Ok(()); }
-                    // 本引用合同使用原校验分页工具，不能因注册存在或 SSH read_file 可用就认定可达。
-                    if !model_tools.contains("read_artifact") {
-                        return Err(super::store::StoreError::InvalidPlan(
-                            "本次最终模型工具范围无法读取完整用户约束；保持原工具上界并等待恢复".to_owned(),
-                        ));
-                    }
-                    let config = artifacts.ok_or_else(|| super::store::StoreError::InvalidPlan(
-                        "本次执行缺少原 host artifact 配置，不能读取完整用户约束".to_owned(),
-                    ))?;
-                    for steer in required {
-                        let artifact = store.recorded_user_steer_artifact(&run_id, steer)?;
-                        let reference = echo_agent::tools::artifact::ToolOutputArtifactRef {
-                            path: artifact.path, artifact_bytes: artifact.bytes, payload_bytes: artifact.bytes,
-                            sha256: artifact.sha256.ok_or_else(|| super::store::StoreError::InvalidPlan("原文 hash 缺失".to_owned()))?,
-                            retention: config.retention.clone(),
-                        };
-                        // 使用真实 snapshot 配置再核一次可达性；不手造一个宽松根冒 invocation 可读。
-                        echo_agent::tools::files::artifact::read_artifact_page(
-                            &config, &reference, None,
-                            echo_agent::tools::files::artifact::ArtifactPageLimit::Bytes(1),
-                        ).map_err(|error| super::store::StoreError::InvalidPlan(format!("本次调用无法读取完整用户约束：{error}")))?;
-                    }
-                    Ok(())
-                }).await.map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
+                .run_store(
+                    "qualify TaskRuntime source references against final model request",
+                    move |store| {
+                        let mut required = Vec::new();
+                        let mut visible = visible;
+                        if let Some(goal) = store.canonical_goal_reference(&run_id)? {
+                            if let Some(text) =
+                                verified_artifact_text(&goal.artifact, &observed_reads)
+                            {
+                                visible.push(text);
+                            }
+                        }
+                        for reference in &advertised {
+                            if store
+                                .qualify_raw_input_history_reference(&run_id, reference)
+                                .is_ok()
+                                && let Some(artifact) = &reference.artifact
+                                && let Some(text) =
+                                    verified_artifact_text(artifact, &observed_reads)
+                            {
+                                for line in text.lines().skip(1) {
+                                    if let Ok(record) =
+                                        serde_json::from_str::<serde_json::Value>(line)
+                                        && let Some(body) = record
+                                            .pointer("/event/payload/input_snapshot/payload/text")
+                                            .or_else(|| record.pointer("/event/payload/text"))
+                                            .and_then(serde_json::Value::as_str)
+                                    {
+                                        visible.push(body.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        let current = store
+                            .get_run(&run_id)?
+                            .ok_or_else(|| super::store::StoreError::RunNotFound(run_id.clone()))?;
+                        let goal_visible = visible.iter().any(|message| {
+                            message == &current.goal
+                                || message.contains(&format!("Goal: {}\n", current.goal))
+                                || message.contains(&format!(
+                                    "Objective:\n{}\nContinuation contract:",
+                                    current.goal
+                                ))
+                        });
+                        if !goal_visible {
+                            let mut current_goal = None;
+                            for goal in goals {
+                                if store
+                                    .qualify_canonical_goal_reference(&run_id, &goal)
+                                    .is_ok()
+                                {
+                                    current_goal = Some(goal);
+                                    break;
+                                }
+                            }
+                            let goal = current_goal.ok_or_else(|| {
+                                super::store::StoreError::InvalidPlan(
+                                    "最终主模型请求缺少准确当前Goal版本的host可读全文引用"
+                                        .to_string(),
+                                )
+                            })?;
+                            required.push(goal.artifact);
+                        }
+                        let mut qualified = None;
+                        let mut rejected = None;
+                        for candidate in advertised {
+                            match store.qualify_raw_input_history_reference(&run_id, &candidate) {
+                                Ok(()) => {
+                                    qualified = Some(candidate);
+                                    break;
+                                }
+                                Err(error) => rejected = Some(error),
+                            }
+                        }
+                        match qualified {
+                            Some(reference) if reference.source_records != 0 => {
+                                let omitted = store.raw_input_history_needs_reader(
+                                    &run_id, &reference, &visible,
+                                )?;
+                                if omitted || model_tools.contains("read_artifact") {
+                                    required.push(reference.artifact.ok_or_else(|| {
+                                        super::store::StoreError::InvalidPlan(
+                                            "原文历史缺文件引用".to_string(),
+                                        )
+                                    })?);
+                                }
+                            }
+                            Some(_) => {}
+                            None => {
+                                if store
+                                    .raw_input_history_reference(&run_id, None)?
+                                    .source_records
+                                    != 0
+                                {
+                                    return Err(rejected.unwrap_or_else(|| {
+                                        super::store::StoreError::InvalidPlan(
+                                            "最终主模型请求缺少完整原始输入历史入口".to_string(),
+                                        )
+                                    }));
+                                }
+                            }
+                        }
+                        if required.is_empty() {
+                            return Ok(());
+                        }
+                        if !model_tools.contains("read_artifact") {
+                            return Err(super::store::StoreError::InvalidPlan(
+                                "本次最终模型工具范围无法读取必要原文；保持原工具上界并等待恢复"
+                                    .to_string(),
+                            ));
+                        }
+                        let config = artifacts.ok_or_else(|| {
+                            super::store::StoreError::InvalidPlan(
+                                "本次执行缺少原host artifact配置，不能读取必要原文".to_string(),
+                            )
+                        })?;
+                        for artifact in required {
+                            let descriptor = echo_agent::tools::artifact::ToolOutputArtifactRef {
+                                path: artifact.path,
+                                artifact_bytes: artifact.bytes,
+                                payload_bytes: artifact.bytes,
+                                sha256: artifact.sha256.ok_or_else(|| {
+                                    super::store::StoreError::InvalidPlan(
+                                        "必要原文SHA缺失".to_string(),
+                                    )
+                                })?,
+                                retention: config.retention.clone(),
+                            };
+                            echo_agent::tools::files::artifact::read_artifact_page(
+                                &config,
+                                &descriptor,
+                                None,
+                                echo_agent::tools::files::artifact::ArtifactPageLimit::Bytes(1),
+                            )
+                            .map_err(|error| {
+                                super::store::StoreError::InvalidPlan(format!(
+                                    "本次调用无法读取必要原文：{error}"
+                                ))
+                            })?;
+                        }
+                        Ok(())
+                    },
+                )
+                .await
+                .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
         })
     }
 
@@ -345,9 +478,26 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
                     let run_id = run_id.to_string();
                     super::executor::TaskRuntimeOperation::new(store)
                         .run_store("project TaskRuntime model context", move |store| {
+                            let recovery =
+                                match build_runtime_recovery_capsule_checked(&store, &run_id)? {
+                                    Some(recovery) => recovery,
+                                    None => {
+                                        let run = store.get_run(&run_id)?.ok_or_else(|| {
+                                            super::store::StoreError::RunNotFound(run_id.clone())
+                                        })?;
+                                        format!(
+                                            "{RUNTIME_RECOVERY_MARKER}\nGoal: {}\n{}",
+                                            truncate_chars(&run.goal, MAX_GOAL_CHARS),
+                                            format_raw_history_reference(
+                                                &store
+                                                    .raw_input_history_reference(&run_id, None)?
+                                            )?
+                                        )
+                                    }
+                                };
                             Ok((
-                                build_runtime_goal_contract(&store, &run_id),
-                                build_runtime_recovery_capsule_checked(&store, &run_id)?,
+                                build_runtime_goal_contract_checked(&store, &run_id)?,
+                                Some(recovery),
                             ))
                         })
                         .await
@@ -373,6 +523,236 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
     }
 }
 
+fn format_raw_history_reference(
+    reference: &super::store::RawInputHistoryReference,
+) -> Result<String, super::store::StoreError> {
+    let mut rendered = format!(
+        "{RAW_INPUT_HISTORY_MARKER}\nreference: {}\n",
+        serde_json::to_string(reference)?
+    );
+    if let Some(artifact) = &reference.artifact {
+        rendered.push_str(&format!(
+            "path: {}\nbytes: {}\nsha256: {}\n",
+            artifact.path.display(),
+            artifact.bytes,
+            artifact
+                .sha256
+                .as_deref()
+                .ok_or_else(|| super::store::StoreError::InvalidPlan(
+                    "原文历史引用SHA缺失".to_string()
+                ))?
+        ));
+    }
+    rendered.push_str("这是准确Run/原journal前缀的原始输入来源记录，包含接纳与投递事实；Accepted不等于已理解或已执行。用read_artifact分页读取必要早期原文，结合历史理解，不自动改Goal或计划。\n[eko_original_input_history_end]\n\n");
+    Ok(rendered)
+}
+
+type ObservedArtifactRead = (Option<String>, String);
+
+fn observed_artifact_reads(request: &echo_agent::llm::ChatRequest) -> Vec<ObservedArtifactRead> {
+    let mut calls = std::collections::HashMap::<String, Option<String>>::new();
+    let mut reads = Vec::new();
+    for message in &request.messages {
+        if message.role == echo_agent::llm::types::Role::Assistant
+            && let Some(tool_calls) = &message.tool_calls
+        {
+            for call in tool_calls {
+                calls.remove(&call.id);
+                if call.function.name == "read_artifact" {
+                    if let Ok(parameters) =
+                        serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                    {
+                        calls.insert(
+                            call.id.clone(),
+                            parameters
+                                .get("expected_sha256")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
+                        );
+                    }
+                }
+            }
+        }
+        if message.role == echo_agent::llm::types::Role::Tool
+            && message
+                .name
+                .as_deref()
+                .is_none_or(|name| name == "read_artifact")
+            && let Some(call) = message
+                .tool_call_id
+                .as_ref()
+                .and_then(|id| calls.remove(id))
+            && let Some(output) = message.content.as_text_ref()
+        {
+            reads.push((call, output.to_string()));
+        }
+    }
+    reads
+}
+
+fn utf8_segment(text: &str, start: u64, end: u64) -> Option<String> {
+    let start = usize::try_from(start).ok()?;
+    let end = usize::try_from(end).ok()?;
+    if start > end
+        || end > text.as_bytes().len()
+        || !text.is_char_boundary(start)
+        || !text.is_char_boundary(end)
+    {
+        return None;
+    }
+    Some(
+        text.char_indices()
+            .skip_while(|(offset, _)| *offset < start)
+            .take_while(|(offset, _)| *offset < end)
+            .map(|(_, ch)| ch)
+            .collect(),
+    )
+}
+
+/// 只承认实际请求中已配对reader结果的完整字节覆盖及同一SHA，不把本地缓存内容冒模型可见。
+fn verified_artifact_text(
+    artifact: &crate::prepared_turn::InputResourceRef,
+    reads: &[ObservedArtifactRead],
+) -> Option<String> {
+    let expected = artifact.sha256.as_deref()?;
+    let mut pages = Vec::new();
+    for (sha, output) in reads {
+        if sha
+            .as_deref()
+            .is_some_and(|sha| !sha.eq_ignore_ascii_case(expected))
+        {
+            continue;
+        }
+        let Some((body, notice)) = output.rsplit_once("\n\n[Artifact ") else {
+            continue;
+        };
+        let Some(range) = notice
+            .strip_prefix("page: bytes ")
+            .or_else(|| notice.strip_prefix("complete: bytes "))
+        else {
+            continue;
+        };
+        let Some((offsets, rest)) = range.split_once(" of ") else {
+            continue;
+        };
+        let Some((start, end)) = offsets.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (start.parse::<u64>(), end.parse::<u64>()) else {
+            continue;
+        };
+        let Some(total) = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u64>()
+            .ok()
+        else {
+            continue;
+        };
+        if total != artifact.bytes
+            || end > total
+            || end.checked_sub(start) != u64::try_from(body.as_bytes().len()).ok()
+        {
+            continue;
+        }
+        pages.push((start, end, body));
+    }
+    pages.sort_by_key(|(start, end, _)| (*start, *end));
+    let mut text = String::new();
+    let mut covered = 0_u64;
+    for (start, end, body) in pages {
+        if start > covered {
+            return None;
+        }
+        let overlap = covered.min(end).checked_sub(start)?;
+        if utf8_segment(&text, start, covered.min(end))? != utf8_segment(body, 0, overlap)? {
+            return None;
+        }
+        if end > covered {
+            text.push_str(&utf8_segment(body, overlap, end.checked_sub(start)?)?);
+            covered = end;
+        }
+    }
+    if covered != artifact.bytes || hex::encode(Sha256::digest(text.as_bytes())) != expected {
+        return None;
+    }
+    Some(text)
+}
+
+fn format_goal_reference(
+    reference: &super::store::CanonicalGoalReference,
+) -> Result<String, super::store::StoreError> {
+    Ok(format!(
+        "\n{CANONICAL_GOAL_REFERENCE_MARKER}\nreference: {}\npath: {}\nbytes: {}\nsha256: {}\n这是原TaskRuntime当前Goal的host全文引用；原goal_revision/SHA仍由用户CAS拥有，不代表新的输入或目标。\n[eko_canonical_goal_reference_end]\n",
+        serde_json::to_string(reference)?,
+        reference.artifact.path.display(),
+        reference.artifact.bytes,
+        reference.goal_sha256
+    ))
+}
+
+fn goal_references_from_request(
+    request: &echo_agent::llm::ChatRequest,
+    run_id: &str,
+) -> Vec<super::store::CanonicalGoalReference> {
+    let mut references = Vec::new();
+    for message in &request.messages {
+        let Some(text) = message.content.as_text_ref() else {
+            continue;
+        };
+        let Some((_, block)) = text.split_once(CANONICAL_GOAL_REFERENCE_MARKER) else {
+            continue;
+        };
+        let Some(encoded) = block
+            .lines()
+            .find_map(|line| line.strip_prefix("reference: "))
+        else {
+            continue;
+        };
+        if let Ok(reference) = serde_json::from_str::<super::store::CanonicalGoalReference>(encoded)
+            && reference.run_id == run_id
+        {
+            references.push(reference);
+        }
+    }
+    references.sort_by_key(|reference| std::cmp::Reverse(reference.goal_revision));
+    references
+}
+
+fn raw_history_reference_from_request(
+    request: &echo_agent::llm::ChatRequest,
+    run_id: &str,
+) -> Vec<super::store::RawInputHistoryReference> {
+    let mut references = Vec::new();
+    for message in &request.messages {
+        let Some(text) = message.content.as_text_ref() else {
+            continue;
+        };
+        if !text.contains(RUNTIME_RECOVERY_MARKER) {
+            continue;
+        }
+        let Some((_, block)) = text.split_once(RAW_INPUT_HISTORY_MARKER) else {
+            continue;
+        };
+        let Some(encoded) = block
+            .lines()
+            .find_map(|line| line.strip_prefix("reference: "))
+        else {
+            continue;
+        };
+        // 用户历史也可能引用过capsule示例；只收可解码候选，再由原store核精确来源。
+        if let Ok(reference) =
+            serde_json::from_str::<super::store::RawInputHistoryReference>(encoded)
+            && reference.run_id == run_id
+        {
+            references.push(reference);
+        }
+    }
+    references.sort_by_key(|reference| std::cmp::Reverse(reference.observed_through_sequence));
+    references
+}
+
 /// Protect the dynamic task brief for the current Subagent invocation.
 pub async fn install_task_context_protection(agent: &ReactAgent) {
     let mut ctx = agent.context().lock().await;
@@ -390,11 +770,25 @@ pub(crate) fn install_domain_context_projection(agent: &mut ReactAgent) {
 
 /// Derive a compact, compression-safe view of the active runtime state.
 pub fn build_runtime_goal_contract(store: &TaskRuntimeStore, run_id: &str) -> Option<String> {
-    let state = store.get_run_state(run_id).ok().flatten()?;
-    let continuation = state.continuation.as_ref()?;
+    build_runtime_goal_contract_checked(store, run_id)
+        .ok()
+        .flatten()
+}
+
+fn build_runtime_goal_contract_checked(
+    store: &TaskRuntimeStore,
+    run_id: &str,
+) -> Result<Option<String>, super::store::StoreError> {
+    let Some(state) = store.get_run_state(run_id)? else {
+        return Ok(None);
+    };
+    let Some(continuation) = state.continuation.as_ref() else {
+        return Ok(None);
+    };
     if !continuation.enabled {
-        return None;
+        return Ok(None);
     }
+    let goal_reference = store.canonical_goal_reference(run_id)?;
     let run = state.run;
     let mut hasher = Sha256::new();
     hasher.update(run.goal.as_bytes());
@@ -417,7 +811,7 @@ pub fn build_runtime_goal_contract(store: &TaskRuntimeStore, run_id: &str) -> Op
         .time_budget_seconds
         .map(|budget| budget.saturating_sub(continuation.time_used_seconds));
 
-    Some(format!(
+    let mut contract = format!(
         "{RUNTIME_GOAL_MARKER}\n\
          Run: id={}, status={}, objective_sha256={}, plan_revision={}\n\
          Objective{}:\n{}\n\
@@ -435,12 +829,13 @@ pub fn build_runtime_goal_contract(store: &TaskRuntimeStore, run_id: &str) -> Op
             .map(|revision| revision.to_string())
             .unwrap_or_else(|| "none".to_string()),
         if objective_truncated {
-            let artifact = store
-                .objective_artifact_path(run_id)
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "unavailable".to_string());
+            let artifact = goal_reference.as_ref().ok_or_else(|| {
+                super::store::StoreError::InvalidPlan("长Goal缺本机可读引用".to_string())
+            })?;
             format!(
-                " (bounded here; recover the full objective artifact before acting: {artifact})"
+                " (bounded here; recover the full current Goal with host read_artifact: {}; sha256={})",
+                artifact.artifact.path.display(),
+                artifact.goal_sha256
             )
         } else {
             String::new()
@@ -462,7 +857,11 @@ pub fn build_runtime_goal_contract(store: &TaskRuntimeStore, run_id: &str) -> Op
         remaining_time_seconds
             .map(|seconds| seconds.to_string())
             .unwrap_or_else(|| "unbounded".to_string()),
-    ))
+    );
+    if let Some(reference) = goal_reference {
+        contract.push_str(&format_goal_reference(&reference)?);
+    }
+    Ok(Some(contract))
 }
 
 /// Derive a compact, compression-safe view of the active runtime state.
@@ -483,6 +882,8 @@ fn build_runtime_recovery_capsule_checked(
     let run = state.run;
     let continuation = state.continuation;
     let recent_constraints = state.recent_constraints;
+    let raw_history = store.raw_input_history_reference(run_id, None)?;
+    let goal_reference = store.canonical_goal_reference(run_id)?;
     let plan = store.get_plan(run_id).unwrap_or_default();
     let todos = store.list_todos(run_id).unwrap_or_default();
     let cells = store.list_background_cells(run_id).unwrap_or_default();
@@ -495,6 +896,8 @@ fn build_runtime_recovery_capsule_checked(
     if !has_plan_tasks
         && !has_runtime_todos
         && recent_constraints.is_empty()
+        && raw_history.source_records == 0
+        && goal_reference.is_none()
         && cells.is_empty()
         && continuation.as_ref().is_none_or(|state| !state.enabled)
     {
@@ -510,7 +913,7 @@ fn build_runtime_recovery_capsule_checked(
          The file-backed TaskRuntimeStore remains authoritative.\n",
     );
     out.push_str(&format!(
-        "Run: id={}, status={}, route={}, domain={}, goal={}\n",
+        "Run: id={}, status={}, route={}, domain={}\nGoal: {}\n",
         run.run_id,
         run.status.as_str(),
         run.route,
@@ -609,6 +1012,11 @@ fn build_runtime_recovery_capsule_checked(
             ));
         }
         out.push('\n');
+    }
+
+    out.push_str(&format_raw_history_reference(&raw_history)?);
+    if let Some(reference) = goal_reference {
+        out.push_str(&format_goal_reference(&reference)?);
     }
 
     push_task_group(
@@ -1131,11 +1539,19 @@ mod tests {
         );
         let contract = build_runtime_goal_contract(&store, "r4")
             .ok_or_else(|| "goal contract should be built".to_string())?;
-        if !contract.contains("objective artifact before acting")
-            || !contract.contains("objective-r1-")
-        {
-            return Err("goal contract should point at the spilled objective artifact".to_string());
-        }
+        let canonical = store
+            .canonical_goal_reference("r4")
+            .map_err(|error| error.to_string())?
+            .ok_or("长Goal缺原authority的host引用")?;
+        // 已批准的当前Goal由原GoalState持有，旧objective是归档，不能继续
+        // 用旧提示语/文件名要求模型把归档当作当前目标的权威入口。
+        assert!(contract.contains("host read_artifact"));
+        assert!(contract.contains(&canonical.artifact.path.display().to_string()));
+        assert!(contract.contains(&canonical.goal_sha256));
+        assert_eq!(
+            std::fs::read_to_string(&canonical.artifact.path).map_err(|error| error.to_string())?,
+            long_goal
+        );
         let capsule = build_runtime_recovery_capsule(&store, "r4")
             .ok_or_else(|| "capsule should be built".to_string())?;
         assert!(
@@ -1150,7 +1566,13 @@ mod tests {
         );
         let degraded_contract = build_runtime_goal_contract(&store, "r4")
             .ok_or_else(|| "goal contract should survive artifact degradation".to_string())?;
-        assert!(degraded_contract.contains("unavailable"));
+        assert!(degraded_contract.contains(&canonical.artifact.path.display().to_string()));
+        assert!(degraded_contract.contains(&canonical.goal_sha256));
+        assert_eq!(
+            std::fs::read_to_string(&canonical.artifact.path).map_err(|error| error.to_string())?,
+            long_goal,
+            "损坏旧归档不能把原当前Goal降成不可用"
+        );
         Ok(())
     }
 
@@ -1505,6 +1927,541 @@ mod tests {
         Ok(())
     }
 
+    fn verify_actual_model_artifact_pages(
+        reference: &echo_agent::tools::artifact::ToolOutputArtifactRef,
+        expected_pages: Vec<(String, echo_agent::tools::files::artifact::ArtifactPage)>,
+        actual_calls: &[Vec<Message>],
+        actual_read_calls: &std::collections::HashMap<String, echo_agent::agent::ToolInvocation>,
+        actual_read_results: &std::collections::HashMap<
+            String,
+            (String, echo_agent::tools::ToolResult),
+        >,
+    ) -> Result<String, String> {
+        let path = reference.path.clone();
+        let sha256 = reference.sha256.clone();
+        let bytes = reference.artifact_bytes;
+        let mut actual_source = String::new();
+        let mut expected_start = 0_u64;
+        for (call_id, expected) in expected_pages {
+            let (expected_page, reader_start, reader_end) =
+                (expected.content, expected.start_byte, expected.end_byte);
+            let (messages, message_index, actual_message) = actual_calls
+                .iter()
+                .flat_map(|messages| {
+                    messages
+                        .iter()
+                        .enumerate()
+                        .map(move |(index, message)| (messages, index, message))
+                })
+                .find(|(_, _, message)| message.tool_call_id.as_deref() == Some(call_id.as_str()))
+                .ok_or_else(|| {
+                    let requests = actual_calls.iter().enumerate().map(|(index, messages)| {
+                        let messages = messages.iter().map(|message| {
+                            let text = message.content.as_text_ref().unwrap_or("");
+                            serde_json::json!({
+                                "role": format!("{:?}", message.role),
+                                "call_id": message.tool_call_id,
+                                "calls": message.tool_calls,
+                                "bytes": text.len(),
+                                "sha256": hex::encode(Sha256::digest(text.as_bytes())),
+                                "prefix": text.chars().take(160).collect::<String>(),
+                            })
+                        }).collect::<Vec<_>>();
+                        serde_json::json!({"request":index,"messages":messages})
+                    }).collect::<Vec<_>>();
+                    format!("真实工具结果未进入下一主模型请求：{}", serde_json::json!({
+                        "missing_call_id":call_id,
+                        "reader_start":reader_start,"reader_end":reader_end,
+                        "expected_page_bytes":expected_page.len(),
+                        "expected_page_sha256":hex::encode(Sha256::digest(expected_page.as_bytes())),
+                        "actual_reader_result":actual_read_results.get(&call_id),
+                        "actual_reader_call":actual_read_calls.get(&call_id),
+                        "actual_model_requests":requests,
+                    }))
+                })?;
+            let paired_call = messages
+                .iter()
+                .take(message_index)
+                .flat_map(|message| message.tool_calls.iter().flatten())
+                .find(|call| call.id == call_id)
+                .ok_or("真实模型Tool结果缺同请求中的原assistant调用")?;
+            let invocation = actual_read_calls
+                .get(&call_id)
+                .ok_or("实际reader缺原ToolCall事件")?;
+            assert_eq!(paired_call.function.name, "read_artifact");
+            assert_eq!(invocation.name, "read_artifact");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&paired_call.function.arguments)
+                    .map_err(|error| error.to_string())?,
+                invocation.requested_args
+            );
+            assert_eq!(
+                invocation
+                    .args
+                    .get("expected_sha256")
+                    .and_then(serde_json::Value::as_str),
+                Some(sha256.as_str())
+            );
+            assert_eq!(
+                invocation
+                    .args
+                    .get("max_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                Some(2_000)
+            );
+            assert_eq!(
+                invocation
+                    .args
+                    .get("path")
+                    .and_then(serde_json::Value::as_str),
+                path.to_str()
+            );
+            let (name, result) = actual_read_results
+                .get(&call_id)
+                .ok_or("实际reader缺原ToolResult事件")?;
+            assert_eq!(name, "read_artifact");
+            assert!(result.success, "原reader失败，不能计为原文页：{result:?}");
+            assert!(result.error.is_none());
+            assert!(
+                result.artifact.is_none(),
+                "不能把结果sidecar的preview当原文入模"
+            );
+            assert_eq!(result.metadata.get("sha256"), Some(&sha256));
+            let result_path = result
+                .metadata
+                .get("artifact_path")
+                .ok_or("实际reader结果缺原文件坐标")?;
+            assert_eq!(
+                std::path::Path::new(result_path)
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?,
+                path.canonicalize().map_err(|error| error.to_string())?
+            );
+            let number = |key: &str| -> Result<u64, String> {
+                result
+                    .metadata
+                    .get(key)
+                    .ok_or_else(|| format!("原reader结果缺{key}"))?
+                    .parse::<u64>()
+                    .map_err(|error| error.to_string())
+            };
+            let start = number("start_byte")?;
+            let end = number("end_byte")?;
+            let total = number("total_bytes")?;
+            assert_eq!((start, end), (reader_start, reader_end));
+            assert_eq!(start, expected_start, "真实页范围必须连续");
+            assert!(end >= start && end <= total);
+            assert_eq!(total, bytes);
+            let suffix = if let Some(next) = result.metadata.get("next_cursor") {
+                format!(
+                    "\n\n[Artifact page: bytes {start}-{end} of {total}; continue with cursor={next}.]"
+                )
+            } else {
+                format!("\n\n[Artifact complete: bytes {start}-{end} of {total}.]")
+            };
+            // 先按原reader真实封包解出模型实际正文，再校验整页字节。
+            // 不按expected字符数截首部，也不把fixture原文拼入实际输出。
+            let actual = actual_message
+                .content
+                .as_text_ref()
+                .ok_or("实际模型Tool消息没有文本正文")?;
+            assert_eq!(actual_message.role, echo_agent::llm::types::Role::Tool);
+            assert_eq!(actual, result.output, "模型页必须等于原ToolResult完整输出");
+            let payload = actual
+                .strip_suffix(&suffix)
+                .ok_or_else(|| format!("真实模型页不符合原reader封包：{call_id}"))?;
+            let page_bytes = u64::try_from(payload.len()).map_err(|error| error.to_string())?;
+            assert_eq!(page_bytes, end.saturating_sub(start));
+            assert_eq!(
+                hex::encode(Sha256::digest(payload.as_bytes())),
+                hex::encode(Sha256::digest(expected_page.as_bytes())),
+                "真实整页UTF-8 SHA不匹配"
+            );
+            assert_eq!(payload, expected_page);
+            actual_source.push_str(payload);
+            expected_start = end;
+        }
+        assert_eq!(expected_start, bytes);
+        assert_eq!(
+            hex::encode(Sha256::digest(actual_source.as_bytes())),
+            sha256
+        );
+        assert_eq!(
+            actual_source,
+            std::fs::read_to_string(&path).map_err(|error| error.to_string())?
+        );
+        Ok(actual_source)
+    }
+
+    #[tokio::test]
+    async fn earliest_steer_after_twelve_inputs_reaches_model_through_original_history()
+    -> Result<(), String> {
+        use echo_agent::agent::{
+            Agent, AgentInvocationContext, CancellationToken, ReactAgentBuilder,
+        };
+        use echo_agent::compression::compressor::SlidingWindowCompressor;
+        use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
+        use futures::StreamExt;
+        for repetitions in [2_000, 1] {
+            let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let run_id = "thirteen-original-inputs";
+            let original = format!(
+                "{}EARLY_ORIGINAL_TAIL_7461🧭",
+                "早期仍有效的完整背景 ".repeat(repetitions)
+            );
+            let store =
+                seed_bounded_steer_run(&temporary.path().join(".eko/tasks"), run_id, &original)?;
+            let original_goal = store
+                .get_run(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("原Goal缺失")?;
+            let original_input = crate::prepared_turn::PreparedUserTurn::build(
+                crate::prepared_turn::UserTurnInput {
+                    text: &original,
+                    attachments: &[],
+                    spill_dir: &crate::prepared_turn::resolve_user_input_spill_dir(Some(
+                        temporary.path(),
+                    )),
+                    conversation_id: Some("bounded-conversation"),
+                    turn_id: Some("oversized-steer"),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            let mut history = vec![
+                original_input
+                    .to_message()
+                    .map_err(|error| error.to_string())?,
+            ];
+            for index in 0..12 {
+                let later = format!("后续普通输入{index}：继续当前任务，不改Goal。");
+                store
+                    .record_run_steer(run_id, &format!("later-{index}"), &later)
+                    .map_err(|error| error.to_string())?;
+                history.push(Message::assistant("旧执行输出 ".repeat(2_000)));
+                history.push(Message::user(later));
+            }
+            drop(store);
+            let store = Arc::new(
+                TaskRuntimeStore::new_in_memory_with_shadow_root(
+                    temporary.path().join(".eko/tasks"),
+                )
+                .map_err(|error| error.to_string())?,
+            );
+            let state = store
+                .get_run_state(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("原Run缺失")?;
+            assert_eq!(state.recent_constraints.len(), 8);
+            assert!(
+                state
+                    .recent_constraints
+                    .iter()
+                    .all(|steer| steer.turn_id != "oversized-steer")
+            );
+            let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+            let _registration = registry.register(run_id, store.clone());
+            let config = crate::infra::tool_output_artifact_config(Some(temporary.path()));
+            let remote = Arc::new(UnreachableSshFiles(std::sync::atomic::AtomicUsize::new(0)));
+            let make_agent = |llm: Arc<echo_agent::testing::MockLlmClient>| {
+                ReactAgentBuilder::new()
+                    .enable_tools()
+                    .file_system(remote.clone())
+                    .auto_project_rules(false)
+                    .tool_output_artifacts(config.clone())
+                    .model("mock-model")
+                    .system_prompt("保留用户原文，按需读取历史")
+                    .llm_client(llm)
+                    .token_limit(8_000)
+                    .max_iterations(32)
+                    .build()
+                    .map_err(|error| error.to_string())
+            };
+            let invocation = AgentInvocationContext {
+                history: Some(history),
+                allowed_tools: Some(["read_artifact".to_string()].into_iter().collect()),
+                runtime: Some(echo_agent::tools::ExternalRunContext {
+                    conversation_id: Some("bounded-conversation".to_string()),
+                    run_id: Some(run_id.to_string()),
+                    turn_id: Some("continue-turn".to_string()),
+                    execution_id: Some("continue-turn".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let first_model = Arc::new(
+                echo_agent::testing::MockLlmClient::new().with_response("先找回原始输入。"),
+            );
+            let first_agent = make_agent(first_model.clone())?;
+            first_agent.set_pre_model_context_projector(Some(Arc::new(
+                TaskRuntimeContextProjector::new(registry.clone()),
+            )));
+            *first_agent.context().lock().await = ContextManager::builder(8_000)
+                .compressor(SlidingWindowCompressor::new(20).with_recent_token_budget(400))
+                .build();
+            let mut events = first_agent
+                .execute_stream_message_with_invocation_context(
+                    Message::user("继续".to_string()),
+                    CancellationToken::new(),
+                    invocation.clone(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut compressed = false;
+            while let Some(event) = events.next().await {
+                compressed |= matches!(
+                    event.map_err(|error| error.to_string())?,
+                    echo_agent::agent::AgentEvent::ContextCompressed { .. }
+                );
+            }
+            assert!(compressed, "必须通过真实压缩，不能只查询fixture里的原文");
+            let first_calls = first_model.all_calls();
+            assert_eq!(first_calls.len(), 1);
+            let first_request = first_calls.first().ok_or("实际主模型请求缺失")?;
+            let advertised = first_request
+                .iter()
+                .filter_map(|message| message.content.as_text_ref())
+                .find_map(|text| {
+                    text.split_once("[eko_original_input_history]")
+                        .map(|(_, reference)| reference)
+                });
+            assert!(
+                advertised.is_some(),
+                "十三条后的早期原文必须在真实主模型请求中有可发现入口；recent4不能替代完整来源"
+            );
+            let advertised = advertised.ok_or("实际模型没有原文历史入口")?;
+            let field = |name: &str| {
+                advertised
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix(name))
+                    .map(str::trim)
+            };
+            let path = std::path::PathBuf::from(field("path:").ok_or("模型可见原文路径缺失")?);
+            let sha256 = field("sha256:").ok_or("模型可见原文SHA缺失")?.to_string();
+            let bytes = field("bytes:")
+                .ok_or("模型可见原文大小缺失")?
+                .parse::<u64>()
+                .map_err(|error| error.to_string())?;
+            let reference = echo_agent::tools::artifact::ToolOutputArtifactRef {
+                path: path.clone(),
+                artifact_bytes: bytes,
+                payload_bytes: bytes,
+                sha256: sha256.clone(),
+                retention: config.retention.clone(),
+            };
+            // 只使用实际模型请求已经收到的引用；reader仅生成同文件的opaque cursor脚本。
+            let mut script = echo_agent::testing::MockLlmClient::new();
+            let mut cursor = None;
+            let mut expected_pages = Vec::new();
+            for ordinal in 0..31 {
+                let call_id = format!("raw-history-page-{ordinal}");
+                // cursor 是可省略的 string 字段；第一页省略它，不能发 JSON null。
+                let mut args = serde_json::json!({
+                    "path": path.clone(),
+                    "expected_sha256": sha256.clone(),
+                    "max_tokens": 2_000,
+                });
+                if let Some(cursor) = cursor.as_ref() {
+                    args.as_object_mut()
+                        .ok_or("原reader脚本参数不是对象")?
+                        .insert("cursor".to_string(), serde_json::json!(cursor));
+                }
+                script = script.then_tool_call(&call_id, "read_artifact", args.to_string());
+                let page = read_artifact_page(
+                    &config,
+                    &reference,
+                    cursor.as_deref(),
+                    ArtifactPageLimit::Tokens(2_000),
+                )
+                .map_err(|error| error.to_string())?;
+                let complete = page.complete;
+                let next = page.next_cursor.clone();
+                expected_pages.push((call_id, page));
+                if complete {
+                    break;
+                }
+                cursor = Some(next.ok_or("原reader缺下一页cursor")?);
+                if ordinal == 30 {
+                    return Err("同原32轮夹具不足完成原文分页".to_string());
+                }
+            }
+            let final_model = Arc::new(script.with_response("已按原文完成核对。"));
+            let final_agent = make_agent(final_model.clone())?;
+            final_agent.set_pre_model_context_projector(Some(Arc::new(
+                TaskRuntimeContextProjector::new(registry.clone()),
+            )));
+            *final_agent.context().lock().await = ContextManager::builder(8_000)
+                .compressor(SlidingWindowCompressor::new(20).with_recent_token_budget(400))
+                .build();
+            let mut events = final_agent
+                .execute_stream_message_with_invocation_context(
+                    Message::user("继续".to_string()),
+                    CancellationToken::new(),
+                    invocation,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut actual_read_calls = std::collections::HashMap::new();
+            let mut actual_read_results = std::collections::HashMap::new();
+            while let Some(event) = events.next().await {
+                match event.map_err(|error| error.to_string())? {
+                    echo_agent::agent::AgentEvent::ToolCall {
+                        call_id,
+                        invocation,
+                    } => {
+                        actual_read_calls.insert(call_id, invocation);
+                    }
+                    echo_agent::agent::AgentEvent::ToolResult {
+                        call_id,
+                        name,
+                        result,
+                    } => {
+                        actual_read_results.insert(call_id, (name, result));
+                    }
+                    _ => {}
+                }
+            }
+            let actual_calls = final_model.all_calls();
+            assert_eq!(actual_calls.len(), expected_pages.len().saturating_add(1));
+            assert!(
+                final_model
+                    .all_tool_counts()
+                    .iter()
+                    .all(|count| *count == 1)
+            );
+            let actual_source = verify_actual_model_artifact_pages(
+                &reference,
+                expected_pages,
+                &actual_calls,
+                &actual_read_calls,
+                &actual_read_results,
+            )?;
+            assert!(actual_source.contains(&original));
+            assert!(
+                actual_calls
+                    .iter()
+                    .any(|messages| messages.iter().any(|message| message
+                        .content
+                        .as_text_ref()
+                        .is_some_and(|text| text.contains("EARLY_ORIGINAL_TAIL_7461🧭"))))
+            );
+            let after = store
+                .get_run(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("原Goal缺失")?;
+            assert_eq!(
+                (after.goal, after.goal_revision, after.goal_sha256),
+                (
+                    original_goal.goal,
+                    original_goal.goal_revision,
+                    original_goal.goal_sha256
+                )
+            );
+            if repetitions == 1 {
+                // 复用模型实际收到的配对ToolCall/Tool结果，不能从fixture文件补入全文。
+                let read_history = actual_calls
+                    .last()
+                    .cloned()
+                    .ok_or("原文读取后模型历史缺失")?;
+                for missing_page in [false, true] {
+                    let mut requested_history = read_history.clone();
+                    if missing_page {
+                        let position = requested_history
+                            .iter()
+                            .position(|message| message.role == echo_agent::llm::types::Role::Tool)
+                            .ok_or("缺页负控没有实际Tool页可移除")?;
+                        requested_history.remove(position);
+                    }
+                    let summary_model = Arc::new(
+                        echo_agent::testing::MockLlmClient::new()
+                            .with_response("按已读取原文总结。"),
+                    );
+                    let summary_agent = ReactAgentBuilder::new()
+                        .file_system(remote.clone())
+                        .auto_project_rules(false)
+                        .tool_output_artifacts(config.clone())
+                        .model("mock-model")
+                        .llm_client(summary_model.clone())
+                        .token_limit(8_000)
+                        .build()
+                        .map_err(|error| error.to_string())?;
+                    summary_agent.set_pre_model_context_projector(Some(Arc::new(
+                        TaskRuntimeContextProjector::new(registry.clone()),
+                    )));
+                    let summary_invocation = AgentInvocationContext {
+                        history: Some(requested_history),
+                        runtime: Some(echo_agent::tools::ExternalRunContext {
+                            conversation_id: Some("bounded-conversation".to_string()),
+                            run_id: Some(run_id.to_string()),
+                            turn_id: Some("summary-turn".to_string()),
+                            execution_id: Some("summary-turn".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    let mut rejected = false;
+                    match summary_agent
+                        .execute_stream_message_with_invocation_context(
+                            Message::user("总结已经读过的原文".to_string()),
+                            CancellationToken::new(),
+                            summary_invocation,
+                        )
+                        .await
+                    {
+                        Err(error) if missing_page => {
+                            rejected = error.to_string().contains("必要原文");
+                        }
+                        Err(error) => return Err(error.to_string()),
+                        Ok(mut events) => {
+                            while let Some(event) = events.next().await {
+                                match event {
+                                    Ok(echo_agent::agent::AgentEvent::Error {
+                                        failure, ..
+                                    }) if missing_page => {
+                                        rejected |= is_required_context_unavailable(&failure);
+                                    }
+                                    Err(error) if missing_page => {
+                                        rejected |= error.to_string().contains("必要原文");
+                                    }
+                                    other => {
+                                        other.map_err(|error| error.to_string())?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if missing_page {
+                        assert!(rejected, "实际Tool页不完整时不能把本地完整缓存冒模型已见");
+                        assert_eq!(summary_model.call_count(), 0);
+                        continue;
+                    }
+                    assert_eq!(
+                        summary_model.call_count(),
+                        1,
+                        "必要原文已由真实reader进入请求，NoTools总结不应重新要求reader"
+                    );
+                    assert!(
+                        summary_model
+                            .all_tool_counts()
+                            .iter()
+                            .all(|count| *count == 0)
+                    );
+                    assert!(
+                        summary_model
+                            .all_calls()
+                            .iter()
+                            .any(|messages| messages.iter().any(|message| message.role
+                                == echo_agent::llm::types::Role::Tool
+                                && message.content.as_text_ref().is_some_and(
+                                    |text| text.contains("EARLY_ORIGINAL_TAIL_7461🧭")
+                                )))
+                    );
+                }
+            }
+            assert_eq!(remote.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn oversized_steer_reference_reaches_actual_model_and_verified_reader()
     -> Result<(), String> {
@@ -1691,6 +2648,516 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn user_updated_long_goal_reaches_real_model_via_host_reader_after_cold_reopen()
+    -> Result<(), String> {
+        use echo_agent::agent::{
+            Agent, AgentInvocationContext, CancellationToken, ReactAgentBuilder,
+        };
+        use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
+        use futures::StreamExt;
+        for continuation in [false, true] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let root = directory.path().join(".eko/tasks");
+            let run_id = "updated-long-goal-model";
+            let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+                .map_err(|error| error.to_string())?;
+            store
+                .create_run(
+                    run_id,
+                    &store.active_workspace_id(),
+                    "goal-conversation",
+                    "initial-turn",
+                    DomainProfile::General,
+                    "initial short goal",
+                    "agent_task_plan",
+                    AttendedMode::Attended,
+                )
+                .map_err(|error| error.to_string())?;
+            store
+                .configure_run_continuation(run_id, continuation, false, None, None)
+                .map_err(|error| error.to_string())?;
+            store
+                .transition_run(run_id, TaskRunStatus::Running)
+                .map_err(|error| error.to_string())?;
+            store
+                .transition_run(run_id, TaskRunStatus::Paused)
+                .map_err(|error| error.to_string())?;
+            let revised = format!(
+                "{}CURRENT_USER_GOAL_TAIL_9134🧭",
+                "current user goal detail ".repeat(if continuation { 600 } else { 25 })
+            );
+            assert!(revised.chars().count() > MAX_GOAL_CHARS);
+            assert_eq!(
+                revised.chars().count() > MAX_GOAL_CONTRACT_CHARS,
+                continuation
+            );
+            let user_goal = store
+                .update_run_goal(
+                    run_id,
+                    1,
+                    &revised,
+                    "用户显式长Goal",
+                    super::super::types::RunGoalActorSource::Gui,
+                )
+                .map_err(|error| error.to_string())?;
+            drop(store);
+            let store = Arc::new(
+                TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+                    .map_err(|error| error.to_string())?,
+            );
+            assert_eq!(
+                store
+                    .raw_input_history_reference(run_id, None)
+                    .map_err(|error| error.to_string())?
+                    .source_records,
+                0
+            );
+            let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+            let _registration = registry.register(run_id, store.clone());
+            let config = crate::infra::tool_output_artifact_config(Some(directory.path()));
+            let remote = Arc::new(UnreachableSshFiles(std::sync::atomic::AtomicUsize::new(0)));
+            let make_agent = |llm: Arc<echo_agent::testing::MockLlmClient>| {
+                ReactAgentBuilder::new()
+                    .enable_tools()
+                    .file_system(remote.clone())
+                    .auto_project_rules(false)
+                    .tool_output_artifacts(config.clone())
+                    .model("mock-model")
+                    .system_prompt("按用户当前Goal读取原文并核对")
+                    .llm_client(llm)
+                    .token_limit(8_000)
+                    .max_iterations(32)
+                    .build()
+                    .map_err(|error| error.to_string())
+            };
+            let invocation = AgentInvocationContext {
+                history: Some(vec![Message::assistant("过期执行输出 ".repeat(12_000))]),
+                allowed_tools: Some(["read_artifact".to_string()].into_iter().collect()),
+                runtime: Some(echo_agent::tools::ExternalRunContext {
+                    run_id: Some(run_id.to_string()),
+                    conversation_id: Some("goal-conversation".to_string()),
+                    turn_id: Some("inspect-goal".to_string()),
+                    execution_id: Some("inspect-goal".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let blocked_model = Arc::new(
+                echo_agent::testing::MockLlmClient::new().with_response("不应调用缺reader的模型"),
+            );
+            let blocked = make_agent(blocked_model.clone())?;
+            blocked.set_pre_model_context_projector(Some(Arc::new(
+                TaskRuntimeContextProjector::new(registry.clone()),
+            )));
+            *blocked.context().lock().await = ContextManager::builder(8_000)
+                .compressor(
+                    echo_agent::compression::compressor::SlidingWindowCompressor::new(20)
+                        .with_recent_token_budget(400),
+                )
+                .build();
+            let mut narrow = invocation.clone();
+            narrow.allowed_tools = Some(["read_file".to_string()].into_iter().collect());
+            let mut rejected = false;
+            match blocked
+                .execute_stream_message_with_invocation_context(
+                    Message::user("继续".to_string()),
+                    CancellationToken::new(),
+                    narrow,
+                )
+                .await
+            {
+                Err(error) => rejected = error.to_string().contains("必要原文"),
+                Ok(mut events) => {
+                    while let Some(event) = events.next().await {
+                        match event {
+                            Ok(echo_agent::agent::AgentEvent::Error { failure, .. }) => {
+                                rejected |= is_required_context_unavailable(&failure)
+                            }
+                            Err(error) => rejected |= error.to_string().contains("必要原文"),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            assert!(rejected, "长Goal必要原文不能用远端read_file替代host reader");
+            assert_eq!(blocked_model.call_count(), 0);
+            assert_eq!(remote.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let first = Arc::new(
+                echo_agent::testing::MockLlmClient::new().with_response("先读取当前Goal全文。"),
+            );
+            let probe = make_agent(first.clone())?;
+            probe.set_pre_model_context_projector(Some(Arc::new(
+                TaskRuntimeContextProjector::new(registry.clone()),
+            )));
+            *probe.context().lock().await = ContextManager::builder(8_000)
+                .compressor(
+                    echo_agent::compression::compressor::SlidingWindowCompressor::new(20)
+                        .with_recent_token_budget(400),
+                )
+                .build();
+            let mut events = probe
+                .execute_stream_message_with_invocation_context(
+                    Message::user("继续".to_string()),
+                    CancellationToken::new(),
+                    invocation.clone(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut compressed = false;
+            while let Some(event) = events.next().await {
+                compressed |= matches!(
+                    event.map_err(|error| error.to_string())?,
+                    echo_agent::agent::AgentEvent::ContextCompressed { .. }
+                );
+            }
+            assert!(compressed);
+            let calls = first.all_calls();
+            assert_eq!(calls.len(), 1);
+            let messages = calls.first().ok_or("实际Goal模型请求缺失")?;
+            assert!(
+                !messages.iter().any(|message| message
+                    .content
+                    .as_text_ref()
+                    .is_some_and(|text| text.contains("CURRENT_USER_GOAL_TAIL_9134🧭"))),
+                "尾部只能经真实host reader进入模型，不能预先重送当前消息"
+            );
+            let encoded = messages
+                .iter()
+                .filter_map(|message| message.content.as_text_ref())
+                .find_map(|text| {
+                    text.split_once(CANONICAL_GOAL_REFERENCE_MARKER)
+                        .and_then(|(_, block)| {
+                            block
+                                .lines()
+                                .find_map(|line| line.strip_prefix("reference: "))
+                        })
+                })
+                .ok_or("实际模型缺当前Goal可读ref")?;
+            let reference: super::super::store::CanonicalGoalReference =
+                serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+            assert_eq!(reference.goal_revision, 2);
+            assert_eq!(reference.goal_sha256, user_goal.goal_sha256);
+            assert!(
+                reference
+                    .artifact
+                    .path
+                    .starts_with(directory.path().join(".eko/artifacts"))
+            );
+            let descriptor = echo_agent::tools::artifact::ToolOutputArtifactRef {
+                path: reference.artifact.path.clone(),
+                artifact_bytes: reference.artifact.bytes,
+                payload_bytes: reference.artifact.bytes,
+                sha256: reference.goal_sha256.clone(),
+                retention: config.retention.clone(),
+            };
+            let mut script = echo_agent::testing::MockLlmClient::new();
+            let mut cursor = None;
+            let mut pages = Vec::new();
+            for ordinal in 0..31 {
+                let call = format!("canonical-goal-page-{ordinal}");
+                let mut args = serde_json::json!({
+                    "path": descriptor.path.clone(),
+                    "expected_sha256": descriptor.sha256.clone(),
+                    "max_tokens": 2_000,
+                });
+                if let Some(cursor) = cursor.as_ref() {
+                    args.as_object_mut()
+                        .ok_or_else(|| "reader script args not object".to_string())?
+                        .insert("cursor".to_string(), serde_json::json!(cursor));
+                }
+                script = script.then_tool_call(&call, "read_artifact", args.to_string());
+                let page = read_artifact_page(
+                    &config,
+                    &descriptor,
+                    cursor.as_deref(),
+                    ArtifactPageLimit::Tokens(2_000),
+                )
+                .map_err(|error| error.to_string())?;
+                let complete = page.complete;
+                let next = page.next_cursor.clone();
+                pages.push((call, page));
+                if complete {
+                    break;
+                }
+                cursor = Some(next.ok_or("Goal原文页缺cursor")?);
+                if ordinal == 30 {
+                    return Err("原32轮夹具无法完成Goal原文分页".to_string());
+                }
+            }
+            let model = Arc::new(script.with_response("已读到当前用户Goal尾部。"));
+            let agent = make_agent(model.clone())?;
+            agent.set_pre_model_context_projector(Some(Arc::new(
+                TaskRuntimeContextProjector::new(registry),
+            )));
+            *agent.context().lock().await = ContextManager::builder(8_000)
+                .compressor(
+                    echo_agent::compression::compressor::SlidingWindowCompressor::new(20)
+                        .with_recent_token_budget(400),
+                )
+                .build();
+            let mut events = agent
+                .execute_stream_message_with_invocation_context(
+                    Message::user("继续".to_string()),
+                    CancellationToken::new(),
+                    invocation,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut actual_read_calls = std::collections::HashMap::new();
+            let mut actual_read_results = std::collections::HashMap::new();
+            while let Some(event) = events.next().await {
+                match event.map_err(|error| error.to_string())? {
+                    echo_agent::agent::AgentEvent::ToolCall {
+                        call_id,
+                        invocation,
+                    } => {
+                        actual_read_calls.insert(call_id, invocation);
+                    }
+                    echo_agent::agent::AgentEvent::ToolResult {
+                        call_id,
+                        name,
+                        result,
+                    } => {
+                        actual_read_results.insert(call_id, (name, result));
+                    }
+                    _ => {}
+                }
+            }
+            let actual_calls = model.all_calls();
+            assert_eq!(actual_calls.len(), pages.len().saturating_add(1));
+            let actual_goal = verify_actual_model_artifact_pages(
+                &descriptor,
+                pages,
+                &actual_calls,
+                &actual_read_calls,
+                &actual_read_results,
+            )?;
+            assert_eq!(actual_goal, revised);
+            assert!(
+                actual_calls
+                    .iter()
+                    .any(|messages| messages.iter().any(|message| message
+                        .content
+                        .as_text_ref()
+                        .is_some_and(|text| text.contains("CURRENT_USER_GOAL_TAIL_9134🧭"))))
+            );
+            assert_eq!(remote.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let after = store
+                .get_run(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("原Goal缺失")?;
+            assert_eq!(
+                (after.goal, after.goal_revision, after.goal_sha256),
+                (
+                    user_goal.goal,
+                    user_goal.goal_revision,
+                    user_goal.goal_sha256
+                )
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn short_user_goal_and_inline_input_do_not_require_a_reader_in_narrow_scopes()
+    -> Result<(), String> {
+        use echo_agent::agent::{
+            Agent, AgentInvocationContext, CancellationToken, ReactAgentBuilder,
+        };
+        use futures::StreamExt;
+        for inline_middle in [false, true] {
+            for (reader_only, continuation) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let initial = if inline_middle {
+                    format!(
+                        "{}CURRENT_INLINE_MIDDLE_TAIL_6321🧭",
+                        "当前用户完整内联文本 ".repeat(45)
+                    )
+                } else {
+                    "最初短Goal".to_string()
+                };
+                if inline_middle {
+                    assert!(initial.chars().count() > crate::prepared_turn::PREVIEW_CHARS);
+                    assert!(initial.chars().count() < MAX_GOAL_CONTRACT_CHARS);
+                }
+                let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+                let root = directory.path().join(".eko/tasks");
+                let store = Arc::new(
+                    TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+                        .map_err(|error| error.to_string())?,
+                );
+                let address = crate::conversation_input::ConversationInputAddress {
+                    workspace_id: store.active_workspace_id(),
+                    conversation_id: "short-goal-conversation".to_string(),
+                };
+                let payload = crate::conversation_input::ConversationInputPayload::new(
+                    initial.clone(),
+                    Vec::new(),
+                )
+                .map_err(|error| error.to_string())?;
+                let input = super::super::types::RunInputSnapshot {
+                    source: crate::conversation_input::ConversationInputSource::Gui,
+                    identity: crate::conversation_input::ConversationInputIdentity {
+                        address,
+                        input_id: "short-goal-source".to_string(),
+                        revision: 1,
+                        payload_sha256: payload.payload_sha256.clone(),
+                    },
+                    payload,
+                };
+                store
+                    .create_run_for_active_workspace_with_source(
+                        "short-goal-run",
+                        "short-goal-conversation",
+                        "initial-turn",
+                        DomainProfile::General,
+                        &initial,
+                        "agent_task_plan",
+                        AttendedMode::Attended,
+                        super::super::types::TaskRunExecutionProfile::conversation_turn(),
+                        None,
+                        &input,
+                    )
+                    .map_err(|error| error.to_string())?;
+                store
+                    .configure_run_continuation("short-goal-run", continuation, false, None, None)
+                    .map_err(|error| error.to_string())?;
+                store
+                    .transition_run("short-goal-run", TaskRunStatus::Running)
+                    .map_err(|error| error.to_string())?;
+                store
+                    .transition_run("short-goal-run", TaskRunStatus::Paused)
+                    .map_err(|error| error.to_string())?;
+                let user_goal = if inline_middle {
+                    store
+                        .get_run("short-goal-run")
+                        .map_err(|error| error.to_string())?
+                        .ok_or("初始Goal缺失")?
+                } else {
+                    store
+                        .update_run_goal(
+                            "short-goal-run",
+                            1,
+                            "用户当前短Goal",
+                            "用户修改",
+                            super::super::types::RunGoalActorSource::Gui,
+                        )
+                        .map_err(|error| error.to_string())?
+                };
+                if !inline_middle || continuation {
+                    assert!(
+                        store
+                            .canonical_goal_reference("short-goal-run")
+                            .map_err(|error| error.to_string())?
+                            .is_none()
+                    );
+                }
+                let current = if inline_middle {
+                    let prepared = crate::prepared_turn::PreparedUserTurn::build(
+                        crate::prepared_turn::UserTurnInput {
+                            text: &initial,
+                            attachments: &[],
+                            spill_dir: &directory.path().join(".eko/artifacts/user-input"),
+                            conversation_id: Some("short-goal-conversation"),
+                            turn_id: Some("short-goal-turn"),
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                    assert!(
+                        prepared.resources.is_empty(),
+                        "中段文本必须沿真实PreparedUserTurn内联，而非借fixture补源"
+                    );
+                    prepared.to_message().map_err(|error| error.to_string())?
+                } else {
+                    Message::user("继续".to_string())
+                };
+                let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+                let _registration = registry.register("short-goal-run", store.clone());
+                let model = Arc::new(
+                    echo_agent::testing::MockLlmClient::new().with_response("按当前短Goal继续。"),
+                );
+                let remote = Arc::new(UnreachableSshFiles(std::sync::atomic::AtomicUsize::new(0)));
+                let builder = ReactAgentBuilder::new()
+                    .model("mock-model")
+                    .auto_project_rules(false)
+                    .file_system(remote.clone())
+                    .tool_output_artifacts(crate::infra::tool_output_artifact_config(Some(
+                        directory.path(),
+                    )))
+                    .llm_client(model.clone())
+                    .token_limit(8_000);
+                let agent = if reader_only {
+                    builder.enable_tools().build()
+                } else {
+                    builder.build()
+                }
+                .map_err(|error| error.to_string())?;
+                agent.set_pre_model_context_projector(Some(Arc::new(
+                    TaskRuntimeContextProjector::new(registry),
+                )));
+                let invocation = AgentInvocationContext {
+                    allowed_tools: reader_only
+                        .then(|| ["read_file".to_string()].into_iter().collect()),
+                    runtime: Some(echo_agent::tools::ExternalRunContext {
+                        run_id: Some("short-goal-run".to_string()),
+                        conversation_id: Some("short-goal-conversation".to_string()),
+                        turn_id: Some("short-goal-turn".to_string()),
+                        execution_id: Some("short-goal-turn".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let mut events = agent
+                    .execute_stream_message_with_invocation_context(
+                        current,
+                        CancellationToken::new(),
+                        invocation,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                while let Some(event) = events.next().await {
+                    event.map_err(|error| error.to_string())?;
+                }
+                assert_eq!(
+                    model.call_count(),
+                    1,
+                    "必要源已完整内联，不应因派生历史新增reader门控"
+                );
+                assert!(
+                    model
+                        .all_tool_counts()
+                        .iter()
+                        .all(|count| *count == usize::from(reader_only))
+                );
+                if inline_middle {
+                    assert!(
+                        model.all_calls().iter().all(|messages| messages
+                            .iter()
+                            .any(|message| message.role == echo_agent::llm::types::Role::User
+                                && message.content.as_text_ref() == Some(initial.as_str()))),
+                        "当前实际请求须含完整中段文本及尾部，不能只认capsule预览或本地缓存"
+                    );
+                }
+                assert_eq!(remote.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+                let after = store
+                    .get_run("short-goal-run")
+                    .map_err(|error| error.to_string())?
+                    .ok_or("短Goal缺失")?;
+                assert_eq!(
+                    (after.goal, after.goal_revision, after.goal_sha256),
+                    (
+                        user_goal.goal,
+                        user_goal.goal_revision,
+                        user_goal.goal_sha256
+                    )
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn oversized_steer_missing_or_changed_cache_recovers_only_from_journal() -> Result<(), String> {
         use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
@@ -1844,8 +3311,8 @@ mod tests {
                 while let Some(event) = stream.next().await {
                     match event {
                         Err(error) => failed |= error.to_string().contains("用户约束原文"),
-                        Ok(AgentEvent::Error { message, .. }) => {
-                            failed |= message.contains("用户约束原文")
+                        Ok(AgentEvent::Error { failure, .. }) => {
+                            failed |= is_required_context_unavailable(&failure)
                         }
                         _ => {}
                     }
@@ -2119,8 +3586,17 @@ mod tests {
         let mut script = echo_agent::testing::MockLlmClient::new();
         let mut cursor = None;
         for ordinal in 0..32 {
-            let parameters = serde_json::json!({"path": artifact.path.clone(), "expected_sha256": reference.sha256.clone(),
-                "max_tokens": 2_000, "cursor": cursor.clone()});
+            let mut parameters = serde_json::json!({
+                "path": artifact.path.clone(),
+                "expected_sha256": reference.sha256.clone(),
+                "max_tokens": 2_000,
+            });
+            if let Some(cursor) = cursor.as_ref() {
+                parameters
+                    .as_object_mut()
+                    .ok_or("原reader参数不是对象")?
+                    .insert("cursor".to_string(), serde_json::json!(cursor));
+            }
             script = script.then_tool_call(
                 &format!("source-page-{ordinal}"),
                 "read_artifact",
@@ -2166,10 +3642,10 @@ mod tests {
         .map_err(|error| error.to_string())?;
         let recovered = launch.wait().await.map_err(|error| error.to_string())?;
         store.wait_for_run_driver_idle(run_id).await;
-        assert!(matches!(
-            recovered,
-            super::super::executor::RunOutcome::Completed
-        ));
+        assert!(
+            matches!(&recovered, super::super::executor::RunOutcome::Completed),
+            "原真实恢复未完成：{recovered:?}"
+        );
         assert_eq!(
             store
                 .get_run(run_id)
@@ -2221,6 +3697,24 @@ mod tests {
             &original,
             &["read_file"],
         )?;
+        for index in 0..12 {
+            store
+                .record_run_steer(
+                    run_id,
+                    &format!("later-{index}"),
+                    "后继短输入，原工具上界保持read_file",
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        assert!(
+            store
+                .get_run_state(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("原Run缺失")?
+                .recent_constraints
+                .iter()
+                .all(|steer| steer.turn_id != "oversized-steer")
+        );
         let _resources = store.test_resource_scope();
         let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
         let _registration = registry.register(run_id, store.clone());
@@ -2439,9 +3933,9 @@ mod tests {
                 .project(&projection_context(Some("long-goal")))
                 .await
                 .map_err(|error| error.to_string())?;
-            if projections.len() != 2 {
+            if projections.len() != 3 {
                 return Err(format!(
-                    "expected two replaceable projections, got {}",
+                    "expected goal, recovery and domain replaceable projections, got {}",
                     projections.len()
                 ));
             }

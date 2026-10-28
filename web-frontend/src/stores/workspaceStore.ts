@@ -9,9 +9,10 @@ import { useToastStore } from './toastStore';
 import { useToolExecutionStore } from './toolExecutionStore';
 import { useBrowserStore } from './browserStore';
 import { GLOBAL_WORKSPACE_ID } from '../lib/viewAddress';
-import { productDataScope } from '../lib/productDataScope';
+import { productDataScope, sameProductDataScope } from '../lib/productDataScope';
 
 let workspaceGeneration = 0;
+let workspaceListGeneration = 0;
 
 function includeWorkspace(workspaces: Workspace[], workspace: Workspace): Workspace[] {
   // 创建/打开回执已来自原 registry；同步侧栏列表并替换同 ID 的旧 generation。
@@ -59,7 +60,9 @@ interface WorkspaceState {
   /** Initialize: load workspaces and current */
   init: () => Promise<void>;
   /** Switch to a workspace */
-  switchTo: (id: string, connectionId?: string) => Promise<void>;
+  switchTo: (id: string, connectionId?: string, expectedGeneration?: string) => Promise<void>;
+  /** Refresh only canonical registry rows without moving current selection. */
+  refreshList: () => Promise<void>;
   /** Create and switch to a new workspace */
   createAndSwitch: (
     name: string,
@@ -81,6 +84,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   init: async () => {
     const generation = workspaceGeneration + 1;
     workspaceGeneration = generation;
+    const listGeneration = ++workspaceListGeneration;
     set({ isLoading: true });
     try {
       const [listRes, currentRes] = await Promise.all([
@@ -88,11 +92,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         workspaceApi.current().catch(() => ({ workspace: null, active: false })),
       ]);
       if (generation !== workspaceGeneration) return;
-      set({
-        workspaces: listRes.workspaces || [],
+      set((state) => ({
+        workspaces:
+          listGeneration === workspaceListGeneration ? listRes.workspaces || [] : state.workspaces,
         current: currentRes.workspace || null,
         isLoading: false,
-      });
+      }));
       useFileStore.getState().bindScope(productDataScope(currentRes.workspace));
     } catch (e) {
       console.error('Failed to load workspaces:', e);
@@ -100,17 +105,30 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
   },
 
-  switchTo: async (id: string, connectionId?: string) => {
+  refreshList: async () => {
+    const sourceGeneration = workspaceGeneration;
+    const listGeneration = ++workspaceListGeneration;
+    const result = await workspaceApi.list();
+    if (sourceGeneration === workspaceGeneration && listGeneration === workspaceListGeneration)
+      set({ workspaces: result.workspaces ?? [] });
+  },
+
+  switchTo: async (id: string, connectionId?: string, expectedGeneration?: string) => {
     const generation = workspaceGeneration + 1;
     workspaceGeneration = generation;
+    const previousScope = productDataScope(get().current);
     const previousWorkspaceId = get().current?.id ?? GLOBAL_WORKSPACE_ID;
-    detachVisibleWorkspace(previousWorkspaceId);
+    const fenced = expectedGeneration !== undefined;
+    // Fenced Fork keeps the source projection until native CAS accepts this generation.
+    if (!fenced) detachVisibleWorkspace(previousWorkspaceId);
     set({ isLoading: true });
     try {
       if (import.meta.env.DEV) console.debug('[workspaceStore] switchTo:', id);
-      const res = connectionId
-        ? await workspaceApi.switch(id, connectionId)
-        : await workspaceApi.switch(id);
+      const res = fenced
+        ? await workspaceApi.switch(id, connectionId, expectedGeneration)
+        : connectionId
+          ? await workspaceApi.switch(id, connectionId)
+          : await workspaceApi.switch(id);
       if (generation !== workspaceGeneration) return;
       if (import.meta.env.DEV)
         console.debug(
@@ -119,7 +137,19 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           'debug_conv_count:',
           (res as any).debug_conversation_count
         );
-      set({ current: res.workspace, isLoading: false });
+      if (fenced) {
+        if (res.workspace.product_data_generation !== expectedGeneration)
+          throw new Error('目标工作空间代际与切换回执不一致');
+        detachVisibleWorkspace(previousWorkspaceId);
+      }
+      set((state) => ({
+        current: res.workspace,
+        isLoading: false,
+        workspaces: [
+          res.workspace,
+          ...state.workspaces.filter((item) => item.id !== res.workspace.id),
+        ],
+      }));
       showTransitionWarning(res.transition);
       const fileStore = useFileStore.getState();
       fileStore.bindScope(productDataScope(res.workspace));
@@ -137,6 +167,23 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     } catch (e) {
       console.error('[workspaceStore] Failed to switch workspace:', e);
       if (generation === workspaceGeneration) {
+        if (fenced) {
+          let sourceStillCurrent = false;
+          try {
+            const actual = await workspaceApi.current();
+            sourceStillCurrent = sameProductDataScope(
+              previousScope,
+              productDataScope(actual.workspace)
+            );
+          } catch (inspectionError) {
+            console.error('Failed to inspect workspace after fenced switch:', inspectionError);
+          }
+          if (generation !== workspaceGeneration) throw e;
+          if (sourceStillCurrent) {
+            set({ isLoading: false });
+            throw e;
+          }
+        }
         detachVisibleWorkspace(previousWorkspaceId);
         try {
           await recoverVisibleWorkspace(generation);

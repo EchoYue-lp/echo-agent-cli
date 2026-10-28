@@ -1741,6 +1741,7 @@ struct EkoTurnEventSinkState {
     webhook_observer: Option<WebhookTurnObserver>,
     expose_internal_synthesis: bool,
     downstream_failure: Option<echo_agent::error::AgentFailure>,
+    progress_observer: Option<crate::turn_context::TurnProgressObserver>,
 }
 
 enum EkoTurnProjectionRequest {
@@ -1767,6 +1768,7 @@ impl EkoTurnEventSink {
             webhook_observer: Some(webhook_observer),
             expose_internal_synthesis: transcript_visibility == TurnVisibility::Visible,
             downstream_failure: None,
+            progress_observer: None,
         }));
         let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
         let projector_state = std::sync::Arc::clone(&state);
@@ -1831,6 +1833,14 @@ impl EkoTurnEventSink {
         observation: Option<std::sync::Arc<crate::tasks::task_runtime::executor::EkoAgentTurnSink>>,
     ) -> Self {
         self.domain_observation = observation;
+        self
+    }
+
+    fn with_progress_observer(self, observer: crate::turn_context::TurnProgressObserver) -> Self {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .progress_observer = Some(observer);
         self
     }
 
@@ -2008,7 +2018,8 @@ async fn project_eko_turn_event(
     let suppress_internal_transcript = !state.expose_internal_synthesis
         && matches!(
             &event.payload,
-            AgentEvent::Token(_)
+            AgentEvent::AssistantMessage { .. }
+                | AgentEvent::Token(_)
                 | AgentEvent::ThinkStart
                 | AgentEvent::ThinkEnd { .. }
                 | AgentEvent::FinalAnswer(_)
@@ -2016,7 +2027,19 @@ async fn project_eko_turn_event(
     if suppress_internal_transcript {
         return Ok(SinkControl::Continue);
     }
+    let visible_report = match &event.payload {
+        AgentEvent::AssistantMessage { block } => {
+            block.phase != echo_agent::agent::AssistantPhase::Reasoning
+                && block.phase != echo_agent::agent::AssistantPhase::FinalAnswer
+                && !block.delta.trim().is_empty()
+        }
+        AgentEvent::FinalAnswer(text) => !text.trim().is_empty(),
+        _ => false,
+    };
     if sink.on_event(ChatDriverEvent::Agent(Box::new(event))) {
+        if visible_report && let Some(observer) = state.progress_observer.as_ref() {
+            observer.reported();
+        }
         Ok(SinkControl::Continue)
     } else {
         let failure = echo_agent::error::AgentFailure::message(
@@ -2206,8 +2229,16 @@ async fn drive_chat_inner(
             active_run_id.clone(),
         )
         .map_err(|error| error.to_string())?;
+        // 传原Foreground物理owner给原事件头；历史确认不应从文字或Run重建执行身份。
+        let event_identity = match driver_execution_context.as_deref() {
+            Some(execution_id) => event_identity
+                .with_execution_id(execution_id)
+                .map_err(|error| error.to_string())?,
+            None => event_identity,
+        };
         let invocation = echo_agent::agent::AgentInvocationContext {
             allowed_tools,
+            tool_access: None,
             history: None,
             runtime_state_id,
             transcript_generation_id,
@@ -2264,7 +2295,8 @@ async fn drive_chat_inner(
             turn_id.clone(),
             transcript_visibility,
         )
-        .with_domain_observation(domain_observation.clone());
+        .with_domain_observation(domain_observation.clone())
+        .with_progress_observer(_turn_projection_registration.progress_observer());
         let request = TurnRequest::from_message(event_identity, msg)
             .mode(TurnMode::Execute)
             .cancel(cancel)

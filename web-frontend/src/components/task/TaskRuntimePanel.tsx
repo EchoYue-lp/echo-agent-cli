@@ -664,6 +664,12 @@ export function TaskRuntimePanel() {
   const usageSummary = cacheUsageForRuns(visibleTraceRuns);
   const planGoalCurrent =
     plan?.goal_revision === activeRun.goal_revision && plan?.goal_sha256 === activeRun.goal_sha256;
+  // 独立IPC读取可能跨越Goal/计划提交；只有同run和同revision报告可标为当前验收。
+  const completionGateCurrent =
+    completionGate?.run_id === activeRun.run_id &&
+    completionGate.goal_revision === activeRun.goal_revision &&
+    completionGate.plan_revision === (plan?.revision ?? 0) &&
+    (!completionGate.ready || planGoalCurrent);
   const completedCount = planGoalCurrent
     ? todos.filter((todo) => todo.status === ('completed' as TodoStatus)).length
     : 0;
@@ -708,10 +714,12 @@ export function TaskRuntimePanel() {
     };
     setPendingAction(label);
     setActionReceipt(null);
+    // A→B→A仍是新的访问；同身份旧Promise不能替代新请求的回执。
+    const ownsAction = () => actionInFlight.current === operationToken && ownsTarget();
     try {
       const receipt = await operation();
       const snapshot = taskRuntimePresentation(useTaskRuntimeStore.getState());
-      if (!ownsTarget() || !snapshot.activeRun) return false;
+      if (!ownsAction() || !snapshot.activeRun) return false;
       if (snapshot.error) {
         setActionReceipt({
           ...receiptIdentity,
@@ -724,6 +732,8 @@ export function TaskRuntimePanel() {
       if (receipt && typeof receipt === 'object') {
         if ('run_id' in receipt && receipt.run_id !== runId)
           throw new Error('后端回执不属于原运行');
+        if (taskId && 'task_id' in receipt && receipt.task_id !== taskId)
+          throw new Error('后端回执不属于原任务');
         if ('success' in receipt && receipt.success === false)
           outcome = '无需重复执行（后端未改变运行）';
         else if ('success' in receipt && receipt.success === true)
@@ -748,7 +758,7 @@ export function TaskRuntimePanel() {
       });
       return true;
     } catch (actionError) {
-      if (!ownsTarget()) return false;
+      if (!ownsAction()) return false;
       setActionReceipt({
         ...receiptIdentity,
         text: `${label}失败：${actionError instanceof Error ? actionError.message : String(actionError)}`,
@@ -1153,7 +1163,12 @@ export function TaskRuntimePanel() {
             </div>
           )}
 
-          {completionGate && completionGate.requirements.length > 0 && (
+          {completionGate && !completionGateCurrent && (
+            <p role="status" className="eko-task-history-notice">
+              验收报告尚未匹配当前运行、Goal或计划版本，请刷新后确认；旧通过状态不计当前完成。
+            </p>
+          )}
+          {completionGate && completionGateCurrent && completionGate.requirements.length > 0 && (
             <div className="mb-2 border-t border-[var(--border-primary)] pt-2">
               <div className="mb-1 flex items-center justify-between text-[10px]">
                 <span className="font-medium" style={{ color: 'var(--text-tertiary)' }}>

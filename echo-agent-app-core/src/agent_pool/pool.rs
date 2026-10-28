@@ -2104,7 +2104,18 @@ impl AgentPool {
         let model_consumers = created.model_consumers;
         #[cfg(test)]
         if let Some(client) = self.llm_client_override.read().await.clone() {
-            agent.set_llm_client(client);
+            // 测试替换整个模型 transport 时保留真实 verifier，同时替换仍由
+            // 原产品 owner 拥有的 Critic；不能让夹具误用本机模型或覆盖自定义 Critic。
+            let replace_owned_critic = agent.critic_owner() == Some(infra::EKO_MODEL_CRITIC_OWNER);
+            agent.set_llm_client(client.clone());
+            if replace_owned_critic {
+                agent.set_owned_critic(
+                    infra::EKO_MODEL_CRITIC_OWNER,
+                    Arc::new(
+                        echo_agent::agent::critic::LlmCritic::new(client).with_pass_threshold(7.0),
+                    ),
+                );
+            }
         }
         if self.shared.tool_manager.is_none()
             && let Some(snapshot) = self.mcp_config_snapshot.read().await.clone()

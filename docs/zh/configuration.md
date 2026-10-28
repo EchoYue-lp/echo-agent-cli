@@ -38,7 +38,7 @@ framework `FrameworkConfig` 所需的 provider-neutral 字段、typed `Permissio
 3. `./eko.yaml`
 4. `~/.eko/config.yaml`
 
-GUI、TUI、CLI/JSONL 和 channel 读取同一份 `EkoConfig`。GUI 变更通过统一 AppState mutation
+GUI、IM与cron读取同一份 `EkoConfig`；独立console产品不再是配置消费者。GUI 变更通过统一 AppState mutation
 原子保存；包含密钥的配置在 Unix 上写成 `0600`。
 
 EKO channel 通过 `AgentPool` 复用与其它 surface 相同的 provider/model 解析和显式
@@ -133,8 +133,7 @@ Provider 保存共享连接与认证；模型保存调用协议、输入能力�
 支持的 `input_modalities`：`text`、`image`、`audio`、`video`。`text` 始终保留。
 
 密钥解析顺序是 Provider `auth_token`，然后 Provider `api_key_env` 指向的环境变量。
-CLI/TUI 的 Provider 命令不接受明文密钥，避免写入 shell history；GUI 可以把密钥保存
-到本地配置。
+GUI沿原配置保存接口管理Provider密钥；环境变量仍按`api_key_env`解析。不保留独立console Provider命令，也不把密钥写入日志。
 
 `default_api_protocol` 只用于添加模型时的默认选择，运行时以模型自己的
 `api_protocol` 为准。完整决策见 [Provider 架构](./architecture/providers.md)。
@@ -166,8 +165,7 @@ configured_models:
 
 ## Agent 与压缩
 
-`/compress [重点]` 与 `/compact [重点]` 都使用当前配置的策略；TUI 支持同样的重点文本，
-GUI 压缩面板提供可选输入框。旧 `keep_messages` 参数已移除，命令不覆盖已安装的预算。
+GUI压缩面板及保留应用入口沿当前策略处理可选重点文本；不再提供独立TUI压缩界面。旧 `keep_messages` 参数已移除，命令不覆盖已安装的预算。
 最新请求超过软预算时原文可以扩展保留，超过硬输入预算则报错。GUI 的 75% 提示只是建议；
 实际压缩在模型调用前扣除工具/格式定义与 protected 内容后判断。
 Goal、recovery capsule 和最近用户 steer 由 TaskRuntime projection 保留，完整历史仍由
@@ -323,8 +321,7 @@ FEISHU_APP_ID=...
 FEISHU_APP_SECRET=...
 ```
 
-飞书支持 `long_poll` 与 `webhook`。Channel 是完整 Agent surface，使用与 GUI/TUI/CLI
-相同的 chat driver、TaskRuntime、HITL 和 memory 权威。framework 与 EKO 都按
+飞书支持 `long_poll` 与 `webhook`。Channel 是完整 Agent surface，使用与GUI及原后台触发相同的chat driver、TaskRuntime、HITL 和 memory 权威。framework 与 EKO 都按
 `channel_id + conversation_id + sender_id` 隔离会话；同一群聊的不同 sender 不共享 Agent
 上下文、TaskRun、cache 或 foreground control。timeout/reset 会轮换 Agent runtime/checkpoint/cache
 identity，但保留稳定产品 transcript 与 TaskRun；旧 incarnation 在 foreground/lease 与 pool
@@ -373,7 +370,7 @@ channels:
 | ---------------------------- | ---------------------------------- |
 | `EKO_DATA_DIR`               | 覆盖 `~/.eko` 数据根               |
 | `EKO_CONFIG`                 | 主配置文件                         |
-| `MODEL_NAME`                 | CLI `--model` 默认值               |
+| `MODEL_NAME`                 | 桌面`--model`选择覆盖               |
 | `MCP_CONFIG_PATH`            | MCP 配置文件                       |
 | `EKO_UV_PATH`                | analytics runtime 使用的 `uv` 路径 |
 | `RUST_LOG`                   | Rust 日志过滤                      |
@@ -407,3 +404,11 @@ style provider 进入绑定，纯 theme 颜色不进入。来源缺失或变化�
 见 [示例](../../examples/domain-plugin/README.md)。当前源码未编译，adhoc 后台委派仍未闭合。
 
 微信保存但从未开始的输入，在 authenticated Ready 后仍回到原工作空间和消息 context；已尝试或无法确认的工作保留待恢复。恢复沿用原已提交前缀保证，未提交 incomplete tail 与损坏或已 claim 的工作分开处理。当前源码候选尚无构建或原生验收。
+
+## 退役入口与配置边界
+
+旧 `tui.max_display_chars` 不再是当前配置字段，独立TUI／REPL／CLI/JSONL及standalone
+`--channels`参数退出。桌面仅保留model/project/config/MCP override四字段及原优先级。
+旧用户配置和数据文件不随源码删除清理；保存、迁移及错误仍走原配置owner。
+GUI PTY／SSH终端、Agent shell、IM、cron、Task/Subagent、附件、HITL和共享恢复继续保留。
+包仍名`echo-agent-cli`，identifier与`~/.eko`／workspace `.eko`路径不改。

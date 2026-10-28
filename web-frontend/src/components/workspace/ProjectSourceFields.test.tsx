@@ -70,6 +70,74 @@ describe('project source admission', () => {
     expect(view.getByRole('button', { name: '测试连接' })).toBeTruthy();
     expect(view.queryByLabelText('终端')).toBeNull();
   });
+  it('uses the prepared independent fork draft and keeps it alive while the existing command owns it', async () => {
+    api.testSsh.mockResolvedValue({ authenticated: true });
+    const p = props();
+    const view = render(
+      <ProjectSourceFields {...p} fixedLocation draftConnectionId="reply-fork-independent-draft" />
+    );
+    fireEvent.click(view.getByRole('button', { name: '测试连接' }));
+    await waitFor(() =>
+      expect(p.onRemoteSource).toHaveBeenCalledWith(
+        expect.objectContaining({
+          connection_id: 'reply-fork-independent-draft',
+          host: target.host,
+          user: target.user,
+        })
+      )
+    );
+    expect(api.connectSsh).toHaveBeenCalledExactlyOnceWith(
+      'reply-fork-independent-draft',
+      target,
+      24,
+      80
+    );
+    view.rerender(
+      <ProjectSourceFields
+        {...p}
+        fixedLocation
+        draftConnectionId="reply-fork-independent-draft"
+        retainConnection
+      />
+    );
+    view.unmount();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(api.closeSsh).not.toHaveBeenCalled();
+  });
+
+  it('returns a settled fork draft to the original reconnect form without changing request identity', async () => {
+    api.testSsh.mockResolvedValue({ authenticated: true });
+    const p = props();
+    const view = render(
+      <ProjectSourceFields {...p} fixedLocation draftConnectionId="reply-fork-independent-draft" />
+    );
+    fireEvent.click(view.getByRole('button', { name: '测试连接' }));
+    await waitFor(() => expect(api.connectSsh).toHaveBeenCalledTimes(1));
+    view.rerender(
+      <ProjectSourceFields
+        {...p}
+        fixedLocation
+        draftConnectionId="reply-fork-independent-draft"
+        retainConnection
+      />
+    );
+    view.rerender(
+      <ProjectSourceFields
+        {...p}
+        fixedLocation
+        draftConnectionId="reply-fork-independent-draft"
+        retainConnection={false}
+      />
+    );
+    fireEvent.click(view.getByRole('button', { name: '断开并修改连接' }));
+    await waitFor(() => expect(api.closeSsh).toHaveBeenCalledWith('reply-fork-independent-draft'));
+    fireEvent.click(view.getByRole('button', { name: '测试连接' }));
+    await waitFor(() => expect(api.connectSsh).toHaveBeenCalledTimes(2));
+    expect(api.connectSsh.mock.calls.at(-1)?.at(0)).toBe('reply-fork-independent-draft');
+  });
+
   it('keeps existing folder selection distinct from new folder creation', () => {
     const draft = {
       ...emptyProjectSource(),

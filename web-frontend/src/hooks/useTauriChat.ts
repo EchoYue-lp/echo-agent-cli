@@ -150,6 +150,8 @@ export function useTauriChat() {
   const frontierAppliedOrdinalRef = useRef(0);
   const dispatchingInputIdRef = useRef<string | null>(null);
   const pendingAdmissionRef = useRef<PendingChatAdmission | null>(null);
+  const pendingSteersRef = useRef(new Map<string, Promise<boolean>>());
+  const steerProjectionOwnersRef = useRef(new Map<string, symbol>());
   const dispatchMessageRef = useRef<
     | ((
         text: string,
@@ -904,55 +906,105 @@ export function useTauriChat() {
         return false;
       }
       const activeTurnId = activeTurnIdRef.current;
-      const isCurrentSteer = captureInputProjection();
-      try {
-        const result = await apiInvoke<ConversationInputReceipt>('steer_chat_message', {
-          workspaceId: queued.receipt.identity.address.workspace_id,
-          conversationId,
-          expectedActiveTurnId: activeTurnId,
-          identity: queued.receipt.identity,
-          expectedQueueRevision,
-        });
-        // The original journal owns delivery even after focus changes. A late
-        // receipt must not project into another turn or a reopened workspace.
-        if (!isCurrentSteer()) return result.drained;
-        await refreshFrontier(
-          queued.receipt.identity.address.workspace_id,
-          queued.receipt.identity.address.conversation_id
+      const ownsTarget = captureInputProjection();
+      // Enter自动投递与队列按钮可同时观察同一输入。复用准确版本/原turn的
+      // 在途回执，避免第二次CAS拒绝覆盖第一次仍待drain的真实状态。
+      const projectionKey = JSON.stringify([
+        identityGenerationRef.current,
+        workspaceScope.workspaceGeneration,
+        queued.receipt.identity.address.workspace_id,
+        queued.receipt.identity.address.conversation_id,
+        queued.receipt.identity.input_id,
+        activeTurnId,
+        currentMessageKeyRef.current,
+      ]);
+      const pendingKey = JSON.stringify([
+        projectionKey,
+        queued.receipt.identity.revision,
+        queued.receipt.identity.payload_sha256,
+      ]);
+      const pending = pendingSteersRef.current.get(pendingKey);
+      if (pending) return pending;
+      const projectionOwner = Symbol('steer-projection');
+      steerProjectionOwnersRef.current.set(projectionKey, projectionOwner);
+      // 新版本开始观察后，旧版本的结果只返回旧调用方，不覆盖当前输入。
+      const isCurrentSteer = () => {
+        const current = frontierRef.current.items.find(
+          (item) => item.receipt.identity.input_id === queued.receipt.identity.input_id
         );
-        if (!isCurrentSteer()) return result.drained;
-        if (!result.drained) {
-          setSteerOutcomes((previous) => ({
-            ...previous,
-            [queued.receipt.identity.input_id]: 'retained',
+        return (
+          ownsTarget() &&
+          steerProjectionOwnersRef.current.get(projectionKey) === projectionOwner &&
+          (!current ||
+            (current.receipt.identity.revision === queued.receipt.identity.revision &&
+              current.receipt.identity.payload_sha256 === queued.receipt.identity.payload_sha256))
+        );
+      };
+      setSteerOutcomes((previous) => {
+        if (!(queued.receipt.identity.input_id in previous)) return previous;
+        const next = { ...previous };
+        delete next[queued.receipt.identity.input_id];
+        return next;
+      });
+      const operation = (async () => {
+        try {
+          const result = await apiInvoke<ConversationInputReceipt>('steer_chat_message', {
+            workspaceId: queued.receipt.identity.address.workspace_id,
+            conversationId,
+            expectedActiveTurnId: activeTurnId,
+            identity: queued.receipt.identity,
+            expectedQueueRevision,
+          });
+          // The original journal owns delivery even after focus changes. A late
+          // receipt must not project into another turn or a reopened workspace.
+          if (!isCurrentSteer()) return result.drained;
+          await refreshFrontier(
+            queued.receipt.identity.address.workspace_id,
+            queued.receipt.identity.address.conversation_id
+          );
+          if (!isCurrentSteer()) return result.drained;
+          if (!result.drained) {
+            setSteerOutcomes((previous) => ({
+              ...previous,
+              [queued.receipt.identity.input_id]: 'retained',
+            }));
+            useToastStore.getState().addToast('info', '当前阶段不能插入，已保留在排队队列中');
+            return false;
+          }
+          const displayAttachments = queued.payload.attachments.map((attachment) => ({
+            name: attachment.name,
+            mime_type: attachment.mime_type,
+            url: `data:${attachment.mime_type};base64,${attachment.data}`,
+            size: attachment.size,
+            source: attachment.source,
           }));
-          useToastStore.getState().addToast('info', '当前阶段不能插入，已保留在排队队列中');
+          assistantIdRef.current = useChatStore
+            .getState()
+            .continueAfterSteer(
+              assistantIdRef.current,
+              queued.payload.text || '(附件)',
+              displayAttachments
+            );
+          return true;
+        } catch (error) {
+          if (isCurrentSteer()) {
+            setSteerOutcomes((previous) => ({
+              ...previous,
+              [queued.receipt.identity.input_id]: 'rejected',
+            }));
+            useToastStore.getState().addToast('error', `补充当前任务失败：${errorMessage(error)}`);
+          }
           return false;
         }
-        const displayAttachments = queued.payload.attachments.map((attachment) => ({
-          name: attachment.name,
-          mime_type: attachment.mime_type,
-          url: `data:${attachment.mime_type};base64,${attachment.data}`,
-          size: attachment.size,
-          source: attachment.source,
-        }));
-        assistantIdRef.current = useChatStore
-          .getState()
-          .continueAfterSteer(
-            assistantIdRef.current,
-            queued.payload.text || '(附件)',
-            displayAttachments
-          );
-        return true;
-      } catch (error) {
-        if (isCurrentSteer()) {
-          setSteerOutcomes((previous) => ({
-            ...previous,
-            [queued.receipt.identity.input_id]: 'rejected',
-          }));
-          useToastStore.getState().addToast('error', `补充当前任务失败：${errorMessage(error)}`);
-        }
-        return false;
+      })();
+      pendingSteersRef.current.set(pendingKey, operation);
+      try {
+        return await operation;
+      } finally {
+        if (pendingSteersRef.current.get(pendingKey) === operation)
+          pendingSteersRef.current.delete(pendingKey);
+        if (steerProjectionOwnersRef.current.get(projectionKey) === projectionOwner)
+          steerProjectionOwnersRef.current.delete(projectionKey);
       }
     },
     [captureInputProjection, refreshFrontier]

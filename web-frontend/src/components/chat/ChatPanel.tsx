@@ -1,6 +1,7 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useChatStore } from '../../stores/chatStore';
 import { MessageBubble } from './MessageBubble';
+import { ReplyForkDialog, type ReplyForkSource } from './ReplyForkDialog';
 import { ExecutionStatus } from './ExecutionStatus';
 import { HitlDialog } from './HitlDialog';
 import { ChatInput } from './ChatInput';
@@ -30,7 +31,7 @@ import {
   X,
 } from 'lucide-react';
 import { providerApi, type ProductDataScope } from '../../api/endpoints';
-import type { Attachment } from '../../types/api';
+import type { Attachment, ChatMessage } from '../../types/api';
 import type { QueuedChatInput } from '../../hooks/useTauriChat';
 import { useContextPaneStore } from '../../stores/contextPaneStore';
 import { useWorkspaceViewStore } from '../../stores/workspaceViewStore';
@@ -89,8 +90,7 @@ export function ChatPanel() {
 
   // ── 按需卡片状态 ──
   const [failureToastDismissed, setFailureToastDismissed] = useState(false);
-  const [isForking, setIsForking] = useState(false);
-  const forkInProgress = useRef(false);
+  const [forkSource, setForkSource] = useState<ReplyForkSource | null>(null);
   const [configuredModels, setConfiguredModels] = useState<ConfiguredModel[]>([]);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const workspaceMenuRef = useRef<HTMLDivElement>(null);
@@ -231,31 +231,28 @@ export function ChatPanel() {
     void branchAndResend(messageId, newContent);
   };
 
-  const handleFork = async (messageId: string) => {
-    if (forkInProgress.current || isStreaming) return;
-    const currentMessages = useChatStore.getState().messages;
-    const messageIndex = currentMessages.findIndex((message) => message.id === messageId);
-    const promptIndex = currentMessages
-      .slice(0, messageIndex)
-      .findLastIndex((message) => message.role === 'user' && !message.internalAgent);
-    if (messageIndex < 0 || promptIndex < 0) return;
-    const userTurnIndex = currentMessages
-      .slice(0, promptIndex)
-      .filter((message) => message.role === 'user' && !message.internalAgent).length;
-    forkInProgress.current = true;
-    setIsForking(true);
-    try {
-      const id = await useConversationStore.getState().forkCurrent(userTurnIndex);
-      if (useConversationStore.getState().activeId === id) {
-        useContextPaneStore.getState().reset();
-      }
-    } catch (error) {
-      console.error('Failed to fork conversation:', error);
-      useToastStore.getState().addToast('error', '分叉会话失败，请重试');
-    } finally {
-      forkInProgress.current = false;
-      setIsForking(false);
-    }
+  const forkReplies = completedReplyForks(messages);
+  const handleFork = (messageId: string) => {
+    const conversation = useConversationStore.getState();
+    const workspace = useWorkspaceStore.getState();
+    if (
+      forkSource ||
+      useChatStore.getState().isStreaming ||
+      workspace.isLoading ||
+      conversation.isLoading ||
+      !conversation.activeId
+    )
+      return;
+    const userTurnIndex = completedReplyForks(useChatStore.getState().messages).get(messageId);
+    if (userTurnIndex == null) return;
+    setForkSource({
+      scope: productDataScope(workspace.current),
+      conversationId: conversation.activeId,
+      conversationEpoch: conversation.newConversationEpoch,
+      navigationEpoch: useUiStore.getState().navigationEpoch,
+      userTurnIndex,
+      requestId: crypto.randomUUID(),
+    });
   };
 
   const handleScroll = useCallback(() => {
@@ -581,8 +578,10 @@ export function ChatPanel() {
                       message={msg}
                       onRegenerate={handleRegenerate}
                       onEditAndResend={handleEditAndResend}
-                      onFork={activeConversationId ? handleFork : undefined}
-                      forkDisabled={isStreaming || isForking}
+                      onFork={
+                        activeConversationId && forkReplies.has(msg.id) ? handleFork : undefined
+                      }
+                      forkDisabled={isStreaming || !!forkSource}
                     />
                   </div>
                 );
@@ -627,8 +626,38 @@ export function ChatPanel() {
           </div>
         )}
       </AgentPane>
+      {forkSource && <ReplyForkDialog source={forkSource} onClose={() => setForkSource(null)} />}
     </>
   );
+}
+
+// Only the final visible message of a user turn can offer Fork. The backend
+// independently verifies its canonical prefix and replacement admission.
+function completedReplyForks(messages: readonly ChatMessage[]): Map<string, number> {
+  const replies = new Map<string, number>();
+  let userTurnIndex = -1;
+  let lastVisible: ChatMessage | undefined;
+  const finish = () => {
+    if (
+      userTurnIndex >= 0 &&
+      lastVisible?.role === 'assistant' &&
+      lastVisible.finalAnswerConfirmed === true &&
+      !lastVisible.isStreaming &&
+      lastVisible.content.trim()
+    ) {
+      replies.set(lastVisible.id, userTurnIndex);
+    }
+  };
+  for (const message of messages) {
+    if (message.internalAgent) continue;
+    if (message.role === 'user') {
+      finish();
+      userTurnIndex += 1;
+    }
+    lastVisible = message;
+  }
+  finish();
+  return replies;
 }
 
 // UI observation is bounded; only the backend Goal CAS proves physical quiescence.
@@ -649,7 +678,10 @@ function GoalBar({
   const [reason, setReason] = useState('用户更新目标');
   const [editRevision, setEditRevision] = useState(run.goal_revision);
   const [progress, setProgress] = useState<string | null>(null);
-  const [notice, setNotice] = useState<{ text: string; failed: boolean } | null>(null);
+  const [notice, setNotice] = useState<{
+    text: string;
+    failed: boolean;
+  } | null>(null);
   const mounted = useRef(false);
   const operation = useRef<symbol | null>(null);
   useEffect(() => {
@@ -977,7 +1009,10 @@ function QueuedInputList({
   onSteer: (id: string) => Promise<boolean>;
 }) {
   const [draggedId, setDraggedId] = useState<string | null>(null);
-  const [editing, setEditing] = useState<{ id: string; version: string } | null>(null);
+  const [editing, setEditing] = useState<{
+    id: string;
+    version: string;
+  } | null>(null);
   const [editingText, setEditingText] = useState('');
   const [busyId, setBusyId] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<{

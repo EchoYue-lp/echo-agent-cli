@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
+use std::time::{Duration, Instant};
 
 use echo_agent::compression::{ContextProjection, PreModelContextProjector, ProjectionContext};
 use echo_agent::error::Result as AgentResult;
@@ -20,6 +21,39 @@ use crate::tasks::task_runtime::compact_context::{
 
 /// Stable projection owner for the current turn's product contract.
 pub const TURN_CONTRACT_MARKER: &str = "eko:turn-contract";
+
+const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+const PROGRESS_REMINDER_MARKER: &str = "eko:progress-reminder";
+const PROGRESS_REPORT_RULES: &str = "Progress communication: Give a brief user-visible update before the first tool operation and when a key finding, plan change, blocker, or verification result changes. Keep assistant progress separate from provider reasoning and tool output. Tool logs and runtime status are observations, not new findings. During a long tool or model call, do not start another model loop or interrupt the operation just to report progress.";
+
+struct TurnProgressState {
+    last_report: Instant,
+    reminded_iteration: Option<usize>,
+}
+
+impl TurnProgressState {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_report: now,
+            reminded_iteration: None,
+        }
+    }
+
+    fn reminder_needed(&mut self, iteration: usize, now: Instant) -> bool {
+        if now.saturating_duration_since(self.last_report) < PROGRESS_REPORT_INTERVAL {
+            return false;
+        }
+        // 同一模型安全点可能因压缩而重新投影，复用一个替换式提醒；
+        // 下一次请求不重复提醒，直到真正公开的自然语言报告重置计时。
+        let reminded = self.reminded_iteration.get_or_insert(iteration);
+        *reminded == iteration
+    }
+
+    fn reported(&mut self, now: Instant) {
+        self.last_report = now;
+        self.reminded_iteration = None;
+    }
+}
 
 const LANGUAGE_PRIORITY_RULES: &str = r#"Response language priority:
 1. An explicit output-language request wins.
@@ -39,6 +73,7 @@ struct TurnRegistration {
     /// Already-read values belonging to this exact turn, never an I/O cache
     /// for another turn or a replacement for the Workspace location owner.
     project: Option<Arc<crate::infra::PreparedProjectContext>>,
+    progress: TurnProgressState,
 }
 
 /// Process-stable bridge from interactive turn ownership into model calls.
@@ -90,6 +125,7 @@ impl TurnPromptContextRegistry {
                     id,
                     contract,
                     project,
+                    progress: TurnProgressState::new(Instant::now()),
                 },
             );
         TurnPromptContextRegistration {
@@ -115,6 +151,19 @@ impl TurnPromptContextRegistry {
             .and_then(|registration| registration.project.clone())
     }
 
+    fn progress_reminder(&self, turn_id: &str, iteration: usize) -> bool {
+        self.registrations
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_mut(turn_id)
+            .is_some_and(|registration| {
+                registration.contract.is_some()
+                    && registration
+                        .progress
+                        .reminder_needed(iteration, Instant::now())
+            })
+    }
+
     pub fn contains(&self, turn_id: &str) -> bool {
         self.registrations
             .read()
@@ -136,6 +185,13 @@ pub struct TurnPromptContextRegistration {
 }
 
 impl TurnPromptContextRegistration {
+    pub(crate) fn progress_observer(&self) -> TurnProgressObserver {
+        TurnProgressObserver {
+            registry: Arc::clone(&self.registry),
+            turn_id: self.turn_id.clone(),
+            id: self.id,
+        }
+    }
     /// Publish only after the owned invocation's strict preparation succeeds.
     /// The registration id fences an old guard from replacing a newer turn.
     pub(crate) fn install_project_context(
@@ -154,6 +210,28 @@ impl TurnPromptContextRegistration {
             return Ok(());
         }
         Err("project turn registration changed before model admission".to_string())
+    }
+}
+
+/// 只观察已向用户发布的报告；旧执行的回调不能重置新注册的时钟。
+pub(crate) struct TurnProgressObserver {
+    registry: Arc<TurnPromptContextRegistry>,
+    turn_id: String,
+    id: uuid::Uuid,
+}
+
+impl TurnProgressObserver {
+    pub(crate) fn reported(&self) {
+        let mut registrations = self
+            .registry
+            .registrations
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(registration) = registrations.get_mut(&self.turn_id)
+            && registration.id == self.id
+        {
+            registration.progress.reported(Instant::now());
+        }
     }
 }
 
@@ -223,6 +301,15 @@ impl EkoContextProjector {
 }
 
 impl PreModelContextProjector for EkoContextProjector {
+    fn recovered_tool_origins<'a>(
+        &'a self,
+        context: &'a ProjectionContext,
+        messages: &'a [Message],
+    ) -> BoxFuture<'a, AgentResult<Vec<echo_agent::compression::RecoveredToolOrigin>>> {
+        // 原EKO装配已经拥有此TaskRuntime projector；来源只沿Frame已有getter，不另设恢复器。
+        self.task_runtime.recovered_tool_origins(context, messages)
+    }
+
     fn validate_model_request<'a>(
         &'a self,
         context: &'a ProjectionContext,
@@ -260,6 +347,14 @@ impl PreModelContextProjector for EkoContextProjector {
             projections.push(ContextProjection {
                 marker: TURN_CONTRACT_MARKER.to_string(),
                 message: contract.map(render_turn_contract).map(Message::user),
+            });
+            let remind = context
+                .turn_id
+                .as_deref()
+                .is_some_and(|turn_id| self.turns.progress_reminder(turn_id, context.iteration));
+            projections.push(ContextProjection {
+                marker: PROGRESS_REMINDER_MARKER.to_string(),
+                message: remind.then(|| Message::user("No user-visible natural-language progress report has been published for at least 60 seconds. At this existing model safe point, briefly report the current finding, changed plan, blocker, or verification result before continuing. If there is no new finding, say what you are still waiting for; do not invent progress or a completion.".to_string())),
             });
             projections.push(self.hot_memory.projection());
             let pending_command_cell_watch = match (
@@ -306,7 +401,7 @@ fn render_turn_contract(contract: TurnContract) -> String {
         }
     };
     format!(
-        "[eko_turn_contract]\nTurn origin: {}\nInstruction author: {}\n\nResponse language:\n{language_anchor}\n{LANGUAGE_PRIORITY_RULES}\n[/eko_turn_contract]",
+        "[eko_turn_contract]\nTurn origin: {}\nInstruction author: {}\n\nResponse language:\n{language_anchor}\n{LANGUAGE_PRIORITY_RULES}\n\n{PROGRESS_REPORT_RULES}\n[/eko_turn_contract]",
         contract.origin.as_str(),
         contract.authorship.as_str(),
     )
@@ -315,6 +410,47 @@ fn render_turn_contract(contract: TurnContract) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_reminder_waits_for_safe_point_and_only_rearms_after_report() {
+        let start = Instant::now();
+        let mut progress = TurnProgressState::new(start);
+        assert!(!progress.reminder_needed(1, start + Duration::from_secs(59)));
+        assert!(progress.reminder_needed(2, start + Duration::from_secs(60)));
+        assert!(progress.reminder_needed(2, start + Duration::from_secs(61)));
+        assert!(!progress.reminder_needed(3, start + Duration::from_secs(120)));
+        progress.reported(start + Duration::from_secs(125));
+        assert!(!progress.reminder_needed(4, start + Duration::from_secs(184)));
+        assert!(progress.reminder_needed(5, start + Duration::from_secs(185)));
+    }
+
+    #[test]
+    fn old_progress_observer_cannot_reset_replaced_turn() -> anyhow::Result<()> {
+        let registry = Arc::new(TurnPromptContextRegistry::new());
+        let old = registry.register("turn", RunTurnOrigin::User, InstructionAuthorship::User);
+        let observer = old.progress_observer();
+        let current = registry.register("turn", RunTurnOrigin::User, InstructionAuthorship::User);
+        let before = registry
+            .registrations
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get("turn")
+            .map(|registration| registration.progress.last_report)
+            .ok_or_else(|| anyhow::anyhow!("current registration missing"))?;
+        observer.reported();
+        let after = registry
+            .registrations
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get("turn")
+            .map(|registration| registration.progress.last_report);
+        assert_eq!(after, Some(before));
+        drop(old);
+        assert!(registry.contains("turn"));
+        drop(current);
+        assert!(!registry.contains("turn"));
+        Ok(())
+    }
 
     #[derive(Default)]
     struct VerificationEvents(std::sync::Mutex<Vec<echo_agent::agent::EventEnvelope>>);

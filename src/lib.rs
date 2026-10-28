@@ -1,4 +1,3 @@
-pub mod cli;
 pub mod logging;
 pub mod task_run_control;
 
@@ -40,9 +39,6 @@ pub fn configure_data_root() -> anyhow::Result<()> {
 // remains covered by the workspace's strict panic lint gate.
 #[allow(clippy::unreachable)]
 pub mod tauri;
-
-#[cfg(feature = "tui")]
-pub mod tui;
 
 // Re-export from app-core
 pub use echo_agent_app_core::api::{

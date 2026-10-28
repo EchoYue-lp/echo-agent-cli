@@ -14,7 +14,7 @@
 
 ## 📋 项目简介
 
-Eclip 是一个生产级的通用 Agent 产品，基于 Rust 生态构建，提供 **TUI（终端界面）** 和 **GUI（桌面应用）** 两种交互模式，专注于以下核心场景：
+Eclip 是一个生产级的通用 Agent 产品，基于 Rust 生态构建，以 **GUI（桌面应用）** 为唯一产品主入口，继续接收 IM 和 cron 后台输入，专注于以下核心场景：
 
 - **💻 Coding** — 代码生成、审查、重构、调试、测试
 - **📊 数据分析** — 结构化数据分析、统计、可视化、报告生成
@@ -23,7 +23,7 @@ Eclip 是一个生产级的通用 Agent 产品，基于 Rust 生态构建，提�
 
 ### 核心特性
 
-- 🤖 **双模式交互**：全屏终端（TUI）、桌面应用（Tauri GUI）
+- 🤖 **桌面主入口**：Tauri GUI；IM 收发和 cron 继续沿共享 app-core 运行
 - 🔄 **长程任务支持**：断点续传、进度追踪、人机协作检查点
 - 🧩 **可扩展架构**：MCP 服务器、插件系统（PluginRegistry）、技能管理
 - 📡 **IM 通道集成**：支持 QQ Bot、飞书（飞书 webhook/long_poll 模式）
@@ -43,13 +43,10 @@ echo-agent-cli/
 ├── config/                 # 配置文件（eko.yaml, mcp.json）
 ├── docs/                   # 项目文档（架构、配置、入门指南）
 ├── src/                    # 应用入口
-│   ├── main.rs             # TUI 主入口
 │   ├── lib.rs              # 库导出
-│   ├── cli/                # CLI 参数解析、REPL、Slash 命令（20+ 模块）
-│   ├── tui/                # 终端 UI（ratatui，事件驱动架构）
 │   ├── tauri/              # Tauri IPC 层（GUI 后端）
 │   └── logging/            # 日志 inspector
-├── echo-agent-app-core/    # 核心应用库（TUI/GUI 共享）
+├── echo-agent-app-core/    # 共享应用库（GUI/IM/cron）
 │   └── src/
 │       ├── state/           # 配置、workspace/delivery scope 与 AppState 聚合
 │       ├── agent_handle.rs # Agent 并发封装
@@ -61,7 +58,7 @@ echo-agent-cli/
 │       ├── workspace/      # 工作区管理
 │       ├── conversation_projection.rs  # 会话 UI 投影 DTO
 │       ├── project/        # 项目上下文、编码循环
-│       ├── output/         # REPL ANSI 输出
+│       ├── output/         # 共享输出投影
 │       ├── scheduler/      # 定时任务调度
 │       ├── skills_hub/     # 技能市场
 │       ├── webhook/        # Webhook 事件回调
@@ -77,8 +74,8 @@ echo-agent-cli/
 ### 前置条件
 
 - **Rust** >= 1.95（使用 `rustup` 安装）
-- **Node.js** 20.19+、22.13+ 或 24+（仅 GUI 桌面应用需要，TUI 不需要）
-- **Tauri CLI**（仅打包桌面安装包时需要）：`npm install -g @tauri-apps/cli`
+- **Node.js** 20.19+、22.13+ 或 24+（桌面开发/打包需要）
+- **Tauri CLI 2.12.4**（GUI 开发/打包需要）：Cargo 与 npm 启动器独立安装，构建前核对实际入口版本。
 
 ### 安装依赖
 
@@ -88,15 +85,14 @@ cd echo-agent-cli
 # 安装 Rust 依赖
 cargo fetch
 
-# 安装前端依赖（仅 GUI 需要，TUI 可跳过）
+# 安装桌面前端依赖
 cd web-frontend && npm install && cd ..
 ```
 
-> **提示**：如果只使用 TUI 模式，可以跳过 Node.js 和前端依赖安装。使用 `./init.sh` 会自动处理。
 
 ### 配置
 
-GUI、TUI 和 CLI 共享 `model_providers`、`configured_models` 和 `default_model_id`。用户可以创建多个 Provider，并在每个 Provider 下创建多个模型；每个模型明确选择 Chat Completions、Responses 或 Anthropic 协议，纯文本能力默认启用，并可追加图像、音频、视频能力。用户填写的 API Key 优先级高于 Provider 配置的环境变量。
+GUI、IM 与 cron 共享 `model_providers`、`configured_models` 和 `default_model_id`。用户可以创建多个 Provider，并在每个 Provider 下创建多个模型；每个模型明确选择 Chat Completions、Responses 或 Anthropic 协议，纯文本能力默认启用，并可追加图像、音频、视频能力。用户填写的 API Key 优先级高于 Provider 配置的环境变量。
 
 也可以通过 `eko.yaml` 设置模型。完整配置参考：
 
@@ -118,31 +114,10 @@ MCP 配置优先级：`--mcp-config` → YAML `mcp.config_path` →
 
 ## 📦 构建与安装
 
-项目使用 Feature Flags 分离 TUI 和 GUI 构建。默认启用 `tui` feature。
-
-> **入口区别**：`echo-agent-cli` 是 TUI（终端全屏界面）入口；`echo-agent-tauri` 是 GUI（Tauri 桌面应用）入口。若运行 `target/release/echo-agent-cli`，看到 TUI 是预期行为。要生成可双击打开且包含前端资源的桌面产物，请使用 Tauri 打包命令：`cargo tauri build -- --no-default-features --features gui`。GUI feature 会同时启用 `channels`，因此桌面应用会一并打包多通道能力。
-
-### TUI（终端全屏界面）
-
-```bash
-# 编译（Release）
-cargo build --bin echo-agent-cli --release
-
-# 直接运行（不安装）
-cargo run --bin echo-agent-cli
-
-# 安装到 ~/.cargo/bin（推荐，可全局调用）
-cargo install --path . --bin echo-agent-cli --no-default-features --features tui
-
-# 确认安装成功
-which echo-agent-cli
-
-echo-agent-cli   # 安装后直接运行
-```
-
-编译产物路径：`target/debug/echo-agent-cli` 或 `target/release/echo-agent-cli`
-
-> **推荐**：确认 `which echo-agent-cli` 能找到 `~/.cargo/bin/echo-agent-cli` 后，再设置别名 `alias ecw='echo-agent-cli'`（添加到 `~/.bashrc` 或 `~/.zshrc`）。如果找不到，请先把 `~/.cargo/bin` 加入 `PATH`。
+源码只保留既有 `echo-agent-tauri` 桌面产品入口，默认 `gui` feature 同时启用
+`channels`。独立 TUI、REPL、CLI/JSONL 和 standalone `--channels` 已退出；Rust package
+仍名为 `echo-agent-cli`，不因入口或品牌变化改名。GUI 内置 PTY/SSH 终端、Agent shell、
+桌面四个配置参数及独立 SDK Host stdio 继续保留。
 
 ### GUI（桌面应用）
 
@@ -151,31 +126,38 @@ GUI 使用 Tauri 打包，包含两部分：
 - `web-frontend/`：React 前端，构建产物为 `web-frontend/dist`；
 - Rust GUI 运行时：由 `gui` feature 启用，并自动包含 `channels` 多通道能力，最终随 Tauri 一起打进桌面应用包。
 
-> `tauri.conf.json` 已配置 GUI runner；直接运行 `cargo tauri dev/build` 会使用 `echo-agent-tauri` 和 `gui` feature，不会落到默认 TUI binary。Tauri CLI 目前会把 Cargo 默认 feature 展开进日志，因此你可能看到 `--features gui,tui`；这是 Tauri CLI 的参数展开行为，不代表启动了 TUI 入口。日常 GUI 开发推荐使用 `.cargo/config.toml` 中的 `cargo gui-dev` alias。
+Rust `tauri` 与前端 `@tauri-apps/api` 须保持同一 minor 版本，当前两个锁文件中均为 `2.12.4`。前端固定该精确版本并保留 `package-lock.json`；安装后仍需通过 Tauri 原有的版本匹配检查。
+
+> Cargo 的 `default-run` 与首个 `[[bin]]` 均为 `echo-agent-tauri`，Tauri runner 另显式选择 GUI binary 与 `gui` feature。当前默认 feature 不再包含 `tui`；不保留旧模式逃逸分派。日常 GUI 开发推荐使用 `.cargo/config.toml` 中的 `cargo gui-dev` alias。
 
 #### 开发运行
 
+首次使用 GUI 前，先完成下方[工具安装](#生产打包)，并核对所选 `cargo tauri --version` 或 `tauri --version`。
+
 ```bash
-# 推荐：启动前端 Vite 服务并打开 Tauri 窗口，且显式禁用默认 tui feature
+# 推荐：启动前端 Vite 服务并打开 Tauri 窗口，显式选择同一 GUI 入口
 cargo gui-dev
 
 # 等价的完整命令
 cargo tauri dev -- --no-default-features --features gui --bin echo-agent-tauri
 
-# 兼容入口：也会启动 GUI，但日志中可能出现 --features gui,tui
+# 同一 GUI 入口
 cargo tauri dev
 ```
 
 #### 生产打包
 
 ```bash
-# 首次需要安装 Tauri CLI
-npm install -g @tauri-apps/cli
+# 使用 Cargo 子命令时，先安装匹配版本的 Cargo CLI
+cargo install tauri-cli --version 2.12.4 --locked
+
+# 如选用独立的官方 npm tauri 启动器，可安装以下精确版本
+npm install -g @tauri-apps/cli@2.12.4
 
 # 推荐：自动构建前端 + 编译 Release + 生成平台原生安装包
 cargo gui-bundle
 
-# 兼容入口：也会打包 GUI，但日志中可能出现 --features gui,tui
+# 同一 GUI 打包入口
 cargo tauri build
 ```
 
@@ -209,9 +191,13 @@ cargo gui-run
 
 裸可执行文件路径：`target/release/echo-agent-tauri`（Windows 为 `target/release/echo-agent-tauri.exe`）。
 
-#### 为什么不会打成 TUI？
+#### 桌面包主入口如何选择？
 
-Tauri CLI 打包时会构建包名二进制 `echo-agent-cli`，项目已在 `--no-default-features --features gui` 下把它路由到同一套 GUI/Tauri 运行时；因此打包产物不会启动 TUI。
+`Cargo.toml` 的 `default-run` 与唯一产品 `[[bin]]` 均为 `echo-agent-tauri`，
+Tauri runner 与 `mainBinaryName` 继续选择同一二进制。独立 `echo-agent-cli` binary 已移除；
+这不修改包名、`com.eko.desktop` identifier 或 `~/.eko`／workspace `.eko` 数据路径。
+
+新包须实际构建并核对 `Info.plist` 的 `CFBundleExecutable`、包内二进制和内嵌前端资源。入口配置修正后，仍须对每个实际新包分别完成打包结果和原生运行验收；旧裸 binary 和单独静态页面不作为新包已通过的证据。
 
 `gui` feature 已依赖 `channels` feature，所以 GUI 打包命令无需额外写 `--features "gui,channels"`，多通道能力会随 GUI 一起编译进桌面应用。
 
@@ -229,8 +215,8 @@ Browser、Sandbox、数据分析和论文/系统综述工作台。Workflow 和�
 带 `(branch)` 标题的新会话都保留在当前工作区会话列表，Fork 不会自动重发问题。
 
 Side Conversation 依赖 GUI 的侧栏树和并行视图，只通过 Tauri 提供创建、恢复与管理；
-TUI、CLI/JSONL 和 channel 保留普通 conversation、Subagent 与 `/fork` 行为，不增加该布局
-能力的专用命令或 wire contract。
+IM 的普通 conversation、Subagent 和已有 fork 行为继续保留；不增加 Side Conversation
+专用 channel wire contract，也不为保留共享能力恢复旧终端产品入口。
 
 Agent 协作由模型工具和运行时自动完成，GUI 不提供手动消息或 Agent 组管理页面。
 用户通过 Sidechat、Forkchat 参与独立探索，并在现有对话与任务视图中查看结果。
@@ -241,9 +227,8 @@ Agent 协作由模型工具和运行时自动完成，GUI 不提供手动消息�
 
 | Feature     | 描述                                   | 默认启用 |
 | ----------- | -------------------------------------- | -------- |
-| `tui`       | 终端全屏界面（ratatui）                | ✅       |
-| `gui`       | 桌面应用（Tauri，自动包含 `channels`） | ❌       |
-| `channels`  | 多通道支持（IM）                       | ❌       |
+| `gui`       | 桌面应用（Tauri，自动包含 `channels`） | ✅       |
+| `channels`  | 多通道支持（IM）                       | 随 GUI   |
 | `telemetry` | 遥测数据收集                           | ❌       |
 | `devtools`  | Tauri 开发者工具                       | ❌       |
 
@@ -256,7 +241,6 @@ echo-agent-cli 启用以下 echo-agent 框架 features：
 | `mcp`                     | MCP 协议支持          |
 | `human-loop`              | 人机协作循环          |
 | `subagent`                | 子 Agent 编排         |
-| `tasks`                   | 任务系统              |
 | `git` / `shell` / `files` | 编码与本地执行工具    |
 | `web` / `media` / `chart` | Web、多模态与图表工具 |
 | `research` / `rag`        | 学术研究与检索能力    |
@@ -267,190 +251,27 @@ Eclip 不启用 framework `sqlite` feature；会话、runtime、memory 和 TaskR
 
 ## 🖥️ 使用指南
 
-### TUI 快捷键
+### GUI、IM 与后台运行
 
-| 快捷键              | 功能                             |
-| ------------------- | -------------------------------- |
-| `Ctrl+C` / `Ctrl+Q` | 退出应用                         |
-| `Ctrl+B`            | 切换侧边栏                       |
-| `Ctrl+L`            | 清空聊天                         |
-| `Shift+Enter`       | 输入换行                         |
-| `Enter`             | 发送消息                         |
-| `Esc`               | 取消生成 / 关闭弹窗              |
-| `Tab`               | 切换侧边栏标签                   |
-| `S-Tab`             | 补全列表上一项                   |
-| `↑/↓`               | 浏览输入历史                     |
-| `PageUp/PageDown`   | 快速滚动聊天                     |
-| `y` / `n`           | 批准 / 拒绝工具执行（HITL 审批） |
+通过原 GUI 会话与任务视图发送输入、查看 Subagent 结果、附件与 HITL；IM 和 cron 继续经
+同一 app-core 的输入/任务/恢复 owner 运行。隐藏窗口保持后台服务，真正退出关闭准入并等待
+原生命周期物理结算，不留下 daemon。GUI 内置终端与 Agent shell 继续可用。
 
-### Slash 命令
+reasoning 与普通 assistant 正文分别保存，phase 只是消息阶段，不能因普通文字或工具完成
+判定任务成功。最终候选经过原 Guard/Critic/Stop、持久化与运行时结算；运行时完成不等于
+整个 TaskRun／Goal 已完成。交付仍消费原末尾状态与流 EOF。
 
-在输入框输入 `/` 可查看可用命令（命令面板，支持模糊搜索）：
+### 桌面最小启动参数
 
-#### Session 会话管理
+| 参数 | 短形式 | 用途 |
+| --- | --- | --- |
+| `--model <id-or-name>` | `-m` | 选择已启用的配置模型 ID 或唯一模型名称 |
+| `--config <path>` | | 指定配置文件 |
+| `--mcp-config <path>` | | 指定 MCP 配置 |
+| `--project <path>` | | 指定项目目录 |
 
-| 命令       | 别名   | 描述                            |
-| ---------- | ------ | ------------------------------- |
-| `/clear`   | `cls`  | 清空当前对话并重置 Agent 上下文 |
-| `/history` | `hist` | 查看会话历史                    |
-| `/stats`   | `st`   | 显示会话统计                    |
-| `/status`  |        | 显示 Agent 状态                 |
-| `/new`     | `n`    | 创建新会话                      |
-| `/compact` | `cp`   | 压缩上下文窗口                  |
-| `/undo`    | `u`    | 撤销上一步操作                  |
-
-#### Context 上下文管理
-
-| 命令                 | 别名   | 描述                                                     |
-| -------------------- | ------ | -------------------------------------------------------- |
-| `/mode <mode>`       |        | 切换模式（general/coding/research/medical/data/writing） |
-| `/model <name>`      |        | 切换模型                                                 |
-| `/think [level]`     |        | 查看或设置当前模型支持的思考等级                         |
-| `/reasoning [level]` |        | `/think` 的别名                                          |
-| `/system [prompt]`   | `sys`  | 查看或设置系统提示词                                     |
-| `/memory`            |        | 查看记忆内容                                             |
-| `/remember <fact>`   |        | 保存一条记忆                                             |
-| `/forget <fact>`     |        | 删除一条记忆                                             |
-| `/compress`          |        | 手动压缩上下文                                           |
-| `/context`           |        | 查看上下文信息                                           |
-| `/refresh`           |        | 刷新项目上下文                                           |
-| `/project`           | `proj` | 项目管理                                                 |
-
-#### Coding 编码工具
-
-| 命令                  | 别名 | 描述                     |
-| --------------------- | ---- | ------------------------ |
-| `/plan`               |      | 进入计划模式（只读分析） |
-| `/tasks`              |      | 查看活跃任务             |
-| `/task-progress`      | `tp` | 查看任务进度             |
-| `/task-tree`          | `tt` | 查看任务树               |
-| `/test [name]`        |      | 运行测试                 |
-| `/code-review [path]` | `cr` | 请求代码审查             |
-| `/fix`                |      | 自动修复问题             |
-| `/diff [file]`        |      | 查看 git 或文件差异      |
-| `/agents`             |      | 列出可用 Agent           |
-| `/agent`              |      | Agent 管理               |
-| `/hooks`              | `hk` | 管理 Hooks               |
-
-#### Git 操作
-
-| 命令          | 别名 | 描述          |
-| ------------- | ---- | ------------- |
-| `/git <args>` |      | 运行 git 命令 |
-
-#### Research 学术研究
-
-| 命令             | 别名 | 描述         |
-| ---------------- | ---- | ------------ |
-| `/search-papers` | `sp` | 搜索学术论文 |
-| `/fetch-paper`   | `fp` | 获取指定论文 |
-| `/papers`        |      | 列出已有论文 |
-
-#### Medical 医学研究
-
-医学模式通过 `/mode medical` 切换，Agent 可直接调用以下工具（无需 slash 命令）：
-
-- `pubmed_search` — 搜索 PubMed 医学文献（PMID、MeSH 词、摘要）
-- `clinical_trials_search` — 搜索 ClinicalTrials.gov 临床试验（NCT ID、状态、阶段、结局）
-- `pdf_fetch` — 下载并解析论文全文
-- `web_search` + `web_fetch` — 网络搜索补充信息
-
-所有医学工具**免费使用**，无需 API Key。详见 [配置指南](docs/zh/configuration.md)。
-
-#### Pipeline 流水线
-
-| 命令                    | 别名 | 描述               |
-| ----------------------- | ---- | ------------------ |
-| `/pipeline [list\|run]` |      | 管理单流水线       |
-| `/analyze`              | `da` | 运行数据分析流水线 |
-| `/write`                | `wp` | 运行写作流水线     |
-
-#### Skills & Plugins 技能与插件
-
-| 命令       | 别名     | 描述           |
-| ---------- | -------- | -------------- |
-| `/skills`  | `sk`     | 技能管理       |
-| `/mcp`     | `m`      | MCP 服务器管理 |
-| `/plugins` | `plugin` | 插件管理       |
-
-Eclip 插件采用扁平包结构：根目录使用 `plugin.json`，Skills、MCP、Subagents、
-Hooks、monitors、themes 和 output styles 都从固定根位置发现，不使用
-namespace 或组件路径声明。旧 `.echo-plugin/manifest.yaml` 不再支持。
-完整格式见 [echo-agent 插件系统文档](../echo-agent/docs/zh/32-plugin-system.md)。
-
-#### Evolution 自我进化
-
-| 命令                | 别名 | 描述                                         |
-| ------------------- | ---- | -------------------------------------------- |
-| `/review`           |      | 从最近运行生成带证据的记忆候选（默认不保存） |
-| `/curator`          |      | 管理技能生命周期                             |
-| `/critiques`        | `cq` | 查看评审意见                                 |
-| `/memory-review`    | `mr` | 审查已积累记忆（默认不自动语义合并）         |
-| `/skill-candidates` | `sc` | 查看技能候选与草稿                           |
-| `/runs`             |      | 列出最近运行                                 |
-| `/run`              |      | 查看或导出运行详情                           |
-
-#### Scheduling 定时调度
-
-| 命令                        | 别名 | 描述                                       |
-| --------------------------- | ---- | ------------------------------------------ |
-| `/cron [list\|add\|remove]` |      | 管理定时任务                               |
-| `/auto-memory`              | `am` | 自动记忆管理（on/off/extract/show/config） |
-
-#### Advanced 高级功能
-
-| 命令                                 | 别名    | 描述                                          |
-| ------------------------------------ | ------- | --------------------------------------------- |
-| `/checkpoint`                        | `/save` | 强制保存当前 runtime checkpoint               |
-| `/sessions [query]`                  | `ss`    | 从 canonical ConversationStore 列出或搜索会话 |
-| `/archive-session <conversation-id>` |         | 归档会话（从当前列表隐藏）                    |
-| `/restore-session <conversation-id>` |         | 恢复已归档会话                                |
-| `/export`                            |         | 导出会话                                      |
-| `/profile`                           | `prof`  | 配置档案管理                                  |
-| `/verbose`                           |         | 切换详细模式                                  |
-| `/doctor`                            | `doc`   | 诊断配置问题                                  |
-| `/delegate`                          | `dl`    | 委托子 Agent                                  |
-| `/search`                            |         | 搜索功能                                      |
-| `/inspect`                           | `ins`   | 检查状态                                      |
-| `/trace`                             | `tr`    | 追踪观测（sessions/summary/stats）            |
-| `/workspace`                         | `ws`    | 工作区管理                                    |
-
-#### Security 安全
-
-| 命令                 | 别名   | 描述              |
-| -------------------- | ------ | ----------------- |
-| `/permission [mode]` | `perm` | 查看/设置权限模式 |
-
-#### Info 信息
-
-| 命令     | 别名     | 描述            |
-| -------- | -------- | --------------- |
-| `/tools` |          | 显示可用工具    |
-| `/cost`  |          | 显示 Token 用量 |
-| `/usage` |          | 使用统计        |
-| `/debug` |          | 调试信息        |
-| `/help`  | `h`, `?` | 显示帮助信息    |
-
-#### Exit 退出
-
-| 命令              | 别名 | 描述     |
-| ----------------- | ---- | -------- |
-| `/quit` / `/exit` | `q`  | 退出应用 |
-
-### CLI 常用参数
-
-| 参数                   | 短形式 | 描述                                                            |
-| ---------------------- | ------ | --------------------------------------------------------------- |
-| `--model <id-or-name>` | `-m`   | 选择已启用的配置模型 ID 或唯一模型名称；未知/重名会报错         |
-| `--config <path>`      |        | 指定配置文件路径                                                |
-| `--mcp-config <path>`  |        | 指定 MCP 配置文件路径                                           |
-| `--project <path>`     |        | 指定项目目录                                                    |
-| `--jsonl <prompt>`     |        | 非交互执行一次请求；stdout 每行输出一个 canonical chat envelope |
-| `--continue`           | `-c`   | 继续最近一次会话                                                |
-| `--resume <id>`        | `-r`   | 恢复指定会话                                                    |
-| `--verbose`            | `-v`   | 详细输出模式                                                    |
-
-> **提示**：Agent 模式、系统提示词等可在 TUI 内通过 `/mode`、`/system` 等 slash 命令调整，无需通过 CLI 参数设置。
+`--tui`、`--cli`、`--jsonl`、`--channels`、console resume/permission/rendering 参数不属于
+桌面入口，不作为另一个产品模式。会话和 Task/Subagent 恢复继续由 GUI/IM/cron 原 owner 承担。
 
 ---
 
@@ -459,20 +280,20 @@ namespace 或组件路径声明。旧 `.echo-plugin/manifest.yaml` 不再支持�
 ### 代码检查
 
 ```bash
-# Rust 编译检查（TUI 模式，默认）
+# Rust workspace 快检
 cargo check --workspace
 
 # GUI 入口编译检查
 cargo check --bin echo-agent-tauri --no-default-features --features gui
 
-# TUI Clippy 检查
+# Rust Clippy 快检
 cargo clippy --workspace
 
-# TUI 测试
+# Rust workspace 测试
 cargo test --workspace
 ```
 
-> **说明**：为避免混淆，日常开发也建议分别检查 TUI 与 GUI 入口；不要把 TUI/GUI 当成同一个打包产物处理。
+> 裸后端与完整桌面包分别验收；日常快检不替代所属仓库的完整门禁与新包 native 验收。
 
 ### CI 依赖审计
 
@@ -483,8 +304,8 @@ framework `scripts/generate-vendored-media-audit-lock.py` 与其 `vendor/registr
 临时视图只恢复三个 bundled parent 的原 registry source/checksum 归属，保留真实锁的其它节点和依赖边，
 实际构建锁保持原样。Python 3.11+ 仅用于这项开发审计工具，不是 Eclip 运行依赖。
 
-当前交付按[人的精确风险决定](docs/supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md)
-暂时保留 glib 0.18.5、proc-macro-error 1.0.4、bincode 1.3.3。
+原交付按[人的精确风险决定](docs/supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md)
+曾接受 glib 0.18.5、proc-macro-error 1.0.4、bincode 1.3.3；本次源码退役后的最终锁、consumer范围与诊断须重新逐项核验，不自动继承或续写摘要。
 `scripts/check_cli_dependency_risks.py` 保留完整官方扫描 JSON、stderr 和真实退出码，另行报告风险决定核对结果；
 扫描 exit 1 不会被改称审计通过。仅允许清单中的 advisory、类别、版本、registry source/checksum；
 新增告警、漏洞、yanked、扫描失败或输入漂移仍阻断。glib 的 soundness 风险尚未修复。
@@ -529,8 +350,6 @@ npx tsc -b
 
 ```
 echo-agent-cli (二进制入口)
-    ├── src/cli/      CLI / REPL / Slash 命令
-    ├── src/tui/      TUI 前端 (ratatui)
     └── src/tauri/    GUI 前端 (Tauri IPC)
             │
             ▼
@@ -548,18 +367,16 @@ echo-agent (AI Agent 框架)
     └── file stores / human-loop / model protocols
 ```
 
-### Agent Streaming
+### 原生消息与执行观察
 
-使用 `tokio::sync::mpsc::unbounded_channel` 实现真正增量式流式输出：
-
-- 后台任务获取 `RwLock<ReactAgent>` 并调用 `execute_stream()`/`chat_stream()`
-- 逐事件通过 channel 发送
-- 返回基于 channel 接收端的流，避免返回时持有锁
+保留的GUI／IM／cron沿原AgentHandle与driver消费同一canonical流。reasoning、普通assistant
+正文及tool call/result分别保留原身份和顺序；普通文字不被自动标作thinking。
+phase或block complete是消息事实，不单独签发执行成功。最终候选经过原Guard/Critic/Stop、
+持久化和物理owner结算，Stop要求继续仍返回同一主循环。兼容FinalAnswer之后仍消费最后
+ExecutionStatus与原EOF；整个TaskRun／Goal是否完成继续由应用原权威判断。
 
 ### 界面配色
 
-- REPL 使用稳定的 ANSI 终端配色。
-- TUI 使用自己的 ratatui 深色/浅色 palette。
 - GUI 使用 CSS 变量管理界面配色。
 - 不提供只修改显示文案、却不改变渲染状态的伪主题命令。
 
@@ -587,14 +404,14 @@ echo-agent (AI Agent 框架)
 项目 `.eko/skills/` 中的 Skill 会在运行时自动发现。相同名称按项目 Skill、Plugin Skill、
 用户 Skill 的顺序优先，项目 Skill 不写入全局启停文件。
 
-支持 `/auto-memory` 从会话提取带证据候选，统一进入 Review Inbox，采纳后才写入长期记忆。
+GUI沿原自动记忆开关与提取入口生成带证据候选，统一进入Review Inbox；按原策略采纳后才写入长期记忆。独立console的`/auto-memory`不再是当前操作入口。
 
 ### 退役的语言服务
 
 Eclip 不再请求 framework `lsp` feature，不注册语言服务工具，也不提供 `/lsp`、LSP 设置页或 IPC。
 旧 `.lsp.yaml` 与插件 `lsp.yaml` 只产生明确退休诊断，用户文件保持原样；混合插件仍处理合法组件。
-框架 A2A/LSP API 此阶段仍为其它消费者保留，待 Eclip/SDK 去依赖共同验收后另行删除。
-独立 TUI、CLI/JSONL、IM、cron、终端与其它 Agent 能力本次继续保留。
+Framework 的具名物理撤销与 SDK 正式采用分别由各自精确源码和门禁承担，应用去依赖不替代其资格。
+独立 TUI、REPL、CLI/JSONL 产品入口已退出；GUI、IM、cron、内置终端及其它共享 Agent 能力继续保留。
 
 ---
 
@@ -657,6 +474,13 @@ MIT License。
 ## 🤝 致谢
 
 - [echo-agent](https://github.com/EchoYue-lp/echo-agent) — 底层 AI Agent 框架
-- [ratatui](https://github.com/ratatui-org/ratatui) — 终端 UI 库
+- [ratatui](https://github.com/ratatui-org/ratatui) — 已退役终端实现的历史致谢
 - [Tauri](https://tauri.app/) — 桌面应用框架
 - [React](https://react.dev/) + [Vite](https://vitejs.dev/) + [Tailwind CSS](https://tailwindcss.com/) — Web 前端技术栈
+
+## 源码退役与交付资格
+
+本文随独立终端源码删除采用；正式锁、删后构建、依赖策略、SDK正式Git来源、native窗口／
+手机／SSH、main CI与发布分别验收。文案同步或旧focused通过不证明这些结果。
+固定 `pre-retirement-2026-10-24` 与完整能力分支保旧入口，恢复需新任务评估，不改指 refs、
+不回滚当前工作区、不删除用户会话、记忆、插件文件或任务journal。

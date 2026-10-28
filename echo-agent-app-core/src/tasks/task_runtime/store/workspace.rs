@@ -251,7 +251,16 @@ impl TaskRuntimeStore {
         root: &std::path::Path,
         args: &[&str],
     ) -> Result<String, super::worktree::WorktreeError> {
-        super::worktree::run_git_in_environment(root, args, self.project_environment.get())
+        // 这是用户直接触发的 GUI Git 原语；本地操作复用原生进程路径，
+        // 不套用 Agent 自动任务的目录沙箱。SSH 始终保留原项目连接与执行 owner，
+        // 不允许在远程不可用时回退本机；自动任务仍调用自己的 environment 路径。
+        let environment = self.project_environment.get().filter(|environment| {
+            matches!(
+                &environment.location,
+                crate::workspace::ProjectLocation::Ssh { .. }
+            )
+        });
+        super::worktree::run_git_in_environment(root, args, environment)
     }
 
     pub fn project_worktree_lock(

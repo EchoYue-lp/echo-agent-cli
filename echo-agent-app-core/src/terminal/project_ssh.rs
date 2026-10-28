@@ -193,6 +193,15 @@ impl ProjectSshConnection {
         }))
     }
 
+    /// Opaque identity of this physical OpenSSH owner. It cannot be rebuilt
+    /// from the workspace key and changes when the connection is replaced.
+    pub fn generation(&self) -> String {
+        use sha2::{Digest as _, Sha256};
+        hex::encode(Sha256::digest(
+            self.control_directory.path().as_os_str().as_encoded_bytes(),
+        ))
+    }
+
     pub fn target(&self) -> &TerminalTarget {
         &self.target
     }
@@ -702,12 +711,41 @@ impl TerminalService {
             .ok_or_else(|| "project SSH connection has not been prepared".to_string())
     }
 
+    /// 读取单一物理owner快照；后继mutation仍须在原creation lock内核对Arc。
+    pub fn project_ssh_exclusive(
+        &self,
+        owner_id: &str,
+    ) -> Result<Arc<ProjectSshConnection>, String> {
+        let connection = self.project_ssh(owner_id)?;
+        if self
+            .project_connections
+            .iter()
+            .any(|entry| entry.key() != owner_id && Arc::ptr_eq(entry.value(), &connection))
+        {
+            return Err("SSH physical connection has another owner".into());
+        }
+        Ok(connection)
+    }
+
     /// Transfer the original prepared connection into the existing Workspace
     /// identity after owned project creation succeeds; no connection is rebuilt.
     pub async fn reassign_project_ssh(
         &self,
         previous_owner: &str,
         workspace_id: &str,
+    ) -> Result<(), String> {
+        let expected = self.project_ssh(previous_owner)?;
+        self.reassign_project_ssh_checked(previous_owner, workspace_id, &expected)
+            .await
+    }
+
+    /// 只转移刚才实际验证的物理 owner。防止认证后等待期间旧 draft
+    /// 关闭/重建或同 Arc 双登记，让来源连接被误迁走或误关闭。
+    pub async fn reassign_project_ssh_checked(
+        &self,
+        previous_owner: &str,
+        workspace_id: &str,
+        expected: &Arc<ProjectSshConnection>,
     ) -> Result<(), String> {
         let _creation = self.project_creation_lock.lock().await;
         if self.shutting_down.load(Ordering::Acquire) {
@@ -719,13 +757,29 @@ impl TerminalService {
         if workspace_id.trim().is_empty() {
             return Err("workspace id cannot be empty".to_string());
         }
+        let connection = self.project_ssh(previous_owner)?;
+        if !Arc::ptr_eq(&connection, expected) {
+            return Err(
+                "SSH draft generation changed after verification; connection not transferred"
+                    .into(),
+            );
+        }
+        if self
+            .project_connections
+            .iter()
+            .any(|entry| entry.key() != previous_owner && Arc::ptr_eq(entry.value(), &connection))
+        {
+            return Err(
+                "SSH physical connection already has another owner; connection not transferred"
+                    .into(),
+            );
+        }
         if previous_owner == workspace_id {
-            return self.project_ssh(previous_owner).map(|_| ());
+            return Ok(());
         }
         if self.project_connections.contains_key(workspace_id) {
             return Err("workspace already owns a project SSH connection".to_string());
         }
-        let connection = self.project_ssh(previous_owner)?;
         connection.effective_target()?;
         self.project_connections
             .insert(workspace_id.to_string(), connection);
@@ -769,6 +823,24 @@ impl TerminalService {
     }
 
     pub async fn close_project_ssh(&self, owner_id: &str) -> Result<(), String> {
+        self.close_project_ssh_inner(owner_id, None).await
+    }
+
+    /// 原操作结算未移交draft时只关闭已验证的同一物理owner。
+    /// 已移交的旧key不关闭新workspace；替换/双登记均保留并报告。
+    pub async fn close_project_ssh_checked(
+        &self,
+        owner_id: &str,
+        expected: &Arc<ProjectSshConnection>,
+    ) -> Result<(), String> {
+        self.close_project_ssh_inner(owner_id, Some(expected)).await
+    }
+
+    async fn close_project_ssh_inner(
+        &self,
+        owner_id: &str,
+        expected: Option<&Arc<ProjectSshConnection>>,
+    ) -> Result<(), String> {
         // Serializes physical close with the original draft -> Workspace map
         // transfer. A cancelled stale draft cannot close a published project.
         let _creation = self.project_creation_lock.lock().await;
@@ -779,6 +851,20 @@ impl TerminalService {
         else {
             return Ok(());
         };
+        if let Some(expected) = expected {
+            if !Arc::ptr_eq(expected, &connection) {
+                return Err(
+                    "SSH draft generation changed before cleanup; current owner retained".into(),
+                );
+            }
+            if self
+                .project_connections
+                .iter()
+                .any(|entry| entry.key() != owner_id && Arc::ptr_eq(entry.value(), &connection))
+            {
+                return Err("SSH draft has another owner; source connection retained".into());
+            }
+        }
         if let Err(error) = connection.observe_idle().await {
             if !self.shutting_down.load(Ordering::Acquire) {
                 // A bounded failed close observation is not a terminal state.
@@ -824,6 +910,91 @@ mod tests {
     use echo_agent::tools::filesystem::FileSystem;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_launch_pty_keeps_target_owner_and_reports_xterm_capabilities()
+    -> Result<(), String> {
+        use crate::terminal::TerminalEvent;
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = TerminalService::new();
+        let mut receiver = service.subscribe();
+        let target = TerminalTarget::Ssh {
+            host: "original.invalid".to_string(),
+            user: Some("echo".to_string()),
+            port: Some(2222),
+        };
+        let connection = ProjectSshConnection::prepare(&service, "term-launch", target.clone())?;
+        service
+            .project_connections
+            .insert("term-launch".into(), Arc::clone(&connection));
+        let operation = connection.operation()?;
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.cwd(directory.path());
+        // 复用既有SSH launch注入缝，只替换物理子进程；不启动SSH、不声称已认证。
+        service
+            .create_inner_with_project(
+                "term-launch".into(),
+                None,
+                29,
+                87,
+                target.clone(),
+                None,
+                Some(ProjectTerminalLaunch {
+                    command,
+                    connection: Arc::clone(&connection),
+                    operation: Some(operation),
+                }),
+                Vec::new(),
+            )
+            .await?;
+        assert_eq!(service.session("term-launch")?.info.target, target);
+        assert_eq!(connection.active_operations.load(Ordering::Acquire), 1);
+        service
+            .write(
+                "term-launch",
+                b"printf 'TERM_CAP=<%s>\\nCWD_CAP=<%s>\\n' \"$TERM\" \"$PWD\"; stty size; exit 7\r",
+            )
+            .await?;
+        let (output, code) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut output = Vec::new();
+            loop {
+                match receiver.recv().await {
+                    Ok(TerminalEvent::Output { id, bytes }) if id == "term-launch" => {
+                        output.extend(bytes)
+                    }
+                    Ok(TerminalEvent::Exited { id, exit_code, .. }) if id == "term-launch" => {
+                        break Ok::<_, String>((output, exit_code));
+                    }
+                    Ok(TerminalEvent::Issue { message, .. }) => break Err(message),
+                    Ok(_) => {}
+                    Err(error) => break Err(error.to_string()),
+                }
+            }
+        })
+        .await
+        .map_err(|_| "original project PTY owner did not settle".to_string())??;
+        assert_eq!(code, 7);
+        assert_eq!(connection.active_operations.load(Ordering::Acquire), 0);
+        assert!(!service.contains("term-launch"));
+        let retained = service
+            .project_connections
+            .get("term-launch")
+            .ok_or_else(|| "original project connection was replaced".to_string())?;
+        assert!(Arc::ptr_eq(retained.value(), &connection));
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("TERM_CAP=<xterm-256color>"), "{output}");
+        assert!(output.contains("29 87"), "{output}");
+        let cwd = directory
+            .path()
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        assert!(
+            output.contains(&format!("CWD_CAP=<{}>", cwd.display())),
+            "{output}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn relative_project_directory_resolves_remote_home_not_current_directory() -> Result<(), String>
@@ -974,6 +1145,150 @@ mod tests {
         assert_eq!(connection.active_operations.load(Ordering::Acquire), 1);
         drop(operation);
         connection.observe_idle().await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reply_fork_reassign_rejects_replaced_or_double_registered_owner() -> Result<(), String>
+    {
+        let service = TerminalService::new();
+        let target = TerminalTarget::Ssh {
+            host: "example.invalid".into(),
+            user: Some("fixture".into()),
+            port: Some(22),
+        };
+        let original = ProjectSshConnection::prepare(&service, "draft", target.clone())?;
+        let replacement = ProjectSshConnection::prepare(&service, "draft", target.clone())?;
+        assert_ne!(original.generation(), replacement.generation());
+        replacement
+            .effective_target
+            .set(target)
+            .map_err(|_| "fixture target already set")?;
+        service
+            .project_connections
+            .insert("draft".into(), replacement.clone());
+        assert!(
+            service
+                .reassign_project_ssh_checked("draft", "destination", &original)
+                .await
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&service.project_ssh("draft")?, &replacement));
+        assert!(service.project_ssh("destination").is_err());
+        service
+            .project_connections
+            .insert("source".into(), replacement.clone());
+        assert!(
+            service
+                .reassign_project_ssh_checked("draft", "destination", &replacement)
+                .await
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&service.project_ssh("source")?, &replacement));
+        service.project_connections.remove("source");
+        service
+            .reassign_project_ssh_checked("draft", "destination", &replacement)
+            .await?;
+        assert!(service.project_ssh("draft").is_err());
+        service.close_project_ssh("destination").await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reply_fork_pretransfer_failure_closes_only_the_proven_independent_draft()
+    -> Result<(), String> {
+        let service = TerminalService::new();
+        let target = TerminalTarget::Ssh {
+            host: "example.invalid".into(),
+            user: Some("fixture".into()),
+            port: Some(22),
+        };
+        let source = ProjectSshConnection::prepare(&service, "source", target.clone())?;
+        let draft =
+            ProjectSshConnection::prepare(&service, "reply-fork-auth-fixture", target.clone())?;
+        let replaced = ProjectSshConnection::prepare(&service, "reply-fork-auth-fixture", target)?;
+        service
+            .project_connections
+            .insert("source".into(), source.clone());
+        service
+            .project_connections
+            .insert("reply-fork-auth-fixture".into(), draft.clone());
+        assert!(
+            service
+                .close_project_ssh_checked("reply-fork-auth-fixture", &replaced)
+                .await
+                .is_err()
+        );
+        assert!(service.project_ssh("reply-fork-auth-fixture").is_ok());
+        service
+            .close_project_ssh_checked("reply-fork-auth-fixture", &draft)
+            .await?;
+        assert!(service.project_ssh("reply-fork-auth-fixture").is_err());
+        let active = source.operation()?;
+        drop(active);
+        assert!(!source.closing.load(Ordering::Acquire));
+        service
+            .project_connections
+            .insert("bad-double-owner".into(), source.clone());
+        assert!(
+            service
+                .close_project_ssh_checked("bad-double-owner", &source)
+                .await
+                .is_err()
+        );
+        assert!(!source.closing.load(Ordering::Acquire));
+        service.project_connections.remove("bad-double-owner");
+        service.close_project_ssh("source").await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reply_fork_distinct_owners_survive_closing_either_side() -> Result<(), String> {
+        let service = TerminalService::new();
+        let target = TerminalTarget::Ssh {
+            host: "example.invalid".into(),
+            user: Some("fixture".into()),
+            port: Some(22),
+        };
+        for close_source_first in [true, false] {
+            let source = ProjectSshConnection::prepare(&service, "source", target.clone())?;
+            let draft = ProjectSshConnection::prepare(&service, "draft", target.clone())?;
+            source
+                .effective_target
+                .set(target.clone())
+                .map_err(|_| "fixture source already set")?;
+            draft
+                .effective_target
+                .set(target.clone())
+                .map_err(|_| "fixture draft already set")?;
+            assert!(!Arc::ptr_eq(&source, &draft));
+            assert_ne!(source.generation(), draft.generation());
+            assert_ne!(source.master_terminal_id(), draft.master_terminal_id());
+            service
+                .project_connections
+                .insert("source".into(), source.clone());
+            service
+                .project_connections
+                .insert("draft".into(), draft.clone());
+            service
+                .reassign_project_ssh_checked("draft", "destination", &draft)
+                .await?;
+            let (first, survivor) = if close_source_first {
+                ("source", "destination")
+            } else {
+                ("destination", "source")
+            };
+            service.close_project_ssh(first).await?;
+            let remaining = service.project_ssh(survivor)?;
+            let operation = remaining.operation()?;
+            assert!(!remaining.closing.load(Ordering::Acquire));
+            drop(operation);
+            service.close_project_ssh(survivor).await?;
+        }
+        // 仅原物理 owner/准入控制；没有启动 SSH 或真实远端 PTY。
         Ok(())
     }
 

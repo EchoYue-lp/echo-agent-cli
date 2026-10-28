@@ -840,8 +840,7 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
         .tool_execution(echo_agent::tools::ToolExecutionConfig {
             timeout_ms: app_config.agent.tool_timeout_ms,
             ..Default::default()
-        })
-        .enable_cot();
+        });
 
     // ── Pass the resolved configured model to the LLM client ──
     // Without this, the agent falls back to env vars + echo-agent-models.yaml,
@@ -1049,7 +1048,7 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
     }
 
     // Inject LlmCritic for self-verification. The critic scores the agent's
-    // final_answer; if below threshold (7.0), feedback is injected and the
+    // 原生最终回答候选；低于阈值（7.0）时注入反馈并继续原循环。
     // agent retries (up to verifier_max_retries=2).
     // The critic consumes the exact prepared transport used by the parent;
     // it never re-resolves global config or assumes Chat Completions.
@@ -1233,6 +1232,16 @@ impl PreparedProjectContext {
 }
 
 impl echo_agent::compression::PreModelContextProjector for PreparedProjectContext {
+    fn recovered_tool_origins<'a>(
+        &'a self,
+        context: &'a echo_agent::compression::ProjectionContext,
+        messages: &'a [echo_agent::llm::types::Message],
+    ) -> BoxFuture<'a, echo_agent::error::Result<Vec<echo_agent::compression::RecoveredToolOrigin>>>
+    {
+        // Fresh/Project适配仍是原同一对象；没有原producer证据时不能从其当前装配补出旧来源。
+        crate::legacy_eko_history::recovered_tool_origins(context, messages)
+    }
+
     fn project<'a>(
         &'a self,
         context: &'a echo_agent::compression::ProjectionContext,
@@ -1332,11 +1341,10 @@ fn configure_run_code_capability(agent: &mut ReactAgent, available: bool) {
 /// compiled into the binary (`src/subagents/coding/*.md`). Editing a `.md`
 /// prompt therefore takes effect on next agent build without recompiling.
 ///
-/// Only `readonly` subagents are registered here (the 4 generic capability
-/// roles: explorer/reviewer/planner/summarizer). Domain specialization lives
-/// in the context/skill layer, not separate agent definitions — aligns with
-/// industry consensus (Claude Code ~3 subagents, OpenHands microagents,
-/// Devin single-agent). Used by the main agent for L2 delegation.
+/// 按原定义注册只读和writer角色。readonly与can_delegate分别控制能力与委派：
+/// 声明可委派的只读角色仍由只读工厂装配，框架在原builder选择受限dispatch实例，
+/// 不通过删除readonly开关或更换角色来放行。每次调用的工具正上界与深度仍由原scope收窄。
+/// 领域方法继续来自原context/Skill，而不是由本注册函数另造运行权威。
 #[allow(clippy::too_many_arguments)]
 async fn register_default_subagents(
     agent: &mut ReactAgent,
@@ -1845,7 +1853,6 @@ fn build_writer_subagent_agent(
         .auto_project_rules(false)
         // NO .readonly_tools() → full tool set (write capability).
         .register_subagent_message_tools()
-        .enable_cot()
         .token_limit(token_limit)
         .visibility_horizon(eko_visibility_horizon(token_limit))
         .max_tool_output_tokens(max_tool_output_tokens)
@@ -1981,11 +1988,11 @@ fn build_readonly_subagent_agent(
         .enable_tools()
         .file_system(file_system)
         .auto_project_rules(false)
-        .readonly_tools() // SA-2: physical enforcement — no shell/write tools
+        // 工具快照落实只读；合法后代委派由框架受限实例继续承接同一调用上界。
+        .readonly_tools()
         // In-tree communication tools: report/escalate to the run driver and
         // queue-only sibling messaging (uplink read from ToolContext).
         .register_subagent_message_tools()
-        .enable_cot()
         .token_limit(token_limit)
         .visibility_horizon(eko_visibility_horizon(token_limit))
         .max_tool_output_tokens(max_tool_output_tokens)
@@ -2062,4 +2069,117 @@ fn build_readonly_subagent_agent(
     );
     subagent.config_mut().set_cache_user_id(cache_user_id);
     Ok(subagent)
+}
+
+#[cfg(test)]
+mod legacy_source_factory_tests {
+    use super::*;
+    use echo_agent::agent::{Agent, AgentEvent};
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn prepared_project_actual_installation_preserves_unknown_paired_source_before_model()
+    -> anyhow::Result<()> {
+        let dir = crate::legacy_eko_history::production_getter_tests::temporary()?;
+        let (state, traces) = crate::legacy_eko_history::production_getter_tests::durable_fixture(
+            dir.path(),
+            1,
+            true,
+        )
+        .await?;
+        let mut agent = crate::legacy_eko_history::production_getter_tests::agent(state, traces)?;
+        let llm =
+            Arc::new(echo_agent::testing::MockLlmClient::new().with_response("current final"));
+        agent.set_llm_client(llm.clone());
+        let prepared = PreparedProjectContext {
+            instructions: crate::unified_memory::load_instruction_projection_strict_with_state(
+                Some(dir.path()),
+                Some(dir.path()),
+            )?,
+            project: None,
+        };
+        prepared.publish_for_fresh_subagent(&mut agent).await;
+        let raw = agent
+            .execute_stream("restore existing owned history")
+            .await?
+            .collect::<Vec<_>>()
+            .await;
+        let events = raw
+            .into_iter()
+            .collect::<echo_agent::error::Result<Vec<_>>>()?;
+        assert!(
+            matches!(events.last(),Some(AgentEvent::ExecutionStatus(status)) if status.status==echo_agent::agent::ExecutionStatusKind::Settled)
+        );
+        let sent = llm
+            .last_messages()
+            .ok_or_else(|| anyhow::anyhow!("actual model was not called"))?;
+        assert!(
+            sent.iter()
+                .flat_map(|message| message.tool_calls.iter().flatten())
+                .any(|call| call.id == "original-control" && call.function.name == "final_answer"),
+            "实际Prepared getter也不能把来源不明但已配对的旧调用误退役",
+        );
+        assert!(
+            sent.iter().any(|message| message
+                .text_content()
+                .is_some_and(|text| text.contains("actual old tool result"))),
+            "不得丢失旧实际结果"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actual_eko_factory_fresh_same_named_custom_runs_and_does_not_borrow_old_origin()
+    -> anyhow::Result<()> {
+        let dir = crate::legacy_eko_history::production_getter_tests::temporary()?;
+        let mut created = create_agent_with_diagnostics(
+            &AgentCreateParams {
+                conversation_id: Some("fresh-factory-custom".into()),
+                session_id: Some("fresh-factory-custom".into()),
+                working_dir: Some(dir.path().to_path_buf()),
+                workspace_data_root: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+            &EkoConfig::default(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let llm = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .then_tool_call(
+                    "fresh-factory-call",
+                    "final_answer",
+                    r#"{"answer":"custom payload"}"#,
+                )
+                .with_response("after custom effect"),
+        );
+        created.agent.set_llm_client(llm.clone());
+        created.agent.add_tool(Box::new(
+            echo_agent::testing::MockTool::new("final_answer")
+                .with_response("actual factory custom result"),
+        ));
+        let raw = created
+            .agent
+            .execute_stream("new custom")
+            .await?
+            .collect::<Vec<_>>()
+            .await;
+        let events = raw
+            .into_iter()
+            .collect::<echo_agent::error::Result<Vec<_>>>()?;
+        assert!(events.iter().any(|event|matches!(event,AgentEvent::ToolResult{call_id,result,..} if call_id=="fresh-factory-call"&&result.success&&result.output=="actual factory custom result")));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::FinalAnswer(_)))
+                .count(),
+            1
+        );
+        assert_eq!(llm.call_count(), 2);
+        assert!(
+            matches!(events.last(),Some(AgentEvent::ExecutionStatus(status)) if status.status==echo_agent::agent::ExecutionStatusKind::Settled)
+        );
+        created.agent.close().await?;
+        Ok(())
+    }
 }

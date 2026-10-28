@@ -70,3 +70,41 @@ checkpoint+tail 恢复。前端 focused 不能证明 Rust 类型、原生 GUI、
 main CI。Rust 类型导出须等明确租约后从精确源码生成，禁止手改生成合同。官网
 镜像归唯一 root writer，以真正接受的源为准。框架/SDK 示例无需新增 EKO 设置
 API；本仓 YAML 配置示例原位同步。
+
+
+## 2026-10-27：真实只读工厂的调用上界继承
+
+默认首层与用户选择1／2／3总层数的产品政策不变。内置reviewer仍由原loader、
+`register_default_subagents`和`build_readonly_subagent_agent`装配，保留`readonly: true`与
+`can_delegate: true`；不会为了允许下一层而移除只读开关、添加产品权限配置或扩大工具名单。
+框架在原dispatch装配中选择受限只读实例，普通writer实例仍保原来的变更能力。
+
+调用级`tool_access: Option<ToolAccess>`由框架沿原invocation／ToolContext／SubagentContext
+转交，在锁后的原工具快照合并配置只读与祖先只读上界。子调用实际可用工具是原catalog、
+父正向工具上界与有效只读能力的交集；模型schema、`tool_search`和实际执行使用同一结果。
+角色标签或模型参数不能提升上界，空交集也不能回退为无限制。此项是Agent自动执行约束，
+不影响用户主动操作终端或MCP。
+
+EKO的聊天、前台任务与无人值守完整invocation字面量补同义`None`，保留原产品入口行为。
+`ProjectAgentAdapter`已有三个invocation入口完整转交原值，不拆字段或重算权限；字段级
+回归检查只读、工具上界、运行身份、嵌套policy与history均保留。真正只读执行仍由框架
+snapshot／pipeline落实，适配器测试不能替代执行测试。
+
+真实消费者回归应使用同一内置工厂、原TaskRuntime与Fork；模型transport可用夹具替换，
+但实际请求schema、`ToolContext`、事件lineage与工厂／工具调用计数必须一致。绑定层数为
+1／2／3的运行分别恰达上限，下一层不启动；修改默认值不能改变既有Run。计数器只包原
+工厂并安装测试工具，不手造未开启readonly的child，也不清去重记录或改任务ID避开问题。
+写探针与父上界外的只读探针均不得执行；普通writer及附件、None和框架合法max4对照继续
+由各自真实消费者验证。新回归尚未执行时只记录为待验证，不据本ADR宣布深度已通过。
+
+`lh6_product_soak`不需要新增invocation签名，继续纳入原示例编译入口而不启动长soak。
+框架示例与公共API条件矩阵、新Tauri／同conversation双Run原生验收、精确main／CI分别
+由各自批次取得资格。SDK沿独立pin与accepted合同处理，不因调用字段追加自动升级。
+
+### 项目准备与工具执行使用同一工作目录
+
+`ProjectAgentAdapter` 在转交三个 typed invocation 入口之前解析实际工作目录：显式调用
+目录（含隔离 checkout）优先，其次为原 Agent 配置，最后使用 EKO 工厂的项目根兜底。
+项目投影准备和被委派 Agent 收到同一目录；适配器不修改共享 Agent 配置，不重建权限、
+嵌套深度或执行循环。回归须同时检查三入口的字段转交与真实工厂执行的 `ToolContext`，
+仅在 prepare 中读到项目规则不能证明工具已在该项目执行。通过资格以实际消费者回执为准。

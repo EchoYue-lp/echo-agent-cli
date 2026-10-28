@@ -37,7 +37,8 @@ SSH 项目创建使用密码掩码表单，不展示认证终端。界面先订�
 ## 必要原文的有界投影与可恢复暂停
 
 TaskRuntime journal 保存完整 user steer，原活动 capsule 对最近四条只放短文本或
-400字符预览及完整SHA引用。长原文共用 PreparedUserTurn/InputResourceRef 的落盘、
+400字符预览及完整SHA引用，同时提供绑定原journal代际和序号前缀的完整来源入口。
+主模型沿原read_artifact按需读取更早原文，不把近期预览当作全部历史。长原文共用 PreparedUserTurn/InputResourceRef 的落盘、
 SHA和引用格式，内容寻址缓存缺失或损坏只从 journal 重建；不增加输入store或权限。
 该 TaskRuntime 投影与上面的已准备项目事实是不同来源：其原文件读取通过既有
 TaskRuntimeOperation 进行，任何新原文物化/校验失败必须沿required错误通道阻断。
@@ -92,7 +93,7 @@ claim 覆盖新 attempt、暂停消耗 retry、依赖阻塞长期写入 journal�
 - framework 通用机制：DAG 校验与 ready frontier、exact physical claim、revision safe point、
   retry/requeue、terminal settlement、pause/cancel disposition、derived dependency state。
 - EKO 产品策略：review、worktree integration、文件 ownership、unattended preflight、run
-  pause/cancel intent、GUI/TUI/CLI/channel 投影。
+  pause/cancel intent、GUI/channel 投影。
 - adapter：无损转换 `PlanTask` extension，调用 framework pure transforms，并把 task 变化、
   EKO summary 和 claim-bound review 作为一个 `append_batch` 提交。
 
@@ -169,7 +170,7 @@ Resume 只有两个权威 intent，二者都携带从 journal projection 捕获�
 `TaskRunResumeIdentity`：
 
 - 已有 Plan 的普通 run 通过共享 `launch_planned_run_resume` 恢复同一
-  `RuntimeTaskService` executor；GUI/TUI/CLI/channel 不自建 launcher。
+  `RuntimeTaskService` executor；GUI/channel 不自建 launcher。
 - long-horizon chat 通过 `resume_and_claim_run_turn_expected` 在同一物理 batch
   提交 resume 事实与 `RunTurnStarted`。
 
@@ -197,12 +198,12 @@ ChatEventLog 的 async safe point 通过 bounded product-data adapter，并让 b
 exact workspace I/O receipt。manual compression、GUI cancel 和 HITL orphan projection 在 caller
 drop 后仍持有 generation；workspace delete 不能先删文件再被迟到 append 复活。
 
-排队 resume 的 identity 冻结 continuation route。TUI/CLI 不在 surface 读取 run snapshot 或严格
+排队 resume 的 identity 冻结 continuation route。已退役console的旧适配不再参与新执行；保留surface不读取 run snapshot 或严格
 预判 journal sequence；真正判定统一由 store 原子 resume transaction 完成。identity 后只有
 `execution_path` diagnostic Note 的 suffix 可以继续，其它状态、附件或 continuation 变化仍拒绝。
 
 chat preparation/projection、background submit/control/query、boot reconciler、revision runtime、
-Subagent control、GUI/TUI/CLI/channel TaskRuntime surface 和 unattended worktree control 都复用
+Subagent control、GUI/channel TaskRuntime surface 和 unattended worktree control 都复用
 该边界。已接受的复合文件 mutation 把 driver registration 随 closure 一起持有，因此 caller
 drop 不会提前释放 workspace generation。
 
@@ -225,14 +226,14 @@ app-core projector 把 framework metadata 保留在 generated `ExecEvent`，向�
 replay；无法恢复的 transient suffix 形成 `subagent_stream_gap`，保留的 terminal 仍用于
 对账最终结果。恢复会扫描 retained、active 与已知 stream 的并集；active publisher 的
 dispatch-start anchor 可在完整 replay 被挤出后继续提供准确地址。tool detail 失败从已提交事件
-重试，并可由 ChatEventLog 重建。active GUI/TUI/CLI/channel sink 通过 journal 的 weak live
-registry 接收已提交事件；GUI、TUI 和 REPL 后台事件由 committed projection stream 及其有界
+重试，并可由 ChatEventLog 重建。active GUI/channel sink 通过 journal 的 weak live
+registry 接收已提交事件；GUI与IM后台事件由 committed projection stream 及其有界
 late-subscriber/lag replay 投递；请求级 channel 在下一次响应中从 durable conversation cursor
 重放 execution event。因此 live 与 replay 使用同一个 `ChatDriverEvent::Execution` payload。
 
 `execution_path` 只作为原 journal 中的内部诊断保留，不生成普通聊天气泡；不通过删除用户文本清理诊断。
 
-Tauri 和 TUI 不再订阅 raw Subagent event；Tauri 只发布已提交的 chat envelope 与 tool
+Tauri不订阅raw Subagent event；Tauri 只发布已提交的 chat envelope 与 tool
 summary。详见 [ADR 0040](../adr/0040-app-core-subagent-event-projection.md)。
 
 ## 取舍与影响
@@ -264,7 +265,7 @@ summary。详见 [ADR 0040](../adr/0040-app-core-subagent-event-projection.md)�
 
 ## Background Review 生命周期
 
-GUI、TUI、CLI 把框架惰性 handle 交给 app-core 的 generation-bound owner。owner 在首次 poll 前
+GUI与IM把框架惰性 handle 交给 app-core 的 generation-bound owner。owner 在首次 poll 前
 持久准入，持有 generation 直到证据结算，shutdown 时取消并 await 已准入任务；启动时在发布
 主 Agent 前恢复未完成收据。详见 [ADR 0043](../adr/0043-background-review-owner.md)。
 
@@ -308,40 +309,41 @@ TaskRuntime 按框架最终结算决定是否接受 attempt evidence。`Supersed
 
 任务 journal 中存在 canonical `TaskExecution` 时，它是完整 execution 记录。旧 flat status、claim、result 和 retry 字段仅在该记录缺失时作为 fallback；记录损坏或 task 身份不匹配必须拒绝重放，不能借 fallback 绕过。
 
-Review 候选、处理错误、自动 Memory 持久化和应用 Review Inbox 收据是独立事实。GUI 与 TUI 同时保留候选和错误，区分已持久化、未持久化和状态未知；只有 owner 返回真实 evidence receipt 时才能显示对应 Inbox 条目。展示层不产生新的 Review 结果。
+Review 候选、处理错误、自动 Memory 持久化和应用 Review Inbox 收据是独立事实。保留GUI/IM视图继续呈现候选和错误，区分已持久化、未持久化和状态未知；只有 owner 返回真实 evidence receipt 时才能显示对应 Inbox 条目。展示层不产生新的 Review 结果。
 
 EKO 注册的 revision store 通过同一个 run 文件锁和原子 journal 批次提供 execution CAS。claim、中断和 execution 变化由框架计算、校验；应用适配器比较完整 expected execution map 与关系 revision，拒绝关系、context、spec 漂移，execution-only 变化不产生新的 plan revision。abandon attempt 的 journal 与直播使用同一最终提交状态和摘要，被覆盖的请求失败原因仅保留为带精确 claim 身份的独立诊断。
 
 
 ## 产品收敛处置清单
 
-状态：已批准目标，尚待实现。清单核对的源码为
-`c262cfed8e77abed38a27c1fff93547997ec9486`；本机
-`pre-retirement-2026-10-24` tag 与 `chore/Echoyue/full-capabilities-baseline`
-分支均解析到该提交。这是源码可达性记录，不是新的原生 GUI、IM 或 cron 验收结果。
-产品决定见 [ADR 0050](../adr/0050-gui-product-convergence.md)。以下路径均相对本仓根目录。
+本节随独立终端源码删除包采用，描述当前源码owner；构建、锁和原生验收另列。
+退役前完整基线 `c262cfed8e77abed38a27c1fff93547997ec9486` 仍由本机固定
+`pre-retirement-2026-10-24` tag与完整能力分支保留。旧 `src/cli` 所有权只属该历史
+截点，不能与本表当前GUI/app-core路径混用。见[ADR0050](../adr/0050-gui-product-convergence.md)。
 
-### 终端入口与保留 owner
+### 终端入口与保留owner
 
-| 当前源码与真实消费 | 后续处置与前置条件 |
+| 当前源码与真实消费 | 移除面、保留合同与验证边界 |
 | --- | --- |
-| `Cargo.toml` 默认启用 `tui`；`src/main.rs` 分派 TUI/REPL/JSONL/channel，GUI build 仍可转入 JSONL；`src/lib.rs` 暴露 CLI/TUI 模块 | 保留路径验收后退役独立 TUI/REPL/CLI/JSONL 分派、终端专属依赖及帮助/配置说明。仅隐藏参数或禁用默认 feature 不算退出。保留可用的桌面进程入口。 |
-| `src/tauri/desktop.rs::DesktopArgs` 由同模块的 `parse_desktop_args` 解析，已不依赖 console `Args` | 桌面仅接受 model（含 `-m`/`MODEL_NAME`）、project、config 和 MCP override；保留 Finder `-psn_` 过滤与 MCP 参数 → YAML → 环境变量优先级。console resume/JSONL/permission/rendering 参数不属于桌面入口，解析时明确拒绝。 |
-| `src/cli/modes.rs::run_channels_mode` 构造 QQ/飞书 adapter、`ChannelManager`、session factory 和 shutdown/join；`src/cli/channels.rs::AppChannelMessageHandler`、`ChannelSessionCoordinator` 及 `channels/{input_pump,outbound,tool_render}.rs` 处理 IM identity、回复和结算 | 保留 IM 行为，先把应用生命周期迁入共享 app-core owner，再删启动模式。保留 `(channel, conversation, sender)`、session incarnation、input-pump 关闭/join、outbound/tool 呈现与 channel HITL。当前 GUI bootstrap 未启动此 manager，配置字段不代表 GUI IM 管理已交付。 |
-| `echo-agent-app-core/src/auto_memory/mod.rs::AUTO_MEMORY_ENABLED` 经既有 `api::auto_memory` 导出；panels、尚存 CLI/TUI 调用点均消费它 | 唯一开关已归 app-core，默认 true、进程全局、不持久化，仍使用 Relaxed 原子读写。GUI 先校验 workspace/generation 再写开关；归位不新增每工作区状态或 store。后续删除 console adapter 时保留 GUI 记忆控制与原 evidence lease。 |
-| `echo-agent-app-core/src/runtime.rs::ApplicationServices::compose`、`ApplicationLifecycleOwner`；`state/app_state.rs::start_scheduler_and_task_service`；`scheduler/{mod,runner}.rs` | 保留共享启动、TaskRun boot 恢复、SchedulerRunner、文件 cron 定义与投递账本。`src/tauri/commands/scheduler.rs` 和 `web-frontend/src/components/scheduler/SchedulerPanel.tsx` 仍是其适配层。不另建 GUI scheduler，不新增自动重放策略。 |
-| `echo-agent-app-core/src/terminal.rs::TerminalService`、`src/tauri/terminal.rs`、`web-frontend/src/components/terminal/` | 保留 GUI PTY/xterm 的创建、输入、resize、关闭和清理。终端产品入口退役不删除交互式终端或 Agent shell。源码现已沿同一 owner 接受明确的本地/系统 OpenSSH 目标；Plan06 原生/远端验收仍未完成（ADR 0051）。 |
-| `echo-agent-app-core/src/hitl/{dispatcher,channel_provider}.rs`；`src/tauri/commands/chat.rs::TauriHumanLoopHandler`；共享 chat/pool/TaskRuntime owner | 保留通用 HumanLoop 请求身份、GUI/IM 回答 owner、Task/Subagent 与恢复。删前核对 `hitl/{tui_provider,repl_provider}.rs`、`src/cli/{jsonl,repl,editor,completion,keybindings,commands,command,extension_surface}.rs`、`cmd_impls/`、`src/tui/` 以及 console 呈现/配置/测试/示例的专属消费者；共享行为由保留 owner 承接。 |
+| 既有`src-tauri/src/main.rs`→`src/tauri/desktop.rs::run_desktop_entry` | 旧main／cli／tui／JSONL／standalone channels分派和专属provider/config/deps退出；默认gui仍选择echo-agent-tauri，不新建launcher。 |
+| 独立`DesktopArgs`／`parse_desktop_args` | 只保model（-m／MODEL_NAME）、project、config、MCP override，保Finder过滤和原优先级；旧console resume/permission/rendering参数拒绝，不作桌面模式。 |
+| `ApplicationServices::compose`→app-core `ChannelRuntime`／`management`／`input_pump`／`outbound` | desktop安装GUI HITL factory后实际`start_configured`；原sender身份、incarnation、input-pump关闭/join、回复/工具投影及channel HITL保留，不再由src/cli拥有。真实手机认证/收发与source/focused分别验收。 |
+| app-core `auto_memory::AUTO_MEMORY_ENABLED`→GUI panels | 保同一进程全局Atomic、默认true与Relaxed语义；GUI先核原workspace/generation/evidence lease，console adapter不再消费，不新增store。 |
+| app-core `ApplicationLifecycleOwner`／AppState／scheduler | 保原File scheduler定义/occurrence ledger、TaskRun与pending conversation/Agent delivery启动恢复。Tauri IPC/面板仍是薄适配；不另建GUI scheduler或自动重放未知effect。 |
+| GUI `terminal::create/write/resize/close/list`→app-core `TerminalService`／project_ssh | 保PTY/xterm、系统SSH、Agent shell和原物理cleanup owner。独立终端产品删除不扩删这些；真实远端/native验收不从源码推出。 |
+| app-core HITL dispatcher／pairing／channel_provider与Tauri handler | 保GUI/IM竞争身份、取消、Task/Subagent、附件/记忆和共享恢复。专属Repl/Tui provider删除；适用start失败断言迁真实GUI ChannelRuntime receipt，manager start/stop失败分别保断言。 |
 
-桌面 bootstrap 已通过 app-core 组合共享服务并启动 scheduler。事件循环使用 `run_return`，
-随后由 `run_desktop_with_settlement` 保持 `ApplicationLifecycleOwner` 结算。
-`src/tauri/mod.rs` 当前通过全局快捷键切换窗口可见性；这不能证明所有关闭/托盘/退出路径
-已符合新产品并通过验收。目标行为：窗口隐藏时，进程内 IM/cron 继续运行；真正退出由原有
-owner 停止准入、取消并 join 已接受工作，退出后没有后台 daemon 继续执行。重启延续原有
-conversation/session identity、occurrence 幂等与 TaskRuntime 恢复，不静默重放结果未知的
-副作用。GUI IM 管理、失败/重连展示及隐藏/退出/重启验收必须先于终端入口删除。
+CloseRequested沿原prevent_close+hide保进程后台；ExitRequested只begin原owner一次，
+run_return后services.join／settle.wait_final结束再离开Tokio。重启保持原身份、occurrence
+幂等与恢复，不因窗口关闭、消息phase或普通工具结果补成功，不静默重放未知副作用。
+保留路径仍跑原适用回归与native验收；源码准备/采用不冒这些通过，也不额外设全SSH/微信
+人工矩阵完成才可准备独立leaf的门禁。
 
-### LSP 消费者解除依赖
+### 退役前LSP消费者历史对照
+
+以下记录原LSP消费者解除依赖时的处置范围，属于历史路径，不表示当前仍有这些注册、
+controller或console入口；当前插件旧声明沿保留的generic diagnostics和原prepare generation处理。
+
 
 下表是固定完整能力基线的退役前源码清单。EKO 源码现已移除这些运行时消费者；保留该清单
 用于恢复和逐项对账，不宣告当前仍支持 LSP。框架物理删除和 SDK 验收各自结算；本次消费者
@@ -463,3 +465,25 @@ Goal、goal_revision或goal_hash。用户通过GUI目标编辑或IM `/task-goal`
 必要历史、完整长原文及末尾限制继续沿原journal、压缩投影与read_artifact读取；缺失或
 校验失败时原required_context_unavailable暂停相关新副作用，原Goal和可恢复owner保留。
 这里不新增GoalStore、要求解释器、第二份队列/状态机或结构化模型协议，也不裁剪通用框架/SDK API。
+
+### 原始输入历史来源族
+
+TaskRuntime的`events.jsonl`仍拥有原输入及其稳定身份；`HistoryProjection`扩展的原始输入来源族与既有artifact/review族同属可丢弃读模型。来源族分别保留接纳和投递事实，不进行语义去重、分类、Goal改写或自动计划/验收更新。主模型仍自行结合历史理解普通Steer。
+
+RunAuthority在原产品数据lease下捕获journal identity和固定观察序号，以有界页扫描完整前缀；`run_id`或相同head不足以替代journal代际。原来源族和不可变文件使用来源内容身份稳定发布，现有`InputResourceRef`给恢复capsule提供一个可发现入口，模型继续用`read_artifact`分页取得早期原文。普通工具事件不改原文源字节，新增输入只发布新引用；旧快照/旧cursor不能跨Run、工作空间或来源代际混用。
+
+最终请求资格只接受该模型请求已经收到的准确前缀，并核本次真实工具上界和本机artifact root/SHA。缓存缺失或损坏从唯一journal恢复；源不可读、版本不明、SHA或reader资格失败沿原`required_context_unavailable`暂停并保留owner、Goal和expected-resume，不静默使用空历史或扩大工具权限。所有原文路径取TaskRuntime本机产品data-root，不随SSH执行cwd重定向。
+
+长canonical Goal不借原文来源族伪造输入。原GoalContract/物化接缝把超过既有spill边界的完整当前目标发布到同host artifacts根，引用绑定原Goal revision/hash、Run与journal代际；原tasks/objective继续归档。旧Goal引用保持文件不变，当前资格只接受用户最新权威版本，legacy没有Accepted的初始化目标同样可读。短Goal与已完整内联的原文不增加reader要求；实际被省略的必要全文才必须具有本轮真实read_artifact资格，读取失败仍按原Pause/expected-resume处理。
+
+完整可见性的判断以最终实际模型请求为准：既有 GoalContract 能内联的边界与未启用 continuation 时的恢复预览边界分别沿用；预览会省略的 canonical Goal 发布 host 引用。当前 PreparedUserTurn 已完整内联的中段文字（超过预览长度但未到 spill 边界）保持 NoTools／read_file-only 正常执行。此前真实配对 read_artifact 调用和 Tool 结果若仍完整留在请求中，按分页字节范围、全文覆盖及原 SHA 核对后也算全文可见；缺页、重叠不一致或 SHA 不符不算。核对不会从本地文件补入缺失模型文字，也不把“文件存在”当作“模型已读取”。同一 Goal 的已发布引用资格仍绑定 Run、journal、revision 与 hash，不随当前投影显示模式改变。
+
+## 独立终端退出后的当前owner
+
+本节随EKO终端删除包采用。DesktopArgs四字段与数据根不依赖旧console；desktop经原
+AgentRuntime::bootstrap／ApplicationServices::compose接IM、cron、Task/Subagent、HITL、
+记忆、附件、会话/任务恢复和退出owner。关闭窗口仅hide；真正Exit停止准入，原services
+join／settle.wait_final返回后才离开Tokio。GUI terminal／SSH、Agent shell与SDK stdio保留。
+
+旧src/cli路径对照及tui/cli来源枚举只说明历史。当前没有独立REPL/JSONL产品或新Task CRUD；
+原运行时结算不等于Goal完成，UI、文档或旧focused结果不补造删后构建/锁/native/正式pin资格。

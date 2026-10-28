@@ -792,3 +792,769 @@ mod resolve_subagent_model_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod readonly_factory_consumer_tests {
+    use super::*;
+    use crate::tasks::task_runtime::{
+        AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, RunOutcome, TaskPlan,
+        TaskRunStatus, TaskRuntimeStore,
+    };
+    use echo_agent::llm::{ChatRequest, ChatResponse};
+    use echo_agent::testing::MockLlmClient;
+    use futures::stream::BoxStream;
+
+    struct ReadonlyFactoryRequestProbe {
+        inner: MockLlmClient,
+        schemas: std::sync::Mutex<Vec<Vec<echo_agent::llm::ToolDefinition>>>,
+        project_checks: std::sync::Mutex<Vec<(bool, bool)>>,
+    }
+
+    impl ReadonlyFactoryRequestProbe {
+        fn observe(&self, request: &ChatRequest) -> echo_agent::error::Result<()> {
+            let system_text = request
+                .messages
+                .iter()
+                .filter(|message| matches!(message.role, echo_agent::llm::types::Role::System))
+                .filter_map(|message| message.content.as_text_ref())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.project_checks
+                .lock()
+                .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?
+                .push((
+                    system_text.contains("READONLY_FACTORY_TMP_PROJECT"),
+                    system_text.contains("# echo-agent-cli(EKO)AGENTS.md"),
+                ));
+            self.schemas
+                .lock()
+                .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?
+                .push(request.tools.clone().unwrap_or_default());
+            Ok(())
+        }
+    }
+
+    impl LlmClient for ReadonlyFactoryRequestProbe {
+        fn chat(&self, request: ChatRequest) -> BoxFuture<'_, Result<ChatResponse>> {
+            Box::pin(async move {
+                self.observe(&request)?;
+                self.inner.chat(request).await
+            })
+        }
+
+        fn chat_stream(
+            &self,
+            request: ChatRequest,
+        ) -> BoxFuture<'_, Result<BoxStream<'static, Result<echo_agent::llm::ChatChunk>>>> {
+            Box::pin(async move {
+                self.observe(&request)?;
+                self.inner.chat_stream(request).await
+            })
+        }
+
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+    }
+
+    fn isolated_readonly_factory_project() -> std::result::Result<tempfile::TempDir, String> {
+        let fixture = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let old_root = crate::utils::find_project_root(fixture.path());
+        let old_instructions =
+            crate::instruction_provider::InstructionProvider::load_for_file_system(
+                Some(fixture.path()),
+                None,
+                &echo_agent::tools::files::LocalFileSystem,
+            )
+            .map_err(|error| error.to_string())?;
+        eprintln!(
+            "未设独立项目边界时root={old_root:?}; inherited_repo_rules={}",
+            old_instructions
+                .repository_level
+                .as_deref()
+                .is_some_and(|text| text.contains("# echo-agent-cli(EKO)AGENTS.md"))
+        );
+        // TMPDIR位于主仓内；用真实VCS边界代表独立项目，不改生产resolver或删仓库规则。
+        let initialized = std::process::Command::new("git")
+            .args(["-c", "init.defaultBranch=main", "init", "--quiet"])
+            .arg(fixture.path())
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !initialized.status.success() {
+            return Err(format!(
+                "隔离测试项目初始化失败: {}",
+                String::from_utf8_lossy(&initialized.stderr)
+            ));
+        }
+        std::fs::write(
+            fixture.path().join("AGENTS.md"),
+            "READONLY_FACTORY_TMP_PROJECT\n仅检查这个隔离项目。\n",
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            crate::utils::find_project_root(fixture.path()),
+            Some(fixture.path().to_path_buf())
+        );
+        let bound_instructions =
+            crate::instruction_provider::InstructionProvider::load_for_file_system(
+                Some(fixture.path()),
+                None,
+                &echo_agent::tools::files::LocalFileSystem,
+            )
+            .map_err(|error| error.to_string())?;
+        let bound_rules = bound_instructions
+            .repository_level
+            .as_deref()
+            .ok_or_else(|| "隔离项目规则未加载".to_string())?;
+        assert!(bound_rules.contains("READONLY_FACTORY_TMP_PROJECT"));
+        assert!(!bound_rules.contains("# echo-agent-cli(EKO)AGENTS.md"));
+        Ok(fixture)
+    }
+
+    #[tokio::test]
+    async fn real_builtin_readonly_factory_keeps_delegate_schema_through_task_runtime_fork()
+    -> std::result::Result<(), String> {
+        use crate::subagent_policy::{SubagentDepthDefaults, SubagentDepthLimit};
+
+        let fixture = isolated_readonly_factory_project()?;
+        let definitions = crate::subagent_loader::discover_subagents(None, None);
+        let reviewer = definitions
+            .iter()
+            .find(|definition| definition.name == "reviewer")
+            .ok_or_else(|| "真实 builtin reviewer 未加载".to_string())?;
+        assert!(reviewer.readonly);
+        assert!(reviewer.can_delegate);
+        assert_eq!(reviewer.source, "builtin:reviewer");
+
+        let transport = Arc::new(ReadonlyFactoryRequestProbe {
+            inner: MockLlmClient::new()
+                .then_tool_call(
+                    "readonly-factory-dispatch-discovery",
+                    "tool_search",
+                    r#"{"query":"agent_tool"}"#,
+                )
+                .with_response("## Summary\n真实只读工厂工具曝光检查完成。"),
+            schemas: std::sync::Mutex::new(Vec::new()),
+            project_checks: std::sync::Mutex::new(Vec::new()),
+        });
+        let registry = Arc::new(echo_agent::subagent::SubagentRegistry::new());
+        let mut events = registry.event_bus().subscribe();
+        let mut primary = ReactAgentBuilder::new()
+            .name("readonly-factory-primary")
+            .model("mock-model")
+            .enable_tools()
+            .enable_subagent()
+            .subagent_registry(registry.clone())
+            .register_agent_dispatch_tool()
+            .working_dir(fixture.path())
+            .auto_project_rules(false)
+            .build()
+            .map_err(|error| error.to_string())?;
+        let cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry> =
+            Arc::new(echo_agent::tasks::BackgroundCommandManager::default());
+        // 只替换模型传输；真实 loader、默认注册、readonly 工厂和动态 Fork adapter 均保留。
+        let consumers = register_default_subagents(
+            &mut primary,
+            &EkoConfig::default(),
+            SubagentRuntimeGeneration {
+                model: "mock-model".to_string(),
+                llm_config: None,
+                llm_client: Some(transport.clone()),
+                temperature: None,
+                // Mock模型窗口仍为8k；显式输出配置1024避免默认8192占满整个窗口。
+                max_tokens: Some(1_024),
+                token_limit: 8_192,
+                thinking: None,
+            },
+            30_000,
+            DEFAULT_MAX_TOOL_OUTPUT_TOKENS,
+            "readonly-factory-consumer",
+            &definitions,
+            Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
+            registry,
+            None,
+            Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox()),
+            cells,
+            Arc::new(crate::analysis_runtime::AnalyticsRuntime::default()),
+            true,
+            None,
+            Arc::new(echo_agent::tools::files::LocalFileSystem),
+            Some(fixture.path().join("product-data")),
+            Some(fixture.path().to_path_buf()),
+        )
+        .await;
+
+        let defaults = Arc::new(SubagentDepthDefaults::new(SubagentDepthLimit::new(3)?));
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?
+                .with_subagent_depth_defaults(defaults),
+        );
+        let _resource_scope = store.test_resource_scope();
+        let run_id = "readonly-real-factory-run";
+        let goal = "核对真实只读工厂的受限委派曝光";
+        store
+            .create_run(
+                run_id,
+                "ws_test",
+                "conv_test",
+                "msg_test",
+                DomainProfile::General,
+                goal,
+                "",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        let plan = TaskPlan {
+            plan_id: "readonly-real-factory-plan".to_string(),
+            run_id: run_id.to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            domain_binding: None,
+            goal_revision: 1,
+            goal_sha256: crate::tasks::task_runtime::task_goal_sha256(goal),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: "native-depth-probe".to_string(),
+                title: "真实 readonly 工厂曝光".to_string(),
+                description: "调用 tool_search 查找 agent_tool，再正常返回检查结果。".to_string(),
+                kind: PlanTaskKind::ReadOnlyReview,
+                agent_role: "reviewer".to_string(),
+                allowed_tools: vec![
+                    "read_file".to_string(),
+                    "tool_search".to_string(),
+                    "agent_tool".to_string(),
+                ],
+                ..Default::default()
+            }],
+        };
+        store
+            .attach_plan_for_test(&plan)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(run_id, TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let primary = AgentHandle::new(primary);
+        let outcome = crate::tasks::task_runtime::execute_run(
+            store.clone(),
+            Some(primary.clone()),
+            None,
+            None,
+            None,
+            None,
+            run_id,
+            echo_agent::agent::CancellationToken::new(),
+            crate::tasks::task_runtime::memory_bridge::MemoryPolicy::None,
+            None,
+        )
+        .await;
+        // 原执行真正结算后再做断言，失败不能把工厂或活动 owner 留在后台。
+        drop(primary);
+        drop(consumers);
+        let outcome = outcome.map_err(|error| error.to_string())?;
+        assert!(
+            matches!(&outcome, RunOutcome::Completed),
+            "真实 TaskRuntime 结果={outcome:?}; 模型请求数={}; 已结算 Subagent={:?}",
+            transport.inner.call_count(),
+            store
+                .list_subagent_runs(run_id)
+                .map_err(|error| error.to_string())?
+        );
+        let runs = store
+            .list_subagent_runs(run_id)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs.first()
+                .ok_or_else(|| "真实 Fork 执行记录缺失".to_string())?
+                .subagent_name,
+            "reviewer"
+        );
+        let mut dispatches = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let echo_agent::subagent::SubagentEvent::DispatchStarted { agent, mode, .. } =
+                event.as_ref()
+            {
+                assert_eq!(*mode, echo_agent::subagent::ExecutionMode::Fork);
+                dispatches.push(agent.clone());
+            }
+        }
+        assert_eq!(dispatches, vec!["reviewer".to_string()]);
+        let schemas = transport
+            .schemas
+            .lock()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(schemas.len(), 2, "必须经过真实工具搜索后的第二次模型请求");
+        let project_checks = transport
+            .project_checks
+            .lock()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(project_checks.len(), schemas.len());
+        assert!(
+            project_checks
+                .iter()
+                .all(|(temporary, repository)| *temporary && !*repository),
+            "真实模型必须只接收已绑定的隔离项目规则: {project_checks:?}"
+        );
+        eprintln!(
+            "actual_model_calls={}; project_checks={project_checks:?}",
+            transport.inner.call_count()
+        );
+        let dispatch = schemas
+            .last()
+            .and_then(|tools| tools.iter().find(|tool| tool.function.name == "agent_tool"));
+        assert!(
+            dispatch.is_some(),
+            "真实 builtin reviewer 经 readonly factory→TaskRuntime→Fork 后，tool_search 未把合法 agent_tool 送进模型 schema"
+        );
+        let dispatch = dispatch.ok_or_else(|| "只读委派 schema 缺失".to_string())?;
+        let target_names = dispatch
+            .function
+            .parameters
+            .pointer("/properties/agent_name/enum")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "委派schema未提供实际目标枚举".to_string())?;
+        assert!(
+            target_names
+                .iter()
+                .any(|name| name.as_str() == Some("reviewer"))
+        );
+        assert!(
+            !target_names
+                .iter()
+                .any(|name| name.as_str() == Some("implementer"))
+        );
+        Ok(())
+    }
+    #[derive(Debug, Clone)]
+    struct ReadonlyScopeObservation {
+        policy: Option<echo_agent::tasks::NestedDelegationPolicy>,
+        access: Option<echo_agent::tools::ToolAccess>,
+        available: Vec<String>,
+        run_id: Option<String>,
+        execution_id: Option<String>,
+        working_dir: Option<std::path::PathBuf>,
+        lineage: Option<echo_agent::tools::SubagentLineage>,
+    }
+
+    struct ReadonlyScopeProbe {
+        name: &'static str,
+        mutating: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        observations: Option<Arc<std::sync::Mutex<Vec<ReadonlyScopeObservation>>>>,
+    }
+
+    impl echo_agent::tools::Tool for ReadonlyScopeProbe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "Observe an exact test invocation; no file or process access."
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object", "properties":{}, "additionalProperties":false})
+        }
+        fn risk_level(&self) -> echo_agent::tools::ToolRiskLevel {
+            if self.mutating {
+                echo_agent::tools::ToolRiskLevel::Standard
+            } else {
+                echo_agent::tools::ToolRiskLevel::ReadOnly
+            }
+        }
+        fn permissions(&self) -> Vec<echo_agent::prelude::ToolPermission> {
+            vec![if self.mutating {
+                echo_agent::prelude::ToolPermission::Write
+            } else {
+                echo_agent::prelude::ToolPermission::Read
+            }]
+        }
+        fn execute_with_context<'a>(
+            &'a self,
+            _parameters: echo_agent::tools::ToolParameters,
+            context: &'a echo_agent::tools::ToolContext,
+        ) -> BoxFuture<'a, Result<echo_agent::tools::ToolResult>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(observations) = self.observations.as_ref() {
+                    observations
+                        .lock()
+                        .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?
+                        .push(ReadonlyScopeObservation {
+                            policy: context.delegation_policy,
+                            access: context.tool_access,
+                            available: context
+                                .tool_visibility
+                                .as_ref()
+                                .map(|visibility| visibility.available_names())
+                                .unwrap_or_default(),
+                            run_id: context.run_id.clone(),
+                            execution_id: context.execution_id.clone(),
+                            working_dir: context.working_dir.clone(),
+                            lineage: context.subagent_lineage.clone(),
+                        });
+                }
+                Ok(echo_agent::tools::ToolResult::success("scope observed"))
+            })
+        }
+    }
+
+    fn install_readonly_scope_probes(
+        agent: &dyn echo_agent::agent::Agent,
+        reads: &Arc<std::sync::atomic::AtomicUsize>,
+        writes: &Arc<std::sync::atomic::AtomicUsize>,
+        outside: &Arc<std::sync::atomic::AtomicUsize>,
+        observations: &Arc<std::sync::Mutex<Vec<ReadonlyScopeObservation>>>,
+    ) {
+        for (name, mutating, calls, observed) in [
+            (
+                "i2_scope_probe",
+                false,
+                reads.clone(),
+                Some(observations.clone()),
+            ),
+            ("i2_write_probe", true, writes.clone(), None),
+            ("i2_outside_probe", false, outside.clone(), None),
+        ] {
+            agent.register_tool(Box::new(ReadonlyScopeProbe {
+                name,
+                mutating,
+                calls,
+                observations: observed,
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn real_builtin_readonly_factory_preserves_run_depth_and_tool_upper_bound()
+    -> std::result::Result<(), String> {
+        use crate::subagent_policy::{SubagentDepthDefaults, SubagentDepthLimit};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = isolated_readonly_factory_project()?;
+        let definitions = crate::subagent_loader::discover_subagents(None, None);
+        let reviewer = definitions
+            .iter()
+            .find(|definition| definition.name == "reviewer")
+            .ok_or_else(|| "builtin reviewer missing".to_string())?;
+        assert!(reviewer.readonly && reviewer.can_delegate);
+        assert_eq!(reviewer.source, "builtin:reviewer");
+        let mut script = MockLlmClient::new();
+        for maximum in [1_u8, 2, 3] {
+            for depth in 1_u8..=maximum {
+                let prefix = format!("limit{maximum}-depth{depth}");
+                script = script
+                    .then_tool_call(format!("{prefix}-find-probe"), "tool_search", r#"{"query":"i2_scope_probe"}"#)
+                    .then_tool_call(format!("{prefix}-probe"), "i2_scope_probe", "{}")
+                    .then_tool_call(format!("{prefix}-write"), "i2_write_probe", "{}")
+                    .then_tool_call(format!("{prefix}-outside"), "i2_outside_probe", "{}")
+                    .then_tool_call(format!("{prefix}-find-delegate"), "tool_search", r#"{"query":"agent_tool"}"#)
+                    .then_tool_call(format!("{prefix}-delegate"), "agent_tool",
+                        serde_json::json!({"agent_name":"reviewer", "task":"继续真实只读下一层", "mode":"fork"}).to_string());
+            }
+            for depth in (1_u8..=maximum).rev() {
+                script = script.with_response(format!("## Summary\n只读层数{depth}已结算。"));
+            }
+        }
+        let transport = Arc::new(ReadonlyFactoryRequestProbe {
+            inner: script,
+            schemas: std::sync::Mutex::new(Vec::new()),
+            project_checks: std::sync::Mutex::new(Vec::new()),
+        });
+        let registry = Arc::new(echo_agent::subagent::SubagentRegistry::new());
+        let mut events = registry.event_bus().subscribe_envelopes();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let outside = Arc::new(AtomicUsize::new(0));
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let mut primary = ReactAgentBuilder::new()
+            .name("readonly-depth-primary")
+            .model("mock-model")
+            .enable_tools()
+            .enable_subagent()
+            .subagent_registry(registry.clone())
+            .register_agent_dispatch_tool()
+            .working_dir(fixture.path())
+            .auto_project_rules(false)
+            .build()
+            .map_err(|error| error.to_string())?;
+        install_readonly_scope_probes(&primary, &reads, &writes, &outside, &observations);
+        let consumers = register_default_subagents(
+            &mut primary,
+            &EkoConfig::default(),
+            SubagentRuntimeGeneration {
+                model: "mock-model".to_string(),
+                llm_config: None,
+                llm_client: Some(transport.clone()),
+                temperature: None,
+                max_tokens: None,
+                token_limit: effective_token_limit(&EkoConfig::default(), None),
+                thinking: None,
+            },
+            30_000,
+            DEFAULT_MAX_TOOL_OUTPUT_TOKENS,
+            "readonly-depth-consumer",
+            &definitions,
+            Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
+            registry.clone(),
+            None,
+            Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox()),
+            Arc::new(echo_agent::tasks::BackgroundCommandManager::default()),
+            Arc::new(crate::analysis_runtime::AnalyticsRuntime::default()),
+            true,
+            None,
+            Arc::new(echo_agent::tools::files::LocalFileSystem),
+            Some(fixture.path().join("product-data")),
+            Some(fixture.path().to_path_buf()),
+        )
+        .await;
+        // 包装原工厂仅计数并安装计数工具；不手造 child、不移除 readonly 或改变角色声明。
+        for inherited in consumers.inherited_factories.iter() {
+            let original = inherited.factory.clone();
+            let factory_calls = factory_calls.clone();
+            let reads = reads.clone();
+            let writes = writes.clone();
+            let outside = outside.clone();
+            let observations = observations.clone();
+            let factory = Arc::new(FnAgentFactory::new(move || {
+                let original = original.clone();
+                let factory_calls = factory_calls.clone();
+                let reads = reads.clone();
+                let writes = writes.clone();
+                let outside = outside.clone();
+                let observations = observations.clone();
+                Box::pin(async move {
+                    factory_calls.fetch_add(1, Ordering::SeqCst);
+                    let agent = original.create().await?;
+                    install_readonly_scope_probes(
+                        agent.as_ref(),
+                        &reads,
+                        &writes,
+                        &outside,
+                        &observations,
+                    );
+                    Ok(agent)
+                }) as BoxFuture<'static, Result<Box<dyn echo_agent::agent::Agent>>>
+            }));
+            registry
+                .register_factory(inherited.definition.clone(), factory)
+                .await;
+        }
+        let primary = AgentHandle::new(primary);
+        let defaults = Arc::new(SubagentDepthDefaults::new(SubagentDepthLimit::new(1)?));
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?
+                .with_subagent_depth_defaults(defaults.clone()),
+        );
+        let _resource_scope = store.test_resource_scope();
+        for maximum in [1_u8, 2, 3] {
+            defaults.publish(SubagentDepthLimit::new(maximum)?);
+            let run_id = format!("readonly-real-depth-run-{maximum}");
+            let goal = "沿真实内置工厂执行受限只读层数";
+            store
+                .create_run(
+                    &run_id,
+                    "ws_test",
+                    "same-readonly-conversation",
+                    "msg_test",
+                    DomainProfile::General,
+                    goal,
+                    "",
+                    AttendedMode::Attended,
+                )
+                .map_err(|error| error.to_string())?;
+            let plan = TaskPlan {
+                plan_id: format!("readonly-depth-plan-{maximum}"),
+                run_id: run_id.clone(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                domain_binding: None,
+                goal_revision: 1,
+                goal_sha256: crate::tasks::task_runtime::task_goal_sha256(goal),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![PlanTask {
+                    id: "native-depth-probe".to_string(),
+                    title: "真实只读深度".to_string(),
+                    description: "沿模型实际工具调用递归只读审查，到边界后正常结算。".to_string(),
+                    kind: PlanTaskKind::ReadOnlyReview,
+                    agent_role: "reviewer".to_string(),
+                    allowed_tools: vec![
+                        "read_file".to_string(),
+                        "tool_search".to_string(),
+                        "agent_tool".to_string(),
+                        "i2_scope_probe".to_string(),
+                        "i2_write_probe".to_string(),
+                    ],
+                    ..Default::default()
+                }],
+            };
+            store
+                .attach_plan_for_test(&plan)
+                .map_err(|error| error.to_string())?;
+            let snapshot = store
+                .get_run_state(&run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "bound run missing".to_string())?;
+            assert_eq!(
+                snapshot
+                    .execution_profile
+                    .require_subagent_depth_limit()?
+                    .get(),
+                maximum
+            );
+            defaults.publish(SubagentDepthLimit::new(if maximum == 1 { 3 } else { 1 })?);
+            store
+                .transition_run(&run_id, TaskRunStatus::Running)
+                .map_err(|error| error.to_string())?;
+            let before_reads = reads.load(Ordering::SeqCst);
+            let before_factory = factory_calls.load(Ordering::SeqCst);
+            let before_models = transport.inner.call_count();
+            let before_observed = observations
+                .lock()
+                .map_err(|error| error.to_string())?
+                .len();
+            let outcome = crate::tasks::task_runtime::execute_run(
+                store.clone(),
+                Some(primary.clone()),
+                None,
+                None,
+                None,
+                None,
+                &run_id,
+                echo_agent::agent::CancellationToken::new(),
+                crate::tasks::task_runtime::memory_bridge::MemoryPolicy::None,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            assert!(
+                matches!(&outcome, RunOutcome::Completed),
+                "max={maximum}, outcome={outcome:?}"
+            );
+            assert_eq!(
+                reads.load(Ordering::SeqCst).saturating_sub(before_reads),
+                usize::from(maximum)
+            );
+            assert_eq!(
+                factory_calls
+                    .load(Ordering::SeqCst)
+                    .saturating_sub(before_factory),
+                usize::from(maximum)
+            );
+            assert_eq!(
+                transport.inner.call_count().saturating_sub(before_models),
+                usize::from(maximum).saturating_mul(7)
+            );
+            assert_eq!(writes.load(Ordering::SeqCst), 0);
+            assert_eq!(outside.load(Ordering::SeqCst), 0);
+            let actual = observations
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get(before_observed..)
+                .ok_or_else(|| "observation slice missing".to_string())?
+                .to_vec();
+            let mut started = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let echo_agent::subagent::SubagentEvent::DispatchStarted {
+                    mode,
+                    execution_id,
+                    ..
+                } = &event.payload.event
+                {
+                    assert_eq!(*mode, echo_agent::subagent::ExecutionMode::Fork);
+                    assert_eq!(
+                        event.run_id.as_ref().map(|id| id.as_str()),
+                        Some(run_id.as_str())
+                    );
+                    let execution = execution_id
+                        .clone()
+                        .ok_or_else(|| "dispatch execution missing".to_string())?;
+                    started.push((execution, event.payload.invocation.clone()));
+                }
+            }
+            assert_eq!(started.len(), usize::from(maximum));
+            for (index, observed) in actual.iter().enumerate() {
+                let depth =
+                    u8::try_from(index.saturating_add(1)).map_err(|error| error.to_string())?;
+                assert_eq!(
+                    observed.policy,
+                    Some(echo_agent::tasks::NestedDelegationPolicy {
+                        can_spawn_subagents: true,
+                        delegate_depth: depth,
+                        max_delegate_depth: maximum,
+                    })
+                );
+                assert_eq!(
+                    observed.access,
+                    Some(echo_agent::tools::ToolAccess::ReadOnly)
+                );
+                assert_eq!(observed.run_id.as_deref(), Some(run_id.as_str()));
+                assert_eq!(
+                    observed.working_dir.as_deref(),
+                    Some(fixture.path()),
+                    "真实工具目标必须与提示词/TaskRuntime绑定的隔离项目一致"
+                );
+                assert!(
+                    !observed
+                        .available
+                        .iter()
+                        .any(|name| name == "i2_write_probe" || name == "i2_outside_probe")
+                );
+                let (execution, invocation) = started
+                    .get(index)
+                    .ok_or_else(|| "corresponding dispatch missing".to_string())?;
+                assert_eq!(observed.execution_id.as_deref(), Some(execution.as_str()));
+                let lineage = observed
+                    .lineage
+                    .as_ref()
+                    .ok_or_else(|| "actual ToolContext lineage missing".to_string())?;
+                assert_eq!(lineage.agent_name.as_deref(), Some("reviewer"));
+                assert_eq!(lineage.run_id.as_deref(), Some(run_id.as_str()));
+                assert_eq!(invocation.agent_name, "reviewer");
+                assert_eq!(
+                    invocation
+                        .agent_path
+                        .as_deref()
+                        .map(|path| path.split('/').filter(|part| *part == "reviewer").count()),
+                    Some(usize::from(depth))
+                );
+                if index > 0 {
+                    let (parent_execution, _) = started
+                        .get(index.saturating_sub(1))
+                        .ok_or_else(|| "parent dispatch missing".to_string())?;
+                    assert_eq!(
+                        invocation.parent_execution_id.as_deref(),
+                        Some(parent_execution.as_str())
+                    );
+                }
+            }
+            let schemas = transport
+                .schemas
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let case_schemas = schemas
+                .get(before_models..)
+                .ok_or_else(|| "actual request range missing".to_string())?;
+            assert_eq!(
+                case_schemas
+                    .iter()
+                    .any(|tools| tools.iter().any(|tool| tool.function.name == "agent_tool")),
+                maximum > 1
+            );
+            assert!(case_schemas.iter().all(|tools| {
+                tools.iter().all(|tool| {
+                    tool.function.name != "i2_write_probe"
+                        && tool.function.name != "i2_outside_probe"
+                })
+            }));
+        }
+        drop(primary);
+        drop(consumers);
+        Ok(())
+    }
+}

@@ -3,6 +3,8 @@ import { isHitlRequestIdentity, sameHitlIdentity } from '../types/api';
 import type { HitlRequestIdentity } from '../types/api';
 import type {
   AssistantMessageBlock,
+  NativeExecutionStatus,
+  NativeFinalAnswerSource,
   ChatMessage,
   ApprovalRequest,
   ExecutionRound,
@@ -96,13 +98,20 @@ interface ChatState {
     attachments?: ChatMessage['attachments']
   ) => string;
   appendToken: (id: string, token: string) => void;
-  appendAssistantBlock: (id: string, block: AssistantMessageBlock) => void;
+  appendAssistantBlock: (
+    id: string,
+    block: AssistantMessageBlock,
+    executionId?: string | null,
+    publicationEventId?: string | null
+  ) => void;
+  observeExecutionStatus: (id: string, status: NativeExecutionStatus) => void;
   appendThinking: (id: string, token: string) => void;
   startThinkingSegment: (id: string) => void;
   recordToolStart: (messageId: string, toolExecutionId: string) => void;
   startToolBatch: (toolCount: number) => void;
   endToolBatch: () => void;
-  applyFinalAnswer: (id: string, content: string) => void;
+  applyFinalAnswer: (id: string, content: string, executionId?: string | null) => void;
+  applyFinalAnswerSource: (id: string, source: NativeFinalAnswerSource) => void;
   settleAssistantMessage: (id: string) => void;
   projectAssistantError: (id: string, error: string) => void;
   handoffToTaskRuntime: (id: string, content: string, isRunning: boolean) => void;
@@ -305,14 +314,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
     });
   },
 
-  appendAssistantBlock: (id, block) => {
+  appendAssistantBlock: (id, block, executionId, publicationEventId) => {
     set((state) => ({
       messages: state.messages.map((message) => {
         if (message.id !== id || !message.isStreaming) return message;
         const blocks = [...(message.assistantBlocks ?? [])];
         const index = blocks.findIndex(
           (entry) =>
-            entry.block.request_id === block.request_id && entry.block.block_id === block.block_id
+            (entry.execution_id ?? null) === (executionId ?? null) &&
+            entry.block.request_id === block.request_id &&
+            entry.block.block_id === block.block_id
         );
         if (index >= 0) {
           const previous = blocks[index];
@@ -320,10 +331,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
             return message;
           if (previous.block.phase !== 'unknown' && previous.block.phase !== block.phase)
             return message;
-          blocks[index] = { block, content: previous.content + block.delta };
+          blocks[index] = {
+            block,
+            content: previous.content + block.delta,
+            execution_id: executionId ?? previous.execution_id,
+            publication_event_id: publicationEventId ?? previous.publication_event_id,
+          };
           return { ...message, assistantBlocks: blocks };
         }
-        blocks.push({ block, content: block.delta });
+        blocks.push({
+          block,
+          content: block.delta,
+          execution_id: executionId,
+          publication_event_id: publicationEventId,
+        });
         return {
           ...message,
           assistantBlocks: blocks,
@@ -439,12 +460,42 @@ export const useChatStore = create<ChatState>((set, get) => ({
     scheduleAutoSave();
   },
 
-  applyFinalAnswer: (id, content) => {
+  // 原生终态仅提供消息来源坐标，不更新 TaskRun/TurnStatus 或最终发布标记。
+  observeExecutionStatus: (id, status) => {
+    if (!['settled', 'failed', 'cancelled'].includes(status.status)) return;
+    set((state) => ({
+      messages: state.messages.map((message) =>
+        message.id === id && !message.executionStatus
+          ? { ...message, executionStatus: status }
+          : message
+      ),
+    }));
+  },
+
+  // 只薄接后端已校验的呈现关联；不写正文、phase、完成标记或运行状态。
+  applyFinalAnswerSource: (id, source) => {
+    set((state) => ({
+      messages: state.messages.map((message) => {
+        const status = message.executionStatus;
+        return message.id === id &&
+          message.finalAnswerConfirmed &&
+          status?.status === 'settled' &&
+          message.finalAnswerExecutionId === source.execution_id &&
+          status.execution_id === source.execution_id &&
+          status.request_id === source.request_id &&
+          status.sequence === source.sequence
+          ? { ...message, finalAnswerSource: source }
+          : message;
+      }),
+    }));
+  },
+
+  applyFinalAnswer: (id, content, executionId) => {
     if (!content.trim()) return;
     set((state) => ({
       messages: state.messages.map((message) =>
         message.id === id && !message.finalAnswerConfirmed
-          ? { ...message, content, finalAnswerConfirmed: true }
+          ? { ...message, content, finalAnswerConfirmed: true, finalAnswerExecutionId: executionId }
           : message
       ),
     }));

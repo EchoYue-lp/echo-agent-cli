@@ -20,7 +20,8 @@ use super::event_rebuild::{
 };
 use super::file_shadow::{ProjectionRefreshStats, ShadowError};
 use super::history_projection::{
-    HistoryProjection, HistoryProjectionApplyStatus, artifacts_from_events, reviews_from_events,
+    HistoryProjection, HistoryProjectionApplyStatus, RawInputHistorySnapshot,
+    artifacts_from_events, reviews_from_events,
 };
 use super::types::{PlanRevision, RunStateSnapshot, RuntimeEventKind, RuntimeTaskEvent};
 
@@ -498,6 +499,7 @@ impl RunAuthority {
             expected_run_id,
             run_directory,
             recovery.last_applied_sequence,
+            journal.journal_identity(),
         );
         let history_status = reconcile_history_projection(
             &mut history,
@@ -1000,6 +1002,112 @@ impl RunAuthority {
                     .map_err(|sequence| ShadowError::SequenceOutOfRange { sequence })
             })
             .collect()
+    }
+
+    /// 在同一个原authority下取固定前缀。不同Run即使序号相同也不能共用来源快照。
+    pub(crate) fn raw_input_history_snapshot(
+        &self,
+        requested_cut: Option<u64>,
+    ) -> Result<RawInputHistorySnapshot, ShadowError> {
+        let mut guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| ShadowError::AuthorityClosed(self.event_path.display().to_string()))?;
+        if state.durability_debt.is_some() {
+            return Err(ShadowError::Rebuild(
+                "raw input journal durability remains unconfirmed".to_string(),
+            ));
+        }
+        let head = state.reducer.last_applied_sequence();
+        let cut = requested_cut.unwrap_or(head);
+        if cut == 0 {
+            return Err(ShadowError::Rebuild(
+                "raw input cut predates the original RunCreated event".to_string(),
+            ));
+        }
+        if cut > head {
+            return Err(ShadowError::Rebuild(
+                "raw input cut exceeds original journal head".to_string(),
+            ));
+        }
+        let run = state.reducer.with_state(|projection| {
+            validate_projection_health(projection)?;
+            projection
+                .rebuilt_plan()
+                .map(|rebuilt| rebuilt.run)
+                .map_err(|error| ShadowError::Rebuild(error.to_string()))
+        })?;
+        let journal = Arc::clone(&state.journal);
+        if cut != 0 {
+            // 暖读模型不是原journal可读性的替身；原reader同时核原frame/generation，源丢失须显式失败。
+            let witness = journal
+                .replay_after(cut.saturating_sub(1), 1)
+                .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
+            if witness.first().is_none_or(|record| record.sequence != cut) {
+                return Err(ShadowError::Rebuild(
+                    "raw history source cut is not readable from the original journal".to_string(),
+                ));
+            }
+        }
+        let _history = reconcile_history_projection(&mut state.history, journal.as_ref(), head);
+        if let Ok(snapshot) = state.history.raw_input_snapshot(&run, cut) {
+            return Ok(snapshot);
+        }
+        // 派生族缺失/损坏只能从原journal重建。固定页扫描所有事件到cut，不以匹配的一页冒全集。
+        let mut events = Vec::new();
+        let mut after = 0;
+        // 可变派生族始终修复到已捕获head；旧发布前缀由下方snapshot过滤，不能把整个暖族回滚。
+        while after < head {
+            let page = journal
+                .replay_after(after, 256)
+                .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
+            if page.is_empty() {
+                return Err(ShadowError::Rebuild(
+                    "raw source journal prefix ended before its cut".to_string(),
+                ));
+            }
+            let mut advanced = after;
+            for record in page {
+                if record.sequence > head {
+                    break;
+                }
+                if record.sequence <= advanced {
+                    return Err(ShadowError::Rebuild(
+                        "raw source journal scan did not advance".to_string(),
+                    ));
+                }
+                advanced = record.sequence;
+                let event = record
+                    .event
+                    .project(record.sequence)
+                    .map_err(|sequence| ShadowError::SequenceOutOfRange { sequence })?;
+                if event.run_id != self.expected_run_id {
+                    return Err(ShadowError::Rebuild(
+                        "raw source journal contains another Run".to_string(),
+                    ));
+                }
+                if matches!(
+                    event.event_type,
+                    RuntimeEventKind::RunInputAccepted | RuntimeEventKind::RunSteerRecorded
+                ) {
+                    events.push(event);
+                }
+            }
+            if advanced == after {
+                return Err(ShadowError::Rebuild(
+                    "raw source cut is not present in the original journal".to_string(),
+                ));
+            }
+            after = advanced;
+        }
+        state
+            .history
+            .replace_raw_inputs(&events, head)
+            .map_err(ShadowError::Rebuild)?;
+        state
+            .history
+            .raw_input_snapshot(&run, cut)
+            .map_err(ShadowError::Rebuild)
     }
 
     pub(crate) fn read_plan_projection(&self) -> Result<Option<PlanRevision>, ShadowError> {

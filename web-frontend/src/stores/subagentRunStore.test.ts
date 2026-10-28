@@ -427,3 +427,401 @@ describe('subagentRunStore terminal result', () => {
     expect(restored?.outcome?.touched_files.read).toEqual(['src/cli']);
   });
 });
+
+describe('canonical native Subagent observation projection', () => {
+  const envelope = (
+    sequence: number,
+    phase: 'commentary' | 'reasoning' | 'partial_answer' | 'final_answer' = 'commentary'
+  ) => ({
+    schema_version: 5,
+    event_id: `native-${sequence}`,
+    content_hash: `sha256:${sequence}`,
+    sequence,
+    stream_id: 'native-stream',
+    turn_id: 'execution-1',
+    message_id: 'message-1',
+    conversation_id: 'conversation-1',
+    run_id: 'run-1',
+    execution_id: 'execution-1',
+    parent_event_id: null,
+    timestamp: '2026-10-28T00:00:00Z',
+    payload: {
+      type: 'assistant_message',
+      data: {
+        block: {
+          provider_source: {
+            protocol: 'responses',
+            request_id: 'request-1',
+            item_id: 'item-1',
+            output_index: 0,
+            content_kind: 'output_text',
+          },
+          block_id: `block-${sequence}`,
+          request_id: 'request-1',
+          sequence,
+          phase,
+          delta: `content-${sequence}`,
+          complete: true,
+          provider: 'fixture',
+          reasoning:
+            phase === 'reasoning'
+              ? { type: 'signed', thinking: '原生推理', signature: 'original-signature' }
+              : null,
+        },
+      },
+    },
+  });
+  const wire = (native: ReturnType<typeof envelope>): ExecEvent => ({
+    workspace_id: 'workspace-1',
+    conversation_id: 'conversation-1',
+    run_id: 'run-1',
+    scope: 'subagent',
+    task_id: 'task-1',
+    subagent_run_id: 'execution-1',
+    agent: 'primary',
+    event: 'note',
+    payload: {
+      kind: 'native_agent_event',
+      execution_id: 'execution-1',
+      agent: 'primary',
+      agent_envelope: native,
+    },
+    framework_event: null,
+  });
+  beforeEach(() => useSubagentRunStore.getState().clear());
+  it('keeps phase, signature, provenance and duplicate identity without creating a terminal', () => {
+    const original = [
+      envelope(1),
+      envelope(2, 'reasoning'),
+      envelope(3, 'partial_answer'),
+      envelope(4, 'final_answer'),
+    ];
+    original.forEach((event) => ingestSubagentExecEvent(wire(event)));
+    ingestSubagentExecEvent(wire(original[0]));
+    const run = useSubagentRunStore.getState().runs[subagentRunStoreKey('run-1', 'execution-1')];
+    expect(run?.events.map((event) => event.agent_envelope)).toEqual(original);
+    expect(run?.status).toBe('running');
+    expect(run?.finalOutput).toBeUndefined();
+  });
+  it('rejects a canonical envelope for a different execution owner', () => {
+    ingestSubagentExecEvent(wire({ ...envelope(1), execution_id: 'foreign-execution' }));
+    expect(Object.keys(useSubagentRunStore.getState().runs)).toHaveLength(0);
+  });
+  it('fills native history after terminal hydration without reopening the task', () => {
+    useSubagentRunStore.getState().ingest({
+      kind: 'subagent',
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
+      run_id: 'run-1',
+      subagent_run_id: 'execution-1',
+      agent: 'primary',
+      event: 'failed',
+      error: 'original failure',
+    });
+    const taskRun: TaskRun = {
+      run_id: 'run-1',
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
+      root_message_id: 'message-1',
+      domain_profile: 'general',
+      domain_binding: null,
+      status: 'running',
+      goal: 'original',
+      goal_revision: 1,
+      goal_sha256: 'sha',
+      plan_id: null,
+      route: '',
+      attended_mode: 'attended',
+      created_at: '2026-10-28T00:00:00Z',
+      updated_at: '2026-10-28T00:00:00Z',
+    };
+    const native = envelope(1, 'reasoning');
+    const events: RuntimeTaskEvent[] = [
+      {
+        seq: '1',
+        run_id: 'run-1',
+        task_id: 'task-1',
+        step_id: 'execution-1',
+        event_type: 'note',
+        payload: {
+          kind: 'native_agent_event',
+          execution_id: 'execution-1',
+          agent: 'primary',
+          agent_envelope: native,
+        },
+        timestamp: '2026-10-28T00:00:00Z',
+      },
+    ];
+    ingestTaskRuntimeSubagentEvents(taskRun, null, events);
+    ingestSubagentExecEvent(wire(native));
+    const run = useSubagentRunStore.getState().runs[subagentRunStoreKey('run-1', 'execution-1')];
+    expect(run?.status).toBe('failed');
+    expect(
+      run?.events.filter((event) => event.event === 'note').map((event) => event.agent_envelope)
+    ).toEqual([native]);
+  });
+  it('restores unseen early native events and tool positions after late live/terminal observations', () => {
+    ingestSubagentExecEvent(wire(envelope(5)));
+    useSubagentRunStore.getState().ingest({
+      kind: 'subagent',
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
+      run_id: 'run-1',
+      subagent_run_id: 'execution-1',
+      agent: 'primary',
+      event: 'failed',
+      error: 'original failure',
+    });
+    const taskRun: TaskRun = {
+      run_id: 'run-1',
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
+      root_message_id: 'message-1',
+      domain_profile: 'general',
+      domain_binding: null,
+      status: 'running',
+      goal: 'original',
+      goal_revision: 1,
+      goal_sha256: 'sha',
+      plan_id: null,
+      route: '',
+      attended_mode: 'attended',
+      created_at: '2026-10-28T00:00:00Z',
+      updated_at: '2026-10-28T00:00:00Z',
+    };
+    const notes = [1, 3, 5].map((sequence) => ({
+      seq: String(sequence),
+      run_id: 'run-1',
+      task_id: 'task-1',
+      step_id: 'execution-1',
+      event_type: 'note' as const,
+      payload: {
+        kind: 'native_agent_event',
+        execution_id: 'execution-1',
+        agent: 'primary',
+        agent_envelope: envelope(sequence),
+      },
+      timestamp: '2026-10-28T00:00:00Z',
+    }));
+    const tool: RuntimeTaskEvent = {
+      seq: '2',
+      run_id: 'run-1',
+      task_id: 'task-1',
+      step_id: 'original-call',
+      event_type: 'tool_started',
+      payload: { execution_id: 'execution-1', call_id: 'original-call', tool_name: 'read_file' },
+      timestamp: '2026-10-28T00:00:00Z',
+    };
+    ingestTaskRuntimeSubagentEvents(taskRun, null, [notes[0], tool, notes[1], notes[2]]);
+    const run = useSubagentRunStore.getState().runs[subagentRunStoreKey('run-1', 'execution-1')];
+    expect(run?.status).toBe('failed');
+    expect(
+      run?.events.filter((event) => event.runtime_sequence != null).map((event) => event.event_id)
+    ).toEqual(['native-1', 'runtime:2', 'native-3', 'native-5']);
+  });
+  it('keeps Settled as an observation and represents malformed payloads as unreadable', () => {
+    const status = {
+      ...envelope(1),
+      payload: {
+        type: 'execution_status',
+        data: {
+          execution_id: 'execution-1',
+          request_id: null,
+          sequence: 1,
+          phase: 'Terminal',
+          status: 'settled',
+          reason: null,
+        },
+      },
+    };
+    const valid = wire(envelope(1));
+    valid.payload = {
+      kind: 'native_agent_event',
+      execution_id: 'execution-1',
+      agent: 'primary',
+      agent_envelope: status,
+    };
+    ingestSubagentExecEvent(valid);
+    const malformed = wire(envelope(2));
+    malformed.payload = {
+      kind: 'native_agent_event',
+      execution_id: 'execution-1',
+      agent_envelope: { ...envelope(2), payload: { type: 'error' } },
+    };
+    ingestSubagentExecEvent(malformed);
+    const run = useSubagentRunStore.getState().runs[subagentRunStoreKey('run-1', 'execution-1')];
+    expect(run?.status).toBe('running');
+    expect(run?.events.at(-1)?.native_decode_error).toContain('不可读');
+  });
+  it('does not move later live output ahead when only a suffix gets durable coordinates', () => {
+    const before = envelope(1),
+      after = envelope(3);
+    ingestSubagentExecEvent(wire(before));
+    ingestSubagentExecEvent({
+      ...wire(before),
+      event: 'tool_started',
+      payload: { call_id: 'call-between' },
+    });
+    ingestSubagentExecEvent(wire(after));
+    const taskRun: TaskRun = {
+      run_id: 'run-1',
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
+      root_message_id: 'message-1',
+      domain_profile: 'general',
+      domain_binding: null,
+      status: 'running',
+      goal: 'original',
+      goal_revision: 1,
+      goal_sha256: 'sha',
+      plan_id: null,
+      route: '',
+      attended_mode: 'attended',
+      created_at: '2026-10-28T00:00:00Z',
+      updated_at: '2026-10-28T00:00:00Z',
+    };
+    ingestTaskRuntimeSubagentEvents(taskRun, null, [
+      {
+        seq: '3',
+        run_id: 'run-1',
+        task_id: 'task-1',
+        step_id: 'execution-1',
+        event_type: 'note',
+        payload: {
+          kind: 'native_agent_event',
+          execution_id: 'execution-1',
+          agent: 'primary',
+          agent_envelope: after,
+        },
+        timestamp: '2026-10-28T00:00:00Z',
+      },
+    ]);
+    const run = useSubagentRunStore.getState().runs[subagentRunStoreKey('run-1', 'execution-1')];
+    expect(run?.events.map((event) => event.agent_envelope?.event_id ?? event.call_id)).toEqual([
+      'native-1',
+      'call-between',
+      'native-3',
+    ]);
+  });
+  it('repositions replay-only tools after later pages provide their surrounding anchors', () => {
+    ingestSubagentExecEvent(wire(envelope(1)));
+    ingestSubagentExecEvent(wire(envelope(3)));
+    const taskRun: TaskRun = {
+      run_id: 'run-1',
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
+      root_message_id: 'message-1',
+      domain_profile: 'general',
+      domain_binding: null,
+      status: 'running',
+      goal: 'original',
+      goal_revision: 1,
+      goal_sha256: 'sha',
+      plan_id: null,
+      route: '',
+      attended_mode: 'attended',
+      created_at: '2026-10-28T00:00:00Z',
+      updated_at: '2026-10-28T00:00:00Z',
+    };
+    const tool: RuntimeTaskEvent = {
+      seq: '2',
+      run_id: 'run-1',
+      task_id: 'task-1',
+      step_id: 'middle-call',
+      event_type: 'tool_started',
+      payload: { execution_id: 'execution-1', call_id: 'middle-call' },
+      timestamp: '2026-10-28T00:00:00Z',
+    };
+    ingestTaskRuntimeSubagentEvents(taskRun, null, [tool]);
+    for (const sequence of [3, 1]) {
+      ingestTaskRuntimeSubagentEvents(taskRun, null, [
+        {
+          seq: String(sequence),
+          run_id: 'run-1',
+          task_id: 'task-1',
+          step_id: 'execution-1',
+          event_type: 'note',
+          payload: {
+            kind: 'native_agent_event',
+            execution_id: 'execution-1',
+            agent: 'primary',
+            agent_envelope: envelope(sequence),
+          },
+          timestamp: '2026-10-28T00:00:00Z',
+        },
+      ]);
+    }
+    const run = useSubagentRunStore.getState().runs[subagentRunStoreKey('run-1', 'execution-1')];
+    expect(run?.events.map((event) => event.agent_envelope?.event_id ?? event.call_id)).toEqual([
+      'native-1',
+      'middle-call',
+      'native-3',
+    ]);
+  });
+  it('does not freeze shared chat replay arrival order over canonical native order', () => {
+    ingestSubagentExecEvent(wire(envelope(5)));
+    ingestSubagentExecEvent(wire(envelope(1)), {
+      event_id: 'chat-1',
+      stream_id: 'chat-stream',
+      sequence: 1,
+      timestamp: '2026-10-28T00:00:00Z',
+    });
+    ingestSubagentExecEvent(wire(envelope(5)), {
+      event_id: 'chat-5',
+      stream_id: 'chat-stream',
+      sequence: 5,
+      timestamp: '2026-10-28T00:00:00Z',
+    });
+    const run = useSubagentRunStore.getState().runs[subagentRunStoreKey('run-1', 'execution-1')];
+    expect(run?.events.map((event) => event.agent_envelope?.event_id)).toEqual([
+      'native-1',
+      'native-5',
+    ]);
+  });
+
+  it('retains exact durable sequence strings above the JavaScript integer boundary', () => {
+    const taskRun: TaskRun = {
+      run_id: 'run-1',
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
+      root_message_id: 'message-1',
+      domain_profile: 'general',
+      domain_binding: null,
+      status: 'running',
+      goal: 'original',
+      goal_revision: 1,
+      goal_sha256: 'sha',
+      plan_id: null,
+      route: '',
+      attended_mode: 'attended',
+      created_at: '2026-10-28T00:00:00Z',
+      updated_at: '2026-10-28T00:00:00Z',
+    };
+    for (const [seq, ordinal] of [
+      ['9007199254740993', 3],
+      ['9007199254740992', 1],
+    ] as const) {
+      ingestTaskRuntimeSubagentEvents(taskRun, null, [
+        {
+          seq,
+          run_id: 'run-1',
+          task_id: 'task-1',
+          step_id: 'execution-1',
+          event_type: 'note',
+          payload: {
+            kind: 'native_agent_event',
+            execution_id: 'execution-1',
+            agent: 'primary',
+            agent_envelope: envelope(ordinal),
+          },
+          timestamp: '2026-10-28T00:00:00Z',
+        },
+      ]);
+    }
+    const run = useSubagentRunStore.getState().runs[subagentRunStoreKey('run-1', 'execution-1')];
+    expect(run?.events.map((event) => event.runtime_sequence)).toEqual([
+      '9007199254740992',
+      '9007199254740993',
+    ]);
+  });
+});

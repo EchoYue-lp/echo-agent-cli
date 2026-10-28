@@ -58,3 +58,19 @@ TaskRun 在原 `RunCreated`/目标版本中绑定经验证的位置 identity 和
 [OpenSSH `ssh(1)`](https://man.openbsd.org/ssh.1) 区分终端读取与 `SSH_ASKPASS` 图形询问；[VS Code Remote SSH 故障排查](https://code.visualstudio.com/docs/remote/troubleshooting)也明确将等待认证提示与连接完成分开。EKO 已有原 PTY/ControlMaster、二进制终端写入和连接移交，因此保留这一权威，改用掩码表单呈现，不再增加 askpass helper 或第二套连接 owner。表单是应用界面策略，登录成功仍由原 ControlMaster 证明，不能从密码提示、按钮点击或本地进程启动推断。
 
 旧黑终端反例与新交互分别记录：浏览器真实 Modal/xterm 下，外层文本框聚焦时公开 probe 没有写入，直接聚焦 helper 输入区后产生写入；这证明一个输入可达性缺口，不倒推用户每次真实失败的原因。新表单/生命周期前端回归、原 PTY 无回显控制、目录解析和真实 SSH 验收按各自证据结算，源码或 mock 通过不代表 `ubuntu@111.229.245.175` 的真实认证已通过。
+
+## 回复分叉的目标绑定（2026-10-27）
+
+新 Worktree 是原 Git owner 创建的代码目录，不自行成为另一套 Workspace 权威。原 registry 登记目标后，分叉按返回的 product_data_generation 获取 scoped runtime；目标删除/重开或位置代际变化时拒绝旧回执。文件、Agent 命令、Git、终端和产物始终从同一个 execution location 解析。
+
+用户直接触发的 GUI Git 原语沿既有 `project_run_git` 分派：本地项目复用原 native 进程路径，SSH 项目保留原 environment 与连接 owner，不在远程失败时回退本机。Agent 自动任务继续使用原项目 executor 与沙箱；这里不改变工作树算法、operation、merge lock 或清理权威。
+
+自动打开分叉也必须把 expected generation 传入原工作空间切换准入，在同一个 transition 写锁内复用原 generation 校验，不能只核对前端缓存。目标重新登记或被删除时，拒绝旧选择而不接入后继目标。GUI 在这种切换被原生准入接受前保持来源投影；拒绝后查询原 current 事实，确认来源未变时保持原消息和文件绑定。资源列表从原 registry 重读，不从迟到回执重新登记已删除条目。
+
+来源和目标各持自己的 SSH 认证 owner。准备与真正移交之间出现 draft 替换时，原创建/重连用刚才实际验证的 Arc 核对；已有来源 workspace 的连接不能作为可转移 draft。该检查防止框架 bug 误迁移或误关闭本地用户正在使用的连接，不给用户主动认证增加权限模式门控。
+
+用户关闭 Fork 弹窗只退役观察。整段原 owned flow 在真实操作返回后，负责结算已证明属于本请求、仍未移交的独立 draft；认证 key、物理 Arc、有效目标和单一登记均须吻合。已移交后的旧 key 无项不关闭目标，key 被替换或双登记则保留并报告，绝不按未经验证的来源 key 清理。未知操作未返回时不提前关闭，清理失败与原错误一起进入原 supervisor 收据。
+
+代码 HEAD-only 与历史资源保全分别处理：未提交代码留源，目标恢复所需的已知产品资源逐 bytes/大小/SHA 复制。来源关闭或独立清理后，目标仍由原 reader 读取自己的副本，不扩大 reader 根。部分创建/复制失败保留真实资源，从既有列表和 managed import 继续检查，不自动重建或删除用户代码。真实 SSH/终端矩阵与本机资源测试分开验收。
+
+恢复提示依据实际 receipt：已有 Workspace、conversation 或 created／observed Worktree 时提示相应列表；只有分支残留且没有可打开对象时，不承诺列表存在目标。界面保留原错误与核对重试入口，不据 stderr 创建 pending store、认领或删除 live ref。旧包的失败与后继源码、集成和原生阳性结果分别保留。

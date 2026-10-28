@@ -276,7 +276,7 @@ export type ChatEvent = {
       after_tokens: number;
     }
   | { type: 'chart'; spec: unknown }
-  | { type: 'final_answer'; data: string }
+  | { type: 'final_answer'; data: string; execution_id?: string | null }
   | { type: 'cancelled' }
   | { type: 'error'; message: string }
   | { type: 'run_status'; status: ChatRunStatus }
@@ -358,7 +358,18 @@ export interface TranscriptProjectionSettlement {
 }
 
 /** Framework AssistantMessageBlock 的无损呈现合同；缺失阶段保持 unknown。 */
+export interface ProviderOutputSource {
+  protocol: 'chat_completions' | 'responses' | 'anthropic';
+  request_id: string;
+  item_id: string;
+  output_index: number;
+  content_index?: number | null;
+  content_kind?: string | null;
+  phase?: string | null;
+}
+
 export interface AssistantMessageBlock {
+  provider_source?: ProviderOutputSource | null;
   block_id: string;
   request_id: string;
   sequence: number;
@@ -370,6 +381,9 @@ export interface AssistantMessageBlock {
 }
 
 export interface AssistantBlockView {
+  /** 原已发布 Agent envelope 的执行身份；缺失时不推断最终候选。 */
+  execution_id?: string | null;
+  publication_event_id?: string | null;
   block: AssistantMessageBlock;
   content: string;
 }
@@ -436,6 +450,18 @@ export type AgentEvent =
   | { type: 'parameter_error'; data: Record<string, unknown> }
   | { type: 'final_answer'; data: string }
   | { type: 'cancelled' };
+
+export type NativeExecutionStatus = Extract<AgentEvent, { type: 'execution_status' }>['data'];
+
+/** EKO 既有 publication 校验的只读呈现身份；sequence 来自实际 Settled。 */
+export interface NativeFinalAnswerSource {
+  execution_id: string;
+  request_id: string;
+  sequence: number;
+  blocks: (Pick<AssistantMessageBlock, 'request_id' | 'block_id' | 'sequence'> & {
+    publication_event_id: string;
+  })[];
+}
 
 export interface AgentEventEnvelope {
   schema_version: number;
@@ -758,6 +784,10 @@ export interface ChatMessage {
   assistantBlocks?: AssistantBlockView[];
   /** 只由运行时最终发布事件设置，块完成/phase 本身不产生资格。 */
   finalAnswerConfirmed?: boolean;
+  /** 仅用于已发布正文与原 native 块的身份关联，不裁决执行完成。 */
+  finalAnswerExecutionId?: string | null;
+  executionStatus?: NativeExecutionStatus;
+  finalAnswerSource?: NativeFinalAnswerSource;
   /** AgentRouter coordination retained only in a Side Conversation view. */
   internalAgent?: boolean;
   thinkingContent?: string; // deprecated, kept for history display
@@ -832,7 +862,15 @@ export interface SavedMessage {
   internal_agent?: boolean;
   assistant_blocks?: AssistantBlockView[];
   final_answer_confirmed?: boolean;
-  tool_calls?: { id: string; type: string; function: { name: string; arguments: string } }[];
+  /** 后端既有 publication 校验得到的原 Settled 坐标与精确候选块。 */
+  execution_status?: NativeExecutionStatus;
+  final_answer_source?: NativeFinalAnswerSource;
+  tool_calls?: {
+    provider_source?: ProviderOutputSource | null;
+    id: string;
+    type: string;
+    function: { name: string; arguments: string };
+  }[];
   thinking_segments?: string[];
   execution_steps?: { type: string; index?: number; call_id?: string }[];
   execution_rounds?: {

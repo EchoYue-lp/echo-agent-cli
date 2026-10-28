@@ -133,6 +133,142 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe('task run history canonical reports and receipt ownership', () => {
+  it.each(['goal', 'plan', 'run', 'plan-goal'] as const)(
+    'labels a mismatched %s completion report stale instead of passed',
+    (mismatch) => {
+      const state = useTaskRuntimeStore.getState();
+      useTaskRuntimeStore.setState({
+        ...(mismatch === 'plan-goal' && state.plan
+          ? { plan: { ...state.plan, goal_sha256: 'old-goal-hash' } }
+          : {}),
+        completionGate: {
+          run_id: mismatch === 'run' ? 'another-run' : run.run_id,
+          goal_revision: mismatch === 'goal' ? 0 : run.goal_revision,
+          plan_revision: mismatch === 'plan' ? 0 : (state.plan?.revision ?? 0),
+          ready: true,
+          requirements: [
+            {
+              requirement: {
+                requirement_id: 'old-requirement',
+                goal_revision: 0,
+                plan_revision: 0,
+                task_id: 'task-1',
+                title: '旧验收项',
+                description: '旧版本通过不能替代当前版本',
+                requirement_sha256: 'old',
+                required_artifacts: [],
+                execution_checks: [],
+                acceptance_criteria: [],
+              },
+              status: 'accepted',
+              evidence: [],
+            },
+          ],
+          blockers: [],
+        },
+      });
+      render(<TaskRuntimePanel />);
+      expect(screen.queryByText('通过', { exact: true })).toBeNull();
+      expect(screen.getByText(/验收报告尚未匹配当前运行/)).toBeTruthy();
+      expect(screen.queryByTestId('completion-gate-requirements')).toBeNull();
+    }
+  );
+
+  it('keeps a matching canonical completion report visible', () => {
+    const state = useTaskRuntimeStore.getState();
+    useTaskRuntimeStore.setState({
+      completionGate: {
+        run_id: run.run_id,
+        goal_revision: run.goal_revision,
+        plan_revision: state.plan?.revision ?? 0,
+        ready: true,
+        blockers: [],
+        requirements: [
+          {
+            requirement: {
+              requirement_id: 'current-requirement',
+              goal_revision: run.goal_revision,
+              plan_revision: state.plan?.revision ?? 0,
+              task_id: 'task-1',
+              title: '当前验收项',
+              description: '原始规范报告',
+              requirement_sha256: 'current',
+              required_artifacts: [],
+              execution_checks: [],
+              acceptance_criteria: [],
+            },
+            status: 'accepted',
+            evidence: [],
+          },
+        ],
+      },
+    });
+    render(<TaskRuntimePanel />);
+    expect(screen.getByText('通过', { exact: true })).toBeTruthy();
+    expect(screen.getByTestId('completion-gate-requirements')).toBeTruthy();
+    expect(screen.queryByText(/验收报告尚未匹配当前运行/)).toBeNull();
+  });
+
+  it.each(['success', 'failure'] as const)(
+    'does not publish the first visit %s after switching A to B and back to A',
+    async (outcome) => {
+      let settleOld: (() => void) | undefined;
+      let settleNew: (() => void) | undefined;
+      const resume = vi
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve, reject) => {
+              settleOld = () =>
+                outcome === 'success'
+                  ? resolve({ kind: 'resumed', run_id: run.run_id })
+                  : reject(new Error('旧访问失败'));
+            })
+        )
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              settleNew = () => resolve({ kind: 'resumed', run_id: run.run_id });
+            })
+        );
+      useTaskRuntimeStore.setState({ resumeTaskRun: resume });
+      render(<TaskRuntimePanel />);
+      fireEvent.click(screen.getByRole('button', { name: '继续执行' }));
+      act(() => useTaskRuntimeStore.setState({ activeRun: { ...run, run_id: 'run-b' } }));
+      act(() => useTaskRuntimeStore.setState({ activeRun: { ...run } }));
+      fireEvent.click(screen.getByRole('button', { name: '继续执行' }));
+      expect(resume).toHaveBeenCalledTimes(2);
+      await act(async () => settleOld?.());
+      expect(screen.queryByText(/继续执行恢复请求已接受/)).toBeNull();
+      expect(screen.queryByText(/旧访问失败/)).toBeNull();
+      expect(screen.getByText('继续执行请求处理中，等待运行记录返回…')).toBeTruthy();
+      await act(async () => settleNew?.());
+      expect(screen.getByText(/继续执行恢复请求已接受/)).toBeTruthy();
+    }
+  );
+
+  it('rejects a retry receipt for another task in the same run', async () => {
+    useTaskRuntimeStore.setState((state) => ({
+      todos: state.todos.map((todo) => ({ ...todo, status: 'blocked' })),
+      retryBlockedTask: vi.fn(async () => ({
+        kind: 'recovery_retry_recorded' as const,
+        run_id: run.run_id,
+        task_id: 'another-task',
+        next_attempt: 1,
+      })),
+    }));
+    render(<TaskRuntimePanel />);
+    fireEvent.click(screen.getByRole('button', { name: '查看任务：任务 1 中文 🧭' }));
+    const dialog = screen.getByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: '重试' }));
+    await waitFor(() =>
+      expect(within(dialog).getByRole('alert').textContent).toContain('回执不属于原任务')
+    );
+    expect(within(dialog).queryByText(/恢复重试已记录/)).toBeNull();
+  });
+});
+
 describe('task runtime list and details', () => {
   it('bounds visible cards and keeps search and paging on the existing projection', () => {
     seed(25);

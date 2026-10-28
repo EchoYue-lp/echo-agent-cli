@@ -536,18 +536,23 @@ export const permissionsApi = {
 export const auditApi = {
   logs: (offset?: number, limit?: number) =>
     isTauri()
-      ? apiInvoke<{ logs: AuditLog[]; total: number; offset: number; limit: number }>(
-          'get_audit_logs',
-          { offset, limit }
-        )
+      ? apiInvoke<{
+          logs: AuditLog[];
+          total: number;
+          offset: number;
+          limit: number;
+        }>('get_audit_logs', { offset, limit })
       : get<{ logs: AuditLog[]; total: number; offset: number; limit: number }>(
           `/audit/logs${offset !== undefined ? `?offset=${offset}&limit=${limit ?? 100}` : ''}`
         ),
   stats: () =>
     isTauri()
-      ? apiInvoke<{ total: number; allowed: number; denied: number; asked: number }>(
-          'get_audit_stats'
-        )
+      ? apiInvoke<{
+          total: number;
+          allowed: number;
+          denied: number;
+          asked: number;
+        }>('get_audit_stats')
       : get<{ total: number; allowed: number; denied: number; asked: number }>('/audit/stats'),
   clear: () =>
     isTauri()
@@ -648,9 +653,77 @@ export const extractApi = {
 
 export interface SideConversationLaunchReceipt {
   creation: SideConversationCreateReceipt;
-  first_turn: { kind: string; message_key: string; root_turn_id: string } | null;
+  first_turn: {
+    kind: string;
+    message_key: string;
+    root_turn_id: string;
+  } | null;
   initial_prompt: string;
   launch_error: string | null;
+}
+
+export type ConversationForkDestination = 'current_workspace' | 'new_worktree';
+
+export interface ConversationForkPreparation {
+  request_id: string;
+  workspace_id: string;
+  workspace_generation: string;
+  source_id: string;
+  user_turn_index: number;
+  prefix_sha256: string;
+  message_count: number;
+  worktree: {
+    available: boolean;
+    reason: string | null;
+    repo_root: string | null;
+    head: string | null;
+    branch: string;
+    path: string | null;
+    project_location: ProjectLocation;
+    ssh_target: Extract<TerminalTarget, { kind: 'ssh' }> | null;
+    source_connection_generation: string | null;
+    draft_connection_id: string | null;
+  };
+}
+
+export interface ConversationForkRequest {
+  preparation: ConversationForkPreparation;
+  destination: ConversationForkDestination;
+  ssh_connection_id?: string;
+}
+
+export interface ConversationForkReceipt {
+  success: boolean;
+  id: string | null;
+  source_id: string;
+  source_workspace_id: string;
+  message_count: number;
+  target_content: string;
+  request_id: string;
+  destination: ConversationForkDestination;
+  workspace_id: string;
+  workspace_generation: string;
+  worktree?: {
+    created: boolean;
+    observed: boolean;
+    path: string;
+    head: string;
+    descriptor: (WorktreeInfo & { lock_reason?: string | null; commit_oid?: string }) | null;
+    error: string | null;
+  } | null;
+  workspace?: Workspace | null;
+  conversation_created: boolean;
+  existing_conversation_observed?: boolean;
+  resources?: Array<{
+    source_path: string;
+    target_path: string;
+    bytes: number;
+    sha256: string;
+    reader_verified: boolean;
+  }>;
+  imported: boolean;
+  warnings?: string[];
+  error?: string | null;
 }
 
 export const conversationApi = {
@@ -700,7 +773,12 @@ export const conversationApi = {
   },
   save: (
     workspaceId: string,
-    data: { id: string; title: string; messages: SavedMessage[]; model?: string }
+    data: {
+      id: string;
+      title: string;
+      messages: SavedMessage[];
+      model?: string;
+    }
   ) =>
     isTauri()
       ? apiInvoke<{ kind: string; id: string }>('create_conversation', {
@@ -720,22 +798,45 @@ export const conversationApi = {
           request: { kind: 'rename', title: data.title },
         })
       : put<{ success: boolean }>(`/conversations/${id}`, data),
-  branch: (workspaceId: string, id: string, userTurnIndex: number, includeTurn = false) =>
+  prepareFork: (scope: ProductDataScope, id: string, userTurnIndex: number, requestId: string) =>
+    apiInvoke<ConversationForkPreparation>('prepare_conversation_fork', {
+      ...scope,
+      id,
+      userTurnIndex,
+      requestId,
+    }),
+  branch: (
+    workspaceId: string,
+    id: string,
+    userTurnIndex: number,
+    includeTurn = false,
+    fork?: ConversationForkRequest
+  ) =>
     isTauri()
-      ? apiInvoke<{
-          success: boolean;
-          id: string;
-          source_id: string;
-          message_count: number;
-          target_content: string;
-        }>('branch_conversation', { workspaceId, id, userTurnIndex, includeTurn })
-      : post<{
-          success: boolean;
-          id: string;
-          source_id: string;
-          message_count: number;
-          target_content: string;
-        }>(`/conversations/${id}/branch`, {
+      ? apiInvoke<
+          {
+            success: boolean;
+            id: string;
+            source_id: string;
+            message_count: number;
+            target_content: string;
+          } & Partial<ConversationForkReceipt>
+        >('branch_conversation', {
+          workspaceId,
+          id,
+          userTurnIndex,
+          includeTurn,
+          fork,
+        })
+      : post<
+          {
+            success: boolean;
+            id: string;
+            source_id: string;
+            message_count: number;
+            target_content: string;
+          } & Partial<ConversationForkReceipt>
+        >(`/conversations/${id}/branch`, {
           user_turn_index: userTurnIndex,
           include_turn: includeTurn,
         }),
@@ -755,10 +856,11 @@ export const conversationApi = {
         }>(`/conversations/${id}`),
   setArchived: (workspaceId: string, id: string, archived: boolean) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; conversation_id: string; archived: boolean }>(
-          'set_conversation_archived',
-          { workspaceId, id, archived }
-        )
+      ? apiInvoke<{
+          success: boolean;
+          conversation_id: string;
+          archived: boolean;
+        }>('set_conversation_archived', { workspaceId, id, archived })
       : Promise.reject(new Error('会话归档管理仅支持桌面模式')),
   export: (workspaceId: string, id: string) =>
     isTauri()
@@ -769,13 +871,16 @@ export const conversationApi = {
       : get<{ format: string; content: string; id: string }>(`/conversations/${id}/export`),
   restore: (workspaceId: string, id: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; message_count: number; conversation_id: string }>(
-          'restore_conversation',
-          { workspaceId, id }
-        )
-      : post<{ success: boolean; message_count: number; conversation_id: string }>(
-          `/conversations/${id}/restore`
-        ),
+      ? apiInvoke<{
+          success: boolean;
+          message_count: number;
+          conversation_id: string;
+        }>('restore_conversation', { workspaceId, id })
+      : post<{
+          success: boolean;
+          message_count: number;
+          conversation_id: string;
+        }>(`/conversations/${id}/restore`),
   search: (workspaceId: string, query: string, limit?: number) =>
     isTauri()
       ? apiInvoke<ConversationListItem[]>('search_conversations', { workspaceId, query, limit })
@@ -1757,7 +1862,11 @@ export interface SystematicReviewRecord {
     source_id: string;
     result_id?: string;
     tool: 'rob2' | 'robins_i' | 'custom';
-    domains: Array<{ domain: string; judgment: RiskJudgment; rationale: string }>;
+    domains: Array<{
+      domain: string;
+      judgment: RiskJudgment;
+      rationale: string;
+    }>;
     overall: RiskJudgment;
     rationale: string;
     assessed_at: string;
@@ -2008,7 +2117,13 @@ export const systematicReviewsApi = {
 
 export type ProjectLocation =
   | { kind: 'local'; path: string }
-  | { kind: 'ssh'; host: string; user: string | null; port: number | null; path: string };
+  | {
+      kind: 'ssh';
+      host: string;
+      user: string | null;
+      port: number | null;
+      path: string;
+    };
 
 export type ProjectSource =
   | { kind: 'existing_local'; path: string }
@@ -2084,15 +2199,16 @@ export const workspaceApi = {
       : get<WorkspaceListResponse>('/workspaces'),
   create: (name: string, kind?: string, root?: string, source?: ProjectSource) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; created?: boolean; workspace: Workspace }>(
-          'create_workspace',
-          {
-            name,
-            kind,
-            root,
-            source,
-          }
-        )
+      ? apiInvoke<{
+          success: boolean;
+          created?: boolean;
+          workspace: Workspace;
+        }>('create_workspace', {
+          name,
+          kind,
+          root,
+          source,
+        })
       : post<{ success: boolean; created?: boolean; workspace: Workspace }>('/workspaces', {
           name,
           kind,
@@ -2124,18 +2240,25 @@ export const workspaceApi = {
     isTauri()
       ? apiInvoke<{ workspace: Workspace }>('get_workspace', { id }).then((r) => r.workspace)
       : get<Workspace>(`/workspaces/${id}`),
-  switch: (id: string, connectionId?: string) =>
-    isTauri()
+  switch: (id: string, connectionId?: string, expectedGeneration?: string) => {
+    if (!isTauri() && expectedGeneration !== undefined)
+      return Promise.reject(new Error('指定工作空间代际的切换需要桌面应用'));
+    return isTauri()
       ? apiInvoke<{
           success: boolean;
           workspace: Workspace;
           transition: WorkspaceTransitionReceipt;
-        }>('switch_workspace', { id, connectionId })
+        }>('switch_workspace', {
+          id,
+          connectionId,
+          ...(expectedGeneration !== undefined ? { expectedGeneration } : {}),
+        })
       : post<{
           success: boolean;
           workspace: Workspace;
           transition: WorkspaceTransitionReceipt;
-        }>(`/workspaces/${id}/switch`, {}),
+        }>(`/workspaces/${id}/switch`, {});
+  },
   exit: () =>
     isTauri()
       ? apiInvoke<{ success: boolean; transition: WorkspaceTransitionReceipt }>('exit_workspace')
@@ -2193,10 +2316,11 @@ export const evolutionApi = {
         }>('/evolution/review', { run_id: runId }),
   listEvidence: (status: EvidenceInboxFilter = 'pending') =>
     isTauri()
-      ? apiInvoke<{ candidates: EvidenceCandidate[]; count: number; path: string }>(
-          'list_evidence_candidates',
-          { status }
-        )
+      ? apiInvoke<{
+          candidates: EvidenceCandidate[];
+          count: number;
+          path: string;
+        }>('list_evidence_candidates', { status })
       : get<{ candidates: EvidenceCandidate[]; count: number; path: string }>(
           `/evolution/evidence?status=${encodeURIComponent(status)}`
         ),
@@ -2839,10 +2963,11 @@ export const pluginApi = {
           requestScope,
           name,
         }).then(pluginThemeActivationFromReceipt)
-      : post<{ success: boolean; active: string | null; theme: PluginThemeDefinition | null }>(
-          '/plugins/theme',
-          { name }
-        ),
+      : post<{
+          success: boolean;
+          active: string | null;
+          theme: PluginThemeDefinition | null;
+        }>('/plugins/theme', { name }),
   outputStyles: (requestScope: ExtensionRequestScope) =>
     isTauri()
       ? apiInvoke<ExtensionCommandReceipt>('list_plugin_output_styles', { requestScope }).then(
@@ -3071,7 +3196,11 @@ export type ChannelSecretUpdate =
   | { action: 'set'; value: string };
 export interface ManagedChannelsConfiguration {
   revision: string;
-  weixin?: { enabled: boolean; has_credential: boolean; account_id?: string | null };
+  weixin?: {
+    enabled: boolean;
+    has_credential: boolean;
+    account_id?: string | null;
+  };
   qq: { enabled: boolean; app_id: string; has_secret: boolean };
   feishu: {
     enabled: boolean;
@@ -3204,7 +3333,11 @@ export interface SchedulerHistoryRecord {
     reason?: string;
     envelope?: {
       message_id: string;
-      payload: { task: SchedulerTask; scheduled_at: string; trigger: 'manual' | 'scheduled' };
+      payload: {
+        task: SchedulerTask;
+        scheduled_at: string;
+        trigger: 'manual' | 'scheduled';
+      };
     };
     [key: string]: unknown;
   };

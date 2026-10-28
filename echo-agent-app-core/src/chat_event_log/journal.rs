@@ -87,6 +87,8 @@ impl ChatEventLog {
             stream_access: Mutex::new(VecDeque::new()),
             live_sinks: Mutex::new(HashMap::new()),
             #[cfg(test)]
+            native_history_read_test_barrier: Mutex::new(None),
+            #[cfg(test)]
             deletion_pause: None,
             #[cfg(test)]
             orphan_recovery_pause: None,
@@ -113,6 +115,8 @@ impl ChatEventLog {
             streams: DashMap::new(),
             stream_access: Mutex::new(VecDeque::new()),
             live_sinks: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            native_history_read_test_barrier: Mutex::new(None),
             #[cfg(test)]
             deletion_pause: None,
             #[cfg(test)]
@@ -319,6 +323,176 @@ impl ChatEventLog {
         drop(cached);
         self.evict_inactive_streams(None);
         Ok(replay)
+    }
+
+    /// 按当前canonical消息的已批准块/原execution坐标查询原publication子集。
+    /// Message只提供查询键，不授予正文或成功；原selector/verifier仍检查全部原事实。
+    /// 每次最多推进一个原journal batch；未追平或旧物理前缀缺口明确返回错误。
+    pub fn native_history_publications(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        message: &echo_agent::llm::types::Message,
+    ) -> Result<Vec<ChatEventEnvelope>, ChatEventLogError> {
+        if !native_history_message_requires_publications(message) {
+            return Ok(Vec::new());
+        }
+        let selected_stream_id = stream_id(workspace_id, Some(conversation_id), conversation_id)?;
+        let Some(cached) = self.stream_journal(&selected_stream_id, false)? else {
+            return Ok(Vec::new());
+        };
+        let mut guard = lock_cached_stream(&cached);
+        let Some(authority) = guard.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let (through, head) = advance_native_publication_projection(authority)?;
+        if through < head {
+            return Err(ChatEventLogError::NativeHistoryPending {
+                through_sequence: through,
+                latest_sequence: head,
+            });
+        }
+        self.prune_native_history_checkpointed(authority, &selected_stream_id);
+        let events = native_publications_for_message(authority, message, None)?;
+        drop(guard);
+        drop(cached);
+        self.evict_inactive_streams(None);
+        Ok(events)
+    }
+
+    /// 同一次GUI冷载/Fork自动续完原读点；每批只读固定条数并复用原I/O配额。
+    /// 没有模型循环/后台owner：取消或drop调用者后不再排新批，当前blocking批保原槽完成。
+    pub async fn native_history_publications_async(
+        self: &Arc<Self>,
+        workspace_id: &str,
+        conversation_id: &str,
+        message: &echo_agent::llm::types::Message,
+        cancel: &echo_agent::agent::CancellationToken,
+    ) -> Result<Vec<ChatEventEnvelope>, ChatEventLogError> {
+        if cancel.is_cancelled() {
+            return Err(ChatEventLogError::NativeHistoryReadCancelled);
+        }
+        if !native_history_message_requires_publications(message) {
+            return Ok(Vec::new());
+        }
+        let workspace_id = workspace_id.to_string();
+        let conversation_id = conversation_id.to_string();
+        let message = Arc::new(message.clone());
+        let mut cursor = None;
+        loop {
+            if cancel.is_cancelled() {
+                return Err(ChatEventLogError::NativeHistoryReadCancelled);
+            }
+            let permit = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ChatEventLogError::NativeHistoryReadCancelled),
+                permit = PROCESS_CHAT_EVENT_IO.clone().acquire_owned() =>
+                    permit.map_err(|error| ChatEventLogError::Serialization(error.to_string()))?,
+            };
+            let log = Arc::clone(self);
+            let workspace = workspace_id.clone();
+            let conversation = conversation_id.clone();
+            let canonical = Arc::clone(&message);
+            let previous = cursor.take();
+            // 不在Tokio线程持有std mutex/同步文件I/O；一个批真实结束后才看取消/下一批。
+            let step = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                log.native_history_publication_read_step(
+                    &workspace,
+                    &conversation,
+                    canonical.as_ref(),
+                    previous,
+                )
+            })
+            .await
+            .map_err(|error| ChatEventLogError::Serialization(error.to_string()))??;
+            if cancel.is_cancelled() {
+                return Err(ChatEventLogError::NativeHistoryReadCancelled);
+            }
+            match step {
+                NativeHistoryReadStep::Ready(events) => return Ok(events),
+                NativeHistoryReadStep::Pending(next) => {
+                    cursor = Some(next);
+                    #[cfg(test)]
+                    {
+                        let barrier = self
+                            .native_history_read_test_barrier
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .take();
+                        if let Some(barrier) = barrier {
+                            barrier.entered.notify_one();
+                            barrier.release.notified().await;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
+    fn native_history_publication_read_step(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        message: &echo_agent::llm::types::Message,
+        cursor: Option<NativeHistoryReadCursor>,
+    ) -> Result<NativeHistoryReadStep, ChatEventLogError> {
+        let stream = stream_id(workspace_id, Some(conversation_id), conversation_id)?;
+        let mut cursor = if let Some(cursor) = cursor {
+            if cursor.stream_id != stream {
+                return Err(ChatEventLogError::NativeHistoryReadChanged);
+            }
+            cursor
+        } else {
+            let Some(cached) = self.stream_journal(&stream, false)? else {
+                return Ok(NativeHistoryReadStep::Ready(Vec::new()));
+            };
+            let (identity, head) = {
+                let guard = lock_cached_stream(&cached);
+                let Some(authority) = guard.as_ref() else {
+                    return Err(ChatEventLogError::NativeHistoryReadChanged);
+                };
+                (
+                    authority.journal.journal_identity().clone(),
+                    authority.journal.last_sequence(),
+                )
+            };
+            NativeHistoryReadCursor {
+                stream_id: stream.clone(),
+                cached,
+                journal_identity: identity,
+                head,
+            }
+        };
+        let mut guard = lock_cached_stream(&cursor.cached);
+        let Some(authority) = guard.as_mut() else {
+            return Err(ChatEventLogError::NativeHistoryReadChanged);
+        };
+        if authority.journal.journal_identity() != &cursor.journal_identity {
+            return Err(ChatEventLogError::NativeHistoryReadChanged);
+        }
+        let (through, _) = advance_native_publication_projection_through(authority, cursor.head)?;
+        if through < cursor.head {
+            drop(guard);
+            return Ok(NativeHistoryReadStep::Pending(cursor));
+        }
+        let events = match native_publications_for_message(authority, message, Some(cursor.head)) {
+            Ok(events) => events,
+            Err(ChatEventLogError::NativeHistorySnapshotAdvanced { .. }) => {
+                // 同原generation出现了新pub投影，自动重定一次有限head，不能混头/换owner。
+                cursor.head = authority.journal.last_sequence();
+                drop(guard);
+                return Ok(NativeHistoryReadStep::Pending(cursor));
+            }
+            Err(error) => return Err(error),
+        };
+        if through == authority.journal.last_sequence() {
+            self.prune_native_history_checkpointed(authority, &stream);
+        }
+        drop(guard);
+        self.evict_inactive_streams(None);
+        Ok(NativeHistoryReadStep::Ready(events))
     }
 
     /// Close ordinary-Chat command cells whose process owner disappeared.
@@ -1925,6 +2099,24 @@ impl ChatEventLog {
     }
 
     fn maintain_retention(&self, authority: &mut StreamAuthority, stream_id: &str) {
+        // 原journal prune合同要求先耐久保存将被裁前缀。投影失败/追平未完时保原事实，
+        // 不能重试已commit的append，也不能拿缺原pub的history冒成功。
+        match advance_native_publication_projection(authority) {
+            Ok((through, head)) if through == head => {}
+            Ok((through, head)) => {
+                tracing::debug!(%stream_id, through, head, "native publication projection continues in bounded batches; prune deferred");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%stream_id, %error, "native publication checkpoint unconfirmed; original journal retained");
+                return;
+            }
+        }
+        self.prune_native_history_checkpointed(authority, stream_id);
+    }
+
+    // 只由已确认原coverage覆盖当前head的路径调用；不重复读日志，也不新增deadline。
+    fn prune_native_history_checkpointed(&self, authority: &mut StreamAuthority, stream_id: &str) {
         let metadata = authority.journal.retention_metadata();
         let segments = authority.journal.segments();
         if segments.len() <= self.retention.max_segments && !metadata.cleanup_pending {
@@ -1938,8 +2130,22 @@ impl ChatEventLog {
             .pins
             .earliest()
             .map_or(natural_keep, |pin| natural_keep.min(pin));
+        #[cfg(feature = "test-utils")]
+        native_history_perf_io_event(authority, "retention_prune", "attempt");
         match authority.journal.prune_closed_segments_before(keep_from) {
             Ok(receipt) => {
+                #[cfg(feature = "test-utils")]
+                native_history_perf_io_event(
+                    authority,
+                    "retention_prune",
+                    if matches!(&receipt.commit, JournalPruneCommitStatus::Confirmed)
+                        && matches!(&receipt.cleanup, JournalPhysicalCleanupStatus::Confirmed)
+                    {
+                        "success"
+                    } else {
+                        "failure"
+                    },
+                );
                 authority.pins.discard_before(receipt.retained_floor);
                 if let JournalPruneCommitStatus::Degraded { error } = receipt.commit {
                     tracing::warn!(%error, %stream_id, retained_floor = receipt.retained_floor, "chat event retention marker committed with a degraded barrier");
@@ -1949,6 +2155,8 @@ impl ChatEventLog {
                 }
             }
             Err(error) => {
+                #[cfg(feature = "test-utils")]
+                native_history_perf_io_event(authority, "retention_prune", "failure");
                 tracing::warn!(error = %error, %stream_id, "chat event retention remains pending after a committed safe point")
             }
         }

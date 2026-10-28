@@ -9,6 +9,7 @@ import { MessageBubble } from '../components/chat/MessageBubble';
 
 const mocks = vi.hoisted(() => ({
   getConversation: vi.fn(),
+  listWorkspaces: vi.fn(),
   listToolExecutions: vi.fn(),
   restoreConversation: vi.fn(),
   branchConversation: vi.fn(),
@@ -26,6 +27,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../api/endpoints', () => ({
   sessionApi: { reset: mocks.resetSession },
+  workspaceApi: { list: mocks.listWorkspaces },
   conversationApi: {
     list: mocks.listConversations,
     createSide: mocks.createSideConversation,
@@ -44,6 +46,8 @@ vi.mock('../api/endpoints', () => ({
 }));
 
 import type { ChatMessage, SavedMessage } from '../types/api';
+import type { ConversationForkRequest } from '../api/endpoints';
+import { useWorkspaceStore } from './workspaceStore';
 import { useChatStore } from './chatStore';
 import { chatMessagesToSaved, restoredMessageId, useConversationStore } from './conversationStore';
 
@@ -53,6 +57,50 @@ function deferred<T>() {
     resolve = next;
   });
   return { promise, resolve };
+}
+
+function forkRequest(): ConversationForkRequest {
+  return {
+    destination: 'current_workspace',
+    preparation: {
+      request_id: 'fork-request-1',
+      workspace_id: 'global',
+      workspace_generation: 'global',
+      source_id: 'conversation-1',
+      user_turn_index: 0,
+      prefix_sha256: 'prefix-sha',
+      message_count: 2,
+      worktree: {
+        available: false,
+        reason: '非 Git 工作空间',
+        repo_root: null,
+        head: null,
+        branch: 'eko/fork-test',
+        path: null,
+        project_location: { kind: 'local', path: '/source' },
+        ssh_target: null,
+        source_connection_generation: null,
+        draft_connection_id: null,
+      },
+    },
+  };
+}
+
+function forkReceipt() {
+  return {
+    success: true,
+    id: 'branch-1',
+    source_id: 'conversation-1',
+    source_workspace_id: 'global',
+    message_count: 2,
+    target_content: 'canonical user prompt',
+    request_id: 'fork-request-1',
+    destination: 'current_workspace' as const,
+    workspace_id: 'global',
+    workspace_generation: 'global',
+    conversation_created: true,
+    imported: true,
+  };
 }
 
 function sideEntry() {
@@ -77,9 +125,15 @@ function sideEntry() {
 beforeEach(() => {
   vi.clearAllMocks();
   useToastStore.getState().clearAll();
+  useWorkspaceStore.setState({
+    current: null,
+    isLoading: false,
+    workspaces: [],
+  });
   mocks.listToolExecutions.mockResolvedValue([]);
   mocks.restoreConversation.mockResolvedValue(undefined);
   mocks.listConversations.mockResolvedValue([]);
+  mocks.listWorkspaces.mockResolvedValue({ workspaces: [], count: 0 });
   mocks.updateConversation.mockResolvedValue(undefined);
   mocks.retrySideConversation.mockResolvedValue({
     creation: { duplicate: true, entry: { group_id: 'side-group-1' } },
@@ -93,13 +147,7 @@ beforeEach(() => {
     conversation_id: 'conversation-1',
     archived: false,
   });
-  mocks.branchConversation.mockResolvedValue({
-    success: true,
-    id: 'branch-1',
-    source_id: 'conversation-1',
-    message_count: 2,
-    target_content: 'canonical user prompt',
-  });
+  mocks.branchConversation.mockResolvedValue(forkReceipt());
   mocks.resetSession.mockResolvedValue(undefined);
   mocks.saveConversation.mockImplementation(async (_workspaceId, data) => ({
     kind: 'primary',
@@ -450,10 +498,16 @@ describe('conversation message identity', () => {
       ],
     });
 
-    const id = await useConversationStore.getState().forkCurrent(0);
+    const id = await useConversationStore.getState().forkCurrent(forkRequest());
 
-    expect(id).toBe('branch-1');
-    expect(mocks.branchConversation).toHaveBeenCalledWith('global', 'conversation-1', 0, true);
+    expect(id).toMatchObject({ id: 'branch-1', opened: true });
+    expect(mocks.branchConversation).toHaveBeenCalledWith(
+      'global',
+      'conversation-1',
+      0,
+      true,
+      forkRequest()
+    );
     expect(useConversationStore.getState().conversations.map((item) => item.id)).toEqual([
       'conversation-1',
       'branch-1',
@@ -468,15 +522,301 @@ describe('conversation message identity', () => {
   });
 
   it('does not replace a newer conversation selection when Fork completes late', async () => {
-    const response = deferred<{ id: string }>();
+    const response = deferred<ReturnType<typeof forkReceipt>>();
     mocks.branchConversation.mockReturnValueOnce(response.promise);
     useConversationStore.setState({ activeId: 'conversation-1' });
-    const forking = useConversationStore.getState().forkCurrent(0);
+    const forking = useConversationStore.getState().forkCurrent(forkRequest());
     useConversationStore.setState({ activeId: 'conversation-2' });
-    response.resolve({ id: 'branch-1' });
+    response.resolve(forkReceipt());
     await forking;
     expect(useConversationStore.getState().activeId).toBe('conversation-2');
     expect(mocks.getConversation).not.toHaveBeenCalled();
+  });
+
+  it('keeps a cancelled observer or newer page from opening a completed Fork', async () => {
+    useConversationStore.setState({ activeId: 'conversation-1' });
+    const response = deferred<ReturnType<typeof forkReceipt>>();
+    mocks.branchConversation.mockReturnValueOnce(response.promise);
+    let currentPage = true;
+    const forking = useConversationStore.getState().forkCurrent(forkRequest(), () => currentPage);
+    currentPage = false;
+    response.resolve(forkReceipt());
+    expect(await forking).toMatchObject({ id: 'branch-1', opened: false });
+    expect(mocks.getConversation).not.toHaveBeenCalled();
+    expect(useConversationStore.getState().activeId).toBe('conversation-1');
+    await expect(
+      useConversationStore.getState().forkCurrent(forkRequest(), () => false)
+    ).resolves.toMatchObject({ opened: false });
+    expect(mocks.getConversation).not.toHaveBeenCalled();
+  });
+
+  it('retains partial workspace facts without opening or deleting them', async () => {
+    useConversationStore.setState({ activeId: 'conversation-1' });
+    const workspace = {
+      id: 'new-workspace',
+      name: '保留的空间',
+      root: '/product/new',
+      created_at: '2026-10-27T00:00:00Z',
+      last_active: '2026-10-27T00:00:00Z',
+      kind: { type: 'code' },
+      metadata: { tags: [] },
+      product_data_generation: 'new-generation',
+    };
+    mocks.listWorkspaces.mockResolvedValueOnce({ workspaces: [workspace], count: 1 });
+    mocks.branchConversation.mockResolvedValueOnce({
+      ...forkReceipt(),
+      success: false,
+      imported: false,
+      id: null,
+      workspace,
+      workspace_id: workspace.id,
+      workspace_generation: workspace.product_data_generation,
+      error: '原文迁移失败',
+    });
+    const result = await useConversationStore.getState().forkCurrent(forkRequest());
+    expect(result).toMatchObject({
+      opened: false,
+      workspace,
+      error: '原文迁移失败',
+    });
+    expect(useWorkspaceStore.getState().workspaces).toContainEqual(workspace);
+    expect(useConversationStore.getState().activeId).toBe('conversation-1');
+    expect(mocks.getConversation).not.toHaveBeenCalled();
+  });
+
+  it('does not replace a reopened target generation with a late fork resource receipt', async () => {
+    useConversationStore.setState({ activeId: 'conversation-1' });
+    const workspace = {
+      id: 'reopened-target',
+      name: '当前新代际',
+      root: '/product/current',
+      created_at: '2026-10-27T00:00:00Z',
+      last_active: '2026-10-27T00:00:00Z',
+      kind: { type: 'code' },
+      metadata: { tags: [] },
+      product_data_generation: 'current-generation',
+    };
+    useWorkspaceStore.setState({ workspaces: [workspace] });
+    const stale = {
+      ...workspace,
+      name: '旧回执',
+      product_data_generation: 'retired-generation',
+    };
+    mocks.branchConversation.mockResolvedValueOnce({
+      ...forkReceipt(),
+      success: false,
+      imported: false,
+      id: null,
+      workspace: stale,
+      workspace_id: stale.id,
+      workspace_generation: stale.product_data_generation,
+      error: '历史复制未完成',
+    });
+    const receipt = await useConversationStore.getState().forkCurrent(forkRequest());
+    expect(receipt).toMatchObject({ opened: false, workspace: stale });
+    expect(useWorkspaceStore.getState().workspaces).toEqual([workspace]);
+    expect(mocks.getConversation).not.toHaveBeenCalled();
+  });
+
+  it('does not switch to a successor target generation after a successful old fork receipt', async () => {
+    const switchTo = useWorkspaceStore.getState().switchTo;
+    const switching = vi.fn();
+    const workspace = {
+      id: 'reopened-success',
+      name: '真实新目标',
+      root: '/product/current',
+      created_at: '2026-10-27T00:00:00Z',
+      last_active: '2026-10-27T00:00:00Z',
+      kind: { type: 'code' },
+      metadata: { tags: [] },
+      product_data_generation: 'current-generation',
+    };
+    const stale = { ...workspace, product_data_generation: 'old-generation' };
+    useConversationStore.setState({ activeId: 'conversation-1' });
+    useWorkspaceStore.setState({ workspaces: [workspace], switchTo: switching });
+    const request = forkRequest();
+    request.destination = 'new_worktree';
+    mocks.branchConversation.mockResolvedValueOnce({
+      ...forkReceipt(),
+      destination: 'new_worktree',
+      workspace: stale,
+      workspace_id: stale.id,
+      workspace_generation: stale.product_data_generation,
+    });
+    try {
+      const receipt = await useConversationStore.getState().forkCurrent(request);
+      expect(receipt).toMatchObject({ success: true, opened: false });
+      expect(switching).not.toHaveBeenCalled();
+      expect(useWorkspaceStore.getState().workspaces).toEqual([workspace]);
+      expect(mocks.getConversation).not.toHaveBeenCalled();
+    } finally {
+      useWorkspaceStore.setState({ switchTo });
+    }
+  });
+
+  it('does not resurrect a target deleted from the canonical registry after a fork receipt', async () => {
+    useConversationStore.setState({ activeId: 'conversation-1' });
+    const workspace = {
+      id: 'deleted-target',
+      name: '旧资源',
+      root: '/product/deleted',
+      created_at: '',
+      last_active: '',
+      kind: { type: 'code' },
+      metadata: { tags: [] },
+      product_data_generation: 'old-generation',
+    };
+    mocks.branchConversation.mockResolvedValueOnce({
+      ...forkReceipt(),
+      workspace,
+      workspace_id: workspace.id,
+      workspace_generation: workspace.product_data_generation,
+    });
+    mocks.listWorkspaces.mockResolvedValueOnce({ workspaces: [], count: 0 });
+    expect(await useConversationStore.getState().forkCurrent(forkRequest())).toMatchObject({
+      opened: false,
+      workspace,
+    });
+    expect(useWorkspaceStore.getState().workspaces).toEqual([]);
+    expect(mocks.getConversation).not.toHaveBeenCalled();
+  });
+
+  it('rejects a mismatched source generation before any creation', async () => {
+    useConversationStore.setState({ activeId: 'conversation-1' });
+    const request = forkRequest();
+    request.preparation.workspace_generation = 'stale-generation';
+    await expect(useConversationStore.getState().forkCurrent(request)).rejects.toThrow(
+      '来源已变化'
+    );
+    expect(mocks.branchConversation).not.toHaveBeenCalled();
+  });
+
+  it('opens the exact new workspace and imported idle conversation through the original switch', async () => {
+    const switchTo = useWorkspaceStore.getState().switchTo;
+    const workspace = {
+      id: 'new-workspace',
+      name: '独立空间',
+      root: '/product/new',
+      created_at: '2026-10-27T00:00:00Z',
+      last_active: '2026-10-27T00:00:00Z',
+      kind: { type: 'code' },
+      metadata: { tags: [] },
+      product_data_generation: 'target-generation',
+    };
+    const request = forkRequest();
+    request.destination = 'new_worktree';
+    useConversationStore.setState({ activeId: 'conversation-1' });
+    mocks.listWorkspaces.mockResolvedValueOnce({ workspaces: [workspace], count: 1 });
+    mocks.branchConversation.mockResolvedValueOnce({
+      ...forkReceipt(),
+      destination: 'new_worktree',
+      workspace,
+      workspace_id: workspace.id,
+      workspace_generation: workspace.product_data_generation,
+    });
+    mocks.getConversation.mockResolvedValueOnce({
+      messages: [
+        { role: 'user', content: '源问题' },
+        { role: 'assistant', content: '完整回复' },
+      ],
+    });
+    const switching = vi.fn(async (id: string) => {
+      useConversationStore.getState().detachForWorkspace('global');
+      useWorkspaceStore.setState({ current: workspace });
+      await useConversationStore.getState().init(id);
+    });
+    useWorkspaceStore.setState({ switchTo: switching });
+    try {
+      const receipt = await useConversationStore.getState().forkCurrent(request);
+      expect(receipt).toMatchObject({
+        opened: true,
+        workspace_id: workspace.id,
+        id: 'branch-1',
+      });
+      expect(switching).toHaveBeenCalledExactlyOnceWith(
+        workspace.id,
+        undefined,
+        workspace.product_data_generation
+      );
+      expect(mocks.getConversation).toHaveBeenCalledWith(workspace.id, 'branch-1');
+      expect(mocks.restoreConversation).toHaveBeenCalledWith(workspace.id, 'branch-1');
+      expect(useConversationStore.getState().activeId).toBe('branch-1');
+    } finally {
+      useWorkspaceStore.setState({ switchTo });
+    }
+  });
+
+  it('keeps a created target when switching fails and never reports it as uncreated', async () => {
+    const switchTo = useWorkspaceStore.getState().switchTo;
+    const workspace = {
+      id: 'new-workspace',
+      name: '尚未打开',
+      root: '/product/new',
+      created_at: '2026-10-27T00:00:00Z',
+      last_active: '2026-10-27T00:00:00Z',
+      kind: { type: 'code' },
+      metadata: { tags: [] },
+      product_data_generation: 'target-generation',
+    };
+    const request = forkRequest();
+    request.destination = 'new_worktree';
+    useConversationStore.setState({ activeId: 'conversation-1' });
+    mocks.listWorkspaces.mockResolvedValueOnce({ workspaces: [workspace], count: 1 });
+    mocks.branchConversation.mockResolvedValueOnce({
+      ...forkReceipt(),
+      destination: 'new_worktree',
+      workspace,
+      workspace_id: workspace.id,
+      workspace_generation: workspace.product_data_generation,
+    });
+    useWorkspaceStore.setState({
+      switchTo: vi.fn().mockRejectedValue(new Error('真实目标连接已断开')),
+    });
+    try {
+      expect(await useConversationStore.getState().forkCurrent(request)).toMatchObject({
+        success: true,
+        imported: true,
+        opened: false,
+        workspace,
+        open_error: '真实目标连接已断开',
+      });
+      expect(useWorkspaceStore.getState().workspaces).toContainEqual(workspace);
+      expect(mocks.getConversation).not.toHaveBeenCalled();
+    } finally {
+      useWorkspaceStore.setState({ switchTo });
+    }
+  });
+
+  it('does not publish a fork whose observer closes during history hydration', async () => {
+    useConversationStore.setState({ activeId: 'conversation-1' });
+    const sourceMessages: ChatMessage[] = [
+      {
+        id: 'original',
+        role: 'assistant',
+        content: '保留原历史',
+        timestamp: 1,
+      },
+    ];
+    useChatStore.getState().replaceMessages(sourceMessages);
+    mocks.getConversation.mockResolvedValueOnce({
+      messages: [
+        { role: 'user', content: '源问题' },
+        { role: 'assistant', content: '复制回复' },
+      ],
+    });
+    const restoration = deferred<void>();
+    mocks.restoreConversation.mockReturnValueOnce(restoration.promise);
+    let observing = true;
+    const forking = useConversationStore.getState().forkCurrent(forkRequest(), () => observing);
+    await waitFor(() =>
+      expect(mocks.restoreConversation).toHaveBeenCalledWith('global', 'branch-1')
+    );
+    observing = false;
+    restoration.resolve(undefined);
+    expect(await forking).toMatchObject({ opened: false });
+    expect(useConversationStore.getState().activeId).toBe('conversation-1');
+    expect(useConversationStore.getState().isLoading).toBe(false);
+    expect(useChatStore.getState().messages).toEqual(sourceMessages);
   });
 
   it('preserves the source selection and transcript when Fork fails', async () => {
@@ -485,7 +825,7 @@ describe('conversation message identity', () => {
     useChatStore
       .getState()
       .replaceMessages([{ id: 'reply', role: 'assistant', content: 'original', timestamp: 1 }]);
-    await expect(useConversationStore.getState().forkCurrent(0)).rejects.toThrow(
+    await expect(useConversationStore.getState().forkCurrent(forkRequest())).rejects.toThrow(
       'source turn is active'
     );
     expect(useConversationStore.getState().activeId).toBe('conversation-1');
@@ -1344,7 +1684,9 @@ describe('canonical tool transcript recovery', () => {
   });
 
   it('keeps a new active stream when an old history request returns late', async () => {
-    const old = deferred<{ messages: ReturnType<typeof canonicalHistoryCall>[] }>();
+    const old = deferred<{
+      messages: ReturnType<typeof canonicalHistoryCall>[];
+    }>();
     mocks.getConversation.mockReturnValueOnce(old.promise);
     const pending = useConversationStore.getState().loadConversation('canonical-history');
     await useConversationStore.getState().startNew();

@@ -3,7 +3,7 @@ import { transcriptToolExecution, type ChatMessage } from '../../types/api';
 import { Copy, Check, RefreshCw, GitFork, Pencil, X, ArrowUp, File, Download } from 'lucide-react';
 import MarkdownContent from '../common/MarkdownContent';
 import { ThinkingSegment } from './ThinkingSegment';
-import { NativeMessageTimeline } from './NativeMessageTimeline';
+import { NativeMessageTimeline, nativeAssistantBlockText } from './NativeMessageTimeline';
 import { ParallelExecutionBlock, visibleSubagentRuns } from './ParallelExecutionBlock';
 import { ToolExecutionGroup } from './ToolExecutionGroup';
 import { ExecutionProcessGroup } from './ExecutionProcessGroup';
@@ -222,7 +222,7 @@ export const MessageBubble = memo(function MessageBubble({
   const executionItems = groupExecutionSteps(steps);
   const hasNativeTimeline = Boolean(message.assistantBlocks?.length);
   const hasVisibleNativeContent = message.assistantBlocks?.some(
-    (view) => view.block.phase !== 'final_answer' && Boolean(view.content.trim())
+    (view) => view.block.phase !== 'final_answer' && Boolean(nativeAssistantBlockText(view).trim())
   );
   const activeRun = useTaskRuntimeStore((state) => state.activeRun);
   const subagentRuns = useSubagentRunStore((state) => state.runs);

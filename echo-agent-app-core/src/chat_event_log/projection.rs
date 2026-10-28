@@ -1,3 +1,516 @@
+// 查询/追平只读一个固定原journal batch；调用者可用Pending中的cursor续接，
+// 不能把tail4096或尚未追平的投影冒充完整history。
+const NATIVE_HISTORY_PROJECTION_BATCH: usize = REPLAY_BATCH_SIZE;
+const NATIVE_HISTORY_DIRECTORY: &str = "native-publications";
+
+fn native_history_message_requires_publications(message: &echo_agent::llm::types::Message) -> bool {
+    message.role == echo_agent::llm::types::Role::Assistant
+        && (message
+            .approved_assistant_blocks
+            .as_ref()
+            .is_some_and(|blocks| !blocks.is_empty())
+            || message.execution_status.is_some())
+}
+
+fn native_publication_key<T: Serialize>(
+    kind: &str,
+    value: &T,
+) -> Result<String, ChatEventLogError> {
+    let bytes = echo_agent::utils::canonical_json::canonical_json_bytes(value)
+        .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
+    Ok(format!("{kind}-{}", digest(&bytes)))
+}
+
+fn native_product_key(event: &ChatEventEnvelope) -> Result<String, ChatEventLogError> {
+    native_publication_key(
+        "product",
+        &(
+            &event.workspace_id,
+            &event.conversation_id,
+            &event.root_turn_id,
+            &event.turn_id,
+            &event.message_id,
+        ),
+    )
+}
+
+fn native_publication_fact_key(
+    event: &ChatEventEnvelope,
+) -> Result<Option<String>, ChatEventLogError> {
+    use echo_agent::agent::{AgentEvent, ExecutionStatusKind};
+    match &event.payload {
+        ChatDriverEvent::Agent(agent) => match &agent.payload {
+            AgentEvent::AssistantMessage { block } => {
+                native_publication_key("block", block).map(Some)
+            }
+            AgentEvent::FinalAnswer(_) => agent
+                .execution_id
+                .as_ref()
+                .map(|execution| native_publication_key("final", &execution.as_str()))
+                .transpose(),
+            AgentEvent::ExecutionStatus(status)
+                if matches!(
+                    status.status,
+                    ExecutionStatusKind::Settled
+                        | ExecutionStatusKind::Failed
+                        | ExecutionStatusKind::Cancelled
+                ) =>
+            {
+                agent
+                    .execution_id
+                    .as_ref()
+                    .map(|execution| native_publication_key("terminal", &execution.as_str()))
+                    .transpose()
+            }
+            _ => Ok(None),
+        },
+        ChatDriverEvent::TurnStatus { status }
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") =>
+        {
+            native_product_key(event).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn native_execution_scope_key(
+    event: &ChatEventEnvelope,
+) -> Result<Option<String>, ChatEventLogError> {
+    match &event.payload {
+        ChatDriverEvent::Agent(agent) => agent
+            .execution_id
+            .as_ref()
+            .map(|execution| native_publication_key("scope", &execution.as_str()))
+            .transpose(),
+        _ => Ok(None),
+    }
+}
+
+fn native_publication_same_scope(left: &ChatEventEnvelope, right: &ChatEventEnvelope) -> bool {
+    left.workspace_id == right.workspace_id
+        && left.conversation_id == right.conversation_id
+        && left.root_turn_id == right.root_turn_id
+        && left.turn_id == right.turn_id
+        && left.message_id == right.message_id
+}
+
+fn native_history_checkpoint<S>(authority: &StreamAuthority, name: &str) -> FileCheckpointStore<S> {
+    FileCheckpointStore::open(
+        authority
+            .journal
+            .directory()
+            .join(NATIVE_HISTORY_DIRECTORY)
+            .join(format!("{name}.json")),
+    )
+}
+
+fn validate_native_anchor(
+    authority: &StreamAuthority,
+    expected_key: &str,
+    frame: &echo_agent::state::journal::CheckpointFrame<NativePublicationAnchor>,
+) -> Result<(), ChatEventLogError> {
+    let path = authority.journal.directory();
+    if &frame.journal_identity != authority.journal.journal_identity()
+        || frame.sequence > authority.journal.last_sequence()
+        || frame.state.key != expected_key
+        || frame.state.records.len() > 2
+    {
+        return Err(corrupt(
+            path,
+            "native publication checkpoint identity/key/coverage mismatch",
+        ));
+    }
+    for event in &frame.state.records {
+        if event.stream_id != authority.expected_stream_id
+            || event.sequence > frame.sequence
+            || (native_publication_fact_key(event)?.as_deref() != Some(expected_key)
+                && native_execution_scope_key(event)?.as_deref() != Some(expected_key))
+        {
+            return Err(corrupt(
+                path,
+                "native publication checkpoint contains a foreign original record",
+            ));
+        }
+        validate_driver_event(&event.payload)?;
+        validate_event_stream_identity(
+            &event.workspace_id,
+            event.conversation_id.as_deref(),
+            &event.root_turn_id,
+            &event.payload,
+        )?;
+    }
+    Ok(())
+}
+
+fn preserve_native_publication(
+    authority: &StreamAuthority,
+    event: &ChatEventEnvelope,
+    confirmed_through: u64,
+) -> Result<(), ChatEventLogError> {
+    // 原statusful validator检查同execution全部Agent事件的outer scope。
+    // 每个不同scope保原record见证，不能丢掉Token/ToolCall中的跨owner拒绝依据。
+    let mut keys = Vec::new();
+    if let Some(key) = native_publication_fact_key(event)? {
+        keys.push(key);
+    }
+    if let Some(key) = native_execution_scope_key(event)? {
+        keys.push(key);
+    }
+    for key in keys {
+        preserve_native_publication_key(authority, event, &key, confirmed_through)?;
+    }
+    Ok(())
+}
+
+fn preserve_native_publication_key(
+    authority: &StreamAuthority,
+    event: &ChatEventEnvelope,
+    key: &str,
+    confirmed_through: u64,
+) -> Result<(), ChatEventLogError> {
+    let checkpoint = native_history_checkpoint::<NativePublicationAnchor>(authority, key);
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(authority, "anchor_load", "attempt");
+    let load_result = checkpoint.load();
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(
+        authority,
+        "anchor_load",
+        if load_result.is_ok() {
+            "success"
+        } else {
+            "failure"
+        },
+    );
+    let loaded =
+        load_result.map_err(|error| journal_error(authority.journal.directory(), error))?;
+    let mut state = if let Some(frame) = loaded.as_ref() {
+        validate_native_anchor(authority, key, frame)?;
+        frame.state.clone()
+    } else {
+        NativePublicationAnchor {
+            key: key.to_string(),
+            records: Vec::new(),
+            ambiguous: false,
+        }
+    };
+    let through = loaded
+        .as_ref()
+        .filter(|frame| &frame.journal_identity == authority.journal.journal_identity())
+        .map_or(event.sequence, |frame| frame.sequence.max(event.sequence));
+    let identical = if key.starts_with("scope-") {
+        state
+            .records
+            .iter()
+            .any(|previous| native_publication_same_scope(previous, event))
+    } else {
+        let encoded = echo_agent::utils::canonical_json::canonical_json_bytes(event)
+            .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
+        state
+            .records
+            .iter()
+            .map(echo_agent::utils::canonical_json::canonical_json_bytes)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?
+            .iter()
+            .any(|record| *record == encoded)
+    };
+    if identical
+        && loaded
+            .as_ref()
+            .is_some_and(|frame| frame.sequence <= confirmed_through)
+    {
+        // 此原record的barrier已由先前成功投影/当前有界batch确认，无须每个Token重写快照。
+        return Ok(());
+    }
+    if !identical {
+        if key.starts_with("product-") {
+            // 原validator本来取同scope最后一个真实product terminal；不保整条状态流。
+            if state
+                .records
+                .first()
+                .is_none_or(|previous| event.sequence > previous.sequence)
+            {
+                state.records = vec![event.clone()];
+            }
+        } else if state.records.len() < 2 {
+            // 唯一许可需要原全记录；两个不同见证已足以暴露非唯一来源。
+            state.records.push(event.clone());
+        } else {
+            state.ambiguous = true;
+        }
+    }
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(authority, "anchor_save", "attempt");
+    let save_result = checkpoint.save(authority.journal.journal_identity(), &state, through);
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(
+        authority,
+        "anchor_save",
+        if save_result.is_ok() {
+            "success"
+        } else {
+            "failure"
+        },
+    );
+    save_result.map_err(|error| journal_error(authority.journal.directory(), error))
+}
+
+fn advance_native_publication_projection(
+    authority: &StreamAuthority,
+) -> Result<(u64, u64), ChatEventLogError> {
+    advance_native_publication_projection_through(authority, authority.journal.last_sequence())
+}
+
+fn advance_native_publication_projection_through(
+    authority: &StreamAuthority,
+    frozen_head: u64,
+) -> Result<(u64, u64), ChatEventLogError> {
+    let path = authority.journal.directory();
+    // 先确认原journal，不从仅存在于checkpoint的内容创造事实。
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(authority, "journal_sync", "attempt");
+    let sync_result = authority.journal.sync_data();
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(
+        authority,
+        "journal_sync",
+        if sync_result.is_ok() {
+            "success"
+        } else {
+            "failure"
+        },
+    );
+    sync_result.map_err(|error| journal_error(path, error))?;
+    let floor = authority.journal.retention_metadata().retained_floor;
+    let actual_head = authority.journal.last_sequence();
+    if frozen_head > actual_head {
+        return Err(ChatEventLogError::NativeHistoryReadChanged);
+    }
+    let head = frozen_head;
+    let checkpoint = native_history_checkpoint::<NativePublicationCoverage>(authority, "coverage");
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(authority, "coverage_load", "attempt");
+    let load_result = checkpoint.load();
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(
+        authority,
+        "coverage_load",
+        if load_result.is_ok() {
+            "success"
+        } else {
+            "failure"
+        },
+    );
+    let loaded = load_result.map_err(|error| journal_error(path, error))?;
+    let (mut through, coverage) = if let Some(frame) = loaded {
+        if &frame.journal_identity != authority.journal.journal_identity() {
+            return Err(corrupt(
+                path,
+                "native publication coverage belongs to a foreign journal generation",
+            ));
+        }
+        if frame.sequence > actual_head
+            || frame.state.first_observed_sequence == 0
+            || frame.state.first_observed_sequence > frame.sequence.saturating_add(1)
+        {
+            return Err(corrupt(
+                path,
+                "native publication coverage exceeds original journal",
+            ));
+        }
+        if frame.sequence < floor.saturating_sub(1) {
+            return Err(ChatEventLogError::NativeHistoryGap {
+                retained_floor: floor,
+                key: "coverage".into(),
+            });
+        }
+        (frame.sequence, frame.state)
+    } else {
+        (
+            floor.saturating_sub(1),
+            NativePublicationCoverage {
+                first_observed_sequence: floor,
+            },
+        )
+    };
+    // 原前缀未受此generation的可靠coverage覆盖，就不能证明后缀没有漏掉第二owner。
+    // 这不是空checkpoint：保留原journal并明确gap，不静默重建唯一性或成功。
+    if coverage.first_observed_sequence != 1 {
+        return Err(ChatEventLogError::NativeHistoryGap {
+            retained_floor: floor,
+            key: "original-prefix-uncovered".into(),
+        });
+    }
+    if through < head {
+        let batch = authority
+            .journal
+            .replay_after(through, NATIVE_HISTORY_PROJECTION_BATCH)
+            .map_err(|error| journal_error(path, error))?;
+        if batch.is_empty() {
+            return Err(corrupt(
+                path,
+                "native publication bounded replay did not reach original head",
+            ));
+        }
+        for record in batch {
+            if record.sequence > head {
+                break;
+            }
+            if record.sequence != through.saturating_add(1) {
+                return Err(corrupt(
+                    path,
+                    "native publication bounded replay skipped original sequence",
+                ));
+            }
+            let event = envelope_from_record(record, path, &authority.expected_stream_id)?;
+            preserve_native_publication(authority, &event, through)?;
+            through = event.sequence;
+        }
+    }
+    // 所有原pub原子落盘以后才提交coverage；任何barrier错误都阻止后续prune。
+    // 即使load已见rename，也重新save以确认本次父目录barrier，不把degraded当成功。
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(authority, "coverage_save", "attempt");
+    let save_result = checkpoint.save(authority.journal.journal_identity(), &coverage, through);
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(
+        authority,
+        "coverage_save",
+        if save_result.is_ok() {
+            "success"
+        } else {
+            "failure"
+        },
+    );
+    save_result.map_err(|error| journal_error(path, error))?;
+    Ok((through, head))
+}
+
+fn read_native_publication_anchor(
+    authority: &StreamAuthority,
+    key: &str,
+    frozen_head: Option<u64>,
+) -> Result<Vec<ChatEventEnvelope>, ChatEventLogError> {
+    let checkpoint = native_history_checkpoint::<NativePublicationAnchor>(authority, key);
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(authority, "anchor_load", "attempt");
+    let load_result = checkpoint.load();
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(
+        authority,
+        "anchor_load",
+        if load_result.is_ok() {
+            "success"
+        } else {
+            "failure"
+        },
+    );
+    let loaded =
+        load_result.map_err(|error| journal_error(authority.journal.directory(), error))?;
+    let Some(frame) = loaded else {
+        // 完整coverage下未出现的事实是权威缺席；例如Candidate不保证真的发过Settled。
+        // 原前缀缺coverage已由advance明确Gap，不能按当前floor误判为事实丢失。
+        return Ok(Vec::new());
+    };
+    validate_native_anchor(authority, key, &frame)?;
+    if let Some(head) = frozen_head
+        && (frame
+            .state
+            .records
+            .iter()
+            .any(|event| event.sequence > head)
+            || (frame.state.ambiguous && frame.sequence > head))
+    {
+        // product最后状态等投影已越过冻结读点，不能拼接不同head的事实。
+        return Err(ChatEventLogError::NativeHistorySnapshotAdvanced {
+            frozen_head: head,
+            latest_sequence: authority.journal.last_sequence(),
+        });
+    }
+    if frame.state.ambiguous {
+        return Err(corrupt(
+            authority.journal.directory(),
+            "native publication has more than one original source",
+        ));
+    }
+    Ok(frame.state.records)
+}
+
+fn native_publications_for_message(
+    authority: &StreamAuthority,
+    message: &echo_agent::llm::types::Message,
+    frozen_head: Option<u64>,
+) -> Result<Vec<ChatEventEnvelope>, ChatEventLogError> {
+    let mut keys = Vec::new();
+    for block in message
+        .approved_assistant_blocks
+        .as_deref()
+        .unwrap_or_default()
+    {
+        keys.push(native_publication_key("block", block)?);
+    }
+    if let Some(status) = message.execution_status.as_ref() {
+        keys.push(native_publication_key("final", &status.execution_id)?);
+        keys.push(native_publication_key("terminal", &status.execution_id)?);
+        keys.push(native_publication_key("scope", &status.execution_id)?);
+    }
+    keys.sort();
+    keys.dedup();
+    let mut events = Vec::new();
+    let mut scope_missing = false;
+    for key in keys {
+        let records = read_native_publication_anchor(authority, &key, frozen_head)?;
+        if key.starts_with("scope-") && records.is_empty() {
+            scope_missing = true;
+        }
+        events.extend(records);
+    }
+    if let Some(status) = message.execution_status.as_ref()
+        && scope_missing
+        && events.iter().any(|event| {
+            matches!(&event.payload, ChatDriverEvent::Agent(agent)
+            if agent.execution_id.as_ref().is_some_and(|id| id.as_str() == status.execution_id))
+        })
+    {
+        // 已有同exec原事实却没scope见证，不能过滤掉跨消息拒绝依据后授权成功。
+        return Err(ChatEventLogError::NativeHistoryGap {
+            retained_floor: authority.journal.retention_metadata().retained_floor,
+            key: "required-execution-scope".into(),
+        });
+    }
+    // product terminal按原outer scope读，绝不用Message/Candidate推断它是否存在。
+    if message.execution_status.is_some() {
+        let products = events
+            .iter()
+            .filter(|event| {
+                matches!(&event.payload, ChatDriverEvent::Agent(agent)
+                if matches!(&agent.payload, echo_agent::agent::AgentEvent::FinalAnswer(_)
+                    | echo_agent::agent::AgentEvent::ExecutionStatus(_)))
+            })
+            .map(native_product_key)
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        for key in products {
+            events.extend(read_native_publication_anchor(
+                authority,
+                &key,
+                frozen_head,
+            )?);
+        }
+    }
+    events.sort_by_key(|event| event.sequence);
+    let mut seen = HashSet::new();
+    let mut original = Vec::new();
+    for event in events {
+        let encoded = echo_agent::utils::canonical_json::canonical_json_bytes(&event)
+            .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
+        if seen.insert(encoded) {
+            original.push(event);
+        }
+    }
+    Ok(original)
+}
+
 struct EnumeratedStream {
     stream_id: String,
     path: PathBuf,
@@ -1435,4 +1948,84 @@ fn validate_unclaimed_channel_input(
     current
         .payload
         .validate_channel_digest(&receipt.identity.address)
+}
+
+// test-utils私有观测，产品默认构建不编译；跨blocking线程由原tracing dispatcher收集。
+// 记录调用尝试及Result结算，不把它解释为OS syscall、物理I/O字节或优化收益。
+#[cfg(feature = "test-utils")]
+fn native_history_perf_io_event(
+    authority: &StreamAuthority,
+    operation: &'static str,
+    stage: &'static str,
+) {
+    tracing::trace!(target: "eko::native_history::perf_io", path = %authority.journal.directory().display(), operation, stage);
+    #[cfg(test)]
+    native_history_perf_io::record(authority.journal.directory(), operation, stage);
+}
+
+#[cfg(all(test, feature = "test-utils"))]
+mod native_history_perf_io {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+    pub(super) struct Count {
+        pub(super) attempted: u64,
+        pub(super) succeeded: u64,
+        pub(super) failed: u64,
+    }
+    pub(super) type Counts = BTreeMap<&'static str, Count>;
+    static ACTIVE: Mutex<Option<(PathBuf, Counts)>> = Mutex::new(None);
+
+    pub(super) fn record(path: &Path, operation: &'static str, stage: &'static str) {
+        let mut active = ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
+        let Some((root, counts)) = active.as_mut() else {
+            return;
+        };
+        if !path.starts_with(root) {
+            return;
+        }
+        let count = counts.entry(operation).or_default();
+        match stage {
+            "attempt" => count.attempted = count.attempted.saturating_add(1),
+            "success" => count.succeeded = count.succeeded.saturating_add(1),
+            "failure" => count.failed = count.failed.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    pub(super) struct Observation {
+        root: PathBuf,
+        active: bool,
+    }
+    impl Observation {
+        pub(super) fn begin(root: PathBuf) -> Result<Self, String> {
+            let mut active = ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
+            if active.is_some() {
+                return Err("native I/O observation already owned".into());
+            }
+            *active = Some((root.clone(), Counts::new()));
+            Ok(Self { root, active: true })
+        }
+        pub(super) fn finish(mut self) -> Result<Counts, String> {
+            let mut active = ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
+            if active.as_ref().is_none_or(|(root, _)| *root != self.root) {
+                return Err("native I/O observation owner changed".into());
+            }
+            let (_, counts) = active.take().ok_or("I/O observation disappeared")?;
+            self.active = false;
+            Ok(counts)
+        }
+    }
+    impl Drop for Observation {
+        fn drop(&mut self) {
+            if self.active {
+                let mut active = ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
+                if active.as_ref().is_some_and(|(root, _)| *root == self.root) {
+                    *active = None;
+                }
+            }
+        }
+    }
 }

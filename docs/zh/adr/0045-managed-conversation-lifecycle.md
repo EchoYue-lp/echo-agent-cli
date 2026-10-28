@@ -31,3 +31,35 @@
 - 聚合删除仍是唯一 EKO 协调权威；框架 Managed transcript 与 runtime-state journal 保留自己的 CAS 语义。目标回滚已提交而 handoff 意图清理失败时，启动恢复识别目标 tombstone 并结算废弃意图，不再导入新 epoch。
 - 缺少 managed 请求的旧未完成 tombstone 明确保留恢复债务，不绑定到新建的同名 conversation。
 - 框架 examples 与 `echo-website` 不消费 EKO 删除 tombstone，无需同步修改。
+
+## 完整回复的两种工作空间分叉（2026-10-27）
+
+本节落实已批准合同。正式集成、产品构建、原生窗口及真实 SSH 的资格分别记录，ADR 的采纳不表示这些验证已完成。
+
+- 每轮只由运行时确认的最终完整回复提供一个入口；正文非空、工具调用结束或旧 ThinkEnd 不独立拥有最终资格。原生消息阶段和执行结算沿框架/EKO 唯一权威。未知旧历史不按文字措辞补造成功。编辑/重新生成保持原回合前边界；既有 Side Conversation 历史和树形导航保留。
+- 当前工作空间与新 Worktree 共用 canonical 前缀和原 managed import。新 Worktree 固定准备时的源 commit OID，源 HEAD 后来前进不改变本请求基点；不复制 dirty、untracked 或 ignored 代码。detached HEAD 有有效提交时可用，非 Git/unborn 只禁新 Worktree并说明原因。
+- 两种形式都创建空闲普通会话，沿目标工作空间原模型/权限装配。不克隆 Goal、TaskRun、Subagent、控制 owner 或源会话模型覆盖，不自动发出用户输入。复制历史中的目标文字不等于复制仍可执行的 Goal。
+- 稳定 request_id 绑定来源 workspace/generation、conversation、用户回合与 canonical 前缀 SHA。目标登记后仍按返回 generation 获取真实 scoped runtime 并持有原 lease，不能仅凭同名 ID 取得后继代际。迟到回执不能抢新导航或覆盖已重开目标的列表信息。
+- 原 create_worktree 与回复分叉使用相同 Git/FileSystem/锁。原生 `git worktree list --porcelain -z` 保留准确路径、完整 OID 和请求锁原因。add 成功而 list 失败保留已创建事实；重试先重读，不重复 add、不 force 删除。普通删除遇到迟到用户写入而失败时，重读原身份后恢复本请求锁；确认失败继续报告原错误与资源位置。
+- SSH 来源仅供原 Git 操作；目标由原 GUI 建立独立认证 draft。禁止迁移来源 workspace 的连接键或同 Arc 双登记。原创建/重连在实际转移点核验刚才验证的物理连接，被替换即拒绝转移；双方各自关闭只结算自己的 owner。
+- 只搬运已知产品原文/输出描述符与持久内联附件，不字符串改写用户任意路径，不复制整个 `.eko`、journal、凭据或运行控制。目标副本位于原 reader 根，校验实际 bytes、大小与 SHA，并由原 bounded reader 完整回读。没有资源引用的历史无需 artifact reader 配置。
+- 资源失败不发布半份历史，已写文件仍随回执保留，并明确 reader_verified 是否成立。Git目录、Workspace、conversation 与 import 分别报告真实事实。既有目标没有 managed import 回执时拒绝覆盖，不能以空会话或名称推断所有权；已提交导入继续走原 locator/CAS，不重复推进 epoch。
+
+依据沿 [Git Worktree](https://git-scm.com/docs/git-worktree)、[Claude Code Worktrees](https://code.claude.com/docs/en/worktrees.md) 与既有 managed conversation/Workspace 设计。Eclip 采用用户明确的本地 HEAD-only；对话前缀、提交代码和活动执行资源各由原 owner 负责。该能力属于 EKO 产品策略，不新增框架 Workspace API、任务 store、Git 算法或全局补偿状态机。
+
+
+## 2026-10-28 补充：资源关联随原生 Message 持久化
+
+背景：正文描述符、path 命名空间、正文或 Parts 的哈希、相近时间都不能证明资源来源。终态后补记 journal 会漏掉 live Steer，以及非终态 observation 后仍运行的物理 owner。
+
+决策：复用 Framework 已有 ContentPart::ResourceLink / LinkedResource.meta。PreparedUserTurn::to_message 从真实 InputResourceRef 在同一条 Message 生成 eko_input_resource v1，用户正文与内联图片仍在原 Parts。初始输入与 GUI/IM live Steer 共用此 producer；TrackedSteer、Context、canonical projection 和 checkpoint 直接携带关联，不增加 Message 字段、store、后台 capture 或终态 join。
+
+关联包含真实 path、bytes、SHA、source，以及原 producer 生成文字的字符范围和哈希。范围只定位真实引用，不能授予来源。Reply Fork 只迁移 typed link；原 reader 校验 bytes/SHA，复制并实际回读后更新 link 和该范围，保留未知 metadata、消息身份、时间及原调用/结果 JSON。中途失败不发布半段历史，仍返回已落地副本的回执。旧纯文字、用户 JSON/Markdown、未知外部链接保留为历史，不扫描文件、不升级来源。
+
+分层：Framework 拥有 Parts 的序列化、Steer/Context/checkpoint 和通用工具结果资源载体；EKO 拥有输入落盘、input meta、目标 workspace 复制及呈现。工具载体须由真实 ToolResult.artifact producer 生成，不能用唯一 call_id/tool_name 或应用私有 ToolExecutionRepository 猜测补回。
+
+GUI 与可编辑目标正文通过 resource_history_display_text 隐藏本产品 link 的模型 fallback，原 display_content 继续优先。旧引用提示经原 Fork receipt 的 warnings 呈现，不改变 native final 准入。
+
+弃用正文扫描、按内容命中 sidecar、终态补记 journal。复用已有资源能力，无新增 F Message 字段、存储或 canonical digest 算法；新 Parts 自然进入既有 digest。参考本轮按发布索引核对的 types、conversation projection、steer、stream_channel、snapshot 源码，精确 SHA 见 framework-read-evidence.json。现有 provider adapter 已将 ResourceLink 转成模型文字，无新增供应商 wire variant。
+
+实际 reader、Managed 文件存储、源删除后再 Fork 由候选 Rust 回归覆盖。本轮未执行 Cargo/native/SSH/PTY，结构闭合不等于运行验收完成。工具 producer 的最小 F 增量尚未正式采用。

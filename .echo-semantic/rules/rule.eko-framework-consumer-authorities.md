@@ -140,6 +140,7 @@ evidence_refs:
 - evidence.gui-dialog-presentation
 - evidence.latest-framework-consumer-integration
 - evidence.cancellation-observation-consumer
+- evidence.eko-native-measurement-source-basis
 finding_refs: [finding.cli-upstream-dependency-risks, finding.eko-channel-helper-relocation]
 ---
 
@@ -230,3 +231,36 @@ Original EKO TaskRuntime journals, scope captures and typed controls remain auth
 epoch15 在原 TaskRuntime、输入 journal、tracked mailbox 与执行 owner 上完成定向验证：含 channels 配置实际68项、无 channels 配置37项均零失败、零忽略、零编译 warning；GUI caller 和无 channels 生产检查最终自然退出0且零 warning。直接支持 GUI 分页/控制的 Rust 范围仅 `task_history_` 五项与 `task_control_generation_` 三项，不把其余渠道测试合称 GUI 验收。原两项 GUI/IM 投递前持久确认的行为 RED、编译/fixture 错误、19 warning、后继残余 import warning 与早先零 warning 误报撤销都保留，后继绿色不改写原结果。
 
 Root 在同一前端来源取得75文件/580测试、TypeScript 与 Tauri 模式 Vite build、全 ESLint 和格式检查自然0；回执绑定465个输入，不借本次语义文档更新重跑或续期其它产品验收。Rust 制品和日志已在 target 外保全，准确清理自然0，原 target 不存在。上述有限结算见共用 Evidence 的本日补充，不提升宽 Rule 或全项目 closure。
+
+## 2026-10-28 有界原生、历史与测量consumer源码依据
+
+本节只把14个当前consumer路径纳入本Rule已有权威/合同边界，不新增Map、Behavior、运行
+owner或统一执行器。既有渠道资产仍只表示其真实channel owner，不扩成输入资源、UI或
+性能工具的万能owner。Rule保持高风险needs_review，原四Behavior及旧动态/删除聚合缺口不清。
+
+新增路径由`evidence.eko-native-measurement-source-basis`的独立当前source切点支撑。
+本Rule旧observed_at继续表示其历史观察，不证明这些新文件当时已存在；该新source观察不
+续期旧运行结果。若正常来源合同拒绝该组合，保留真实失败并由原writer正常绑定，不改工具或
+schema/exclude，不填造source/after revision。
+
+### 原生与历史consumer
+
+消息/历史投影从原Framework Message、ChatEventLog或TaskRuntime journal派生，块phase与
+execution observation不替代physical receipt或TaskRun/Goal状态。UI只呈现原envelope、原
+scope/owner与序号；缺失/冲突不能从当前页面、工具名或普通文本补身份/成功。
+
+PreparedUserTurn的资源沿原producer和ContentPart::ResourceLink/meta传递；Fork复制消费
+已有typed关联并核原reader、bytes/SHA与scope，字符范围/哈希只定位正文，不独立授来源。
+旧纯文字或未知链接不扫描升级为可信资源。legacy getter当前保持Unknown，不借今天factory/
+registry或旧参数签发过去的Builtin来源，pending继续原restore拒绝。新增source依据不把
+00旧API回归接入、source审查或原投影代码称完整retention/capture已修或运行通过。
+
+### 测量证据consumer
+
+测量工具只消费既有Store/Journal/TaskRuntime/工具与GUI权威。synthetic workspace的锁、
+目录身份和字节清单仅保护测量输入，不成为业务owner。样本绑定source/lock、实际Cargo
+argv/features/profile、binary、dataset、protocol及进程身份；单位、durability、工具集合或
+条件不同不能直接归为优化收益。失败/拒绝/预览与成功分组，watchdog不是产品SLA；进程
+CPU/RSS/block-operation计数不是单操作资源或物理字节吞吐。有效但不完整报告保持不完整，
+不能从脚本、测试定义、一次样本或旧绿色推完整测量通过。原Plan08协议和证据读取规则仍属
+其本来范围，本节不新建性能执行owner或接受新风险。

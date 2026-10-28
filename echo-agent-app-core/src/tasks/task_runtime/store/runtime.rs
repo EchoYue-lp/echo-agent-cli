@@ -2,6 +2,30 @@
 /// journal; in-context projections stay bounded and point at the artifact.
 const OBJECTIVE_ARTIFACT_SPILL_CHARS: usize = 8_000;
 
+/// 某一次已捕获原journal前缀的派生读取入口，不拥有任何输入或Goal状态。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawInputHistoryReference {
+    pub(crate) run_id: String,
+    pub(crate) journal_identity: String,
+    pub(crate) observed_through_sequence: u64,
+    pub(crate) last_source_sequence: u64,
+    pub(crate) source_records: u64,
+    pub(crate) inline_initial_text: Option<String>,
+    pub(crate) artifact: Option<crate::prepared_turn::InputResourceRef>,
+}
+
+/// 当前Goal的不可变读取引用；版本仍由原TaskRuntime Goal CAS拥有。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CanonicalGoalReference {
+    pub(crate) run_id: String,
+    pub(crate) journal_identity: String,
+    pub(crate) goal_revision: u64,
+    pub(crate) goal_sha256: String,
+    pub(crate) artifact: crate::prepared_turn::InputResourceRef,
+}
+
 #[cfg(test)]
 pub(crate) type PhysicalCompletionFaultForTest =
     std::sync::Arc<std::sync::Mutex<Option<Result<RuntimeTaskEvent, String>>>>;
@@ -2783,6 +2807,227 @@ impl TaskRuntimeStore {
         )
         .map_err(|error| StoreError::InvalidPlan(format!("用户约束原文校验失败：{error}")))?;
         Ok(artifact)
+    }
+
+    /// 原始来源族和有界capsule共用同一只读入口。None选择当前已确认前缀；Some只重建原旧快照。
+    pub(crate) fn raw_input_history_reference(
+        &self,
+        run_id: &str,
+        requested_cut: Option<u64>,
+    ) -> Result<RawInputHistoryReference, StoreError> {
+        self.with_run_lock(run_id, || {
+            let (durability, _) = self.shadow.settle_event_state(run_id)?;
+            if !matches!(durability, JournalDurabilityStatus::Confirmed) {
+                return Err(StoreError::InvalidPlan(
+                    "原始输入来源耐久未确认，未准许模型继续".to_string(),
+                ));
+            }
+            let snapshot = self
+                .shadow
+                .raw_input_history_snapshot(run_id, requested_cut)?;
+            let artifact = if snapshot.source_records == 0 {
+                None
+            } else {
+                let run = self
+                    .get_run(run_id)?
+                    .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+                let task_root = self.shadow.root();
+                let state_dir = task_root.parent().ok_or_else(|| {
+                    StoreError::InvalidPlan("原TaskRuntime缺少产品数据根".to_string())
+                })?;
+                let source_turn = format!("raw-input-history-{}", snapshot.journal_identity);
+                Some(
+                    crate::prepared_turn::materialize_recorded_user_text(
+                        &snapshot.text,
+                        &state_dir.join("artifacts").join("user-input"),
+                        &run.conversation_id,
+                        &source_turn,
+                    )
+                    .map_err(|error| {
+                        StoreError::InvalidPlan(format!("用户约束原文历史物化失败：{error}"))
+                    })?,
+                )
+            };
+            Ok(RawInputHistoryReference {
+                run_id: snapshot.run_id,
+                journal_identity: snapshot.journal_identity,
+                observed_through_sequence: snapshot.observed_through_sequence,
+                last_source_sequence: snapshot.last_source_sequence,
+                source_records: snapshot.source_records,
+                inline_initial_text: snapshot.inline_initial_text,
+                artifact,
+            })
+        })
+    }
+
+    /// 实际请求必须使用该Run已发布的准确前缀。后继append不使合法旧前缀失效，也不混入旧文件。
+    pub(crate) fn qualify_raw_input_history_reference(
+        &self,
+        run_id: &str,
+        advertised: &RawInputHistoryReference,
+    ) -> Result<(), StoreError> {
+        if advertised.run_id != run_id {
+            return Err(StoreError::InvalidPlan("原文引用属于其它Run".to_string()));
+        }
+        let expected =
+            self.raw_input_history_reference(run_id, Some(advertised.observed_through_sequence))?;
+        if serde_json::to_value(advertised)? != serde_json::to_value(expected)? {
+            return Err(StoreError::InvalidPlan(
+                "原文引用不属于准确journal代际或固定来源前缀".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 只核实际请求是否已完整内联原文；不是意图分类，不赋予新输入任何Applied状态。
+    pub(crate) fn raw_input_history_needs_reader(
+        &self,
+        run_id: &str,
+        reference: &RawInputHistoryReference,
+        visible: &[String],
+    ) -> Result<bool, StoreError> {
+        self.with_run_lock(run_id, || {
+            let snapshot = self
+                .shadow
+                .raw_input_history_snapshot(run_id, Some(reference.observed_through_sequence))?;
+            let run = self
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            for line in snapshot.text.lines().skip(1) {
+                let record: serde_json::Value = serde_json::from_str(line)?;
+                let event = record
+                    .get("event")
+                    .ok_or_else(|| StoreError::InvalidPlan("原文来源缺事件".to_string()))?;
+                let accepted = event.get("event_type").and_then(serde_json::Value::as_str)
+                    == Some("run_input_accepted");
+                let payload = event
+                    .get("payload")
+                    .ok_or_else(|| StoreError::InvalidPlan("原文来源缺原始负载".to_string()))?;
+                let text = if accepted {
+                    payload.pointer("/input_snapshot/payload/text")
+                } else {
+                    payload.get("text")
+                }
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| StoreError::InvalidPlan("原文来源缺文字".to_string()))?;
+                let initial = accepted
+                    && payload.get("role").and_then(serde_json::Value::as_str)
+                        == Some("initial_goal");
+                if initial && reference.inline_initial_text.as_deref() == Some(text) {
+                    continue;
+                }
+                if visible.iter().any(|message| message == text) {
+                    continue;
+                }
+                let turn = payload
+                    .get("turn_id")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| event.get("step_id").and_then(serde_json::Value::as_str))
+                    .unwrap_or_default();
+                let turn_preview = turn
+                    .chars()
+                    .take(super::compact_context::MAX_TASK_TITLE_CHARS)
+                    .collect::<String>();
+                if text.chars().count() <= crate::prepared_turn::PREVIEW_CHARS
+                    && visible.iter().any(|message| {
+                        message.contains(&format!("- (turn {turn_preview}) {text}\n"))
+                    })
+                {
+                    continue;
+                }
+                if initial
+                    && run.goal == text
+                    && visible.iter().any(|message| {
+                        message.contains(&format!("Goal: {text}\n"))
+                            || message
+                                .contains(&format!("Objective:\n{text}\nContinuation contract:"))
+                    })
+                {
+                    continue;
+                }
+                return Ok(true);
+            }
+            Ok(false)
+        })
+    }
+
+    /// 旧tasks/objective文件仍归档保留；模型读取长Goal使用同一个host artifacts根。
+    pub(crate) fn canonical_goal_reference(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<CanonicalGoalReference>, StoreError> {
+        self.canonical_goal_reference_inner(run_id, false)
+    }
+
+    fn canonical_goal_reference_inner(
+        &self,
+        run_id: &str,
+        force: bool,
+    ) -> Result<Option<CanonicalGoalReference>, StoreError> {
+        self.with_run_lock(run_id, || {
+            let state = self
+                .get_run_state(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let inline_limit = if state
+                .continuation
+                .as_ref()
+                .is_some_and(|continuation| continuation.enabled)
+            {
+                OBJECTIVE_ARTIFACT_SPILL_CHARS
+            } else {
+                super::compact_context::MAX_GOAL_CHARS
+            };
+            let run = state.run;
+            if task_goal_sha256(&run.goal) != run.goal_sha256 {
+                return Err(StoreError::InvalidPlan(
+                    "当前Goal正文与原版本SHA不一致".to_string(),
+                ));
+            }
+            if !force && run.goal.chars().count() <= inline_limit {
+                return Ok(None);
+            }
+            let source = self.shadow.raw_input_history_snapshot(run_id, None)?;
+            let task_root = self.shadow.root();
+            let state_dir = task_root
+                .parent()
+                .ok_or_else(|| StoreError::InvalidPlan("原Goal缺产品data-root".to_string()))?;
+            let turn = format!("goal-{}-r{}", source.journal_identity, run.goal_revision);
+            let artifact = crate::prepared_turn::materialize_recorded_user_text(
+                &run.goal,
+                &state_dir.join("artifacts").join("user-input"),
+                &run.conversation_id,
+                &turn,
+            )
+            .map_err(|error| StoreError::InvalidPlan(format!("当前Goal全文物化失败：{error}")))?;
+            if artifact.sha256.as_deref() != Some(run.goal_sha256.as_str()) {
+                return Err(StoreError::InvalidPlan(
+                    "当前Goal物化SHA未保持原Goal身份".to_string(),
+                ));
+            }
+            Ok(Some(CanonicalGoalReference {
+                run_id: run.run_id,
+                journal_identity: source.journal_identity,
+                goal_revision: run.goal_revision,
+                goal_sha256: run.goal_sha256,
+                artifact,
+            }))
+        })
+    }
+
+    pub(crate) fn qualify_canonical_goal_reference(
+        &self,
+        run_id: &str,
+        advertised: &CanonicalGoalReference,
+    ) -> Result<(), StoreError> {
+        let expected = self
+            .canonical_goal_reference_inner(run_id, true)?
+            .ok_or_else(|| StoreError::InvalidPlan("当前Goal不再对应旧长Goal引用".to_string()))?;
+        if serde_json::to_value(advertised)? != serde_json::to_value(expected)? {
+            return Err(StoreError::InvalidPlan(
+                "长Goal引用的Run、代际、revision或SHA已失效".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Replace the sole authoritative Goal after an explicit local-user action.
@@ -7927,6 +8172,67 @@ impl TaskRuntimeStore {
             RuntimeEventKind::Note,
             serde_json::json!({ "message": message }),
         ))
+    }
+
+    /// Store a lossless Agent observation in the existing run journal. The
+    /// payload never mutates task/run/attempt terminal state.
+    pub(crate) fn record_native_agent_event(
+        &self,
+        run_id: &str,
+        task_id: Option<&str>,
+        execution_id: Option<&str>,
+        payload: serde_json::Value,
+    ) -> Result<(), StoreError> {
+        self.with_run_lock(run_id, || {
+            if self.get_run(run_id)?.is_none() {
+                return Err(StoreError::RunNotFound(run_id.to_string()));
+            }
+            let id = payload
+                .pointer("/agent_envelope/event_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    StoreError::InvalidPlan("native envelope requires its original event id".into())
+                })?;
+            // Reuse the original journal under the original run mutation lock.
+            // Bounded pages avoid materializing the whole history; no second index/store.
+            let mut after = 0;
+            loop {
+                let mut query = RuntimeEventQuery::new(after, 256)
+                    .with_event_types(vec![RuntimeEventKind::Note]);
+                if let Some(execution) = execution_id {
+                    query = query.for_execution(execution);
+                }
+                let page = self.query_events_bounded(run_id, query)?;
+                let count = page.len();
+                for existing in page {
+                    after = after.max(existing.seq);
+                    if existing
+                        .payload
+                        .pointer("/agent_envelope/event_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(id)
+                    {
+                        if existing.payload == payload {
+                            return Ok(());
+                        }
+                        return Err(StoreError::InvalidPlan(
+                            "native event identity conflicts with its committed original envelope"
+                                .into(),
+                        ));
+                    }
+                }
+                if count < 256 {
+                    break;
+                }
+            }
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
+                run_id,
+                task_id,
+                execution_id,
+                RuntimeEventKind::Note,
+                payload,
+            ))
+        })
     }
 
     /// Persist trigger/scheduling metadata without expanding the TaskRun state

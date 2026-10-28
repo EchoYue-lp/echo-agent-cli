@@ -61,6 +61,12 @@ enum WorkspaceTransitionRequest {
     SwitchRegistered {
         workspace_id: crate::workspace::WorkspaceId,
         connection_id: Option<String>,
+        expected_generation: Option<String>,
+    },
+    ReconnectProject {
+        workspace_id: crate::workspace::WorkspaceId,
+        connection_id: String,
+        expected_generation: Option<String>,
     },
     Exit,
     Delete(crate::workspace::WorkspaceId),
@@ -74,6 +80,7 @@ enum WorkspaceSettlementOutcome {
     Created(Workspace, bool),
     Transition(WorkspaceTransitionReceipt),
     Deleted,
+    ProjectReconnected,
     Linked(Workspace),
 }
 

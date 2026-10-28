@@ -199,7 +199,8 @@ async function runAction<T>(
   operation: (address: RunAddress, view: TaskRuntimeView | null) => Promise<T>,
   refreshOnError = false,
   apply?: (result: T, current: TaskRuntimeView) => Partial<TaskRuntimeView>,
-  throwOnError = false
+  throwOnError = false,
+  canonicalGoalReceipt = false
 ): Promise<T | undefined> {
   const before = get();
   const view = viewForRun(before, typeof target === 'string' ? target : target?.run_id);
@@ -221,21 +222,22 @@ async function runAction<T>(
   const chatVersion = loadGeneration;
   const historyVersion = historyRequestGeneration;
   let appliedGoalReceipt = false;
-  const stillOwned = () => {
+  const stillOwned = (acceptedGoal = false) => {
     const state = get();
     return (
       !!state.taskScope &&
       sameProductDataScope(state.taskScope, capturedScope) &&
       ((state.activeRun?.run_id === address.run_id &&
         state.activeRun.workspace_id === address.workspace_id &&
-        loadGeneration === chatVersion) ||
+        loadGeneration === chatVersion &&
+        (historyRequestGeneration === historyVersion || acceptedGoal)) ||
         (state.historySnapshot?.activeRun?.run_id === address.run_id &&
           state.historySnapshot.activeRun.workspace_id === address.workspace_id &&
-          historyRequestGeneration === historyVersion))
+          (historyRequestGeneration === historyVersion || acceptedGoal)))
     );
   };
   const errorForTarget = (error: string | null) => {
-    if (!stillOwned()) return;
+    if (!stillOwned(appliedGoalReceipt)) return;
     const state = get();
     if (
       state.activeRun?.run_id === address.run_id &&
@@ -263,7 +265,8 @@ async function runAction<T>(
     ) {
       throw new Error('后端回执不属于原运行');
     }
-    if (stillOwned()) {
+    // 浏览切换退役旧操作的呈现owner；只有已成功提交的Goal回执仍需更新同run规范目标。
+    if (stillOwned(canonicalGoalReceipt)) {
       if (apply) {
         const state = get();
         const isChat =
@@ -313,7 +316,8 @@ async function runAction<T>(
     }
     return result;
   } catch (error) {
-    if (refreshOnError && stillOwned()) await get().refresh(address.workspace_id, address.run_id);
+    if (refreshOnError && stillOwned(appliedGoalReceipt))
+      await get().refresh(address.workspace_id, address.run_id);
     const message = error instanceof Error ? error.message : String(error);
     errorForTarget(message);
     if (throwOnError) throw error instanceof Error ? error : new Error(message);
@@ -517,10 +521,11 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   loadRuns: async (scope, statuses = [], more = false) => {
     if (!get().taskScope || !sameProductDataScope(get().taskScope as ProductDataScope, scope))
       get().bindScope(scope);
-    const request = ++inventoryRequestGeneration;
     const filters = more ? get().runStatuses : statuses;
     const cursor = more ? get().nextRunContinuation : null;
+    // 没有后续位置就是无操作，不能退役正在读取的第一页及其busy owner。
     if (more && !cursor) return;
+    const request = ++inventoryRequestGeneration;
     set({ loadingRuns: true, runListError: null });
     try {
       const page = await taskRuntimeApi.listRuns(scope, filters, cursor);
@@ -918,6 +923,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           activeRun: canonical.goal_revision > previous.goal_revision ? canonical : previous,
         };
       },
+      true,
       true
     );
     return result !== undefined;

@@ -2,7 +2,26 @@
 
 ## 状态
 
-Accepted：2026-10-24 已批准产品方向；运行时退役尚待实现。
+已接受。本文与独立终端源码删除包共同采用；源码入口退出、保留owner、删后构建／锁、native及发布分别验收，不因本ADR更新宣告全交付。
+
+## 2026-10-28 源码实施边界
+
+独立`src/main.rs`模式分派、`src/cli`／`src/tui`专属adapter、JSONL sink与子进程测试、
+REPL/TUI HITL provider及专属配置/依赖退出。默认GUI继续使用原`src-tauri/src/main.rs`
+→`run_desktop_entry`，不新建launcher。下方基线与旧对照表属于原批准时的历史，不能作为当前仍有入口的承诺。
+
+DesktopArgs独立四字段，auto_memory同一Atomic、app-core ApplicationServices的IM／scheduler
+启动、pending handoff/delivery恢复以及原begin_shutdown／join.wait_final已接管。全start失败
+的适用断言迁到保留的ChannelRuntime startreceipt，保真实manager start/stop错误与计数；
+不因删除console而删除GUI/IM配对、取消与恢复合同。
+
+GUI PTY／SSH、Agent shell、Task/Subagent、附件、记忆、HITL和独立SDK Host stdio保留。
+package `echo-agent-cli`、`com.eko.desktop`、`~/.eko`与workspace `.eko`不随品牌或入口改名。
+旧source枚举的tui/cli值仅保历史身份，不恢复新产品入口。固定tag/分支与用户数据不动。
+
+本次文稿不证明删后编译、正常锁/风险、SDK实际删除Git pin、窗口/手机/SSH或main CI通过。
+原适用保留回归与native资格仍需真实后继组合验收；不额外要求全部SSH/微信人工矩阵完成才
+可以准备具名独立leaf，也不将已有source/focused票冒成native。
 
 ## 背景
 

@@ -1,9 +1,17 @@
 //! Tauri IPC commands for conversation persistence.
 
+#[cfg(test)]
+#[path = "conversations_native_history_tests.rs"]
+mod native_history_tests;
+
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::memory::{NewConversation, StoredMessage};
-use echo_agent_app_core::api::conversation_projection::{AttachmentsPayload, SavedMessage};
+use echo_agent_app_core::api::chat_driver::ChatDriverEvent;
+use echo_agent_app_core::api::chat_event_log::ChatEventEnvelope;
+use echo_agent_app_core::api::conversation_projection::{
+    AttachmentsPayload, NativeHistoryImport, SavedMessage,
+};
 use echo_agent_app_core::api::state::ScopedChatRuntime;
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -243,6 +251,7 @@ fn pack_ui_projection(message: &mut SavedMessage) -> Option<String> {
         thinking_segments: message.thinking_segments.take().unwrap_or_default(),
         execution_steps: message.execution_steps.take().unwrap_or_default(),
         execution_rounds: message.execution_rounds.take(),
+        native_history_import: None,
         attachments: message.attachments.take().unwrap_or_default(),
     })
     .ok()
@@ -485,7 +494,71 @@ async fn load_agent_transcript(
     .map_err(|error| IpcError::Internal(error.to_string()))
 }
 
-fn project_stored_message(message: StoredMessage) -> SavedMessage {
+fn project_stored_message(message: StoredMessage) -> Result<SavedMessage, IpcError> {
+    project_stored_message_with_publications(message, None, None, &[])
+}
+
+fn project_stored_message_with_publications(
+    message: StoredMessage,
+    workspace_id: Option<&str>,
+    conversation_id: Option<&str>,
+    publications: &[ChatEventEnvelope],
+) -> Result<SavedMessage, IpcError> {
+    // Reuse canonical parsing, including structured call identity and malformed
+    // metadata errors. Never turn a present but invalid call into no call.
+    let restored = echo_agent::memory::restore_message(&message).map_err(|_| {
+        IpcError::Internal("无法加载工具历史记录；原始对话记录已保留，请重试".to_string())
+    })?;
+    let resource_display =
+        echo_agent_app_core::api::prepared_turn::resource_history_display_text(&message)
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let attachment_payload = message
+        .attachments_json
+        .as_deref()
+        .and_then(AttachmentsPayload::parse);
+    let native_publication = if let Some(import) = attachment_payload
+        .as_ref()
+        .and_then(|payload| payload.native_history_import.as_ref())
+    {
+        verify_native_history_import(&restored, import)?;
+        Some(
+            echo_agent_app_core::api::conversation_projection::project_native_history_publication(
+                &restored,
+                &import.source_workspace_id,
+                &import.source_conversation_id,
+                &import.events,
+            )
+            .map_err(IpcError::Internal)?,
+        )
+    } else if let (Some(workspace_id), Some(conversation_id)) = (workspace_id, conversation_id)
+        && (restored.assistant_blocks.is_some()
+            || restored.approved_assistant_blocks.is_some()
+            || restored.execution_status.is_some())
+    {
+        Some(
+            echo_agent_app_core::api::conversation_projection::project_native_history_publication(
+                &restored,
+                workspace_id,
+                conversation_id,
+                publications,
+            )
+            .map_err(IpcError::Internal)?,
+        )
+    } else {
+        None
+    };
+    let stored_native_blocks = restored
+        .assistant_blocks
+        .filter(|blocks| !blocks.is_empty())
+        .map(echo_agent_app_core::api::conversation_projection::project_assistant_blocks)
+        .transpose()
+        .map_err(IpcError::Internal)?;
+    let native_blocks = native_publication
+        .as_ref()
+        .and_then(Option::as_ref)
+        .map(|view| view.blocks.clone())
+        .or(stored_native_blocks);
+    let tool_calls = restored.tool_calls;
     let internal_agent = echo_agent_app_core::api::side_conversation::is_internal_agent_message(
         message.attachments_json.as_deref(),
     );
@@ -493,13 +566,10 @@ fn project_stored_message(message: StoredMessage) -> SavedMessage {
         message_id,
         display_content,
         thinking_segments,
-        execution_steps,
+        mut execution_steps,
         execution_rounds,
         attachments,
-    ) = message
-        .attachments_json
-        .as_deref()
-        .and_then(AttachmentsPayload::parse)
+    ) = attachment_payload
         .map(|payload| {
             let thinking_segments =
                 (!payload.thinking_segments.is_empty()).then_some(payload.thinking_segments);
@@ -517,27 +587,106 @@ fn project_stored_message(message: StoredMessage) -> SavedMessage {
         })
         .unwrap_or((None, None, None, None, None, None));
 
-    SavedMessage {
+    if let Some(blocks) = native_blocks.as_ref() {
+        let mut steps: Vec<echo_agent_app_core::api::conversation_projection::SavedExecutionStep> =
+            blocks
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    echo_agent_app_core::api::conversation_projection::SavedExecutionStep {
+                        step_type: "assistant".to_string(),
+                        index: Some(index),
+                        call_id: None,
+                    }
+                })
+                .collect();
+        steps.extend(execution_steps.take().unwrap_or_default());
+        execution_steps = Some(steps);
+    }
+    // 原生块已拥有正文，不能再次把聚合content显示为另一份最终回答。
+    // 最终发布资格等待原Framework耐久结算身份，不从provider phase或文本猜测。
+    let (content, final_answer_confirmed) = if let Some(Some(view)) = native_publication.as_ref() {
+        (view.content.clone(), view.final_answer_confirmed)
+    } else if native_blocks.is_some() {
+        (None, false)
+    } else {
+        (
+            display_content.or(resource_display).or(message.content),
+            false,
+        )
+    };
+    Ok(SavedMessage {
         message_id,
         role: message.role,
-        content: display_content.or(message.content),
+        content,
+        assistant_blocks: native_blocks,
+        final_answer_confirmed,
+        execution_status: native_publication
+            .as_ref()
+            .and_then(Option::as_ref)
+            .and_then(|view| view.execution_status.clone()),
+        final_answer_source: native_publication
+            .as_ref()
+            .and_then(Option::as_ref)
+            .and_then(|view| view.final_answer_source.clone()),
         internal_agent,
-        tool_calls: message
-            .tool_calls_json
-            .and_then(|value| serde_json::from_str(&value).ok()),
+        tool_calls,
         thinking_segments,
         tool_result: message.tool_result_json,
         execution_steps,
         execution_rounds,
         attachments,
+    })
+}
+
+// 原一次GUI请求内按消息准备事实；每个读取async自动续完固定原head，不让用户重试Pending。
+async fn project_conversation_messages_with_native_history(
+    stored: Vec<StoredMessage>,
+    side_initial_identity: Option<(usize, String, String)>,
+    internal_message_ids: &std::collections::HashSet<i64>,
+    workspace_id: &str,
+    conversation_id: &str,
+    log: &std::sync::Arc<echo_agent_app_core::api::chat_event_log::ChatEventLog>,
+    cancel: &echo_agent::agent::CancellationToken,
+) -> Result<Vec<SavedMessage>, IpcError> {
+    let mut publications = Vec::with_capacity(stored.len());
+    for message in &stored {
+        if cancel.is_cancelled() {
+            return Err(IpcError::Validation("会话历史读取已取消".into()));
+        }
+        let imported = message
+            .attachments_json
+            .as_deref()
+            .and_then(AttachmentsPayload::parse)
+            .is_some_and(|payload| payload.native_history_import.is_some());
+        let events = if imported {
+            Vec::new()
+        } else {
+            let canonical = echo_agent::memory::restore_message(message)
+                .map_err(|error| IpcError::Internal(error.to_string()))?;
+            log.native_history_publications_async(workspace_id, conversation_id, &canonical, cancel)
+                .await
+                .map_err(|error| IpcError::Internal(error.to_string()))?
+        };
+        publications.push(events);
     }
+    if cancel.is_cancelled() {
+        return Err(IpcError::Validation("会话历史读取已取消".into()));
+    }
+    project_conversation_messages(
+        stored,
+        side_initial_identity,
+        internal_message_ids,
+        Some((workspace_id, conversation_id, &publications)),
+    )
 }
 
 fn project_conversation_messages(
     stored: Vec<StoredMessage>,
     side_initial_identity: Option<(usize, String, String)>,
     internal_message_ids: &std::collections::HashSet<i64>,
-) -> Vec<SavedMessage> {
+    publication_context: Option<(&str, &str, &[Vec<ChatEventEnvelope>])>,
+) -> Result<Vec<SavedMessage>, IpcError> {
     let mut side_initial_identity = side_initial_identity;
     stored
         .into_iter()
@@ -557,12 +706,25 @@ fn project_conversation_messages(
                         )
                 },
             );
-            let mut projected = project_stored_message(message);
+            let mut projected = match publication_context {
+                Some((workspace_id, conversation_id, by_message)) => {
+                    let publications = by_message.get(index).ok_or_else(|| {
+                        IpcError::Internal("历史publication页与原消息索引不一致".into())
+                    })?;
+                    project_stored_message_with_publications(
+                        message,
+                        Some(workspace_id),
+                        Some(conversation_id),
+                        publications,
+                    )?
+                }
+                None => project_stored_message(message)?,
+            };
             projected.internal_agent |= internal_agent;
             if is_initial_side_user && let Some((_, message_id, _)) = side_initial_identity.take() {
                 projected.message_id = Some(message_id);
             }
-            projected
+            Ok(projected)
         })
         .collect()
 }
@@ -577,6 +739,10 @@ mod tests {
             message_id: Some(id.to_string()),
             role: role.to_string(),
             content: Some(content.to_string()),
+            assistant_blocks: None,
+            final_answer_confirmed: false,
+            execution_status: None,
+            final_answer_source: None,
             internal_agent: false,
             tool_calls: None,
             thinking_segments: None,
@@ -585,6 +751,46 @@ mod tests {
             execution_rounds: None,
             attachments: None,
         }
+    }
+
+    #[test]
+    fn canonical_native_blocks_reach_gui_without_final_inference() -> anyhow::Result<()> {
+        let mut source = Message::assistant("聚合正文只在原块内显示".to_string());
+        source.assistant_blocks = Some(vec![echo_agent::agent::AssistantMessageBlock {
+            provider_source: None,
+            block_id: "provider-message".to_string(),
+            request_id: "request".to_string(),
+            sequence: 4,
+            phase: echo_agent::agent::AssistantPhase::Commentary,
+            delta: "先检查，再验证。".to_string(),
+            complete: true,
+            provider: Some("fixture".to_string()),
+            reasoning: None,
+        }]);
+        let stored = echo_agent::memory::project_message("conversation", &source)?;
+        let projected = project_stored_message(stored)?;
+        assert!(projected.content.is_none());
+        let first = projected
+            .assistant_blocks
+            .as_ref()
+            .and_then(|blocks| blocks.first())
+            .ok_or_else(|| anyhow::anyhow!("canonical native block was lost"))?;
+        assert_eq!(first.content, "先检查，再验证。");
+        assert_eq!(first.block.request_id, "request");
+        assert_eq!(first.block.sequence, 4);
+        assert_eq!(
+            first.block.phase,
+            echo_agent::agent::AssistantPhase::Commentary
+        );
+        assert_eq!(
+            projected
+                .execution_steps
+                .as_ref()
+                .and_then(|steps| steps.first())
+                .map(|step| step.step_type.as_str()),
+            Some("assistant")
+        );
+        Ok(())
     }
 
     #[test]
@@ -648,6 +854,52 @@ mod tests {
     }
 
     #[test]
+    fn canonical_nested_tool_calls_reach_the_gui_without_loss() -> anyhow::Result<()> {
+        use echo_agent::llm::types::{FunctionCall, ToolCall};
+        let calls = vec![ToolCall {
+            provider_source: None,
+            id: "call-canonical".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{\"path\":\"中文🧭.txt\"}".to_string(),
+            },
+        }];
+        let stored = StoredMessage {
+            id: Some(1),
+            conversation_id: "history".to_string(),
+            role: "assistant".to_string(),
+            content: None,
+            attachments_json: None,
+            tool_calls_json: Some(serde_json::to_string(&calls)?),
+            tool_result_json: None,
+            created_at: "2026-10-27T00:00:00Z".to_string(),
+        };
+        let projected = project_stored_message(stored)?;
+        let value = serde_json::to_value(projected)?;
+        assert_eq!(value.get("tool_calls"), Some(&serde_json::to_value(calls)?));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_tool_history_is_an_explicit_error_and_is_not_rewritten() {
+        let stored = StoredMessage {
+            id: Some(1),
+            conversation_id: "history".to_string(),
+            role: "assistant".to_string(),
+            content: None,
+            attachments_json: None,
+            tool_calls_json: Some("[{invalid-json]".to_string()),
+            tool_result_json: None,
+            created_at: "2026-10-27T00:00:00Z".to_string(),
+        };
+        let original = stored.clone();
+        let projected = project_stored_message(stored.clone());
+        assert!(projected.is_err());
+        assert_eq!(stored, original);
+    }
+
+    #[test]
     fn stored_internal_agent_marker_projects_to_the_gui_contract() -> anyhow::Result<()> {
         let stored = StoredMessage {
             id: Some(1),
@@ -662,7 +914,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
         };
 
-        let projected = project_stored_message(stored);
+        let projected = project_stored_message(stored)?;
         assert!(projected.internal_agent);
         assert_eq!(projected.content.as_deref(), Some("internal instruction"));
         assert_eq!(
@@ -675,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_message_ids_do_not_relabel_identical_user_text() {
+    fn exact_message_ids_do_not_relabel_identical_user_text() -> anyhow::Result<()> {
         let messages = [
             ("user", "internal instruction"),
             ("assistant", "internal result"),
@@ -698,7 +950,7 @@ mod tests {
         })
         .collect();
         let ids = std::collections::HashSet::from([1_i64, 2_i64]);
-        let projected = project_conversation_messages(messages, None, &ids);
+        let projected = project_conversation_messages(messages, None, &ids, None)?;
         assert_eq!(
             projected
                 .iter()
@@ -706,10 +958,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![true, true, false, false]
         );
+        Ok(())
     }
 
     #[test]
-    fn completed_side_first_prompt_recovers_its_stable_gui_identity() {
+    fn completed_side_first_prompt_recovers_its_stable_gui_identity() -> anyhow::Result<()> {
         let stored = vec![
             StoredMessage {
                 id: Some(1),
@@ -751,7 +1004,8 @@ mod tests {
                 "initial side prompt".to_string(),
             )),
             &std::collections::HashSet::new(),
-        );
+            None,
+        )?;
 
         assert_eq!(
             projected
@@ -764,6 +1018,141 @@ mod tests {
                 .first()
                 .is_some_and(|message| message.message_id.is_none())
         );
+        Ok(())
+    }
+
+    fn fork_publication_fixture(
+        status: echo_agent::agent::ExecutionStatusKind,
+        product_status: &str,
+    ) -> anyhow::Result<(
+        echo_agent::llm::types::Message,
+        Vec<echo_agent_app_core::api::chat_event_log::ChatEventEnvelope>,
+    )> {
+        let temporary = tempfile::tempdir()?;
+        let log = echo_agent_app_core::api::chat_event_log::ChatEventLog::open(
+            temporary.path(),
+            echo_agent_app_core::api::chat_event_log::ChatEventRetention::default(),
+        )?;
+        let block = echo_agent::agent::AssistantMessageBlock {
+            provider_source: None,
+            block_id: "fork-final-block".to_string(),
+            request_id: "fork-request".to_string(),
+            sequence: 1,
+            phase: echo_agent::agent::AssistantPhase::FinalAnswer,
+            delta: "confirmed".to_string(),
+            complete: true,
+            provider: Some("fixture".to_string()),
+            reasoning: None,
+        };
+        let mut message = echo_agent::llm::types::Message::assistant("confirmed".to_string());
+        message.assistant_blocks = Some(vec![block.clone()]);
+        message.approved_assistant_blocks = Some(vec![block]);
+        message.execution_status = Some(serde_json::from_value(serde_json::json!({
+            "execution_id": "fork-execution",
+            "request_id": "fork-request",
+            "sequence": 2,
+            "phase": "Terminal",
+            "status": status,
+            "reason": null,
+        }))?);
+        let identity = echo_agent::agent::EventIdentity::for_chat(
+            Some("fork-conversation".to_string()),
+            "fork-root",
+            "fork-root",
+            Some("fork-run".to_string()),
+        )?
+        .with_execution_id("fork-execution")?;
+        let append = |sequence, payload| -> anyhow::Result<()> {
+            let envelope =
+                echo_agent::agent::EventEnvelope::new(&identity, sequence, None, payload)?;
+            log.append(
+                "fork-workspace",
+                Some("fork-conversation"),
+                "fork-root",
+                echo_agent_app_core::api::chat_driver::ChatDriverEvent::Agent(Box::new(envelope)),
+            )?;
+            Ok(())
+        };
+        append(
+            1,
+            echo_agent::agent::AgentEvent::AssistantMessage {
+                block: message
+                    .assistant_blocks
+                    .as_ref()
+                    .and_then(|blocks| blocks.first())
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("fixture block missing"))?,
+            },
+        )?;
+        append(
+            2,
+            echo_agent::agent::AgentEvent::FinalAnswer("confirmed".to_string()),
+        )?;
+        append(
+            3,
+            echo_agent::agent::AgentEvent::ExecutionStatus(
+                message
+                    .execution_status
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("fixture status missing"))?,
+            ),
+        )?;
+        log.append(
+            "fork-workspace",
+            Some("fork-conversation"),
+            "fork-root",
+            echo_agent_app_core::api::chat_driver::ChatDriverEvent::TurnStatus {
+                status: product_status.to_string(),
+            },
+        )?;
+        let events = log
+            .replay("fork-workspace", Some("fork-conversation"), "fork-root", 0)?
+            .events;
+        Ok((message, events))
+    }
+
+    #[test]
+    fn direct_fork_publication_gate_rejects_unconfirmed_native_replies() -> anyhow::Result<()> {
+        for status in [
+            echo_agent::agent::ExecutionStatusKind::Candidate,
+            echo_agent::agent::ExecutionStatusKind::Failed,
+            echo_agent::agent::ExecutionStatusKind::Cancelled,
+        ] {
+            let (message, events) = fork_publication_fixture(status.clone(), "completed")?;
+            assert!(
+                validated_reply_fork_publication_events(
+                    &message,
+                    "fork-workspace",
+                    "fork-conversation",
+                    &events,
+                )
+                .is_err(),
+                "unconfirmed status {status:?} must reject both prepare and execute"
+            );
+        }
+        let (message, events) =
+            fork_publication_fixture(echo_agent::agent::ExecutionStatusKind::Settled, "cancelled")?;
+        assert!(
+            validated_reply_fork_publication_events(
+                &message,
+                "fork-workspace",
+                "fork-conversation",
+                &events,
+            )
+            .is_err()
+        );
+        let (message, events) =
+            fork_publication_fixture(echo_agent::agent::ExecutionStatusKind::Settled, "completed")?;
+        assert!(
+            !validated_reply_fork_publication_events(
+                &message,
+                "fork-workspace",
+                "fork-conversation",
+                &events,
+            )?
+            .is_empty()
+        );
+        Ok(())
     }
 
     #[test]
@@ -1093,6 +1482,59 @@ mod tests {
         );
         Ok(())
     }
+    // 接入 conversations.rs 原测试模块：测试真实原flow与真实叶子I/O permit，未运行Cargo前不称通过。
+    #[tokio::test]
+    async fn reply_fork_eight_compositions_keep_leaf_permits_and_survive_observer_drop()
+    -> anyhow::Result<()> {
+        use echo_agent_app_core::api::product_data_io::ProductDataIoService;
+        let io = ProductDataIoService::new();
+        let arrived = Arc::new(tokio::sync::Barrier::new(9));
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::channel(8);
+        let mut observers = Vec::new();
+        let mut releases = Vec::new();
+        for _ in 0..8 {
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            releases.push(release_tx);
+            let owner_io = io.clone();
+            let nested_io = io.clone();
+            let entered = arrived.clone();
+            let completed = completed_tx.clone();
+            observers.push(tokio::spawn(async move {
+                run_reply_fork_composition_owned(owner_io, async move {
+                    entered.wait().await;
+                    release_rx
+                        .await
+                        .map_err(|error| IpcError::Internal(error.to_string()))?;
+                    let actual = nested_io
+                        .run("reply fork actual leaf fixture", || 7)
+                        .await
+                        .map_err(crate::tauri::commands::product_data::blocking_error)?;
+                    let _ = completed.send(actual).await;
+                    Ok(serde_json::json!({ "success": true }))
+                })
+                .await
+            }));
+        }
+        // 仅作死锁保护，不改变产品等待/结算期限。
+        tokio::time::timeout(std::time::Duration::from_secs(30), arrived.wait()).await?;
+        for observer in observers {
+            observer.abort();
+        }
+        for release in releases {
+            let _ = release.send(());
+        }
+        let completed = async {
+            for _ in 0..8 {
+                if completed_rx.recv().await != Some(7) {
+                    anyhow::bail!("original detached composition lost its leaf work");
+                }
+            }
+            io.begin_shutdown().map_err(anyhow::Error::msg)?;
+            io.join_shutdown().await.map_err(anyhow::Error::msg)
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), completed).await??;
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -1239,7 +1681,16 @@ pub async fn get_conversation(
     workspace_id: String,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let store = scoped_store(&state, &workspace_id).await?;
+    let control = state
+        .app_state
+        .workspace_control_for_scope(&workspace_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let workspace_generation = control.generation();
+    let store = control
+        .runtime()
+        .conversation_store()
+        .ok_or_else(|| IpcError::Internal("Conversation store not available".into()))?;
 
     let conv = store
         .get_conversation(&id)
@@ -1288,8 +1739,31 @@ pub async fn get_conversation(
         )),
         None => None,
     };
-    let messages =
-        project_conversation_messages(stored, side_initial_identity, &internal_message_ids);
+    let read_cancel = state.app_state.tasks.cancel_token.clone();
+    let messages = project_conversation_messages_with_native_history(
+        stored,
+        side_initial_identity,
+        &internal_message_ids,
+        &workspace_id,
+        &id,
+        &state.app_state.storage.chat_events,
+        &read_cancel,
+    )
+    .await?;
+    // 原workspace/control和conversation创建身份fence；前端loadGeneration/canProject继续挡旧视图。
+    let _same_workspace = state
+        .app_state
+        .workspace_control_for_generation(&workspace_id, &workspace_generation)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let current = store
+        .get_conversation(&id)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?
+        .ok_or_else(|| IpcError::NotFound("历史读取期间原会话已删除".into()))?;
+    if current.id != conv.id || current.created_at != conv.created_at {
+        return Err(IpcError::Validation("历史读取期间会话身份已变更".into()));
+    }
 
     Ok(serde_json::json!({
         "id": conv.id,
@@ -1394,6 +1868,1268 @@ pub async fn update_conversation(
     Ok(serde_json::json!({"success": true}))
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReplyForkWorktreePreparation {
+    pub available: bool,
+    pub reason: Option<String>,
+    pub repo_root: Option<String>,
+    pub head: Option<String>,
+    pub branch: String,
+    pub path: Option<String>,
+    pub project_location: echo_agent_app_core::api::workspace::ProjectLocation,
+    pub ssh_target: Option<echo_agent_app_core::api::terminal::TerminalTarget>,
+    pub source_connection_generation: Option<String>,
+    pub draft_connection_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReplyForkPreparation {
+    pub request_id: String,
+    pub workspace_id: String,
+    pub workspace_generation: String,
+    pub source_id: String,
+    pub user_turn_index: usize,
+    pub prefix_sha256: String,
+    pub message_count: usize,
+    pub worktree: ReplyForkWorktreePreparation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyForkDestination {
+    CurrentWorkspace,
+    NewWorktree,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ReplyForkRequest {
+    pub preparation: ReplyForkPreparation,
+    pub destination: ReplyForkDestination,
+    pub ssh_connection_id: Option<String>,
+}
+
+fn reply_fork_prefix_digest(prefix: &[StoredMessage]) -> Result<String, IpcError> {
+    use sha2::{Digest as _, Sha256};
+    let normalized = prefix
+        .iter()
+        .cloned()
+        .map(|mut message| {
+            message.id = None;
+            message.conversation_id = "reply-fork-prefix".into();
+            message
+        })
+        .collect::<Vec<_>>();
+    let bytes =
+        serde_json::to_vec(&normalized).map_err(|error| IpcError::Internal(error.to_string()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn validated_reply_fork_publication_events(
+    message: &echo_agent::llm::types::Message,
+    workspace_id: &str,
+    conversation_id: &str,
+    events: &[ChatEventEnvelope],
+) -> Result<Vec<ChatDriverEvent>, IpcError> {
+    let has_native = message.assistant_blocks.is_some()
+        || message.approved_assistant_blocks.is_some()
+        || message.execution_status.is_some();
+    if !has_native {
+        return Ok(Vec::new());
+    }
+    let publication =
+        echo_agent_app_core::api::conversation_projection::project_native_history_publication(
+            message,
+            workspace_id,
+            conversation_id,
+            events,
+        )
+        .map_err(IpcError::Validation)?
+        .ok_or_else(|| IpcError::Validation("原生回复 publication 不可用".into()))?;
+    if !publication.final_answer_confirmed || publication.content.is_none() {
+        return Err(IpcError::Validation(
+            "原生回复尚未获得同一 execution 的已确认 publication，不能分叉".into(),
+        ));
+    }
+    let execution_id = message
+        .execution_status
+        .as_ref()
+        .map(|status| status.execution_id.as_str())
+        .ok_or_else(|| IpcError::Validation("原生回复缺少 execution 身份".into()))?;
+    let settled_event_sequence = events.iter().find_map(|event| match &event.payload {
+        ChatDriverEvent::Agent(agent) => {
+            let echo_agent::agent::AgentEvent::ExecutionStatus(status) = &agent.payload else {
+                return None;
+            };
+            (status.execution_id == execution_id
+                && status.request_id
+                    == message
+                        .execution_status
+                        .as_ref()
+                        .and_then(|value| value.request_id.clone())
+                && status.sequence
+                    == message
+                        .execution_status
+                        .as_ref()
+                        .map(|value| value.sequence)
+                        .unwrap_or_default()
+                && status.status == echo_agent::agent::ExecutionStatusKind::Settled)
+                .then_some(event.sequence)
+        }
+        _ => None,
+    });
+    let mut copied = Vec::new();
+    for event in events {
+        match &event.payload {
+            ChatDriverEvent::Agent(agent)
+                if agent
+                    .execution_id
+                    .as_ref()
+                    .is_some_and(|value| value.as_str() == execution_id) =>
+            {
+                copied.push(event.payload.clone());
+            }
+            ChatDriverEvent::TurnStatus { status }
+                if settled_event_sequence.is_some_and(|sequence| event.sequence > sequence)
+                    && event.conversation_id.as_deref() == Some(conversation_id)
+                    && matches!(status.as_str(), "completed" | "failed" | "cancelled") =>
+            {
+                copied.push(event.payload.clone());
+            }
+            _ => {}
+        }
+    }
+    if copied.is_empty() {
+        return Err(IpcError::Validation(
+            "原生回复缺少可迁移的 publication 事件".into(),
+        ));
+    }
+    Ok(copied)
+}
+
+fn attach_native_history_import(
+    message: &mut StoredMessage,
+    import: NativeHistoryImport,
+) -> Result<(), IpcError> {
+    let raw = message
+        .attachments_json
+        .as_deref()
+        .ok_or_else(|| IpcError::Internal("native history metadata is missing".into()))?;
+    let mut value: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+        IpcError::Internal(format!("native history metadata is invalid: {error}"))
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        IpcError::Internal("native history metadata must preserve an object payload".into())
+    })?;
+    object.insert(
+        "native_history_import".to_string(),
+        serde_json::to_value(import).map_err(|error| IpcError::Internal(error.to_string()))?,
+    );
+    message.attachments_json =
+        Some(serde_json::to_string(&value).map_err(|error| IpcError::Internal(error.to_string()))?);
+    Ok(())
+}
+
+fn verify_native_history_import(
+    message: &echo_agent::llm::types::Message,
+    import: &NativeHistoryImport,
+) -> Result<(), IpcError> {
+    use sha2::{Digest as _, Sha256};
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(message).map_err(|error| IpcError::Internal(error.to_string()))?,
+    ));
+    if digest != import.message_content_sha256 {
+        return Err(IpcError::Internal(
+            "导入 native 历史的 canonical Message SHA 不匹配".into(),
+        ));
+    }
+    if let Some(status) = message.execution_status.as_ref() {
+        if status.execution_id != import.execution_id {
+            return Err(IpcError::Internal(
+                "导入 native 历史 execution 身份不匹配".into(),
+            ));
+        }
+    } else {
+        let progress =
+            echo_agent_app_core::api::conversation_projection::native_progress_publication_events(
+                message,
+                &import.source_workspace_id,
+                &import.source_conversation_id,
+                &import.events,
+            )
+            .map_err(IpcError::Internal)?;
+        let original_records = progress
+            .iter()
+            .map(echo_agent::utils::canonical_json::canonical_json_bytes)
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        let imported_records = import
+            .events
+            .iter()
+            .map(echo_agent::utils::canonical_json::canonical_json_bytes)
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        // 仅允许完整原中间块的幂等重放，额外事件或最终授权仍须拒绝。
+        if original_records.is_empty() || original_records != imported_records {
+            return Err(IpcError::Internal(
+                "导入普通进度包含非进度事件或缺少批准记录".into(),
+            ));
+        }
+    }
+    let mut agent_seen = false;
+    for event in &import.events {
+        if event.workspace_id != import.source_workspace_id
+            || event.conversation_id.as_deref() != Some(import.source_conversation_id.as_str())
+            || event.root_turn_id != import.source_root_turn_id
+            || event.turn_id != import.source_turn_id
+            || event.message_id != import.source_message_id
+        {
+            return Err(IpcError::Internal(
+                "导入 native 历史 source scope 不匹配".into(),
+            ));
+        }
+        match &event.payload {
+            ChatDriverEvent::Agent(agent) => {
+                if !agent
+                    .execution_id
+                    .as_ref()
+                    .is_some_and(|value| value.as_str() == import.execution_id)
+                {
+                    return Err(IpcError::Internal(
+                        "导入 native 历史 Agent execution 身份不匹配".into(),
+                    ));
+                }
+                agent_seen = true;
+            }
+            ChatDriverEvent::TurnStatus { .. } => {}
+            _ => {
+                return Err(IpcError::Internal(
+                    "导入 native 历史包含未批准的事件类型".into(),
+                ));
+            }
+        }
+    }
+    if !agent_seen {
+        return Err(IpcError::Internal(
+            "导入 native 历史缺少 Agent publication".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn attach_reply_fork_native_history_imports(
+    app_state: &echo_agent_app_core::api::AppState,
+    runtime: &ScopedChatRuntime,
+    source_id: &str,
+    prefix: &mut [StoredMessage],
+) -> Result<(), IpcError> {
+    let workspace_id = runtime.execution_scope().workspace_id().to_string();
+    let last_assistant = prefix
+        .iter()
+        .rposition(|message| message.role == "assistant");
+    for (index, message) in prefix.iter_mut().enumerate() {
+        if message.role != "assistant" {
+            continue;
+        }
+        let restored = echo_agent::memory::restore_message(message)
+            .map_err(|_| IpcError::Validation("无法读取分叉历史中的原生消息".into()))?;
+        let imported = message
+            .attachments_json
+            .as_deref()
+            .and_then(AttachmentsPayload::parse)
+            .and_then(|payload| payload.native_history_import);
+        let source_publications;
+        let (publication_workspace, publication_conversation, publication_events) =
+            if let Some(import) = imported.as_ref() {
+                verify_native_history_import(&restored, import)?;
+                (
+                    import.source_workspace_id.as_str(),
+                    import.source_conversation_id.as_str(),
+                    import.events.as_slice(),
+                )
+            } else {
+                source_publications = app_state
+                    .storage
+                    .chat_events
+                    .native_history_publications_async(
+                        &workspace_id,
+                        source_id,
+                        &restored,
+                        &app_state.tasks.cancel_token,
+                    )
+                    .await
+                    .map_err(|error| IpcError::Validation(error.to_string()))?;
+                (
+                    workspace_id.as_str(),
+                    source_id,
+                    source_publications.as_slice(),
+                )
+            };
+        let require_final = Some(index) == last_assistant;
+        let Some(status) = restored.execution_status.as_ref() else {
+            if require_final
+                && (restored.assistant_blocks.is_some()
+                    || restored.approved_assistant_blocks.is_some())
+            {
+                return Err(IpcError::Validation(
+                    "原生历史缺少 execution publication 坐标，不能迁移".into(),
+                ));
+            }
+            // Reasoning 与工具前 Unknown 的资格同由原批准块和真实发布记录核对。
+            // 不回填 phase/status，最后选定回复仍受上方最终确认门槛约束。
+            let progress = echo_agent_app_core::api::conversation_projection::native_progress_publication_events(
+                &restored, publication_workspace, publication_conversation, publication_events,
+            ).map_err(IpcError::Validation)?;
+            if let Some(first) = progress.first() {
+                let ChatDriverEvent::Agent(agent) = &first.payload else {
+                    return Err(IpcError::Internal("普通进度缺少原 Agent envelope".into()));
+                };
+                let execution_id = agent
+                    .execution_id
+                    .as_ref()
+                    .ok_or_else(|| IpcError::Validation("普通进度缺少原 execution 身份".into()))?
+                    .to_string();
+                let source_workspace_id = first.workspace_id.clone();
+                let source_conversation_id = first.conversation_id.clone().ok_or_else(|| {
+                    IpcError::Validation("普通进度缺少原 conversation 身份".into())
+                })?;
+                let source_root_turn_id = first.root_turn_id.clone();
+                let source_turn_id = first.turn_id.clone();
+                let source_message_id = first.message_id.clone();
+                use sha2::{Digest as _, Sha256};
+                let message_content_sha256 = hex::encode(Sha256::digest(
+                    serde_json::to_vec(&restored)
+                        .map_err(|error| IpcError::Internal(error.to_string()))?,
+                ));
+                attach_native_history_import(
+                    message,
+                    NativeHistoryImport {
+                        source_workspace_id,
+                        source_conversation_id,
+                        source_root_turn_id,
+                        source_turn_id,
+                        source_message_id,
+                        execution_id,
+                        message_content_sha256,
+                        events: progress,
+                    },
+                )?;
+            }
+            continue;
+        };
+        let publication =
+            echo_agent_app_core::api::conversation_projection::project_native_history_publication(
+                &restored,
+                publication_workspace,
+                publication_conversation,
+                publication_events,
+            )
+            .map_err(IpcError::Validation)?
+            .ok_or_else(|| IpcError::Validation("原生历史 publication 不可用".into()))?;
+        if require_final && (!publication.final_answer_confirmed || publication.content.is_none()) {
+            return Err(IpcError::Validation(
+                "分叉最终回复没有同一 execution 的已确认 publication".into(),
+            ));
+        }
+        if !require_final
+            && restored
+                .approved_assistant_blocks
+                .as_ref()
+                .is_some_and(|blocks| !blocks.is_empty() && publication.blocks.is_empty())
+        {
+            return Err(IpcError::Validation(
+                "分叉历史的 approved native block 缺少原 publication".into(),
+            ));
+        }
+        let agent_events = publication_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.payload,
+                    ChatDriverEvent::Agent(agent)
+                        if agent
+                            .execution_id
+                            .as_ref()
+                            .is_some_and(|value| value.as_str() == status.execution_id)
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let Some(first) = agent_events.first() else {
+            return Err(IpcError::Validation(
+                "分叉历史缺少可迁移的 Agent publication".into(),
+            ));
+        };
+        let expected_execution_id = status.execution_id.as_str();
+        let expected_sequence = status.sequence;
+        let settled_outer_sequence =
+            publication_events
+                .iter()
+                .find_map(|event| match &event.payload {
+                    ChatDriverEvent::Agent(agent) => {
+                        let echo_agent::agent::AgentEvent::ExecutionStatus(status) = &agent.payload
+                        else {
+                            return None;
+                        };
+                        (status.execution_id == expected_execution_id
+                            && status.sequence == expected_sequence
+                            && status.status == echo_agent::agent::ExecutionStatusKind::Settled)
+                            .then_some(event.sequence)
+                    }
+                    _ => None,
+                });
+        let matching_events = publication_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.payload,
+                    ChatDriverEvent::Agent(agent)
+                        if agent
+                            .execution_id
+                            .as_ref()
+                            .is_some_and(|value| value.as_str() == status.execution_id)
+                ) || (Some(index) == last_assistant
+                    && settled_outer_sequence.is_some_and(|sequence| event.sequence > sequence)
+                    && event.workspace_id == first.workspace_id
+                    && event.conversation_id == first.conversation_id
+                    && event.root_turn_id == first.root_turn_id
+                    && event.turn_id == first.turn_id
+                    && event.message_id == first.message_id
+                    && matches!(
+                        &event.payload,
+                        ChatDriverEvent::TurnStatus { status }
+                            if matches!(status.as_str(), "completed" | "failed" | "cancelled")
+                    ))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let message_content_sha256 = {
+            use sha2::{Digest as _, Sha256};
+            hex::encode(Sha256::digest(
+                serde_json::to_vec(&restored)
+                    .map_err(|error| IpcError::Internal(error.to_string()))?,
+            ))
+        };
+        attach_native_history_import(
+            message,
+            NativeHistoryImport {
+                source_workspace_id: first.workspace_id.clone(),
+                source_conversation_id: first.conversation_id.clone().unwrap_or_default(),
+                source_root_turn_id: first.root_turn_id.clone(),
+                source_turn_id: first.turn_id.clone(),
+                source_message_id: first.message_id.clone(),
+                execution_id: status.execution_id.clone(),
+                message_content_sha256,
+                events: matching_events,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Fork admission must prove the selected reply through the original journal.
+/// UI confirmation fields are display projections and cannot authorize a fork.
+async fn validate_reply_fork_publication(
+    app_state: &echo_agent_app_core::api::AppState,
+    runtime: &ScopedChatRuntime,
+    source_id: &str,
+    prefix: &[StoredMessage],
+) -> Result<(), IpcError> {
+    let workspace_id = runtime.execution_scope().workspace_id().to_string();
+    let Some(last_assistant) = prefix
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+    else {
+        return Err(IpcError::Validation(
+            "无法分叉没有 assistant 回复的回合".into(),
+        ));
+    };
+    let restored = echo_agent::memory::restore_message(last_assistant)
+        .map_err(|_| IpcError::Validation("无法验证分叉回复的原始消息".into()))?;
+    let has_native = restored.assistant_blocks.is_some()
+        || restored.approved_assistant_blocks.is_some()
+        || restored.execution_status.is_some();
+    if !has_native {
+        return Ok(());
+    }
+    let imported = last_assistant
+        .attachments_json
+        .as_deref()
+        .and_then(AttachmentsPayload::parse)
+        .and_then(|payload| payload.native_history_import);
+    if let Some(import) = imported.as_ref() {
+        verify_native_history_import(&restored, import)?;
+        let _ = validated_reply_fork_publication_events(
+            &restored,
+            &import.source_workspace_id,
+            &import.source_conversation_id,
+            &import.events,
+        )?;
+    } else {
+        let events = app_state
+            .storage
+            .chat_events
+            .native_history_publications_async(
+                &workspace_id,
+                source_id,
+                &restored,
+                &app_state.tasks.cancel_token,
+            )
+            .await
+            .map_err(|error| IpcError::Validation(error.to_string()))?;
+        let _ =
+            validated_reply_fork_publication_events(&restored, &workspace_id, source_id, &events)?;
+    }
+    Ok(())
+}
+
+async fn reply_fork_prefix(
+    app_state: &echo_agent_app_core::api::AppState,
+    runtime: &ScopedChatRuntime,
+    source_id: &str,
+    user_turn_index: usize,
+    branch_id: &str,
+) -> Result<(echo_agent::memory::Conversation, Vec<StoredMessage>, String), IpcError> {
+    let store = runtime
+        .conversation_store()
+        .ok_or_else(|| IpcError::Internal("Conversation store not available".into()))?;
+    let source = store
+        .get_conversation(source_id)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?
+        .ok_or_else(|| IpcError::NotFound(format!("Conversation '{source_id}' not found")))?;
+    let mut messages = store
+        .get_messages(source_id)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let internal = app_state
+        .internal_message_ids_scoped(runtime.execution_scope().workspace_id(), source_id)
+        .await
+        .map_err(IpcError::Internal)?
+        .into_iter()
+        .collect();
+    retain_public_messages(&mut messages, &internal);
+    let target = messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .nth(user_turn_index)
+        .ok_or_else(|| IpcError::Validation("所选用户回合已不存在".into()))?;
+    let resource_display =
+        echo_agent_app_core::api::prepared_turn::resource_history_display_text(target)
+            .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let target_content = target
+        .attachments_json
+        .as_deref()
+        .and_then(AttachmentsPayload::parse)
+        .and_then(|payload| payload.display_content)
+        .or(resource_display)
+        .or_else(|| target.content.clone())
+        .ok_or_else(|| IpcError::Validation("所选用户回合没有正文".into()))?;
+    // The existing final reply and tool-history validator remains the authority.
+    let prefix = branch_prefix(&messages, user_turn_index, branch_id, true)?;
+    validate_reply_fork_publication(app_state, runtime, source_id, &prefix).await?;
+    echo_agent_app_core::api::managed_conversation::validate_import_history(branch_id, &prefix)
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    Ok((source, prefix, target_content))
+}
+
+#[tauri::command]
+pub async fn prepare_conversation_fork(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    workspace_generation: String,
+    id: String,
+    user_turn_index: usize,
+    request_id: String,
+) -> Result<ReplyForkPreparation, IpcError> {
+    let request_id = uuid::Uuid::parse_str(&request_id)
+        .map_err(|_| IpcError::Validation("分叉请求 ID 无效".into()))?
+        .to_string();
+    let control = state
+        .app_state
+        .workspace_control_for_generation(&workspace_id, &workspace_generation)
+        .await
+        .map_err(IpcError::from)?;
+    let runtime = control.runtime();
+    let _admission = runtime
+        .begin_managed_replacement(&state.app_state.session.foreground_turns, &id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let (_, prefix, _) = reply_fork_prefix(
+        &state.app_state,
+        runtime,
+        &id,
+        user_turn_index,
+        "reply-fork-prefix",
+    )
+    .await?;
+    let location = if workspace_id == "global" {
+        echo_agent_app_core::api::workspace::ProjectLocation::Local {
+            path: control.project_root(),
+        }
+    } else {
+        let registry = Arc::clone(&state.app_state.workspace.registry);
+        let workspace =
+            echo_agent_app_core::api::workspace::WorkspaceId::from_raw(workspace_id.clone());
+        state
+            .app_state
+            .session
+            .product_data_io
+            .run("inspect reply fork source", move || {
+                registry.inspect(&workspace)
+            })
+            .await
+            .map_err(super::product_data::blocking_error)?
+            .map_err(IpcError::from)?
+            .execution_location()
+    };
+    let mut worktree = ReplyForkWorktreePreparation {
+        available: false,
+        reason: None,
+        repo_root: None,
+        head: None,
+        branch: format!("eko/fork-{request_id}"),
+        path: None,
+        project_location: location.clone(),
+        ssh_target: None,
+        source_connection_generation: None,
+        draft_connection_id: None,
+    };
+    let prepared = async {
+        if let echo_agent_app_core::api::workspace::ProjectLocation::Ssh {
+            host, user, port, ..
+        } = location
+        {
+            let connection = state
+                .app_state
+                .terminal
+                .project_ssh(&workspace_id)
+                .map_err(IpcError::Validation)?;
+            connection
+                .check_authenticated()
+                .await
+                .map_err(IpcError::Validation)?;
+            let target =
+                echo_agent_app_core::api::terminal::TerminalTarget::Ssh { host, user, port };
+            if connection
+                .effective_target()
+                .map_err(IpcError::Validation)?
+                != &target
+            {
+                return Err(IpcError::Validation(
+                    "来源 SSH 有效目标已改变，请重新连接".into(),
+                ));
+            }
+            worktree.ssh_target = Some(target);
+            worktree.source_connection_generation = Some(connection.generation());
+            worktree.draft_connection_id = Some(format!("reply-fork-auth-{request_id}"));
+        }
+        let (repo, head, path) = super::panels::prepare_reply_worktree(
+            &state.app_state,
+            &workspace_id,
+            &workspace_generation,
+            worktree.branch.clone(),
+        )
+        .await?;
+        worktree.repo_root = Some(repo);
+        worktree.head = Some(head);
+        worktree.path = Some(path);
+        Ok::<(), IpcError>(())
+    }
+    .await;
+    match prepared {
+        Ok(()) => worktree.available = true,
+        Err(error) => {
+            worktree.reason = Some(format!(
+                "新 Worktree 暂不可用：需要可读取的 Git 提交与原项目连接（{error}）；当前工作空间仍可分叉"
+            ))
+        }
+    }
+    Ok(ReplyForkPreparation {
+        request_id,
+        workspace_id,
+        workspace_generation,
+        source_id: id,
+        user_turn_index,
+        prefix_sha256: reply_fork_prefix_digest(&prefix)?,
+        message_count: prefix.len(),
+        worktree,
+    })
+}
+
+async fn run_reply_fork_owned(
+    app_state: Arc<echo_agent_app_core::api::AppState>,
+    workspace_id: String,
+    source_id: String,
+    user_turn_index: usize,
+    request: ReplyForkRequest,
+) -> Result<serde_json::Value, IpcError> {
+    let io = app_state.session.product_data_io.clone();
+    run_reply_fork_composition_owned(io, async move {
+        let cleanup = if request.preparation.workspace_id == workspace_id
+            && request.preparation.source_id == source_id
+            && request.preparation.user_turn_index == user_turn_index
+        {
+            reply_fork_independent_draft(&app_state, &workspace_id, &request).await?
+        } else {
+            None
+        };
+        let mut result = execute_reply_fork(
+            Arc::clone(&app_state),
+            workspace_id,
+            source_id,
+            user_turn_index,
+            request,
+        )
+        .await;
+        // 这里只在真实原操作返回后执行；IPC观察丢失不提前关闭仍在用的draft。
+        if let Some((owner_id, connection)) = cleanup {
+            if let Err(cleanup_error) = app_state
+                .terminal
+                .close_project_ssh_checked(&owner_id, &connection)
+                .await
+            {
+                result = match result {
+                    Err(primary) => Err(IpcError::Internal(format!(
+                        "{primary}; 独立SSH draft结算未确认: {cleanup_error}"
+                    ))),
+                    Ok(mut facts) => {
+                        let primary = facts.get("error").and_then(serde_json::Value::as_str)
+                            .unwrap_or("分叉资源已保留").to_string();
+                        if let Some(object) = facts.as_object_mut() {
+                            object.insert("error".into(), format!("{primary}; 独立SSH draft结算未确认: {cleanup_error}").into());
+                            object.insert("draft_cleanup_error".into(), cleanup_error.into());
+                            object.insert("success".into(), false.into());
+                            Ok(facts)
+                        } else {
+                            Err(IpcError::Internal(format!("{primary}; 分叉资源回执不是对象; 独立SSH draft结算未确认: {cleanup_error}")))
+                        }
+                    }
+                };
+            }
+        }
+        result
+    })
+    .await
+}
+
+/// 只有本请求computed key、未登记且物理独立的draft才取得结算义务。
+async fn reply_fork_independent_draft(
+    app_state: &Arc<echo_agent_app_core::api::AppState>,
+    source_workspace_id: &str,
+    request: &ReplyForkRequest,
+) -> Result<
+    Option<(
+        String,
+        Arc<echo_agent_app_core::api::terminal::ProjectSshConnection>,
+    )>,
+    IpcError,
+> {
+    if request.destination != ReplyForkDestination::NewWorktree {
+        return Ok(None);
+    }
+    let Some(target) = request.preparation.worktree.ssh_target.as_ref() else {
+        return Ok(None);
+    };
+    let Some(key) = request.ssh_connection_id.as_ref() else {
+        return Ok(None);
+    };
+    let request_id = uuid::Uuid::parse_str(&request.preparation.request_id)
+        .map_err(|_| IpcError::Validation("分叉请求ID无效".into()))?;
+    if key != &format!("reply-fork-auth-{request_id}")
+        || Some(key) != request.preparation.worktree.draft_connection_id.as_ref()
+        || key == source_workspace_id
+    {
+        return Ok(None);
+    }
+    let registry = Arc::clone(&app_state.workspace.registry);
+    let owner = echo_agent_app_core::api::workspace::WorkspaceId::from_raw(key.clone());
+    let registered = app_state
+        .session
+        .product_data_io
+        .run("inspect reply fork draft owner", move || {
+            registry.is_identity_reserved(&owner)
+        })
+        .await
+        .map_err(super::product_data::blocking_error)?
+        .map_err(IpcError::from)?;
+    if registered {
+        return Ok(None);
+    }
+    let Ok(draft) = app_state.terminal.project_ssh_exclusive(key) else {
+        return Ok(None);
+    };
+    if app_state
+        .terminal
+        .project_ssh(source_workspace_id)
+        .is_ok_and(|source| Arc::ptr_eq(&source, &draft))
+    {
+        return Ok(None);
+    }
+    if Some(target) != draft.effective_target().ok() {
+        return Ok(None);
+    }
+    Ok(Some((key.clone(), draft)))
+}
+
+/// 原 flow 仅保留整段协调 owner，不占叶子阻塞 I/O permit。
+/// 观察者消失不取消已准入 Git/import，原 supervisor 继续结算真实失败。
+async fn run_reply_fork_composition_owned<F>(
+    io: echo_agent_app_core::api::product_data_io::ProductDataIoService,
+    future: F,
+) -> Result<serde_json::Value, IpcError>
+where
+    F: std::future::Future<Output = Result<serde_json::Value, IpcError>> + Send + 'static,
+{
+    let flow = io
+        .begin_owned_flow("reply fork composition")
+        .map_err(super::product_data::blocking_error)?;
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = future.await;
+        let failure = match &result {
+            Err(error) => Some(error.to_string()),
+            Ok(value) => value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        };
+        flow.settle(failure);
+        let _ = result_tx.send(result);
+    });
+    result_rx
+        .await
+        .map_err(|_| IpcError::Internal("分叉执行未返回结果，请核对原资源收据".into()))?
+}
+
+async fn execute_reply_fork(
+    app_state: Arc<echo_agent_app_core::api::AppState>,
+    workspace_id: String,
+    source_id: String,
+    user_turn_index: usize,
+    request: ReplyForkRequest,
+) -> Result<serde_json::Value, IpcError> {
+    use echo_agent_app_core::api::workspace::{
+        ProjectLocation, ProjectSource, WorkspaceId, WorkspaceKind,
+    };
+    let prepared = &request.preparation;
+    let request_id = uuid::Uuid::parse_str(&prepared.request_id)
+        .map_err(|_| IpcError::Validation("分叉请求 ID 无效".into()))?
+        .to_string();
+    if prepared.workspace_id != workspace_id
+        || prepared.source_id != source_id
+        || prepared.user_turn_index != user_turn_index
+    {
+        return Err(IpcError::Validation("分叉请求与原来源身份不匹配".into()));
+    }
+    let source_control = app_state
+        .workspace_control_for_generation(&workspace_id, &prepared.workspace_generation)
+        .await
+        .map_err(IpcError::from)?;
+    let source_runtime = source_control.runtime();
+    // Serialize retries with the existing conversation identity owner and retain
+    // its idle admission for the whole composed operation, including lost replies.
+    let _source_admission = source_runtime
+        .begin_managed_replacement(&app_state.session.foreground_turns, &source_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let branch_id = format!("conv-fork-{request_id}");
+    if branch_id == source_id {
+        return Err(IpcError::Validation("分叉请求 ID 已属于来源会话".into()));
+    }
+    let (source, mut prefix, target_content) = reply_fork_prefix(
+        &app_state,
+        source_runtime,
+        &source_id,
+        user_turn_index,
+        &branch_id,
+    )
+    .await?;
+    if prefix.len() != prepared.message_count
+        || reply_fork_prefix_digest(&prefix)? != prepared.prefix_sha256
+    {
+        return Err(IpcError::Validation(
+            "来源完整回合已改变，请重新选择回复".into(),
+        ));
+    }
+    attach_reply_fork_native_history_imports(&app_state, source_runtime, &source_id, &mut prefix)
+        .await?;
+    // 此处构造且独占一个 JSON object；后续键写入不接受外部 Value 容器。
+    let mut response = serde_json::json!({
+        "success": false, "id": null, "request_id": request_id, "destination": request.destination,
+        "source_id": source_id, "source_workspace_id": workspace_id,
+        "workspace_id": workspace_id, "workspace_generation": prepared.workspace_generation,
+        "message_count": prefix.len(), "target_content": target_content,
+        "worktree": null, "workspace": null, "conversation_created": false, "imported": false,
+    });
+    let outcome = async {
+        let mut target_workspace_id = workspace_id.clone();
+        let mut target_workspace_generation = prepared.workspace_generation.clone();
+        if request.destination == ReplyForkDestination::NewWorktree {
+            let worktree = &prepared.worktree;
+            if !worktree.available {
+                return Err(IpcError::Validation(
+                    worktree
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "当前项目不能创建 Worktree".into()),
+                ));
+            }
+            let head = worktree
+                .head
+                .as_ref()
+                .ok_or_else(|| IpcError::Validation("缺少固定源提交".into()))?;
+            let path = worktree
+                .path
+                .as_ref()
+                .ok_or_else(|| IpcError::Validation("缺少固定 Worktree 目录".into()))?;
+            let branch = format!("eko/fork-{request_id}");
+            if worktree.branch != branch {
+                return Err(IpcError::Validation("Worktree 分支身份已改变".into()));
+            }
+            // 重读原项目位置/连接。HEAD 后来前进也仍使用本请求固定的 OID，
+            // 重试先重读 Git 资源，不重新解释 HEAD 或新建同名目录。
+            let (repo_now, _current_head, path_now) = super::panels::prepare_reply_worktree(
+                &app_state,
+                &workspace_id,
+                &prepared.workspace_generation,
+                branch.clone(),
+            )
+            .await?;
+            if Some(&repo_now) != worktree.repo_root.as_ref()
+
+                || path_now != *path
+            {
+                return Err(IpcError::Validation(
+                    "来源项目或 Worktree 位置已改变，请重新准备分叉".into(),
+                ));
+            }
+            let source_location = if workspace_id == "global" {
+                ProjectLocation::Local {
+                    path: source_control.project_root(),
+                }
+            } else {
+                let registry = Arc::clone(&app_state.workspace.registry);
+                let id = WorkspaceId::from_raw(workspace_id.clone());
+                app_state
+                    .session
+                    .product_data_io
+                    .run("recheck reply fork source", move || registry.inspect(&id))
+                    .await
+                    .map_err(super::product_data::blocking_error)?
+                    .map_err(IpcError::from)?
+                    .execution_location()
+            };
+            if source_location != worktree.project_location {
+                return Err(IpcError::Validation("来源项目位置代际已改变".into()));
+            }
+            let target_name = format!("reply-fork-{request_id}");
+            let target_id = WorkspaceId::from_name(&target_name);
+            // An independent draft is verified before any source Git effect.
+            // A source-bound connection is never a transferable target owner.
+            let ssh_draft = match &source_location {
+                ProjectLocation::Local { .. } => None,
+                ProjectLocation::Ssh { .. } => {
+                    let source_connection = app_state
+                        .terminal
+                        .project_ssh(&workspace_id)
+                        .map_err(IpcError::Validation)?;
+                    if worktree.source_connection_generation.as_deref()
+                        != Some(source_connection.generation().as_str())
+                    {
+                        return Err(IpcError::Validation(
+                            "来源 SSH 物理连接已更换，请重新准备分叉".into(),
+                        ));
+                    }
+                    source_connection
+                        .check_authenticated()
+                        .await
+                        .map_err(IpcError::Validation)?;
+                    let target = worktree
+                        .ssh_target
+                        .as_ref()
+                        .ok_or_else(|| IpcError::Validation("缺少原 SSH 有效目标".into()))?;
+                    if source_connection
+                        .effective_target()
+                        .map_err(IpcError::Validation)?
+                        != target
+                    {
+                        return Err(IpcError::Validation("来源 SSH 有效目标不匹配".into()));
+                    }
+                    let draft_id = request.ssh_connection_id.as_ref().ok_or_else(|| {
+                        IpcError::Validation("请先在原 GUI 完成独立目标 SSH 认证".into())
+                    })?;
+                    if Some(draft_id) != worktree.draft_connection_id.as_ref()
+                        || draft_id == &workspace_id
+                    {
+                        return Err(IpcError::Validation(
+                            "目标 SSH 必须使用本次独立认证连接，不能迁移来源连接".into(),
+                        ));
+                    }
+                    // After successful publication only the target key exists.
+                    let draft = app_state
+                        .terminal
+                        .project_ssh(draft_id)
+                        .or_else(|_| app_state.terminal.project_ssh(target_id.as_str()))
+                        .map_err(IpcError::Validation)?;
+                    if Arc::ptr_eq(&source_connection, &draft)
+                        || draft.effective_target().map_err(IpcError::Validation)? != target
+                    {
+                        return Err(IpcError::Validation(
+                            "目标 SSH 连接不是同目标的独立 owner".into(),
+                        ));
+                    }
+                    draft
+                        .check_authenticated()
+                        .await
+                        .map_err(IpcError::Validation)?;
+                    Some(draft_id.clone())
+                }
+            };
+            let identity = serde_json::to_vec(&(prepared, request.destination))
+                .map_err(|error| IpcError::Internal(error.to_string()))?;
+            use sha2::{Digest as _, Sha256};
+            let reason = format!("eko-reply-fork:{}", hex::encode(Sha256::digest(identity)));
+            let creation = super::panels::create_worktree_for_app(
+                &app_state,
+                &workspace_id,
+                &prepared.workspace_generation,
+                branch,
+                head.clone(),
+                Some(path.clone()),
+                Some(reason),
+            )
+            .await?;
+            response["worktree"] = serde_json::to_value(&creation)
+                .map_err(|error| IpcError::Internal(error.to_string()))?;
+            if let Some(error) = creation.error {
+                return Err(IpcError::Internal(error));
+            }
+            if !creation.observed {
+                return Err(IpcError::Internal(
+                    "Worktree 创建状态未知，请先从原列表确认".into(),
+                ));
+            }
+            // Registry remains the sole Workspace authority. Re-entry accepts
+            // only the exact environment proven by the native Git receipt.
+            let registry = Arc::clone(&app_state.workspace.registry);
+            let lookup_id = target_id.clone();
+            let existing = app_state
+                .session
+                .product_data_io
+                .run("find reply fork workspace", move || {
+                    registry
+                        .list()
+                        .map(|items| items.into_iter().find(|item| item.id == lookup_id))
+                })
+                .await
+                .map_err(super::product_data::blocking_error)?
+                .map_err(IpcError::from)?;
+            let expected_location = match &source_location {
+                ProjectLocation::Local { .. } => ProjectLocation::Local { path: path.into() },
+                ProjectLocation::Ssh {
+                    host, user, port, ..
+                } => ProjectLocation::Ssh {
+                    host: host.clone(),
+                    user: user.clone(),
+                    port: *port,
+                    path: path.clone(),
+                },
+            };
+            let workspace = match existing {
+                Some(workspace) => {
+                    if workspace.execution_location() != expected_location {
+                        return Err(IpcError::Validation(
+                            "目标工作空间已属于其它项目；保留已有资源".into(),
+                        ));
+                    }
+                    if let Some(draft_id) = ssh_draft.as_ref() {
+                        if app_state.terminal.project_ssh(draft_id).is_ok() {
+                            app_state
+                                .reconnect_workspace_project_owned(
+                                    target_id.clone(),
+                                    draft_id.clone(),
+                                    Some(workspace.opaque_product_data_generation()),
+                                )
+                                .await
+                                .map_err(IpcError::from)?;
+                        }
+                    }
+                    workspace
+                }
+                None => {
+                    let source = match &expected_location {
+                        ProjectLocation::Local { path } => {
+                            ProjectSource::ExistingLocal { path: path.clone() }
+                        }
+                        ProjectLocation::Ssh {
+                            host,
+                            user,
+                            port,
+                            path,
+                        } => ProjectSource::Ssh {
+                            host: host.clone(),
+                            user: user.clone(),
+                            port: *port,
+                            path: path.clone(),
+                            connection_id: ssh_draft.ok_or_else(|| {
+                                IpcError::Validation("目标独立 SSH draft 缺失".into())
+                            })?,
+                        },
+                    };
+                    app_state
+                        .create_project_workspace_owned(
+                            &target_name,
+                            WorkspaceKind::General,
+                            source,
+                        )
+                        .await
+                        .map_err(IpcError::from)?
+                        .0
+                }
+            };
+            response["workspace"] = serde_json::to_value(&workspace)
+                .map_err(|error| IpcError::Internal(error.to_string()))?;
+            response["workspace_id"] = workspace.id.to_string().into();
+            response["workspace_generation"] = workspace.opaque_product_data_generation().into();
+            target_workspace_id = workspace.id.to_string();
+            target_workspace_generation = workspace.opaque_product_data_generation();
+        }
+        // Registry 读到的产品代际必须与真正加载的 runtime 一致；一直持有原lease。
+        let target_control = app_state
+            .workspace_control_for_generation(&target_workspace_id, &target_workspace_generation)
+            .await
+            .map_err(IpcError::from)?;
+        let target_runtime = target_control.runtime();
+        let target_admission = target_runtime
+            .begin_managed_replacement(&app_state.session.foreground_turns, &branch_id)
+            .await
+            .map_err(|error| IpcError::Validation(error.to_string()))?;
+        let target_store = target_runtime
+            .conversation_store()
+            .ok_or_else(|| IpcError::Internal("目标 conversation store 不可用".into()))?;
+        let existing = target_store
+            .get_conversation(&branch_id)
+            .await
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        let existing_import = target_store.get_latest_managed_import(&branch_id).await
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        if existing.is_some() {
+            response["id"] = branch_id.clone().into();
+            response["existing_conversation_observed"] = true.into();
+            if existing_import.is_none() {
+                return Err(IpcError::Validation(
+                    "目标会话已存在但没有本次 managed import 回执，保留现有资源；请从原会话列表检查，不自动覆盖或重建".into()
+                ));
+            }
+        }
+        // Transfer only references. Inline multimodal parts are already copied
+        // with the canonical prefix; source control/TaskRun state is not read.
+        let source_root = source_runtime
+            .primary_agent()
+            .read(|agent| agent.tool_output_artifacts().map(|config| config.root_dir))
+            .await
+            .or_else(|| Some(if workspace_id == "global" {
+                echo_agent_app_core::api::data_root::user_data_path("artifacts")
+            } else {
+                echo_agent_app_core::api::workspace::layout::WorkspaceLayout::artifacts(source_control.data_root())
+            }));
+        let target_root = target_runtime
+            .primary_agent()
+            .read(|agent| agent.tool_output_artifacts().map(|config| config.root_dir))
+            .await;
+        let copy_id = branch_id.clone();
+        let (copied, resources) = app_state
+            .session
+            .product_data_io
+            .run("copy reply fork history resources", move || {
+                let report = echo_agent_app_core::api::prepared_turn::copy_reply_fork_history_resources_with_receipts(
+                    &mut prefix, source_root.as_deref(), target_root.as_deref(), &copy_id,
+                );
+                (prefix, report)
+            })
+            .await
+            .map_err(super::product_data::blocking_error)?;
+        response["resources"] = serde_json::to_value(&resources.resources)
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        response["warnings"] = serde_json::to_value(&resources.warnings)
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        if let Some(error) = resources.error {
+            return Err(IpcError::Validation(error));
+        }
+        if existing.is_none() {
+            target_runtime
+                .create_managed_conversation_under_admission(
+                    &target_admission,
+                    NewConversation {
+                        conversation_id: branch_id.clone(),
+                        user_id: source.user_id,
+                        agent_type: source.agent_type,
+                        title: Some(
+                            source
+                                .title
+                                .map(|title| format!("{title}（分叉）"))
+                                .unwrap_or_else(|| "回复分叉".into()),
+                        ),
+                    },
+                )
+                .await
+                .map_err(|error| IpcError::Internal(error.to_string()))?;
+        }
+        response["id"] = branch_id.clone().into();
+        response["conversation_created"] = true.into();
+        let rows = target_store
+            .get_messages(&branch_id)
+            .await
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        let runtime_state = target_runtime
+            .runtime_state_store()
+            .ok_or_else(|| IpcError::Internal("目标 Runtime state 不可用".into()))?;
+        let branch_agent = target_runtime
+            .agent_for(&branch_id)
+            .await
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        if existing_import.is_some() {
+            let actual = echo_agent::memory::managed_import_projection_digests(&branch_id, &rows)
+                .map_err(|error| IpcError::Internal(error.to_string()))?;
+            let expected =
+                echo_agent::memory::managed_import_projection_digests(&branch_id, &copied)
+                    .map_err(|error| IpcError::Internal(error.to_string()))?;
+            if actual != expected {
+                return Err(IpcError::Validation(
+                    "目标会话已有其它历史，不覆盖后续用户内容".into(),
+                ));
+            }
+            echo_agent_app_core::api::managed_conversation::resume_or_import(
+                target_store.as_ref(),
+                runtime_state.as_ref(),
+                &branch_agent.agent(),
+                &branch_id,
+            )
+            .await
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        } else {
+            echo_agent_app_core::api::managed_conversation::replace_and_resume(
+                target_store.as_ref(),
+                runtime_state.as_ref(),
+                &branch_agent.agent(),
+                &branch_id,
+                &copied,
+            )
+            .await
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        }
+        response["imported"] = true.into();
+        response["success"] = true.into();
+        Ok::<(), IpcError>(())
+    }
+    .await;
+    if let Err(error) = outcome {
+        response["error"] = error.to_string().into();
+    }
+    Ok(response)
+}
+
 /// Create an immutable branch before a user turn, or through its complete reply.
 ///
 /// Edit/regenerate callers resend that user turn against the returned
@@ -1407,7 +3143,21 @@ pub async fn branch_conversation(
     id: String,
     user_turn_index: usize,
     include_turn: Option<bool>,
+    fork: Option<ReplyForkRequest>,
 ) -> Result<serde_json::Value, IpcError> {
+    if let Some(request) = fork {
+        if include_turn != Some(true) {
+            return Err(IpcError::Validation("回复分叉必须包含完整回合".into()));
+        }
+        return run_reply_fork_owned(
+            Arc::clone(&state.app_state),
+            workspace_id,
+            id,
+            user_turn_index,
+            request,
+        )
+        .await;
+    }
     let runtime = scoped_runtime(&state, &workspace_id).await?;
     let _source_admission = runtime
         .begin_managed_replacement(&state.app_state.session.foreground_turns, &id)
@@ -1444,11 +3194,15 @@ pub async fn branch_conversation(
                 "user turn index {user_turn_index} is outside the canonical transcript"
             ))
         })?;
+    let resource_display =
+        echo_agent_app_core::api::prepared_turn::resource_history_display_text(target)
+            .map_err(|error| IpcError::Validation(error.to_string()))?;
     let target_content = target
         .attachments_json
         .as_deref()
         .and_then(AttachmentsPayload::parse)
         .and_then(|payload| payload.display_content)
+        .or(resource_display)
         .or_else(|| target.content.clone())
         .ok_or_else(|| {
             IpcError::Validation(format!(

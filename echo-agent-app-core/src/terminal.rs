@@ -206,10 +206,14 @@ impl TerminalSession {
     ) -> Result<(Arc<Self>, Box<dyn Read + Send>), String> {
         validate_dimensions(size.rows, size.cols)?;
         let target = target.normalized()?;
-        let (command, project_connection, project_operation) = match project_launch {
+        let (mut command, project_connection, project_operation) = match project_launch {
             Some(launch) => (launch.command, Some(launch.connection), launch.operation),
             None => (command_for_target(&target, cwd, shell), None, None),
         };
+        // 前端是 xterm 仿真器；所有交互 PTY（包括原 SSH launch）都应广告其能力，
+        // 不能把启动宿主继承的 TERM=dumb 当作终端类型。这里只设置子进程环境，
+        // 不改全局环境或 shell 配置；当前没有独立的产品 terminal-type 配置。
+        command.env("TERM", "xterm-256color");
         let pair: PtyPair = portable_pty::native_pty_system()
             .openpty(size)
             .map_err(|error| format!("failed to open PTY: {error}"))?;
@@ -894,6 +898,61 @@ fn default_shell() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_pty_has_xterm_capabilities_at_original_cwd_and_keeps_exit_status()
+    -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = TerminalService::new();
+        let mut receiver = service.subscribe();
+        service
+            .create_with_shell_for_test(
+                "term-capabilities".to_string(),
+                Some(directory.path().to_path_buf()),
+                31,
+                93,
+                "/bin/sh".to_string(),
+            )
+            .await?;
+        let session = service.session("term-capabilities")?;
+        assert_eq!(session.info.target, TerminalTarget::Local);
+        service.write("term-capabilities", b"printf 'TERM_CAP=<%s>\\nCWD_CAP=<%s>\\n' \"$TERM\" \"$PWD\"; stty size; exit 13\r").await?;
+        let (output, code) = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut output = Vec::new();
+            loop {
+                match receiver.recv().await {
+                    Ok(TerminalEvent::Output { id, bytes }) if id == "term-capabilities" => {
+                        output.extend(bytes)
+                    }
+                    Ok(TerminalEvent::Exited { id, exit_code, .. })
+                        if id == "term-capabilities" =>
+                    {
+                        break Ok::<_, String>((output, exit_code));
+                    }
+                    Ok(TerminalEvent::Issue { message, .. }) => break Err(message),
+                    Ok(_) => {}
+                    Err(error) => break Err(error.to_string()),
+                }
+            }
+        })
+        .await
+        .map_err(|_| "original PTY owner did not settle".to_string())??;
+        assert_eq!(code, 13);
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("TERM_CAP=<xterm-256color>"), "{output}");
+        assert!(output.contains("31 93"), "{output}");
+        let cwd = directory
+            .path()
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        assert!(
+            output.contains(&format!("CWD_CAP=<{}>", cwd.display())),
+            "{output}"
+        );
+        assert!(!service.contains("term-capabilities"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn oversized_writes_are_rejected_before_session_lookup() {

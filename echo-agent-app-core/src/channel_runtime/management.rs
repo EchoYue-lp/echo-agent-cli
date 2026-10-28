@@ -1369,8 +1369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standalone_all_start_failures_return_without_waiting_for_shutdown()
-    -> anyhow::Result<()> {
+    async fn gui_all_start_failures_return_original_start_receipt() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let state = state(temp.path()).await?;
         let revision = state.config.configuration_snapshot().await.1;
@@ -1380,20 +1379,18 @@ mod tests {
                 Ok(())
             })
             .await?;
-        // Original QQ constructor rejects these missing credentials before any
-        // network/session starts. This fixture never contacts a real platform.
         let channels = Arc::new(ChannelRuntime::new(&state));
-        let cancel = echo_agent::agent::CancellationToken::new();
-        let result = tokio::time::timeout(
+        let (started, failures) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            super::super::run_channels_mode(super::super::ChannelsModeArgs {
-                runtime: channels,
-                shutdown: cancel.clone(),
-            }),
+            channels.start_configured_with_receipt(),
         )
         .await?;
-        assert!(result.is_err());
-        assert!(!cancel.is_cancelled());
+        assert_eq!(started, 0);
+        assert!(!failures.is_empty());
+        channels
+            .shutdown_and_wait()
+            .await
+            .map_err(anyhow::Error::msg)?;
         Ok(())
     }
 

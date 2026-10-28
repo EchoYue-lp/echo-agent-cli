@@ -309,6 +309,16 @@ impl WorkspaceRegistry {
         Ok(workspace)
     }
 
+    /// 身份是否已由索引或默认目录占用。损坏/不可读不是“未登记”，
+    /// 用于保护现有连接owner，不发布Workspace或建立第二份注册表。
+    pub fn is_identity_reserved(&self, id: &WorkspaceId) -> anyhow::Result<bool> {
+        let index = self.load_index()?;
+        if index.entries.contains_key(id.as_str()) {
+            return Ok(true);
+        }
+        Ok(self.base_dir.join(id.as_path_segment()).try_exists()?)
+    }
+
     /// Read one workspace without changing activity or writing its manifest.
     ///
     /// Product-data and runtime scope resolution use this path. A read may run
@@ -587,6 +597,26 @@ impl WorkspaceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_fork_owner_check_does_not_treat_broken_registry_as_an_unowned_draft()
+    -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(temporary.path().join("registry"))?;
+        let created = registry.create_at(
+            "reserved",
+            WorkspaceKind::General,
+            temporary.path().join("workspace"),
+        )?;
+        std::fs::write(WorkspaceLayout::manifest(&created.root), "broken manifest")?;
+        assert!(registry.inspect(&created.id).is_err());
+        assert!(registry.is_identity_reserved(&created.id)?);
+        let missing = WorkspaceId::from_raw("reply-fork-auth-fixture".to_string());
+        assert!(!registry.is_identity_reserved(&missing)?);
+        std::fs::write(registry.base_dir.join("registry.json"), "broken index")?;
+        assert!(registry.is_identity_reserved(&missing).is_err());
+        Ok(())
+    }
 
     #[test]
     fn inspect_is_side_effect_free_and_keeps_manifest_bytes_stable() -> anyhow::Result<()> {

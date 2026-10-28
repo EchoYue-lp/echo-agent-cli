@@ -207,6 +207,7 @@ pub fn build_tauri_app(
             commands::conversations::set_conversation_archived,
             commands::conversations::get_conversation,
             commands::conversations::update_conversation,
+            commands::conversations::prepare_conversation_fork,
             commands::conversations::branch_conversation,
             commands::conversations::delete_conversation,
             commands::conversations::export_conversation,

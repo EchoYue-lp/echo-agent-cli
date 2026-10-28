@@ -1646,6 +1646,7 @@ async fn run_main_agent_task_with_resources(
                     .cloned();
                 let invocation = echo_agent::agent::AgentInvocationContext {
                     allowed_tools,
+                    tool_access: None,
                     history: None,
                     runtime_state_id,
                     transcript_generation_id,

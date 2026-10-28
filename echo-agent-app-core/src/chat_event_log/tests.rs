@@ -1851,4 +1851,1087 @@ mod tests {
         );
         Ok(())
     }
+    fn native_history_test_message() -> Result<(echo_agent::llm::types::Message, AgentEvent), String>
+    {
+        use echo_agent::agent::{AssistantMessageBlock, AssistantPhase};
+        let block = AssistantMessageBlock {
+            provider_source: None,
+            block_id: "history-block".into(),
+            request_id: "history-request".into(),
+            sequence: 0,
+            phase: AssistantPhase::Commentary,
+            delta: "原批准进度🙂".into(),
+            complete: true,
+            provider: None,
+            reasoning: None,
+        };
+        let mut message = echo_agent::llm::types::Message::assistant(block.delta.clone());
+        message.assistant_blocks = Some(vec![block.clone()]);
+        message.approved_assistant_blocks = Some(vec![block.clone()]);
+        Ok((message, AgentEvent::AssistantMessage { block }))
+    }
+
+    fn append_native_history_test_event(
+        log: &ChatEventLog,
+        sequence: u64,
+        event: AgentEvent,
+    ) -> Result<ChatEventEnvelope, String> {
+        let identity = EventIdentity::new("history-stream", "turn-1")
+            .map_err(|error| error.to_string())?
+            .with_conversation_id("conversation-1")
+            .map_err(|error| error.to_string())?
+            .with_message_id("turn-1")
+            .map_err(|error| error.to_string())?
+            .with_execution_id("history-execution")
+            .map_err(|error| error.to_string())?;
+        let event = EventEnvelope::new(&identity, sequence, None, event)
+            .map_err(|error| error.to_string())?;
+        log.append(
+            "workspace-1",
+            Some("conversation-1"),
+            "turn-1",
+            ChatDriverEvent::Agent(Box::new(event)),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn native_history_checkpoint_preserves_exact_records_after_real_prune_and_cold_reopen()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let retention = ChatEventRetention {
+            segment_rollover_bytes: 1,
+            max_segments: 2,
+            max_replay_events: 4,
+        };
+        let (message, event) = native_history_test_message()?;
+        let log = ChatEventLog::open(temp.path(), retention).map_err(|error| error.to_string())?;
+        let original = append_native_history_test_event(&log, 1, event)?;
+        for _ in 0..12 {
+            append_status(&log, "completed")?;
+        }
+        let replay = log
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            replay
+                .retained_earliest_cursor
+                .is_some_and(|floor| floor > original.sequence)
+        );
+        assert!(
+            segment_count(&log)? <= retention.max_segments,
+            "不能永久pin原native日志段"
+        );
+        drop(log);
+        let cold = ChatEventLog::open(temp.path(), retention).map_err(|error| error.to_string())?;
+        let events = cold
+            .native_history_publications("workspace-1", "conversation-1", &message)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            serde_json::to_value(&events).map_err(|error| error.to_string())?,
+            serde_json::to_value(vec![original]).map_err(|error| error.to_string())?
+        );
+        let view = crate::conversation_projection::project_native_history_publication(
+            &message,
+            "workspace-1",
+            "conversation-1",
+            &events,
+        )?
+        .ok_or_else(|| "native view missing".to_string())?;
+        assert_eq!(view.blocks.len(), 1);
+        assert!(!view.final_answer_confirmed);
+        Ok(())
+    }
+
+    #[test]
+    fn native_history_recovery_advances_one_bounded_batch_without_tail_skipping()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        let (message, event) = native_history_test_message()?;
+        let original = append_native_history_test_event(&log, 1, event)?;
+        for _ in 0..NATIVE_HISTORY_PROJECTION_BATCH {
+            log.append(
+                "workspace-1",
+                Some("conversation-1"),
+                "turn-1",
+                ChatDriverEvent::TurnStatus {
+                    status: "running".into(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let first = log.native_history_publications("workspace-1", "conversation-1", &message);
+        assert!(
+            matches!(first, Err(ChatEventLogError::NativeHistoryPending { through_sequence, latest_sequence })
+            if through_sequence == u64::try_from(NATIVE_HISTORY_PROJECTION_BATCH).unwrap_or(u64::MAX)
+                && latest_sequence == through_sequence.saturating_add(1))
+        );
+        let events = log
+            .native_history_publications("workspace-1", "conversation-1", &message)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            events.first().map(|event| &event.event_id),
+            Some(&original.event_id)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_history_failed_checkpoint_keeps_original_segments_and_committed_append()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let retention = ChatEventRetention {
+            segment_rollover_bytes: 1,
+            max_segments: 1,
+            max_replay_events: 64,
+        };
+        let log = ChatEventLog::open(temp.path(), retention).map_err(|error| error.to_string())?;
+        let (message, event) = native_history_test_message()?;
+        let original = append_native_history_test_event(&log, 1, event)?;
+        let stream = stream_id("workspace-1", Some("conversation-1"), "turn-1")
+            .map_err(|error| error.to_string())?;
+        let checkpoint = log
+            .stream_dir(&stream)
+            .join(NATIVE_HISTORY_DIRECTORY)
+            .join("coverage.json");
+        // 原FileCheckpointStore真实读失败：不是注入假成功，不删除原journal event。
+        fs::create_dir_all(
+            checkpoint
+                .parent()
+                .ok_or_else(|| "coverage parent missing".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(&checkpoint, b"{broken-checkpoint").map_err(|error| error.to_string())?;
+        for _ in 0..4 {
+            append_status(&log, "completed")?;
+        }
+        let replay = log
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(replay.retained_earliest_cursor, Some(1));
+        assert!(
+            replay
+                .events
+                .iter()
+                .any(|event| event.event_id == original.event_id)
+        );
+        assert!(segment_count(&log)? > retention.max_segments);
+        assert!(
+            log.native_history_publications("workspace-1", "conversation-1", &message)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_history_foreign_generation_or_corrupt_anchor_never_authorizes_raw_fallback()
+    -> Result<(), String> {
+        let first = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let second = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let (message, event) = native_history_test_message()?;
+        let logs = [
+            ChatEventLog::open(first.path(), ChatEventRetention::default())
+                .map_err(|error| error.to_string())?,
+            ChatEventLog::open(second.path(), ChatEventRetention::default())
+                .map_err(|error| error.to_string())?,
+        ];
+        for log in &logs {
+            append_native_history_test_event(log, 1, event.clone())?;
+            append_status(log, "completed")?;
+        }
+        let key = native_publication_fact_key(
+            &logs
+                .first()
+                .ok_or_else(|| "first log missing".to_string())?
+                .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+                .map_err(|error| error.to_string())?
+                .events
+                .into_iter()
+                .next()
+                .ok_or_else(|| "original event missing".to_string())?,
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "block key missing".to_string())?;
+        let stream = stream_id("workspace-1", Some("conversation-1"), "turn-1")
+            .map_err(|error| error.to_string())?;
+        let left = logs
+            .first()
+            .ok_or_else(|| "first log missing".to_string())?
+            .stream_dir(&stream)
+            .join(NATIVE_HISTORY_DIRECTORY)
+            .join(format!("{key}.json"));
+        let right_log = logs
+            .get(1)
+            .ok_or_else(|| "second log missing".to_string())?;
+        let right = right_log
+            .stream_dir(&stream)
+            .join(NATIVE_HISTORY_DIRECTORY)
+            .join(format!("{key}.json"));
+        fs::copy(&left, &right).map_err(|error| error.to_string())?;
+        assert!(
+            right_log
+                .native_history_publications("workspace-1", "conversation-1", &message)
+                .is_err(),
+            "同payload/scope也不能用另一journal generation的快照"
+        );
+        fs::write(&right, b"{corrupt").map_err(|error| error.to_string())?;
+        assert!(
+            right_log
+                .native_history_publications("workspace-1", "conversation-1", &message)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_history_checkpoint_preserves_original_publication_ambiguity() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        let (message, event) = native_history_test_message()?;
+        append_native_history_test_event(&log, 1, event.clone())?;
+        append_native_history_test_event(&log, 2, event)?;
+        append_status(&log, "completed")?;
+        let events = log
+            .native_history_publications("workspace-1", "conversation-1", &message)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(events.len(), 2, "不能去掉不同原ID的歧义见证");
+        assert!(
+            crate::conversation_projection::native_progress_publication_events(
+                &message,
+                "workspace-1",
+                "conversation-1",
+                &events
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_history_checkpoint_keeps_final_settled_and_later_product_failure_separate()
+    -> Result<(), String> {
+        use echo_agent::agent::{ExecutionStatus, ExecutionStatusKind};
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let retention = ChatEventRetention {
+            segment_rollover_bytes: 1,
+            max_segments: 2,
+            max_replay_events: 4,
+        };
+        let log = ChatEventLog::open(temp.path(), retention).map_err(|error| error.to_string())?;
+        let status = ExecutionStatus {
+            adapter_generated: false,
+            execution_id: "history-execution".into(),
+            request_id: Some("history-request".into()),
+            sequence: 4,
+            phase: AgentEvent::FinalAnswer(String::new()).phase(),
+            status: ExecutionStatusKind::Settled,
+            reason: None,
+        };
+        let mut message = echo_agent::llm::types::Message::assistant("已发布正文🙂".into());
+        let mut candidate = status.clone();
+        candidate.status = ExecutionStatusKind::Candidate;
+        message.execution_status = Some(candidate);
+        let original_final = append_native_history_test_event(
+            &log,
+            1,
+            AgentEvent::FinalAnswer("已发布正文🙂".into()),
+        )?;
+        let original_settled =
+            append_native_history_test_event(&log, 2, AgentEvent::ExecutionStatus(status))?;
+        append_status(&log, "completed")?;
+        let before = log
+            .native_history_publications("workspace-1", "conversation-1", &message)
+            .map_err(|error| error.to_string())?;
+        let view = crate::conversation_projection::project_native_history_publication(
+            &message,
+            "workspace-1",
+            "conversation-1",
+            &before,
+        )?
+        .ok_or_else(|| "view missing".to_string())?;
+        assert!(view.final_answer_confirmed);
+        let product_failed = log
+            .append(
+                "workspace-1",
+                Some("conversation-1"),
+                "turn-1",
+                ChatDriverEvent::TurnStatus {
+                    status: "failed".into(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        for _ in 0..12 {
+            log.append(
+                "workspace-1",
+                Some("conversation-1"),
+                "another-root",
+                ChatDriverEvent::TurnConfiguration {
+                    permission_mode: "default".into(),
+                    approval_policy: "on-request".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        assert!(
+            log.replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+                .map_err(|error| error.to_string())?
+                .retained_earliest_cursor
+                .is_some_and(|floor| floor > product_failed.sequence)
+        );
+        drop(log);
+        let cold = ChatEventLog::open(temp.path(), retention).map_err(|error| error.to_string())?;
+        let facts = cold
+            .native_history_publications("workspace-1", "conversation-1", &message)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            serde_json::to_value(&facts).map_err(|error| error.to_string())?,
+            serde_json::to_value(vec![original_final, original_settled, product_failed])
+                .map_err(|error| error.to_string())?
+        );
+        let view = crate::conversation_projection::project_native_history_publication(
+            &message,
+            "workspace-1",
+            "conversation-1",
+            &facts,
+        )?
+        .ok_or_else(|| "view missing".to_string())?;
+        assert!(
+            !view.final_answer_confirmed,
+            "真实后继product失败不能被先前Settled/Candidate覆盖"
+        );
+        assert!(view.content.is_none());
+        Ok(())
+    }
+    #[test]
+    fn native_history_adoption_after_uncovered_prune_does_not_invent_unique_source()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let retention = ChatEventRetention {
+            segment_rollover_bytes: 1,
+            max_segments: 1,
+            max_replay_events: 64,
+        };
+        let log = ChatEventLog::open(temp.path(), retention).map_err(|error| error.to_string())?;
+        let (message, event) = native_history_test_message()?;
+        append_native_history_test_event(&log, 1, event.clone())?;
+        let surviving = append_native_history_test_event(&log, 2, event)?;
+        let full = log
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            crate::conversation_projection::native_progress_publication_events(
+                &message,
+                "workspace-1",
+                "conversation-1",
+                &full.events
+            )
+            .is_err(),
+            "完整原前缀明确有第二次不同publication，不能恢复成单一来源"
+        );
+        let stream = stream_id("workspace-1", Some("conversation-1"), "turn-1")
+            .map_err(|error| error.to_string())?;
+        let cached = log
+            .stream_journal(&stream, false)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "stream missing".to_string())?;
+        {
+            let guard = lock_cached_stream(&cached);
+            let authority = guard
+                .as_ref()
+                .ok_or_else(|| "authority missing".to_string())?;
+            // 原旧产品未保存native coverage而直接prune的实际切点；不手工删除event文件。
+            authority
+                .journal
+                .prune_closed_segments_before(surviving.sequence)
+                .map_err(|error| error.to_string())?;
+        }
+        drop(cached);
+        assert!(
+            matches!(
+                log.native_history_publications("workspace-1", "conversation-1", &message),
+                Err(ChatEventLogError::NativeHistoryGap { .. })
+            ),
+            "suffix命中key也不能证明被裁prefix没有owner/歧义事实"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_history_foreign_checkpoint_is_not_overwritten_by_later_append_maintenance()
+    -> Result<(), String> {
+        let left_dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let right_dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let left = ChatEventLog::open(left_dir.path(), ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        let right = ChatEventLog::open(right_dir.path(), ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        let (message, event) = native_history_test_message()?;
+        let first = append_native_history_test_event(&left, 1, event.clone())?;
+        append_status(&left, "completed")?;
+        append_native_history_test_event(&right, 1, event.clone())?;
+        append_status(&right, "completed")?;
+        let key = native_publication_fact_key(&first)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "native key missing".to_string())?;
+        let stream = stream_id("workspace-1", Some("conversation-1"), "turn-1")
+            .map_err(|error| error.to_string())?;
+        let foreign_anchor = left
+            .stream_dir(&stream)
+            .join(NATIVE_HISTORY_DIRECTORY)
+            .join(format!("{key}.json"));
+        let original_anchor = right
+            .stream_dir(&stream)
+            .join(NATIVE_HISTORY_DIRECTORY)
+            .join(format!("{key}.json"));
+        let foreign_bytes = fs::read(&foreign_anchor).map_err(|error| error.to_string())?;
+        fs::write(&original_anchor, &foreign_bytes).map_err(|error| error.to_string())?;
+        append_native_history_test_event(&right, 2, event)?;
+        append_status(&right, "completed")?;
+        assert_eq!(
+            fs::read(&original_anchor).map_err(|error| error.to_string())?,
+            foreign_bytes,
+            "maintenance不能把foreign anchor当None后静默覆写"
+        );
+        assert!(
+            right
+                .native_history_publications("workspace-1", "conversation-1", &message)
+                .is_err()
+        );
+        let foreign_coverage = left
+            .stream_dir(&stream)
+            .join(NATIVE_HISTORY_DIRECTORY)
+            .join("coverage.json");
+        let original_coverage = right
+            .stream_dir(&stream)
+            .join(NATIVE_HISTORY_DIRECTORY)
+            .join("coverage.json");
+        let foreign_bytes = fs::read(foreign_coverage).map_err(|error| error.to_string())?;
+        fs::write(&original_coverage, &foreign_bytes).map_err(|error| error.to_string())?;
+        append_status(&right, "completed")?;
+        assert_eq!(
+            fs::read(&original_coverage).map_err(|error| error.to_string())?,
+            foreign_bytes
+        );
+        assert!(
+            right
+                .native_history_publications("workspace-1", "conversation-1", &message)
+                .is_err(),
+            "foreign coverage不因后继safePoint被洗成同generation"
+        );
+        Ok(())
+    }
+    #[test]
+    fn native_history_scoped_subset_preserves_full_journal_cross_scope_refusal()
+    -> Result<(), String> {
+        use echo_agent::agent::{ExecutionStatus, ExecutionStatusKind};
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        let status = ExecutionStatus {
+            adapter_generated: false,
+            execution_id: "history-execution".into(),
+            request_id: Some("history-request".into()),
+            sequence: 4,
+            phase: AgentEvent::FinalAnswer(String::new()).phase(),
+            status: ExecutionStatusKind::Settled,
+            reason: None,
+        };
+        let mut message = echo_agent::llm::types::Message::assistant("原正文".into());
+        let mut candidate = status.clone();
+        candidate.status = ExecutionStatusKind::Candidate;
+        message.execution_status = Some(candidate);
+        append_native_history_test_event(&log, 1, AgentEvent::FinalAnswer("原正文".into()))?;
+        append_native_history_test_event(&log, 2, AgentEvent::ExecutionStatus(status))?;
+        append_status(&log, "completed")?;
+        let scope_b = EventIdentity::new("other-stream", "other-turn")
+            .map_err(|error| error.to_string())?
+            .with_conversation_id("conversation-1")
+            .map_err(|error| error.to_string())?
+            .with_message_id("other-turn")
+            .map_err(|error| error.to_string())?
+            .with_execution_id("history-execution")
+            .map_err(|error| error.to_string())?;
+        let conflicting = EventEnvelope::new(
+            &scope_b,
+            1,
+            None,
+            AgentEvent::Token("另一消息scope的原事件".into()),
+        )
+        .map_err(|error| error.to_string())?;
+        log.append(
+            "workspace-1",
+            Some("conversation-1"),
+            "other-turn",
+            ChatDriverEvent::Agent(Box::new(conflicting)),
+        )
+        .map_err(|error| error.to_string())?;
+        let all = log
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+            .map_err(|error| error.to_string())?
+            .events;
+        let full_view = crate::conversation_projection::project_native_history_publication(
+            &message,
+            "workspace-1",
+            "conversation-1",
+            &all,
+        )?
+        .ok_or_else(|| "full view missing".to_string())?;
+        assert!(!full_view.final_answer_confirmed);
+        let subset = log
+            .native_history_publications("workspace-1", "conversation-1", &message)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            subset
+                .iter()
+                .any(|event| event.root_turn_id == "other-turn"),
+            "有界子集不能抹掉原同execution跨消息scope的拒绝见证"
+        );
+        let subset_view = crate::conversation_projection::project_native_history_publication(
+            &message,
+            "workspace-1",
+            "conversation-1",
+            &subset,
+        )?
+        .ok_or_else(|| "subset view missing".to_string())?;
+        assert!(!subset_view.final_answer_confirmed);
+        assert!(subset_view.content.is_none());
+        let key = native_publication_key("scope", &"history-execution")
+            .map_err(|error| error.to_string())?;
+        let stream = stream_id("workspace-1", Some("conversation-1"), "turn-1")
+            .map_err(|error| error.to_string())?;
+        // 只损坏此新temp投影，原journal不删；三条成功事实不能补掉丢失的scope拒绝见证。
+        fs::remove_file(
+            log.stream_dir(&stream)
+                .join(NATIVE_HISTORY_DIRECTORY)
+                .join(format!("{key}.json")),
+        )
+        .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            log.native_history_publications("workspace-1", "conversation-1", &message),
+            Err(ChatEventLogError::NativeHistoryGap { .. })
+        ));
+        Ok(())
+    }
+    #[test]
+    fn native_history_complete_coverage_keeps_never_published_settlement_unconfirmed_after_prune()
+    -> Result<(), String> {
+        use echo_agent::agent::{ExecutionStatus, ExecutionStatusKind};
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let retention = ChatEventRetention {
+            segment_rollover_bytes: 1,
+            max_segments: 2,
+            max_replay_events: 4,
+        };
+        let log = ChatEventLog::open(temp.path(), retention).map_err(|error| error.to_string())?;
+        let mut message = echo_agent::llm::types::Message::assistant("尚未实际结算的原正文".into());
+        message.execution_status = Some(ExecutionStatus {
+            adapter_generated: false,
+            execution_id: "history-execution".into(),
+            request_id: Some("history-request".into()),
+            sequence: 4,
+            phase: AgentEvent::FinalAnswer(String::new()).phase(),
+            status: ExecutionStatusKind::Candidate,
+            reason: None,
+        });
+        let final_event = append_native_history_test_event(
+            &log,
+            1,
+            AgentEvent::FinalAnswer("尚未实际结算的原正文".into()),
+        )?;
+        let complete_before = log
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+            .map_err(|error| error.to_string())?
+            .events;
+        let before = crate::conversation_projection::project_native_history_publication(
+            &message,
+            "workspace-1",
+            "conversation-1",
+            &complete_before,
+        )?
+        .ok_or_else(|| "baseline view missing".to_string())?;
+        assert!(!before.final_answer_confirmed && before.content.is_none());
+        for _ in 0..12 {
+            log.append(
+                "workspace-1",
+                Some("conversation-1"),
+                "another-root",
+                ChatDriverEvent::TurnConfiguration {
+                    permission_mode: "default".into(),
+                    approval_policy: "on-request".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        assert!(
+            log.replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+                .map_err(|error| error.to_string())?
+                .retained_earliest_cursor
+                .is_some_and(|floor| floor > final_event.sequence)
+        );
+        drop(log);
+        let cold = ChatEventLog::open(temp.path(), retention).map_err(|error| error.to_string())?;
+        let original = cold
+            .native_history_publications("workspace-1", "conversation-1", &message)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            serde_json::to_value(&original).map_err(|error| error.to_string())?,
+            serde_json::to_value(vec![final_event]).map_err(|error| error.to_string())?
+        );
+        let after = crate::conversation_projection::project_native_history_publication(
+            &message,
+            "workspace-1",
+            "conversation-1",
+            &original,
+        )?
+        .ok_or_else(|| "restored view missing".to_string())?;
+        assert_eq!(
+            (
+                after.final_answer_confirmed,
+                after.content,
+                after.unavailable
+            ),
+            (
+                before.final_answer_confirmed,
+                before.content,
+                before.unavailable
+            )
+        );
+        assert!(after.blocks.is_empty());
+        Ok(())
+    }
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    #[ignore = "explicit private I/O diagnostic; not a latency sample"]
+    async fn native_history_same_head_io_attempts_and_successes_diagnostic() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = Arc::new(
+            ChatEventLog::open(temp.path(), ChatEventRetention::default())
+                .map_err(|error| error.to_string())?,
+        );
+        let (message, event) = native_history_test_message()?;
+        let original = append_native_history_test_event(&log, 1, event)?;
+        let cancel = echo_agent::agent::CancellationToken::new();
+        log.native_history_publications_async("workspace-1", "conversation-1", &message, &cancel)
+            .await
+            .map_err(|error| error.to_string())?;
+        let observer = native_history_perf_io::Observation::begin(temp.path().to_path_buf())?;
+        for _ in 0..2 {
+            let events = log
+                .native_history_publications_async(
+                    "workspace-1",
+                    "conversation-1",
+                    &message,
+                    &cancel,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(
+                serde_json::to_value(events).map_err(|error| error.to_string())?,
+                serde_json::to_value(vec![original.clone()]).map_err(|error| error.to_string())?
+            );
+        }
+        let counts = observer.finish()?;
+        for operation in [
+            "journal_sync",
+            "coverage_load",
+            "coverage_save",
+            "anchor_load",
+        ] {
+            let count = counts
+                .get(operation)
+                .ok_or("expected I/O observation missing")?;
+            assert_eq!(count.attempted, 2);
+            assert_eq!(count.succeeded, 2);
+            assert_eq!(count.failed, 0);
+        }
+        assert!(
+            counts
+                .get("anchor_save")
+                .is_none_or(|count| count.attempted == 0)
+        );
+        eprintln!(
+            "native-history logical I/O attempts/results: {}",
+            serde_json::to_string(&counts).map_err(|error| error.to_string())?
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    #[ignore = "explicit private failed-I/O diagnostic; not a successful performance sample"]
+    async fn native_history_io_failed_load_is_not_counted_as_success() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = Arc::new(
+            ChatEventLog::open(temp.path(), ChatEventRetention::default())
+                .map_err(|error| error.to_string())?,
+        );
+        let (message, event) = native_history_test_message()?;
+        append_native_history_test_event(&log, 1, event)?;
+        let cancel = echo_agent::agent::CancellationToken::new();
+        log.native_history_publications_async("workspace-1", "conversation-1", &message, &cancel)
+            .await
+            .map_err(|error| error.to_string())?;
+        let stream = stream_id("workspace-1", Some("conversation-1"), "turn-1")
+            .map_err(|error| error.to_string())?;
+        let cached = log
+            .stream_journal(&stream, false)
+            .map_err(|error| error.to_string())?
+            .ok_or("原stream缺失")?;
+        let path = {
+            let guard = lock_cached_stream(&cached);
+            let authority = guard.as_ref().ok_or("原authority缺失")?;
+            native_history_checkpoint::<NativePublicationCoverage>(authority, "coverage")
+                .path()
+                .to_path_buf()
+        };
+        // 仅破坏本fresh测试的派生文件；原journal与canonical事实不变。
+        std::fs::write(path, b"{corrupt").map_err(|error| error.to_string())?;
+        let observer = native_history_perf_io::Observation::begin(temp.path().to_path_buf())?;
+        let result = log
+            .native_history_publications_async("workspace-1", "conversation-1", &message, &cancel)
+            .await;
+        let counts = observer.finish()?;
+        assert!(result.is_err());
+        let load = counts.get("coverage_load").ok_or("缺失败load观测")?;
+        assert_eq!(load.attempted, 1);
+        assert_eq!(load.succeeded, 0);
+        assert_eq!(load.failed, 1);
+        assert!(
+            counts
+                .get("coverage_save")
+                .is_none_or(|count| count.attempted == 0)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_history_cold_first_call_automatically_completes_4097_and_8193_records()
+    -> Result<(), String> {
+        for target in [4097_u64, 8193_u64] {
+            let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let log = Arc::new(
+                ChatEventLog::open(temp.path(), ChatEventRetention::default())
+                    .map_err(|error| error.to_string())?,
+            );
+            let (message, event) = native_history_test_message()?;
+            let original = append_native_history_test_event(&log, 1, event)?;
+            for _ in 1..target {
+                log.append(
+                    "workspace-1",
+                    Some("conversation-1"),
+                    "turn-1",
+                    ChatDriverEvent::TurnStatus {
+                        status: "running".into(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            let stream = stream_id("workspace-1", Some("conversation-1"), "turn-1")
+                .map_err(|error| error.to_string())?;
+            assert!(
+                !log.stream_dir(&stream)
+                    .join(NATIVE_HISTORY_DIRECTORY)
+                    .exists(),
+                "首次采用必须没有原投影，不借前序safePoint追平"
+            );
+            assert_eq!(
+                log.replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+                    .map_err(|error| error.to_string())?
+                    .retained_earliest_cursor,
+                Some(1)
+            );
+            drop(log);
+            let cold = Arc::new(
+                ChatEventLog::open(temp.path(), ChatEventRetention::default())
+                    .map_err(|error| error.to_string())?,
+            );
+            let cancel = echo_agent::agent::CancellationToken::new();
+            // 一个正常调用，内部自动2/3批；调用者不捕获Pending或重试。
+            let events = cold
+                .native_history_publications_async(
+                    "workspace-1",
+                    "conversation-1",
+                    &message,
+                    &cancel,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(
+                serde_json::to_value(events).map_err(|error| error.to_string())?,
+                serde_json::to_value(vec![original]).map_err(|error| error.to_string())?
+            );
+            let cached = cold
+                .stream_journal(&stream, false)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "cold stream missing".to_string())?;
+            let guard = lock_cached_stream(&cached);
+            let authority = guard
+                .as_ref()
+                .ok_or_else(|| "cold authority missing".to_string())?;
+            let coverage =
+                native_history_checkpoint::<NativePublicationCoverage>(authority, "coverage")
+                    .load()
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "coverage missing".to_string())?;
+            assert_eq!(coverage.sequence, target);
+            assert_eq!(coverage.state.first_observed_sequence, 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_history_cancellation_between_batches_keeps_original_progress_without_continuing()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = Arc::new(
+            ChatEventLog::open(temp.path(), ChatEventRetention::default())
+                .map_err(|error| error.to_string())?,
+        );
+        let (message, event) = native_history_test_message()?;
+        append_native_history_test_event(&log, 1, event)?;
+        for _ in 1..8193 {
+            log.append(
+                "workspace-1",
+                Some("conversation-1"),
+                "turn-1",
+                ChatDriverEvent::TurnStatus {
+                    status: "running".into(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let barrier = Arc::new(NativeHistoryReadTestBarrier {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *log.native_history_read_test_barrier
+            .lock()
+            .map_err(|_| "test barrier poisoned".to_string())? = Some(barrier.clone());
+        let cancel = echo_agent::agent::CancellationToken::new();
+        let reader_log = log.clone();
+        let reader_cancel = cancel.clone();
+        let read = tokio::spawn(async move {
+            reader_log
+                .native_history_publications_async(
+                    "workspace-1",
+                    "conversation-1",
+                    &message,
+                    &reader_cancel,
+                )
+                .await
+        });
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            barrier.entered.notified(),
+        )
+        .await
+        .is_err()
+        {
+            cancel.cancel();
+            barrier.release.notify_one();
+            let _ = read.await;
+            return Err("测试未在30秒内到达首个真实批次边界".into());
+        }
+        cancel.cancel();
+        barrier.release.notify_one();
+        assert!(matches!(
+            read.await.map_err(|error| error.to_string())?,
+            Err(ChatEventLogError::NativeHistoryReadCancelled)
+        ));
+        let stream = stream_id("workspace-1", Some("conversation-1"), "turn-1")
+            .map_err(|error| error.to_string())?;
+        let cached = log
+            .stream_journal(&stream, false)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "stream missing".to_string())?;
+        let guard = lock_cached_stream(&cached);
+        let authority = guard
+            .as_ref()
+            .ok_or_else(|| "authority missing".to_string())?;
+        let coverage =
+            native_history_checkpoint::<NativePublicationCoverage>(authority, "coverage")
+                .load()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "first-batch coverage missing".to_string())?;
+        assert_eq!(
+            coverage.sequence, 4096,
+            "取消后不得偷偷完成后两批或当空结果成功"
+        );
+        assert_eq!(authority.journal.last_sequence(), 8193);
+        Ok(())
+    }
+
+    #[test]
+    fn native_history_continuation_keeps_frozen_head_and_rejects_replaced_original_slot()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        let (message, event) = native_history_test_message()?;
+        let original = append_native_history_test_event(&log, 1, event.clone())?;
+        for _ in 1..4097 {
+            log.append(
+                "workspace-1",
+                Some("conversation-1"),
+                "turn-1",
+                ChatDriverEvent::TurnStatus {
+                    status: "running".into(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let first = log
+            .native_history_publication_read_step("workspace-1", "conversation-1", &message, None)
+            .map_err(|error| error.to_string())?;
+        let NativeHistoryReadStep::Pending(cursor) = first else {
+            return Err("first batch did not retain continuation".into());
+        };
+        assert_eq!(cursor.head, 4097);
+        log.append(
+            "workspace-1",
+            Some("conversation-1"),
+            "turn-1",
+            ChatDriverEvent::TurnStatus {
+                status: "running".into(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let second = log
+            .native_history_publication_read_step(
+                "workspace-1",
+                "conversation-1",
+                &message,
+                Some(cursor.clone()),
+            )
+            .map_err(|error| error.to_string())?;
+        let NativeHistoryReadStep::Ready(events) = second else {
+            return Err("fixed head chased unrelated append".into());
+        };
+        assert_eq!(
+            events.first().map(|event| &event.event_id),
+            Some(&original.event_id)
+        );
+        {
+            let guard = lock_cached_stream(&cursor.cached);
+            let authority = guard
+                .as_ref()
+                .ok_or_else(|| "original slot missing".to_string())?;
+            let coverage =
+                native_history_checkpoint::<NativePublicationCoverage>(authority, "coverage")
+                    .load()
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "coverage missing".to_string())?;
+            assert_eq!(coverage.sequence, 4097, "原有限head不追逐并发尾部");
+            assert_eq!(authority.journal.last_sequence(), 4098);
+        }
+        // 删除/重建使用原产品API，只作用于本新temp；旧读游标不能切到新owner。
+        log.remove_conversation("workspace-1", "conversation-1")
+            .map_err(|error| error.to_string())?;
+        append_native_history_test_event(&log, 1, event)?;
+        assert!(matches!(
+            log.native_history_publication_read_step(
+                "workspace-1",
+                "conversation-1",
+                &message,
+                Some(cursor)
+            ),
+            Err(ChatEventLogError::NativeHistoryReadChanged)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_history_async_continuation_does_not_swallow_gap_or_foreign_corruption()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = Arc::new(
+            ChatEventLog::open(
+                temp.path(),
+                ChatEventRetention {
+                    segment_rollover_bytes: 1,
+                    max_segments: 1,
+                    max_replay_events: 64,
+                },
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        let (message, event) = native_history_test_message()?;
+        append_native_history_test_event(&log, 1, event.clone())?;
+        append_native_history_test_event(&log, 2, event)?;
+        let stream = stream_id("workspace-1", Some("conversation-1"), "turn-1")
+            .map_err(|error| error.to_string())?;
+        let cached = log
+            .stream_journal(&stream, false)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "stream missing".to_string())?;
+        {
+            let guard = lock_cached_stream(&cached);
+            guard
+                .as_ref()
+                .ok_or_else(|| "authority missing".to_string())?
+                .journal
+                .prune_closed_segments_before(2)
+                .map_err(|error| error.to_string())?;
+        }
+        let cancel = echo_agent::agent::CancellationToken::new();
+        assert!(matches!(
+            log.native_history_publications_async(
+                "workspace-1",
+                "conversation-1",
+                &message,
+                &cancel
+            )
+            .await,
+            Err(ChatEventLogError::NativeHistoryGap { .. })
+        ));
+        let corrupt_path = log
+            .stream_dir(&stream)
+            .join(NATIVE_HISTORY_DIRECTORY)
+            .join("coverage.json");
+        fs::create_dir_all(
+            corrupt_path
+                .parent()
+                .ok_or_else(|| "coverage parent missing".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(&corrupt_path, b"{corrupt").map_err(|error| error.to_string())?;
+        assert!(
+            log.native_history_publications_async(
+                "workspace-1",
+                "conversation-1",
+                &message,
+                &cancel
+            )
+            .await
+            .is_err()
+        );
+        FileCheckpointStore::<NativePublicationCoverage>::open(&corrupt_path)
+            .save(
+                &JournalIdentity::new(),
+                &NativePublicationCoverage {
+                    first_observed_sequence: 1,
+                },
+                0,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(
+            matches!(
+                log.native_history_publications_async(
+                    "workspace-1",
+                    "conversation-1",
+                    &message,
+                    &cancel
+                )
+                .await,
+                Err(ChatEventLogError::Corrupt { .. })
+            ),
+            "合法外代快照也不能被自动续读洗掉"
+        );
+        Ok(())
+    }
 }

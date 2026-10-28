@@ -51,7 +51,7 @@ pub(crate) fn record_schema_budget(
     }
 }
 
-const CONTROL_TOOLS: &[&str] = &["final_answer", "tool_search"];
+const CONTROL_TOOLS: &[&str] = &["tool_search"];
 const FILE_TOOLS: &[&str] = &["read_file", "read_artifact", "apply_patch", "grep", "glob"];
 const DIRECTORY_TOOLS: &[&str] = &["list_dir"];
 const EXECUTION_TOOLS: &[&str] = &["shell"];
@@ -141,6 +141,13 @@ pub(crate) fn disabled_tools() -> HashSet<String> {
 
 #[cfg(test)]
 mod tests {
+    mod performance_baseline {
+        use super::*;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/tool_catalog_baseline.rs"
+        ));
+    }
     use super::*;
     use echo_agent::agent::{Agent, ReactAgentBuilder};
     use echo_agent::tools::ToolManager;
@@ -179,7 +186,6 @@ mod tests {
             vec![
                 "apply_patch",
                 "diff",
-                "final_answer",
                 "glob",
                 "grep",
                 "interrupt_command_cell_watch",

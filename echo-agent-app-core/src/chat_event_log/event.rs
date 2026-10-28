@@ -16,8 +16,9 @@ use crate::tool_execution_projection::ToolExecutionProjector;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use echo_agent::state::journal::{
-    EventJournal, JournalDurabilityStatus, JournalPhysicalCleanupStatus, JournalPruneCommitStatus,
-    JournalRecord, SegmentedFileEventJournal,
+    CheckpointStore, EventJournal, FileCheckpointStore, JournalDurabilityStatus, JournalIdentity,
+    JournalPhysicalCleanupStatus, JournalPruneCommitStatus, JournalRecord,
+    SegmentedFileEventJournal,
 };
 use echo_agent::utils::fs::FileDurability;
 use serde::{Deserialize, Serialize};
@@ -94,6 +95,26 @@ pub enum ChatEventLogError {
     Corrupt { path: PathBuf, message: String },
     #[error("chat event serialization failed: {0}")]
     Serialization(String),
+    #[error(
+        "原生历史发布投影尚未追平原日志: through={through_sequence}, head={latest_sequence}；请续读同一原投影"
+    )]
+    NativeHistoryPending {
+        through_sequence: u64,
+        latest_sequence: u64,
+    },
+    #[error("原生历史读取已取消；未继续推进后续批次")]
+    NativeHistoryReadCancelled,
+    #[error("原生历史读取的原journal generation/scope已失效；不能切换到替代owner")]
+    NativeHistoryReadChanged,
+    #[error("原生历史投影在冻结head后出现新事实: frozen={frozen_head}, head={latest_sequence}")]
+    NativeHistorySnapshotAdvanced {
+        frozen_head: u64,
+        latest_sequence: u64,
+    },
+    #[error(
+        "原生历史缺少所需原发布事实: retained_floor={retained_floor}, key={key}；不能从被裁前缀补造完成"
+    )]
+    NativeHistoryGap { retained_floor: u64, key: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,6 +132,24 @@ struct PersistedChatEvent {
 }
 
 type StreamJournal = SegmentedFileEventJournal<PersistedChatEvent>;
+
+// 同一journal owner下的耐久派生投影；只复制原记录，不写新的publication/执行终态。
+// 每个key只保唯一事实及歧义见证，避免把原Token/工具噪声或整条历史装成一个快照。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativePublicationAnchor {
+    key: String,
+    records: Vec<ChatEventEnvelope>,
+    ambiguous: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativePublicationCoverage {
+    // 兼容已有被裁日志：缺失的旧前缀不能因新增投影被误称已恢复。
+    first_observed_sequence: u64,
+}
+
 type StartedCommandCellWatchDelivery = (
     String,
     Option<String>,
@@ -166,6 +205,26 @@ type StreamAuthorityCell = Mutex<Option<StreamAuthority>>;
 type CachedStreamJournal = Arc<StreamAuthorityCell>;
 type StreamAuthorityRegistry = HashMap<PathBuf, Weak<StreamAuthorityCell>>;
 
+// 当前调用局部的读游标，持有原缓存槽；不注册新owner/store/后台循环。
+#[derive(Clone)]
+struct NativeHistoryReadCursor {
+    stream_id: String,
+    cached: CachedStreamJournal,
+    journal_identity: JournalIdentity,
+    head: u64,
+}
+
+enum NativeHistoryReadStep {
+    Pending(NativeHistoryReadCursor),
+    Ready(Vec<ChatEventEnvelope>),
+}
+
+#[cfg(test)]
+struct NativeHistoryReadTestBarrier {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct LiveChatSinkRoute {
     workspace_id: String,
@@ -198,6 +257,8 @@ pub struct ChatEventLog {
     streams: DashMap<String, CachedStreamJournal>,
     stream_access: Mutex<VecDeque<String>>,
     live_sinks: Mutex<LiveChatSinkRegistry>,
+    #[cfg(test)]
+    native_history_read_test_barrier: Mutex<Option<Arc<NativeHistoryReadTestBarrier>>>,
     #[cfg(test)]
     deletion_pause: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
     #[cfg(test)]

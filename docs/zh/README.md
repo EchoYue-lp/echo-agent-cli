@@ -16,3 +16,9 @@ node ../../scripts/check-docs-parity.mjs
 
 框架公共能力请阅读同级 `echo-agent` 仓库的正式文档；跨语言 SDK、协议合同和 Host 适配器请阅读独立的
 [echo-agent-sdk](https://github.com/EchoYue-lp/echo-agent-sdk) 仓库。本目录只记录 Eclip 应用策略和组合方式。
+
+## 当前入口退役同步
+
+独立TUI／REPL／CLI/JSONL产品退出，GUI主入口与IM／cron、GUI内置终端、Agent shell及共享
+Task/Subagent／HITL／附件／记忆／恢复继续保留。包名、identifier、数据路径和固定恢复refs不改。
+本轮代码与中文文稿由各唯一writer合流；文稿同步不代表删后构建/锁/SDK正式Git/native/发布通过。

@@ -2448,6 +2448,7 @@ pub struct RuntimeTaskEvent {
     pub task_id: Option<String>,
     pub step_id: Option<String>,
     pub event_type: RuntimeEventKind,
+    #[ts(type = "unknown")]
     pub payload: serde_json::Value,
     #[serde(with = "echo_agent::utils::time::local_rfc3339")]
     #[ts(as = "String")]

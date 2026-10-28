@@ -7,6 +7,7 @@ import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { useToolExecutionStore } from '../../stores/toolExecutionStore';
 import type { AssistantMessageBlock } from '../../types/api';
 import { MessageBubble } from './MessageBubble';
+import { NativeMessageTimeline } from './NativeMessageTimeline';
 import { chatMessagesToSaved } from '../../stores/conversationStore';
 
 function block(
@@ -124,5 +125,91 @@ describe('原生消息时间线', () => {
       />
     );
     expect(container.childElementCount).toBe(0);
+  });
+
+  it('工具前typed Reasoning空delta独立折叠并仅呈现thinking和公开summary，Unknown保普通正文', () => {
+    const signed = {
+      ...block('mixed-original-reasoning-0', 'reasoning', '', 0),
+      request_id: 'resource-chain-request-1',
+      reasoning: { type: 'signed', thinking: '原签名推理🙂', signature: 'native-copy-signature' },
+    };
+    const redacted = {
+      ...block('mixed-original-reasoning-1', 'reasoning', '', 1),
+      request_id: 'resource-chain-request-1',
+      reasoning: { type: 'redacted', data: 'native-copy-redacted' },
+    };
+    const opaque = {
+      ...block('mixed-original-reasoning-2', 'reasoning', '', 2),
+      request_id: 'resource-chain-request-1',
+      reasoning: {
+        type: 'opaque',
+        provider: 'responses',
+        id: 'native-copy-opaque',
+        data: 'native-copy-encrypted',
+        summary: ['native-copy-summary'],
+      },
+    };
+    const body = {
+      ...block(
+        'mixed-original-unknown-body',
+        'unknown',
+        '先读取原文件与附件，再确认工具返回的完整结果。',
+        3
+      ),
+      request_id: 'resource-chain-request-1',
+    };
+    const message = {
+      id: 'mixed-cold-history',
+      timestamp: 0,
+      role: 'assistant' as const,
+      content: '',
+      finalAnswerConfirmed: false,
+      isStreaming: false,
+      assistantBlocks: [signed, redacted, opaque, body].map((native) => ({
+        block: native,
+        content: native.delta,
+      })),
+      executionSteps: [
+        { type: 'assistant' as const, index: 0 },
+        { type: 'assistant' as const, index: 1 },
+        { type: 'assistant' as const, index: 2 },
+        { type: 'assistant' as const, index: 3 },
+        { type: 'tool' as const, callId: 'resource-chain-call' },
+      ],
+    };
+    const original = JSON.stringify(message);
+    const { container } = render(<NativeMessageTimeline message={message} />);
+    expect(screen.getByText(body.delta)).toBeTruthy();
+    expect(screen.queryByText('原签名推理🙂')).toBeNull();
+    expect(screen.queryByText('native-copy-summary')).toBeNull();
+    const foldButtons = screen.getAllByRole('button', { name: /^展开思考/ });
+    expect(foldButtons.length).toBeGreaterThanOrEqual(2);
+    for (const button of foldButtons) fireEvent.click(button);
+    expect(screen.getByText('原签名推理🙂')).toBeTruthy();
+    expect(screen.getByText('native-copy-summary')).toBeTruthy();
+    expect(screen.queryByText('native-copy-signature')).toBeNull();
+    expect(screen.queryByText('native-copy-redacted')).toBeNull();
+    expect(screen.queryByText('native-copy-encrypted')).toBeNull();
+    expect(screen.queryByText('native-copy-opaque')).toBeNull();
+    const displayed = container.textContent ?? '';
+    for (const privateValue of [
+      'native-copy-signature',
+      'native-copy-redacted',
+      'native-copy-encrypted',
+      'native-copy-opaque',
+    ]) {
+      expect(displayed).not.toContain(privateValue);
+    }
+    expect(displayed.indexOf('原签名推理🙂')).toBeLessThan(displayed.indexOf(body.delta));
+    expect(displayed.indexOf('native-copy-summary')).toBeLessThan(displayed.indexOf(body.delta));
+    expect(displayed.indexOf(body.delta)).toBeLessThan(displayed.indexOf('状态未恢复'));
+    expect(JSON.stringify(message)).toBe(original);
+    expect(message.assistantBlocks.map((view) => view.block.phase)).toEqual([
+      'reasoning',
+      'reasoning',
+      'reasoning',
+      'unknown',
+    ]);
+    expect(message.finalAnswerConfirmed).toBe(false);
   });
 });

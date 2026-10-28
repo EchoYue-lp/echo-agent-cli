@@ -2614,6 +2614,12 @@ impl AppState {
             connection_id,
         }) = source.as_ref()
         {
+            // 本地数据/连接保护：项目创建只接独立 draft，不能迁走已登记来源。
+            if self.workspace.registry.is_identity_reserved(
+                &crate::workspace::WorkspaceId::from_raw(connection_id.clone()),
+            )? {
+                anyhow::bail!("请使用新项目的独立 SSH 认证连接，不能转移已有工作空间 owner");
+            }
             let connection = self
                 .terminal
                 .project_ssh(connection_id)
@@ -2648,6 +2654,7 @@ impl AppState {
                     port: *effective_port,
                     path: verified_path,
                 },
+                connection,
             ))
         } else {
             None
@@ -2657,8 +2664,12 @@ impl AppState {
                 source.as_ref()
             {
                 let workspace_id = crate::workspace::WorkspaceId::from_name(&name).to_string();
+                let verified_connection = verified_remote
+                    .as_ref()
+                    .map(|(_, _, connection)| connection)
+                    .ok_or_else(|| anyhow::anyhow!("已认证 SSH owner 缺失，未转移连接"))?;
                 self.terminal
-                    .reassign_project_ssh(connection_id, &workspace_id)
+                    .reassign_project_ssh_checked(connection_id, &workspace_id, verified_connection)
                     .await
                     .map_err(anyhow::Error::msg)?;
                 Some(workspace_id)
@@ -2687,18 +2698,19 @@ impl AppState {
                     existing.root.display()
                 );
             }
-            let workspace = if let Some((location, execution_location)) = verified_remote {
-                registry.create_project(&name, kind, location, Some(execution_location))?
-            } else if let Some(source) = source {
-                registry.create_local_project(&name, kind, source)?
-            } else {
-                match root {
-                    Some(root) => registry
-                        .create_at(&name, kind, root)
-                        .map_err(anyhow::Error::msg),
-                    None => registry.create(&name, kind).map_err(anyhow::Error::msg),
-                }?
-            };
+            let workspace =
+                if let Some((location, execution_location, _connection)) = verified_remote {
+                    registry.create_project(&name, kind, location, Some(execution_location))?
+                } else if let Some(source) = source {
+                    registry.create_local_project(&name, kind, source)?
+                } else {
+                    match root {
+                        Some(root) => registry
+                            .create_at(&name, kind, root)
+                            .map_err(anyhow::Error::msg),
+                        None => registry.create(&name, kind).map_err(anyhow::Error::msg),
+                    }?
+                };
             Ok((workspace, true))
         })
         .await
@@ -5730,7 +5742,7 @@ impl AppState {
         self: &Arc<Self>,
         workspace_id: crate::workspace::WorkspaceId,
     ) -> anyhow::Result<WorkspaceTransitionReceipt> {
-        self.switch_workspace_registered_with_connection(workspace_id, None)
+        self.switch_workspace_registered_with_connection(workspace_id, None, None)
             .await
     }
 
@@ -5738,11 +5750,13 @@ impl AppState {
         self: &Arc<Self>,
         workspace_id: crate::workspace::WorkspaceId,
         connection_id: Option<String>,
+        expected_generation: Option<String>,
     ) -> anyhow::Result<WorkspaceTransitionReceipt> {
         match self
             .run_owned_workspace_transition(WorkspaceTransitionRequest::SwitchRegistered {
                 workspace_id,
                 connection_id,
+                expected_generation,
             })
             .await?
         {
@@ -5751,16 +5765,42 @@ impl AppState {
         }
     }
 
+    /// Reconnect a registered target through its original owned transition,
+    /// without changing GUI focus. Reply-fork retries use this after a partial
+    /// publication; source connections are never transferred to the target.
+    pub async fn reconnect_workspace_project_owned(
+        self: &Arc<Self>,
+        workspace_id: crate::workspace::WorkspaceId,
+        connection_id: String,
+        expected_generation: Option<String>,
+    ) -> anyhow::Result<()> {
+        match self
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::ReconnectProject {
+                workspace_id,
+                connection_id,
+                expected_generation,
+            })
+            .await?
+        {
+            WorkspaceSettlementOutcome::ProjectReconnected => Ok(()),
+            _ => anyhow::bail!("workspace reconnect settlement returned an unexpected outcome"),
+        }
+    }
+
     async fn reconnect_workspace_project_inner(
         &self,
         workspace_id: &crate::workspace::WorkspaceId,
         connection_id: &str,
+        expected_generation: Option<&str>,
     ) -> anyhow::Result<()> {
         if connection_id == workspace_id.as_str() {
             anyhow::bail!("Reconnection must hand off a newly prepared draft connection");
         }
         let _lifecycle = self.workspace.transition.write().await;
         let workspace = self.workspace.registry.inspect(workspace_id)?;
+        if let Some(expected) = expected_generation {
+            validate_workspace_product_data_generation(Some(&workspace), expected)?;
+        }
         let crate::workspace::ProjectLocation::Ssh {
             host,
             user,
@@ -5819,7 +5859,7 @@ impl AppState {
             .await
             .map_err(anyhow::Error::msg)?;
         self.terminal
-            .reassign_project_ssh(connection_id, workspace_id.as_str())
+            .reassign_project_ssh_checked(connection_id, workspace_id.as_str(), &connection)
             .await
             .map_err(anyhow::Error::msg)?;
         Ok(())
@@ -5929,20 +5969,39 @@ impl AppState {
                 WorkspaceTransitionRequest::SwitchRegistered {
                     workspace_id,
                     connection_id,
+                    expected_generation,
                 } => {
                     if let Some(connection_id) = connection_id {
                         state
-                            .reconnect_workspace_project_inner(&workspace_id, &connection_id)
+                            .reconnect_workspace_project_inner(
+                                &workspace_id,
+                                &connection_id,
+                                expected_generation.as_deref(),
+                            )
                             .await?;
                     }
                     let receipt = state
-                        .switch_registered_workspace_inner(workspace_id)
+                        .switch_registered_workspace_inner(workspace_id, expected_generation)
                         .await?;
                     Ok(WorkspaceSettlementOutcome::Transition(
                         state
                             .reconcile_extension_skills_after_workspace_load(receipt)
                             .await,
                     ))
+                }
+                WorkspaceTransitionRequest::ReconnectProject {
+                    workspace_id,
+                    connection_id,
+                    expected_generation,
+                } => {
+                    state
+                        .reconnect_workspace_project_inner(
+                            &workspace_id,
+                            &connection_id,
+                            expected_generation.as_deref(),
+                        )
+                        .await?;
+                    Ok(WorkspaceSettlementOutcome::ProjectReconnected)
                 }
                 WorkspaceTransitionRequest::Exit => state
                     .exit_workspace_inner()
@@ -6148,13 +6207,22 @@ impl AppState {
     async fn switch_registered_workspace_inner(
         &self,
         workspace_id: crate::workspace::WorkspaceId,
+        expected_generation: Option<String>,
     ) -> anyhow::Result<WorkspaceTransitionReceipt> {
         let _transition = self.workspace.transition.write().await;
+        // 原transition写锁内先核注册代际，旧Fork不得触碰后继目标或当前投影。
+        if let Some(expected) = expected_generation.as_deref() {
+            let snapshot = self.workspace.registry.inspect(&workspace_id)?;
+            validate_workspace_product_data_generation(Some(&snapshot), expected)?;
+        }
         let workspace = self
             .workspace
             .registry
             .open(&workspace_id)
             .map_err(anyhow::Error::msg)?;
+        if let Some(expected) = expected_generation.as_deref() {
+            validate_workspace_product_data_generation(Some(&workspace), expected)?;
+        }
         self.switch_workspace_inner_locked(workspace).await
     }
 

@@ -10,6 +10,9 @@ import {
 } from 'lucide-react';
 import { taskRuntimeApi } from '../../api/endpoints';
 import type { SubagentControlIdentity } from '../../generated';
+import { nativeSubagentEnvelope } from '../../stores/subagentRunStore';
+import type { AgentEventEnvelope } from '../../types/api';
+import { SubagentNativeEvent } from '../subagent/SubagentNativeEvent';
 import type { SubagentRunState } from '../../stores/subagentRunStore';
 import { useToastStore } from '../../stores/toastStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
@@ -57,8 +60,17 @@ function commandId(action: string): string {
 }
 
 export type SubagentTimelineEntry =
+  | {
+      kind: 'native';
+      key: string;
+      envelope: AgentEventEnvelope;
+      content?: string;
+      originals?: AgentEventEnvelope[];
+    }
+  | { kind: 'native_error'; key: string; message: string }
   | { kind: 'thinking'; key: string; content: string }
   | { kind: 'text'; key: string; content: string }
+  | { kind: 'tool_ref'; key: string; callId: string }
   | { kind: 'tool'; key: string; toolId: string }
   | { kind: 'gap'; key: string; from?: number; to?: number };
 
@@ -86,7 +98,33 @@ export function subagentTimelineEntries(
 
   run.events.forEach((event, index) => {
     const key = event.event_id ?? `${event.event}-${index}`;
-    if (event.event === 'thinking_delta') {
+    if (event.event === 'note') {
+      const envelope = nativeSubagentEnvelope(event.agent_envelope);
+      if (envelope) {
+        const previous = entries.at(-1);
+        const old =
+          previous?.kind === 'native' && previous.envelope.payload.type === 'assistant_message'
+            ? previous.envelope
+            : null;
+        if (
+          previous?.kind === 'native' &&
+          old &&
+          old.payload.type === 'assistant_message' &&
+          envelope.payload.type === 'assistant_message' &&
+          old.stream_id === envelope.stream_id &&
+          old.turn_id === envelope.turn_id &&
+          old.execution_id === envelope.execution_id &&
+          old.payload.data.block.request_id === envelope.payload.data.block.request_id &&
+          old.payload.data.block.block_id === envelope.payload.data.block.block_id
+        ) {
+          previous.content =
+            (previous.content ?? old.payload.data.block.delta) + envelope.payload.data.block.delta;
+          previous.originals = [...(previous.originals ?? [old]), envelope];
+          previous.envelope = envelope;
+        } else entries.push({ kind: 'native', key, envelope });
+      } else if (event.native_decode_error)
+        entries.push({ kind: 'native_error', key, message: event.native_decode_error });
+    } else if (event.event === 'thinking_delta') {
       appendText('thinking', key, typeof event.content === 'string' ? event.content : '');
     } else if (event.event === 'token_delta') {
       appendText('text', key, typeof event.content === 'string' ? event.content : '');
@@ -95,6 +133,8 @@ export function subagentTimelineEntries(
       if (toolId) {
         usedTools.add(toolId);
         entries.push({ kind: 'tool', key, toolId });
+      } else {
+        entries.push({ kind: 'tool_ref', key, callId: event.call_id });
       }
     } else if (event.event === 'subagent_stream_gap') {
       entries.push({
@@ -129,9 +169,17 @@ export function visibleSubagentTimelineEntries(
     normalizedOutput.length > 0 &&
     normalizedStream.length > 0 &&
     normalizedOutput.includes(normalizedStream);
-  return terminal && terminalCoversStream
-    ? entries.filter((entry) => entry.kind !== 'text')
-    : entries;
+  return entries.filter((entry) => {
+    if (terminal && terminalCoversStream && entry.kind === 'text') return false;
+    if (
+      terminal &&
+      entry.kind === 'native' &&
+      entry.envelope.payload.type === 'final_answer' &&
+      entry.envelope.payload.data === finalOutput
+    )
+      return false;
+    return true;
+  });
 }
 
 export function SubagentDetailView({ run, onBack }: SubagentDetailViewProps) {
@@ -326,10 +374,35 @@ export function SubagentDetailView({ run, onBack }: SubagentDetailViewProps) {
           </div>
         )}
 
+        {visibleTimeline
+          .filter((entry) => entry.kind === 'native_error')
+          .map((entry) =>
+            entry.kind === 'native_error' ? (
+              <p role="alert" key={entry.key}>
+                {entry.message}
+              </p>
+            ) : null
+          )}
         {visibleTimeline.length > 0 && (
           <ExecutionProcessGroup completed={terminal}>
             <div className="space-y-1">
               {visibleTimeline.map((entry, index) => {
+                if (entry.kind === 'native_error') return null;
+                if (entry.kind === 'tool_ref')
+                  return (
+                    <p key={entry.key} className="text-xs text-[var(--text-secondary)]">
+                      工具调用 {entry.callId}（详情尚未载入）
+                    </p>
+                  );
+                if (entry.kind === 'native')
+                  return (
+                    <SubagentNativeEvent
+                      key={entry.key}
+                      envelope={entry.envelope}
+                      content={entry.content}
+                      originals={entry.originals}
+                    />
+                  );
                 if (entry.kind === 'thinking') {
                   const thinkingIndex = visibleTimeline
                     .slice(0, index + 1)

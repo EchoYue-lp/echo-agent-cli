@@ -1109,6 +1109,16 @@ impl FileTaskShadow {
             .map(Option::unwrap_or_default)
     }
 
+    pub(crate) fn raw_input_history_snapshot(
+        &self,
+        run_id: &str,
+        requested_cut: Option<u64>,
+    ) -> Result<super::history_projection::RawInputHistorySnapshot, ShadowError> {
+        self.authority(run_id, false)?
+            .ok_or_else(|| ShadowError::Io(format!("raw input Run not found: {run_id}")))?
+            .raw_input_history_snapshot(requested_cut)
+    }
+
     pub(crate) fn read_summary_projection(
         &self,
         run_id: &str,

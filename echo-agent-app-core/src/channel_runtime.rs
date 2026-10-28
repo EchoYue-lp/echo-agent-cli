@@ -186,6 +186,10 @@ async fn drive_with_channel_prompts<F: std::future::Future>(
 #[cfg(feature = "channels")]
 mod outbound;
 
+#[cfg(all(test, feature = "channels"))]
+#[path = "channel_runtime/native_message_tests.rs"]
+mod native_message_tests;
+
 #[cfg(feature = "channels")]
 mod input_pump;
 
@@ -8416,12 +8420,27 @@ async fn aggregate_by_sentence_with_repository<'a>(
         let mut tool_state = ChannelToolRenderState::default();
         let mut tool_capacity_reported = false;
         let mut tool_identity_conflict_reported = false;
+        let mut native_messages = false;
+        let mut legacy_tokens_seen = false;
+        let mut native_events = HashSet::new();
+        let mut unknown_blocks: HashMap<_, String> = HashMap::new();
+        let mut unknown_bytes = 0_usize;
+        let mut confirmed_executions = HashSet::new();
         // flush 全 buf(若非空)的统一动作,被多个终态/flush 分支共用。
         macro_rules! flush_all {
             () => {
                 if !buf.is_empty() {
                     yield ChannelOutboundDraft::stream(std::mem::take(&mut buf));
                 }
+            };
+        }
+        macro_rules! discard_unknown_execution {
+            ($stream:expr, $turn:expr, $execution:expr) => {
+                unknown_blocks.retain(|(stream, turn, execution, _, _), text| {
+                    let discard = stream == $stream && turn == $turn && execution == $execution;
+                    if discard { unknown_bytes = unknown_bytes.saturating_sub(text.len()); }
+                    !discard
+                });
             };
         }
         while let Some(ev) = events.next().await {
@@ -8461,6 +8480,8 @@ async fn aggregate_by_sentence_with_repository<'a>(
                     yield ChannelOutboundDraft::ordinary(prompt);
                 }
                 ChannelRenderEvent::Token(t) => {
+                    if native_messages { continue; }
+                    legacy_tokens_seen = true;
                     buf.push_str(&t);
                     if let Some(trailing_chars) = buf.chars().rev().position(|ch| ch == '\n') {
                         let cut = buf.chars().count().saturating_sub(trailing_chars);
@@ -8482,7 +8503,71 @@ async fn aggregate_by_sentence_with_repository<'a>(
                     .to_string();
                 let chat_owner = ChannelToolOwner::Chat(fallback_message_id.clone());
                 match envelope.payload {
+                AgentEvent::AssistantMessage { block } => {
+                    native_messages = true;
+                    // 仅去重原event身份的重复呈现，不生成消息或完成事实。
+                    let observation = (
+                        envelope.stream_id.clone(), envelope.turn_id.clone(),
+                        envelope.execution_id.clone(), envelope.event_id,
+                    );
+                    if !native_events.insert(observation) { continue; }
+                    let block_key = (
+                        envelope.stream_id, envelope.turn_id, envelope.execution_id,
+                        block.request_id, block.block_id,
+                    );
+                    match block.phase {
+                        echo_agent::agent::AssistantPhase::Commentary
+                        | echo_agent::agent::AssistantPhase::PartialAnswer => {
+                            if block.phase == echo_agent::agent::AssistantPhase::Commentary
+                                && let Some(previous) = unknown_blocks.remove(&block_key)
+                            {
+                                unknown_bytes = unknown_bytes.saturating_sub(previous.len());
+                                buf.push_str(&previous);
+                            }
+                            buf.push_str(&block.delta);
+                            if block.complete {
+                                flush_all!();
+                                // 公开块完成是文字呈现边界，不是执行终态。
+                                yield ChannelOutboundDraft::ordinary(String::new());
+                            } else if buf.chars().count() >= FLUSH_THRESHOLD {
+                                flush_all!();
+                            }
+                        }
+                        // reasoning含签名/opaque原件已原样经过sink和journal；
+                        // IM不将其或未知/最终候选转成公开进度。
+                        echo_agent::agent::AssistantPhase::Unknown => {
+                            if block.delta.len() > outbound::CHANNEL_TURN_EVENT_BYTES.saturating_sub(unknown_bytes) {
+                                Err(echo_agent::error::ReactError::Other("channel unknown-message projection exceeds its existing event-byte budget".to_string()))?;
+                            }
+                            unknown_bytes = unknown_bytes.saturating_add(block.delta.len());
+                            unknown_blocks.entry(block_key).or_default().push_str(&block.delta);
+                        }
+                        echo_agent::agent::AssistantPhase::Reasoning
+                        | echo_agent::agent::AssistantPhase::FinalAnswer => {}
+                    }
+                }
+                AgentEvent::ExecutionStatus(status) => {
+                    let observation = (
+                        envelope.stream_id, envelope.turn_id,
+                        envelope.execution_id, envelope.event_id,
+                    );
+                    if !native_events.insert(observation) { continue; }
+                    flush_all!();
+                    let label = match status.status {
+                        echo_agent::agent::ExecutionStatusKind::Started => "started",
+                        echo_agent::agent::ExecutionStatusKind::Waiting => "waiting",
+                        echo_agent::agent::ExecutionStatusKind::ToolPending => "tool_pending",
+                        echo_agent::agent::ExecutionStatusKind::Candidate => "candidate",
+                        echo_agent::agent::ExecutionStatusKind::Settled => "agent_execution_settled",
+                        echo_agent::agent::ExecutionStatusKind::Cancelled => "agent_execution_cancelled",
+                        echo_agent::agent::ExecutionStatusKind::Failed => "agent_execution_failed",
+                    };
+                    let reason = status.reason.as_deref().map(|reason| format!(": {}", channel_safe_text(reason, 320))).unwrap_or_default();
+                    yield ChannelOutboundDraft::ordinary(format!("[execution:{}] {label}{reason}", channel_safe_text(&status.execution_id, 80)));
+                }
                 AgentEvent::Token(t) => {
+                    if native_messages { continue; }
+                    legacy_tokens_seen = true;
                     buf.push_str(&t);
                     // 1. 换行 flush(到最后一个 \n 含)。反向字符偏移表示换行后
                     //    还有多少字符,因此 `cut` 是包含换行的字符数。
@@ -8604,16 +8689,36 @@ async fn aggregate_by_sentence_with_repository<'a>(
                         }
                     }
                 }
-                AgentEvent::FinalAnswer(_) => {
+                AgentEvent::FinalAnswer(answer) => {
                     flush_all!();
+                    if answer.trim().is_empty() {
+                        tool_state.finish_owner(&chat_owner);
+                        continue;
+                    }
+                    discard_unknown_execution!(&envelope.stream_id, &envelope.turn_id, &envelope.execution_id);
+                    if native_messages || !legacy_tokens_seen {
+                        // FinalAnswer来自原Framework校验/持久化/执行结算路径。
+                        // 按原事件顺序呈现；Terminal仍独占foreground关闭，
+                        // 不由此把Agent执行结束提升成TaskRun完成。
+                        let execution = (
+                            envelope.stream_id,
+                            envelope.turn_id,
+                            envelope.execution_id,
+                        );
+                        if confirmed_executions.insert(execution) {
+                            yield ChannelOutboundDraft::confirmed_answer(answer);
+                        }
+                    }
                     tool_state.finish_owner(&chat_owner);
                 }
                 AgentEvent::Cancelled => {
                     flush_all!();
+                    discard_unknown_execution!(&envelope.stream_id, &envelope.turn_id, &envelope.execution_id);
                     tool_state.finish_owner(&chat_owner);
                 }
                 AgentEvent::Error { .. } => {
                     flush_all!();
+                    discard_unknown_execution!(&envelope.stream_id, &envelope.turn_id, &envelope.execution_id);
                     tool_state.finish_owner(&chat_owner);
                 }
                 AgentEvent::BudgetDecision { decision, reason, .. } => {
@@ -15745,78 +15850,6 @@ mod tests {
     }
 }
 
-/// Retained standalone surface delegates to the same application channel owner.
-pub struct ChannelsModeArgs {
-    pub runtime: Arc<ChannelRuntime>,
-    pub shutdown: echo_agent::agent::CancellationToken,
-}
-pub async fn run_channels_mode(args: ChannelsModeArgs) -> anyhow::Result<()> {
-    let configuration = args
-        .runtime
-        .configuration()
-        .await
-        .map_err(anyhow::Error::msg)?;
-    if !configuration
-        .pointer("/qq/enabled")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-        && !configuration
-            .pointer("/feishu/enabled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    {
-        return finish_channel_lifecycle(
-            vec!["no configured IM channel could be started".to_string()],
-            Ok(()),
-        );
-    }
-    let (started, mut failures) = args.runtime.start_configured_with_receipt().await;
-    if started == 0 {
-        if failures.is_empty() {
-            failures.push("no configured IM channel could be started".to_string());
-        }
-        // Retained standalone behavior: do not wait indefinitely for shutdown
-        // when every actual start failed. Drain the same owner before reporting.
-        return finish_channel_lifecycle(
-            failures,
-            args.runtime
-                .shutdown_and_wait()
-                .await
-                .map_err(anyhow::Error::msg),
-        );
-    }
-    for error in &failures {
-        tracing::warn!(%error, "Configured IM channel did not start");
-    }
-    args.shutdown.cancelled().await;
-    finish_channel_lifecycle(
-        failures,
-        args.runtime
-            .shutdown_and_wait()
-            .await
-            .map_err(anyhow::Error::msg),
-    )
-}
-
-#[cfg(feature = "channels")]
-fn finish_channel_lifecycle(
-    start_failures: Vec<String>,
-    stop_result: anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    let mut failures = start_failures;
-    if let Err(error) = stop_result {
-        failures.push(format!("shutdown: {error}"));
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "channel lifecycle failed: {}",
-            failures.join("; ")
-        ))
-    }
-}
-
 #[cfg(feature = "channels")]
 fn channel_session_config(timeout_minutes: u64) -> echo_agent::channels::SessionConfig {
     echo_agent::channels::SessionConfig::default()
@@ -16063,13 +16096,17 @@ mod original_composition_tests {
             })
             .collect::<Vec<_>>();
         let stop_result = manager.stop_all().await.map_err(anyhow::Error::from);
-        let error = finish_channel_lifecycle(start_failures, stop_result)
+        assert!(
+            start_failures
+                .iter()
+                .any(|message| message.contains("start-fails"))
+        );
+        let error = stop_result
             .err()
-            .ok_or_else(|| anyhow::anyhow!("channel lifecycle failures were not reported"))?;
+            .ok_or_else(|| anyhow::anyhow!("stop failure was not reported"))?;
 
         assert_eq!(start_stops.load(Ordering::SeqCst), 1);
         assert_eq!(stop_stops.load(Ordering::SeqCst), 1);
-        assert!(error.to_string().contains("start-fails"));
         assert!(error.to_string().contains("stop-fails"));
         Ok(())
     }

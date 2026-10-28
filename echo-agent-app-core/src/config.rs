@@ -37,7 +37,6 @@ pub struct EkoConfig {
     pub hooks: HooksDefinition,
     pub server: ServerConfig,
     pub logging: LoggingConfig,
-    pub tui: TuiConfig,
 }
 
 impl Default for EkoConfig {
@@ -54,7 +53,6 @@ impl Default for EkoConfig {
             hooks: HooksDefinition::default(),
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
-            tui: TuiConfig::default(),
         }
     }
 }
@@ -395,20 +393,6 @@ impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: "info".to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
-pub struct TuiConfig {
-    pub max_display_chars: usize,
-}
-
-impl Default for TuiConfig {
-    fn default() -> Self {
-        Self {
-            max_display_chars: 20_000,
         }
     }
 }

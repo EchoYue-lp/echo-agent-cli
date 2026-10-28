@@ -3235,6 +3235,89 @@ mod workspace_transition_tests {
     }
 
     #[tokio::test]
+    async fn reply_fork_native_switch_rejects_recreated_target_before_source_projection_changes()
+    -> Result<(), String> {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let (state, _pool, _plugins) = extension_control_state(temporary.path()).await?;
+        let source = state
+            .workspace
+            .registry
+            .create_at(
+                "source",
+                crate::workspace::WorkspaceKind::General,
+                temporary.path().join("source"),
+            )
+            .map_err(|error| error.to_string())?;
+        state
+            .switch_workspace_registered(source.id.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let old = state
+            .workspace
+            .registry
+            .create_at(
+                "target",
+                crate::workspace::WorkspaceKind::General,
+                temporary.path().join("old-target"),
+            )
+            .map_err(|error| error.to_string())?;
+        let expected = old.opaque_product_data_generation();
+        let transition = state.workspace.transition.write().await;
+        let pending_state = state.clone();
+        let target_id = old.id.clone();
+        let pending = tokio::spawn(async move {
+            pending_state
+                .switch_workspace_registered_with_connection(target_id, None, Some(expected))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!pending.is_finished());
+        state
+            .workspace
+            .registry
+            .delete(&old.id)
+            .map_err(|error| error.to_string())?;
+        let current = state
+            .workspace
+            .registry
+            .create_at(
+                "target",
+                crate::workspace::WorkspaceKind::General,
+                temporary.path().join("new-target"),
+            )
+            .map_err(|error| error.to_string())?;
+        assert_ne!(
+            current.opaque_product_data_generation(),
+            old.opaque_product_data_generation()
+        );
+        drop(transition);
+        assert!(pending.await.map_err(|error| error.to_string())?.is_err());
+        assert_eq!(
+            state
+                .current_workspace()
+                .await
+                .map(|workspace| workspace.id),
+            Some(source.id)
+        );
+        state
+            .switch_workspace_registered_with_connection(
+                current.id.clone(),
+                None,
+                Some(current.opaque_product_data_generation()),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            state
+                .current_workspace()
+                .await
+                .map(|workspace| workspace.id),
+            Some(current.id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn handoff_collision_preserves_both_workspace_conversations() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root_a = temp.path().join("workspace-a");
@@ -4959,31 +5042,54 @@ mod workspace_transition_tests {
         Ok(())
     }
 
-    async fn relinked_task_control_fixture(root: &std::path::Path)
-    -> Result<(Arc<AppState>, crate::workspace::WorkspaceId, String, String), Box<dyn std::error::Error>> {
+    async fn relinked_task_control_fixture(
+        root: &std::path::Path,
+    ) -> Result<
+        (Arc<AppState>, crate::workspace::WorkspaceId, String, String),
+        Box<dyn std::error::Error>,
+    > {
         let first_root = root.join("project-before");
         let next_root = root.join("project-after");
         std::fs::create_dir_all(&first_root)?;
         std::fs::create_dir_all(&next_root)?;
         let (state, _, _) = extension_control_state(root).await?;
         let workspace = state.workspace.registry.create_at(
-            "generation-control", crate::workspace::WorkspaceKind::General, first_root,
+            "generation-control",
+            crate::workspace::WorkspaceKind::General,
+            first_root,
         )?;
         let id = workspace.id.clone();
         state.switch_workspace(workspace).await?;
         let old_control = state.workspace_control_for_scope(id.as_str()).await?;
         let old_generation = old_control.generation();
-        let old_store = old_control.runtime().task_runtime().ok_or("old task runtime missing")?;
-        old_store.create_run("same-run", id.as_str(), "conversation", "root", crate::tasks::task_runtime::DomainProfile::General,
-            "preserve captured project", "agent_task_plan", crate::tasks::task_runtime::AttendedMode::Attended)?;
+        let old_store = old_control
+            .runtime()
+            .task_runtime()
+            .ok_or("old task runtime missing")?;
+        old_store.create_run(
+            "same-run",
+            id.as_str(),
+            "conversation",
+            "root",
+            crate::tasks::task_runtime::DomainProfile::General,
+            "preserve captured project",
+            "agent_task_plan",
+            crate::tasks::task_runtime::AttendedMode::Attended,
+        )?;
         drop(old_store);
         drop(old_control);
         state.link_workspace_project_owned(&id, next_root).await?;
         let current = state.workspace_control_for_scope(id.as_str()).await?;
         let current_generation = current.generation();
         assert_ne!(old_generation, current_generation);
-        let store = current.runtime().task_runtime().ok_or("new task runtime missing")?;
-        store.transition_run("same-run", crate::tasks::task_runtime::TaskRunStatus::Running)?;
+        let store = current
+            .runtime()
+            .task_runtime()
+            .ok_or("new task runtime missing")?;
+        store.transition_run(
+            "same-run",
+            crate::tasks::task_runtime::TaskRunStatus::Running,
+        )?;
         drop(store);
         drop(current);
         Ok((state, id, old_generation, current_generation))
@@ -4993,14 +5099,27 @@ mod workspace_transition_tests {
     async fn task_control_generation_rejects_relinked_workspace_without_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
-        let (state, id, old_generation, current_generation) = relinked_task_control_fixture(temp.path()).await?;
-        let current = state.workspace_control_for_generation(id.as_str(), &current_generation).await?;
-        let store = current.runtime().task_runtime().ok_or("new task runtime missing")?;
+        let (state, id, old_generation, current_generation) =
+            relinked_task_control_fixture(temp.path()).await?;
+        let current = state
+            .workspace_control_for_generation(id.as_str(), &current_generation)
+            .await?;
+        let store = current
+            .runtime()
+            .task_runtime()
+            .ok_or("new task runtime missing")?;
         let before = store.get_run_state("same-run")?.ok_or("new run missing")?;
         // These commands all use this production helper before mutation or launch.
-        for action in ["pause", "cancel", "resume", "retry", "goal", "budget", "graph", "recovery", "skip"] {
-            let rejected = state.workspace_control_for_generation(id.as_str(), &old_generation).await;
-            assert!(rejected.is_err(), "late {action} accepted a replacement generation");
+        for action in [
+            "pause", "cancel", "resume", "retry", "goal", "budget", "graph", "recovery", "skip",
+        ] {
+            let rejected = state
+                .workspace_control_for_generation(id.as_str(), &old_generation)
+                .await;
+            assert!(
+                rejected.is_err(),
+                "late {action} accepted a replacement generation"
+            );
             let unchanged = store.get_run_state("same-run")?.ok_or("run disappeared")?;
             assert_eq!(unchanged.journal_sequence, before.journal_sequence);
             assert_eq!(unchanged.run.status, before.run.status);
@@ -5013,13 +5132,32 @@ mod workspace_transition_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let (state, id, _, generation) = relinked_task_control_fixture(temp.path()).await?;
-        let checked = state.workspace_control_for_generation(id.as_str(), &generation).await?;
-        let store = checked.runtime().task_runtime().ok_or("checked runtime missing")?;
-        let before = store.get_run_state("same-run")?.ok_or("running snapshot missing")?.journal_sequence;
+        let checked = state
+            .workspace_control_for_generation(id.as_str(), &generation)
+            .await?;
+        let store = checked
+            .runtime()
+            .task_runtime()
+            .ok_or("checked runtime missing")?;
+        let before = store
+            .get_run_state("same-run")?
+            .ok_or("running snapshot missing")?
+            .journal_sequence;
         assert!(store.request_pause("same-run")?);
-        assert_eq!(store.get_run("same-run")?.ok_or("paused run missing")?.status,
-            crate::tasks::task_runtime::TaskRunStatus::Paused);
-        assert!(store.get_run_state("same-run")?.ok_or("paused snapshot missing")?.journal_sequence > before);
+        assert_eq!(
+            store
+                .get_run("same-run")?
+                .ok_or("paused run missing")?
+                .status,
+            crate::tasks::task_runtime::TaskRunStatus::Paused
+        );
+        assert!(
+            store
+                .get_run_state("same-run")?
+                .ok_or("paused snapshot missing")?
+                .journal_sequence
+                > before
+        );
         Ok(())
     }
 
@@ -5028,7 +5166,9 @@ mod workspace_transition_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let (state, id, _, generation) = relinked_task_control_fixture(temp.path()).await?;
-        let checked = state.workspace_control_for_generation(id.as_str(), &generation).await?;
+        let checked = state
+            .workspace_control_for_generation(id.as_str(), &generation)
+            .await?;
         let pinned_runtime = checked.runtime().clone();
         drop(checked);
         // The returned runtime clone still owns the original lease used by every command.
@@ -5038,7 +5178,9 @@ mod workspace_transition_tests {
                 .await
                 .is_err_and(|error| error.to_string().contains("controls: 1"))
         );
-        let store = pinned_runtime.task_runtime().ok_or("pinned runtime missing")?;
+        let store = pinned_runtime
+            .task_runtime()
+            .ok_or("pinned runtime missing")?;
         assert!(store.request_pause("same-run")?);
         drop(store);
         drop(pinned_runtime);

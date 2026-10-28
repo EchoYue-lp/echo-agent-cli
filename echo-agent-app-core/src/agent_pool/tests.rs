@@ -3211,6 +3211,7 @@ mod tests {
         let client = Arc::new(echo_agent::testing::MockLlmClient::new().with_responses([
             r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
             "## Summary\nExact evidence inspected; no changes required.",
+            r#"{"score":9.0,"passed":true,"feedback":"Exact evidence inspected","suggestions":[]}"#,
         ]));
         pool.set_llm_client_override_for_test(client.clone()).await;
         publish_domain_for_test(&pool, domain_components_for_test(directory.path(), "gui")?)
@@ -3325,7 +3326,7 @@ mod tests {
         })?
         .map_err(|error| error.to_string())?;
         assert_eq!(outcome, crate::chat_driver::TurnOutcome::Completed);
-        assert_eq!(client.call_count(), 2);
+        assert_eq!(client.call_count(), 3);
         let requests = client.all_calls();
         assert_eq!(
             requests

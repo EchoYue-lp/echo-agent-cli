@@ -3,6 +3,14 @@
 mod tests {
     use super::*;
 
+    mod performance_baseline {
+        use super::*;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/runtime_baseline.rs"
+        ));
+    }
+
     fn durable_input_source(
         store: &TaskRuntimeStore,
         input_id: &str,
@@ -55,6 +63,585 @@ mod tests {
             identity,
             payload,
         })
+    }
+
+    fn raw_history_descriptor(
+        history: &RawInputHistoryReference,
+        config: &echo_agent::tools::artifact::ToolOutputArtifactConfig,
+    ) -> Result<echo_agent::tools::artifact::ToolOutputArtifactRef, Box<dyn std::error::Error>>
+    {
+        let artifact = history.artifact.as_ref().ok_or("原文历史文件缺失")?;
+        Ok(echo_agent::tools::artifact::ToolOutputArtifactRef {
+            path: artifact.path.clone(),
+            artifact_bytes: artifact.bytes,
+            payload_bytes: artifact.bytes,
+            sha256: artifact.sha256.clone().ok_or("原文历史SHA缺失")?,
+            retention: config.retention.clone(),
+        })
+    }
+
+    #[test]
+    fn raw_input_history_fixed_prefix_crosses_scan_pages_and_keeps_legacy_duplicates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".eko/tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        seed_task_query_run(
+            &store,
+            "raw-run",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        let text = "相同文字是合法重复输入，不能按文字合并🧭";
+        let first = durable_input_source(&store, "first-source", 1, text, false)?;
+        store.accept_run_steer_input(
+            "raw-run",
+            "same-turn",
+            first.source,
+            &first.identity,
+            &first.payload,
+        )?;
+        store.record_run_steer("raw-run", "same-turn", text)?;
+        let old = store.raw_input_history_reference("raw-run", None)?;
+        let old_family = std::fs::read(root.join("raw-run/raw-input-history.jsonl"))?;
+        let old_family_metadata = std::fs::read(root.join("raw-run/raw-input-history.meta.jsonl"))?;
+        assert_eq!(old.source_records, 2);
+        let config = crate::infra::tool_output_artifact_config(Some(directory.path()));
+        let old_descriptor = raw_history_descriptor(&old, &config)?;
+        let old_metadata = std::fs::metadata(&old_descriptor.path)?;
+        let first_page =
+            read_artifact_page(&config, &old_descriptor, None, ArtifactPageLimit::Bytes(31))?;
+        let old_cursor = first_page.next_cursor.ok_or("原文第一页缺cursor")?;
+        for index in 0..270 {
+            store.commit_runtime_event(RuntimeJournalEvent::for_append(
+                "raw-run",
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({"index":index,"message":"无关工具/执行事实"}),
+            ))?;
+        }
+        let no_new_input = store.raw_input_history_reference("raw-run", None)?;
+        assert!(no_new_input.observed_through_sequence > old.observed_through_sequence);
+        assert_eq!(no_new_input.source_records, old.source_records);
+        assert_eq!(no_new_input.last_source_sequence, old.last_source_sequence);
+        let no_new_descriptor = raw_history_descriptor(&no_new_input, &config)?;
+        assert_eq!(no_new_descriptor.path, old_descriptor.path);
+        assert_eq!(no_new_descriptor.sha256, old_descriptor.sha256);
+        assert_eq!(
+            std::fs::metadata(&no_new_descriptor.path)?.modified()?,
+            old_metadata.modified()?
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&no_new_descriptor.path)?.ino(),
+                old_metadata.ino()
+            );
+        }
+        let second = durable_input_source(&store, "second-source", 1, text, false)?;
+        store.accept_run_steer_input(
+            "raw-run",
+            "same-turn",
+            second.source,
+            &second.identity,
+            &second.payload,
+        )?;
+        store.record_run_steer("raw-run", "same-turn", text)?;
+        let current = store.raw_input_history_reference("raw-run", None)?;
+        assert_eq!(current.source_records, 4);
+        assert!(current.last_source_sequence > 256);
+        let current_descriptor = raw_history_descriptor(&current, &config)?;
+        assert_ne!(current_descriptor.path, old_descriptor.path);
+        store.qualify_raw_input_history_reference("raw-run", &old)?;
+        // 旧引用的坏段恢复不能回滚整个暖族；后继非source事件也不能把丢失尾部重新盖成Current。
+        std::fs::write(
+            root.join("raw-run/raw-input-history.jsonl"),
+            "旧快照资格校验时发现坏段",
+        )?;
+        store.qualify_raw_input_history_reference("raw-run", &old)?;
+        store.commit_runtime_event(RuntimeJournalEvent::for_append(
+            "raw-run",
+            None,
+            None,
+            RuntimeEventKind::Note,
+            serde_json::json!({"message":"恢复旧快照后的无关事件"}),
+        ))?;
+        assert_eq!(
+            store
+                .raw_input_history_reference("raw-run", None)?
+                .source_records,
+            4
+        );
+        assert!(
+            read_artifact_page(
+                &config,
+                &old_descriptor,
+                Some(&old_cursor),
+                ArtifactPageLimit::Bytes(31)
+            )
+            .is_ok()
+        );
+        assert!(
+            read_artifact_page(
+                &config,
+                &current_descriptor,
+                Some(&old_cursor),
+                ArtifactPageLimit::Bytes(31)
+            )
+            .is_err()
+        );
+        let duplicate = store.accept_run_steer_input(
+            "raw-run",
+            "same-turn",
+            first.source,
+            &first.identity,
+            &first.payload,
+        )?;
+        assert!(duplicate.duplicate);
+        assert_eq!(
+            store
+                .raw_input_history_reference("raw-run", None)?
+                .source_records,
+            4
+        );
+        let contents = std::fs::read_to_string(&current_descriptor.path)?;
+        let records = contents
+            .lines()
+            .skip(1)
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(records.len(), 4);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record
+                    .pointer("/event/payload/input_snapshot/identity/input_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("first-source"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record
+                    .pointer("/event/payload/input_snapshot/identity/input_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("second-source"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record
+                    .pointer("/event/event_type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("run_steer_recorded"))
+                .count(),
+            2
+        );
+        drop(store);
+        // 段及其CRC仍互相自洽，但落后于同代cursor；必须核完整族身份并重建，不能丢后两条。
+        std::fs::write(root.join("raw-run/raw-input-history.jsonl"), old_family)?;
+        std::fs::write(
+            root.join("raw-run/raw-input-history.meta.jsonl"),
+            old_family_metadata,
+        )?;
+        let stale_segment = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        let repaired = stale_segment.raw_input_history_reference("raw-run", None)?;
+        assert_eq!(repaired.source_records, 4);
+        assert_eq!(
+            raw_history_descriptor(&repaired, &config)?.sha256,
+            current_descriptor.sha256
+        );
+        drop(stale_segment);
+        // 移除派生族迫使固定256扫描跨越270无关事件，不能只取第一个匹配页。
+        std::fs::remove_file(root.join("raw-run/raw-input-history.jsonl"))?;
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        let restored = reopened.raw_input_history_reference("raw-run", None)?;
+        assert_eq!(restored.journal_identity, current.journal_identity);
+        assert_eq!(restored.source_records, 4);
+        let restored_descriptor = raw_history_descriptor(&restored, &config)?;
+        assert_eq!(restored_descriptor.path, current_descriptor.path);
+        assert_eq!(restored_descriptor.sha256, current_descriptor.sha256);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_input_history_cache_rebuild_rejects_old_cursor_and_preserves_updated_goal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".eko/tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        let original = format!("{}初始Goal原文尾部🧭", "完整源背景 ".repeat(300));
+        let source = durable_input_source(&store, "initial-source", 1, &original, false)?;
+        store.create_run_for_active_workspace_with_source(
+            "raw-goal",
+            "same-conversation",
+            "initial-turn",
+            DomainProfile::General,
+            &original,
+            "agent_task_plan",
+            AttendedMode::Attended,
+            TaskRunExecutionProfile::conversation_turn(),
+            None,
+            &source,
+        )?;
+        let config = crate::infra::tool_output_artifact_config(Some(directory.path()));
+        let first = store.raw_input_history_reference("raw-goal", None)?;
+        let descriptor = raw_history_descriptor(&first, &config)?;
+        let cursor = read_artifact_page(&config, &descriptor, None, ArtifactPageLimit::Bytes(31))?
+            .next_cursor
+            .ok_or("原cursor缺失")?;
+        store.transition_run("raw-goal", TaskRunStatus::Running)?;
+        store.transition_run("raw-goal", TaskRunStatus::Paused)?;
+        let updated = store.update_run_goal(
+            "raw-goal",
+            1,
+            "用户显式修改后的新Goal",
+            "用户操作",
+            RunGoalActorSource::Gui,
+        )?;
+        let after_update = store.raw_input_history_reference("raw-goal", None)?;
+        assert_eq!(
+            raw_history_descriptor(&after_update, &config)?.sha256,
+            descriptor.sha256
+        );
+        assert!(std::fs::read_to_string(&descriptor.path)?.contains(&original));
+        std::fs::write(
+            root.join("raw-goal/raw-input-history.jsonl"),
+            "损坏的派生来源族",
+        )?;
+        assert_eq!(
+            raw_history_descriptor(
+                &store.raw_input_history_reference("raw-goal", None)?,
+                &config
+            )?
+            .sha256,
+            descriptor.sha256
+        );
+        std::fs::write(&descriptor.path, "已损坏的原文缓存")?;
+        let rebuilt =
+            store.raw_input_history_reference("raw-goal", Some(first.observed_through_sequence))?;
+        let rebuilt_descriptor = raw_history_descriptor(&rebuilt, &config)?;
+        assert_eq!(rebuilt_descriptor.sha256, descriptor.sha256);
+        assert!(
+            read_artifact_page(
+                &config,
+                &rebuilt_descriptor,
+                Some(&cursor),
+                ArtifactPageLimit::Bytes(31)
+            )
+            .is_err()
+        );
+        assert!(
+            read_artifact_page(
+                &config,
+                &rebuilt_descriptor,
+                None,
+                ArtifactPageLimit::Bytes(31)
+            )
+            .is_ok()
+        );
+        std::fs::remove_file(&rebuilt_descriptor.path)?;
+        let regenerated =
+            store.raw_input_history_reference("raw-goal", Some(first.observed_through_sequence))?;
+        assert_eq!(
+            raw_history_descriptor(&regenerated, &config)?.sha256,
+            descriptor.sha256
+        );
+        let after = store.get_run("raw-goal")?.ok_or("原Goal缺失")?;
+        assert_eq!(
+            (after.goal, after.goal_revision, after.goal_sha256),
+            (
+                updated.goal.clone(),
+                updated.goal_revision,
+                updated.goal_sha256.clone()
+            )
+        );
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        let restored = reopened.raw_input_history_reference("raw-goal", None)?;
+        assert_eq!(
+            raw_history_descriptor(&restored, &config)?.sha256,
+            descriptor.sha256
+        );
+        assert_eq!(
+            reopened.get_run("raw-goal")?.ok_or("原Goal缺失")?.goal,
+            updated.goal
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_input_history_snapshots_isolate_runs_generations_and_concurrent_append()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".eko/tasks");
+        let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?);
+        for run_id in ["raw-first", "raw-second"] {
+            seed_task_query_run(&store, run_id, TaskRunExecutionProfile::conversation_turn())?;
+            store.record_run_steer(run_id, "same-turn", "同样文字，仍是不同Run")?;
+        }
+        let old = store.raw_input_history_reference("raw-first", None)?;
+        let other = store.raw_input_history_reference("raw-second", None)?;
+        assert_ne!(old.journal_identity, other.journal_identity);
+        assert!(
+            store
+                .qualify_raw_input_history_reference("raw-second", &old)
+                .is_err()
+        );
+        let mut wrong_generation = old.clone();
+        wrong_generation.journal_identity = other.journal_identity;
+        assert!(
+            store
+                .qualify_raw_input_history_reference("raw-first", &wrong_generation)
+                .is_err()
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let reader = store.clone();
+        let reader_barrier = barrier.clone();
+        let writer = store.clone();
+        let raced = std::thread::scope(
+            |scope| -> Result<RawInputHistoryReference, Box<dyn std::error::Error>> {
+                let read = scope.spawn(move || {
+                    reader_barrier.wait();
+                    reader.raw_input_history_reference("raw-first", None)
+                });
+                let write = scope.spawn(move || {
+                    barrier.wait();
+                    writer.record_run_steer("raw-first", "later-turn", "并发新输入")
+                });
+                let snapshot = read.join().map_err(|_| "原文快照线程异常")??;
+                write.join().map_err(|_| "原输入追加线程异常")??;
+                Ok(snapshot)
+            },
+        )?;
+        assert!(raced.source_records == 1 || raced.source_records == 2);
+        store.qualify_raw_input_history_reference("raw-first", &raced)?;
+        store.qualify_raw_input_history_reference("raw-first", &old)?;
+        let final_snapshot = store.raw_input_history_reference("raw-first", None)?;
+        assert_eq!(final_snapshot.source_records, 2);
+        let mut future = final_snapshot.clone();
+        future.observed_through_sequence = future.observed_through_sequence.saturating_add(1);
+        assert!(
+            store
+                .qualify_raw_input_history_reference("raw-first", &future)
+                .is_err()
+        );
+        drop(store);
+        let new_root = directory.path().join("another-workspace/.eko/tasks");
+        let replacement = TaskRuntimeStore::new_in_memory_with_shadow_root(&new_root)?;
+        seed_task_query_run(
+            &replacement,
+            "raw-first",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        replacement.record_run_steer("raw-first", "same-turn", "另工作空间自己的第一条")?;
+        replacement.record_run_steer("raw-first", "later-turn", "另工作空间自己的第二条")?;
+        let new = replacement.raw_input_history_reference("raw-first", None)?;
+        assert_ne!(new.journal_identity, old.journal_identity);
+        assert!(
+            replacement
+                .qualify_raw_input_history_reference("raw-first", &old)
+                .is_err()
+        );
+        assert_eq!(
+            new.observed_through_sequence,
+            final_snapshot.observed_through_sequence
+        );
+        drop(replacement);
+        for name in [
+            "raw-input-history.jsonl",
+            "raw-input-history.meta.jsonl",
+            "history-cursor.json",
+        ] {
+            std::fs::copy(
+                root.join("raw-first").join(name),
+                new_root.join("raw-first").join(name),
+            )?;
+        }
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(&new_root)?;
+        let recovered = reopened.raw_input_history_reference("raw-first", None)?;
+        assert_eq!(recovered.journal_identity, new.journal_identity);
+        assert_eq!(
+            recovered
+                .artifact
+                .as_ref()
+                .and_then(|artifact| artifact.sha256.as_ref()),
+            new.artifact
+                .as_ref()
+                .and_then(|artifact| artifact.sha256.as_ref())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_input_history_missing_journal_never_reuses_warm_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".eko/tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        seed_task_query_run(
+            &store,
+            "raw-unavailable",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        store.record_run_steer("raw-unavailable", "original-turn", "原文必须仍可验证")?;
+        let snapshot = store.raw_input_history_reference("raw-unavailable", None)?;
+        assert_eq!(snapshot.source_records, 1);
+        let original = root.join("raw-unavailable/events.jsonl");
+        let held = root.join("raw-unavailable/events.held");
+        std::fs::rename(&original, &held)?;
+        let rejected = store
+            .raw_input_history_reference("raw-unavailable", None)
+            .is_err();
+        std::fs::rename(&held, &original)?;
+        assert!(rejected, "暖缓存不能冒原journal当前可读");
+        store.qualify_raw_input_history_reference("raw-unavailable", &snapshot)?;
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_goal_host_refs_keep_legacy_and_user_versions_without_inventing_inputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".eko/tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        let initial = format!(
+            "{}LEGACY_INITIAL_GOAL_TAIL_3872🧭",
+            "initial goal detail ".repeat(600)
+        );
+        store.create_run(
+            "goal-host",
+            "default",
+            "same-conversation",
+            "initial-turn",
+            DomainProfile::General,
+            &initial,
+            "agent_task_plan",
+            AttendedMode::Attended,
+        )?;
+        assert_eq!(
+            store
+                .raw_input_history_reference("goal-host", None)?
+                .source_records,
+            0
+        );
+        let first = store
+            .canonical_goal_reference("goal-host")?
+            .ok_or("legacy长Goal缺host ref")?;
+        let config = crate::infra::tool_output_artifact_config(Some(directory.path()));
+        let descriptor =
+            |goal: &CanonicalGoalReference| echo_agent::tools::artifact::ToolOutputArtifactRef {
+                path: goal.artifact.path.clone(),
+                artifact_bytes: goal.artifact.bytes,
+                payload_bytes: goal.artifact.bytes,
+                sha256: goal.goal_sha256.clone(),
+                retention: config.retention.clone(),
+            };
+        let old = descriptor(&first);
+        assert!(
+            old.path
+                .starts_with(directory.path().join(".eko/artifacts"))
+        );
+        assert!(read_artifact_page(&config, &old, None, ArtifactPageLimit::Bytes(31)).is_ok());
+        let cursor = read_artifact_page(&config, &old, None, ArtifactPageLimit::Bytes(31))?
+            .next_cursor
+            .ok_or("旧Goal cursor缺失")?;
+        store.transition_run("goal-host", TaskRunStatus::Running)?;
+        store.transition_run("goal-host", TaskRunStatus::Paused)?;
+        let revised = format!(
+            "{}USER_UPDATED_GOAL_TAIL_5739🧭",
+            "updated user goal detail ".repeat(600)
+        );
+        let updated = store.update_run_goal(
+            "goal-host",
+            1,
+            &revised,
+            "用户显式修改长Goal",
+            RunGoalActorSource::Gui,
+        )?;
+        let current = store
+            .canonical_goal_reference("goal-host")?
+            .ok_or("用户长Goal缺host ref")?;
+        assert_eq!(current.goal_revision, 2);
+        assert_eq!(current.goal_sha256, updated.goal_sha256);
+        assert_ne!(current.artifact.path, first.artifact.path);
+        assert_eq!(
+            store
+                .raw_input_history_reference("goal-host", None)?
+                .source_records,
+            0,
+            "canonical Goal引用不能伪造成新的用户输入事实"
+        );
+        assert!(
+            store
+                .qualify_canonical_goal_reference("goal-host", &first)
+                .is_err()
+        );
+        store.qualify_canonical_goal_reference("goal-host", &current)?;
+        assert!(
+            read_artifact_page(&config, &old, Some(&cursor), ArtifactPageLimit::Bytes(31)).is_ok()
+        );
+        assert_eq!(std::fs::read_to_string(&first.artifact.path)?, initial);
+        assert_eq!(std::fs::read_to_string(&current.artifact.path)?, revised);
+        let new_descriptor = descriptor(&current);
+        assert!(
+            read_artifact_page(
+                &config,
+                &new_descriptor,
+                Some(&cursor),
+                ArtifactPageLimit::Bytes(31)
+            )
+            .is_err()
+        );
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        let restored = reopened
+            .canonical_goal_reference("goal-host")?
+            .ok_or("冷重开Goal ref缺失")?;
+        assert_eq!(restored.artifact.path, current.artifact.path);
+        assert_eq!(restored.goal_sha256, current.goal_sha256);
+        std::fs::write(&restored.artifact.path, "坏Goal缓存")?;
+        let repaired = reopened
+            .canonical_goal_reference("goal-host")?
+            .ok_or("Goal缓存重建缺失")?;
+        assert_eq!(std::fs::read_to_string(&repaired.artifact.path)?, revised);
+        let current_run = reopened.get_run("goal-host")?.ok_or("当前Goal缺失")?;
+        assert_eq!(
+            (
+                current_run.goal,
+                current_run.goal_revision,
+                current_run.goal_sha256
+            ),
+            (updated.goal, updated.goal_revision, updated.goal_sha256)
+        );
+        // 同一canonical Goal的已发布引用不能仅因当前投影显示模式改变而失去资格。
+        let middle = format!("{}MIDDLE_GOAL_TAIL_1672🧭", "middle detail ".repeat(40));
+        reopened.update_run_goal(
+            "goal-host",
+            2,
+            &middle,
+            "用户改中段Goal",
+            RunGoalActorSource::Gui,
+        )?;
+        let middle_ref = reopened
+            .canonical_goal_reference("goal-host")?
+            .ok_or("recovery420之外须发布中段Goal")?;
+        reopened.configure_run_continuation("goal-host", true, false, None, None)?;
+        assert!(
+            reopened.canonical_goal_reference("goal-host")?.is_none(),
+            "原GoalContract仍能内联中段Goal"
+        );
+        reopened.qualify_canonical_goal_reference("goal-host", &middle_ref)?;
+        assert_eq!(std::fs::read_to_string(&middle_ref.artifact.path)?, middle);
+        Ok(())
     }
 
     #[test]
@@ -1314,6 +1901,142 @@ mod tests {
                 .query_task_runs_page("generation-a", &[], 20, None)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn task_history_live_pages_keep_creation_order_and_normalize_statuses()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TaskRuntimeStore::new_in_memory()?;
+        for id in ["a", "b", "c"] {
+            seed_task_query_run(
+                &store,
+                id,
+                TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            )?;
+        }
+        let first = store.query_task_runs_page(
+            "generation-live",
+            &[TaskRunStatus::Running, TaskRunStatus::Pending],
+            1,
+            None,
+        )?;
+        assert_eq!(
+            first.items.first().map(|run| run.run_id.as_str()),
+            Some("c")
+        );
+        let cursor = first.next_continuation.as_deref().ok_or("缺少续页位置")?;
+        // 状态和updated_at在页间变化，不改变创建顺序；live查询可排除已不匹配的行。
+        store.transition_run("b", TaskRunStatus::Cancelled)?;
+        let second = store.query_task_runs_page(
+            "generation-live",
+            &[
+                TaskRunStatus::Pending,
+                TaskRunStatus::Pending,
+                TaskRunStatus::Running,
+            ],
+            1,
+            Some(cursor),
+        )?;
+        assert_eq!(
+            second.items.first().map(|run| run.run_id.as_str()),
+            Some("a")
+        );
+        assert!(second.next_continuation.is_none());
+        let refreshed = store.query_task_runs_page("generation-live", &[], 20, None)?;
+        assert_eq!(
+            refreshed
+                .items
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "b", "a"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_history_live_page_discovers_new_formal_plan_below_its_original_cut()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TaskRuntimeStore::new_in_memory()?;
+        for id in ["a-old", "z-top"] {
+            seed_task_query_run(
+                &store,
+                id,
+                TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            )?;
+        }
+        seed_task_query_run(
+            &store,
+            "m-turn",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        let first = store.query_task_runs_page("generation-live", &[], 1, None)?;
+        let cursor = first.next_continuation.as_deref().ok_or("缺少续页位置")?;
+        // 普通turn只因原权威提交了真实plan变得可见；读取列表不创建plan/任务。
+        store.attach_plan_for_test(&TaskPlan {
+            plan_id: "new-formal-plan".into(),
+            run_id: "m-turn".into(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            domain_binding: None,
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("目标 m-turn 中文 🧭"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: "legal-task".into(),
+                title: "合法计划任务".into(),
+                ..Default::default()
+            }],
+        })?;
+        seed_task_query_run(
+            &store,
+            "zz-new-above-cut",
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+        )?;
+        let second = store.query_task_runs_page("generation-live", &[], 1, Some(cursor))?;
+        assert_eq!(
+            second.items.first().map(|run| run.run_id.as_str()),
+            Some("m-turn")
+        );
+        let next = second.next_continuation.as_deref().ok_or("缺少末页位置")?;
+        let last = store.query_task_runs_page("generation-live", &[], 1, Some(next))?;
+        assert_eq!(
+            last.items.first().map(|run| run.run_id.as_str()),
+            Some("a-old")
+        );
+        assert!(last.next_continuation.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn task_history_page_recovers_torn_tail_without_inventing_an_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        let root = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(root.path())?;
+        seed_task_query_run(
+            &store,
+            "torn",
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+        )?;
+        let journal = root.path().join("torn/events.jsonl");
+        let valid = std::fs::read(&journal)?;
+        drop(store);
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&journal)?;
+        writer.write_all(b"{\"seq\":")?;
+        writer.sync_all()?;
+        drop(writer);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(root.path())?;
+        let page = reopened.query_task_runs_page("generation-live", &[], 20, None)?;
+        assert_eq!(page.items.len(), 1);
+        let events = reopened.query_task_event_page("torn", 0, 20)?;
+        assert_eq!(events.events.len(), 1);
+        assert_eq!(events.next_after_sequence, 1);
+        assert!(!events.has_more);
+        assert_eq!(std::fs::read(&journal)?, valid);
         Ok(())
     }
 

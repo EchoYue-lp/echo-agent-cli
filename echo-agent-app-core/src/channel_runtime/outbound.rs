@@ -6,7 +6,7 @@ use super::ChannelRenderEvent;
 
 pub(super) const CHANNEL_EVENT_QUEUE_CAPACITY: usize = 64;
 const CHANNEL_TURN_EVENT_LIMIT: usize = 2_048;
-const CHANNEL_TURN_EVENT_BYTES: usize = 512 * 1024;
+pub(super) const CHANNEL_TURN_EVENT_BYTES: usize = 512 * 1024;
 const CHANNEL_TURN_ENQUEUED_MESSAGES: usize = 512;
 pub(super) const CHANNEL_TOKEN_COALESCE_BYTES: usize = 1024;
 
@@ -16,6 +16,7 @@ struct ChannelSinkBudget {
     accepted_bytes: usize,
     enqueued_messages: usize,
     pending_token: String,
+    native_messages: bool,
 }
 
 /// Ephemeral bounded operation boundary over the canonical journal and tool projection.
@@ -38,13 +39,25 @@ impl ChannelSurfaceSink {
     }
 
     fn deliver_driver(&self, event: crate::chat_driver::ChatDriverEvent) -> bool {
+        let mut budget = lock_channel_sink_budget(&self.budget);
+        // 原生块携带完整身份与phase；兼容Token不再作为第二份正文投递。
+        if budget.native_messages
+            && matches!(&event, crate::chat_driver::ChatDriverEvent::Agent(envelope)
+                if matches!(&envelope.payload, echo_agent::agent::AgentEvent::Token(_)))
+        {
+            return true;
+        }
         let event_bytes = match channel_serialized_size(&event, CHANNEL_TURN_EVENT_BYTES) {
             Some(bytes) => bytes,
             None => return self.reject_delivery("channel event exceeds turn byte budget"),
         };
-        let mut budget = lock_channel_sink_budget(&self.budget);
         if !accept_channel_event(&mut budget, event_bytes) {
             return self.reject_delivery("channel event budget exhausted");
+        }
+        if matches!(&event, crate::chat_driver::ChatDriverEvent::Agent(envelope)
+            if matches!(&envelope.payload, echo_agent::agent::AgentEvent::AssistantMessage { .. }))
+        {
+            budget.native_messages = true;
         }
         if let crate::chat_driver::ChatDriverEvent::Agent(envelope) = &event
             && let echo_agent::agent::AgentEvent::Token(token) = &envelope.payload
@@ -76,13 +89,24 @@ impl ChannelSurfaceSink {
     }
 
     fn deliver_journaled(&self, envelope: crate::chat_event_log::ChatEventEnvelope) -> bool {
+        let mut budget = lock_channel_sink_budget(&self.budget);
+        if budget.native_messages
+            && matches!(&envelope.payload, crate::chat_driver::ChatDriverEvent::Agent(agent)
+                if matches!(&agent.payload, echo_agent::agent::AgentEvent::Token(_)))
+        {
+            return true;
+        }
         let event_bytes = match channel_serialized_size(&envelope, CHANNEL_TURN_EVENT_BYTES) {
             Some(bytes) => bytes,
             None => return self.reject_delivery("journaled channel event exceeds byte budget"),
         };
-        let mut budget = lock_channel_sink_budget(&self.budget);
         if !accept_channel_event(&mut budget, event_bytes) {
             return self.reject_delivery("journaled channel event budget exhausted");
+        }
+        if matches!(&envelope.payload, crate::chat_driver::ChatDriverEvent::Agent(agent)
+            if matches!(&agent.payload, echo_agent::agent::AgentEvent::AssistantMessage { .. }))
+        {
+            budget.native_messages = true;
         }
         if let crate::chat_driver::ChatDriverEvent::Agent(agent) = &envelope.payload
             && let echo_agent::agent::AgentEvent::Token(token) = &agent.payload
@@ -127,12 +151,30 @@ impl ChannelSurfaceSink {
     }
 
     fn try_send(&self, budget: &mut ChannelSinkBudget, event: ChannelRenderEvent) -> bool {
-        if budget.enqueued_messages >= CHANNEL_TURN_ENQUEUED_MESSAGES {
+        let native = match &event {
+            ChannelRenderEvent::Driver(crate::chat_driver::ChatDriverEvent::Agent(envelope)) => {
+                matches!(
+                    &envelope.payload,
+                    echo_agent::agent::AgentEvent::AssistantMessage { .. }
+                )
+            }
+            ChannelRenderEvent::Journaled(envelope) => {
+                matches!(&envelope.payload, crate::chat_driver::ChatDriverEvent::Agent(agent)
+                    if matches!(&agent.payload, echo_agent::agent::AgentEvent::AssistantMessage { .. }))
+            }
+            _ => false,
+        };
+        // Native deltas keep their exact envelopes. They already consume the
+        // original event/byte budget; the legacy coalesced-message counter
+        // must not cancel a drained reader after 512 small native deltas.
+        if !native && budget.enqueued_messages >= CHANNEL_TURN_ENQUEUED_MESSAGES {
             return self.reject_delivery("channel message budget exhausted");
         }
         match self.tx.try_send(event) {
             Ok(()) => {
-                budget.enqueued_messages = budget.enqueued_messages.saturating_add(1);
+                if !native {
+                    budget.enqueued_messages = budget.enqueued_messages.saturating_add(1);
+                }
                 true
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -216,7 +258,9 @@ fn channel_serialized_size(value: &impl serde::Serialize, limit: usize) -> Optio
 }
 
 pub(super) const CHANNEL_OUTBOUND_TOTAL_MESSAGES: usize = 256;
-const CHANNEL_OUTBOUND_ORDINARY_MESSAGES: usize = 255;
+const CHANNEL_OUTBOUND_ORDINARY_MESSAGES: usize = 254;
+const CHANNEL_OUTBOUND_FINAL_MESSAGES: usize = 1;
+const CHANNEL_OUTBOUND_FINAL_BYTES: usize = 2 * 1024;
 const CHANNEL_OUTBOUND_TOTAL_BYTES: usize = 256 * 1024;
 const CHANNEL_OUTBOUND_TERMINAL_BYTES: usize = 4 * 1024;
 const CHANNEL_OUTBOUND_TEXT_CHARS: usize = 4_096;
@@ -227,6 +271,7 @@ enum ChannelOutboundKind {
     Ordinary,
     Buffered,
     Terminal,
+    ConfirmedAnswer,
 }
 
 pub(super) struct ChannelOutboundDraft {
@@ -249,6 +294,14 @@ impl ChannelOutboundDraft {
             kind: ChannelOutboundKind::Ordinary,
             text: text.into(),
             continuation: true,
+        }
+    }
+
+    pub(super) fn confirmed_answer(text: impl Into<String>) -> Self {
+        Self {
+            kind: ChannelOutboundKind::ConfirmedAnswer,
+            text: text.into(),
+            continuation: false,
         }
     }
 
@@ -289,7 +342,9 @@ pub(super) fn channel_outbound_chunks(
 ) -> Vec<String> {
     let max_chars = match draft.kind {
         ChannelOutboundKind::Ordinary => CHANNEL_OUTBOUND_TEXT_CHARS,
-        ChannelOutboundKind::Buffered => CHANNEL_REDACTION_PENDING_BYTES,
+        ChannelOutboundKind::Buffered | ChannelOutboundKind::ConfirmedAnswer => {
+            CHANNEL_REDACTION_PENDING_BYTES
+        }
         ChannelOutboundKind::Terminal => CHANNEL_OUTBOUND_TERMINAL_CHARS,
     };
     echo_agent::utils::utf8::split_utf8_chunks(
@@ -450,6 +505,7 @@ fn channel_outbound_transport_with_rate<'a>(
         let mut ordinary_bytes = 0_usize;
         let mut terminal_messages = 0_usize;
         let mut terminal_bytes = 0_usize;
+        let mut final_messages = 0_usize;
         let mut ordinary_limit_reported = false;
         let mut remaining_burst = rate_policy.burst;
         let mut next_sustained = tokio::time::Instant::now() + rate_policy.sustained_interval;
@@ -470,8 +526,9 @@ fn channel_outbound_transport_with_rate<'a>(
                         if terminal_messages
                             >= CHANNEL_OUTBOUND_TOTAL_MESSAGES
                                 .saturating_sub(CHANNEL_OUTBOUND_ORDINARY_MESSAGES)
+                                .saturating_sub(CHANNEL_OUTBOUND_FINAL_MESSAGES)
                             || bytes
-                                > CHANNEL_OUTBOUND_TERMINAL_BYTES.saturating_sub(terminal_bytes)
+                                > CHANNEL_OUTBOUND_TERMINAL_BYTES.saturating_sub(CHANNEL_OUTBOUND_FINAL_BYTES).saturating_sub(terminal_bytes)
                         {
                             continue;
                         }
@@ -526,6 +583,41 @@ fn channel_outbound_transport_with_rate<'a>(
         }
         while let Some(draft) = drafts.next().await {
             let draft = draft?;
+            if draft.kind == ChannelOutboundKind::ConfirmedAnswer {
+                if let Some(tail) = sanitizer.finish() {
+                    emit_sanitized!(ChannelOutboundKind::Buffered, tail);
+                }
+                let chunks = channel_outbound_chunks(&channel_id, &draft);
+                let bytes = chunks.iter().fold(0_usize, |total, chunk| total.saturating_add(chunk.len()));
+                let ordinary_byte_limit = CHANNEL_OUTBOUND_TOTAL_BYTES.saturating_sub(CHANNEL_OUTBOUND_TERMINAL_BYTES);
+                let content_limit = CHANNEL_OUTBOUND_ORDINARY_MESSAGES.saturating_sub(1);
+                if chunks.len() <= content_limit.saturating_sub(ordinary_messages)
+                    && bytes <= ordinary_byte_limit.saturating_sub(ordinary_bytes)
+                {
+                    for chunk in chunks {
+                        if chunk.is_empty() { continue; }
+                        ordinary_messages = ordinary_messages.saturating_add(1);
+                        ordinary_bytes = ordinary_bytes.saturating_add(chunk.len());
+                        await_channel_rate(&mut remaining_burst, &mut next_sustained, rate_policy).await;
+                        yield OutboundMessage::new(&channel_id, &to, chat_type, chunk);
+                    }
+                } else {
+                    if final_messages >= CHANNEL_OUTBOUND_FINAL_MESSAGES {
+                        Err(echo_agent::error::ReactError::Other(
+                            "channel confirmed-answer reserve exhausted; inspect the durable conversation".to_string(),
+                        ))?;
+                    }
+                    let preview = channel_safe_text(&draft.text, CHANNEL_OUTBOUND_TERMINAL_CHARS);
+                    let preview = format!("{preview}（完整结果见原会话记录）");
+                    if preview.len() > CHANNEL_OUTBOUND_FINAL_BYTES {
+                        Err(echo_agent::error::ReactError::Other("channel confirmed-answer preview exceeds its reserve".to_string()))?;
+                    }
+                    final_messages = final_messages.saturating_add(1);
+                    await_channel_rate(&mut remaining_burst, &mut next_sustained, rate_policy).await;
+                    yield OutboundMessage::new(&channel_id, &to, chat_type, preview);
+                }
+                continue;
+            }
             let input_chars = if draft.kind == ChannelOutboundKind::Terminal {
                 CHANNEL_OUTBOUND_TERMINAL_CHARS
             } else {

@@ -13,6 +13,7 @@
  */
 
 import { create } from 'zustand';
+import type { AgentEventEnvelope } from '../types/api';
 import { isCanonicalUsageEvent } from '../components/compress/subagentUsage';
 import type {
   ExecEvent as GeneratedExecEvent,
@@ -41,6 +42,7 @@ export type SubagentRunEventKind = Extract<
   | 'thinking_delta'
   | 'thinking_ended'
   | 'token_delta'
+  | 'note'
   | 'tool_started'
   | 'tool_completed'
   | 'subagent_escalation_requested'
@@ -111,6 +113,14 @@ export type ExecutionEvent = GeneratedExecutionAddress & {
   verification?: SubagentVerification[];
   remaining_work?: string[];
   touched_files?: SubagentTouchedFiles;
+  /** Original canonical envelope, retained without flattening phase or provenance. */
+  agent_envelope?: AgentEventEnvelope;
+  native_decode_error?: string;
+  runtime_sequence?: string;
+  journal_stream_id?: string;
+  journal_sequence?: number;
+  runtime_replay?: boolean;
+  live_observed?: boolean;
   framework_event?: SubagentEventMetadata | null;
   event_id?: string;
   stream_id?: string;
@@ -184,6 +194,7 @@ const STORED_SUBAGENT_EVENTS = new Set<string>([
   'thinking_delta',
   'thinking_ended',
   'token_delta',
+  'note',
   'tool_started',
   'tool_completed',
   'subagent_escalation_requested',
@@ -371,10 +382,31 @@ export function subagentExecutionEventFromWire(
     return null;
   }
   const payload = jsonRecord(event.payload) ?? {};
+  if (event.event === 'note' && payload.kind !== 'native_agent_event') return null;
+  const original = jsonRecord(payload.agent_envelope);
+  if (
+    event.event === 'note' &&
+    original &&
+    (original.run_id !== event.run_id ||
+      original.conversation_id !== event.conversation_id ||
+      original.execution_id !== event.subagent_run_id ||
+      original.turn_id !== event.subagent_run_id)
+  )
+    return null;
+  const native = nativeSubagentEnvelope(payload.agent_envelope);
+  const decodeError =
+    event.event === 'note' && !native ? '原生事件不可读，原始记录仍保留' : undefined;
   const outcome = jsonRecord(payload.outcome);
   const metadata = event.framework_event;
   const terminalStatus = runtimeTerminalEvent(payload.terminal_status ?? outcome?.status);
-  const timestamp = metadata?.timestamp ?? journal?.timestamp;
+  if (
+    native &&
+    (native.run_id !== event.run_id ||
+      native.conversation_id !== event.conversation_id ||
+      native.execution_id !== event.subagent_run_id)
+  )
+    return null;
+  const timestamp = native?.timestamp ?? metadata?.timestamp ?? journal?.timestamp;
   const startedAt = timestamp ? runtimeEventTimestamp(timestamp) : undefined;
   const artifacts = runtimeArtifacts(outcome?.artifacts ?? payload.artifacts);
   const verification = runtimeVerification(outcome?.verification ?? payload.verification);
@@ -414,15 +446,22 @@ export function subagentExecutionEventFromWire(
     verification,
     remaining_work: jsonStringArray(outcome?.remaining_work ?? payload.remaining_work),
     touched_files: touchedFiles,
+    journal_stream_id: journal?.stream_id,
+    journal_sequence: journal?.sequence,
+    agent_envelope: native,
+    native_decode_error: decodeError,
     framework_event: metadata,
-    event_id: metadata?.event_id ?? journal?.event_id,
+    event_id: native?.event_id ?? metadata?.event_id ?? journal?.event_id,
     stream_id:
+      native?.stream_id ??
       metadata?.stream_id ??
       (event.event === 'subagent_stream_gap' ? jsonString(payload.stream_id) : journal?.stream_id),
     // A synthetic gap describes the framework stream but is itself sequenced
     // by ChatEventLog. Do not compare that outer sequence with framework data.
     sequence:
-      metadata?.sequence ?? (event.event === 'subagent_stream_gap' ? undefined : journal?.sequence),
+      native?.sequence ??
+      metadata?.sequence ??
+      (event.event === 'subagent_stream_gap' ? undefined : journal?.sequence),
     timestamp,
     parent_event_id: metadata?.parent_event_id ?? undefined,
     requested_after: jsonNumber(payload.requested_after),
@@ -453,12 +492,66 @@ export function taskRuntimeSubagentExecutionEvents(
     if (
       runtimeEvent.run_id !== run.run_id ||
       (runtimeEvent.event_type !== 'subagent_assigned' &&
-        runtimeEvent.event_type !== 'subagent_released')
+        runtimeEvent.event_type !== 'subagent_released' &&
+        runtimeEvent.event_type !== 'note' &&
+        runtimeEvent.event_type !== 'tool_started' &&
+        runtimeEvent.event_type !== 'tool_completed')
     ) {
       continue;
     }
 
     const payload = jsonRecord(runtimeEvent.payload);
+    if (
+      runtimeEvent.event_type === 'tool_started' ||
+      runtimeEvent.event_type === 'tool_completed'
+    ) {
+      const execution = jsonString(payload?.execution_id);
+      if (!execution) continue;
+      const tool = subagentExecutionEventFromWire({
+        workspace_id: run.workspace_id,
+        conversation_id: run.conversation_id,
+        run_id: run.run_id,
+        scope: 'subagent',
+        task_id: runtimeEvent.task_id,
+        subagent_run_id: execution,
+        agent: null,
+        event: runtimeEvent.event_type,
+        payload,
+        framework_event: null,
+      });
+      if (tool)
+        projected.push({
+          ...tool,
+          event_id: `runtime:${runtimeEvent.seq}`,
+          timestamp: runtimeEvent.timestamp,
+          runtime_sequence: runtimeEvent.seq,
+          runtime_replay: true,
+        });
+      continue;
+    }
+    if (runtimeEvent.event_type === 'note') {
+      const execution = jsonString(payload?.execution_id) ?? runtimeEvent.step_id;
+      if (payload?.kind !== 'native_agent_event' || !execution) continue;
+      const native = subagentExecutionEventFromWire({
+        workspace_id: run.workspace_id,
+        conversation_id: run.conversation_id,
+        run_id: run.run_id,
+        scope: 'subagent',
+        task_id: runtimeEvent.task_id,
+        subagent_run_id: execution,
+        agent: jsonString(payload.agent) ?? null,
+        event: 'note',
+        payload,
+        framework_event: null,
+      });
+      if (native)
+        projected.push({
+          ...native,
+          runtime_sequence: runtimeEvent.seq,
+          runtime_replay: true,
+        });
+      continue;
+    }
     const executionId = jsonString(payload?.execution_id) ?? runtimeEvent.step_id ?? undefined;
     if (!executionId) continue;
 
@@ -569,29 +662,58 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
       // TaskRuntime tool/thinking events share kind="subagent" on the wire but
       // belong to their dedicated stores. Keep this lifecycle log type-safe.
       if (!STORED_SUBAGENT_EVENTS.has(ev.event)) return s;
+      if (ev.event === 'note' && !ev.agent_envelope && !ev.native_decode_error) return s;
       const id = ev.subagent_run_id;
       const storeKey = subagentRunStoreKey(ev.run_id, id);
       const prev = s.runs[storeKey];
       const newStatus = statusFromEvent(ev.event);
+      const duplicate = prev?.events.findIndex(
+        (candidate) =>
+          (ev.event_id && candidate.event_id === ev.event_id) ||
+          ((ev.runtime_replay || candidate.runtime_replay) &&
+            ['tool_started', 'tool_completed'].includes(ev.event) &&
+            candidate.event === ev.event &&
+            candidate.call_id === ev.call_id)
+      );
+      if (prev && duplicate != null && duplicate >= 0) {
+        if (ev.runtime_sequence == null && ev.journal_sequence == null) return s;
+        const events = prev.events.map((candidate, index) =>
+          index === duplicate
+            ? {
+                ...ev,
+                ...candidate,
+                runtime_sequence: ev.runtime_sequence ?? candidate.runtime_sequence,
+                runtime_replay: ev.runtime_replay ?? candidate.runtime_replay,
+                journal_stream_id: ev.journal_stream_id ?? candidate.journal_stream_id,
+                journal_sequence: ev.journal_sequence ?? candidate.journal_sequence,
+                live_observed: ev.journal_sequence != null ? false : candidate.live_observed,
+              }
+            : candidate
+        );
+        return { runs: { ...s.runs, [storeKey]: { ...prev, events: orderNativeHistory(events) } } };
+      }
+      // Keep the original stale lifecycle fence while admitting unseen history.
       if (
         prev &&
-        ((ev.event_id && prev.events.some((candidate) => candidate.event_id === ev.event_id)) ||
-          (ev.sequence != null &&
-            prev.events.some(
-              (candidate) =>
-                candidate.stream_id === ev.stream_id &&
-                candidate.sequence != null &&
-                candidate.sequence >= ev.sequence!
-            )))
-      ) {
+        newStatus !== null &&
+        !ev.runtime_replay &&
+        ev.sequence != null &&
+        prev.events.some(
+          (candidate) =>
+            candidate.stream_id === ev.stream_id &&
+            candidate.sequence != null &&
+            candidate.sequence >= ev.sequence!
+        )
+      )
         return s;
-      }
       // Synthetic TaskRuntime recovery may settle before the canonical chat
       // replay arrives. It cannot be overwritten by another synthetic event,
       // but framework-sequenced history may still fill the timeline and enrich
       // the same terminal outcome.
       const previousTerminal = Boolean(prev && prev.status !== 'running');
-      const frameworkSequenced = Boolean(ev.framework_event);
+      const frameworkSequenced = Boolean(
+        ev.framework_event || ev.agent_envelope || ev.runtime_replay || ev.native_decode_error
+      );
       if (previousTerminal && !frameworkSequenced) {
         return s;
       }
@@ -624,10 +746,29 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         usageEvents: [],
       };
       // Append the event, capping the log.
-      const events =
-        run.events.length >= MAX_EVENTS_PER_RUN
-          ? [...run.events.slice(run.events.length - MAX_EVENTS_PER_RUN + 1), ev]
-          : [...run.events, ev];
+      const olderSource =
+        ev.sequence != null &&
+        run.events.some(
+          (candidate) =>
+            candidate.stream_id === ev.stream_id &&
+            candidate.sequence != null &&
+            candidate.sequence > ev.sequence!
+        );
+      const incoming = {
+        ...ev,
+        live_observed:
+          ev.live_observed ??
+          (!ev.runtime_replay &&
+            ev.journal_sequence == null &&
+            !olderSource &&
+            Boolean(
+              ev.agent_envelope ||
+              ev.framework_event ||
+              ['tool_started', 'tool_completed'].includes(ev.event)
+            )),
+      };
+      const events = orderNativeHistory([...run.events, incoming]);
+      if (events.length > MAX_EVENTS_PER_RUN) events.splice(0, events.length - MAX_EVENTS_PER_RUN);
       // Accumulate LLM usage events separately (uncapped, but bounded by the
       // number of model calls — typically small) for cache-diagnostics panels.
       const usageEvents = isCanonicalUsageEvent(ev)
@@ -687,4 +828,139 @@ export function ingestTaskRuntimeSubagentEvents(
   for (const event of taskRuntimeSubagentExecutionEvents(run, plan, events)) {
     useSubagentRunStore.getState().ingest(event);
   }
+}
+
+/** Native observations never provide lifecycle status to statusFromEvent. */
+export function nativeSubagentEnvelope(value: unknown): AgentEventEnvelope | undefined {
+  const envelope = jsonRecord(value);
+  const payload = jsonRecord(envelope?.payload);
+  if (
+    !envelope ||
+    !payload ||
+    typeof envelope.schema_version !== 'number' ||
+    !Number.isSafeInteger(envelope.schema_version) ||
+    typeof envelope.content_hash !== 'string' ||
+    typeof envelope.timestamp !== 'string' ||
+    typeof envelope.event_id !== 'string' ||
+    typeof envelope.stream_id !== 'string' ||
+    typeof envelope.turn_id !== 'string' ||
+    typeof envelope.run_id !== 'string' ||
+    typeof envelope.conversation_id !== 'string' ||
+    typeof envelope.execution_id !== 'string' ||
+    typeof envelope.sequence !== 'number' ||
+    !Number.isSafeInteger(envelope.sequence)
+  )
+    return undefined;
+  const data = jsonRecord(payload.data);
+  if (payload.type === 'assistant_message') {
+    const block = jsonRecord(data?.block);
+    if (
+      !block ||
+      typeof block.block_id !== 'string' ||
+      typeof block.request_id !== 'string' ||
+      typeof block.delta !== 'string' ||
+      typeof block.complete !== 'boolean' ||
+      !['reasoning', 'commentary', 'partial_answer', 'final_answer', 'unknown'].includes(
+        String(block.phase)
+      )
+    )
+      return undefined;
+  } else if (payload.type === 'execution_status') {
+    if (
+      !data ||
+      typeof data.execution_id !== 'string' ||
+      ![
+        'started',
+        'waiting',
+        'tool_pending',
+        'candidate',
+        'settled',
+        'cancelled',
+        'failed',
+      ].includes(String(data.status)) ||
+      (data.reason != null && typeof data.reason !== 'string')
+    )
+      return undefined;
+  } else if (payload.type === 'error') {
+    if (!data || typeof data.message !== 'string') return undefined;
+  } else if (payload.type === 'final_answer') {
+    if (typeof payload.data !== 'string') return undefined;
+  } else if (payload.type !== 'cancelled') return undefined;
+  return value as AgentEventEnvelope;
+}
+
+/** Stable presentation merge of original sequence facts, never execution scheduling. */
+function orderNativeHistory(events: ExecutionEvent[]): ExecutionEvent[] {
+  const links = events.map(() => new Set<number>());
+  const incoming = events.map(() => 0);
+  const connect = (from: number, to: number) => {
+    const edges = links[from];
+    if (from === to || edges.has(to)) return;
+    edges.add(to);
+    incoming[to] += 1;
+  };
+  const join = (indices: number[]) =>
+    indices.forEach((id, index) => {
+      if (index > 0) connect(indices[index - 1], id);
+    });
+  join(
+    events.map((event, index) => (event.live_observed ? index : -1)).filter((index) => index >= 0)
+  );
+  join(
+    events
+      .map((event, index) => (event.runtime_sequence != null ? index : -1))
+      .filter((index) => index >= 0)
+      .sort((a, b) =>
+        compareRuntimeSequence(events[a].runtime_sequence!, events[b].runtime_sequence!)
+      )
+  );
+  const journalStreams = new Map<string, number[]>();
+  events.forEach((event, index) => {
+    if (event.journal_stream_id && event.journal_sequence != null) {
+      journalStreams.set(event.journal_stream_id, [
+        ...(journalStreams.get(event.journal_stream_id) ?? []),
+        index,
+      ]);
+    }
+  });
+  journalStreams.forEach((indices) =>
+    join(indices.sort((a, b) => events[a].journal_sequence! - events[b].journal_sequence!))
+  );
+  const streams = new Map<string, number[]>();
+  events.forEach((event, index) => {
+    const envelope = event.agent_envelope ?? event.framework_event;
+    if (!envelope) return;
+    const key = JSON.stringify([envelope.stream_id, envelope.turn_id, envelope.execution_id]);
+    streams.set(key, [...(streams.get(key) ?? []), index]);
+  });
+  streams.forEach((indices) =>
+    join(
+      indices.sort(
+        (a, b) =>
+          (events[a].agent_envelope ?? events[a].framework_event)!.sequence -
+          (events[b].agent_envelope ?? events[b].framework_event)!.sequence
+      )
+    )
+  );
+  const ready = incoming.flatMap((count, index) => (count === 0 ? [index] : []));
+  const ordered: ExecutionEvent[] = [];
+  while (ready.length) {
+    const index = ready.shift()!;
+    ordered.push(events[index]);
+    links[index].forEach((next) => {
+      incoming[next] -= 1;
+      if (incoming[next] !== 0) return;
+      const place = ready.findIndex((value) => value > next);
+      if (place < 0) ready.push(next);
+      else ready.splice(place, 0, next);
+    });
+  }
+  return ordered.length === events.length ? ordered : events;
+}
+
+function compareRuntimeSequence(left: string, right: string): number {
+  if (!/^\d+$/.test(left) || !/^\d+$/.test(right)) return 0;
+  const a = BigInt(left),
+    b = BigInt(right);
+  return a < b ? -1 : a > b ? 1 : 0;
 }

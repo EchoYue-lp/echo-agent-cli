@@ -4,28 +4,28 @@
 已接入应用入口，并且可从至少一个真实 surface 调用；仅有类型、测试夹具或未注册模块
 不计入。
 
-GUI 是推荐的产品主入口，IM 收发和 cron 后台触发继续保留。表中 TUI、REPL、CLI/JSONL
-描述的是尚未删除的迁移期实现，不再代表长期入口能力对等或新增能力目标；GUI 内置终端、
-Agent shell、MCP 与共享 Task/Subagent 能力不随独立终端入口退役。见
-[产品收敛边界](./adr/0050-gui-product-convergence.md)。
+GUI是当前唯一产品主入口；IM收发与cron后台触发继续保留。独立TUI、REPL、CLI/JSONL
+及standalone channels入口已退出；GUI内置终端、Agent shell、MCP、Task/Subagent、附件、
+记忆和共享恢复继续原owner。历史来源枚举不表示仍有独立产品入口。源码可达、focused、
+native与发布各自验收，文稿同步不把保留能力统称“全验收通过”。
 
 ## Agent 与会话
 
 聊天 Token 不再根据旧 ThinkStart/ThinkEnd 改写为 Reasoning。运行等待行显示实际
 模型或工具操作、耗时与最后事件时间；UI 计时器不会生成助手正文或完成事实。
-原生消息分层与 60 秒安全点报告策略仍须完成 Framework 接缝、Rust 与新版原生验收，
+原生消息分层与60秒安全点报告策略按各自真实源码和回执验收；已有接缝/focused不代新版原生验收，
 详见 [ADR 0057](./adr/0057-native-messages-and-progress-policy.md)。
 
 | 能力           | 当前实现                                                                      | 主要依据                                        |
 | -------------- | ----------------------------------------------------------------------------- | ----------------------------------------------- |
-| 流式对话       | TUI、GUI、CLI/JSONL、channel 共享 `drive_chat` 与 typed `TurnOutcome`         | `echo-agent-app-core/src/chat_driver.rs`        |
+| 流式对话       | GUI与channel共享 `drive_chat` 与 typed `TurnOutcome`         | `echo-agent-app-core/src/chat_driver.rs`        |
 | 多会话 Agent   | `AgentPool` 按 conversation 维护 Agent，忙会话不会被驱逐                      | `echo-agent-app-core/src/agent_pool/pool.rs`         |
 | Channel 会话   | app-core 原 owner 管理 sender-scoped 产品 ID 与 incarnation Agent/checkpoint/cache ID，reset 保留历史 | `echo-agent-app-core/src/channel_runtime.rs`、`channel_runtime/input_pump.rs` |
 | 前台 turn 控制 | admission、steer、cancel、settlement 由 app-core 统一拥有                     | `echo-agent-app-core/src/foreground_turn.rs`    |
-| 会话追加输入   | 四个交互 surface 共用 durable frontier、tracked drain 与 exact terminal       | `echo-agent-app-core/src/conversation_input.rs` |
+| 会话追加输入   | 保留交互surface共用 durable frontier、tracked drain 与 exact terminal       | `echo-agent-app-core/src/conversation_input.rs` |
 | 会话历史       | framework `FileConversationStore` 为权威，EKO 只做 workspace 绑定和 UI 投影   | `echo-agent-app-core/src/workspace/runtime.rs`  |
 | 分叉会话       | GUI 完成回复下方提供“复制 / 重新生成 / 分叉会话”；Fork 包含该回复所在的完整回合和工具记录，打开带 `(branch)` 标题的独立普通会话，刷新当前工作区列表并保留原会话；后续回合及隐藏内部消息不复制。编辑/重新生成仍在目标用户回合前分叉并重发 | `src/tauri/commands/conversations.rs`、`web-frontend/src/components/chat/ChatPanel.tsx` |
-| 支线对话       | GUI 专属侧栏布局；committed context 快照、一级 Subagent 关系、独立模型/turn 与隐藏内部消息，TUI/CLI/channel 无专用入口 | `echo-agent-app-core/src/side_conversation.rs`、`web-frontend/src/components/chat/SideConversationDialog.tsx` |
+| 支线对话       | GUI 专属侧栏布局；committed context 快照、一级 Subagent 关系、独立模型/turn 与隐藏内部消息，channel无专用入口 | `echo-agent-app-core/src/side_conversation.rs`、`web-frontend/src/components/chat/SideConversationDialog.tsx` |
 | 会话归档       | 侧边栏只显示未归档会话；“设置 -> 项目数据 -> 归档”可恢复或永久删除 | `echo-agent-app-core/src/conversation_archive.rs`、`web-frontend/src/components/sessions/ArchivedConversationsPanel.tsx` |
 | 附件与长输入   | 上传文件、长粘贴和超预算文本落到 workspace artifact，再按引用读取             | `echo-agent-app-core/src/attachments.rs`        |
 | 上下文压缩     | summary/hybrid/sliding/adaptive 策略、默认 token 近期窗口、跨 surface focus/cancel 与 goal/recovery 投影 | `echo-agent-app-core/src/manual_compression.rs` |
@@ -63,7 +63,7 @@ EKO 拥有文件投影、workspace、review、worktree、资源策略和各 surf
 具体 authority、原子 settlement 和 blocking I/O 约束见
 [RuntimeTaskService 适配决策](./architecture/runtime.md)。
 Task 依赖只存在于单个 revisioned TaskRun 的 `PlanRevision.tasks[].depends_on`；background
-launcher 不再维护跨 TaskRun metadata DAG 或轮询器。CLI 使用 `/tasks dag <run-id>` 查看该权威图。
+launcher不维护跨TaskRun metadata DAG或轮询器。依赖图由同一TaskRuntime/框架任务工具读取；独立CLI的`/tasks dag`不再是当前入口，不据此新增GUI图编辑器。
 
 ## 工具与扩展
 
@@ -73,8 +73,8 @@ launcher 不再维护跨 TaskRun metadata DAG 或轮询器。CLI 使用 `/tasks 
 | Workspace diff | 显式 workspace generation、已验证 Git ref、app-core 统一结构化 hunk，Tauri 仅映射 wire DTO | `echo-agent-app-core/src/diff.rs`                      |
 | 代码执行与分析 | `run_code` 使用 EKO 锁定的 Python analytics runtime                                      | `echo-agent-app-core/src/analysis_runtime.rs`          |
 | Terminal       | 本地/系统 OpenSSH 交互终端与 Agent shell 分离；源码已准备，原生/远端待验                                        | `echo-agent-app-core/src/terminal.rs`                  |
-| Browser/Chrome | 托管 Chromium、Chrome extension backend、tab/session/observation 与五入口控制            | Browser runtime + Extension dispatcher                 |
-| 工作流         | 一份 file-backed catalog 与 framework Graph executor；GUI/TUI/CLI/channel 共用服务       | `echo-agent-app-core/src/workflow_service.rs`          |
+| Browser/Chrome | 托管 Chromium、Chrome extension backend、tab/session/observation 与保留入口／Subagent的同owner控制            | Browser runtime + Extension dispatcher                 |
+| 工作流         | 一份 file-backed catalog 与 framework Graph executor；GUI/channel 共用服务       | `echo-agent-app-core/src/workflow_service.rs`          |
 | 结构化抽取     | pooled Agent `extract_json`、JSON Schema 输入/输出验证、typed 多 surface outcome         | `echo-agent-app-core/src/structured_extraction.rs`     |
 | MCP            | 一份用户 `mcp.json`、真实 reconcile、scope-keyed health、plugin name ownership           | `McpConfigRuntime` + Extension control                 |
 | Tool output    | summary/detail 分离、opaque detail ref、cursor page、文件/JSONL 恢复                     | `echo-agent-app-core/src/tool_execution_projection.rs` |
@@ -94,9 +94,9 @@ store。
 - Skill 使用 version 3 `{enabled}` flat policy、atomic commit、typed settled/degraded receipt 与
   caller-drop owned settlement；GUI/headless boot、workspace load 和下一 mutation 都重新读取
   policy 并 reconcile，不保留 repair debt。
-- GUI 使用 generated typed generic IPC；JSONL 输出 journaled typed `ExtensionReceipt` 且不
-  进入模型；CLI、TUI、channel 使用同一 app-core authority 并保留 terminal settlement。
-- Browser 的完整命令面在 GUI、TUI、CLI/JSONL 和 channel 可达。
+- GUI使用generated typed generic IPC，channel使用同一app-core authority与terminal settlement；
+  canonical journal/replay仍保留，但不再提供独立JSONL stdout产品。
+- Browser的保留命令面沿GUI与channel的原权限、session和owner可达；不保留console控制器。
 - MCP health 由 Extension control 按 authority scope 维护；Hook project identity 来自
   captured workspace root，不使用 process cwd。
 - Plugin portable components 只由 framework prepare/apply；EKO mutation 使用一次捕获的
@@ -114,11 +114,11 @@ store。
 | 学术研究     | paper library、scholarly search、Zotero、Europe PMC、citation audit/export | `echo-agent-app-core/src/research.rs`                    |
 | 医学研究     | PICO/PECO、screening、RoB、GRADE、PRISMA、适用性风险                       | `web-frontend/src/components/papers/ReviewWorkbench.tsx` |
 | Sandbox      | GUI 已挂载配置、可用性检查和真实本地 sandbox execution                     | `src/tauri/commands/panels.rs`                           |
-| 定时任务     | file-backed cron scheduler、GUI/TUI/CLI 控制与原样 prompt                  | `echo-agent-app-core/src/scheduler/`                     |
+| 定时任务     | file-backed cron scheduler、GUI与保留渠道控制与原样 prompt                  | `echo-agent-app-core/src/scheduler/`                     |
 | 记忆与自进化 | generation-bound layered memory、safe-point hot projection、`/reflect`、Review Inbox、Curator、rule/Skill promotion、dashboard | `echo-agent-app-core/src/evolution/`、`echo-agent-app-core/src/reflection.rs` |
 
 GUI 设置已挂载渠道与定时任务页面，配置、控制及历史继续使用原 ChannelRuntime、scheduler
-和 TaskRuntime 权威。IM handler 已由 app-core 接管，旧 channel bin 只转发；这不表示真实平台
+和 TaskRuntime 权威。IM handler由app-core的ChannelRuntime及原management/input-pump/outbound拥有；这不表示真实平台
 收发、GUI/IM 人工请求组合、隐藏/退出/重启及完整产品验收均已通过。边界见
 [IM/cron owner 决策](./adr/0053-im-cron-gui-control.md)。
 
@@ -126,10 +126,10 @@ GUI 设置已挂载渠道与定时任务页面，配置、控制及历史继续�
 
 - 动态 Provider 和模型配置支持 Chat Completions、Responses、Anthropic 三种协议，
   以及 text/image/audio/video 输入能力。详见 [Provider 架构](./architecture/providers.md)。
-- GUI、TUI、CLI/JSONL 和 channel 共享模型、thinking profile、permission mode、
+- GUI、IM与cron共享模型、thinking profile、permission mode、
   TaskRuntime 与 Extension authority。
-- JSONL one-shot 可显式选择 permission/approval policy 和附件；HITL 请求
-  进入 canonical event stream，不能回传的 input/selection 会明确拒绝而不静默挂起。
+- 桌面与IM的权限、审批和附件沿原绑定；cron保持原执行策略，不从入口退役获得新许可。
+  HITL请求/回答仍按原配对身份处理，取消或过期不补授权；不保留JSONL one-shot控制器。
 - Browser session、approval receipt、普通 Subagent event 和 workspace 删除投影均使用
   `(workspace, conversation)` 地址；同名 conversation 不会跨 workspace 混写或误删。
 - Trace、usage/cache、context budget、Tool/Subagent execution 与 TaskRuntime event 均有
@@ -164,5 +164,6 @@ projection 参与每个 Agent。详见 ADR
 
 EKO 不再请求框架 LSP feature、注册语言服务器工具或暴露 LSP 命令/设置/IPC。
 旧配置与插件声明给出明确退休诊断，不删除用户文件；混合插件保留合法组件及原发布/清理
-收据。框架 A2A/LSP API 仍存在，等待两个消费者验收后另行物理删除；本次不退役终端入口、
-IM、cron、MCP 或 Subagent。
+收据。框架 A2A/LSP 的删除与组合验证按各自仓库独立验收。EKO 的独立 TUI、REPL、
+CLI/JSONL 产品入口也已退出；GUI 内置终端、Agent shell、IM、cron、MCP 与 Subagent
+继续保留。源码退出不代表本轮删后 Rust、原生或发布验收已完成。

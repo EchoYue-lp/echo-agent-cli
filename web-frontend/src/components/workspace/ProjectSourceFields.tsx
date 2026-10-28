@@ -54,6 +54,8 @@ interface Props {
   onRemoteSource: (source: ProjectSource | undefined) => void;
   busy: boolean;
   fixedLocation?: boolean;
+  draftConnectionId?: string;
+  retainConnection?: boolean;
 }
 
 export function ProjectSourceFields({
@@ -63,6 +65,8 @@ export function ProjectSourceFields({
   onRemoteSource,
   busy,
   fixedLocation = false,
+  draftConnectionId,
+  retainConnection = false,
 }: Props) {
   const [connectionId, setConnectionId] = useState<string>();
   const [issue, setIssue] = useState('');
@@ -95,7 +99,7 @@ export function ProjectSourceFields({
     }
     setIssue('');
     onRemoteSource(undefined);
-    setConnectionId(`project-draft-${crypto.randomUUID()}`);
+    setConnectionId(draftConnectionId ?? `project-draft-${crypto.randomUUID()}`);
   };
   return (
     <div className="space-y-3">
@@ -243,6 +247,7 @@ export function ProjectSourceFields({
             onTestingChange={setTesting}
             onAuthenticatedChange={setCredentialLocked}
             busy={busy}
+            retainConnection={retainConnection}
           />
         ) : (
           <button
@@ -297,6 +302,7 @@ function ProjectAuthentication({
   onTestingChange,
   onAuthenticatedChange,
   busy,
+  retainConnection,
 }: {
   connectionId: string;
   target: TerminalTarget;
@@ -308,8 +314,10 @@ function ProjectAuthentication({
   onTestingChange: (testing: boolean) => void;
   onAuthenticatedChange: (authenticated: boolean) => void;
   busy: boolean;
+  retainConnection: boolean;
 }) {
   const latest = useRef({
+    retainConnection,
     password,
     path,
     onSource,
@@ -319,6 +327,7 @@ function ProjectAuthentication({
     onAuthenticatedChange,
   });
   latest.current = {
+    retainConnection,
     password,
     path,
     onSource,
@@ -487,7 +496,10 @@ function ProjectAuthentication({
         void pending
           .catch(() => undefined)
           .then(() => {
-            if (!active.current) return workspaceApi.closeSsh(connectionId);
+            // Once submitted, the existing fork command owns this independent draft.
+            // Closing an observer must not close an in-flight Git/import connection.
+            if (!active.current && !latest.current.retainConnection)
+              return workspaceApi.closeSsh(connectionId);
           })
           .catch(() => {
             useToastStore

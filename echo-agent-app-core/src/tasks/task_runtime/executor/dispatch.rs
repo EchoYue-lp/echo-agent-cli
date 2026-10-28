@@ -936,6 +936,7 @@ struct RunTurnPersistence {
 struct EkoAgentTurnState {
     output: String,
     in_thinking: bool,
+    native_event_ids: HashMap<String, String>,
     pending_verification: HashMap<String, String>,
     pending_file_access: HashMap<String, (String, serde_json::Value)>,
     observed_evidence: Vec<echo_agent::subagent::SubagentEvidence>,
@@ -1056,8 +1057,117 @@ impl EventSink for EkoAgentTurnSink {
         envelope: echo_agent::agent::EventEnvelope,
     ) -> echo_agent::error::Result<SinkControl> {
         let source_event_id = envelope.event_id.to_string();
+        let native_started = !self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .native_event_ids
+            .is_empty();
+        if matches!(
+            &envelope.payload,
+            AgentEvent::AssistantMessage { .. } | AgentEvent::ExecutionStatus(_)
+        ) || (native_started
+            && matches!(
+                &envelope.payload,
+                AgentEvent::FinalAnswer(_) | AgentEvent::Cancelled | AgentEvent::Error { .. }
+            ))
+        {
+            if envelope
+                .run_id
+                .as_ref()
+                .is_none_or(|id| id.as_str() != self.context.run_id)
+                || envelope
+                    .conversation_id
+                    .as_ref()
+                    .is_none_or(|id| id.as_str() != self.context.conversation_id)
+                || self.context.execution_id.as_ref().is_some_and(|expected| {
+                    envelope
+                        .execution_id
+                        .as_ref()
+                        .is_none_or(|id| id.as_str() != expected)
+                })
+                || self
+                    .context
+                    .execution_id
+                    .as_ref()
+                    .is_some_and(|expected| envelope.turn_id.as_str() != expected)
+                || self
+                    .run_turn
+                    .as_ref()
+                    .is_some_and(|owner| envelope.turn_id.as_str() != owner.turn_id)
+            {
+                return Err(echo_agent::error::ReactError::Other(
+                    "native task envelope does not match its original execution owner".into(),
+                ));
+            }
+            let source_hash = format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(serde_json::to_vec(&envelope).map_err(
+                    |error| Self::persistence_error("canonical envelope encoding failed", error)
+                )?)
+            );
+            if let Some(previous) = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .native_event_ids
+                .get(&source_event_id)
+            {
+                if previous == &source_hash {
+                    return Ok(SinkControl::Continue);
+                }
+                return Err(echo_agent::error::ReactError::Other(
+                    "native event identity has conflicting canonical content".into(),
+                ));
+            }
+            let payload = serde_json::json!({
+                "kind": "native_agent_event", "execution_id": self.context.execution_id,
+                "agent": self.context.agent_role, "agent_envelope": envelope,
+            });
+            // Persist in the existing TaskRuntime journal before the original
+            // live observer. This is an observation, never a task transition.
+            let persistence = self
+                .primary_task
+                .as_ref()
+                .map(|owner| &owner.blocking)
+                .or_else(|| self.run_turn.as_ref().map(|owner| &owner.blocking));
+            if let Some(blocking) = persistence {
+                let run_id = self.context.run_id.clone();
+                let task_id = self.context.task_id.clone();
+                let execution_id = self.context.execution_id.clone();
+                let persisted = payload.clone();
+                blocking
+                    .run("persist native Agent envelope observation", move |store| {
+                        store.record_native_agent_event(
+                            &run_id,
+                            task_id.as_deref(),
+                            execution_id.as_deref(),
+                            persisted,
+                        )
+                    })
+                    .await
+                    .map_err(|error| {
+                        Self::persistence_error("native Agent envelope persistence failed", error)
+                    })?;
+            }
+            self.emit(RuntimeEventKind::Note, payload);
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .native_event_ids
+                .insert(source_event_id.clone(), source_hash);
+        }
         match envelope.payload {
             AgentEvent::Token(content) => {
+                if !self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .native_event_ids
+                    .is_empty()
+                {
+                    return Ok(SinkControl::Continue);
+                }
                 let in_thinking = {
                     let mut state = self
                         .state
@@ -2619,3 +2729,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         self.note(run_id, None, reason.to_string()).await
     }
 }
+
+#[cfg(test)]
+#[path = "native_projection_tests.rs"]
+mod native_projection_tests;

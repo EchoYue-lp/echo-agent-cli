@@ -1512,12 +1512,15 @@ pub async fn activate_skill_draft(
 // Worktree
 // ════════════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Serialize)]
-struct WorktreeInfo {
-    path: String,
-    branch: String,
-    managed: bool,
-    head: String,
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub(super) struct WorktreeInfo {
+    pub(super) path: String,
+    pub(super) branch: String,
+    pub(super) managed: bool,
+    pub(super) head: String,
+    pub(super) commit_oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) lock_reason: Option<String>,
 }
 
 struct ScopedWorktreeControl {
@@ -1577,12 +1580,21 @@ async fn worktree_control_for_workspace(
     workspace_id: &str,
     workspace_generation: &str,
 ) -> Result<ScopedWorktreeControl, IpcError> {
+    worktree_control_for_app(&state.app_state, workspace_id, workspace_generation).await
+}
+
+async fn worktree_control_for_app(
+    app_state: &Arc<echo_agent_app_core::api::AppState>,
+    workspace_id: &str,
+    workspace_generation: &str,
+) -> Result<ScopedWorktreeControl, IpcError> {
     if workspace_id == "global" {
         // Preserve only the explicit global local owner, never as a fallback.
-        let product =
-            super::product_data::scoped_control(state, workspace_id, workspace_generation).await?;
-        let control = state
-            .app_state
+        let product = app_state
+            .workspace_control_for_generation(workspace_id, workspace_generation)
+            .await
+            .map_err(IpcError::from)?;
+        let control = app_state
             .workspace_control_for_scope(workspace_id)
             .await
             .map_err(|error| IpcError::Validation(error.to_string()))?;
@@ -1595,8 +1607,7 @@ async fn worktree_control_for_workspace(
             files: Arc::new(echo_agent::tools::files::LocalFileSystem),
         });
     }
-    let project = state
-        .app_state
+    let project = app_state
         .project_resources_for_workspace(workspace_id, workspace_generation)
         .await
         .map_err(IpcError::from)?;
@@ -1665,11 +1676,13 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
     let mut current_path: Option<PathBuf> = None;
     let mut current_head = String::new();
     let mut current_branch = String::new();
+    let mut current_lock_reason: Option<String> = None;
 
     let flush = |items: &mut Vec<WorktreeInfo>,
                  path: &mut Option<PathBuf>,
                  head: &mut String,
-                 branch: &mut String| {
+                 branch: &mut String,
+                 lock_reason: &mut Option<String>| {
         let Some(path_buf) = path.take() else {
             return;
         };
@@ -1687,18 +1700,28 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
             branch: display_branch,
             managed: canonical != canonical_repo,
             head: head.chars().take(12).collect(),
+            commit_oid: head.clone(),
+            lock_reason: lock_reason.take(),
         });
         head.clear();
         branch.clear();
     };
 
-    for line in output.lines() {
-        if line.trim().is_empty() {
+    // -z 是原生 Git 无歧义路径合同，避免中文、换行及空白路径被 C quote。
+    // 保留非 NUL 入口只供既有历史/静态夹具读取。
+    let fields = if output.contains('\0') {
+        output.split('\0').collect::<Vec<_>>()
+    } else {
+        output.lines().collect::<Vec<_>>()
+    };
+    for line in fields {
+        if line.is_empty() {
             flush(
                 &mut items,
                 &mut current_path,
                 &mut current_head,
                 &mut current_branch,
+                &mut current_lock_reason,
             );
             continue;
         }
@@ -1708,12 +1731,15 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
                 &mut current_path,
                 &mut current_head,
                 &mut current_branch,
+                &mut current_lock_reason,
             );
             current_path = Some(PathBuf::from(path));
         } else if let Some(head) = line.strip_prefix("HEAD ") {
             current_head = head.to_string();
         } else if let Some(branch) = line.strip_prefix("branch ") {
             current_branch = branch.to_string();
+        } else if let Some(reason) = line.strip_prefix("locked ") {
+            current_lock_reason = Some(reason.to_string());
         }
     }
     flush(
@@ -1721,6 +1747,7 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
         &mut current_path,
         &mut current_head,
         &mut current_branch,
+        &mut current_lock_reason,
     );
     items
 }
@@ -1820,13 +1847,197 @@ pub async fn list_worktrees(
             let output = run_git(
                 control.store.as_deref(),
                 &repo_root,
-                &["worktree", "list", "--porcelain"],
+                &["worktree", "list", "--porcelain", "-z"],
             )?;
             Ok::<Vec<WorktreeInfo>, IpcError>(parse_worktree_list(&output, &repo_root))
         })
         .await
         .map_err(super::product_data::blocking_error)??;
     Ok(json!(worktrees))
+}
+
+/// Snapshot Git in the exact original project environment. A commit OID also
+/// supports detached HEAD, while unborn/non-Git projects fail before creation.
+pub(super) async fn prepare_reply_worktree(
+    app_state: &Arc<echo_agent_app_core::api::AppState>,
+    workspace_id: &str,
+    workspace_generation: &str,
+    branch: String,
+) -> Result<(String, String, String), IpcError> {
+    let control = worktree_control_for_app(app_state, workspace_id, workspace_generation).await?;
+    app_state
+        .session
+        .product_data_io
+        .run("prepare reply worktree", move || {
+            let root = git_repo_root(&control)?;
+            validate_branch_name(&control, &root, &branch)?;
+            let head = run_git(
+                control.store.as_deref(),
+                &root,
+                &["rev-parse", "--verify", "HEAD^{commit}"],
+            )?;
+            let path = default_worktree_path(&root, &branch)?;
+            Ok((
+                root.to_string_lossy().to_string(),
+                head,
+                path.to_string_lossy().to_string(),
+            ))
+        })
+        .await
+        .map_err(super::product_data::blocking_error)?
+}
+
+/// Resource facts survive a successful add followed by a failed list. The
+/// native Git lock reason is the operation receipt; no second registry/store.
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct WorktreeCreation {
+    pub(super) created: bool,
+    pub(super) observed: bool,
+    pub(super) path: String,
+    pub(super) head: String,
+    pub(super) descriptor: Option<WorktreeInfo>,
+    pub(super) error: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_worktree_in_control(
+    control: &ScopedWorktreeControl,
+    repo_root: &Path,
+    branch: &str,
+    base_ref: &str,
+    path: Option<String>,
+    lock_reason: Option<&str>,
+) -> Result<WorktreeCreation, IpcError> {
+    validate_branch_name(control, repo_root, branch)?;
+    let target = path
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                repo_root.join(path)
+            }
+        })
+        .unwrap_or(default_worktree_path(repo_root, branch)?);
+    let target_str = target.to_string_lossy().to_string();
+    let head = run_git(
+        control.store.as_deref(),
+        repo_root,
+        &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
+    )?;
+    // The listing is read before every mutation. A matching native receipt is
+    // required; a directory/branch with the same name is never adopted.
+    if let Some(reason) = lock_reason {
+        let output = run_git(
+            control.store.as_deref(),
+            repo_root,
+            &["worktree", "list", "--porcelain", "-z"],
+        )?;
+        if let Some(existing) = parse_worktree_list(&output, repo_root)
+            .into_iter()
+            .find(|item| item.path == target_str)
+        {
+            if existing.branch != branch
+                || existing.commit_oid != head
+                || existing.lock_reason.as_deref() != Some(reason)
+            {
+                return Err(IpcError::Validation(
+                    "Worktree 已被其它操作占用，保留原目录且不会覆盖".into(),
+                ));
+            }
+            return Ok(WorktreeCreation {
+                created: true,
+                observed: true,
+                path: target_str,
+                head,
+                descriptor: Some(existing),
+                error: None,
+            });
+        }
+    }
+    validate_worktree_target(control.files.as_ref(), repo_root, &target)?;
+    let mut args = vec!["worktree", "add"];
+    if let Some(reason) = lock_reason {
+        args.extend(["--lock", "--reason", reason]);
+    }
+    args.extend(["-b", branch, &target_str, &head]);
+    let add = run_git(control.store.as_deref(), repo_root, &args);
+    let mut receipt = WorktreeCreation {
+        created: add.is_ok(),
+        observed: false,
+        path: target_str.clone(),
+        head,
+        descriptor: None,
+        error: add.err().map(|error| error.to_string()),
+    };
+    // Even an unconfirmed Git execution is observed first. Never replay add on
+    // an error and never force-remove a user directory to manufacture rollback.
+    match run_git(
+        control.store.as_deref(),
+        repo_root,
+        &["worktree", "list", "--porcelain", "-z"],
+    ) {
+        Ok(output) => {
+            if let Some(item) = parse_worktree_list(&output, repo_root)
+                .into_iter()
+                .find(|item| item.path == target_str)
+            {
+                let matches = item.branch == branch
+                    && item.commit_oid == receipt.head
+                    && lock_reason.is_none_or(|reason| item.lock_reason.as_deref() == Some(reason));
+                if matches {
+                    receipt.created = true;
+                    receipt.observed = true;
+                    receipt.descriptor = Some(item);
+                } else {
+                    receipt.error =
+                        Some("Git 目录已存在但资源身份不匹配；请从 Worktree 列表检查".into());
+                }
+            } else if receipt.error.is_none() {
+                receipt.error =
+                    Some("Git add 已返回，但未能在原 Worktree 列表确认目标；保留创建事实".into());
+            }
+        }
+        Err(error) => {
+            receipt.error = Some(match receipt.error {
+                Some(primary) => format!("{primary}; Worktree 重读失败: {error}"),
+                None => format!("Worktree 已创建，列表重读失败: {error}"),
+            })
+        }
+    }
+    Ok(receipt)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn create_worktree_for_app(
+    app_state: &Arc<echo_agent_app_core::api::AppState>,
+    workspace_id: &str,
+    workspace_generation: &str,
+    branch: String,
+    base: String,
+    path: Option<String>,
+    lock_reason: Option<String>,
+) -> Result<WorktreeCreation, IpcError> {
+    let control = worktree_control_for_app(app_state, workspace_id, workspace_generation).await?;
+    let (control, repo_root) = git_repo_root_async(control).await?;
+    let merge_guard = control.merge_lock(&repo_root).lock_owned().await;
+    app_state
+        .session
+        .product_data_io
+        .run("create project worktree", move || {
+            let _merge_guard = merge_guard;
+            create_worktree_in_control(
+                &control,
+                &repo_root,
+                &branch,
+                &base,
+                path,
+                lock_reason.as_deref(),
+            )
+        })
+        .await
+        .map_err(super::product_data::blocking_error)?
 }
 
 #[tauri::command]
@@ -1838,57 +2049,140 @@ pub async fn create_worktree(
     base: Option<String>,
     path: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let control =
-        worktree_control_for_workspace(&state, &workspace_id, &workspace_generation).await?;
-    let branch = branch.trim().to_string();
-    let base_ref = base
-        .and_then(|s| {
-            let trimmed = s.trim().to_string();
-            (!trimmed.is_empty()).then_some(trimmed)
-        })
-        .unwrap_or_else(|| "HEAD".to_string());
-    let (control, repo_root) = git_repo_root_async(control).await?;
-    let merge_guard = control.merge_lock(&repo_root).lock_owned().await;
-    let created = state
-        .app_state
-        .session
-        .product_data_io
-        .run("create project worktree", move || {
-            let _merge_guard = merge_guard;
-            validate_branch_name(&control, &repo_root, &branch)?;
-            let target = path
-                .filter(|value| !value.trim().is_empty())
-                .map(PathBuf::from)
-                .map(|path| {
-                    if path.is_absolute() {
-                        path
-                    } else {
-                        repo_root.join(path)
-                    }
-                })
-                .unwrap_or(default_worktree_path(&repo_root, &branch)?);
-            validate_worktree_target(control.files.as_ref(), &repo_root, &target)?;
-            let target_str = target.to_string_lossy().to_string();
-            run_git(
-                control.store.as_deref(),
-                &repo_root,
-                &["worktree", "add", "-b", &branch, &target_str, &base_ref],
-            )?;
-            let output = run_git(
-                control.store.as_deref(),
-                &repo_root,
-                &["worktree", "list", "--porcelain"],
-            )?;
-            parse_worktree_list(&output, &repo_root)
-                .into_iter()
-                .find(|worktree| worktree.path == target_str)
-                .ok_or_else(|| {
-                    IpcError::Internal("Created worktree was not found in git output".into())
-                })
-        })
-        .await
-        .map_err(super::product_data::blocking_error)??;
-    Ok(json!(created))
+    let base = base
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "HEAD".into());
+    let receipt = create_worktree_for_app(
+        &state.app_state,
+        &workspace_id,
+        &workspace_generation,
+        branch.trim().to_string(),
+        base,
+        path,
+        None,
+    )
+    .await?;
+    if let Some(error) = receipt.error {
+        return Err(IpcError::Internal(error));
+    }
+    receipt
+        .descriptor
+        .map(|item| json!(item))
+        .ok_or_else(|| IpcError::Internal("Created worktree was not found in git output".into()))
+}
+
+/// 复用原 Git 删除约束；任何失败都不 force、不重建目录。
+fn remove_worktree_in_control(
+    control: &ScopedWorktreeControl,
+    repo_root: &Path,
+    path: &str,
+) -> Result<(), IpcError> {
+    let target = PathBuf::from(path);
+    if target.as_os_str().is_empty() {
+        return Err(IpcError::Validation("Worktree path cannot be empty".into()));
+    }
+    let canonical_repo = control
+        .files
+        .canonicalize(&repo_root)
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let canonical_target = control
+        .files
+        .canonicalize(&target)
+        .map_err(|error| IpcError::Validation(format!("Cannot resolve worktree path: {error}")))?;
+    if canonical_target == canonical_repo {
+        return Err(IpcError::Validation(
+            "Refusing to remove the primary repository worktree".into(),
+        ));
+    }
+    let output = run_git(
+        control.store.as_deref(),
+        &repo_root,
+        &["worktree", "list", "--porcelain", "-z"],
+    )?;
+    let known = parse_worktree_list(&output, &repo_root)
+        .into_iter()
+        .find(|worktree| {
+            control
+                .files
+                .canonicalize(&PathBuf::from(&worktree.path))
+                .map(|path| path == canonical_target)
+                .unwrap_or(false)
+        });
+    let known = known
+        .ok_or_else(|| IpcError::Validation("Path is not a registered git worktree".into()))?;
+    let target_str = target.to_string_lossy().to_string();
+    let reply_lock = known
+        .lock_reason
+        .as_deref()
+        .filter(|reason| reason.starts_with("eko-reply-fork:"));
+    if reply_lock.is_some() {
+        // Local data-loss protection still comes from Git's ordinary
+        // remove check; no --force is used after unlocking our receipt.
+        let dirty = run_git(
+            control.store.as_deref(),
+            &target,
+            &["status", "--porcelain"],
+        )?;
+        if !dirty.is_empty() {
+            return Err(IpcError::Validation(
+                "Worktree 含未提交文件，保留原目录与分叉回执".into(),
+            ));
+        }
+        run_git(
+            control.store.as_deref(),
+            &repo_root,
+            &["worktree", "unlock", &target_str],
+        )?;
+    }
+    let removal = run_git(
+        control.store.as_deref(),
+        repo_root,
+        &["worktree", "remove", &target_str],
+    );
+    if let Err(primary) = removal {
+        // 用户可能在 status 后写入。普通 remove 失败时仍保数据，
+        // 并重读真实 Git 登记再恢复本请求锁，避免丢失重试身份。
+        if let Some(reason) = reply_lock {
+            let restored = (|| -> Result<(), IpcError> {
+                let listing = run_git(
+                    control.store.as_deref(),
+                    repo_root,
+                    &["worktree", "list", "--porcelain", "-z"],
+                )?;
+                let present = parse_worktree_list(&listing, repo_root)
+                    .into_iter()
+                    .find(|item| {
+                        item.path == known.path
+                            && item.branch == known.branch
+                            && item.commit_oid == known.commit_oid
+                    })
+                    .ok_or_else(|| {
+                        IpcError::Validation("删除失败后无法确认原 Worktree 身份；保留资源".into())
+                    })?;
+                if present.lock_reason.as_deref() == Some(reason) {
+                    return Ok(());
+                }
+                if present.lock_reason.is_some() {
+                    return Err(IpcError::Validation(
+                        "Worktree 已被其它 owner 锁定，未覆盖".into(),
+                    ));
+                }
+                run_git(
+                    control.store.as_deref(),
+                    repo_root,
+                    &["worktree", "lock", "--reason", reason, &target_str],
+                )
+                .map(|_| ())
+            })();
+            if let Err(restore) = restored {
+                return Err(IpcError::Internal(format!(
+                    "{primary}; 分叉锁回执恢复失败: {restore}"
+                )));
+            }
+        }
+        return Err(primary);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1908,48 +2202,7 @@ pub async fn remove_worktree(
         .product_data_io
         .run("remove project worktree", move || {
             let _merge_guard = merge_guard;
-            let target = PathBuf::from(path.trim());
-            if target.as_os_str().is_empty() {
-                return Err(IpcError::Validation("Worktree path cannot be empty".into()));
-            }
-            let canonical_repo = control
-                .files
-                .canonicalize(&repo_root)
-                .map_err(|error| IpcError::Validation(error.to_string()))?;
-            let canonical_target = control.files.canonicalize(&target).map_err(|error| {
-                IpcError::Validation(format!("Cannot resolve worktree path: {error}"))
-            })?;
-            if canonical_target == canonical_repo {
-                return Err(IpcError::Validation(
-                    "Refusing to remove the primary repository worktree".into(),
-                ));
-            }
-            let output = run_git(
-                control.store.as_deref(),
-                &repo_root,
-                &["worktree", "list", "--porcelain"],
-            )?;
-            let known = parse_worktree_list(&output, &repo_root)
-                .into_iter()
-                .any(|worktree| {
-                    control
-                        .files
-                        .canonicalize(&PathBuf::from(worktree.path))
-                        .map(|path| path == canonical_target)
-                        .unwrap_or(false)
-                });
-            if !known {
-                return Err(IpcError::Validation(
-                    "Path is not a registered git worktree".into(),
-                ));
-            }
-            let target_str = target.to_string_lossy().to_string();
-            run_git(
-                control.store.as_deref(),
-                &repo_root,
-                &["worktree", "remove", &target_str],
-            )
-            .map(|_| ())
+            remove_worktree_in_control(&control, &repo_root, &path)
         })
         .await
         .map_err(super::product_data::blocking_error)??;
@@ -2241,7 +2494,7 @@ mod scoped_control_tests {
         let operation_store = store.clone();
         run_taskruntime_worktree_operation(Some(store), "test target worktree route", move |store| {
             let _scope = control;
-            let output = run_git(store, &repo, &["worktree", "list", "--porcelain"])?;
+            let output = run_git(store, &repo, &["worktree", "list", "--porcelain", "-z"])?;
             let listed = parse_worktree_list(&output, &repo);
             assert!(listed.first().is_some_and(|entry| entry.path == repo.to_string_lossy() && !entry.managed));
             let unattended = echo_agent_app_core::api::tasks::task_runtime::worktree::list_unattended_worktrees(&repo, store).map_err(|error| IpcError::Internal(error.to_string()))?;
@@ -2299,6 +2552,296 @@ mod scoped_control_tests {
         assert_eq!(listed.len(), 2);
         assert!(listed.first().is_some_and(|entry| !entry.managed));
         assert!(listed.get(1).is_some_and(|entry| entry.managed && entry.path == "/remote/不存在的项目🙂-review"));
+    }
+
+    #[test]
+    fn reply_fork_worktree_is_head_only_and_reenters_using_native_receipt() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let repo = temporary.path().join("source");
+        std::fs::create_dir(&repo)?;
+        run_git(None, &repo, &["init"])?;
+        std::fs::write(repo.join("tracked.txt"), "提交原文🙂")?;
+        std::fs::write(repo.join(".gitignore"), "ignored.txt\n")?;
+        run_git(None, &repo, &["add", "tracked.txt", ".gitignore"])?;
+        run_git(
+            None,
+            &repo,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=EKO Fixture",
+                "-c",
+                "user.email=fixture@eko.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )?;
+        let head = run_git(None, &repo, &["rev-parse", "HEAD"])?;
+        // Detached source heads are valid commit authorities.
+        run_git(None, &repo, &["checkout", "--detach", &head])?;
+        std::fs::write(repo.join("tracked.txt"), "未提交🙂")?;
+        std::fs::write(repo.join("untracked.txt"), "未跟踪🙂")?;
+        std::fs::write(repo.join("ignored.txt"), "忽略🙂")?;
+        let before = ["tracked.txt", "untracked.txt", "ignored.txt"]
+            .into_iter()
+            .map(|name| std::fs::read(repo.join(name)).map(|bytes| (name, bytes)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let control = ScopedWorktreeControl {
+            _global: None,
+            _project: None,
+            repo_root: repo.clone(),
+            store: None,
+            files: Arc::new(echo_agent::tools::files::LocalFileSystem),
+        };
+        let target = temporary.path().join("支线🙂\n尾部 ");
+        let reason = "eko-reply-fork:fixture-identity";
+        let created = create_worktree_in_control(
+            &control,
+            &repo,
+            "eko/fork-fixture",
+            &head,
+            Some(target.to_string_lossy().to_string()),
+            Some(reason),
+        )?;
+        assert!(created.created && created.observed && created.error.is_none());
+        assert_eq!(run_git(None, &target, &["rev-parse", "HEAD"])?, head);
+        assert_eq!(
+            std::fs::read_to_string(target.join("tracked.txt"))?,
+            "提交原文🙂"
+        );
+        assert!(!target.join("untracked.txt").exists());
+        assert!(!target.join("ignored.txt").exists());
+        for (name, bytes) in before {
+            assert_eq!(std::fs::read(repo.join(name))?, bytes);
+        }
+        let resumed = create_worktree_in_control(
+            &control,
+            &repo,
+            "eko/fork-fixture",
+            &head,
+            Some(target.to_string_lossy().to_string()),
+            Some(reason),
+        )?;
+        assert!(resumed.observed && resumed.error.is_none());
+        let listing = run_git(None, &repo, &["worktree", "list", "--porcelain", "-z"])?;
+        assert_eq!(parse_worktree_list(&listing, &repo).len(), 2);
+        assert!(
+            create_worktree_in_control(
+                &control,
+                &repo,
+                "eko/fork-fixture",
+                &head,
+                Some(target.to_string_lossy().to_string()),
+                Some("eko-reply-fork:other-request")
+            )
+            .is_err()
+        );
+        std::fs::write(target.join("user-later.txt"), "保留后续用户文件")?;
+        assert!(
+            run_git(
+                None,
+                &repo,
+                &["worktree", "remove", target.to_string_lossy().as_ref()]
+            )
+            .is_err()
+        );
+        assert!(target.join("user-later.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn reply_fork_rejects_unborn_and_non_git_without_creating_a_directory() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let repo = temporary.path().join("source");
+        std::fs::create_dir(&repo)?;
+        let control = ScopedWorktreeControl {
+            _global: None,
+            _project: None,
+            repo_root: repo.clone(),
+            store: None,
+            files: Arc::new(echo_agent::tools::files::LocalFileSystem),
+        };
+        assert!(git_repo_root(&control).is_err());
+        run_git(None, &repo, &["init"])?;
+        let target = temporary.path().join("branch");
+        assert!(
+            create_worktree_in_control(
+                &control,
+                &repo,
+                "eko/fork-unborn",
+                "HEAD",
+                Some(target.to_string_lossy().to_string()),
+                Some("eko-reply-fork:unborn")
+            )
+            .is_err()
+        );
+        assert!(!target.exists());
+        Ok(())
+    }
+
+    struct ReplyForkFaultExecutor {
+        inner: crate::tauri::commands::files::tests::ProjectGitExecutor,
+        fail_after_add: std::sync::atomic::AtomicBool,
+        pending_list_failure: std::sync::atomic::AtomicBool,
+        late_write: std::sync::Mutex<Option<PathBuf>>,
+        adds: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SandboxExecutor for ReplyForkFaultExecutor {
+        fn name(&self) -> &str {
+            "reply-fork-native-git-fault-fixture"
+        }
+        fn isolation_level(&self) -> IsolationLevel {
+            IsolationLevel::None
+        }
+        fn is_available(&self) -> futures::future::BoxFuture<'_, bool> {
+            Box::pin(async { true })
+        }
+        fn execute(
+            &self,
+            command: SandboxCommand,
+        ) -> futures::future::BoxFuture<
+            '_,
+            echo_agent::error::Result<echo_agent::sandbox::ExecutionResult>,
+        > {
+            Box::pin(async move {
+                use std::sync::atomic::Ordering;
+                let echo_agent::sandbox::CommandKind::Program { program, args } = &command.kind
+                else {
+                    return Err(std::io::Error::other("expected actual native Git program").into());
+                };
+                if program != "git" {
+                    return Err(std::io::Error::other("expected actual Git").into());
+                }
+                let worktree = args.first().is_some_and(|arg| arg == "worktree");
+                let action = args.get(1).map(String::as_str);
+                if worktree
+                    && action == Some("list")
+                    && self.pending_list_failure.swap(false, Ordering::AcqRel)
+                {
+                    return Err(std::io::Error::other("injected post-add list failure").into());
+                }
+                if worktree && action == Some("remove") {
+                    let path = self
+                        .late_write
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take();
+                    if let Some(path) = path {
+                        std::fs::write(path, "保留迟到用户写入🙂")?;
+                    }
+                }
+                let add = worktree && action == Some("add");
+                let result = self.inner.execute(command).await?;
+                if add && result.exit_code == 0 {
+                    self.adds.fetch_add(1, Ordering::AcqRel);
+                    if self.fail_after_add.swap(false, Ordering::AcqRel) {
+                        self.pending_list_failure.store(true, Ordering::Release);
+                    }
+                }
+                Ok(result)
+            })
+        }
+    }
+
+    // Tokio 的固定测试属性名，不是本项目的角色/调度概念。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reply_fork_native_git_partial_list_and_late_write_preserve_original_resources()
+    -> anyhow::Result<()> {
+        use crate::tauri::commands::files::tests::{ProjectGitExecutor, namespaced_files};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let temporary = tempfile::tempdir()?;
+        let repo = temporary.path().join("source");
+        std::fs::create_dir(&repo)?;
+        run_git(None, &repo, &["init"])?;
+        std::fs::write(repo.join("tracked.txt"), "已提交🙂")?;
+        run_git(None, &repo, &["add", "tracked.txt"])?;
+        run_git(
+            None,
+            &repo,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=EKO Fixture",
+                "-c",
+                "user.email=fixture@eko.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        )?;
+        let repo = repo.canonicalize()?;
+        let head = run_git(None, &repo, &["rev-parse", "HEAD"])?;
+        let files = Arc::new(namespaced_files(&repo, &repo));
+        let executor = Arc::new(ReplyForkFaultExecutor {
+            inner: ProjectGitExecutor {
+                files: files.clone(),
+            },
+            fail_after_add: AtomicBool::new(true),
+            pending_list_failure: AtomicBool::new(false),
+            late_write: std::sync::Mutex::new(None),
+            adds: AtomicUsize::new(0),
+        });
+        let store = Arc::new(echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore::new_in_memory_with_shadow_root(temporary.path().join("tasks"))?);
+        store.bind_project_environment(
+            &store.active_workspace_id(),
+            echo_agent_app_core::api::workspace::ProjectLocation::Local { path: repo.clone() },
+            1,
+            files.clone(),
+            executor.clone(),
+        )?;
+        let control = ScopedWorktreeControl {
+            _global: None,
+            _project: None,
+            repo_root: repo.clone(),
+            store: Some(store),
+            files,
+        };
+        let target = temporary.path().canonicalize()?.join("partial");
+        let path = target.to_string_lossy().to_string();
+        let reason = "eko-reply-fork:partial-native";
+        let first = create_worktree_in_control(
+            &control,
+            &repo,
+            "eko/fork-partial",
+            &head,
+            Some(path.clone()),
+            Some(reason),
+        )?;
+        assert!(first.created && !first.observed && first.error.is_some());
+        let retry = create_worktree_in_control(
+            &control,
+            &repo,
+            "eko/fork-partial",
+            &head,
+            Some(path.clone()),
+            Some(reason),
+        )?;
+        assert!(retry.observed && retry.error.is_none());
+        assert_eq!(executor.adds.load(Ordering::Acquire), 1);
+        *executor
+            .late_write
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(target.join("late-user.txt"));
+        assert!(remove_worktree_in_control(&control, &repo, &path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(target.join("late-user.txt"))?,
+            "保留迟到用户写入🙂"
+        );
+        let listing = run_git(
+            control.store.as_deref(),
+            &repo,
+            &["worktree", "list", "--porcelain", "-z"],
+        )?;
+        let actual = parse_worktree_list(&listing, &repo)
+            .into_iter()
+            .find(|item| item.path == path)
+            .ok_or_else(|| anyhow::anyhow!("actual retained worktree absent"))?;
+        assert_eq!(actual.lock_reason.as_deref(), Some(reason));
+        Ok(())
     }
 
     #[test]

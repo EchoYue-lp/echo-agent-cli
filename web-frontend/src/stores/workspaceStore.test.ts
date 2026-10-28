@@ -112,6 +112,36 @@ function deferred<T>() {
 }
 
 describe('workspaceStore file identity integration', () => {
+  it('keeps the source projection while a fenced native switch rejects a reopened target', async () => {
+    const source = workspace('source', 'Source', 'source-generation');
+    useWorkspaceStore.setState({ current: source });
+    mocks.switchWorkspace.mockRejectedValueOnce(new Error('stale workspace generation'));
+    mocks.currentWorkspace.mockResolvedValueOnce({ workspace: source, active: true });
+    await expect(
+      useWorkspaceStore.getState().switchTo('target', undefined, 'retired-generation')
+    ).rejects.toThrow('stale workspace generation');
+    expect(mocks.switchWorkspace).toHaveBeenCalledWith('target', undefined, 'retired-generation');
+    expect(useWorkspaceStore.getState().current).toBe(source);
+    expect(useWorkspaceStore.getState().isLoading).toBe(false);
+    expect(mocks.clearMessages).not.toHaveBeenCalled();
+    expect(mocks.detachConversations).not.toHaveBeenCalled();
+    expect(mocks.bindScope).not.toHaveBeenCalled();
+    expect(mocks.initConversations).not.toHaveBeenCalled();
+  });
+
+  it('refreshes registry rows without clearing or switching the source projection', async () => {
+    const source = workspace('source', 'Source', 'source-generation');
+    const actual = workspace('target', 'Real target', 'current-generation');
+    useWorkspaceStore.setState({ current: source });
+    mocks.listWorkspaces.mockResolvedValueOnce({ workspaces: [source, actual], count: 2 });
+    await useWorkspaceStore.getState().refreshList();
+    expect(useWorkspaceStore.getState().current).toBe(source);
+    expect(useWorkspaceStore.getState().workspaces).toEqual([source, actual]);
+    expect(mocks.clearMessages).not.toHaveBeenCalled();
+    expect(mocks.switchWorkspace).not.toHaveBeenCalled();
+    expect(mocks.bindScope).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     useWorkspaceStore.setState({ current: null, workspaces: [], isLoading: false });

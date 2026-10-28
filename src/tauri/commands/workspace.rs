@@ -129,16 +129,21 @@ async fn switch_opened_workspace(
     app_state: &Arc<echo_agent_app_core::api::AppState>,
     workspace_id: echo_agent_app_core::api::workspace::WorkspaceId,
 ) -> Result<serde_json::Value, IpcError> {
-    switch_opened_workspace_with_connection(app_state, workspace_id, None).await
+    switch_opened_workspace_with_connection(app_state, workspace_id, None, None).await
 }
 
 async fn switch_opened_workspace_with_connection(
     app_state: &Arc<echo_agent_app_core::api::AppState>,
     workspace_id: echo_agent_app_core::api::workspace::WorkspaceId,
     connection_id: Option<String>,
+    expected_generation: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     let transition = app_state
-        .switch_workspace_registered_with_connection(workspace_id.clone(), connection_id)
+        .switch_workspace_registered_with_connection(
+            workspace_id.clone(),
+            connection_id,
+            expected_generation,
+        )
         .await
         .map_err(|error| IpcError::Internal(format!("Failed to switch workspace: {error}")))?;
     let conversation_count = match app_state.conversation_store().await {
@@ -371,16 +376,22 @@ pub async fn switch_workspace(
     state: tauri::State<'_, TauriState>,
     id: String,
     connection_id: Option<String>,
+    expected_generation: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     let ws_id = echo_agent_app_core::api::workspace::WorkspaceId::from_raw(id.clone());
-    switch_opened_workspace_with_connection(&state.app_state, ws_id, connection_id)
-        .await
-        .map_err(|error| match error {
-            IpcError::Internal(message) if message.contains("not found") => {
-                IpcError::NotFound(format!("Workspace not found: {message}"))
-            }
-            other => other,
-        })
+    switch_opened_workspace_with_connection(
+        &state.app_state,
+        ws_id,
+        connection_id,
+        expected_generation,
+    )
+    .await
+    .map_err(|error| match error {
+        IpcError::Internal(message) if message.contains("not found") => {
+            IpcError::NotFound(format!("Workspace not found: {message}"))
+        }
+        other => other,
+    })
 }
 
 #[cfg(test)]

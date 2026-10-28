@@ -241,6 +241,9 @@ describe('真实流式消息与等待状态', () => {
 
   it('从空思考段、空白增量到首个可见内容始终保留且只保留一处等待状态', () => {
     mocks.renderRealBubble = true;
+    useChatStore.setState({
+      messages: [{ id: 'stream-user', role: 'user', content: '用户问题', timestamp: 1 }],
+    });
     const id = useChatStore.getState().startAssistantMessage('stream-thinking');
     const { container } = render(<ChatPanel />);
     expect(container.querySelectorAll('.spinner')).toHaveLength(1);
@@ -269,6 +272,33 @@ describe('真实流式消息与等待状态', () => {
     expect(screen.getByText('完整回复 中文')).toBeTruthy();
     expect(screen.getByRole('button', { name: '分叉会话' })).toBeTruthy();
     expect(container.querySelectorAll('.spinner')).toHaveLength(0);
+  });
+
+  it('offers one fork only after the runtime confirms a final reply', () => {
+    mocks.renderRealBubble = true;
+    useConversationStore.setState({ activeId: 'source-runtime-final' });
+    useChatStore.setState({
+      isStreaming: false,
+      messages: [
+        { id: 'u-final', role: 'user', content: '用户问题', timestamp: 1 },
+        {
+          id: 'progress-final',
+          role: 'assistant',
+          content: '公开进度',
+          timestamp: 2,
+        },
+        {
+          id: 'reply-final',
+          role: 'assistant',
+          content: '尚未确认的回答',
+          timestamp: 3,
+        },
+      ],
+    });
+    render(<ChatPanel />);
+    expect(screen.queryByRole('button', { name: '分叉会话' })).toBeNull();
+    act(() => useChatStore.getState().applyFinalAnswer('reply-final', '已通过原运行时收尾的回答'));
+    expect(screen.getAllByRole('button', { name: '分叉会话' })).toHaveLength(1);
   });
 
   it('仅有空白正文时继续等待，首个正文字符到达后由真实气泡承接', () => {

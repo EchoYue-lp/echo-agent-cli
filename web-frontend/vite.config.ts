@@ -16,7 +16,8 @@ export default defineConfig(({ mode }) => {
       rollupOptions: {
         output: {
           manualChunks: {
-            react: ['react', 'react-dom'],
+            // 实际入口使用 client；将 renderer 与既有 React vendor 一起缓存。
+            react: ['react', 'react-dom', 'react-dom/client'],
             editor: ['@uiw/react-codemirror', '@codemirror/language-data'],
             markdown: ['react-markdown', 'remark-gfm'],
             terminal: ['@xterm/xterm', '@xterm/addon-fit'],

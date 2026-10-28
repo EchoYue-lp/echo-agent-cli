@@ -111,8 +111,9 @@ ZCode 普通 Bot callback
    不同。用户 Stop 继续取消原准确 foreground token；旧 turn 的取消不能影响后继 turn。
    已启动工具由原物理 owner 结算，不能因输入取消假装副作用回滚。
 6. `RunInputAccepted` 只建立历史来源索引，不填近期 `RunSteerRecorded` 投影。原 mailbox
-   成功后的近期记录保持原路径；“进入上下文”“语义已应用”“持续要求取消/替换”与来源的
-   精确关联仍属于 Plan14 后续切片。本片不宣称要求全集、自动 Goal/Plan 改写或完成门禁已闭合。
+   成功后的近期记录保持原路径；来源接纳不代表已经进入主模型上下文或已经执行。
+   普通Steer由主模型结合历史理解，不为旧Plan14建立独立语义Applied或持续要求状态机。
+   完整原文恢复沿下文的同journal来源族与Plan15验收，不自动改Goal、计划或验收。
 
 ## 取舍
 
@@ -158,3 +159,21 @@ Goal、goal_revision或goal_hash。用户通过GUI目标编辑或IM `/task-goal`
 必要历史、完整长原文及末尾限制继续沿原journal、压缩投影与read_artifact读取；缺失或
 校验失败时原required_context_unavailable暂停相关新副作用，原Goal和可恢复owner保留。
 这里不新增GoalStore、要求解释器、第二份队列/状态机或结构化模型协议，也不裁剪通用框架/SDK API。
+
+## 2026-10-27 原始输入历史的同源恢复
+
+普通Steer继续由主模型结合历史理解并按需调整计划；原文恢复不引入另一模型、语义分类器或自动Goal更新。原`events.jsonl`仍是唯一输入事实源，`HistoryProjection`在原artifact/review族之外增加原始输入来源族，保留`RunInputAccepted`与`RunSteerRecorded`各自的原始记录与序号。稳定输入身份沿原幂等规则处理；相同文字、相同turn的合法重复不按字符串合并，Accepted也不代表已理解或已执行。
+
+每次投影在原RunAuthority及产品数据lease下固定journal identity与序号前缀；来源族派生文件和现有`InputResourceRef`把该前缀提供给主模型，主模型沿原`read_artifact`分页读取必要的早期原文。近期四条只是紧凑呈现，不再充当全部来源分母。追加的新输入产生新引用；相同来源字节不会因无关工具事件或时钟变化重写文件。不同Run、工作空间或journal代际不能挪用旧引用。
+
+最终模型请求资格校验核对其实际收到的引用及原工具正上界；原始来源、SHA或原reader不可用时沿既有`required_context_unavailable`暂停并保留原owner/Goal，修复后沿原expected-resume恢复。派生缓存丢失或损坏可从准确journal重建；若重建改变文件身份，旧cursor明确拒绝，从无cursor重读，不能以空历史继续。路径来自本机产品data-root，即便项目绑定SSH也不调用远端文件系统。
+
+本节是源码接线合同；定向测试、完整矩阵、新Tauri与真实GUI/IM验收分别报告，不因文档或局部通过宣称全部完成。
+
+### 长Goal的本机读取与短Goal正控
+
+canonical Goal仍只由原TaskRuntime及用户CAS修改。超过既有Goal内联/溢出边界时，完整当前Goal通过原materialize_recorded_user_text发布到本机artifacts根，模型得到带Run、journal代际、goal_revision与原SHA的不可变引用；原tasks/objective文件仍作归档，不再冒充host read_artifact入口。legacy初始化没有RunInputAccepted也从原canonical Goal事实生成该引用，不伪造输入ID或Applied。旧已发布Goal文件保持不变，新Goal生成新引用；旧目标引用不能作为当前版本执行依据。
+
+短Goal仍按原方式内联；一个有界初始接纳原文可在来源引用中直接呈现，近期短Steer继续原有界呈现。最终请求只有在必要全文实际未呈现时才要求reader，不因短Goal或已完整可见的原文给NoTools/read_file-only任务新增工具门控。这只是核对实际字节可见性，不判断用户意图、不改Goal或计划。长Goal或早期原文实际省略且缺host reader时，仍走原required-context暂停与恢复，不扩大工具上界或用SSH read_file替代。
+
+完整可见性的判断以最终实际模型请求为准：既有 GoalContract 能内联的边界与未启用 continuation 时的恢复预览边界分别沿用；预览会省略的 canonical Goal 发布 host 引用。当前 PreparedUserTurn 已完整内联的中段文字（超过预览长度但未到 spill 边界）保持 NoTools／read_file-only 正常执行。此前真实配对 read_artifact 调用和 Tool 结果若仍完整留在请求中，按分页字节范围、全文覆盖及原 SHA 核对后也算全文可见；缺页、重叠不一致或 SHA 不符不算。核对不会从本地文件补入缺失模型文字，也不把“文件存在”当作“模型已读取”。同一 Goal 的已发布引用资格仍绑定 Run、journal、revision 与 hash，不随当前投影显示模式改变。

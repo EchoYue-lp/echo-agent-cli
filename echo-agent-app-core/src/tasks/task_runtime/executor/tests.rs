@@ -13,6 +13,7 @@ mod tests {
     struct PermissionCountingTool {
         name: String,
         permission: echo_agent::prelude::ToolPermission,
+        readonly_capability: bool,
         calls: Arc<AtomicUsize>,
         policies:
             Option<Arc<std::sync::Mutex<Vec<Option<echo_agent::tasks::NestedDelegationPolicy>>>>>,
@@ -27,6 +28,7 @@ mod tests {
             Self {
                 name: name.to_string(),
                 permission,
+                readonly_capability: false,
                 calls,
                 policies: None,
             }
@@ -37,6 +39,11 @@ mod tests {
             policies: Arc<std::sync::Mutex<Vec<Option<echo_agent::tasks::NestedDelegationPolicy>>>>,
         ) -> Self {
             self.policies = Some(policies);
+            self
+        }
+
+        fn with_readonly_capability(mut self) -> Self {
+            self.readonly_capability = true;
             self
         }
     }
@@ -73,6 +80,14 @@ mod tests {
 
         fn permissions(&self) -> Vec<echo_agent::prelude::ToolPermission> {
             vec![self.permission]
+        }
+
+        fn risk_level(&self) -> echo_agent::tools::ToolRiskLevel {
+            if self.readonly_capability {
+                echo_agent::tools::ToolRiskLevel::ReadOnly
+            } else {
+                echo_agent::tools::ToolRiskLevel::Standard
+            }
         }
 
         fn execute_with_context<'a>(
@@ -133,24 +148,25 @@ mod tests {
     }
 
     fn turn_identity(
-        run_id: &str,
+        run: &TaskRun,
         turn_id: &str,
     ) -> Result<echo_agent::agent::EventIdentity, String> {
         echo_agent::agent::EventIdentity::for_chat(
-            Some("task-turn-conversation".to_string()),
+            Some(run.conversation_id.clone()),
             turn_id,
-            turn_id,
-            Some(run_id.to_string()),
+            run.root_message_id.clone(),
+            Some(run.run_id.clone()),
         )
         .map_err(|error| error.to_string())
     }
 
     async fn drive_scripted_run_turn(
+        store: Arc<TaskRuntimeStore>,
         run: &TaskRun,
         turn_id: &str,
         script: fn() -> Vec<AgentEvent>,
     ) -> Result<TurnReceipt, String> {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let _resources = store.test_resource_scope();
         let sink = EkoAgentTurnSink::for_run(
             run,
             turn_id,
@@ -159,7 +175,7 @@ mod tests {
             None,
         );
         let request =
-            TurnRequest::new(turn_identity(&run.run_id, turn_id)?, "test").mode(TurnMode::Execute);
+            TurnRequest::new(turn_identity(run, turn_id)?, "test").mode(TurnMode::Execute);
         AgentTurnDriver
             .drive(&ScriptedTurnAgent::new(script), request, &sink)
             .await
@@ -267,8 +283,13 @@ mod tests {
             .get_run(&run_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "missing-terminal run was not created".to_string())?;
-        let receipt =
-            drive_scripted_run_turn(&run, "missing-terminal-turn", missing_terminal).await?;
+        let receipt = drive_scripted_run_turn(
+            store.clone(),
+            &run,
+            "missing-terminal-turn",
+            missing_terminal,
+        )
+        .await?;
 
         assert!(matches!(receipt.outcome, TurnOutcome::Failed(_)));
         assert!(receipt.final_answer.is_none());
@@ -339,8 +360,13 @@ mod tests {
             HashSet::new(),
             None,
         );
-        let request = TurnRequest::new(turn_identity(&run_id, "reported-usage-turn")?, "test")
-            .mode(TurnMode::Execute);
+        let request = TurnRequest::new(
+            turn_identity(&run, &execution_id)?
+                .with_execution_id(&execution_id)
+                .map_err(|error| error.to_string())?,
+            "test",
+        )
+        .mode(TurnMode::Execute);
         let receipt = AgentTurnDriver
             .drive(&ScriptedTurnAgent::new(usage_script), request, &sink)
             .await
@@ -388,7 +414,9 @@ mod tests {
             .get_run(&run_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "typed-terminal run was not created".to_string())?;
-        let failed = drive_scripted_run_turn(&run, "provider-timeout", provider_failure).await?;
+        let failed =
+            drive_scripted_run_turn(store.clone(), &run, "provider-timeout", provider_failure)
+                .await?;
         match failed.outcome {
             TurnOutcome::Failed(failure) => {
                 assert_eq!(
@@ -405,7 +433,8 @@ mod tests {
             }
             other => return Err(format!("expected typed provider failure, got {other:?}")),
         }
-        let cancelled = drive_scripted_run_turn(&run, "cancelled-turn", cancelled).await?;
+        let cancelled =
+            drive_scripted_run_turn(store.clone(), &run, "cancelled-turn", cancelled).await?;
         assert!(matches!(cancelled.outcome, TurnOutcome::Cancelled));
         Ok(())
     }
@@ -3981,7 +4010,7 @@ Read the runtime path and found one missing branch.
                         )
                         .with_response("## Summary\n层数探针完成"),
                 );
-                let child = ReactAgentBuilder::new()
+                let mut child_builder = ReactAgentBuilder::new()
                     .name(&name)
                     .model("mock-model")
                     .enable_tools()
@@ -3998,10 +4027,15 @@ Read the runtime path and found one missing branch.
                             echo_agent::prelude::ToolPermission::Read,
                             calls.clone(),
                         )
+                        // 只观察原调用的内存计数/policy，不读写文件；显式声明
+                        // ReadOnly 能力，不能把权限 Read 当成 capability 声明。
+                        .with_readonly_capability()
                         .with_policy_observer(observations.clone()),
-                    ))
-                    .build()
-                    .map_err(|error| error.to_string())?;
+                    ));
+                if !writer {
+                    child_builder = child_builder.readonly_tools();
+                }
+                let child = child_builder.build().map_err(|error| error.to_string())?;
                 let definition = SubagentBuilder::new(&name).fork_mode().can_delegate();
                 let definition = if writer {
                     definition.write_access()
@@ -4064,6 +4098,11 @@ Read the runtime path and found one missing branch.
                 )
                 .await
             } else {
+                let allowed_tools = vec![
+                    "agent_tool".to_string(),
+                    "depth_probe".to_string(),
+                    "tool_search".to_string(),
+                ];
                 run_readonly_subagent(
                     &primary,
                     &run_id,
@@ -4073,7 +4112,7 @@ Read the runtime path and found one missing branch.
                     &task.description,
                     serde_json::json!({}),
                     SubagentTaskContext::default(),
-                    Vec::new(),
+                    allowed_tools,
                     CancellationToken::new(),
                     policy,
                     None,
@@ -4093,7 +4132,11 @@ Read the runtime path and found one missing branch.
                     depth <= maximum,
                     "writer={writer}, max={maximum}, depth={depth}"
                 );
-                assert_eq!(calls.load(Ordering::SeqCst), usize::from(depth <= maximum));
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    usize::from(depth <= maximum),
+                    "writer={writer}, max={maximum}, depth={depth}"
+                );
                 let observed = observations.lock().map_err(|error| error.to_string())?;
                 if depth <= maximum {
                     assert_eq!(
@@ -5202,6 +5245,7 @@ Read the runtime path and found one missing branch.
     /// canonical settlement commits `Interrupted`, so the execution summary and
     /// the review must both be refused instead of persisted for a task the user
     /// already stopped.
+    // Tokio 的固定多线程属性名；不是本项目的 Subagent 概念。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn review_after_durable_interruption_publishes_no_success_evidence() -> Result<(), String>
     {
@@ -5343,6 +5387,7 @@ Read the runtime path and found one missing branch.
     /// interruption-first classifier still reports `Committed` while the
     /// canonical settlement commits `Interrupted`. The receipt's acceptance
     /// fact and the degraded live payload must agree in every cell.
+    // Tokio 的固定多线程属性名；不是本项目的 Subagent 概念。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn interruption_matrix_acceptance_matches_live_payload() -> Result<(), String> {
         for interrupt in ["cancel", "pause"] {
@@ -5482,6 +5527,7 @@ Read the runtime path and found one missing branch.
 
     /// The fix must not over-reach: a non-success review gate on a healthy run
     /// keeps its execution evidence and review history.
+    // Tokio 的固定多线程属性名；不是本项目的 Subagent 概念。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn needs_fix_review_without_interruption_keeps_execution_evidence() -> Result<(), String>
     {

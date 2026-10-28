@@ -1676,6 +1676,347 @@ describe('useTauriChat foreground turn recovery', () => {
     hook.unmount();
   });
 
+  it.each(['automatic admission', 'manual admission'] as const)(
+    'shares the original pending Steer receipt after %s instead of rejecting the same input',
+    async (origin) => {
+      const conversationId = 'native-wait-steer-concurrent';
+      useConversationStore.setState({ activeId: conversationId });
+      const pending = inputProjection(
+        'native-original-input',
+        conversationId,
+        'STEER_NATIVE_CONTROL'
+      );
+      const first = deferred<ConversationInputReceipt>();
+      let invocations = 0;
+      queuedFrontier = {
+        queue_revision: origin === 'automatic admission' ? 0 : 1,
+        items: origin === 'automatic admission' ? [] : [pending],
+      };
+      mocks.apiInvoke.mockImplementation(async (command: string) => {
+        if (command === 'get_active_chat_turn')
+          return { ...activeSnapshot, conversation_id: conversationId };
+        if (command === 'replay_chat_events') return emptyReplay();
+        if (command === 'list_queued_chat_inputs') return queuedFrontier;
+        if (command === 'queue_chat_input') {
+          queuedFrontier = { queue_revision: 1, items: [pending] };
+          return pending.receipt;
+        }
+        if (command === 'steer_chat_message') {
+          invocations += 1;
+          if (invocations > 1) throw new Error('queued input is no longer pending');
+          queuedFrontier = {
+            queue_revision: 3,
+            items: [{ ...pending, receipt: { ...pending.receipt, phase: 'mailbox_accepted' } }],
+          };
+          return first.promise;
+        }
+        return { success: true };
+      });
+      const hook = renderHook(() => useTauriChat());
+      await waitFor(() =>
+        expect(mocks.apiInvoke).toHaveBeenCalledWith('list_queued_chat_inputs', {
+          workspaceId: 'global',
+          conversationId,
+        })
+      );
+      let original: Promise<boolean> | undefined;
+      if (origin === 'automatic admission') {
+        await act(async () => {
+          expect(await hook.result.current.sendMessage('STEER_NATIVE_CONTROL')).toBe(true);
+        });
+      } else {
+        act(() => {
+          original = hook.result.current.steerQueuedMessage(pending.receipt.identity.input_id);
+        });
+      }
+      await waitFor(() => expect(invocations).toBe(1));
+      let immediate: Promise<boolean> | undefined;
+      await act(async () => {
+        immediate = hook.result.current.steerQueuedMessage(pending.receipt.identity.input_id);
+        await Promise.resolve();
+      });
+      const callsBeforeDrain = invocations;
+      const outcomeBeforeDrain = hook.result.current.queuedInputs.at(0)?.steerOutcome;
+      let immediateResult = false;
+      await act(async () => {
+        queuedFrontier = { queue_revision: 5, items: [] };
+        first.resolve({ ...pending.receipt, phase: 'drained', drained: true, queue_revision: 5 });
+        immediateResult = (await immediate) ?? false;
+        if (original) expect(await original).toBe(true);
+      });
+      await waitFor(() => expect(hook.result.current.queuedInputs).toEqual([]));
+      expect(callsBeforeDrain).toBe(1);
+      expect(outcomeBeforeDrain).toBeUndefined();
+      expect(immediateResult).toBe(true);
+      expect(useToastStore.getState().toasts.some((toast) => toast.type === 'error')).toBe(false);
+      expect(
+        useChatStore.getState().messages.filter((message) => message.role === 'user')
+      ).toHaveLength(1);
+      expect(mocks.apiInvoke).not.toHaveBeenCalledWith(
+        'remove_queued_chat_input',
+        expect.anything()
+      );
+      hook.unmount();
+    }
+  );
+
+  it('keeps a real rejection retryable under the original identity after shared observation ends', async () => {
+    const conversationId = 'native-steer-real-rejection';
+    useConversationStore.setState({ activeId: conversationId });
+    const pending = inputProjection('native-retained-input', conversationId, 'original input');
+    const rejected = deferred<ConversationInputReceipt>();
+    const retried = deferred<ConversationInputReceipt>();
+    let invocations = 0;
+    queuedFrontier = { queue_revision: 1, items: [pending] };
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn')
+        return { ...activeSnapshot, conversation_id: conversationId };
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return queuedFrontier;
+      if (command === 'steer_chat_message') {
+        invocations += 1;
+        return invocations === 1 ? rejected.promise : retried.promise;
+      }
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(hook.result.current.queuedInputs.at(0)?.id).toBe('native-retained-input')
+    );
+    let first: Promise<boolean> | undefined;
+    let joined: Promise<boolean> | undefined;
+    act(() => {
+      first = hook.result.current.steerQueuedMessage('native-retained-input');
+      joined = hook.result.current.steerQueuedMessage('native-retained-input');
+    });
+    await act(async () => {
+      rejected.reject(new Error('queued input frontier changed; refresh and retry'));
+      expect(await first).toBe(false);
+      expect(await joined).toBe(false);
+    });
+    expect(invocations).toBe(1);
+    expect(hook.result.current.queuedInputs.at(0)?.steerOutcome).toBe('rejected');
+    expect(useToastStore.getState().toasts.filter((toast) => toast.type === 'error')).toHaveLength(
+      1
+    );
+    let retry: Promise<boolean> | undefined;
+    act(() => {
+      retry = hook.result.current.steerQueuedMessage('native-retained-input');
+    });
+    expect(invocations).toBe(2);
+    expect(hook.result.current.queuedInputs.at(0)?.steerOutcome).toBeUndefined();
+    await act(async () => {
+      queuedFrontier = { queue_revision: 5, items: [] };
+      retried.resolve({ ...pending.receipt, phase: 'drained', drained: true, queue_revision: 5 });
+      expect(await retry).toBe(true);
+    });
+    for (const [, args] of mocks.apiInvoke.mock.calls.filter(
+      ([command]) => command === 'steer_chat_message'
+    ))
+      expect(args.identity).toEqual(pending.receipt.identity);
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('queue_chat_input', expect.anything());
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('remove_queued_chat_input', expect.anything());
+    expect(
+      useChatStore.getState().messages.filter((message) => message.role === 'user')
+    ).toHaveLength(1);
+    hook.unmount();
+  });
+
+  it.each(
+    (['revision', 'payload hash'] as const).flatMap((change) =>
+      (['rejected', 'drained', 'retained'] as const).map((outcome) => [change, outcome] as const)
+    )
+  )('isolates a changed %s while the earlier source receipt is %s', async (change, outcome) => {
+    const conversationId = 'native-steer-source-version';
+    useConversationStore.setState({ activeId: conversationId });
+    const pending = inputProjection('same-input-version', conversationId, 'original input');
+    const changed: ConversationInputProjection = {
+      ...pending,
+      receipt: {
+        ...pending.receipt,
+        identity: {
+          ...pending.receipt.identity,
+          revision: change === 'revision' ? 2 : 1,
+          payload_sha256:
+            change === 'payload hash' ? 'new-payload-sha' : pending.receipt.identity.payload_sha256,
+        },
+      },
+    };
+    const oldReceipt = deferred<ConversationInputReceipt>();
+    const newReceipt = deferred<ConversationInputReceipt>();
+    let invocations = 0;
+    queuedFrontier = { queue_revision: 1, items: [pending] };
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn')
+        return { ...activeSnapshot, conversation_id: conversationId };
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return queuedFrontier;
+      if (command === 'steer_chat_message') {
+        invocations += 1;
+        return invocations === 1 ? oldReceipt.promise : newReceipt.promise;
+      }
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(hook.result.current.queuedInputs.at(0)?.id).toBe('same-input-version')
+    );
+    let first: Promise<boolean> | undefined;
+    act(() => {
+      first = hook.result.current.steerQueuedMessage('same-input-version');
+    });
+    await act(async () => {
+      queuedFrontier = { queue_revision: 2, items: [changed] };
+      mocks.listeners.get('chat://event')?.({
+        payload: inputLifecycleEnvelope(1, 'persisted', conversationId, 'same-input-version'),
+      });
+    });
+    await waitFor(() =>
+      expect(hook.result.current.queuedInputs.at(0)?.identity).toEqual(changed.receipt.identity)
+    );
+    let second: Promise<boolean> | undefined;
+    act(() => {
+      second = hook.result.current.steerQueuedMessage('same-input-version');
+    });
+    const callsBeforeSettlement = invocations;
+    const visibleMessages = useChatStore.getState().messages;
+    await act(async () => {
+      if (outcome === 'rejected')
+        oldReceipt.reject(new Error('original source version was superseded'));
+      else
+        oldReceipt.resolve({
+          ...pending.receipt,
+          phase: outcome === 'drained' ? 'drained' : 'deferred',
+          drained: outcome === 'drained',
+          queue_revision: 2,
+        });
+      expect(await first).toBe(outcome === 'drained');
+    });
+    // 此时新版本还在等待自己的回执；不在同一act里结算而掩盖旧结果覆盖窗口。
+    expect(hook.result.current.queuedInputs.at(0)?.identity).toEqual(changed.receipt.identity);
+    expect(hook.result.current.queuedInputs.at(0)?.steerOutcome).toBeUndefined();
+    expect(useChatStore.getState().messages).toEqual(visibleMessages);
+    expect(useToastStore.getState().toasts).toEqual([]);
+    await act(async () => {
+      queuedFrontier = { queue_revision: 5, items: [] };
+      newReceipt.resolve({
+        ...changed.receipt,
+        phase: 'drained',
+        drained: true,
+        queue_revision: 5,
+      });
+      expect(await second).toBe(true);
+    });
+    expect(callsBeforeSettlement).toBe(2);
+    const args = mocks.apiInvoke.mock.calls
+      .filter(([command]) => command === 'steer_chat_message')
+      .map(([, args]) => args);
+    expect(args.at(0)?.identity).toEqual(pending.receipt.identity);
+    expect(args.at(1)?.identity).toEqual(changed.receipt.identity);
+    expect(args.at(1)?.expectedQueueRevision).toBe(2);
+    hook.unmount();
+  });
+
+  it.each(['turn', 'workspace generation'] as const)(
+    'keeps an old shared promise from projecting into a new %s with the same input identity',
+    async (change) => {
+      const conversationId = 'native-steer-owner-change';
+      const workspace: Workspace = {
+        id: 'global',
+        name: 'Controlled local workspace',
+        root: '/controlled-local',
+        kind: { type: 'coding' },
+        metadata: { tags: [] },
+        product_data_generation: 'generation-a',
+        created_at: '2026-10-25T00:00:00Z',
+        last_active: '2026-10-25T00:00:00Z',
+      };
+      useWorkspaceStore.setState({ current: workspace });
+      useConversationStore.setState({ activeId: conversationId });
+      let snapshot = { ...activeSnapshot, conversation_id: conversationId };
+      const pending = inputProjection('same-original-input', conversationId, 'current guidance');
+      const oldReceipt = deferred<ConversationInputReceipt>();
+      const newReceipt = deferred<ConversationInputReceipt>();
+      let invocations = 0;
+      queuedFrontier = { queue_revision: 1, items: [pending] };
+      mocks.apiInvoke.mockImplementation(async (command: string) => {
+        if (command === 'get_active_chat_turn') return snapshot;
+        if (command === 'replay_chat_events') return emptyReplay();
+        if (command === 'list_queued_chat_inputs') return queuedFrontier;
+        if (command === 'steer_chat_message') {
+          invocations += 1;
+          return invocations === 1 ? oldReceipt.promise : newReceipt.promise;
+        }
+        return { success: true };
+      });
+      const hook = renderHook(() => useTauriChat());
+      await waitFor(() =>
+        expect(hook.result.current.queuedInputs.at(0)?.id).toBe('same-original-input')
+      );
+      let oldResult: Promise<boolean> | undefined;
+      let oldJoined: Promise<boolean> | undefined;
+      act(() => {
+        oldResult = hook.result.current.steerQueuedMessage('same-original-input');
+        oldJoined = hook.result.current.steerQueuedMessage('same-original-input');
+      });
+      expect(invocations).toBe(1);
+      await act(async () => {
+        if (change === 'turn') {
+          snapshot = { ...snapshot, active_turn_id: 'continued-original-run-turn' };
+          mocks.listeners.get('chat://event')?.({
+            payload: turnStatusEnvelope(
+              snapshot.active_turn_id,
+              snapshot.root_turn_id,
+              1,
+              'running',
+              conversationId
+            ),
+          });
+        } else {
+          useWorkspaceStore.setState({
+            current: { ...workspace, product_data_generation: 'generation-b' },
+          });
+        }
+      });
+      await waitFor(() =>
+        expect(hook.result.current.queuedInputs.at(0)?.id).toBe('same-original-input')
+      );
+      let currentResult: Promise<boolean> | undefined;
+      act(() => {
+        currentResult = hook.result.current.steerQueuedMessage('same-original-input');
+      });
+      const callsBeforeSettlement = invocations;
+      const visibleMessages = useChatStore.getState().messages;
+      await act(async () => {
+        oldReceipt.resolve({
+          ...pending.receipt,
+          phase: 'drained',
+          drained: true,
+          queue_revision: 3,
+        });
+        expect(await oldResult).toBe(true);
+        expect(await oldJoined).toBe(true);
+      });
+      expect(useChatStore.getState().messages).toEqual(visibleMessages);
+      expect(useToastStore.getState().toasts).toEqual([]);
+      await act(async () => {
+        queuedFrontier = { queue_revision: 5, items: [] };
+        newReceipt.resolve({
+          ...pending.receipt,
+          phase: 'drained',
+          drained: true,
+          queue_revision: 5,
+        });
+        expect(await currentResult).toBe(true);
+      });
+      expect(callsBeforeSettlement).toBe(2);
+      expect(
+        useChatStore.getState().messages.filter((message) => message.role === 'user')
+      ).toHaveLength(1);
+      hook.unmount();
+    }
+  );
+
   it('steers an exact selected identity and refreshes instead of removing locally', async () => {
     const conversationId = 'conversation-steer-accepted';
     useConversationStore.setState({ activeId: conversationId });

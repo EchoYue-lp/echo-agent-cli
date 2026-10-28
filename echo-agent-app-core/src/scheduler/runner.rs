@@ -1524,10 +1524,9 @@ mod tests {
             None,
             Some(sender.clone()),
         );
-        let invocation = invocation(
-            "cron-scheduled:weixin-one",
-            CronTask::new("notify", "*/5 * * * *", "answer fully"),
-        );
+        let mut task = CronTask::new("notify", "*/5 * * * *", "answer fully");
+        task.definition_id = "notification-positive-definition".to_string();
+        let invocation = invocation("cron-scheduled:weixin-one", task);
         let identity =
             OccurrenceIdentity::from_scheduler_invocation(store.active_workspace_id(), &invocation);
         fire(invocation.clone())
@@ -1574,6 +1573,81 @@ mod tests {
                 .status,
             TaskRunStatus::Completed
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn notification_remains_unsent_for_each_uncompleted_task_run() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for status in [
+            TaskRunStatus::Pending,
+            TaskRunStatus::Running,
+            TaskRunStatus::Paused,
+            TaskRunStatus::Failed,
+            TaskRunStatus::Cancelled,
+        ] {
+            let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory()?);
+            let _resources = store.test_resource_scope();
+            let sender = RecordingWeixin {
+                freeze_calls: AtomicUsize::new(0),
+                sends: std::sync::Mutex::new(Vec::new()),
+            };
+            let mut task = CronTask::new(
+                "native completion boundary",
+                "*/5 * * * *",
+                "original prompt",
+            );
+            task.definition_id = "notification-status-definition".to_string();
+            let invocation = invocation(&format!("native-not-completed-{}", status.as_str()), task);
+            let identity = OccurrenceIdentity::from_scheduler_invocation(
+                store.active_workspace_id(),
+                &invocation,
+            );
+            let target = sender
+                .freeze_target(&invocation, &identity.workspace_id)
+                .await
+                .map_err(anyhow::Error::msg)?
+                .ok_or_else(|| anyhow::anyhow!("frozen target missing"))?;
+            let request =
+                cron_occurrence_request(&identity, &invocation.task, &invocation.task.prompt);
+            let (_, created) =
+                store.get_or_create_occurrence_run_with_weixin(&request, Some(&target))?;
+            assert!(created);
+            let run_id = identity.run_id();
+            if status != TaskRunStatus::Pending {
+                store.transition_run(&run_id, TaskRunStatus::Running)?;
+                if status == TaskRunStatus::Paused {
+                    assert!(store.request_pause(&run_id)?);
+                } else if status != TaskRunStatus::Running {
+                    store.transition_run(&run_id, status)?;
+                }
+            }
+            let before = store
+                .get_run_state(&run_id)?
+                .ok_or_else(|| anyhow::anyhow!("original run missing"))?;
+            assert!(
+                store
+                    .deliver_weixin_completion(&identity, &sender)
+                    .await
+                    .is_err()
+            );
+            let after = store
+                .get_run_state(&run_id)?
+                .ok_or_else(|| anyhow::anyhow!("original run lost"))?;
+            assert_eq!(after.run.status, status);
+            assert_eq!(before.journal_sequence, after.journal_sequence);
+            assert_eq!(store.frozen_weixin_notification(&run_id)?, Some(target));
+            assert!(store.weixin_notification_status(&run_id)?.is_none());
+            assert!(
+                sender
+                    .sends
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("send observer poisoned"))?
+                    .is_empty()
+            );
+            assert_eq!(sender.freeze_calls.load(Ordering::SeqCst), 1);
+        }
         Ok(())
     }
 
@@ -1940,6 +2014,659 @@ mod tests {
                 global.shutdown_run_drivers().await?;
             }
         }
+        Ok(())
+    }
+    /// Exercise the same public runner methods used by GUI management. The
+    /// original store must issue identities; no fixture backfills production.
+    #[tokio::test]
+    async fn gui_runner_definition_is_stable_per_revision_across_fire_edit_and_reopen()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let definition_path = root.path().join("tasks.json");
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<CronTask>::new()));
+        let observed = captured.clone();
+        let callback: OccurrenceFireFn = Arc::new(move |invocation| {
+            let observed = observed.clone();
+            Box::pin(async move {
+                observed
+                    .lock()
+                    .map_err(|_| {
+                        echo_agent::error::ReactError::Other("definition observer poisoned".into())
+                    })?
+                    .push(invocation.task);
+                Ok("original callback physically finished".to_string())
+            })
+        });
+        let runner = FrameworkSchedulerRunner::new_with_occurrence_context(
+            CronTaskStore::new().with_path(definition_path.clone()),
+            CancellationToken::new(),
+            callback.clone(),
+        )
+        .await?;
+        let mut task = CronTask::new("definition lifecycle", "0 0 1 1 *", "original prompt");
+        task.id = "definition-lifecycle-task".into();
+        assert!(
+            task.definition_id.is_empty(),
+            "new input is not yet a stored definition"
+        );
+        runner.add_task(task.clone()).await?;
+        let first = runner
+            .list_tasks()
+            .await
+            .into_iter()
+            .find(|current| current.id == task.id)
+            .ok_or_else(|| anyhow::anyhow!("stored definition missing"))?;
+        assert!(!first.definition_id.trim().is_empty());
+        let first_fire = runner.run_once_with_receipt(&task.id).await?;
+        let second_fire = runner.run_once_with_receipt(&task.id).await?;
+        assert_ne!(
+            first_fire.occurrence.occurrence_id,
+            second_fire.occurrence.occurrence_id
+        );
+        assert!(
+            runner
+                .set_status(&task.id, echo_agent::scheduler::CronTaskStatus::Disabled)
+                .await?
+        );
+        let disabled = runner
+            .list_tasks()
+            .await
+            .into_iter()
+            .find(|current| current.id == task.id)
+            .ok_or_else(|| anyhow::anyhow!("disabled definition missing"))?;
+        assert_eq!(disabled.definition_id, first.definition_id);
+        assert!(
+            runner
+                .set_status(&task.id, echo_agent::scheduler::CronTaskStatus::Enabled)
+                .await?
+        );
+        let current = runner
+            .list_tasks()
+            .await
+            .into_iter()
+            .find(|current| current.id == task.id)
+            .ok_or_else(|| anyhow::anyhow!("enabled definition missing"))?;
+        let edited = runner
+            .edit_task(
+                current,
+                echo_agent::scheduler::CronTaskEdit {
+                    name: "edited definition lifecycle".into(),
+                    cron_expr: "0 0 2 1 *".into(),
+                    prompt: "edited prompt".into(),
+                },
+            )
+            .await?;
+        assert_eq!(edited.id, first.id);
+        assert_eq!(edited.created_at, first.created_at);
+        assert!(!edited.definition_id.trim().is_empty());
+        assert_ne!(edited.definition_id, first.definition_id);
+        runner.run_once_with_receipt(&task.id).await?;
+        drop(runner);
+        let reopened = FrameworkSchedulerRunner::new_with_occurrence_context(
+            CronTaskStore::new().with_path(definition_path),
+            CancellationToken::new(),
+            callback,
+        )
+        .await?;
+        let restored = reopened
+            .list_tasks()
+            .await
+            .into_iter()
+            .find(|current| current.id == task.id)
+            .ok_or_else(|| anyhow::anyhow!("reopened definition missing"))?;
+        assert_eq!(restored.definition_id, edited.definition_id);
+        assert_eq!(restored.id, edited.id);
+        assert_eq!(restored.prompt, edited.prompt);
+        reopened.run_once_with_receipt(&task.id).await?;
+        let captured = captured
+            .lock()
+            .map_err(|_| anyhow::anyhow!("definition observer poisoned"))?;
+        assert_eq!(captured.len(), 4);
+        assert_eq!(
+            captured
+                .iter()
+                .map(|value| value.definition_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                first.definition_id.as_str(),
+                first.definition_id.as_str(),
+                edited.definition_id.as_str(),
+                edited.definition_id.as_str()
+            ]
+        );
+        assert!(captured.iter().all(|value| value.id == task.id));
+        Ok(())
+    }
+
+    /// Bypass the positive invocation helper intentionally: malformed frozen
+    /// definitions must never be repaired by the test or production adapter.
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn empty_or_mismatched_frozen_definition_refuses_model_run_and_notification()
+    -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct DefinitionSender {
+            definition: String,
+            freeze_calls: AtomicUsize,
+            sends: AtomicUsize,
+        }
+        impl WeixinCronDelivery for DefinitionSender {
+            fn freeze_target<'a>(
+                &'a self,
+                _invocation: &'a SchedulerInvocation,
+                workspace_id: &'a str,
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<
+                    Option<crate::tasks::task_runtime::weixin_delivery::WeixinDeliveryTarget>,
+                    String,
+                >,
+            > {
+                Box::pin(async move {
+                    self.freeze_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(Some(
+                        crate::tasks::task_runtime::weixin_delivery::WeixinDeliveryTarget {
+                            account_id: "original-account".into(),
+                            credential_generation: "original-generation".into(),
+                            peer_id: "original-peer".into(),
+                            context_ref: "original-context".into(),
+                            workspace_id: workspace_id.into(),
+                            channel_conversation: "original-direct-conversation".into(),
+                            definition_id: self.definition.clone(),
+                        },
+                    ))
+                })
+            }
+            fn send<'a>(
+                &'a self,
+                _target: &'a crate::tasks::task_runtime::weixin_delivery::WeixinDeliveryTarget,
+                _message_id: &'a str,
+                _text: &'a str,
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<echo_agent::channels::weixin::WeixinSendOutcome, String>,
+            > {
+                Box::pin(async move {
+                    self.sends.fetch_add(1, Ordering::SeqCst);
+                    Err("unexpected send for invalid definition".into())
+                })
+            }
+        }
+        for (task_definition, frozen_definition, expected_error) in [
+            ("", "", "destination is incomplete"),
+            ("valid-original-definition", "", "definition does not match"),
+            (
+                "valid-original-definition",
+                "foreign-definition",
+                "definition does not match",
+            ),
+        ] {
+            let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+            let _resources = store.test_resource_scope();
+            let model = Arc::new(MockLlmClient::new().with_response("must not execute"));
+            let agent = AgentHandle::new(
+                ReactAgentBuilder::new()
+                    .llm_client(model.clone())
+                    .system_prompt("offline definition control")
+                    .build()?,
+            );
+            let sender = Arc::new(DefinitionSender {
+                definition: frozen_definition.into(),
+                freeze_calls: AtomicUsize::new(0),
+                sends: AtomicUsize::new(0),
+            });
+            let fire = build_occurrence_fire_fn_with_weixin(
+                agent,
+                Some(store.clone()),
+                None,
+                None,
+                None,
+                Some(sender.clone()),
+            );
+            let mut task = CronTask::new("invalid definition control", "0 0 1 1 *", "must not run");
+            task.id = "invalid-definition-task".into();
+            task.definition_id = task_definition.into();
+            let invocation = SchedulerInvocation::new(
+                "invalid-definition-occurrence",
+                task,
+                chrono::Utc::now(),
+                echo_agent::scheduler::SchedulerTrigger::Manual,
+            );
+            let identity = OccurrenceIdentity::from_scheduler_invocation(
+                store.active_workspace_id(),
+                &invocation,
+            );
+            for _ in 0..2 {
+                let error = fire(invocation.clone())
+                    .await
+                    .err()
+                    .ok_or_else(|| anyhow::anyhow!("invalid definition unexpectedly admitted"))?;
+                assert!(
+                    error.to_string().contains(expected_error),
+                    "unexpected refusal: {error}"
+                );
+                assert!(store.get_run(&identity.run_id())?.is_none());
+            }
+            assert_eq!(model.call_count(), 0);
+            assert_eq!(sender.freeze_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(sender.sends.load(Ordering::SeqCst), 0);
+            store.shutdown_run_drivers().await?;
+        }
+        Ok(())
+    }
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn one_definition_two_slots_keep_original_target_and_each_slot_sends_once()
+    -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let model = Arc::new(
+            MockLlmClient::new()
+                .with_responses(["first original full answer", "second original full answer"]),
+        );
+        let agent = AgentHandle::new(
+            ReactAgentBuilder::new()
+                .llm_client(model.clone())
+                .system_prompt("offline original slots")
+                .build()?,
+        );
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let _resources = store.test_resource_scope();
+        let sender = Arc::new(RecordingWeixin {
+            freeze_calls: AtomicUsize::new(0),
+            sends: std::sync::Mutex::new(Vec::new()),
+        });
+        let fire = build_occurrence_fire_fn_with_weixin(
+            agent,
+            Some(store.clone()),
+            None,
+            None,
+            None,
+            Some(sender.clone()),
+        );
+        let mut task = CronTask::new(
+            "two original slots",
+            "0 0 1 1 *",
+            "produce original full answer",
+        );
+        task.id = "one-definition-task".into();
+        task.definition_id = "one-original-definition".into();
+        let mut runs = Vec::new();
+        for occurrence in ["original-slot-one", "original-slot-two"] {
+            let invocation = SchedulerInvocation::new(
+                occurrence,
+                task.clone(),
+                chrono::Utc::now(),
+                echo_agent::scheduler::SchedulerTrigger::Manual,
+            );
+            let identity = OccurrenceIdentity::from_scheduler_invocation(
+                store.active_workspace_id(),
+                &invocation,
+            );
+            fire(invocation.clone()).await?;
+            fire(invocation).await?;
+            let frozen = store
+                .frozen_weixin_notification(&identity.run_id())?
+                .ok_or_else(|| anyhow::anyhow!("original frozen route missing"))?;
+            assert_eq!(frozen.definition_id, task.definition_id);
+            assert_eq!(frozen.account_id, "frozen-account");
+            assert_eq!(frozen.credential_generation, "original-generation");
+            assert_eq!(frozen.peer_id, "frozen-peer");
+            assert_eq!(frozen.context_ref, "original-context-reference");
+            assert_eq!(
+                store
+                    .get_run(&identity.run_id())?
+                    .ok_or_else(|| anyhow::anyhow!("original run missing"))?
+                    .status,
+                TaskRunStatus::Completed
+            );
+            runs.push(identity.run_id());
+        }
+        assert_ne!(runs.first(), runs.get(1));
+        assert_eq!(model.call_count(), 2);
+        assert_eq!(sender.freeze_calls.load(Ordering::SeqCst), 2);
+        let sends = sender
+            .sends
+            .lock()
+            .map_err(|_| anyhow::anyhow!("send observer poisoned"))?;
+        assert_eq!(sends.len(), 2);
+        assert_ne!(
+            sends.first().map(|value| &value.0),
+            sends.get(1).map(|value| &value.0)
+        );
+        assert!(
+            sends
+                .first()
+                .is_some_and(|value| value.1.contains("first original full answer"))
+        );
+        assert!(
+            sends
+                .get(1)
+                .is_some_and(|value| value.1.contains("second original full answer"))
+        );
+        Ok(())
+    }
+    /// Same GUI runner/edit/persistence path, then the same original callback
+    /// and TaskRuntime notification ledger. Route settings are an offline
+    /// transport fixture; the original journal alone owns admitted targets.
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn edited_definition_reopens_without_retargeting_original_occurrence_receipt()
+    -> anyhow::Result<()> {
+        use crate::tasks::task_runtime::weixin_delivery::WeixinDeliveryTarget;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct DefinitionRoutes {
+            routes: std::sync::Mutex<std::collections::HashMap<String, WeixinDeliveryTarget>>,
+            freeze_calls: AtomicUsize,
+            sends: std::sync::Mutex<Vec<(WeixinDeliveryTarget, String, String)>>,
+        }
+        impl WeixinCronDelivery for DefinitionRoutes {
+            fn freeze_target<'a>(
+                &'a self,
+                invocation: &'a SchedulerInvocation,
+                _workspace_id: &'a str,
+            ) -> futures::future::BoxFuture<'a, Result<Option<WeixinDeliveryTarget>, String>>
+            {
+                Box::pin(async move {
+                    self.freeze_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(self
+                        .routes
+                        .lock()
+                        .map_err(|_| "route fixture poisoned".to_string())?
+                        .get(&invocation.task.definition_id)
+                        .cloned())
+                })
+            }
+            fn send<'a>(
+                &'a self,
+                target: &'a WeixinDeliveryTarget,
+                message_id: &'a str,
+                text: &'a str,
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<echo_agent::channels::weixin::WeixinSendOutcome, String>,
+            > {
+                Box::pin(async move {
+                    self.sends
+                        .lock()
+                        .map_err(|_| "send fixture poisoned".to_string())?
+                        .push((target.clone(), message_id.into(), text.into()));
+                    Ok(echo_agent::channels::weixin::WeixinSendOutcome::Accepted {
+                        client_id: message_id.into(),
+                        message_id: Some(format!("accepted-{message_id}")),
+                    })
+                })
+            }
+        }
+        fn callback(
+            store: Arc<TaskRuntimeStore>,
+            model: Arc<MockLlmClient>,
+            sender: Arc<DefinitionRoutes>,
+            captured: Arc<std::sync::Mutex<Vec<SchedulerInvocation>>>,
+        ) -> anyhow::Result<OccurrenceFireFn> {
+            let agent = AgentHandle::new(
+                ReactAgentBuilder::new()
+                    .llm_client(model)
+                    .system_prompt("offline persisted definition route")
+                    .build()?,
+            );
+            let original = build_occurrence_fire_fn_with_weixin(
+                agent,
+                Some(store),
+                None,
+                None,
+                None,
+                Some(sender),
+            );
+            Ok(Arc::new(move |invocation| {
+                let captured = captured.clone();
+                let original = original.clone();
+                Box::pin(async move {
+                    captured
+                        .lock()
+                        .map_err(|_| {
+                            echo_agent::error::ReactError::Other(
+                                "invocation observer poisoned".into(),
+                            )
+                        })?
+                        .push(invocation.clone());
+                    original(invocation).await
+                })
+            }))
+        }
+        fn route(
+            definition: &str,
+            account: &str,
+            generation: &str,
+            peer: &str,
+        ) -> WeixinDeliveryTarget {
+            WeixinDeliveryTarget {
+                definition_id: definition.into(),
+                account_id: account.into(),
+                credential_generation: generation.into(),
+                peer_id: peer.into(),
+                context_ref: format!("original-context-{peer}"),
+                workspace_id: "global".into(),
+                channel_conversation: format!("original-direct-{peer}"),
+            }
+        }
+        let root = tempfile::tempdir()?;
+        let tasks_path = root.path().join("tasks.json");
+        let runtime_path = root.path().join("runs");
+        let model = Arc::new(
+            MockLlmClient::new()
+                .with_responses(["original pre-edit answer", "original post-edit answer"]),
+        );
+        let sender = Arc::new(DefinitionRoutes {
+            routes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            freeze_calls: AtomicUsize::new(0),
+            sends: std::sync::Mutex::new(Vec::new()),
+        });
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (old_invocation, old_identity, original_route, edited_definition) = {
+            let store = Arc::new(TaskRuntimeStore::open_for_workspace(
+                &runtime_path,
+                "global",
+            )?);
+            let resources = store.test_resource_scope();
+            let runner = FrameworkSchedulerRunner::new_with_occurrence_context(
+                CronTaskStore::new().with_path(tasks_path.clone()),
+                CancellationToken::new(),
+                callback(
+                    store.clone(),
+                    model.clone(),
+                    sender.clone(),
+                    captured.clone(),
+                )?,
+            )
+            .await?;
+            let mut task = CronTask::new("original route", "0 0 1 1 *", "original pre-edit prompt");
+            task.id = "edited-notification-task".into();
+            runner.add_task(task.clone()).await?;
+            let admitted = runner
+                .list_tasks()
+                .await
+                .into_iter()
+                .find(|value| value.id == task.id)
+                .ok_or_else(|| anyhow::anyhow!("admitted scheduler definition missing"))?;
+            assert!(!admitted.definition_id.trim().is_empty());
+            let original_route = route(
+                &admitted.definition_id,
+                "original-account",
+                "original-generation",
+                "original-peer",
+            );
+            sender
+                .routes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("route fixture poisoned"))?
+                .insert(admitted.definition_id.clone(), original_route.clone());
+            let old_receipt = runner.run_once_with_receipt(&task.id).await?;
+            let old_invocation = captured
+                .lock()
+                .map_err(|_| anyhow::anyhow!("invocation observer poisoned"))?
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("original invocation missing"))?;
+            let old_identity = OccurrenceIdentity::from_scheduler_invocation(
+                store.active_workspace_id(),
+                &old_invocation,
+            );
+            assert_eq!(old_receipt.occurrence.definition_id, admitted.definition_id);
+            assert_eq!(
+                store.frozen_weixin_notification(&old_identity.run_id())?,
+                Some(original_route.clone())
+            );
+            assert!(
+                runner
+                    .set_status(&task.id, echo_agent::scheduler::CronTaskStatus::Disabled)
+                    .await?
+            );
+            assert!(
+                runner
+                    .set_status(&task.id, echo_agent::scheduler::CronTaskStatus::Enabled)
+                    .await?
+            );
+            let current = runner
+                .list_tasks()
+                .await
+                .into_iter()
+                .find(|value| value.id == task.id)
+                .ok_or_else(|| anyhow::anyhow!("enabled scheduler definition missing"))?;
+            assert_eq!(current.definition_id, admitted.definition_id);
+            let edited = runner
+                .edit_task(
+                    current,
+                    echo_agent::scheduler::CronTaskEdit {
+                        name: "edited route".into(),
+                        cron_expr: "0 0 2 1 *".into(),
+                        prompt: "original post-edit prompt".into(),
+                    },
+                )
+                .await?;
+            assert_eq!(edited.id, admitted.id);
+            assert_eq!(edited.created_at, admitted.created_at);
+            assert!(!edited.definition_id.trim().is_empty());
+            assert_ne!(
+                edited.definition_id, admitted.definition_id,
+                "actual content edit owns a new definition revision"
+            );
+            let new_route = route(
+                &edited.definition_id,
+                "new-account",
+                "new-generation",
+                "new-peer",
+            );
+            {
+                let mut routes = sender
+                    .routes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("route fixture poisoned"))?;
+                routes.clear();
+                routes.insert(edited.definition_id.clone(), new_route);
+            }
+            // The exact original TaskRun retains the old route and terminal receipt.
+            assert_eq!(
+                store.frozen_weixin_notification(&old_identity.run_id())?,
+                Some(original_route.clone())
+            );
+            assert_eq!(
+                store
+                    .weixin_notification_status(&old_identity.run_id())?
+                    .and_then(|record| record.outcome),
+                Some(echo_agent::delivery::DeliveryOutcome::Completed)
+            );
+            store.shutdown_run_drivers().await?;
+            drop(runner);
+            drop(store);
+            drop(resources);
+            (old_invocation, old_identity, original_route, edited)
+        };
+        let reopened = Arc::new(TaskRuntimeStore::open_for_workspace(
+            &runtime_path,
+            "global",
+        )?);
+        let _resources = reopened.test_resource_scope();
+        let fire = callback(reopened.clone(), model.clone(), sender.clone(), captured)?;
+        let runner = FrameworkSchedulerRunner::new_with_occurrence_context(
+            CronTaskStore::new().with_path(tasks_path),
+            CancellationToken::new(),
+            fire.clone(),
+        )
+        .await?;
+        let restored = runner
+            .list_tasks()
+            .await
+            .into_iter()
+            .find(|value| value.id == edited_definition.id)
+            .ok_or_else(|| anyhow::anyhow!("edited definition absent after physical reopen"))?;
+        assert_eq!(restored.definition_id, edited_definition.definition_id);
+        assert_eq!(restored.prompt, edited_definition.prompt);
+        let old_before = reopened
+            .get_run_state(&old_identity.run_id())?
+            .ok_or_else(|| anyhow::anyhow!("old run absent"))?;
+        let sends_before = sender
+            .sends
+            .lock()
+            .map_err(|_| anyhow::anyhow!("send fixture poisoned"))?
+            .len();
+        let freezes_before = sender.freeze_calls.load(Ordering::SeqCst);
+        fire(old_invocation).await?;
+        assert_eq!(
+            sender
+                .sends
+                .lock()
+                .map_err(|_| anyhow::anyhow!("send fixture poisoned"))?
+                .len(),
+            sends_before
+        );
+        assert_eq!(
+            sender.freeze_calls.load(Ordering::SeqCst),
+            freezes_before,
+            "old admission never reselects new route"
+        );
+        assert_eq!(
+            model.call_count(),
+            1,
+            "old receipt cannot restart the original prompt"
+        );
+        assert_eq!(
+            reopened.frozen_weixin_notification(&old_identity.run_id())?,
+            Some(original_route.clone())
+        );
+        let old_after = reopened
+            .get_run_state(&old_identity.run_id())?
+            .ok_or_else(|| anyhow::anyhow!("old run lost"))?;
+        assert_eq!(old_after.journal_sequence, old_before.journal_sequence);
+        assert_eq!(old_after.run.status, TaskRunStatus::Completed);
+        let new_receipt = runner.run_once_with_receipt(&restored.id).await?;
+        assert_eq!(new_receipt.occurrence.definition_id, restored.definition_id);
+        assert_ne!(
+            new_receipt.occurrence.occurrence_id,
+            old_identity.occurrence_id
+        );
+        assert_eq!(model.call_count(), 2);
+        assert_eq!(sender.freeze_calls.load(Ordering::SeqCst), 2);
+        let sends = sender
+            .sends
+            .lock()
+            .map_err(|_| anyhow::anyhow!("send fixture poisoned"))?;
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends.first().map(|record| &record.0), Some(&original_route));
+        assert!(
+            sends
+                .first()
+                .is_some_and(|record| record.2.contains("original pre-edit answer"))
+        );
+        let newer = sends
+            .get(1)
+            .ok_or_else(|| anyhow::anyhow!("new definition notification absent"))?;
+        assert_eq!(newer.0.definition_id, restored.definition_id);
+        assert_eq!(newer.0.account_id, "new-account");
+        assert_eq!(newer.0.credential_generation, "new-generation");
+        assert_eq!(newer.0.peer_id, "new-peer");
+        assert!(newer.2.contains("original post-edit answer"));
+        drop(sends);
+        reopened.shutdown_run_drivers().await?;
         Ok(())
     }
 }

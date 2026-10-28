@@ -47,11 +47,22 @@ pub(crate) async fn boxed_project_agent(
 }
 
 impl ProjectAgentAdapter {
+    // 准备投影与实际执行共用同一个 cwd：显式隔离目录优先，其次为原
+    // Agent 配置，再用产品工厂的项目根兜底；不修改共享 Agent 的配置。
+    fn resolve_working_dir(&self, explicit: Option<PathBuf>) -> Option<PathBuf> {
+        explicit
+            // 直接调用原 dyn Agent；Box 自身的 trait 默认 getter 会丢失配置目录。
+            .or_else(|| self.delegate.as_ref().working_dir())
+            .or_else(|| self.default_cwd.clone())
+    }
+
+    fn qualify_invocation(&self, mut invocation: AgentInvocationContext) -> AgentInvocationContext {
+        invocation.working_dir = self.resolve_working_dir(invocation.working_dir);
+        invocation
+    }
+
     async fn prepare(&self, invocation: &AgentInvocationContext) -> Result<()> {
-        let cwd = invocation
-            .working_dir
-            .clone()
-            .or_else(|| self.default_cwd.clone());
+        let cwd = self.resolve_working_dir(invocation.working_dir.clone());
         let state = self.local_state_dir.clone();
         let files = self.files.clone();
         let executor = self.executor.clone();
@@ -102,7 +113,7 @@ impl Agent for ProjectAgentAdapter {
         self.delegate.tool_visibility_policy()
     }
     fn working_dir(&self) -> Option<PathBuf> {
-        self.delegate.working_dir()
+        self.resolve_working_dir(None)
     }
     fn skill_names(&self) -> Vec<String> {
         self.delegate.skill_names()
@@ -143,6 +154,7 @@ impl Agent for ProjectAgentAdapter {
         invocation: AgentInvocationContext,
     ) -> BoxFuture<'a, Result<BoxStream<'a, Result<AgentEvent>>>> {
         Box::pin(async move {
+            let invocation = self.qualify_invocation(invocation);
             self.prepare(&invocation).await?;
             self.delegate
                 .execute_stream_with_invocation_context(task, cancel, invocation)
@@ -167,6 +179,7 @@ impl Agent for ProjectAgentAdapter {
         invocation: AgentInvocationContext,
     ) -> BoxFuture<'a, Result<BoxStream<'a, Result<AgentEvent>>>> {
         Box::pin(async move {
+            let invocation = self.qualify_invocation(invocation);
             self.prepare(&invocation).await?;
             self.delegate
                 .execute_stream_message_with_invocation_context(message, cancel, invocation)
@@ -216,6 +229,7 @@ impl Agent for ProjectAgentAdapter {
         invocation: AgentInvocationContext,
     ) -> BoxFuture<'a, Result<BoxStream<'a, Result<AgentEvent>>>> {
         Box::pin(async move {
+            let invocation = self.qualify_invocation(invocation);
             self.prepare(&invocation).await?;
             self.delegate
                 .chat_stream_message_with_invocation_context(message, cancel, invocation)
@@ -524,6 +538,277 @@ mod tests {
         assert!(!second.contains(&binding.snapshot.method));
         assert_eq!(second.matches("ROLE_BASELINE").count(), 1);
         drop(projection);
+        Ok(())
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ObservedReadonlyInvocation {
+        entry: &'static str,
+        working_dir: Option<PathBuf>,
+        tool_access: Option<echo_agent::tools::ToolAccess>,
+        allowed_tools: Option<std::collections::HashSet<String>>,
+        run_id: Option<String>,
+        policy: Option<echo_agent::tasks::NestedDelegationPolicy>,
+        history: Vec<String>,
+    }
+
+    struct InvocationObservingAgent {
+        working_dir: Option<PathBuf>,
+        observed: Arc<std::sync::Mutex<Vec<ObservedReadonlyInvocation>>>,
+    }
+
+    impl InvocationObservingAgent {
+        fn record(&self, entry: &'static str, invocation: AgentInvocationContext) -> Result<()> {
+            let history = invocation
+                .history
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|message| message.content.as_text_ref().map(str::to_string))
+                .collect();
+            self.observed
+                .lock()
+                .map_err(|error| ReactError::Other(error.to_string()))?
+                .push(ObservedReadonlyInvocation {
+                    entry,
+                    working_dir: invocation.working_dir,
+                    tool_access: invocation.tool_access,
+                    allowed_tools: invocation.allowed_tools,
+                    run_id: invocation
+                        .runtime
+                        .as_ref()
+                        .and_then(|value| value.run_id.clone()),
+                    policy: invocation.runtime.and_then(|value| value.delegation_policy),
+                    history,
+                });
+            Ok(())
+        }
+    }
+
+    impl Agent for InvocationObservingAgent {
+        fn working_dir(&self) -> Option<PathBuf> {
+            self.working_dir.clone()
+        }
+        fn name(&self) -> &str {
+            "invocation-observer"
+        }
+        fn model_name(&self) -> &str {
+            "unused"
+        }
+        fn system_prompt(&self) -> &str {
+            "field-level forwarding probe"
+        }
+        fn execute<'a>(&'a self, _task: &'a str) -> BoxFuture<'a, Result<String>> {
+            Box::pin(async { Err(ReactError::Other("unexpected legacy entry".to_string())) })
+        }
+        fn execute_stream<'a>(
+            &'a self,
+            _task: &'a str,
+        ) -> BoxFuture<'a, Result<BoxStream<'a, Result<AgentEvent>>>> {
+            Box::pin(async {
+                Err(ReactError::Other(
+                    "unexpected legacy stream entry".to_string(),
+                ))
+            })
+        }
+        fn execute_stream_with_invocation_context<'a>(
+            &'a self,
+            _task: &'a str,
+            _cancel: CancellationToken,
+            invocation: AgentInvocationContext,
+        ) -> BoxFuture<'a, Result<BoxStream<'a, Result<AgentEvent>>>> {
+            let observed = self.record("text", invocation);
+            Box::pin(async move {
+                observed?;
+                Ok(futures::stream::empty().boxed())
+            })
+        }
+        fn execute_stream_message_with_invocation_context<'a>(
+            &'a self,
+            _message: Message,
+            _cancel: CancellationToken,
+            invocation: AgentInvocationContext,
+        ) -> BoxFuture<'a, Result<BoxStream<'a, Result<AgentEvent>>>> {
+            let observed = self.record("execute-message", invocation);
+            Box::pin(async move {
+                observed?;
+                Ok(futures::stream::empty().boxed())
+            })
+        }
+        fn chat_stream_message_with_invocation_context<'a>(
+            &'a self,
+            _message: Message,
+            _cancel: CancellationToken,
+            invocation: AgentInvocationContext,
+        ) -> BoxFuture<'a, Result<BoxStream<'a, Result<AgentEvent>>>> {
+            let observed = self.record("chat-message", invocation);
+            Box::pin(async move {
+                observed?;
+                Ok(futures::stream::empty().boxed())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn project_adapter_forwards_readonly_scope_at_all_invocation_entries()
+    -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let initialized = std::process::Command::new("git")
+            .args(["-c", "init.defaultBranch=main", "init", "--quiet"])
+            .arg(temp.path())
+            .output()?;
+        anyhow::ensure!(
+            initialized.status.success(),
+            "test project initialization failed"
+        );
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname=\"adapter-fixture\"\nversion=\"0.0.0\"\n",
+        )?;
+        let (mut adapter, _) = fixture(temp.path(), temp.path().join("state"))?;
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        adapter.delegate = Box::new(InvocationObservingAgent {
+            working_dir: None,
+            observed: observed.clone(),
+        });
+        let policy = echo_agent::tasks::NestedDelegationPolicy {
+            can_spawn_subagents: true,
+            delegate_depth: 1,
+            max_delegate_depth: 3,
+        };
+        let invocation = AgentInvocationContext {
+            tool_access: Some(echo_agent::tools::ToolAccess::ReadOnly),
+            allowed_tools: Some(["read_file".to_string()].into_iter().collect()),
+            history: Some(vec![Message::user("retained history".to_string())]),
+            working_dir: Some(temp.path().to_path_buf()),
+            runtime: Some(echo_agent::tools::ExternalRunContext {
+                run_id: Some("adapter-readonly-run".to_string()),
+                delegation_policy: Some(policy),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let first = adapter
+            .execute_stream_with_invocation_context(
+                "probe",
+                CancellationToken::new(),
+                invocation.clone(),
+            )
+            .await?
+            .collect::<Vec<_>>()
+            .await;
+        let second = adapter
+            .execute_stream_message_with_invocation_context(
+                Message::user("probe".to_string()),
+                CancellationToken::new(),
+                invocation.clone(),
+            )
+            .await?
+            .collect::<Vec<_>>()
+            .await;
+        let third = adapter
+            .chat_stream_message_with_invocation_context(
+                Message::user("probe".to_string()),
+                CancellationToken::new(),
+                invocation,
+            )
+            .await?
+            .collect::<Vec<_>>()
+            .await;
+        assert!(first.is_empty() && second.is_empty() && third.is_empty());
+        let actual = observed
+            .lock()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let expected = ["text", "execute-message", "chat-message"]
+            .into_iter()
+            .map(|entry| ObservedReadonlyInvocation {
+                entry,
+                working_dir: Some(temp.path().to_path_buf()),
+                tool_access: Some(echo_agent::tools::ToolAccess::ReadOnly),
+                allowed_tools: Some(["read_file".to_string()].into_iter().collect()),
+                run_id: Some("adapter-readonly-run".to_string()),
+                policy: Some(policy),
+                history: vec!["retained history".to_string()],
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(*actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_adapter_resolves_actual_cwd_at_all_typed_entries() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let fallback = temp.path().join("fallback");
+        let configured = temp.path().join("configured");
+        let explicit = temp.path().join("explicit");
+        for path in [&fallback, &configured, &explicit] {
+            std::fs::create_dir(path)?;
+            std::fs::write(path.join("Cargo.toml"), "marker")?;
+        }
+        for (requested, delegated, expected) in [
+            (None, None, fallback.clone()),
+            (None, Some(configured.clone()), configured.clone()),
+            (
+                Some(explicit.clone()),
+                Some(configured.clone()),
+                explicit.clone(),
+            ),
+        ] {
+            let (mut adapter, _) = fixture(&fallback, temp.path().join("state"))?;
+            let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            adapter.delegate = Box::new(InvocationObservingAgent {
+                working_dir: delegated.clone(),
+                observed: observed.clone(),
+            });
+            assert_eq!(
+                adapter.working_dir(),
+                delegated.or_else(|| Some(fallback.clone()))
+            );
+            let invocation = AgentInvocationContext {
+                working_dir: requested,
+                ..Default::default()
+            };
+            let first = adapter
+                .execute_stream_with_invocation_context(
+                    "probe",
+                    CancellationToken::new(),
+                    invocation.clone(),
+                )
+                .await?
+                .collect::<Vec<_>>()
+                .await;
+            let second = adapter
+                .execute_stream_message_with_invocation_context(
+                    Message::user("probe".to_string()),
+                    CancellationToken::new(),
+                    invocation.clone(),
+                )
+                .await?
+                .collect::<Vec<_>>()
+                .await;
+            let third = adapter
+                .chat_stream_message_with_invocation_context(
+                    Message::user("probe".to_string()),
+                    CancellationToken::new(),
+                    invocation,
+                )
+                .await?
+                .collect::<Vec<_>>()
+                .await;
+            assert!(first.is_empty() && second.is_empty() && third.is_empty());
+            let actual = observed
+                .lock()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            assert_eq!(actual.len(), 3);
+            for (observation, entry) in
+                actual
+                    .iter()
+                    .zip(["text", "execute-message", "chat-message"])
+            {
+                assert_eq!(observation.entry, entry);
+                assert_eq!(observation.working_dir, Some(expected.clone()));
+            }
+        }
         Ok(())
     }
 }

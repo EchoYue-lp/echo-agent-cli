@@ -836,6 +836,101 @@ describe('taskRuntimeStore conversation loading', () => {
     }
   );
 
+  it.each(['success', 'failure'] as const)(
+    'keeps a captured history visit %s out of a newer A-B-A visit even when A is live chat',
+    async (outcome) => {
+      mocks.latestRunForConversation.mockResolvedValue(run('paused'));
+      mocks.getRun.mockImplementation((_workspace: string, runId: string) =>
+        Promise.resolve({ ...run('paused'), run_id: runId })
+      );
+      useTaskRuntimeStore.getState().bindScope(scope);
+      await useTaskRuntimeStore.getState().loadByConversation(scope.workspaceId, 'conversation-1');
+      await useTaskRuntimeStore.getState().loadByRun(scope, 'run-1');
+      const first = deferred<{ success: boolean; run_id: string }>();
+      const next = deferred<{ success: boolean; run_id: string }>();
+      mocks.pauseRun.mockReturnValueOnce(first.promise).mockReturnValueOnce(next.promise);
+      const oldAction = useTaskRuntimeStore.getState().pause({
+        workspace_id: scope.workspaceId,
+        workspace_generation: scope.workspaceGeneration,
+        run_id: 'run-1',
+      });
+      await useTaskRuntimeStore.getState().loadByRun(scope, 'run-b');
+      await useTaskRuntimeStore.getState().loadByRun(scope, 'run-1');
+      let newSettled = false;
+      const newAction = useTaskRuntimeStore
+        .getState()
+        .pause('run-1')
+        .finally(() => {
+          newSettled = true;
+        });
+      const calls = mocks.getRun.mock.calls.length;
+      if (outcome === 'success') first.resolve({ success: true, run_id: 'run-1' });
+      else first.reject(new Error('OLD_VISIT_FAILURE'));
+      await oldAction;
+      expect(useTaskRuntimeStore.getState().error).toBeNull();
+      expect(useTaskRuntimeStore.getState().historySnapshot?.error).toBeNull();
+      expect(mocks.getRun).toHaveBeenCalledTimes(calls);
+      expect(newSettled).toBe(false);
+      expect(taskRuntimePresentation(useTaskRuntimeStore.getState()).activeRun?.run_id).toBe(
+        'run-1'
+      );
+      next.resolve({ success: true, run_id: 'run-1' });
+      await newAction;
+      expect(newSettled).toBe(true);
+      expect(useTaskRuntimeStore.getState().error).toBeNull();
+    }
+  );
+
+  it('keeps an accepted canonical Goal receipt after a same-run history revisit', async () => {
+    const original = run('paused');
+    const revised = {
+      ...original,
+      goal: '用户规范新目标',
+      goal_revision: 2,
+      goal_sha256: 'goal-2',
+    };
+    mocks.latestRunForConversation.mockResolvedValue(original);
+    mocks.getRun.mockImplementation((_workspace: string, runId: string) =>
+      Promise.resolve({ ...original, run_id: runId })
+    );
+    useTaskRuntimeStore.getState().bindScope(scope);
+    await useTaskRuntimeStore.getState().loadByConversation(scope.workspaceId, 'conversation-1');
+    await useTaskRuntimeStore.getState().loadByRun(scope, 'run-1');
+    const committed = deferred<TaskRun>();
+    mocks.updateGoal.mockReturnValueOnce(committed.promise);
+    const action = useTaskRuntimeStore
+      .getState()
+      .updateGoal('run-1', 1, revised.goal, '用户明确修改');
+    await useTaskRuntimeStore.getState().loadByRun(scope, 'run-b');
+    await useTaskRuntimeStore.getState().loadByRun(scope, 'run-1');
+    mocks.getRun.mockResolvedValue(revised);
+    mocks.getCompletionGate.mockResolvedValue({
+      run_id: revised.run_id,
+      goal_revision: 2,
+      plan_revision: 0,
+      ready: false,
+      requirements: [],
+      blockers: [],
+    });
+    committed.resolve(revised);
+    await expect(action).resolves.toBe(true);
+    expect(useTaskRuntimeStore.getState().activeRun).toEqual(revised);
+    expect(taskRuntimePresentation(useTaskRuntimeStore.getState()).activeRun).toEqual(revised);
+    expect(useTaskRuntimeStore.getState().historySnapshot?.activeRun).toEqual(revised);
+  });
+
+  it('does not retire a pending inventory read when next page has no continuation', async () => {
+    const page = deferred<TaskRunPage>();
+    mocks.listRuns.mockReturnValueOnce(page.promise);
+    const pending = useTaskRuntimeStore.getState().loadRuns(scope, ['completed']);
+    await useTaskRuntimeStore.getState().loadRuns(scope, [], true);
+    page.resolve({ items: [run('completed')], next_continuation: null });
+    await pending;
+    expect(useTaskRuntimeStore.getState().loadingRuns).toBe(false);
+    expect(useTaskRuntimeStore.getState().runPage).toHaveLength(1);
+    expect(useTaskRuntimeStore.getState().runStatuses).toEqual(['completed']);
+  });
+
   it('loads an exact historical run without asking for the newer run in its conversation', async () => {
     mocks.getRun.mockResolvedValue(run('completed'));
     mocks.latestRunForConversation.mockResolvedValue({ ...run('running'), run_id: 'newer-run' });

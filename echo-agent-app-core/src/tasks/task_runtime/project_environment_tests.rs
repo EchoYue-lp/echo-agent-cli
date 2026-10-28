@@ -793,3 +793,71 @@ async fn cancelled_scoped_cell_retains_original_guard_until_physical_receipt()
     assert_eq!(drops.load(std::sync::atomic::Ordering::Acquire), 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn gui_local_git_uses_native_process_but_automatic_git_keeps_project_executor()
+-> std::result::Result<(), String> {
+    let fixture = EnvironmentFixture::new()?;
+    let store = TaskRuntimeStore::open_for_workspace(&fixture.data_root, "workspace")
+        .map_err(|error| error.to_string())?;
+    store
+        .bind_project_environment(
+            "workspace",
+            crate::workspace::ProjectLocation::Local {
+                path: fixture.visible_root.clone(),
+            },
+            1,
+            fixture.files.clone(),
+            fixture.executor.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+    let version = store
+        .project_run_git(&fixture.visible_root, &["--version"])
+        .map_err(|error| error.to_string())?;
+    assert!(version.starts_with("git version "));
+    assert!(
+        fixture
+            .calls
+            .lock()
+            .map_err(|error| error.to_string())?
+            .is_empty()
+    );
+    let environment = store
+        .project_environment()
+        .ok_or_else(|| "original project environment missing".to_string())?;
+    super::worktree::run_git_in_environment(
+        &fixture.visible_root,
+        &["--version"],
+        Some(&environment),
+    )
+    .map_err(|error| error.to_string())?;
+    assert_eq!(
+        fixture
+            .calls
+            .lock()
+            .map_err(|error| error.to_string())?
+            .as_slice(),
+        &[fixture.visible_root.clone()]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn gui_ssh_git_keeps_original_project_executor_without_local_fallback()
+-> std::result::Result<(), String> {
+    let fixture = EnvironmentFixture::new()?;
+    let store = fixture.open("original.invalid", 1)?;
+    let version = store
+        .project_run_git(&fixture.visible_root, &["--version"])
+        .map_err(|error| error.to_string())?;
+    assert!(version.starts_with("git version "));
+    assert_eq!(
+        fixture
+            .calls
+            .lock()
+            .map_err(|error| error.to_string())?
+            .as_slice(),
+        &[fixture.visible_root.clone()]
+    );
+    Ok(())
+}

@@ -4,6 +4,14 @@
 
 已采纳
 
+## 独立分叉连接与验证后转移（2026-10-27）
+
+回复分叉的来源与目标是两个物理 ProjectSshConnection，各持独立认证 PTY 与私有 control socket。来源连接仅供原项目 Git 操作；目标复用原 GUI 掩码认证建立独立 draft，不收集聊天中的密码，不把来源 Arc 双登记为目标。
+
+认证/目录核验与真正的 owner 转移之间可能有等待。原 reassign_project_ssh_checked 在现有 project creation lock 内核验刚才实际验证的 Arc，拒绝被替换的 draft 与同 Arc 双登记；创建和重连仍走原生命周期，不新增 SSH store 或退出 owner。物理 generation 是原连接的 opaque 身份，不能从 workspace 键名重建。转移前失败不得迁走或关闭来源。
+
+本机 owner/准入对照不证明真实 SSH 或 PTY。原 echo 账号支持义务、ubuntu 账号已确认的认证/目录/侧栏事实，以及中文、resize、全屏、Ctrl-C、exit、断线、关闭、多会话和双方任一关闭的原生矩阵继续分别验收；不借一项通过替代其余场景。当前代码/集成/原生的实际验证单独记录。
+
 ## 背景
 
 已批准 Plan06（plan:08c22af5-243e-4460-a70c-2c5e2ec186b6，SHA 7f0a96b913a019d2623283ea711f89a93daa2d60a1e86b4635f72797081624c0）从 EKO 2b52251 与框架 e4e5039 接续。现有 TerminalService 已拥有 PTY，但 GUI 先 create 后监听、切 tab/隐藏卸载、逐块解码 UTF-8，close 仅调用 clone_killer 后立刻移除。portable-pty 0.9.0 的 Unix clone_killer 只发 SIGHUP；原 Child::kill 才有 HUP 宽限后强终止，且仍需原 wait 与 reader join。
@@ -21,6 +29,8 @@
 创建仅有既有 create 一步：target 为 local 或结构化 ssh（host/alias、可选 user/port），参数直接给系统 ssh，不经 shell 拼接、不覆盖用户未填写的配置、不添加弱化 host-key 的参数。程序缺失明确失败，不回退本地 shell。产品不保存凭据，也不硬编码验收服务器；启动仅证明本地进程已启动。
 
 每个 tab 先挂载 xterm、输出/退出/缺口观察及有界串行写队列，ready 后才 create。所有 tab 跨切换和隐藏持续挂载。PTY raw Uint8Array 直接交 xterm，其写回调释放在途预算；输入同样串行且有界。真实广播 lag/队列溢出可见，不伪称完整历史或 VT 重放。每个异步 setup 步骤检查取消并清理自己的实例；已发出的 create 保留原 Promise，取消后精确补偿 close，失败保留可重试 tab。
+
+原共享 `TerminalSession::prepare` 为交互 PTY 子进程设置 `TERM=xterm-256color`，匹配前端 xterm；本地与既有 SSH launch 共用这一装配，不继承启动宿主的 `TERM=dumb` 作为终端能力。设置只作用于该子进程，不改全局环境、shell 配置、连接或 operation owner；`COLORTERM` 继续继承。源码修复、原 TerminalService 集成回归及修后 App／真实 SSH 验收分别记录。
 
 原 Session 保存原 Child、输出 reader 的 JoinHandle 和一个结算任务句柄。关闭设置原会话请求，结算任务使用原 Child::kill/try_wait/wait 并实际 join 原 reader，全部证明后才按实例身份移除并发布一次退出。调用者只借用等待句柄；取消或有界观察超时不 abort 原结算、不取走活句柄。kill/wait/reader 失败保留原资源和目标供重试，不能发正常 Closed。不可恢复的 reader 错误不得靠重试抹掉。直接 child 回收不表示进程组或远端副作用全部停止。
 
