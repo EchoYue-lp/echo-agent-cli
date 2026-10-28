@@ -5,7 +5,7 @@ kind: evidence
 observed_at: source:513d810144fb2c3348549b4734c9ae9275edd7cfbe1c152419b76db135f871f3
 source_refs:
 - echo-agent-app-core/src/conversation_projection.rs
-- echo-agent-app-core/src/legacy_eko_history.rs
+- docs/zh/adr/0057-native-messages-and-progress-policy.md
 - echo-agent-app-core/src/prepared_turn.rs
 - echo-agent-app-core/src/prepared_turn/provenance.rs
 - echo-agent-app-core/src/tasks/task_runtime/history_projection.rs
@@ -20,7 +20,6 @@ source_refs:
 - web-frontend/src/stores/subagentRunStore.ts
 - docs/zh/adr/0045-managed-conversation-lifecycle.md
 - docs/zh/adr/0055-project-workspaces.md
-- docs/zh/adr/0057-native-messages-and-progress-policy.md
 - docs/zh/adr/0060-subagent-native-observations.md
 - docs/zh/guides/task-run-history.md
 supports:
@@ -90,3 +89,16 @@ Rust/native绿。未把旧command_results复制成新执行，也没有新增sce
 Root原Goal及Plan09/10、当前retention先RED后GREEN、最终锁/风险、SDK正式new Git pin/
 source402、native/手机/SSH/mainCI/发布均另取真实后继结果。本次不运行Cargo、模型、Host或
 项目脚本，不修工具/schema/exclude，不清原失败。
+
+
+## 2026-10-29：退役后的前置路径导航维护
+
+本节只维护结构化源码/消费者引用的导航，不重新观察或续期旧运行资格。原观察 `source:513d810144fb2c3348549b4734c9ae9275edd7cfbe1c152419b76db135f871f3`、上文历史原件、失败与限制、原 command/scenario/after revision 均保持原范围；本节不新增 matched、状态或 owner。
+
+| 原历史路径 | 当前实现或退役决定导航 |
+| --- | --- |
+| `echo-agent-app-core/src/legacy_eko_history.rs` | `docs/zh/adr/0057-native-messages-and-progress-policy.md` |
+
+旧路径身份与退出范围由既有退役资产/Finding和正式ADR0050/0057保留；源码历史可在 `d17f88614b626d32a6176491b3bc60c92a84287f` 及后继具名Git保存点回读。新导航只指向现存原接管实现或退出决定，不能把旧observed_at解释成这些路径当时已经运行通过。unknown/needs_review、原动态/native/风险缺口不清；本候选没有执行Cargo或官方新Task校验，采用与真实来源绑定由EKO唯一writer按正常新Task合同完成。
+
+上文legacy getter返回Unknown的逐路径行属于原source513d历史观察；该模块现已按NoCompat退出，仅从本次前置导航清单撤去，不宣称旧来源恢复已由其它projector替代或通过。

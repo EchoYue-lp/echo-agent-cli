@@ -9,7 +9,7 @@ source_refs:
 - echo-agent-app-core/src/channel_runtime/outbound.rs
 - echo-agent-app-core/src/channel_runtime/tool_render.rs
 - echo-agent-app-core/Cargo.toml
-- src/cli/channels.rs
+- docs/zh/adr/0050-gui-product-convergence.md
 - Cargo.toml
 - docs/en/adr/0053-im-cron-gui-control.md
 - docs/zh/adr/0053-im-cron-gui-control.md
@@ -53,3 +53,14 @@ Actual normalized source checks (not runtime):
 - `echo-agent-app-core/src/channel_runtime/input_pump.rs` SHA `d8a58311575fda50780857e4f352b10e52c6d3cabe22b112d52d08c81163d593` exactly equals the original helper after the documented crate-path rewrite and Rust formatting.
 - `echo-agent-app-core/src/channel_runtime/outbound.rs` SHA `3ca258d1d550c45d960c61f05adcb71606ad995925b3979373ca206aca8519f8` exactly equals the original helper after the documented crate-path rewrite and Rust formatting.
 - `echo-agent-app-core/src/channel_runtime/tool_render.rs` SHA `1140303c8d3a2e5274464cbfb54dc282bf6136bcbfe97d22cf71c2270f2274c9` exactly equals the original helper after the documented crate-path rewrite and Rust formatting.
+
+
+## 2026-10-29：退役后的前置路径导航维护
+
+本节只维护结构化源码/消费者引用的导航，不重新观察或续期旧运行资格。原观察 `source:4726a37cc1350e66b30b281fd02e16cdd087cd7f44b58b28a0ba6ab09bfa0d46`、上文历史原件、失败与限制、原 command/scenario/after revision 均保持原范围；本节不新增 matched、状态或 owner。
+
+| 原历史路径 | 当前实现或退役决定导航 |
+| --- | --- |
+| `src/cli/channels.rs` | `docs/zh/adr/0050-gui-product-convergence.md` |
+
+旧路径身份与退出范围由既有退役资产/Finding和正式ADR0050/0057保留；源码历史可在 `pre-retirement-2026-10-24` 及后继具名Git保存点回读。新导航只指向现存原接管实现或退出决定，不能把旧observed_at解释成这些路径当时已经运行通过。unknown/needs_review、原动态/native/风险缺口不清；本候选没有执行Cargo或官方新Task校验，采用与真实来源绑定由EKO唯一writer按正常新Task合同完成。

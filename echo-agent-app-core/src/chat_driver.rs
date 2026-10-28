@@ -2635,7 +2635,8 @@ mod tests {
         use crate::tasks::task_runtime::{RunInputSnapshot, RuntimeEventKind, TaskRuntimeStore};
         use std::sync::Arc;
         let directory = tempfile::tempdir()?;
-        let task_root = directory.path().join("tasks");
+        // 与真实工作区共用 host artifact 根，保持长 Goal 与输入 spill 的读取合同。
+        let task_root = crate::workspace::layout::WorkspaceLayout::tasks(directory.path());
         let store = Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
             &task_root,
         )?);
@@ -2686,7 +2687,9 @@ mod tests {
             crate::prepared_turn::PreparedUserTurn::build(crate::prepared_turn::UserTurnInput {
                 text: &text,
                 attachments: &[],
-                spill_dir: &directory.path().join("spill"),
+                spill_dir: &crate::workspace::layout::WorkspaceLayout::user_input_artifacts(
+                    directory.path(),
+                ),
                 conversation_id: Some(&address.conversation_id),
                 turn_id: Some(turn_id),
             })?;
@@ -2696,8 +2699,14 @@ mod tests {
         let react_agent = echo_agent::agent::ReactAgentBuilder::new()
             .model("source-admission")
             .llm_client(llm.clone())
+            .tool_output_artifacts(crate::infra::tool_output_artifact_config(Some(
+                directory.path(),
+            )))
             .tool(Box::new(
                 echo_agent::tools::files::files::ReadFileTool::new(),
+            ))
+            .tool(Box::new(
+                echo_agent::tools::files::artifact::ReadArtifactTool,
             ))
             .build()?;
         react_agent.set_pre_model_context_projector(Some(Arc::new(
@@ -2707,12 +2716,13 @@ mod tests {
             ),
         )));
         let agent = AgentHandle::new(react_agent);
+        let sink = Arc::new(MockChatSink::default());
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
             workspace_io_receipt: None,
             pool: None,
             store: Some(store.clone()),
-            sink: Arc::new(MockChatSink::default()),
+            sink: sink.clone(),
             webhook_emitter: None,
             conv_id: Some(address.conversation_id.clone()),
             root_message_id: turn_id.into(),
@@ -2752,7 +2762,15 @@ mod tests {
         let outcome = driven.map_err(|error| anyhow::anyhow!(error.to_string()))?;
         idle?;
         service.settle_attempt(&attempt, &outcome.outcome).await?;
-        assert!(matches!(outcome.outcome, TurnOutcome::Completed));
+        assert!(
+            matches!(outcome.outcome, TurnOutcome::Completed),
+            "original driver receipt={outcome:?}; model_calls={}; native_events={:?}",
+            llm.call_count(),
+            sink.events
+                .lock()
+                .map_err(|_| anyhow::anyhow!("original native event record lock poisoned"))?
+                .as_slice(),
+        );
         assert!(llm.call_count() > 0);
         let events = store.list_events(&run_id, 0)?;
         assert_eq!(

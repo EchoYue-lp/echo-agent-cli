@@ -340,3 +340,38 @@ Executed final Project855 qualification: all six original Python methods natural
 fresh实际锁与registry-origin两报告均0漏洞、恰5项unmaintained+1项unsound，原六完整身份新增0/缺失0/变化0，scanner自然1原样保留；原HTTPS I/O和首次本地镜像HEAD失败不重标通过，后继由官方同一RustSec仓SSH真实fresh至3279c99911354c400e1d41e47c7d60e39258b147，再由各scanner实际fetch进程级同源镜像，不关闭fetch/yanked或加ignore。最终正式原adapter的两次gate及原六Python方法需执行后才有资格，用户同意本身不冒验证。原Python测试仅855人口改856、854负控改855，六方法及所有负断言保持，未改checker/threshold或放宽身份。
 
 扫描/完整身份比较/当前源恢复包及用户原答复位于根`.echo-semantic/local/dependency-reassessment-exact-facts-20261027/`；本次最终consumer与policy/正式gate回执位于本仓`.echo-semantic/local/i1-goal-runtime-integration-20261027/risk-maintenance/`。1797构建输入测试证据仍绑定原policy03cf，不把本policy增量冒充原构建整树无漂移；行为34测试和两示例/fmt单列，完整Rust/native/mainCI未由风险复评取得。
+
+## 2026-10-29 F15后继指定273输入的原五身份子集复评候选
+
+原用户本轮授权原话“继续保留原六个依赖，完成本次修复和验证（推荐）”和原六项policy/全部失败保持。当前不是用户新批准五项；Root明确要求在本轮既有授权内按实际退役和新consumer源码复评：bincode1.3.3随独立终端/syntect闭包移除，剩余五项的name/version/source/checksum/advisory/kind与原六项完全相同。无新增risk、ignore、版本或来源接受，不扩展未来迭代、Framework或SDK。
+
+本候选仅绑定Root指定`eko-appcore-fixture-resume-20261029/gui3-final-source-freeze.json`的273个consumer输入，摘要`d027ea4999a8bcbdc8d6262d4cfdd64f4669565135547e2b0e540e0baa01af9e`；freeze SHA为`20dc7b2019f78f2bfd5a3b8fbfcfbbedabab8d34b29e6afb13a8e5a3194fcb96`，其中292构建来源＋14元数据共306项已核回。CLI锁为`399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`（768包）。不引用旧7659、89c7、2dc13或6a17票作为当前新资格。
+
+完整321→273暴露复查以原89c7准确快照为基础。Root逐次转交的89c7→2dc13 prepared_turn类型修正、2dc13→6a17 chat_driver hostArtifact/layout正控及诊断都保完整diff和历史票，生产依赖暴露不变仍精确重绑。**本次6a17→d027是实际生产变化，已重新读源码复评**：仅`validated_reply_fork_publication_events`和`validate_reply_fork_publication`两函数删除无native信息时的成功早退，其余原publication selector/owner/FinalAnswer/真实Settled/正文/双序号/checksum和错误传播原样。无native信息现在沿原selector的None转Validation拒绝；原query的无native快速返回没有启动新I/O，更未引入工具/模型/通知调用。没有新增平台桥、依赖边或完整风险身份，现有GTK/D-Bus来源链仍在。另两文件只含cfg(test)透明future转发和重复测试去重，普通history测试构造glue也仅cfg(test)，没有借增栈/预算/断言放宽处理。所有差异已具名保存，不能把Root摘要或旧6a票替代这次复查。
+
+GUI47 distinct的实际行为证据和current official source0按原owner回执独立保存；GUI3三项已在25项组内不重复计票，原quiet性能ignored不算通过。EKO后继非Rust doc-index变动不在原consumer keyset内，仍以实际两读确认摘要相等并单独记录元数据漂移，不用“只是文档”来跳源码/提交门禁。本policy候选是当前d027输入的可审最终收紧提案，正式采用及fresh actual/canonical仍须Root批准和唯一writer正常门禁；再有任何consumer/source改动一律重新拒绝与复核。
+
+原321源码由原本地Git提交0ebd8984的逐文件blob重算，准确得到原d38f摘要；对当前指定273输入的实际比较为新增5、删除53、修改58、同字节210。逐个新增/修改的source行为、manifest与平台native调用复查见所属ADR和本线证据；删除的是批准的独立CLI/TUI/HITL入口，保GUI/IM/cron/PTY/Fork及当前恢复。
+
+锁fresh对照856→768，新增包0/移除88、共同身份version/source/checksum变化0；共同resolved边新增0/移除24。根Cargo移除16项终端依赖，保留依赖的参数不变；default由tui转gui是产品入口收敛，明确承认桌面GUI现为默认，不能据“包更少”声称平台暴露消失。保留GTK/glib、gtk3-macros/proc-macro-error及通知zbus/zvariant三项闭包；原notification IPC发送、插件注册和menu/tray仍真实可用。源码检查没有新增这些风险API直接调用或锁内依赖边，但不宣称transitive native调用安全或不可达。
+
+上游11份缓存crate归档均按当前锁checksum核验，实际读的manifest/关键source与归档字节一致；来源链和target/feature规则具名记录。app-core批次不运行GTK/D-Bus，不能代替rootGUI、Linux/BSD/macOS平台测试；glib VariantStrIter unsound及维护性风险不叫已修复。
+
+checker采用已审固定five和完整warning集合校验，少项/加项/重复/4或6集合、身份/settings/漏洞/yanked/扫描错误继续拒绝。旧真实raw逐warning缺失的RED和旧6＋新2＋raw4 GREEN原件保持；本273隔离候选的原六＋新增两方法、捕获raw四控制均自然0。raw来自前次官方actual/canonical扫描，其自然1/零漏洞/严格五warning原样保留；本次没有fresh scanner，也没有正式原gate。候选票不能冒最终actual/canonical门禁通过。
+
+唯一EKO writer只能在真实reader安全点按准确base正常预检采用；Root/owner在必要Rust验证结束、最终source稳定后另排原actual-lock和canonical-origin gate。source/consumer变化先复查与机械精确绑定；依赖身份或风险/范围新增则交Root保持阻塞，不自动接受。无正式policy/checker/source/AGENTS写入，无scanner/filter/ignore/globalGit改动，无stage/commit；完整Goal、原native验收和性能仍未由本候选取得资格。
+
+
+### 2026-10-29 当前绑定的真实门禁结果
+
+前文“候选／待正式采用及 fresh 扫描”记录保留为本次审查准备阶段的原件，本后继段记录当前实际采用与验证，不改原人类六项接受原话、候选暴露复查、旧失败或完整身份。原六项减去退役 bincode1.3.3 的五身份严格子集已经由唯一 EKO writer 在正常当前 Task 下正式采用；policy SHA 为 `5cfcbd288da8ca059d70e4a9599dd13cce643ea685d81e4839dff898688732b6`。
+
+原 actual-lock caller 于 2026-10-29 04:00:29＋08:00 启动，canonical-origin caller 于 04:02:07＋08:00 启动，均真实采用默认 fresh fetch。两个官方 scanner 自然退出均为 1，完整 raw 和 stderr 原样保留；两个独立精确 gate/caller 实际均退出 0。两报告均为零漏洞、4 项 unmaintained 和 1 项 unsound，完整五身份、类别和 settings 与当前原接受合同精确相同；这不是零 warning 审计、风险修复或新增人类五项接受。
+
+两次调用前后当前 316 项源码／元数据无漂移，collector 的 273 输入两读均为 `d027ea4999a8bcbdc8d6262d4cfdd64f4669565135547e2b0e540e0baa01af9e`，实际构建锁仍为 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`、768 包。canonical 沿原 Framework helper（SHA `498670e5a346eac600eb1540bd392ef68fb3b475af51c750e4eecd9a0a300667`）生成独立审计锁，SHA `f6f52503a2de104add23c857ebd776eb060ddc18dca49d9ff19fc0f34e9e6b6d`；没有覆盖实际构建锁或修改依赖。
+
+官方数据库报告为 commit `40f5be6fb12ed93fc591bf4ab23b7d793b3f2239`、1381 条 advisory。实际 fetch 将原 DB 从 `99670cfc0bc574433034b75876a4b791ccaa2efb` 更新到该 commit，canonical 的后继 fetch 时间也实际推进。DB 前／间／后 tracked blob 与模式均逐项核回；原六份未跟踪 RUSTSEC-0000 草稿状态原样保留并分别记录，没有擅删、忽略它们或声称 clean DB。没有新增 no-fetch、ignore、filter、URL 或全局 Git 配置。
+
+原 actual/canonical `.audit.json`、`.audit.stderr`、`.gate.json`、`.caller-run.json`，以及 DB 三个状态快照和实核汇总，均保存在 CLI 仓内 `.echo-semantic/local/eko-appcore-fixture-resume-20261029/fresh-exact5-gates-20261029/`。Root 的独立 raw／gate／输入复核保存在顶层 `.echo-semantic/local/controlled-goal-resume-20261029/root-cli-fresh5-gates-readback.json`。官方自然 1 与精确 gate 0 分列，不用旧 raw 或合同控制测试替代本次 fresh 执行。
+
+本后继事实只覆盖当前精确 consumer／lock／完整五身份和设置。任何后继源码、锁、consumer、身份、advisory、漏洞或 settings 变化仍先拒绝并复核，不给未来来源永久签票，也不向 Framework／SDK 继承；Rust、文档、原生、全矩阵、SDK 来源、main CI、发布与完整 Goal 仍分别验收。此次只追加非 consumer 采用／扫描事实，不重复 Rust／GUI／前端验证。

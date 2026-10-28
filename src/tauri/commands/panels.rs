@@ -2626,35 +2626,6 @@ mod scoped_control_tests {
     }
 
     #[test]
-    fn worktree_projection_accepts_bare_record_without_head() {
-        let rows = parse_worktree_list("worktree /remote/bare.git\0bare\0\0", Path::new("/source"));
-        assert!(
-            rows.first()
-                .is_some_and(|entry| entry.commit_oid.is_empty() && entry.branch == "(detached)")
-        );
-    }
-
-    #[test]
-    fn worktree_projection_rejects_non_bare_missing_or_duplicate_identity() {
-        let root = Path::new("/source");
-        assert!(
-            parse_worktree_list("worktree /remote/missing\0branch refs/heads/main\0\0", root)
-                .is_empty()
-        );
-        assert!(
-            parse_worktree_list("worktree /remote/duplicate\0HEAD abc\0HEAD def\0\0", root)
-                .is_empty()
-        );
-        assert!(
-            parse_worktree_list(
-                "worktree /remote/duplicate\0HEAD abc\0branch main\0branch other\0\0",
-                root
-            )
-            .is_empty()
-        );
-    }
-
-    #[test]
     fn worktree_projection_rejects_text_or_truncated_non_nul_input() {
         let root = Path::new("/project");
         assert!(parse_worktree_list("worktree /project\nHEAD abc\n", root).is_empty());

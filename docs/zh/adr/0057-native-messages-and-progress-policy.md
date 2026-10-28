@@ -73,6 +73,10 @@ None、Some(empty)、未批准/未发布的块和无工具无 status 的 Unknown
 机制、store、执行器或结束权威。
 
 
+## 2026-10-29：Fork 最终许可的统一验证
+
+Reply Fork 的入口许可与 publication 事件读取统一使用既有原消息校验，不再保留无 native 字段即可成功的分支。Framework 的 String 输入及非流式传输能力继续保留；它们通过原 ReAct／driver 产生的同 owner 原生发布事实参与校验，不以纯文本、Candidate 或 cron Run journal 推导最终成功。完整正文、FinalAnswer、实际 Settled、身份和双序号门槛保持不变。
+
 ## 已退役决定：旧控制来源 getter（2026-10-28用户NoCompat裁决）
 
 本节原兼容方案已由用户亲编总Goal取消，原实施与测试回执只保历史切点，不算当前版本通过。

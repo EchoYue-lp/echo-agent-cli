@@ -20,7 +20,7 @@ POLICY = json.loads(gate.POLICY_PATH.read_text())
 
 def report_for(risks: list[dict]) -> dict:
     report = {
-        "database": {"advisory-count": 1}, "lockfile": {"dependency-count": 856},
+        "database": {"advisory-count": 1}, "lockfile": {"dependency-count": 768},
         "settings": {"target_arch": [], "target_os": [], "severity": None, "ignore": [],
                      "informational_warnings": ["unmaintained", "unsound", "notice"]},
         "vulnerabilities": {"found": False, "count": 0, "list": []}, "warnings": {},
@@ -35,10 +35,11 @@ def report_for(risks: list[dict]) -> dict:
 
 
 class AcceptedRiskTests(unittest.TestCase):
-    def test_exact_six_and_clean_official_results(self):
-        self.assertEqual(len(gate.verify_report(report_for(POLICY["accepted"]), 1, POLICY, 856)), 6)
-        self.assertEqual(gate.verify_report(report_for([]), 0, POLICY, 856), [])
-        self.assertEqual(len(gate.verify_inputs(gate.ROOT, POLICY)), 856)
+    def test_exact_five_and_clean_official_results(self):
+        self.assertEqual(len(gate.verify_report(report_for(POLICY["accepted"]), 1, POLICY, 768)), 5)
+        with self.assertRaises(ValueError):
+            gate.verify_report(report_for([]), 0, POLICY, 768)
+        self.assertEqual(len(gate.verify_inputs(gate.ROOT, POLICY)), 768)
 
     def test_added_advisory_and_changed_identity_never_inherit_acceptance(self):
         for field in (*gate.IDENTITY_FIELDS, "advisory", "kind"):
@@ -46,13 +47,13 @@ class AcceptedRiskTests(unittest.TestCase):
                 risks = copy.deepcopy(POLICY["accepted"])
                 risks[0][field] += "-changed"
                 with self.assertRaises(ValueError):
-                    gate.verify_report(report_for(risks), 1, POLICY, 856)
+                    gate.verify_report(report_for(risks), 1, POLICY, 768)
         report = report_for(POLICY["accepted"])
         extra = copy.deepcopy(report["warnings"]["unsound"][0])
         extra["advisory"]["id"] = "RUSTSEC-2099-0001"
         report["warnings"]["unsound"].append(extra)
         with self.assertRaises(ValueError):
-            gate.verify_report(report, 1, POLICY, 856)
+            gate.verify_report(report, 1, POLICY, 768)
 
     def test_vulnerability_yank_filters_schema_and_scanner_failure_block(self):
         alterations = [
@@ -61,21 +62,21 @@ class AcceptedRiskTests(unittest.TestCase):
             ("warnings", {"notice": [{}]}),
             ("settings", {"ignore": ["RUSTSEC-2024-0429"]}),
             ("database", {"advisory-count": 0}),
-            ("lockfile", {"dependency-count": 855}),
+            ("lockfile", {"dependency-count": 767}),
         ]
         for key, value in alterations:
             with self.subTest(key=key, value=value):
                 report = report_for(POLICY["accepted"])
                 report[key] = value
                 with self.assertRaises((ValueError, KeyError)):
-                    gate.verify_report(report, 1, POLICY, 856)
+                    gate.verify_report(report, 1, POLICY, 768)
         for code in (-9, 0, 2, 101):
             with self.subTest(scanner_exit=code), self.assertRaises(ValueError):
-                gate.verify_report(report_for(POLICY["accepted"]), code, POLICY, 856)
+                gate.verify_report(report_for(POLICY["accepted"]), code, POLICY, 768)
         with self.assertRaises(ValueError):
-            gate.verify_report({"error": "database fetch failed"}, 1, POLICY, 856)
+            gate.verify_report({"error": "database fetch failed"}, 1, POLICY, 768)
         with self.assertRaises(ValueError):
-            gate.verify_report(report_for([]), 1, POLICY, 856)
+            gate.verify_report(report_for([]), 1, POLICY, 768)
 
     def make_consumer(self, root: Path) -> dict:
         for name in ("src", "src-tauri", "echo-agent-app-core/src", ".cargo", "scripts"):
@@ -94,7 +95,7 @@ class AcceptedRiskTests(unittest.TestCase):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 policy = self.make_consumer(root)
-                self.assertEqual(len(gate.verify_inputs(root, policy)), 856)
+                self.assertEqual(len(gate.verify_inputs(root, policy)), 768)
                 path = root / name
                 path.write_bytes((path.read_bytes() if path.exists() else b"") + b"\n# changed\n")
                 with self.assertRaises(ValueError):
@@ -155,6 +156,61 @@ class AcceptedRiskTests(unittest.TestCase):
                 self.assertEqual(completed.returncode, 1)
                 self.assertIsNone(result["scannerExit"])
                 self.assertIn("unaccepted cargo-audit configuration", result["error"])
+
+    def test_missing_duplicate_and_changed_baseline_cardinality_block(self):
+        for omitted in POLICY["accepted"]:
+            with self.subTest(missing=omitted["advisory"]):
+                retained = [risk for risk in POLICY["accepted"] if risk != omitted]
+                with self.assertRaises(ValueError):
+                    gate.verify_report(report_for(retained), 1, POLICY, 768)
+        duplicated = report_for(POLICY["accepted"])
+        duplicated["warnings"]["unsound"].append(
+            copy.deepcopy(duplicated["warnings"]["unsound"][0])
+        )
+        with self.assertRaises(ValueError):
+            gate.verify_report(duplicated, 1, POLICY, 768)
+        for count in (4, 6):
+            changed = copy.deepcopy(POLICY)
+            changed["accepted"] = changed["accepted"][:count]
+            if count == 6:
+                extra = copy.deepcopy(changed["accepted"][0])
+                extra["advisory"] = "RUSTSEC-2099-0001"
+                changed["accepted"].append(extra)
+            with self.subTest(policy_count=count):
+                with self.assertRaises(ValueError):
+                    gate.verify_report(report_for(changed["accepted"]), 1, changed, 768)
+                with self.assertRaises(ValueError):
+                    gate.verify_inputs(gate.ROOT, changed)
+        changed = copy.deepcopy(POLICY)
+        changed["accepted"][-1] = copy.deepcopy(changed["accepted"][0])
+        with self.assertRaises(ValueError):
+            gate.verify_inputs(gate.ROOT, changed)
+        with self.assertRaises(ValueError):
+            gate.verify_report(report_for(changed["accepted"]), 1, changed, 768)
+
+    def test_each_official_setting_and_withdrawal_change_blocks(self):
+        settings = {
+            "target_arch": ["aarch64"],
+            "target_os": ["macos"],
+            "severity": "high",
+            "ignore": [POLICY["accepted"][0]["advisory"]],
+            "informational_warnings": ["unmaintained", "unsound"],
+            "unexpected_setting": True,
+        }
+        for field, value in settings.items():
+            altered = report_for(POLICY["accepted"])
+            altered["settings"][field] = value
+            with self.subTest(setting=field), self.assertRaises(ValueError):
+                gate.verify_report(altered, 1, POLICY, 768)
+        for field in report_for(POLICY["accepted"])["settings"]:
+            altered = report_for(POLICY["accepted"])
+            del altered["settings"][field]
+            with self.subTest(missing_setting=field), self.assertRaises(ValueError):
+                gate.verify_report(altered, 1, POLICY, 768)
+        withdrawn = report_for(POLICY["accepted"])
+        withdrawn["warnings"]["unsound"][0]["advisory"]["withdrawn"] = "2026-10-28"
+        with self.assertRaises(ValueError):
+            gate.verify_report(withdrawn, 1, POLICY, 768)
 
 
 if __name__ == "__main__":

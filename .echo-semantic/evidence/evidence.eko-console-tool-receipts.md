@@ -3,7 +3,7 @@ schema_version: 1
 id: evidence.eko-console-tool-receipts
 kind: evidence
 observed_at: source:4b09b2cad222a1da6dccdb24b4ceab253f2a868634d2d2df6e56bc9d8b5ea238
-source_refs: [echo-agent-app-core/src/auto_memory/mod.rs, src/cli/cmd_impls/all.rs, src/cli/repl.rs, src/tauri/commands/panels.rs, src/tauri/desktop.rs, src/tui/events.rs, echo-agent-app-core/src/tasks/task_runtime/task_tools.rs, echo-agent-app-core/src/tasks/task_runtime/store/runtime.rs, echo-agent-app-core/src/tasks/task_runtime/store/tests.rs, echo-agent-app-core/src/tasks/task_runtime/register.rs, echo-agent-app-core/src/runtime.rs, docs/en/architecture/runtime.md, docs/zh/architecture/runtime.md, echo-agent-app-core/src/channel_runtime.rs, echo-agent-app-core/src/channel_runtime/outbound.rs, src/tauri/mod.rs, .cargo/accepted-dependency-risks.json, docs/supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md]
+source_refs: [echo-agent-app-core/src/auto_memory/mod.rs, docs/zh/adr/0050-gui-product-convergence.md, echo-agent-app-core/src/runtime.rs, src/tauri/commands/panels.rs, src/tauri/desktop.rs, echo-agent-app-core/src/tasks/task_runtime/task_tools.rs, echo-agent-app-core/src/tasks/task_runtime/store/runtime.rs, echo-agent-app-core/src/tasks/task_runtime/store/tests.rs, echo-agent-app-core/src/tasks/task_runtime/register.rs, docs/en/architecture/runtime.md, docs/zh/architecture/runtime.md, echo-agent-app-core/src/channel_runtime.rs, echo-agent-app-core/src/channel_runtime/outbound.rs, src/tauri/mod.rs, .cargo/accepted-dependency-risks.json, docs/supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md]
 supports: [rule.eko-framework-consumer-authorities]
 limitations: [Historical checks retain their exact source scopes, Full local six-command qualification includes pre-existing ignored cases, One transient du resource observation gap, Six dependency risks remain accepted and unrepaired, No native performance or production static or live SSH IM or main CI acceptance]
 ---
@@ -64,3 +64,16 @@ Before original independent clean-guard0/exact clean0/postguard0, the actual reg
 Only after compiler return, Root's single final bounded same-six reassessment rebinds the policy fromd47 to the final306-input consumer3b76ef95f80c6f68d2d1ae1a9d9e5555e628fb251322cd98d293fcf6de688d61. Both finite source/exposure reviews preserve earlier2ca2 findings: the private owned Box and equivalent desktop short-circuit add no GTK/glib/macro/syntect-bincode/notification-D-Bus consumption or serialized/public/state authority. Existing real activation and unsoundness/maintenance risks remain unrepaired. The policy changes only this consumer field, keeping lock/accepted6/schema/scanner/settings unchanged. Six original Python methods pass0; two newly fetched actual-lock/canonical-origin scans each naturally return scanner1 for exactly the original six warnings, zero vulnerabilities, and separate gate/wrapper0 with noFetch=false. Both use this chat's own full-clean1371-file RustSec DB, verify every Git blob/mode/physical entry before/between/after scans and advance FETCH_HEAD separately. Exact per-process authorized same-official-repository transport recovery changes no global config or filter. Results and raw originals are in local risk-rebind-v1, with the append-only dependency decision recording exact times/hashes. The six risks are accepted, not resolved; source, examples and website behavior gain no new contract from these internal layout/syntax fixes.
 
 The post-compiler policy/decision/Evidence updates form a separate metadata epoch; all compiled Rust/build and437 frontend inputs remain unchanged. The two protected open retirement materials and54 pending console files remain byte-identical and outside this completed qualification scope. Their actual delete-preflight1, old failed Clippy windows, original clocks and raw failures are preserved. Full local command success does not resolve Plan10, repair an external tool, grant publishing or replace native/main/CI acceptance.
+
+
+## 2026-10-29：GUI 扩展范围的退役导航维护
+
+本节仅修复当前 GUI 文件影响闭包中新发现的三处普通文件引用。原观察 `source:4b09b2cad222a1da6dccdb24b4ceab253f2a868634d2d2df6e56bc9d8b5ea238`、上述命令原件、失败、历史风险接受、after revision、ignored 和未验范围保持各自资格；不重新执行或续期历史结果，不新增 matched、状态或 owner。
+
+| 原历史路径 | 当前导航及限定 |
+| --- | --- |
+| `src/cli/cmd_impls/all.rs` | `docs/zh/adr/0050-gui-product-convergence.md`：独立终端入口退出决定，不宣称存在同义新入口。 |
+| `src/cli/repl.rs` | `echo-agent-app-core/src/runtime.rs`：既有共享应用运行时；REPL 本身已退出。 |
+| `src/tui/events.rs` | `src/tauri/commands/panels.rs`：既有 GUI 面板控制；TUI 本身已退出。 |
+
+旧入口代码可从 `pre-retirement-2026-10-24` 及具名历史 Git 保存点回读。当前前置导航只使用仍存在的原共享实现或退役决定，不把旧 observed_at 当作这些导航的当前运行通过。原 unknown/needs_review、完整 Goal/native/风险/mainCI 缺口保留；本次导航修复不修改 checker、schema、base、exclude 或验证输出。

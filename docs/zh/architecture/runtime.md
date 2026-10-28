@@ -2,7 +2,7 @@
 
 ## 项目工作区与真实位置
 
-工作空间、项目与工程对应同一个 Workspace，任务/会话归属它，TaskRun/PlanTask 列表呈现执行记录。创建 Workspace 支持已有本地文件夹、新建本地文件夹和 SSH 远程项目，新建任务不创建目录。代码位置与本机 `Workspace.root` 产品数据分离；旧 manifest 仍按原 `project_root`、`root` 解析，不移动旧目录。位置和验证后的执行身份同属原 manifest/`project_root_revision`，参见 [ADR 0055](../adr/0055-project-workspaces.md)。
+工作空间、项目与工程对应同一个 Workspace，任务/会话归属它，TaskRun/PlanTask 列表呈现执行记录。创建 Workspace 支持已有本地文件夹、新建本地文件夹和 SSH 远程项目，新建任务不创建目录。代码位置与本机 `Workspace.root` 产品数据分离；当前 manifest 必须显式记录 `metadata.project_location`。缺字段时拒读并保留原文件，不从旧 `project_root` 或产品数据 `root` 推断，也不自动迁移。位置和验证后的执行身份同属原 manifest/`project_root_revision`，参见 [ADR 0055](../adr/0055-project-workspaces.md)。
 
 创建或打开工作空间后，原 `workspaceStore` 使用后端 registry 回执按 ID 更新列表，成功进入时与当前选择一起发布；同 ID 的新 generation 替换旧项。创建已落盘但进入失败时只更新列表，保留原选择和错误，不再次创建或切换。迟到回执仍受原切换代次约束，不覆盖后继列表或焦点。
 

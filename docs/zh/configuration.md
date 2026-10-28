@@ -114,9 +114,6 @@ hooks: {}
 
 logging:
   level: "info"
-
-tui:
-  max_display_chars: 20000
 ```
 
 ## Provider 与模型

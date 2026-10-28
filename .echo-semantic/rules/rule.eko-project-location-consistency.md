@@ -70,7 +70,7 @@ code_refs:
 - echo-agent-app-core/src/workspace/mod.rs
 - echo-agent-app-core/src/workspace/registry.rs
 - echo-agent-app-core/src/workspace/runtime.rs
-- src/main.rs
+- src-tauri/src/main.rs
 - src/tauri/commands/files.rs
 - src/tauri/commands/panels.rs
 - src/tauri/commands/workspace.rs
@@ -114,3 +114,14 @@ Evidence 绑定本轮源码和前端精确 epoch；原无映射的 files.rs/diff
 ## 裁决记录
 
 用户最新确认 Workspace＝项目＝工程，任务和会话归属 Workspace；创建 Workspace 选择本地已有/新建/远程三来源，新建任务不创建目录。原前端 epoch2 保留为历史输入，尚不覆盖新导航语义。Project-workspaces 的位置/未知结算义务继续有效，ADR0055 是本仓长期决定。此 Rule 仍 needs_review，未关闭历史 Finding、未接受新的 lock 风险，未宣称 main/CI/release。
+
+
+## 2026-10-29：退役后的前置路径导航维护
+
+本节只维护结构化源码/消费者引用的导航，不重新观察或续期旧运行资格。原观察 `source:f49ec6694fa4b4cf0f175f3a746b2a82a610bfd044d86e11e72f88763aa54c7c`、上文历史原件、失败与限制、原 command/scenario/after revision 均保持原范围；本节不新增 matched、状态或 owner。
+
+| 原历史路径 | 当前实现或退役决定导航 |
+| --- | --- |
+| `src/main.rs` | `src-tauri/src/main.rs` |
+
+旧路径身份与退出范围由既有退役资产/Finding和正式ADR0050/0057保留；源码历史可在 `pre-retirement-2026-10-24` 及后继具名Git保存点回读。新导航只指向现存原接管实现或退出决定，不能把旧observed_at解释成这些路径当时已经运行通过。unknown/needs_review、原动态/native/风险缺口不清；本候选没有执行Cargo或官方新Task校验，采用与真实来源绑定由EKO唯一writer按正常新Task合同完成。

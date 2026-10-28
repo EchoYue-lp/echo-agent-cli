@@ -955,7 +955,6 @@ mod tests {
                 .and_then(|index| index.checked_add(1)),
             conversation_id: "side-1".to_string(),
             role: role.to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
             content: Some(content.to_string()),
             attachments_json: None,
             tool_calls_json: None,
@@ -1184,7 +1183,6 @@ mod tests {
             id: i64::try_from(index).ok(),
             conversation_id: "source".to_string(),
             role: role.to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
             content: Some(content.to_string()),
             attachments_json: None,
             tool_calls_json: (index == 1).then(|| "[]".to_string()),
@@ -1230,7 +1228,6 @@ mod tests {
             id: i64::try_from(index).ok(),
             conversation_id: "source".to_string(),
             role: role.to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
             content: Some(content.to_string()),
             attachments_json: None,
             tool_calls_json: None,
@@ -1950,12 +1947,7 @@ fn validated_reply_fork_publication_events(
     conversation_id: &str,
     events: &[ChatEventEnvelope],
 ) -> Result<Vec<ChatDriverEvent>, IpcError> {
-    let has_native = message.assistant_blocks.is_some()
-        || message.approved_assistant_blocks.is_some()
-        || message.execution_status.is_some();
-    if !has_native {
-        return Ok(Vec::new());
-    }
+    // Fork 许可来自原 publication；正文或缺失 native 字段都不能单独授权。
     let publication =
         echo_agent_app_core::api::conversation_projection::project_native_history_publication(
             message,
@@ -2366,12 +2358,6 @@ async fn validate_reply_fork_publication(
     };
     let restored = echo_agent::memory::restore_message(last_assistant)
         .map_err(|_| IpcError::Validation("无法验证分叉回复的原始消息".into()))?;
-    let has_native = restored.assistant_blocks.is_some()
-        || restored.approved_assistant_blocks.is_some()
-        || restored.execution_status.is_some();
-    if !has_native {
-        return Ok(());
-    }
     let imported = last_assistant
         .attachments_json
         .as_deref()
@@ -3512,11 +3498,11 @@ mod agent_communication_view_tests {
         let (_root, input) = source()?;
         let human = echo_agent::memory::project_message(
             "c",
-            &echo_agent::llm::types::Message::user("human"),
+            &echo_agent::llm::types::Message::user("human".to_string()),
         )?;
         let reply = echo_agent::memory::project_message(
             "c",
-            &echo_agent::llm::types::Message::assistant("reply"),
+            &echo_agent::llm::types::Message::assistant("reply".to_string()),
         )?;
         let rows = vec![human.clone(), reply.clone(), input, reply, human];
         assert_eq!(human_message_positions(&rows)?, vec![0, 4]);

@@ -26,7 +26,7 @@ Unknown 缓存绑定原 stream、turn、execution、request 和 block，不将�
 
 Frame 后继新增的 ExecutionStatus 沿原有序通道显示为具名执行状态，标出原 execution 身份；它不算自然语言汇报，也不提供回答正文。Settled 只显示 Agent 执行已结算，不替代 TaskRun 完成、FinalAnswer 确认或 foreground Terminal；后继汇报、HITL 和取消继续消费同一通道。
 
-FinalAnswer 正文来自 Framework 原 Guard／Critic／Stop／持久化与该次 Agent 执行结算后的唯一确认路径，按原事件顺序呈现，不拖到后续 execution 的汇报或 HITL 之后。原 foreground Terminal 继续独占渠道执行关闭，TaskRun 继续独占目标完成；发布确认回答不改变这两种状态。块 final／complete 或候选在失败、取消、观察未知、断流时不能补成确认回答。后继 execution 的取消不撤销前一次已确认回答，仍显示原取消事实。重复 journal 事件只去重呈现，不新增投递 store 或完成事实。
+FinalAnswer 是 Framework 原 Guard／Critic／Stop／持久化路径的受校验最终正文确认，合法运行时通知继续保留。渠道收到该事件即按原事件顺序呈现，不拖到后续 execution 的汇报或 HITL 之后。FinalAnswer 不证明物理结算完成；Agent 的 ExecutionStatus::Settled、原 driver EOF 与 physical 终态仍由原 owner 后继核对，不能以正文确认提前替代。原 foreground Terminal 继续独占渠道执行关闭，TaskRun 继续独占目标完成；发布确认回答不改变这两种状态。块 final／complete 或候选在失败、取消、观察未知、断流时不能补成确认回答。后继 execution 的取消不撤销前一次已确认回答，仍显示原取消事实。重复 journal 事件只去重呈现，不新增投递 store 或完成事实。
 
 原生增量保原 envelope，使用原 2048 事件／512 KiB 的输入预算与 64 槽实时队列背压；旧 512 条合并消息计数只覆盖旧合并投影，不能在 reader 正常排空时取消第 513 个短原生增量。输出总量仍不超过原 256 消息／256 KiB：普通输出保留 254 槽，另为确认回答和失败／取消各保留一槽，各 2 KiB。正常确认回答仍按普通可用额度完整分块；额度不足时仅发送有界确认预览及原会话完整结果入口提示，不能静默吞掉最终回答，也不能占掉后继取消／失败的保留槽。超过有限确认预览额度时明确返回投影错误，不伪造已投递。
 

@@ -73,7 +73,7 @@ code_refs:
 - echo-agent-app-core/src/workspace/mod.rs
 - echo-agent-app-core/src/workspace/registry.rs
 - echo-agent-app-core/src/workspace/runtime.rs
-- src/main.rs
+- src-tauri/src/main.rs
 - src/tauri/commands/files.rs
 - src/tauri/commands/panels.rs
 - src/tauri/commands/workspace.rs
@@ -134,3 +134,14 @@ This candidate extends the existing Workspace and original Framework provider bo
 ## 未知与限制
 
 The current source is an implementation candidate. Source references include the actual files/diff consumers that previously lacked Project-specific mapping. The related Rule is needs_review. Focused frontend epoch2 ran 28 tests across five files, whole-app noEmit TS, scoped ESLint and format successfully. No Rust/native/real-remote qualification is claimed here; excluded retirement-tool repair, old Findings and accepted dependency risks are unchanged. ADR0055 records the confirmed direction, not a released main commit.
+
+
+## 2026-10-29：退役后的前置路径导航维护
+
+本节只维护结构化源码/消费者引用的导航，不重新观察或续期旧运行资格。原观察 `source:f49ec6694fa4b4cf0f175f3a746b2a82a610bfd044d86e11e72f88763aa54c7c`、上文历史原件、失败与限制、原 command/scenario/after revision 均保持原范围；本节不新增 matched、状态或 owner。
+
+| 原历史路径 | 当前实现或退役决定导航 |
+| --- | --- |
+| `src/main.rs` | `src-tauri/src/main.rs` |
+
+旧路径身份与退出范围由既有退役资产/Finding和正式ADR0050/0057保留；源码历史可在 `pre-retirement-2026-10-24` 及后继具名Git保存点回读。新导航只指向现存原接管实现或退出决定，不能把旧observed_at解释成这些路径当时已经运行通过。unknown/needs_review、原动态/native/风险缺口不清；本候选没有执行Cargo或官方新Task校验，采用与真实来源绑定由EKO唯一writer按正常新Task合同完成。

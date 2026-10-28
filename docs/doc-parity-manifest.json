@@ -1,6 +1,6 @@
 {
-  "schemaVersion": 1,
-  "authority": "zh is the editorial source; en is a reviewed semantic translation. Every migrated entry removes its legacy root source after parity passes.",
+  "schemaVersion": 2,
+  "authority": "中文是当前正式产品文档的主维护来源；不要求为新增或修改的中文页面创建英语副本。既有reviewed英语页按登记检查，工程计划独立登记且不作为产品页面。",
   "entries": [
     {
       "legacyPath": "MASTER-PLAN.md",
@@ -553,6 +553,72 @@
       "sourceLanguage": "zh",
       "translationStatus": "reviewed",
       "legacyRemoved": true
+    },
+    {
+      "targetPath": "adr/0057-native-messages-and-progress-policy.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0058-im-native-output-projection.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0060-subagent-native-observations.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0061-tool-categories-and-required-tools.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "architecture/performance-baseline.md",
+      "kind": "architecture",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "guides/extension-panel-scope-settlement.md",
+      "kind": "guide",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "guides/hitl-replay-identity.md",
+      "kind": "guide",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "guides/plugin-panel-scope-settlement.md",
+      "kind": "guide",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "guides/task-run-history.md",
+      "kind": "guide",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0062-current-five-risk-binding.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    }
+  ],
+  "engineeringEntries": [
+    {
+      "path": "MASTER-PLAN.md",
+      "kind": "project-plan"
     }
   ]
 }

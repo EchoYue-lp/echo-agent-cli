@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "decision": "docs/supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md",
-  "lock_sha256": "3fb8955b56e86eb4bef2454d3328b6ef8eb7f36d7663806387f3b990244e7ed6",
-  "consumer_inputs_sha256": "d38f9a06ca1df7f042295d579bf8144ab3a741a92b6b5bd99fb104941c58ecd9",
+  "lock_sha256": "399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f",
+  "consumer_inputs_sha256": "d027ea4999a8bcbdc8d6262d4cfdd64f4669565135547e2b0e540e0baa01af9e",
   "accepted": [
     {
       "name": "glib",
@@ -18,14 +18,6 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "checksum": "da25490ff9892aab3fcf7c36f08cfb902dd3e71ca0f9f9517bea02a73a5ce38c",
       "advisory": "RUSTSEC-2024-0370",
-      "kind": "unmaintained"
-    },
-    {
-      "name": "bincode",
-      "version": "1.3.3",
-      "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad",
-      "advisory": "RUSTSEC-2025-0141",
       "kind": "unmaintained"
     },
     {

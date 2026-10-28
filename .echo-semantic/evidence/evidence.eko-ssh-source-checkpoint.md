@@ -8,10 +8,8 @@ source_refs:
 - echo-agent-app-core/src/runtime.rs
 - echo-agent-app-core/src/developer_commands.rs
 - src/tauri/terminal.rs
-- src/cli/channels.rs
+- echo-agent-app-core/src/channel_runtime.rs
 - echo-agent-app-core/src/channel_runtime/outbound.rs
-- src/cli/cmd_impls/developer.rs
-- src/tui/events.rs
 - web-frontend/src/api/endpoints.ts
 - web-frontend/src/components/terminal/Terminal.tsx
 - web-frontend/src/components/terminal/TerminalDrawer.tsx
@@ -80,3 +78,16 @@ source_refs 都指向当前可读取的正式源码、测试、ADR或精六项�
 当前可读 channel helper 路径随原实现归位 app-core/channel_runtime；原 bin 入口只转发。此路径修正不续期本文件任何历史 Rust、Node、风险接受或 native 资格；历史观察和具名旧快照结论保持原范围。当前合流尚未 Cargo 编译。
 
 旧来源观察 `source:230d0c7af649f29cef2002109e67167479b0894c28537c90eefe2d0746336829` 保留为历史。当前 observed_at 只绑定归位后的可读来源，不表示旧验证在新合流上续期。
+
+
+## 2026-10-29：退役后的前置路径导航维护
+
+本节只维护结构化源码/消费者引用的导航，不重新观察或续期旧运行资格。原观察 `source:4726a37cc1350e66b30b281fd02e16cdd087cd7f44b58b28a0ba6ab09bfa0d46`、上文历史原件、失败与限制、原 command/scenario/after revision 均保持原范围；本节不新增 matched、状态或 owner。
+
+| 原历史路径 | 当前实现或退役决定导航 |
+| --- | --- |
+| `src/cli/channels.rs` | `echo-agent-app-core/src/channel_runtime.rs` |
+| `src/cli/cmd_impls/developer.rs` | `echo-agent-app-core/src/developer_commands.rs` |
+| `src/tui/events.rs` | `src/tauri/terminal.rs` |
+
+旧路径身份与退出范围由既有退役资产/Finding和正式ADR0050/0057保留；源码历史可在 `pre-retirement-2026-10-24` 及后继具名Git保存点回读。新导航只指向现存原接管实现或退出决定，不能把旧observed_at解释成这些路径当时已经运行通过。unknown/needs_review、原动态/native/风险缺口不清；本候选没有执行Cargo或官方新Task校验，采用与真实来源绑定由EKO唯一writer按正常新Task合同完成。

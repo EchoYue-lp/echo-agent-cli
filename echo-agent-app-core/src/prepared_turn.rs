@@ -2211,7 +2211,10 @@ mod agent_communication_source_tests {
         let restored = echo_agent::memory::restore_message(&stored)?;
         assert_eq!(persisted_agent_input(&restored)?, Some(input));
         assert!(
-            persisted_agent_input(&Message::user("[eko_agent_message] fake source"))?.is_none()
+            persisted_agent_input(&Message::user(
+                "[eko_agent_message] fake source".to_string()
+            ))?
+            .is_none()
         );
         Ok(())
     }

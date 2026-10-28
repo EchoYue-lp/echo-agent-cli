@@ -34,10 +34,10 @@ code_refs:
 - docs/zh/adr/0051-ssh-terminal-sessions.md
 consumer_refs:
 - echo-agent-app-core/src/developer_commands.rs
-- src/cli/channels.rs
+- echo-agent-app-core/src/channel_runtime.rs
 - echo-agent-app-core/src/channel_runtime/outbound.rs
-- src/cli/cmd_impls/developer.rs
-- src/tui/events.rs
+- docs/zh/adr/0050-gui-product-convergence.md
+- web-frontend/src/components/terminal/TerminalDrawer.tsx
 - web-frontend/src/api/endpoints.terminal.test.ts
 - web-frontend/src/components/terminal/TerminalDrawer.test.tsx
 - web-frontend/src/components/terminal/terminal-io.test.ts
@@ -120,3 +120,16 @@ v3 全 transport 独审 ed48bba3 的 I1/I2 由原 owner 收敛：execute 仍为 
 
 
 v5 原薄错误接缝修复 v4 独审 I3：request-mutating 决定是否存在丢失写响应，completed-mutation 决定整次递归操作的 Possible 副作用，两维不共用一个 bool。原递归删除/建父目录及 atomic-write 后续 metadata 沿局部真实已完成事实映射错误；只读请求不制造 stop debt，已执行 mutation 不能降为 None/RestoreThenRetry。新增 mutation 后 read fail 和从未 mutation 的受控本机对照，仍仅源码定义未执行。原 v4/审查 be4d8762 与旧 native/失败资格维持历史范围。
+
+
+## 2026-10-29：退役后的前置路径导航维护
+
+本节只维护结构化源码/消费者引用的导航，不重新观察或续期旧运行资格。原观察 `source:f49ec6694fa4b4cf0f175f3a746b2a82a610bfd044d86e11e72f88763aa54c7c`、上文历史原件、失败与限制、原 command/scenario/after revision 均保持原范围；本节不新增 matched、状态或 owner。
+
+| 原历史路径 | 当前实现或退役决定导航 |
+| --- | --- |
+| `src/cli/channels.rs` | `echo-agent-app-core/src/channel_runtime.rs` |
+| `src/cli/cmd_impls/developer.rs` | `docs/zh/adr/0050-gui-product-convergence.md` |
+| `src/tui/events.rs` | `web-frontend/src/components/terminal/TerminalDrawer.tsx` |
+
+旧路径身份与退出范围由既有退役资产/Finding和正式ADR0050/0057保留；源码历史可在 `pre-retirement-2026-10-24` 及后继具名Git保存点回读。新导航只指向现存原接管实现或退出决定，不能把旧observed_at解释成这些路径当时已经运行通过。unknown/needs_review、原动态/native/风险缺口不清；本候选没有执行Cargo或官方新Task校验，采用与真实来源绑定由EKO唯一writer按正常新Task合同完成。

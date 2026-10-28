@@ -2499,28 +2499,29 @@ mod resource_chain_acceptance {
         Ok(())
     }
 
-    async fn complete_chain(destination: ReplyForkDestination) -> anyhow::Result<()> {
-        // 与其它病例直接委托同一完整链，避免未优化测试额外内嵌一层大型 future。
+    fn complete_chain(
+        destination: ReplyForkDestination,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> {
+        // 直接返回同一 future，避免未优化测试逐层 poll 大型 async 转发包装。
         complete_chain_with_source(
             destination,
             NativeFixtureMode::Original,
             SourceRows::Adapted,
             None,
         )
-        .await
     }
-    async fn complete_native_chain(
+    fn complete_native_chain(
         destination: ReplyForkDestination,
         mode: NativeFixtureMode,
-    ) -> anyhow::Result<()> {
-        complete_chain_with_source(destination, mode, SourceRows::Adapted, None).await
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> {
+        complete_chain_with_source(destination, mode, SourceRows::Adapted, None)
     }
-    async fn complete_chain_with_source(
+    fn complete_chain_with_source(
         destination: ReplyForkDestination,
         mode: NativeFixtureMode,
         source_rows: SourceRows,
         unprojected_history_records: Option<u64>,
-    ) -> anyhow::Result<()> {
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> {
         complete_chain_with_model_mode(
             destination,
             mode,
@@ -2528,7 +2529,6 @@ mod resource_chain_acceptance {
             unprojected_history_records,
             true,
         )
-        .await
     }
 
     async fn complete_chain_with_model_mode(

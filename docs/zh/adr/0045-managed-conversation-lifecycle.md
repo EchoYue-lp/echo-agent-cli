@@ -69,4 +69,4 @@ GUI 与可编辑目标正文通过 resource_history_display_text 隐藏本产品
 
 用户明确开发阶段不保留旧格式兼容。AttachmentsPayload 只接受当前 object，旧 thinking 数组解析与 thinking_segments/execution_rounds 双轨 DTO、round types 和旧接纳测试退役。Reasoning/正文继续来自原生 assistant blocks；工具步骤通过 canonical tool_calls 和 execution_steps 的原 call_id 承载；实际 execution_status/final_answer_source、native_history_import、附件与原始资源 bytes/SHA/reader 不受这次表面退役影响。
 
-Fork 和 Side 复制前缀只移除来源会话本地的 UI message_id，不再清除 canonical 工具步骤。测试沿实际当前 Message producer 验证 clone 后的原消息内容与 call_id 不变，不依赖手写旧 wrapper。目标 runtime/scope 的普通 idle、同版 cold/history/reload/refork、CAS/幂等及不重放真实副作用仍属于必验合同；没有原 publication 的文本不能因此被补写为最终成功，两个旧准入旁路由 EKO 主 owner 与原 typed producer 统一闭合。
+Fork 和 Side 复制前缀只移除来源会话本地的 UI message_id，不再清除 canonical 工具步骤。测试沿实际当前 Message producer 验证 clone 后的原消息内容与 call_id 不变，不依赖手写旧 wrapper。目标 runtime/scope 的普通 idle、同版 cold/history/reload/refork、CAS/幂等及不重放真实副作用仍属于必验合同。Fork 入口和事件读取层均已移除“没有 native 字段即成功”的旧早退，统一使用原 typed publication 校验；没有原 publication 的文本不能被补写为最终成功。非流式传输仍由原 ReAct／driver 生成 native 事实，不另造成功路径。
