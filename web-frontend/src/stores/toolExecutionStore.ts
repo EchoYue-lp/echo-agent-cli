@@ -48,13 +48,25 @@ function eventTimestamp(timestamp: string): number {
 }
 
 function executionIdentity(
-  tool: Pick<ToolExecution, 'workspace_id' | 'owner' | 'call_id' | 'run_id'>
+  tool: Pick<
+    ToolExecution,
+    'workspace_id' | 'conversation_id' | 'owner' | 'call_id' | 'run_id' | 'name'
+  >
 ): string {
-  return `${tool.workspace_id}\u0000${toolExecutionOwnerKey(tool.owner, tool.run_id)}\u0000${tool.call_id}`;
+  return JSON.stringify([
+    tool.workspace_id,
+    tool.conversation_id ?? null,
+    tool.run_id ?? null,
+    toolExecutionOwnerKey(tool.owner, tool.run_id),
+    tool.call_id,
+    tool.name,
+  ]);
 }
 
 function toolStatusRank(tool: ToolExecution): number {
-  return tool.status === 'running' ? 0 : 1;
+  // 后端会以Unknown结束孤儿调用；有结束时间不能继续显示running，也不能覆盖真实结果。
+  if (tool.status === 'unknown') return tool.finished_at == null ? -1 : 1;
+  return tool.status === 'running' ? 0 : 2;
 }
 
 function toolActivityTimestamp(tool: ToolExecution): number {
@@ -96,18 +108,7 @@ function mergeTaskRuntimeBoundary(
   runtimeBoundary: ToolExecution
 ): ToolExecution {
   if (persisted.detail_ref) return persisted;
-  if (runtimeBoundary.status === 'running' || persisted.status === runtimeBoundary.status) {
-    return persisted;
-  }
-  const startedAt = Math.min(persisted.started_at, runtimeBoundary.started_at);
-  const finishedAt = runtimeBoundary.finished_at;
-  return {
-    ...persisted,
-    status: runtimeBoundary.status,
-    started_at: startedAt,
-    finished_at: finishedAt,
-    duration_ms: finishedAt == null ? null : Math.max(0, finishedAt - startedAt),
-  };
+  return { ...mergeToolExecution(persisted, runtimeBoundary), id: persisted.id };
 }
 
 export function mergeHydratedToolExecutions(
@@ -116,7 +117,8 @@ export function mergeHydratedToolExecutions(
 ): ToolExecution[] {
   const merged = new Map<string, ToolExecution>();
   for (const tool of [...current, ...incoming]) {
-    const identity = executionIdentity(tool);
+    // detail id才指向原执行；同call_id的多个详情不能在冷恢复中丢失歧义。
+    const identity = JSON.stringify([executionIdentity(tool), tool.id]);
     const existing = merged.get(identity);
     merged.set(identity, existing ? mergeToolExecution(existing, tool) : tool);
   }
@@ -164,8 +166,8 @@ export function taskRuntimeToolExecutions(
     const previous = tools.get(id);
     const timestamp = eventTimestamp(event.timestamp);
     const terminal = event.event_type !== 'tool_started';
-    const startedAt = previous?.started_at ?? timestamp;
-    tools.set(id, {
+    const startedAt = previous ? Math.min(previous.started_at, timestamp) : timestamp;
+    const boundary: ToolExecution = {
       id,
       workspace_id: run.workspace_id,
       call_id: callId,
@@ -186,7 +188,9 @@ export function taskRuntimeToolExecutions(
       // Empty means only the runtime boundary is available. InlineToolCall
       // keeps the row visible without requesting a nonexistent detail file.
       detail_ref: '',
-    });
+    };
+    // 回放顺序可能包含迟到的开始；实时与冷恢复复用同一归并规则。
+    tools.set(id, previous ? mergeToolExecution(previous, boundary) : boundary);
   }
 
   return [...tools.values()];
@@ -197,14 +201,25 @@ export function mergeTaskRuntimeToolExecutions(
   persisted: readonly ToolExecution[],
   fallback: readonly ToolExecution[]
 ): ToolExecution[] {
-  const merged = new Map<string, ToolExecution>();
-  for (const tool of persisted) merged.set(executionIdentity(tool), tool);
+  const merged = mergeHydratedToolExecutions([], persisted);
+  const positions = new Map<string, number | null>();
+  merged.forEach((tool, index) => {
+    const identity = executionIdentity(tool);
+    positions.set(identity, positions.has(identity) ? null : index);
+  });
   for (const boundary of fallback) {
     const identity = executionIdentity(boundary);
-    const existing = merged.get(identity);
-    merged.set(identity, existing ? mergeTaskRuntimeBoundary(existing, boundary) : boundary);
+    const position = positions.get(identity);
+    if (position === undefined) {
+      positions.set(identity, merged.length);
+      merged.push(boundary);
+    } else if (position !== null) {
+      const existing = merged.at(position);
+      if (existing) merged[position] = mergeTaskRuntimeBoundary(existing, boundary);
+    }
+    // 多个详情共享call_id时不挑选；原位更新保持冷恢复中的原执行顺序。
   }
-  return [...merged.values()];
+  return merged;
 }
 
 export const useToolExecutionStore = create<ToolExecutionState>((set) => ({
@@ -213,14 +228,29 @@ export const useToolExecutionStore = create<ToolExecutionState>((set) => ({
 
   ingest: (tool) => {
     set((state) => {
-      const ownerKey = toolExecutionOwnerKey(tool.owner, tool.run_id);
-      const ownerIds = state.idsByOwner[ownerKey] ?? [];
-      return {
-        tools: { ...state.tools, [tool.id]: tool },
-        idsByOwner: ownerIds.includes(tool.id)
-          ? state.idsByOwner
-          : { ...state.idsByOwner, [ownerKey]: [...ownerIds, tool.id] },
-      };
+      const existing = state.tools[tool.id];
+      // 不同detail id可能是重复call_id的独立执行，必须保留歧义交原consumer判Unknown。
+      const incoming =
+        existing && executionIdentity(existing) === executionIdentity(tool)
+          ? mergeToolExecution(existing, tool)
+          : tool;
+      const ownerKey = toolExecutionOwnerKey(incoming.owner, incoming.run_id);
+      const previousOwnerKey = existing
+        ? toolExecutionOwnerKey(existing.owner, existing.run_id)
+        : null;
+      let idsByOwner = state.idsByOwner;
+      // 同一详情重新绑定owner时移除旧引用；普通事件继续原增量路径，避免重建全部索引。
+      if (previousOwnerKey !== null && previousOwnerKey !== ownerKey) {
+        idsByOwner = {
+          ...idsByOwner,
+          [previousOwnerKey]: (idsByOwner[previousOwnerKey] ?? []).filter((id) => id !== tool.id),
+        };
+      }
+      const ownerIds = idsByOwner[ownerKey] ?? [];
+      if (!ownerIds.includes(tool.id)) {
+        idsByOwner = { ...idsByOwner, [ownerKey]: [...ownerIds, tool.id] };
+      }
+      return { tools: { ...state.tools, [tool.id]: incoming }, idsByOwner };
     });
   },
 
@@ -239,7 +269,12 @@ export const useToolExecutionStore = create<ToolExecutionState>((set) => ({
       );
       return indexTools([
         ...otherConversationTools,
-        ...mergeHydratedToolExecutions(liveTools, tools),
+        ...mergeHydratedToolExecutions(
+          liveTools,
+          tools.filter(
+            (tool) => tool.workspace_id === workspaceId && tool.conversation_id === conversationId
+          )
+        ),
       ]);
     });
   },
@@ -254,9 +289,11 @@ export function ingestTaskRuntimeToolExecutions(
 ): void {
   for (const projected of taskRuntimeToolExecutions(run, events)) {
     const state = useToolExecutionStore.getState();
-    const existing = Object.values(state.tools).find(
+    const matches = Object.values(state.tools).filter(
       (tool) => executionIdentity(tool) === executionIdentity(projected)
     );
+    if (matches.length > 1) continue;
+    const existing = matches.at(0);
     useToolExecutionStore
       .getState()
       .ingest(existing ? mergeTaskRuntimeBoundary(existing, projected) : projected);

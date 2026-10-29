@@ -417,6 +417,7 @@ describe('taskRuntimeStore conversation loading', () => {
     mocks.listToolExecutions.mockResolvedValueOnce([
       {
         id: 'tool-detail-1',
+        workspace_id: 'workspace-1',
         call_id: 'call-1',
         owner: { kind: 'subagent', subagent_run_id: 'run-1:task-1:1:1' },
         conversation_id: 'conversation-1',
