@@ -383,6 +383,8 @@ function ProjectAuthentication({
           if (exited) throw new Error('SSH 连接已退出，请断开后重新测试连接');
           const result = await observeTerminal(workspaceApi.testSsh(connectionId, target));
           if (!current(token)) return;
+          // 原 PTY 可能在本次认证观察等待期间退出；迟到成功不能复活该 draft。
+          if (exited) throw new Error('SSH 连接已退出，请断开后重新测试连接');
           if (result.authenticated) {
             latest.current.onPasswordConsumed(latest.current.password);
             latest.current.onAuthenticatedChange(true);

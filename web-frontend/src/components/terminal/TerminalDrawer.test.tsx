@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => {
       writes: unknown[];
       focusCalls: number;
       data?: (value: string) => void;
+      resized?: (size: { rows: number; cols: number }) => void;
     }>,
     handlers: new Map<string, Set<(event: { payload: Record<string, unknown> }) => void>>(),
   };
@@ -54,7 +55,9 @@ vi.mock('@xterm/xterm', () => ({
       this.data = callback;
       return { dispose() {} };
     }
-    onResize() {
+    resized?: (size: { rows: number; cols: number }) => void;
+    onResize(callback: (size: { rows: number; cols: number }) => void) {
+      this.resized = callback;
       return { dispose() {} };
     }
     write(data: unknown, done?: () => void) {
@@ -111,6 +114,119 @@ function creates() {
 }
 
 describe('terminal drawer session observation', () => {
+  it('waits for the original create and serializes resize with the latest pending dimensions', async () => {
+    let created: ((value: unknown) => void) | undefined;
+    let resized: (() => void) | undefined;
+    const original = mocks.invoke.getMockImplementation();
+    mocks.invoke.mockImplementation((command, args) => {
+      if (command === 'create_terminal')
+        return new Promise((resolve) => {
+          created = resolve;
+        });
+      if (command === 'resize_terminal')
+        return new Promise<void>((resolve) => {
+          resized = resolve;
+        });
+      return original?.(command, args);
+    });
+    render(<TerminalDrawer />);
+    await waitFor(() => expect(creates()).toHaveLength(1));
+    const id = creates().at(0)?.at(1).id;
+    const resizes = () =>
+      mocks.invoke.mock.calls.filter(([command]) => command === 'resize_terminal');
+    act(() => {
+      mocks.terminals.at(0)?.resized?.({ rows: 30, cols: 90 });
+      mocks.terminals.at(0)?.resized?.({ rows: 50, cols: 120 });
+    });
+    expect(resizes()).toHaveLength(0);
+    await act(async () => created?.({ id, pid: 42, target: { kind: 'local' } }));
+    expect(resizes()).toEqual([['resize_terminal', { id, rows: 50, cols: 120 }]]);
+    act(() => {
+      mocks.terminals.at(0)?.resized?.({ rows: 60, cols: 140 });
+      mocks.terminals.at(0)?.resized?.({ rows: 70, cols: 160 });
+    });
+    expect(resizes()).toHaveLength(1);
+    await act(async () => resized?.());
+    expect(resizes()).toEqual([
+      ['resize_terminal', { id, rows: 50, cols: 120 }],
+      ['resize_terminal', { id, rows: 70, cols: 160 }],
+    ]);
+    await act(async () => resized?.());
+  });
+
+  it('keeps alternate-screen UTF-8 bytes and a single-tab exit isolated from the other session', async () => {
+    render(<TerminalDrawer />);
+    await waitFor(() => expect(creates()).toHaveLength(1));
+    const firstId = creates().at(0)?.at(1).id;
+    fireEvent.click(screen.getByTitle('New terminal'));
+    await waitFor(() => expect(creates()).toHaveLength(2));
+    const secondId = creates().at(1)?.at(1).id;
+    const bytes = new TextEncoder().encode('\x1b[?1049h\x1b[2J中文🙂\x1b[?1049l');
+    await act(async () => {
+      for (const part of [bytes.subarray(0, 17), bytes.subarray(17)]) {
+        const data = btoa(String.fromCharCode(...part));
+        for (const handler of mocks.handlers.get('terminal-output') ?? [])
+          handler({ payload: { id: firstId, data } });
+      }
+      for (const handler of mocks.handlers.get('terminal-exit') ?? [])
+        handler({ payload: { id: firstId, reason: 'process_exited', exit_code: 13 } });
+      mocks.terminals.at(0)?.data?.('must-not-send');
+      mocks.terminals.at(1)?.data?.('中🙂\x03');
+    });
+    const actual = (mocks.terminals.at(0)?.writes ?? []).flatMap((part) =>
+      Array.from(part as Uint8Array)
+    );
+    expect(actual).toEqual(Array.from(bytes));
+    expect(mocks.terminals.at(1)?.writes).toHaveLength(0);
+    const writes = mocks.invoke.mock.calls.filter(([command]) => command === 'write_terminal');
+    expect(writes).toHaveLength(1);
+    expect(writes.at(0)?.at(1).id).toBe(secondId);
+    expect(Array.from(atob(writes.at(0)?.at(1).data), (value) => value.charCodeAt(0))).toEqual(
+      Array.from(new TextEncoder().encode('中🙂\x03'))
+    );
+    expect(creates()).toHaveLength(2);
+    expect(mocks.terminals.every((terminal) => !terminal.disposed)).toBe(true);
+  });
+
+  it('keeps a failed project SSH terminal bound to its original scope without a local retry', async () => {
+    mocks.workspace = {
+      id: 'disconnected-remote-project',
+      name: '远程项目',
+      root: '/local/product-data',
+      kind: { type: 'code' },
+      metadata: {
+        tags: [],
+        project_location: {
+          kind: 'ssh',
+          host: '111.229.245.175',
+          user: 'ubuntu',
+          port: 22,
+          path: '/home/ubuntu/ssh-test',
+        },
+      },
+      product_data_generation: 'disconnected-generation',
+      created_at: '',
+      last_active: '',
+    };
+    mocks.invoke.mockRejectedValue(new Error('project SSH master disconnected'));
+    const view = render(<TerminalDrawer />);
+    await waitFor(() =>
+      expect(screen.getAllByText('project SSH master disconnected').length).toBeGreaterThan(0)
+    );
+    expect(creates()).toHaveLength(1);
+    expect(creates().at(0)?.at(1)).toMatchObject({
+      projectWorkspaceId: 'disconnected-remote-project',
+      projectWorkspaceGeneration: 'disconnected-generation',
+    });
+    expect(creates().at(0)?.at(1).target).toBeUndefined();
+    mocks.workspace = null;
+    view.rerender(<TerminalDrawer />);
+    act(() => useUiStore.setState({ terminalOpen: false }));
+    act(() => useUiStore.setState({ terminalOpen: true }));
+    expect(creates()).toHaveLength(1);
+    expect(screen.queryByText('本地终端进程已启动。')).toBeNull();
+  });
+
   it('forwards keyboard focus from the accessible terminal wrapper to xterm', async () => {
     render(<Terminal sessionId="focus-probe" />);
     await waitFor(() => expect(creates()).toHaveLength(1));

@@ -64,6 +64,75 @@ beforeEach(() => {
   api.write.mockReset().mockResolvedValue({ success: true });
 });
 describe('project source admission', () => {
+  it.each([
+    { user: 'echo', remotePath: '' },
+    { user: 'ubuntu', remotePath: '/home/ubuntu/ssh-test' },
+  ])(
+    'does not revive an exited $user draft from a late authentication response',
+    async (account) => {
+      let settle: ((result: { authenticated: boolean }) => void) | undefined;
+      api.testSsh.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            settle = resolve;
+          })
+      );
+      const p = {
+        ...props(),
+        draft: { ...sshDraft, user: account.user, remotePath: account.remotePath },
+      };
+      const id = `exited-draft-${account.user}`;
+      const view = render(<ProjectSourceFields {...p} fixedLocation draftConnectionId={id} />);
+      fireEvent.click(view.getByRole('button', { name: '测试连接' }));
+      await waitFor(() => expect(api.testSsh).toHaveBeenCalledOnce());
+      act(() => {
+        for (const receive of api.handlers.get('terminal-exit') ?? [])
+          receive({ payload: { id, reason: 'process_exited', exit_code: 255 } });
+      });
+      await act(async () => settle?.({ authenticated: true }));
+      expect(p.onRemoteSource).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'ssh' }));
+      expect(p.onRemoteSource).toHaveBeenLastCalledWith(undefined);
+      expect(view.queryByText('SSH 登录已验证；创建时再验证远程目录。')).toBeNull();
+      expect(view.getByText(/SSH 连接已退出/)).toBeTruthy();
+      expect(api.connectSsh).toHaveBeenCalledExactlyOnceWith(
+        id,
+        { ...target, user: account.user },
+        24,
+        80
+      );
+      expect(api.testSsh).toHaveBeenCalledExactlyOnceWith(id, { ...target, user: account.user });
+      expect(api.write).not.toHaveBeenCalled();
+      expect(api.verifySsh).not.toHaveBeenCalled();
+    }
+  );
+
+  it('ignores another owner exit while its original authentication response is pending', async () => {
+    let settle: ((result: { authenticated: boolean }) => void) | undefined;
+    api.testSsh.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          settle = resolve;
+        })
+    );
+    const p = props();
+    const id = 'live-independent-draft';
+    const view = render(<ProjectSourceFields {...p} fixedLocation draftConnectionId={id} />);
+    fireEvent.click(view.getByRole('button', { name: '测试连接' }));
+    await waitFor(() => expect(api.testSsh).toHaveBeenCalledOnce());
+    act(() => {
+      for (const receive of api.handlers.get('terminal-exit') ?? [])
+        receive({ payload: { id: 'another-owner', reason: 'process_exited', exit_code: 255 } });
+    });
+    await act(async () => settle?.({ authenticated: true }));
+    expect(p.onRemoteSource).toHaveBeenLastCalledWith({
+      ...target,
+      path: sshDraft.remotePath,
+      connection_id: id,
+    });
+    expect(api.connectSsh).toHaveBeenCalledOnce();
+    expect(api.write).not.toHaveBeenCalled();
+  });
+
   it('offers a masked password and a connection-only test without an authentication terminal', () => {
     const view = render(<ProjectSourceFields {...props()} />);
     expect(view.getByLabelText('SSH 密码').getAttribute('type')).toBe('password');

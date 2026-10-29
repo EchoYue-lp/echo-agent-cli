@@ -50,6 +50,10 @@ existing examples/lh6_product_soak.rs 不调用终端/SSH，无源码迁移；�
 
 验收沿 Plan06：Node 反例覆盖首输出、setup/cleanup、raw UTF-8、多 tab/隐藏、队列和 close 失败；Rust 后续覆盖忽略 HUP 的原 child、wait/reader、取消/重试和 shutdown 准入；真实 Tauri/远端交互单独取证，未执行项保持未完成。
 
+## 认证观察与原 PTY 退出的顺序
+
+GUI 认证测试返回时，仍须核对同一认证 PTY 是否已经退出。等待 `testSsh` 期间收到该 owner 的 `terminal-exit` 后，迟到的 `authenticated=true` 不能重新发布远程来源或恢复“登录已验证”；应保留断开状态并要求显式重连。其它 owner 的退出不影响当前 draft，已有独立 draft 转交、密码只写原 PTY、迟到视图清理与不重放规则不变。组件回归分别覆盖 echo 与 ubuntu 两个目标的事件顺序；这些公共测试数据不构成真实登录或远程交互验收。
+
 ## 项目连接扩展
 
 用户已明确侧栏任务相当于项目，创建来源是现有本地目录、新建本地目录或远程项目。本扩展以项目工作环境设计和 Plan `plan:986e9191-1a18-454b-a8b8-59ae18ad3bc7` 为准，不再把独立终端验收当作远程项目验收。Workspace 仍拥有项目及位置，TaskRun 仍拥有执行事实；本 ADR 只负责原终端/SSH 资源适配。
